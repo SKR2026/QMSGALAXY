@@ -6533,48 +6533,45 @@ function downloadUploadTemplate() {
 let _licInfo = null;          // cached license object
 let _licTickerHandle = null;  // setInterval handle
 
-/* Sync the header badge from the `licenses` collection (same source as the
-   panel) using _LIC.key. Falls back to _LIC data if the doc isn't found.
-   Called by _applyLicData so the badge stays live on every Firestore push. */
+/* Sync the header badge exclusively from the `licenses` collection —
+   the same source the panel reads, so dates always match exactly.
+   Called by _applyLicData on every Firestore push.                 */
 async function _syncBadgeFromLIC() {
-  // Only overwrite _licInfo when the badge is currently driven by _LIC
-  // (i.e. no explicit pv_license key is saved on this device).
+  // Only run when no explicit pv_license key is stored on this device.
   if (localStorage.getItem('pv_license')) return;
-  if (!_LIC || _LIC.key === 'OPEN' || !_LIC.key) {
+  if (!_LIC || !_LIC.key || _LIC.key === 'OPEN') {
     _licInfo = { status: 'unlicensed' };
     renderLicenseBadge();
     return;
   }
 
-  // Prefer the licenses collection — same doc the panel reads, so dates always match.
-  try {
-    if (typeof db !== 'undefined' && db && typeof db.collection === 'function') {
-      const doc = await db.collection('licenses').doc(_LIC.key).get();
-      if (doc.exists) {
-        const data = doc.data();
-        // Normalize Firestore Timestamp → ms (reuse panel's normalizeDoc logic)
-        let expiresAt = data.expiresAt;
-        if (expiresAt && typeof expiresAt.toMillis === 'function') expiresAt = expiresAt.toMillis();
-        else if (expiresAt instanceof Date) expiresAt = expiresAt.getTime();
-        else expiresAt = Number(expiresAt) || null;
-        _licInfo = { ...data, key: data.key || _LIC.key, expiresAt };
-        renderLicenseBadge();
-        return;
-      }
-    }
-  } catch (e) {
-    console.warn('[PlantVisit] licenses collection lookup failed, falling back to _LIC:', e);
+  if (typeof db === 'undefined' || !db || typeof db.collection !== 'function') {
+    // Firestore not ready yet — _applyLicData will retry when the snapshot fires.
+    return;
   }
 
-  // Fallback: build from _LIC (config/license doc)
-  _licInfo = {
-    key:             _LIC.key,
-    company:         _LIC.org || '',
-    expiresAt:       _LIC.expiry ? new Date(_LIC.expiry).getTime() : null,
-    maxActivations:  _LIC.seats || 999,
-    activationCount: 0,
-    status:          _LIC.valid ? 'active' : 'expired',
-  };
+  try {
+    const doc = await db.collection('licenses').doc(_LIC.key).get();
+    if (doc.exists) {
+      const data = doc.data();
+      // Normalize Firestore Timestamp → Unix ms
+      let expiresAt = data.expiresAt;
+      if (expiresAt && typeof expiresAt.toMillis === 'function') expiresAt = expiresAt.toMillis();
+      else if (expiresAt instanceof Date) expiresAt = expiresAt.getTime();
+      else expiresAt = Number(expiresAt) || null;
+      _licInfo = { ...data, key: data.key || _LIC.key, expiresAt };
+    } else {
+      // Key in config/license doesn't exist in the licenses collection.
+      // The two systems are out of sync — surface this clearly.
+      console.warn('[PlantVisit] License key "' + _LIC.key + '" not found in licenses collection. '
+        + 'Make sure the key saved in the app developer settings matches a key in the license panel.');
+      _licInfo = { status: 'unlicensed' };
+    }
+  } catch (e) {
+    console.warn('[PlantVisit] licenses collection lookup failed:', e);
+    _licInfo = { status: 'unlicensed' };
+  }
+
   renderLicenseBadge();
 }
 
