@@ -1266,10 +1266,101 @@ function showNotConfigured(){
 let CURRENT_PLANT_ID = 'main'; // default, updated when user switches plant
 
 function orgRef()    { return fbDb.collection('orgs').doc(CURRENT_PLANT_ID); }
-function dataRef(col){ return orgRef().collection('data').doc(col); }
-function usersCol()  { return fbDb.collection('orgs').doc('main').collection('users'); }  // users are global
+function dataRef(col){ return orgRef().collection('data').doc(col); }     // config (org, product)
+function rowsCol(col){ return orgRef().collection(col); }                  // per-row collections
+function rowRef(col, id){ return rowsCol(col).doc(id); }
+function usersCol()  { return fbDb.collection('orgs').doc('main').collection('users'); }
 function auditCol()  { return orgRef().collection('audit'); }
 function plantsCol() { return fbDb.collection('plants'); }
+
+const ROW_COLLECTIONS = ['upstream','transport','manufacturing','downstream'];
+
+/* ---------- Ownership / status helpers ---------- */
+function isManagerOrAbove(){
+  return state.user && (state.user.role === 'admin' || state.user.role === 'manager');
+}
+function isAdminUser(){
+  return state.user && state.user.role === 'admin';
+}
+function ownsRow(row){
+  return row && state.user && row.ownerId === state.user.id;
+}
+function rowIsDraft(row){
+  return row && row.status === 'draft';
+}
+function canEditRow(row){
+  // Admins can always edit. Owners can edit while draft.
+  if (!state.user || !row) return false;
+  if (isAdminUser()) return true;
+  if (!canWrite()) return false;
+  return ownsRow(row) && rowIsDraft(row);
+}
+function canDeleteRow(row){
+  // Same as edit.
+  return canEditRow(row);
+}
+function canSubmitRow(row){
+  // Only the owner submits, while draft. Admin can also submit on behalf.
+  if (!state.user || !row) return false;
+  if (isAdminUser()) return rowIsDraft(row);
+  return ownsRow(row) && rowIsDraft(row) && canWrite();
+}
+function canUnlockRow(row){
+  // Only admin, and only if currently submitted.
+  return isAdminUser() && row && row.status === 'submitted';
+}
+
+/* Stamp ownership / status / timestamps onto a freshly-created row, in place.
+   Called by all addX functions before persisting. */
+function stampNewRow(row){
+  row.ownerId    = state.user?.id || '';
+  row.ownerEmail = state.user?.email || '';
+  row.status     = 'draft';
+  row.createdAt  = row.createdAt || new Date().toISOString();
+  row.updatedAt  = row.createdAt;
+  return row;
+}
+
+/* Build the action-buttons HTML for a row in the data tables.
+   Respects per-row ownership and status, and the current user's role. */
+function rowActionsHtml(section, r){
+  // r might be the calculated form (with .co2e) or the original. Both carry id/ownerId/status.
+  const original = (state[section]||[]).find(x => x.id === r.id) || r;
+  const parts = [];
+  if (canEditRow(original)){
+    parts.push(`<button class="row-edit" title="Edit" onclick="editRow('${section}','${r.id}')">EDIT</button>`);
+  }
+  if (canSubmitRow(original)){
+    parts.push(`<button class="row-edit" title="Submit (lock)" style="background:var(--accent-2);color:var(--accent-2-ink)" onclick="submitRow('${section}','${r.id}')">SUBMIT</button>`);
+  }
+  if (canUnlockRow(original)){
+    parts.push(`<button class="row-edit" title="Admin: unlock for editing" style="background:var(--accent-3);color:#0a1726" onclick="unlockRow('${section}','${r.id}')">UNLOCK</button>`);
+  }
+  if (canDeleteRow(original)){
+    parts.push(`<button class="row-del" title="Delete" onclick="deleteRow('${section}','${r.id}')">✕</button>`);
+  }
+  if (parts.length === 0) {
+    // Show a small lock indicator if the row is submitted and the current
+    // user can't unlock it.
+    if (original.status === 'submitted') return '<span style="color:var(--ink-3);font-size:11px">🔒</span>';
+    return '';
+  }
+  return parts.join('');
+}
+
+/* Build the status / owner HTML to show in the table next to each row. */
+function rowMetaHtml(r){
+  const original = r; // includes ownerEmail and status
+  const isSub = original.status === 'submitted';
+  const isMine = ownsRow(original);
+  const statusTag = isSub
+    ? `<span class="tag" style="background:var(--accent-2-tint,rgba(255,200,87,0.15));color:var(--accent-2);font-size:10px">SUBMITTED</span>`
+    : `<span class="tag" style="background:var(--accent-tint);color:var(--accent);font-size:10px">DRAFT</span>`;
+  const ownerTag = isMine
+    ? `<span style="color:var(--ink-2);font-size:11px">you</span>`
+    : `<span style="color:var(--ink-2);font-size:11px" title="${escapeHtml(original.ownerEmail||'')}">${escapeHtml((original.ownerEmail||'—').split('@')[0])}</span>`;
+  return `<div style="display:flex;flex-direction:column;gap:2px;align-items:flex-start">${statusTag}${ownerTag}</div>`;
+}
 
 /* ===================================================================
    PLANT MANAGEMENT
@@ -1402,7 +1493,10 @@ let state = (() => {
   } catch(e){ return JSON.parse(JSON.stringify(DEFAULT_STATE)); }
 })();
 
-/* saveState: writes data collections to Firestore, theme/user to localStorage */
+/* saveState: with the new per-row model, row-collection saves are no-ops here.
+   Rows are written individually by addRow/saveEdit/deleteRow/submitRow/unlockRow.
+   This function still handles 'org' and 'product' (single config docs) and
+   localStorage of theme/user. */
 async function saveState(collection){
   // Always persist theme + current user in localStorage for fast boot
   try {
@@ -1411,27 +1505,19 @@ async function saveState(collection){
 
   if (!fbDb) return; // Firebase not ready yet
 
-  const writes = {
-    upstream:      () => dataRef('upstream').set({ rows: state.upstream }),
-    transport:     () => dataRef('transport').set({ rows: state.transport }),
-    manufacturing: () => dataRef('manufacturing').set({ rows: state.manufacturing }),
-    downstream:    () => dataRef('downstream').set({ rows: state.downstream }),
-    org:           () => dataRef('org').set(state.org),
-    product:       () => dataRef('product').set(state.product),
-  };
-
-  if (collection && writes[collection]){
-    await writes[collection]();
-  } else if (!collection){
-    // Full save — write all at once using a batch
-    const batch = fbDb.batch();
-    batch.set(dataRef('upstream'),      { rows: state.upstream });
-    batch.set(dataRef('transport'),     { rows: state.transport });
-    batch.set(dataRef('manufacturing'), { rows: state.manufacturing });
-    batch.set(dataRef('downstream'),    { rows: state.downstream });
-    batch.set(dataRef('org'),           state.org);
-    batch.set(dataRef('product'),       state.product);
-    await batch.commit();
+  if (collection === 'org')        return dataRef('org').set(state.org);
+  if (collection === 'product')    return dataRef('product').set(state.product);
+  if (ROW_COLLECTIONS.includes(collection)) {
+    // Row collections are saved per-row, not in bulk. Nothing to do here —
+    // callers should use writeRow / deleteRowDoc instead.
+    return;
+  }
+  if (!collection){
+    // Full save: only config docs go in this path now.
+    await Promise.all([
+      dataRef('org').set(state.org),
+      dataRef('product').set(state.product)
+    ]);
   }
 
   // Keep the all-plants dashboard cache in sync with the current plant's edits
@@ -1445,48 +1531,89 @@ async function saveState(collection){
   }
 }
 
-/* loadState: pulls all Firestore collections into memory */
+/* Helper: write a single row document (used by add/edit/submit/unlock). */
+async function writeRow(col, row){
+  if (!fbDb || !ROW_COLLECTIONS.includes(col)) return;
+  await rowRef(col, row.id).set(row);
+}
+
+/* Helper: delete a single row document. */
+async function deleteRowDoc(col, id){
+  if (!fbDb || !ROW_COLLECTIONS.includes(col)) return;
+  await rowRef(col, id).delete();
+}
+
+/* Build the query for a row collection respecting role-based visibility.
+   - Managers and admins: read all rows in this plant.
+   - Regular users (and viewers): only rows they own.
+   The Firestore rules enforce this server-side too; the query just matches. */
+function rowQuery(col){
+  const base = rowsCol(col);
+  if (isManagerOrAbove()) return base;
+  // viewer or user: scope to own rows only
+  const uid = state.user?.id;
+  if (!uid) return base.where('ownerId', '==', '__none__'); // empty result
+  return base.where('ownerId', '==', uid);
+}
+
+/* loadState: pulls all Firestore collections into memory. Rows are loaded
+   with a role-aware query so users only see what they're allowed to see. */
 async function loadState(){
   if (!fbDb) return;
   try {
     const [up, tr, mf, dn, org, prod] = await Promise.all([
-      dataRef('upstream').get(),
-      dataRef('transport').get(),
-      dataRef('manufacturing').get(),
-      dataRef('downstream').get(),
+      rowQuery('upstream').get(),
+      rowQuery('transport').get(),
+      rowQuery('manufacturing').get(),
+      rowQuery('downstream').get(),
       dataRef('org').get(),
       dataRef('product').get(),
     ]);
-    if (up.exists)   state.upstream      = up.data().rows   || [];
-    if (tr.exists)   state.transport     = tr.data().rows   || [];
-    if (mf.exists)   state.manufacturing = mf.data().rows   || [];
-    if (dn.exists)   state.downstream    = dn.data().rows   || [];
-    if (org.exists)  state.org           = { ...DEFAULT_STATE.org, ...org.data() };
-    if (prod.exists) state.product       = { ...DEFAULT_STATE.product, ...prod.data() };
+    state.upstream      = up.docs.map(d => d.data());
+    state.transport     = tr.docs.map(d => d.data());
+    state.manufacturing = mf.docs.map(d => d.data());
+    state.downstream    = dn.docs.map(d => d.data());
+    if (org.exists)  state.org     = { ...DEFAULT_STATE.org, ...org.data() };
+    if (prod.exists) state.product = { ...DEFAULT_STATE.product, ...prod.data() };
   } catch(e){ console.error('loadState error:', e); }
 }
 
-/* Subscribe to realtime Firestore updates — re-renders page when data changes */
+/* Subscribe to realtime Firestore updates — re-renders page when data changes.
+   Listens to each row collection with a role-aware query, plus the two
+   plant-config docs. */
 function subscribeRealtime(){
   if (fbUnsubscribe) fbUnsubscribe();
-  // Listen to all data docs; batch updates with a 300ms debounce
   let debounce;
-  const collections = ['upstream','transport','manufacturing','downstream','org','product'];
-  const unsubs = collections.map(col =>
-    dataRef(col).onSnapshot(snap => {
-      if (!snap.exists) return;
-      const d = snap.data();
-      if (col === 'org')     state.org     = { ...DEFAULT_STATE.org, ...d };
-      else if (col === 'product') state.product = { ...DEFAULT_STATE.product, ...d };
-      else state[col] = d.rows || [];
-      // Debounce re-render so we don't flicker on batch writes
-      clearTimeout(debounce);
-      debounce = setTimeout(() => {
-        updateBadges();
-        document.getElementById('org-name').textContent = state.org.name;
-        const active = document.querySelector('.nav-item.active');
-        if (active) renderPage(active.dataset.page);
-      }, 300);
+  const triggerRender = () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => {
+      updateBadges();
+      const orgNameEl = document.getElementById('org-name');
+      if (orgNameEl) orgNameEl.textContent = state.org.name;
+      const active = document.querySelector('.nav-item.active');
+      if (active) renderPage(active.dataset.page);
+    }, 300);
+  };
+
+  const unsubs = [];
+  ROW_COLLECTIONS.forEach(col => {
+    unsubs.push(
+      rowQuery(col).onSnapshot(snap => {
+        state[col] = snap.docs.map(d => d.data());
+        triggerRender();
+      }, err => console.warn(col + ' listener:', err.message))
+    );
+  });
+  unsubs.push(
+    dataRef('org').onSnapshot(snap => {
+      if (snap.exists) state.org = { ...DEFAULT_STATE.org, ...snap.data() };
+      triggerRender();
+    })
+  );
+  unsubs.push(
+    dataRef('product').onSnapshot(snap => {
+      if (snap.exists) state.product = { ...DEFAULT_STATE.product, ...snap.data() };
+      triggerRender();
     })
   );
   fbUnsubscribe = () => unsubs.forEach(u => u());
@@ -1799,21 +1926,30 @@ function getFilteredTotals(){
 async function loadAllPlantsData(){
   if (!fbDb || !state.plants || !state.plants.length) return;
   const cache = {};
-  // Read sequentially-ish via Promise.all per plant; each plant has 4 docs
+  // For each plant, query the four per-row collections. Apply the same
+  // role-based filter as the main loader: managers/admins see everything,
+  // regular users only see their own rows.
+  const uid = state.user?.id;
+  const seeAll = isManagerOrAbove();
+
   await Promise.all(state.plants.map(async plant => {
     try {
-      const ref = fbDb.collection('orgs').doc(plant.id).collection('data');
+      const baseCol = fbDb.collection('orgs').doc(plant.id);
+      const buildQuery = colName => {
+        const ref = baseCol.collection(colName);
+        return seeAll ? ref : ref.where('ownerId', '==', uid || '__none__');
+      };
       const [up, tr, mf, dn] = await Promise.all([
-        ref.doc('upstream').get(),
-        ref.doc('transport').get(),
-        ref.doc('manufacturing').get(),
-        ref.doc('downstream').get()
+        buildQuery('upstream').get(),
+        buildQuery('transport').get(),
+        buildQuery('manufacturing').get(),
+        buildQuery('downstream').get()
       ]);
       cache[plant.id] = {
-        upstream:      up.exists ? (up.data().rows || []) : [],
-        transport:     tr.exists ? (tr.data().rows || []) : [],
-        manufacturing: mf.exists ? (mf.data().rows || []) : [],
-        downstream:    dn.exists ? (dn.data().rows || []) : []
+        upstream:      up.docs.map(d => d.data()),
+        transport:     tr.docs.map(d => d.data()),
+        manufacturing: mf.docs.map(d => d.data()),
+        downstream:    dn.docs.map(d => d.data())
       };
     } catch(e){
       console.warn('loadAllPlantsData: failed for plant', plant.id, e);
@@ -2876,7 +3012,8 @@ PAGES.upstream = () => {
             <th>Material</th><th>Supplier</th><th>Category</th>
             <th class="num">Weight (kg)</th><th class="num">Recycled %</th>
             <th class="num">EF</th><th class="num">CO₂e (kg)</th>
-            ${canWrite()?'<th></th>':''}
+            <th>Status</th>
+            <th></th>
           </tr></thead>
           <tbody>
             ${rows.length ? rows.map((r,i)=>`
@@ -2888,9 +3025,10 @@ PAGES.upstream = () => {
                 <td class="num">${r.recycledPct||0}%</td>
                 <td class="num">${r.factor.toFixed(3)}</td>
                 <td class="num" style="color:var(--accent)">${fmtCO2(r.co2e)}</td>
-                ${canWrite()?`<td><button class="row-edit" onclick="editRow('upstream','${r.id}')">EDIT</button><button class="row-del" onclick="deleteRow('upstream','${r.id}')">✕</button></td>`:''}
+                <td>${rowMetaHtml(r)}</td>
+                <td>${rowActionsHtml('upstream', r)}</td>
               </tr>`).join('') :
-              `<tr><td colspan="${canWrite()?8:7}" class="empty">No upstream entries — add raw materials above</td></tr>`}
+              `<tr><td colspan="9" class="empty">No upstream entries — add raw materials above</td></tr>`}
           </tbody>
           ${rows.length?`<tfoot><tr style="border-top:2px solid var(--line)">
             <td colspan="6" style="font-family:var(--mono);font-size:10px;letter-spacing:0.15em;color:var(--ink-2)">TOTAL</td>
@@ -2920,9 +3058,9 @@ function addUpstream(){
     factorOverride: parseFloat(document.getElementById('up-factor').value) || null,
     createdAt: new Date().toISOString()
   };
-  state.upstream.push(row);
+  state.upstream.push(stampNewRow(row));
   audit('ADD_UPSTREAM', `${material} ${weightKg}kg from ${row.supplier||'unknown'}`);
-  saveState('upstream');
+  writeRow('upstream', row);
   toast(`Added ${material} — ${fmtCO2(calcUpstreamRow(row).co2e)} kg CO₂e`);
   renderPage('upstream');
 }
@@ -3005,7 +3143,7 @@ PAGES.transport = () => {
             <th>Material</th><th>Route</th><th>Mode</th>
             <th class="num">Weight</th><th class="num">Distance</th>
             <th class="num">Load%</th><th class="num">EF</th>
-            <th class="num">CO₂e</th>${canWrite()?'<th></th>':''}
+            <th class="num">CO₂e</th><th>Status</th><th></th>
           </tr></thead>
           <tbody>
             ${rows.length ? rows.map(r=>`
@@ -3018,14 +3156,15 @@ PAGES.transport = () => {
                 <td class="num">${r.loadEff||100}%</td>
                 <td class="num">${r.factor.toFixed(3)}</td>
                 <td class="num" style="color:var(--accent)">${fmtCO2(r.co2e)}</td>
-                ${canWrite()?`<td><button class="row-edit" onclick="editRow('transport','${r.id}')">EDIT</button><button class="row-del" onclick="deleteRow('transport','${r.id}')">✕</button></td>`:''}
+                <td>${rowMetaHtml(r)}</td>
+                <td>${rowActionsHtml('transport', r)}</td>
               </tr>`).join('') :
-              `<tr><td colspan="${canWrite()?9:8}" class="empty">No shipments logged</td></tr>`}
+              `<tr><td colspan="10" class="empty">No shipments logged</td></tr>`}
           </tbody>
           ${rows.length?`<tfoot><tr style="border-top:2px solid var(--line)">
             <td colspan="7" style="font-family:var(--mono);font-size:10px;letter-spacing:0.15em;color:var(--ink-2)">TOTAL</td>
             <td class="num" style="font-weight:700;color:var(--accent)">${fmtCO2(total)}</td>
-            ${canWrite()?'<td></td>':''}
+            <td></td><td></td>
           </tr></tfoot>`:''}
         </table>
       </div>
@@ -3082,9 +3221,9 @@ function addTransport(){
     returnTrip: document.getElementById('tr-return').checked,
     createdAt: new Date().toISOString()
   };
-  state.transport.push(row);
+  state.transport.push(stampNewRow(row));
   audit('ADD_TRANSPORT', `${mode} ${weightKg}kg × ${distanceKm}km`);
-  saveState('transport');
+  writeRow('transport', row);
   toast(`Added ${mode} shipment — ${fmtCO2(calcTransportRow(row).co2e)} kg CO₂e`);
   renderPage('transport');
 }
@@ -3145,7 +3284,7 @@ PAGES.manufacturing = () => {
             <th>Source</th><th>Machine/Dept</th><th>Period</th>
             <th class="num">Quantity</th><th>Unit</th>
             <th class="num">EF</th><th>Scope</th>
-            <th class="num">CO₂e</th>${canWrite()?'<th></th>':''}
+            <th class="num">CO₂e</th><th>Status</th><th></th>
           </tr></thead>
           <tbody>
             ${rows.length ? rows.map(r=>`
@@ -3158,14 +3297,15 @@ PAGES.manufacturing = () => {
                 <td class="num">${r.factor.toFixed(3)}</td>
                 <td><span class="tag s${r.scope}">S${r.scope}</span></td>
                 <td class="num" style="color:var(--accent)">${fmtCO2(r.co2e)}</td>
-                ${canWrite()?`<td><button class="row-edit" onclick="editRow('manufacturing','${r.id}')">EDIT</button><button class="row-del" onclick="deleteRow('manufacturing','${r.id}')">✕</button></td>`:''}
+                <td>${rowMetaHtml(r)}</td>
+                <td>${rowActionsHtml('manufacturing', r)}</td>
               </tr>`).join('') :
-              `<tr><td colspan="${canWrite()?9:8}" class="empty">No consumption logged</td></tr>`}
+              `<tr><td colspan="10" class="empty">No consumption logged</td></tr>`}
           </tbody>
           ${rows.length?`<tfoot><tr style="border-top:2px solid var(--line)">
             <td colspan="7" style="font-family:var(--mono);font-size:10px;letter-spacing:0.15em;color:var(--ink-2)">TOTAL</td>
             <td class="num" style="font-weight:700;color:var(--accent)">${fmtCO2(total)}</td>
-            ${canWrite()?'<td></td>':''}
+            <td></td><td></td>
           </tr></tfoot>`:''}
         </table>
       </div>
@@ -3193,9 +3333,9 @@ function addManufacturing(){
     notes: document.getElementById('mf-notes').value.trim(),
     createdAt: new Date().toISOString()
   };
-  state.manufacturing.push(row);
+  state.manufacturing.push(stampNewRow(row));
   audit('ADD_MFG', `${source} ${quantity} ${meta?.unit||''}`);
-  saveState('manufacturing');
+  writeRow('manufacturing', row);
   toast(`Added ${source} — ${fmtCO2(calcMfgRow(row).co2e)} kg CO₂e`);
   renderPage('manufacturing');
 }
@@ -3257,7 +3397,7 @@ PAGES.downstream = () => {
           <thead><tr>
             <th>Activity</th><th>Stage</th><th>Region</th>
             <th class="num">Quantity</th><th class="num">EF</th>
-            <th class="num">CO₂e</th>${canWrite()?'<th></th>':''}
+            <th class="num">CO₂e</th><th>Status</th><th></th>
           </tr></thead>
           <tbody>
             ${rows.length ? rows.map(r=>`
@@ -3268,9 +3408,10 @@ PAGES.downstream = () => {
                 <td class="num">${fmt(r.quantity)}</td>
                 <td class="num">${r.factor.toFixed(3)}</td>
                 <td class="num" style="color:${r.co2e<0?'var(--accent)':'var(--accent-2)'}">${fmtCO2(r.co2e)}</td>
-                ${canWrite()?`<td><button class="row-edit" onclick="editRow('downstream','${r.id}')">EDIT</button><button class="row-del" onclick="deleteRow('downstream','${r.id}')">✕</button></td>`:''}
+                <td>${rowMetaHtml(r)}</td>
+                <td>${rowActionsHtml('downstream', r)}</td>
               </tr>`).join('') :
-              `<tr><td colspan="${canWrite()?7:6}" class="empty">No downstream activities</td></tr>`}
+              `<tr><td colspan="8" class="empty">No downstream activities</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -3290,27 +3431,94 @@ function addDownstream(){
     notes: document.getElementById('dn-notes').value.trim(),
     createdAt: new Date().toISOString()
   };
-  state.downstream.push(row);
+  state.downstream.push(stampNewRow(row));
   audit('ADD_DOWNSTREAM', `${activity} ${quantity}`);
-  saveState('downstream');
+  writeRow('downstream', row);
   toast(`Added ${activity} — ${fmtCO2(calcDownstreamRow(row).co2e)} kg CO₂e`);
   renderPage('downstream');
 }
 
-function deleteRow(section, id){
-  if (!canWrite()) return;
+async function deleteRow(section, id){
+  const row = state[section].find(r => r.id === id);
+  if (!row){ toast('Entry not found', 'err'); return; }
+  if (!canDeleteRow(row)){
+    if (row.status === 'submitted' && ownsRow(row)) toast('Submitted — ask admin to unlock first', 'err');
+    else if (!ownsRow(row) && !isAdminUser())      toast('You can only delete your own entries', 'err');
+    else toast('Not allowed', 'err');
+    return;
+  }
   if (!confirm('Delete this entry?')) return;
-  state[section] = state[section].filter(r => r.id !== id);
-  audit('DELETE_'+section.toUpperCase(), id);
-  saveState(section);
-  renderPage(section);
-  toast('Entry deleted');
+  try {
+    await deleteRowDoc(section, id);
+    state[section] = state[section].filter(r => r.id !== id);
+    audit('DELETE_'+section.toUpperCase(), id);
+    renderPage(section);
+    toast('Entry deleted');
+  } catch(e){
+    toast('Delete failed: ' + e.message, 'err');
+  }
+}
+
+/* Submit a draft row → status:'submitted'. After this only admin can edit/delete. */
+async function submitRow(section, id){
+  const row = state[section].find(r => r.id === id);
+  if (!row){ toast('Entry not found', 'err'); return; }
+  if (!canSubmitRow(row)){ toast('Cannot submit this entry', 'err'); return; }
+  if (!confirm('Submit this entry? After submission you will not be able to edit it unless an admin unlocks it.')) return;
+  const updated = {
+    ...row,
+    status: 'submitted',
+    submittedAt: new Date().toISOString(),
+    submittedBy: state.user?.email || '',
+    updatedAt: new Date().toISOString()
+  };
+  try {
+    await writeRow(section, updated);
+    const idx = state[section].findIndex(r => r.id === id);
+    if (idx >= 0) state[section][idx] = updated;
+    audit('SUBMIT_'+section.toUpperCase(), id);
+    renderPage(section);
+    toast('Entry submitted and locked');
+  } catch(e){
+    toast('Submit failed: ' + e.message, 'err');
+  }
+}
+
+/* Admin-only: unlock a submitted row, returning it to draft so the owner
+   (or anyone authorised) can edit it. */
+async function unlockRow(section, id){
+  const row = state[section].find(r => r.id === id);
+  if (!row){ toast('Entry not found', 'err'); return; }
+  if (!canUnlockRow(row)){ toast('Only admin can unlock submitted entries', 'err'); return; }
+  if (!confirm(`Unlock this entry? The owner (${row.ownerEmail || 'unknown'}) will be able to edit it again.`)) return;
+  const updated = {
+    ...row,
+    status: 'draft',
+    unlockedAt: new Date().toISOString(),
+    unlockedBy: state.user?.email || '',
+    updatedAt: new Date().toISOString()
+  };
+  try {
+    await writeRow(section, updated);
+    const idx = state[section].findIndex(r => r.id === id);
+    if (idx >= 0) state[section][idx] = updated;
+    audit('UNLOCK_'+section.toUpperCase(), id + ' (owner: '+(row.ownerEmail||'?')+')');
+    renderPage(section);
+    toast('Entry unlocked for editing');
+  } catch(e){
+    toast('Unlock failed: ' + e.message, 'err');
+  }
 }
 
 function editRow(section, id){
-  if (!canWrite()) return;
   const row = state[section].find(r => r.id === id);
-  if (!row) return;
+  if (!row){ toast('Entry not found', 'err'); return; }
+  if (!canEditRow(row)){
+    if (row.status === 'submitted' && ownsRow(row)) toast('Submitted — ask admin to unlock', 'err');
+    else if (!ownsRow(row) && !isAdminUser())      toast('You can only edit your own entries', 'err');
+    else toast('Not allowed', 'err');
+    return;
+  }
 
   // Build modal fields based on section
   let fields = '';
@@ -3404,11 +3612,17 @@ function editRow(section, id){
   document.body.appendChild(modal);
 }
 
-function saveEdit(section, id){
-  if (!canWrite()) return;
+async function saveEdit(section, id){
   const idx = state[section].findIndex(r => r.id === id);
-  if (idx === -1) return;
-  const row = { ...state[section][idx] };
+  if (idx === -1){ toast('Entry not found', 'err'); return; }
+  const original = state[section][idx];
+  if (!canEditRow(original)){
+    if (original.status === 'submitted' && ownsRow(original)) toast('Submitted — ask admin to unlock', 'err');
+    else if (!ownsRow(original) && !isAdminUser())             toast('You can only edit your own entries', 'err');
+    else toast('Not allowed', 'err');
+    return;
+  }
+  const row = { ...original };
 
   if (section === 'upstream'){
     row.material = document.getElementById('edit-material').value;
@@ -3446,12 +3660,24 @@ function saveEdit(section, id){
     row.notes    = document.getElementById('edit-notes').value.trim();
   }
 
-  state[section][idx] = row;
-  audit('EDIT_'+section.toUpperCase(), id);
-  saveState(section);
-  document.getElementById('edit-modal').remove();
-  renderPage(section);
-  toast('Entry updated');
+  // Preserve immutable ownership fields; bump updatedAt; keep status.
+  row.ownerId   = original.ownerId;
+  row.ownerEmail = original.ownerEmail;
+  row.createdAt = original.createdAt;
+  row.status    = original.status; // edits never change status
+  row.updatedAt = new Date().toISOString();
+  row.editedBy  = state.user?.email || '';
+
+  try {
+    await writeRow(section, row);
+    state[section][idx] = row;
+    audit('EDIT_'+section.toUpperCase(), id);
+    document.getElementById('edit-modal').remove();
+    renderPage(section);
+    toast('Entry updated');
+  } catch(e){
+    toast('Save failed: ' + e.message, 'err');
+  }
 }
 
 /* ----- SCOPE ANALYSIS ----- */
@@ -4524,15 +4750,13 @@ async function savePlantDialog(){
     await plantsCol().doc(newId).set(plant);
     state.plants.push(plant);
 
-    // Seed empty data collections for the new plant so it's ready to use
+    // Seed config docs (org, product) for the new plant. Row collections
+    // (upstream/transport/manufacturing/downstream) are created lazily on
+    // first write — Firestore has no notion of an "empty collection".
     const batch = fbDb.batch();
     const newOrgRef = fbDb.collection('orgs').doc(newId);
-    batch.set(newOrgRef.collection('data').doc('upstream'),      { rows: [] });
-    batch.set(newOrgRef.collection('data').doc('transport'),     { rows: [] });
-    batch.set(newOrgRef.collection('data').doc('manufacturing'), { rows: [] });
-    batch.set(newOrgRef.collection('data').doc('downstream'),    { rows: [] });
-    batch.set(newOrgRef.collection('data').doc('org'),           { ...DEFAULT_STATE.org, name });
-    batch.set(newOrgRef.collection('data').doc('product'),       { ...DEFAULT_STATE.product });
+    batch.set(newOrgRef.collection('data').doc('org'),     { ...DEFAULT_STATE.org, name });
+    batch.set(newOrgRef.collection('data').doc('product'), { ...DEFAULT_STATE.product });
     await batch.commit();
 
     audit('PLANT_CREATE', `Created new plant: ${name}`);
@@ -5035,21 +5259,57 @@ async function backupAll(){
 
 function restoreBackup(input){
   const file = input.files[0]; if (!file) return;
+  if (!isAdminUser()){ toast('Admin only', 'err'); return; }
   const r = new FileReader();
   r.onload = async e => {
     try {
       const data = JSON.parse(e.target.result);
       if (!data.upstream) throw new Error('Invalid backup file — missing upstream data');
-      if (!confirm(`Restore from "${file.name}"? This will overwrite all current data.`)) return;
-      // Write everything to Firestore
-      const batch = fbDb.batch();
-      batch.set(dataRef('upstream'),      { rows: data.upstream      || [] });
-      batch.set(dataRef('transport'),     { rows: data.transport     || [] });
-      batch.set(dataRef('manufacturing'), { rows: data.manufacturing || [] });
-      batch.set(dataRef('downstream'),    { rows: data.downstream    || [] });
-      batch.set(dataRef('org'),     { ...DEFAULT_STATE.org,     ...(data.org     || {}) });
-      batch.set(dataRef('product'), { ...DEFAULT_STATE.product, ...(data.product || {}) });
-      await batch.commit();
+      if (!confirm(`Restore from "${file.name}"? This will OVERWRITE all current row data for this plant.`)) return;
+
+      const adminId    = state.user?.id || '';
+      const adminEmail = state.user?.email || '';
+      const nowIso     = new Date().toISOString();
+
+      // Helper: write a list of rows into a per-row collection. If a backup
+      // row carries ownerId/status from a previous export, keep them; else
+      // stamp current admin as owner and mark as submitted (historical data).
+      const writePerRow = async (col, rows) => {
+        if (!Array.isArray(rows) || rows.length === 0) return;
+        const target = rowsCol(col);
+        let batch = fbDb.batch();
+        let ops = 0;
+        for (const r of rows) {
+          const id = r.id || ('restored_' + Date.now() + '_' + Math.random().toString(36).slice(2,8));
+          const payload = {
+            ...r,
+            id,
+            ownerId:    r.ownerId    || adminId,
+            ownerEmail: r.ownerEmail || adminEmail,
+            status:     r.status     || 'submitted',
+            createdAt:  r.createdAt  || nowIso,
+            updatedAt:  nowIso,
+            restoredAt: nowIso
+          };
+          batch.set(target.doc(id), payload);
+          ops++;
+          if (ops >= 450) { await batch.commit(); batch = fbDb.batch(); ops = 0; }
+        }
+        if (ops > 0) await batch.commit();
+      };
+
+      // Wipe existing per-row docs first, then write the backup.
+      await wipeRowCollections();
+      await writePerRow('upstream',      data.upstream);
+      await writePerRow('transport',     data.transport);
+      await writePerRow('manufacturing', data.manufacturing);
+      await writePerRow('downstream',    data.downstream);
+      // Config docs (org, product) stay as single documents.
+      const cfgBatch = fbDb.batch();
+      cfgBatch.set(dataRef('org'),     { ...DEFAULT_STATE.org,     ...(data.org     || {}) });
+      cfgBatch.set(dataRef('product'), { ...DEFAULT_STATE.product, ...(data.product || {}) });
+      await cfgBatch.commit();
+
       audit('RESTORE', `Restored from ${file.name}`);
       toast('Backup restored — Firestore updated');
       renderPage('dashboard');
@@ -5058,53 +5318,89 @@ function restoreBackup(input){
   r.readAsText(file);
 }
 
+/* Wipe every row in every per-row collection for the current plant.
+   Admin-only. Used by restoreBackup and resetAll. */
+async function wipeRowCollections(){
+  if (!isAdminUser()) throw new Error('Admin only');
+  for (const col of ROW_COLLECTIONS){
+    let snap;
+    do {
+      snap = await rowsCol(col).limit(450).get();
+      if (snap.empty) break;
+      const batch = fbDb.batch();
+      snap.docs.forEach(d => batch.delete(d.ref));
+      await batch.commit();
+    } while (snap.size >= 450);
+  }
+}
+
 async function resetAll(){
+  if (!isAdminUser()){ toast('Admin only', 'err'); return; }
   if (!confirm('Reset ALL emission data in Firestore? This cannot be undone.')) return;
   if (!confirm('Really sure? Upstream, transport, manufacturing, downstream — all will be wiped.')) return;
-  const batch = fbDb.batch();
-  batch.set(dataRef('upstream'),      { rows: [] });
-  batch.set(dataRef('transport'),     { rows: [] });
-  batch.set(dataRef('manufacturing'), { rows: [] });
-  batch.set(dataRef('downstream'),    { rows: [] });
-  await batch.commit();
-  state.upstream = []; state.transport = []; state.manufacturing = []; state.downstream = [];
-  audit('RESET', 'All emission data wiped from Firestore');
-  renderPage('dashboard');
-  toast('All data reset', 'warn');
+  try {
+    await wipeRowCollections();
+    state.upstream = []; state.transport = []; state.manufacturing = []; state.downstream = [];
+    audit('RESET', 'All emission data wiped from Firestore');
+    renderPage('dashboard');
+    toast('All data reset', 'warn');
+  } catch(e){
+    toast('Reset failed: ' + e.message, 'err');
+  }
 }
-function loadSampleData(){
+async function loadSampleData(){
+  if (!canWrite()){ toast('Read-only role', 'err'); return; }
   if (state.upstream.length && !confirm('Append sample data to existing entries?')) return;
-  state.upstream.push(
-    { id:uid(), material:'ABS', weightKg:1200, supplier:'Reliance Polymers', country:'India', category:'Raw Material', recycledPct:20, batch:'PO-2024-A1', createdAt:new Date().toISOString() },
-    { id:uid(), material:'Steel Sheet', weightKg:850, supplier:'Tata Steel', country:'India', category:'Raw Material', recycledPct:35, createdAt:new Date().toISOString() },
-    { id:uid(), material:'Aluminium (Virgin)', weightKg:240, supplier:'Hindalco', country:'India', category:'Component', recycledPct:0, createdAt:new Date().toISOString() },
-    { id:uid(), material:'Cardboard', weightKg:380, supplier:'WestRock', country:'USA', category:'Packaging', recycledPct:85, createdAt:new Date().toISOString() },
-    { id:uid(), material:'Copper', weightKg:65, supplier:'Sterlite Copper', country:'India', category:'Component', recycledPct:15, createdAt:new Date().toISOString() }
-  );
-  state.transport.push(
-    { id:uid(), material:'ABS Pellets', weightKg:1200, distanceKm:850, mode:'Truck (Diesel)', fuel:'Diesel', loadEff:80, origin:'Jamnagar', dest:'Pune Plant', returnTrip:false, createdAt:new Date().toISOString() },
-    { id:uid(), material:'Steel Sheet', weightKg:850, distanceKm:1850, mode:'Rail (Diesel)', fuel:'Diesel', loadEff:90, origin:'Jamshedpur', dest:'Pune Plant', returnTrip:false, createdAt:new Date().toISOString() },
-    { id:uid(), material:'Aluminium', weightKg:240, distanceKm:120, mode:'Truck (Diesel)', fuel:'Diesel', loadEff:60, origin:'Mumbai', dest:'Pune Plant', returnTrip:true, createdAt:new Date().toISOString() },
-    { id:uid(), material:'Cardboard', weightKg:380, distanceKm:14000, mode:'Sea Freight', fuel:'Heavy Fuel Oil', loadEff:85, origin:'USA Port', dest:'JNPT Mumbai', returnTrip:false, createdAt:new Date().toISOString() }
-  );
-  state.manufacturing.push(
-    { id:uid(), source:'Grid Electricity (India)', quantity:48000, unit:'kWh', machine:'Plant-wide', period:new Date().toISOString().slice(0,7), createdAt:new Date().toISOString() },
-    { id:uid(), source:'Diesel (DG Set)', quantity:850, unit:'litre', machine:'Backup DG-1', period:new Date().toISOString().slice(0,7), createdAt:new Date().toISOString() },
-    { id:uid(), source:'PNG (Natural Gas)', quantity:2400, unit:'SCM', machine:'Heat Treatment Furnace', period:new Date().toISOString().slice(0,7), createdAt:new Date().toISOString() },
-    { id:uid(), source:'Refrigerant R-410A', quantity:2.5, unit:'kg', machine:'HVAC Block-A leakage', period:new Date().toISOString().slice(0,7), createdAt:new Date().toISOString() },
-    { id:uid(), source:'Waste — Landfill', quantity:1200, unit:'kg', machine:'General waste', period:new Date().toISOString().slice(0,7), createdAt:new Date().toISOString() },
-    { id:uid(), source:'Water Treatment', quantity:380, unit:'m³', machine:'ETP', period:new Date().toISOString().slice(0,7), createdAt:new Date().toISOString() }
-  );
-  state.downstream.push(
-    { id:uid(), activity:'Warehouse Storage', quantity:8500, stage:'Warehousing', region:'Pune DC', createdAt:new Date().toISOString() },
-    { id:uid(), activity:'Product Use (Electric)', quantity:120000, stage:'Product Use', region:'EU Customers', createdAt:new Date().toISOString() },
-    { id:uid(), activity:'End-of-Life Landfill', quantity:450, stage:'End-of-Life', region:'Mixed', createdAt:new Date().toISOString() },
-    { id:uid(), activity:'Recycling Credit', quantity:380, stage:'End-of-Life', region:'EU Recovery', createdAt:new Date().toISOString() }
-  );
-  audit('LOAD_SAMPLES', 'Sample data loaded');
-  saveState('downstream');
-  toast('Sample data loaded — view dashboard');
-  renderPage('dashboard');
+
+  const samples = {
+    upstream: [
+      { id:uid(), material:'ABS', weightKg:1200, supplier:'Reliance Polymers', country:'India', category:'Raw Material', recycledPct:20, batch:'PO-2024-A1' },
+      { id:uid(), material:'Steel Sheet', weightKg:850, supplier:'Tata Steel', country:'India', category:'Raw Material', recycledPct:35 },
+      { id:uid(), material:'Aluminium (Virgin)', weightKg:240, supplier:'Hindalco', country:'India', category:'Component', recycledPct:0 },
+      { id:uid(), material:'Cardboard', weightKg:380, supplier:'WestRock', country:'USA', category:'Packaging', recycledPct:85 },
+      { id:uid(), material:'Copper', weightKg:65, supplier:'Sterlite Copper', country:'India', category:'Component', recycledPct:15 }
+    ],
+    transport: [
+      { id:uid(), material:'ABS Pellets', weightKg:1200, distanceKm:850, mode:'Truck (Diesel)', fuel:'Diesel', loadEff:80, origin:'Jamnagar', dest:'Pune Plant', returnTrip:false },
+      { id:uid(), material:'Steel Sheet', weightKg:850, distanceKm:1850, mode:'Rail (Diesel)', fuel:'Diesel', loadEff:90, origin:'Jamshedpur', dest:'Pune Plant', returnTrip:false },
+      { id:uid(), material:'Aluminium', weightKg:240, distanceKm:120, mode:'Truck (Diesel)', fuel:'Diesel', loadEff:60, origin:'Mumbai', dest:'Pune Plant', returnTrip:true },
+      { id:uid(), material:'Cardboard', weightKg:380, distanceKm:14000, mode:'Sea Freight', fuel:'Heavy Fuel Oil', loadEff:85, origin:'USA Port', dest:'JNPT Mumbai', returnTrip:false }
+    ],
+    manufacturing: [
+      { id:uid(), source:'Grid Electricity (India)', quantity:48000, unit:'kWh', machine:'Plant-wide', period:new Date().toISOString().slice(0,7) },
+      { id:uid(), source:'Diesel (DG Set)', quantity:850, unit:'litre', machine:'Backup DG-1', period:new Date().toISOString().slice(0,7) },
+      { id:uid(), source:'PNG (Natural Gas)', quantity:2400, unit:'SCM', machine:'Heat Treatment Furnace', period:new Date().toISOString().slice(0,7) },
+      { id:uid(), source:'Refrigerant R-410A', quantity:2.5, unit:'kg', machine:'HVAC Block-A leakage', period:new Date().toISOString().slice(0,7) },
+      { id:uid(), source:'Waste — Landfill', quantity:1200, unit:'kg', machine:'General waste', period:new Date().toISOString().slice(0,7) },
+      { id:uid(), source:'Water Treatment', quantity:380, unit:'m³', machine:'ETP', period:new Date().toISOString().slice(0,7) }
+    ],
+    downstream: [
+      { id:uid(), activity:'Warehouse Storage', quantity:8500, stage:'Warehousing', region:'Pune DC' },
+      { id:uid(), activity:'Product Use (Electric)', quantity:120000, stage:'Product Use', region:'EU Customers' },
+      { id:uid(), activity:'End-of-Life Landfill', quantity:450, stage:'End-of-Life', region:'Mixed' },
+      { id:uid(), activity:'Recycling Credit', quantity:380, stage:'End-of-Life', region:'EU Recovery' }
+    ]
+  };
+
+  try {
+    for (const col of ROW_COLLECTIONS) {
+      let batch = fbDb.batch();
+      let ops = 0;
+      for (const row of samples[col]) {
+        stampNewRow(row);
+        state[col].push(row);
+        batch.set(rowRef(col, row.id), row);
+        ops++;
+        if (ops >= 450) { await batch.commit(); batch = fbDb.batch(); ops = 0; }
+      }
+      if (ops > 0) await batch.commit();
+    }
+    audit('LOAD_SAMPLES', 'Sample data loaded');
+    toast('Sample data loaded — view dashboard');
+    renderPage('dashboard');
+  } catch(e){
+    toast('Sample load failed: ' + e.message, 'err');
+  }
 }
 
 /* ===================================================================
@@ -5169,15 +5465,17 @@ function exportAllExcel(){
 
 function importExcel(section, input){
   const file = input.files[0]; if (!file) return;
+  if (!canWrite()){ toast('Read-only role', 'err'); input.value=''; return; }
+  if (!ROW_COLLECTIONS.includes(section)){ toast('Invalid section', 'err'); input.value=''; return; }
   const r = new FileReader();
-  r.onload = e => {
+  r.onload = async e => {
     try {
       const wb = XLSX.read(new Uint8Array(e.target.result), { type:'array' });
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(ws);
-      let imported = 0;
+      const parsed = [];
       rows.forEach(row => {
-        const entry = { id: uid(), createdAt: new Date().toISOString() };
+        const entry = { id: uid() };
         if (section === 'upstream'){
           if (!row.material || !row.weightKg) return;
           Object.assign(entry, {
@@ -5211,17 +5509,25 @@ function importExcel(section, input){
             stage: row.stage||'', region: row.region||''
           });
         }
-        state[section].push(entry);
-        imported++;
+        parsed.push(entry);
       });
-      if (imported){
-        audit('IMPORT', `${imported} ${section} rows from ${file.name}`);
-        saveState();
-        renderPage(section);
-        toast(`Imported ${imported} entries`);
-      } else {
-        toast('No valid rows found — check column headers', 'err');
+      if (!parsed.length){ toast('No valid rows found — check column headers', 'err'); input.value=''; return; }
+
+      // Stamp ownership/status and write to Firestore in batches.
+      let batch = fbDb.batch();
+      let ops = 0;
+      for (const entry of parsed){
+        stampNewRow(entry);
+        state[section].push(entry);
+        batch.set(rowRef(section, entry.id), entry);
+        ops++;
+        if (ops >= 450){ await batch.commit(); batch = fbDb.batch(); ops = 0; }
       }
+      if (ops > 0) await batch.commit();
+
+      audit('IMPORT', `${parsed.length} ${section} rows from ${file.name}`);
+      renderPage(section);
+      toast(`Imported ${parsed.length} entries`);
     } catch(err){
       toast('Import failed: '+err.message, 'err');
     }
