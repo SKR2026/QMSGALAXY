@@ -5989,8 +5989,156 @@ function exportPDF(){
 }
 
 function exportPCF(){
-  exportPDF();
-  audit('EXPORT_PCF', 'PCF report generated');
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit:'pt', format:'a4' });
+  const t   = getTotals();
+  const margin = 40;
+  const pw     = 515; // printable width
+  let y = margin;
+
+  const pcfPerUnit = t.perKg * (state.product.weightKg || 1);
+  const monthlyUnits = state.product.monthlyUnits || 0;
+
+  // ── Header band ──────────────────────────────────────────────────
+  doc.setFillColor(15,20,28);
+  doc.rect(0,0,595,80,'F');
+  doc.setTextColor(0,212,170);
+  doc.setFont('helvetica','bold');
+  doc.setFontSize(20);
+  doc.text('CARBON FOOTPRINTS', margin, 35);
+  doc.setTextColor(168,179,193);
+  doc.setFontSize(9);
+  doc.setFont('helvetica','normal');
+  doc.text('PRODUCT CARBON FOOTPRINT (PCF) REPORT  ·  ISO 14067 ALIGNED', margin, 52);
+  doc.setFontSize(8);
+  doc.text(new Date().toISOString().slice(0,19).replace('T',' ')+' UTC', margin, 66);
+  y = 110;
+
+  // ── Organisation & product block ─────────────────────────────────
+  doc.setTextColor(20,20,20);
+  doc.setFontSize(14); doc.setFont('helvetica','bold');
+  doc.text(state.org.name, margin, y); y += 18;
+  doc.setFontSize(9); doc.setFont('helvetica','normal'); doc.setTextColor(107,119,133);
+  doc.text(`Product: ${state.product.name}   |   Unit weight: ${state.product.weightKg} kg   |   Monthly output: ${monthlyUnits.toLocaleString()} units`, margin, y);
+  y += 24;
+
+  // ── PCF hero KPI box ─────────────────────────────────────────────
+  doc.setFillColor(15,20,28);
+  doc.rect(margin, y, pw, 70, 'F');
+  doc.setTextColor(0,212,170);
+  doc.setFontSize(8); doc.setFont('helvetica','normal');
+  doc.text('PCF PER UNIT', margin+16, y+18);
+  doc.text('TOTAL ANNUAL CO₂e', margin+180, y+18);
+  doc.text('EMISSIONS INTENSITY', margin+360, y+18);
+  doc.setFontSize(18); doc.setFont('helvetica','bold'); doc.setTextColor(255,255,255);
+  doc.text(`${pcfPerUnit.toFixed(3)} kg CO₂e`, margin+16, y+46);
+  doc.setFontSize(13);
+  doc.text(`${fmtCO2(t.total)} kg`, margin+180, y+46);
+  doc.text(`${t.perKg.toFixed(4)} kg/kg`, margin+360, y+46);
+  doc.setFontSize(7); doc.setTextColor(168,179,193); doc.setFont('helvetica','normal');
+  doc.text('per product unit', margin+16, y+60);
+  doc.text('all lifecycle stages', margin+180, y+60);
+  doc.text('CO₂e per kg product', margin+360, y+60);
+  y += 90;
+
+  // ── Lifecycle stage breakdown (per unit) ─────────────────────────
+  doc.setTextColor(20,20,20);
+  doc.setFontSize(11); doc.setFont('helvetica','bold');
+  doc.text('Lifecycle Stage Breakdown (ISO 14067 — Cradle-to-Gate)', margin, y); y += 8;
+
+  const stages = [
+    { label:'A1-A3  Upstream Materials',   co2e: t.upTotal },
+    { label:'A4      Transportation',       co2e: t.trTotal },
+    { label:'B1      Manufacturing',        co2e: t.mfTotal },
+    { label:'C1-C4  Downstream / End-of-life', co2e: t.dnTotal }
+  ];
+  const perUnitRows = stages.map(s => {
+    const perUnit = monthlyUnits > 0 ? s.co2e / monthlyUnits : 0;
+    const pct     = t.total > 0 ? ((s.co2e / t.total) * 100).toFixed(1) + '%' : '0%';
+    return [s.label, s.co2e.toFixed(2), perUnit.toFixed(4), pct];
+  });
+  doc.autoTable({
+    startY: y,
+    head: [['Stage', 'Total CO₂e (kg)', 'Per Unit (kg CO₂e)', '% of PCF']],
+    body: perUnitRows,
+    foot: [['TOTAL', t.total.toFixed(2), pcfPerUnit.toFixed(4), '100%']],
+    theme:'striped',
+    headStyles:{ fillColor:[15,20,28], textColor:[0,212,170] },
+    footStyles:{ fillColor:[240,245,250], textColor:[20,20,20], fontStyle:'bold' },
+    styles:{ fontSize:9 }, margin:{ left:margin, right:margin }
+  });
+  y = doc.lastAutoTable.finalY + 20;
+
+  // ── Top material contributors ─────────────────────────────────────
+  const topMats = [...state.upstream]
+    .map(r => { const c = calcUpstreamRow(r); return { name: r.material, supplier: r.supplier||'—', co2e: c.co2e }; })
+    .sort((a,b) => b.co2e - a.co2e).slice(0,10);
+
+  if (topMats.length){
+    if (y > 680){ doc.addPage(); y = margin; }
+    doc.setFontSize(11); doc.setFont('helvetica','bold'); doc.setTextColor(20,20,20);
+    doc.text('Top Material Contributors', margin, y); y += 8;
+    doc.autoTable({
+      startY: y,
+      head: [['Material', 'Supplier', 'Total CO₂e (kg)', 'Per Unit (kg CO₂e)', '% PCF']],
+      body: topMats.map(r => [
+        r.name, r.supplier,
+        r.co2e.toFixed(2),
+        monthlyUnits > 0 ? (r.co2e / monthlyUnits).toFixed(4) : '—',
+        t.total > 0 ? ((r.co2e / t.total)*100).toFixed(1)+'%' : '0%'
+      ]),
+      theme:'striped',
+      headStyles:{ fillColor:[15,20,28], textColor:[0,212,170] },
+      styles:{ fontSize:8.5 }, margin:{ left:margin, right:margin }
+    });
+    y = doc.lastAutoTable.finalY + 20;
+  }
+
+  // ── Scope breakdown ───────────────────────────────────────────────
+  if (y > 680){ doc.addPage(); y = margin; }
+  doc.setFontSize(11); doc.setFont('helvetica','bold'); doc.setTextColor(20,20,20);
+  doc.text('GHG Protocol Scope Classification', margin, y); y += 8;
+  doc.autoTable({
+    startY: y,
+    head: [['Scope', 'Description', 'CO₂e (kg)', 'Per Unit (kg CO₂e)', '%']],
+    body: [
+      ['Scope 1', 'Direct emissions (fuel, refrigerants)', t.s1.toFixed(2), monthlyUnits>0?(t.s1/monthlyUnits).toFixed(4):'—', t.total>0?((t.s1/t.total)*100).toFixed(1)+'%':'0%'],
+      ['Scope 2', 'Indirect — purchased energy',           t.s2.toFixed(2), monthlyUnits>0?(t.s2/monthlyUnits).toFixed(4):'—', t.total>0?((t.s2/t.total)*100).toFixed(1)+'%':'0%'],
+      ['Scope 3', 'Other indirect (supply chain, logistics, EOL)', t.s3.toFixed(2), monthlyUnits>0?(t.s3/monthlyUnits).toFixed(4):'—', t.total>0?((t.s3/t.total)*100).toFixed(1)+'%':'0%']
+    ],
+    theme:'striped',
+    headStyles:{ fillColor:[15,20,28], textColor:[0,212,170] },
+    styles:{ fontSize:9 }, margin:{ left:margin, right:margin }
+  });
+  y = doc.lastAutoTable.finalY + 20;
+
+  // ── Methodology & declarations ────────────────────────────────────
+  if (y > 680){ doc.addPage(); y = margin; }
+  doc.setFontSize(11); doc.setFont('helvetica','bold'); doc.setTextColor(20,20,20);
+  doc.text('Methodology & Declarations', margin, y); y += 14;
+  doc.setFont('helvetica','normal'); doc.setFontSize(8.5); doc.setTextColor(60,60,60);
+  const methodLines = [
+    `Standard:         ISO 14067:2018 — Greenhouse gases — Carbon footprint of products`,
+    `Boundary:         Cradle-to-gate (upstream, manufacturing, transport, downstream use/EOL)`,
+    `Functional unit:  1 unit of "${state.product.name}" (${state.product.weightKg} kg)`,
+    `Emission factors: IPCC AR6, national grid authorities, ecoinvent v3 (where applicable)`,
+    `Reporting period: ${new Date().getFullYear()}`,
+    `Prepared by:      ${state.user?.name || '—'}  (${state.user?.email || '—'})`,
+    `Generated:        ${new Date().toISOString().slice(0,19).replace('T',' ')} UTC`
+  ];
+  methodLines.forEach(line => { doc.text(line, margin, y); y += 14; });
+
+  // ── Footer ────────────────────────────────────────────────────────
+  const pageCount = doc.internal.getNumberOfPages();
+  for (let i=1; i<=pageCount; i++){
+    doc.setPage(i);
+    doc.setFontSize(7); doc.setTextColor(150,150,150);
+    doc.text(`CARBON FOOTPRINTS · Product Carbon Footprint Report · Page ${i}/${pageCount} · ${new Date().toISOString().slice(0,10)}`, margin, 820);
+  }
+
+  doc.save(`pcf-report-${state.product.name.replace(/\s+/g,'-').toLowerCase()}-${new Date().toISOString().slice(0,10)}.pdf`);
+  audit('EXPORT_PCF', `PCF report generated for ${state.product.name}`);
+  toast('PCF report downloaded');
 }
 function exportMonthly(){
   exportAllExcel();
