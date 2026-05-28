@@ -3024,7 +3024,6 @@ PAGES.upstream = () => {
           <div class="field"><label>RECYCLED CONTENT (%)</label><input type="number" id="up-recycled" placeholder="0" min="0" max="100" value="0"></div>
           <div class="field"><label>BATCH / PO #</label><input type="text" id="up-batch" placeholder="optional"></div>
           <div class="field"><label>PERIOD</label><input type="month" id="up-period" value="${new Date().toISOString().slice(0,7)}"></div>
-          <div class="field"><label>FACTOR OVERRIDE (kg CO₂e/kg)</label><input type="number" id="up-factor" placeholder="auto" step="0.001"></div>
         </div>
         <div class="form-foot">
           <button class="btn btn-ghost" onclick="renderPage('upstream')">RESET</button>
@@ -3098,7 +3097,6 @@ function addUpstream(){
     recycledPct: parseFloat(document.getElementById('up-recycled').value) || 0,
     batch: document.getElementById('up-batch').value.trim(),
     period: document.getElementById('up-period').value,
-    factorOverride: parseFloat(document.getElementById('up-factor').value) || null,
     createdAt: new Date().toISOString()
   };
   state.upstream.push(stampNewRow(row));
@@ -3620,7 +3618,6 @@ function editRow(section, id){
         <div class="field"><label>RECYCLED CONTENT (%)</label><input type="number" id="edit-recycled" value="${row.recycledPct||0}" min="0" max="100"></div>
         <div class="field"><label>BATCH / PO #</label><input type="text" id="edit-batch" value="${escapeHtml(row.batch||'')}"></div>
         <div class="field"><label>PERIOD</label><input type="month" id="edit-period" value="${row.period||''}"></div>
-        <div class="field"><label>FACTOR OVERRIDE</label><input type="number" id="edit-factor" value="${row.factorOverride||''}" step="0.001" placeholder="auto"></div>
       </div>`;
   } else if (section === 'transport'){
     const modeOpts = Object.entries(EMISSION_FACTORS.transport)
@@ -3712,8 +3709,6 @@ async function saveEdit(section, id){
     row.recycledPct = parseFloat(document.getElementById('edit-recycled').value)||0;
     row.batch    = document.getElementById('edit-batch').value.trim();
     row.period   = document.getElementById('edit-period').value;
-    const fo = parseFloat(document.getElementById('edit-factor').value);
-    row.factorOverride = isNaN(fo) ? null : fo;
   } else if (section === 'transport'){
     row.material   = document.getElementById('edit-material').value.trim();
     row.weightKg   = parseFloat(document.getElementById('edit-weight').value)||0;
@@ -4323,43 +4318,247 @@ PAGES.factors = () => {
     <div id="factor-tab-content"></div>
   `;
 };
+
+/* Persist custom factors to Firestore and merge into runtime lookup */
+async function saveCustomFactor(tab, key, value){
+  if (!state.factors[tab]) state.factors[tab] = {};
+  state.factors[tab][key] = value;
+  // Also patch the live EMISSION_FACTORS so calcs update immediately
+  if (tab === 'materials'){
+    EMISSION_FACTORS.materials[key] = value.factor;
+  } else {
+    if (!EMISSION_FACTORS[tab][key]) EMISSION_FACTORS[tab][key] = {};
+    EMISSION_FACTORS[tab][key].factor = value.factor;
+    if (value.unit  !== undefined) EMISSION_FACTORS[tab][key].unit  = value.unit;
+    if (value.scope !== undefined) EMISSION_FACTORS[tab][key].scope = value.scope;
+  }
+  try { await dataRef('factors').set(state.factors); } catch(e){ console.warn('factors save:', e); }
+  audit('EDIT_FACTOR', `${tab} / ${key} = ${JSON.stringify(value)}`);
+}
+
+async function deleteCustomFactor(tab, key){
+  if (!state.factors[tab] || !(key in state.factors[tab])) return;
+  delete state.factors[tab][key];
+  // Remove from runtime only if it was fully custom (not in original hardcoded set)
+  const orig = tab === 'materials' ? EMISSION_FACTORS.materials : EMISSION_FACTORS[tab];
+  if (orig && !(key in (tab==='materials'
+      ? {'ABS':1,'PP (Polypropylene)':1,'PE (Polyethylene)':1,'PVC':1,'PET':1,'Steel (Virgin)':1,'Steel (Recycled)':1,'Aluminium (Virgin)':1,'Aluminium (Recycled)':1,'Copper':1,'Brass':1,'Glass':1,'Cardboard':1,'Paper':1,'Wood':1,'Rubber':1,'Cement':1,'Cotton Fabric':1,'Polyester Fabric':1,'Nylon':1,'Silicon Wafer':1,'Lithium-ion Cell':1,'Steel Sheet':1,'Stainless Steel':1,'EPS Foam':1,'LDPE Film':1}
+      : Object.fromEntries(Object.keys(EMISSION_FACTORS[tab]||{}).map(k=>[k,1]))
+  ))){
+    if (tab === 'materials') delete EMISSION_FACTORS.materials[key];
+    else delete EMISSION_FACTORS[tab][key];
+  }
+  try { await dataRef('factors').set(state.factors); } catch(e){ console.warn('factors delete:', e); }
+  audit('DELETE_FACTOR', `${tab} / ${key}`);
+}
+
+function openFactorModal(tab, existingKey){
+  const isEdit = !!existingKey;
+  const isMat  = tab === 'materials';
+  const isGrid = tab === 'grid';
+  let cur = {};
+  if (isEdit){
+    if (isGrid){
+      cur = { factor: EMISSION_FACTORS.countryGrid[existingKey] };
+    } else if (isMat){
+      cur = { factor: EMISSION_FACTORS.materials[existingKey] };
+    } else {
+      cur = { ...EMISSION_FACTORS[tab][existingKey] };
+    }
+  }
+
+  const scopeOpts = [1,2,3].map(s=>`<option value="${s}" ${cur.scope==s?'selected':''}>${s}</option>`).join('');
+
+  /* Unit options per tab */
+  const unitPresets = tab==='manufacturing'
+    ? ['kWh','litre','kg','SCM','m³'] : tab==='downstream'
+    ? ['kWh','litre','kg','kg/day','unit'] : ['kg','km','m³','litre','kWh'];
+
+  const unitOpts = unitPresets.map(u=>`<option ${cur.unit===u?'selected':''}>${u}</option>`).join('');
+
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  modal.id = 'factor-modal';
+  modal.innerHTML = `
+    <div class="modal">
+      <div class="modal-head">
+        <div style="font-family:var(--display);font-weight:700;font-size:16px">${isEdit?'Edit':'Add'} Emission Factor — ${tab.charAt(0).toUpperCase()+tab.slice(1)}</div>
+        <button class="btn btn-ghost" onclick="document.getElementById('factor-modal').remove()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid">
+          <div class="field" style="grid-column:1/-1"><label>NAME / KEY</label>
+            <input type="text" id="fm-key" value="${escapeHtml(existingKey||'')}" placeholder="e.g. Recycled PET" ${isEdit?'readonly':''}></div>
+          <div class="field"><label>FACTOR (kg CO₂e / unit)</label>
+            <input type="number" id="fm-factor" value="${cur.factor??''}" step="0.0001" min="0" placeholder="e.g. 2.7"></div>
+          ${!isMat && !isGrid ? `
+          <div class="field"><label>UNIT</label>
+            <select id="fm-unit"><option value="">-- select --</option>${unitOpts}</select></div>
+          <div class="field"><label>SCOPE</label>
+            <select id="fm-scope">${scopeOpts}</select></div>` : ''}
+        </div>
+        ${isEdit && !isGrid ? `<div style="margin-top:10px">
+          <button class="btn btn-danger" style="font-size:11px" onclick="confirmDeleteFactor('${tab}','${escapeHtml(existingKey)}')">🗑 DELETE THIS FACTOR</button>
+        </div>` : ''}
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" onclick="document.getElementById('factor-modal').remove()">CANCEL</button>
+        <button class="btn btn-primary" onclick="submitFactorModal('${tab}','${escapeHtml(existingKey||'')}',${isEdit})">
+          ${isEdit?'SAVE CHANGES':'ADD FACTOR'}
+        </button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+async function submitFactorModal(tab, existingKey, isEdit){
+  const isMat  = tab === 'materials';
+  const isGrid = tab === 'grid';
+  const key    = isEdit ? existingKey : (document.getElementById('fm-key').value.trim());
+  const factor = parseFloat(document.getElementById('fm-factor').value);
+  if (!key){ toast('Name is required', 'err'); return; }
+  if (isNaN(factor)){ toast('Factor value is required', 'err'); return; }
+
+  if (isGrid){
+    EMISSION_FACTORS.countryGrid[key] = factor;
+    if (!state.factors.grid) state.factors.grid = {};
+    state.factors.grid[key] = factor;
+    try { await dataRef('factors').set(state.factors); } catch(e){ console.warn(e); }
+    audit('EDIT_FACTOR', `grid / ${key} = ${factor}`);
+  } else if (isMat){
+    await saveCustomFactor('materials', key, { factor });
+  } else {
+    const unit  = document.getElementById('fm-unit').value;
+    const scope = parseInt(document.getElementById('fm-scope').value) || 3;
+    if (!unit){ toast('Unit is required', 'err'); return; }
+    await saveCustomFactor(tab, key, { factor, unit, scope });
+  }
+  document.getElementById('factor-modal').remove();
+  toast(`Factor ${isEdit?'updated':'added'}: ${key}`);
+  renderPage('factors');
+  // Restore active tab after page re-render
+  setTimeout(()=>{
+    document.querySelectorAll('.tab').forEach(t=>{
+      if(t.dataset.tab===tab){ t.click(); }
+    });
+  }, 80);
+}
+
+async function confirmDeleteFactor(tab, key){
+  if (!confirm(`Delete custom factor "${key}"? Built-in factors will revert to their default values.`)) return;
+  await deleteCustomFactor(tab, key);
+  document.getElementById('factor-modal')?.remove();
+  toast(`Factor deleted: ${key}`);
+  renderPage('factors');
+  setTimeout(()=>{
+    document.querySelectorAll('.tab').forEach(t=>{
+      if(t.dataset.tab===tab){ t.click(); }
+    });
+  }, 80);
+}
+
 POST_RENDER.factors = () => {
+  // Load persisted custom factors from Firestore on first open
+  if (fbDb) {
+    dataRef('factors').get().then(snap => {
+      if (snap.exists){
+        const saved = snap.data();
+        // Merge into state.factors and patch EMISSION_FACTORS
+        Object.entries(saved).forEach(([tab, entries])=>{
+          if (!state.factors[tab]) state.factors[tab] = {};
+          Object.entries(entries||{}).forEach(([k,v])=>{
+            state.factors[tab][k] = v;
+            if (tab === 'materials'){
+              EMISSION_FACTORS.materials[k] = typeof v==='object' ? v.factor : v;
+            } else if (tab === 'grid'){
+              EMISSION_FACTORS.countryGrid[k] = typeof v==='object' ? v.factor : v;
+            } else if (EMISSION_FACTORS[tab]){
+              if (!EMISSION_FACTORS[tab][k]) EMISSION_FACTORS[tab][k] = {};
+              if (typeof v==='object'){
+                EMISSION_FACTORS[tab][k].factor = v.factor;
+                if (v.unit)  EMISSION_FACTORS[tab][k].unit  = v.unit;
+                if (v.scope) EMISSION_FACTORS[tab][k].scope = v.scope;
+              }
+            }
+          });
+        });
+      }
+      renderFactorTabFn('materials');
+    }).catch(()=>{});
+  }
+
   const cc = chartColors();
-  const renderFactorTab = (tab) => {
+  const admin = canAdmin();
+
+  const renderFactorTabFn = (tab) => {
     let html = '';
     if (tab === 'grid'){
-      html = `<div class="card"><div class="card-head"><div class="card-title">National Grid Emission Factors</div></div>
+      html = `<div class="card">
+        <div class="card-head">
+          <div class="card-title">National Grid Emission Factors</div>
+          ${admin?`<button class="btn btn-primary" style="font-size:11px" onclick="openFactorModal('grid','')">+ ADD COUNTRY</button>`:''}
+        </div>
         <div class="card-body tight"><table class="data">
-          <thead><tr><th>Country</th><th class="num">kg CO₂e / kWh</th><th>Rating</th></tr></thead>
+          <thead><tr><th>Country</th><th class="num">kg CO₂e / kWh</th><th>Rating</th>${admin?'<th></th>':''}</tr></thead>
           <tbody>${Object.entries(EMISSION_FACTORS.countryGrid).sort((a,b)=>a[1]-b[1]).map(([c,f])=>{
+            const isCustom = state.factors?.grid?.[c] !== undefined;
             const rating = f<0.1?'Very Clean':f<0.25?'Clean':f<0.5?'Moderate':'High Carbon';
-            const color = f<0.1?cc.a:f<0.25?cc.a3:f<0.5?cc.a2:cc.dng;
-            return `<tr><td>${c}</td><td class="num">${f.toFixed(3)}</td><td><span class="tag" style="background:${color}22;color:${color}">${rating}</span></td></tr>`;
+            const color  = f<0.1?cc.a:f<0.25?cc.a3:f<0.5?cc.a2:cc.dng;
+            return `<tr>
+              <td>${c}${isCustom?` <span class="tag" style="font-size:9px;background:var(--accent-tint);color:var(--accent)">CUSTOM</span>`:''}
+              </td>
+              <td class="num">${f.toFixed(3)}</td>
+              <td><span class="tag" style="background:${color}22;color:${color}">${rating}</span></td>
+              ${admin?`<td><button class="btn btn-ghost" style="font-size:10px;padding:2px 8px" onclick="openFactorModal('grid','${escapeHtml(c)}')">EDIT</button></td>`:''}
+            </tr>`;
           }).join('')}</tbody></table></div></div>`;
     } else {
-      const data = tab === 'transport' ? EMISSION_FACTORS.transport :
-                   tab === 'manufacturing' ? EMISSION_FACTORS.manufacturing :
-                   tab === 'downstream' ? EMISSION_FACTORS.downstream :
-                   EMISSION_FACTORS.materials;
-      html = `<div class="card"><div class="card-head"><div class="card-title">${tab.charAt(0).toUpperCase()+tab.slice(1)} Factors</div></div>
+      const baseData = tab === 'transport' ? EMISSION_FACTORS.transport :
+                       tab === 'manufacturing' ? EMISSION_FACTORS.manufacturing :
+                       tab === 'downstream' ? EMISSION_FACTORS.downstream :
+                       EMISSION_FACTORS.materials;
+      const isMat = tab === 'materials';
+      html = `<div class="card">
+        <div class="card-head">
+          <div class="card-title">${tab.charAt(0).toUpperCase()+tab.slice(1)} Emission Factors</div>
+          ${admin?`<button class="btn btn-primary" style="font-size:11px" onclick="openFactorModal('${tab}','')">+ ADD FACTOR</button>`:''}
+        </div>
         <div class="card-body tight"><table class="data">
-          <thead><tr><th>Item</th><th class="num">Factor</th><th>Unit</th>${tab!=='materials'?'<th>Scope</th>':''}</tr></thead>
-          <tbody>${Object.entries(data).map(([k,v])=>{
-            const factor = typeof v === 'object' ? v.factor : v;
-            const unit = tab==='materials' ? 'kg CO₂e/kg' :
-                         tab==='transport' ? 'kg CO₂e/ton·km' :
-                         `kg CO₂e/${v.unit}`;
-            return `<tr><td>${k}</td><td class="num">${factor}</td><td style="font-family:var(--mono);font-size:11px;color:var(--ink-2)">${unit}</td>${tab!=='materials'?`<td><span class="tag s${v.scope}">S${v.scope}</span></td>`:''}</tr>`;
+          <thead><tr>
+            <th>Item</th><th class="num">Factor</th><th>Unit</th>
+            ${!isMat?'<th>Scope</th>':''}
+            <th>Source</th>
+            ${admin?'<th></th>':''}
+          </tr></thead>
+          <tbody>${Object.entries(baseData).map(([k,v])=>{
+            const factor    = typeof v==='object' ? v.factor : v;
+            const unit      = isMat ? 'kg CO₂e/kg' : tab==='transport' ? 'kg CO₂e/ton·km' : `kg CO₂e/${v.unit}`;
+            const isCustom  = state.factors?.[tab]?.[k] !== undefined;
+            return `<tr>
+              <td>${escapeHtml(k)}</td>
+              <td class="num">${factor}</td>
+              <td style="font-family:var(--mono);font-size:11px;color:var(--ink-2)">${unit}</td>
+              ${!isMat?`<td><span class="tag s${v.scope}">S${v.scope}</span></td>`:''}
+              <td>${isCustom
+                ? `<span class="tag" style="background:var(--accent-tint);color:var(--accent);font-size:9px">CUSTOM</span>`
+                : `<span class="tag" style="background:var(--bg-3);color:var(--ink-3);font-size:9px">DEFAULT</span>`}
+              </td>
+              ${admin?`<td><button class="btn btn-ghost" style="font-size:10px;padding:2px 8px" onclick="openFactorModal('${tab}','${escapeHtml(k)}')">EDIT</button></td>`:''}
+            </tr>`;
           }).join('')}</tbody></table></div></div>`;
     }
     document.getElementById('factor-tab-content').innerHTML = html;
   };
-  renderFactorTab('materials');
+
+  // expose for use by submitFactorModal re-render
+  window._renderFactorTab = renderFactorTabFn;
+  renderFactorTabFn('materials');
+
   document.querySelectorAll('.tab').forEach(t => {
     t.onclick = () => {
       document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
       t.classList.add('active');
-      renderFactorTab(t.dataset.tab);
+      renderFactorTabFn(t.dataset.tab);
     };
   });
 };
