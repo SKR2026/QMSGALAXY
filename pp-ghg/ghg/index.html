@@ -1348,7 +1348,7 @@ function usersCol()  { return fbDb.collection('orgs').doc('main').collection('us
 function auditCol()  { return orgRef().collection('audit'); }
 function plantsCol() { return fbDb.collection('plants'); }
 
-const ROW_COLLECTIONS = ['upstream','transport','manufacturing','downstream'];
+const ROW_COLLECTIONS = ['upstream','transport','manufacturing','downstream','commuting'];
 
 /* ---------- Ownership / status helpers ---------- */
 function isDeveloper(){
@@ -1569,6 +1569,7 @@ const DEFAULT_STATE = {
   transport: [],
   manufacturing: [],
   downstream: [],
+  commuting: [],
   factors: {},
   audit: [],
   product: { name: 'Standard Unit', weightKg: 1, monthlyUnits: 1000 },
@@ -1661,11 +1662,12 @@ function rowQuery(col){
 async function loadState(){
   if (!fbDb) return;
   try {
-    const [up, tr, mf, dn, org, prod] = await Promise.all([
+    const [up, tr, mf, dn, cm, org, prod] = await Promise.all([
       rowQuery('upstream').get(),
       rowQuery('transport').get(),
       rowQuery('manufacturing').get(),
       rowQuery('downstream').get(),
+      rowQuery('commuting').get(),
       dataRef('org').get(),
       dataRef('product').get(),
     ]);
@@ -1673,6 +1675,7 @@ async function loadState(){
     state.transport     = tr.docs.map(d => d.data());
     state.manufacturing = mf.docs.map(d => d.data());
     state.downstream    = dn.docs.map(d => d.data());
+    state.commuting     = cm.docs.map(d => d.data());
     if (org.exists)  state.org     = { ...DEFAULT_STATE.org, ...org.data() };
     if (prod.exists) state.product = { ...DEFAULT_STATE.product, ...prod.data() };
   } catch(e){ console.error('loadState error:', e); }
@@ -1806,6 +1809,21 @@ const EMISSION_FACTORS = {
     'End-of-Life Landfill': { factor: 0.467, unit: 'kg', scope: 3 },
     'End-of-Life Incineration': { factor: 0.213, unit: 'kg', scope: 3 },
     'Recycling Credit': { factor: -0.45, unit: 'kg', scope: 3 }
+  },
+
+  // Employee commuting — kg CO₂e per passenger-km (GHG Protocol Scope 3 Cat.7)
+  commuting: {
+    'Car (Petrol)'         : { factor: 0.1700, unit: 'km/person' },
+    'Car (Diesel)'         : { factor: 0.1630, unit: 'km/person' },
+    'Car (CNG)'            : { factor: 0.1100, unit: 'km/person' },
+    'Car (Electric)'       : { factor: 0.0530, unit: 'km/person' },
+    'Motorcycle / Scooter' : { factor: 0.1030, unit: 'km/person' },
+    'Auto-Rickshaw (CNG)'  : { factor: 0.0900, unit: 'km/person' },
+    'Company Bus (Diesel)' : { factor: 0.0270, unit: 'km/person' },
+    'Public Bus'           : { factor: 0.0220, unit: 'km/person' },
+    'Metro / Rail'         : { factor: 0.0100, unit: 'km/person' },
+    'Cycle / Walk'         : { factor: 0.0000, unit: 'km/person' },
+    'Work From Home'       : { factor: 0.0035, unit: 'day/person' }
   }
 };
 
@@ -1894,30 +1912,42 @@ function calcDownstreamRow(r){
   return { ...r, factor, co2e, scope: 3 };
 }
 
+function calcCommutingRow(r){
+  // quantity = total passenger-km (employees × distance) or days for WFH
+  const meta   = EMISSION_FACTORS.commuting[r.mode] || {};
+  const factor = meta.factor ?? 0;
+  const qty    = (r.employees || 1) * (r.distanceKm || 0) * (r.workingDays || 1);
+  const co2e   = qty * factor;
+  return { ...r, factor, qty, co2e, scope: 3 };
+}
+
 function getTotals(){
   const up = state.upstream.map(calcUpstreamRow);
   const tr = state.transport.map(calcTransportRow);
   const mf = state.manufacturing.map(calcMfgRow);
   const dn = state.downstream.map(calcDownstreamRow);
+  const cm = (state.commuting||[]).map(calcCommutingRow);
 
   const upTotal = up.reduce((s,r)=>s+r.co2e,0);
   const trTotal = tr.reduce((s,r)=>s+r.co2e,0);
   const mfTotal = mf.reduce((s,r)=>s+r.co2e,0);
   const dnTotal = dn.reduce((s,r)=>s+r.co2e,0);
+  const cmTotal = cm.reduce((s,r)=>s+r.co2e,0);
 
   let s1=0,s2=0,s3=0;
   up.forEach(r => s3+=r.co2e);
   tr.forEach(r => s3+=r.co2e);
+  cm.forEach(r => s3+=r.co2e);
   mf.forEach(r => { if(r.scope===1) s1+=r.co2e; else if(r.scope===2) s2+=r.co2e; else s3+=r.co2e; });
   dn.forEach(r => s3+=r.co2e);
 
-  const total = upTotal + trTotal + mfTotal + dnTotal;
+  const total = upTotal + trTotal + mfTotal + dnTotal + cmTotal;
   const productWeight = state.product.weightKg || 1;
-  const monthlyUnits = state.product.monthlyUnits || 1;
+  const monthlyUnits  = state.product.monthlyUnits || 1;
   const totalProductKg = productWeight * monthlyUnits;
   const perKg = totalProductKg > 0 ? total / totalProductKg : 0;
 
-  return { up, tr, mf, dn, upTotal, trTotal, mfTotal, dnTotal, total, s1, s2, s3, perKg, totalProductKg };
+  return { up, tr, mf, dn, cm, upTotal, trTotal, mfTotal, dnTotal, cmTotal, total, s1, s2, s3, perKg, totalProductKg };
 }
 
 /* ===================================================================
@@ -3292,112 +3322,218 @@ PAGES.transport = () => {
   const modeOpts = Object.entries(EMISSION_FACTORS.transport)
     .map(([m,v])=>`<option value="${m}">${m} — ${v.factor} kg/ton·km</option>`).join('');
   const rows = state.transport.map(calcTransportRow);
-  const total = rows.reduce((s,r)=>s+r.co2e,0);
+  const trTotal = rows.reduce((s,r)=>s+r.co2e,0);
 
-  // Mode comparison data
+  const cmRows  = (state.commuting||[]).map(calcCommutingRow);
+  const cmTotal = cmRows.reduce((s,r)=>s+r.co2e,0);
+
+  const commuteOpts = Object.entries(EMISSION_FACTORS.commuting)
+    .map(([m,v])=>`<option value="${m}">${m} — ${v.factor} kg CO₂e/${v.unit}</option>`).join('');
+
   const byMode = {};
   rows.forEach(r => { byMode[r.mode] = (byMode[r.mode]||0) + r.co2e; });
+
+  const byCommuteMode = {};
+  cmRows.forEach(r => { byCommuteMode[r.mode] = (byCommuteMode[r.mode]||0) + r.co2e; });
 
   return `
     <div class="page-header">
       <div>
-        <div class="page-title">Transportation & Distribution</div>
-        <div class="page-sub">UPSTREAM INBOUND · MULTI-MODAL FREIGHT</div>
+        <div class="page-title">Transportation</div>
+        <div class="page-sub">MATERIAL FREIGHT · EMPLOYEE COMMUTING · SCOPE 3</div>
       </div>
       <div class="page-actions">
-        <input type="file" id="tr-file" accept=".xlsx,.xls,.csv" style="display:none" onchange="importExcel('transport',this)">
-        <button class="btn" onclick="document.getElementById('tr-file').click()">⬆ IMPORT</button>
-        <button class="btn" onclick="exportSection('transport')">⬇ EXPORT</button>
+        <button class="btn" onclick="exportSection('transport')">⬇ EXPORT FREIGHT</button>
+        <button class="btn" onclick="exportCommuting()">⬇ EXPORT COMMUTING</button>
       </div>
     </div>
 
     <div class="kpi-grid">
-      <div class="kpi"><div class="kpi-label">Transport Total</div><div class="kpi-value">${fmtCO2(total)}<span class="kpi-unit">kg CO₂e</span></div></div>
-      <div class="kpi s2"><div class="kpi-label">Shipments</div><div class="kpi-value">${rows.length}</div></div>
-      <div class="kpi warn"><div class="kpi-label">Total Distance</div><div class="kpi-value">${fmt(rows.reduce((s,r)=>s+(r.distanceKm||0),0),0)}<span class="kpi-unit">km</span></div></div>
-      <div class="kpi s3"><div class="kpi-label">Total Tonnage</div><div class="kpi-value">${fmt(rows.reduce((s,r)=>s+(r.weightKg||0)/1000,0),1)}<span class="kpi-unit">tons</span></div></div>
+      <div class="kpi"><div class="kpi-label">Freight Total</div><div class="kpi-value">${fmtCO2(trTotal)}<span class="kpi-unit">kg CO₂e</span></div></div>
+      <div class="kpi s3"><div class="kpi-label">Commuting Total</div><div class="kpi-value">${fmtCO2(cmTotal)}<span class="kpi-unit">kg CO₂e</span></div></div>
+      <div class="kpi warn"><div class="kpi-label">Shipments</div><div class="kpi-value">${rows.length}</div></div>
+      <div class="kpi"><div class="kpi-label">Commute Entries</div><div class="kpi-value">${cmRows.length}</div></div>
     </div>
 
-    ${canWriteSection('transport')?`
-    <div class="card">
-      <div class="card-head"><div class="card-title">Add Shipment</div></div>
-      <div class="card-body">
-        <div class="form-grid">
-          <div class="field"><label>MATERIAL / SHIPMENT</label><input type="text" id="tr-material" placeholder="e.g. ABS Pellets"></div>
-          <div class="field"><label>WEIGHT (KG)</label><input type="number" id="tr-weight" placeholder="e.g. 1000" min="0" step="0.01"></div>
-          <div class="field"><label>DISTANCE (KM)</label><input type="number" id="tr-distance" placeholder="e.g. 450" min="0"></div>
-          <div class="field"><label>TRANSPORT MODE</label><select id="tr-mode">${modeOpts}</select></div>
-          <div class="field"><label>FUEL TYPE</label>
-            <select id="tr-fuel">
-              <option>Diesel</option><option>Petrol</option><option>CNG</option>
-              <option>Electric</option><option>Heavy Fuel Oil</option><option>Jet Fuel</option>
-            </select></div>
-          <div class="field"><label>LOAD EFFICIENCY (%)</label><input type="number" id="tr-load" placeholder="100" min="10" max="100" value="80"></div>
-          <div class="field"><label>ORIGIN</label><input type="text" id="tr-origin" placeholder="e.g. Mumbai Port"></div>
-          <div class="field"><label>DESTINATION</label><input type="text" id="tr-dest" placeholder="e.g. Pune Plant"></div>
-          <div class="field"><label>PERIOD</label><input type="month" id="tr-period" value="${new Date().toISOString().slice(0,7)}"></div>
-          <div class="field"><label class="check-row"><input type="checkbox" id="tr-return"> RETURN TRIP (×2)</label></div>
-        </div>
-        <div class="form-foot">
-          <button class="btn btn-primary" onclick="addTransport()">+ ADD SHIPMENT</button>
-        </div>
-      </div>
-    </div>`:`
-    <div class="card" style="border:1px solid var(--line-2)">
-      <div class="card-body" style="display:flex;align-items:center;gap:12px;padding:18px 20px">
-        <span style="font-size:22px">🔒</span>
-        <div>
-          <div style="font-weight:600;color:var(--ink-1)">Transport — Not Assigned</div>
-          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Your account has not been assigned data-entry access for the Transport section. Contact your administrator.</div>
-        </div>
-      </div>
-    </div>`}
+    <div class="tabs" style="margin-bottom:0">
+      <div class="tab active" data-tab="freight">🚚 Material Freight</div>
+      <div class="tab" data-tab="commuting">🚗 Employee Commuting</div>
+    </div>
+
+    <!-- ═══════ FREIGHT TAB ═══════ -->
+    <div id="tab-freight">
+      ${canWriteSection('transport')?`
       <div class="card">
-        <div class="card-head"><div class="card-title">Mode Comparison</div></div>
-        <div class="card-body"><div class="chart-wrap"><canvas id="chart-modes"></canvas></div></div>
+        <div class="card-head"><div class="card-title">Add Shipment</div></div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="field"><label>MATERIAL / SHIPMENT</label><input type="text" id="tr-material" placeholder="e.g. ABS Pellets"></div>
+            <div class="field"><label>WEIGHT (KG)</label><input type="number" id="tr-weight" placeholder="e.g. 1000" min="0" step="0.01"></div>
+            <div class="field"><label>DISTANCE (KM)</label><input type="number" id="tr-distance" placeholder="e.g. 450" min="0"></div>
+            <div class="field"><label>TRANSPORT MODE</label><select id="tr-mode">${modeOpts}</select></div>
+            <div class="field"><label>FUEL TYPE</label>
+              <select id="tr-fuel">
+                <option>Diesel</option><option>Petrol</option><option>CNG</option>
+                <option>Electric</option><option>Heavy Fuel Oil</option><option>Jet Fuel</option>
+              </select></div>
+            <div class="field"><label>LOAD EFFICIENCY (%)</label><input type="number" id="tr-load" placeholder="100" min="10" max="100" value="80"></div>
+            <div class="field"><label>ORIGIN</label><input type="text" id="tr-origin" placeholder="e.g. Mumbai Port"></div>
+            <div class="field"><label>DESTINATION</label><input type="text" id="tr-dest" placeholder="e.g. Pune Plant"></div>
+            <div class="field"><label>PERIOD</label><input type="month" id="tr-period" value="${new Date().toISOString().slice(0,7)}"></div>
+            <div class="field"><label class="check-row"><input type="checkbox" id="tr-return"> RETURN TRIP (×2)</label></div>
+          </div>
+          <div class="form-foot">
+            <button class="btn btn-primary" onclick="addTransport()">+ ADD SHIPMENT</button>
+          </div>
+        </div>
+      </div>`:`
+      <div class="card" style="border:1px solid var(--line-2)">
+        <div class="card-body" style="display:flex;align-items:center;gap:12px;padding:18px 20px">
+          <span style="font-size:22px">🔒</span>
+          <div><div style="font-weight:600;color:var(--ink-1)">Transport — Not Assigned</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Contact your administrator for access.</div></div>
+        </div>
+      </div>`}
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div class="card">
+          <div class="card-head"><div class="card-title">Mode Comparison</div></div>
+          <div class="card-body"><div class="chart-wrap"><canvas id="chart-modes"></canvas></div></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><div class="card-title">Distance vs Emissions</div></div>
+          <div class="card-body"><div class="chart-wrap"><canvas id="chart-dist"></canvas></div></div>
+        </div>
       </div>
+
       <div class="card">
-        <div class="card-head"><div class="card-title">Distance vs Emissions</div></div>
-        <div class="card-body"><div class="chart-wrap"><canvas id="chart-dist"></canvas></div></div>
+        <div class="card-head">
+          <div class="card-title">Shipment Log</div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2)">${rows.length} ENTRIES</div>
+        </div>
+        <div class="card-body tight">
+          <table class="data">
+            <thead><tr>
+              <th>Material</th><th>Route</th><th>Mode</th><th>Period</th>
+              <th class="num">Weight</th><th class="num">Distance</th>
+              <th class="num">Load%</th><th class="num">EF</th>
+              <th class="num">CO₂e</th><th>Status</th><th></th>
+            </tr></thead>
+            <tbody>
+              ${rows.length ? rows.map(r=>`
+                <tr>
+                  <td>${escapeHtml(r.material||'—')}</td>
+                  <td style="font-size:11px;color:var(--ink-1)">${escapeHtml(r.origin||'?')} → ${escapeHtml(r.dest||'?')}${r.returnTrip?' ↺':''}</td>
+                  <td>${escapeHtml(r.mode)}</td>
+                  <td style="font-family:var(--mono);font-size:11px;color:var(--ink-2)">${escapeHtml(r.period||'—')}</td>
+                  <td class="num">${fmt(r.weightKg)} kg</td>
+                  <td class="num">${fmt(r.distanceKm,0)} km</td>
+                  <td class="num">${r.loadEff||100}%</td>
+                  <td class="num">${r.factor.toFixed(3)}</td>
+                  <td class="num" style="color:var(--accent)">${fmtCO2(r.co2e)}</td>
+                  <td>${rowMetaHtml(r)}</td>
+                  <td>${rowActionsHtml('transport', r)}</td>
+                </tr>`).join('') :
+                `<tr><td colspan="11" class="empty">No shipments logged</td></tr>`}
+            </tbody>
+            ${rows.length?`<tfoot><tr style="border-top:2px solid var(--line)">
+              <td colspan="8" style="font-family:var(--mono);font-size:10px;letter-spacing:0.15em;color:var(--ink-2)">TOTAL</td>
+              <td class="num" style="font-weight:700;color:var(--accent)">${fmtCO2(trTotal)}</td>
+              <td></td><td></td>
+            </tr></tfoot>`:''}
+          </table>
+        </div>
       </div>
     </div>
 
-    <div class="card">
-      <div class="card-head">
-        <div class="card-title">Shipment Log</div>
-        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2)">${rows.length} ENTRIES</div>
+    <!-- ═══════ COMMUTING TAB ═══════ -->
+    <div id="tab-commuting" style="display:none">
+      ${canWriteSection('transport')?`
+      <div class="card">
+        <div class="card-head"><div class="card-title">Log Employee Commuting</div></div>
+        <div class="card-body">
+          <div style="font-size:12px;color:var(--ink-2);margin-bottom:12px">
+            GHG Protocol Scope 3 Category 7 — Employee Commuting. Enter per vehicle mode per period.
+          </div>
+          <div class="form-grid">
+            <div class="field"><label>COMMUTE MODE</label>
+              <select id="cm-mode" onchange="updateCommuteUnit()">${commuteOpts}</select></div>
+            <div class="field"><label>NO. OF EMPLOYEES</label>
+              <input type="number" id="cm-employees" placeholder="e.g. 45" min="1" value="1"></div>
+            <div class="field"><label>ONE-WAY DISTANCE (KM)</label>
+              <input type="number" id="cm-distance" placeholder="e.g. 12" min="0" step="0.1"></div>
+            <div class="field"><label>WORKING DAYS / MONTH</label>
+              <input type="number" id="cm-days" placeholder="e.g. 22" min="1" max="31" value="22"></div>
+            <div class="field"><label>DEPARTMENT / GROUP</label>
+              <input type="text" id="cm-dept" placeholder="e.g. Production, Office"></div>
+            <div class="field"><label>PERIOD</label>
+              <input type="month" id="cm-period" value="${new Date().toISOString().slice(0,7)}"></div>
+            <div class="field"><label>UNIT</label>
+              <input type="text" id="cm-unit" readonly></div>
+            <div class="field"><label>NOTES</label>
+              <input type="text" id="cm-notes" placeholder="optional"></div>
+          </div>
+          <div class="form-foot">
+            <button class="btn btn-ghost" onclick="renderPage('transport');setTimeout(()=>document.querySelector('.tab[data-tab=commuting]').click(),50)">RESET</button>
+            <button class="btn btn-primary" onclick="addCommuting()">+ ADD COMMUTING ENTRY</button>
+          </div>
+        </div>
+      </div>`:`
+      <div class="card" style="border:1px solid var(--line-2)">
+        <div class="card-body" style="display:flex;align-items:center;gap:12px;padding:18px 20px">
+          <span style="font-size:22px">🔒</span>
+          <div><div style="font-weight:600;color:var(--ink-1)">Transport — Not Assigned</div>
+          <div style="font-size:12px;color:var(--ink-2);margin-top:2px">Contact your administrator for access.</div></div>
+        </div>
+      </div>`}
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div class="card">
+          <div class="card-head"><div class="card-title">Commute Mode Split</div></div>
+          <div class="card-body"><div class="chart-wrap"><canvas id="chart-commute-modes"></canvas></div></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><div class="card-title">CO₂e by Department</div></div>
+          <div class="card-body"><div class="chart-wrap"><canvas id="chart-commute-dept"></canvas></div></div>
+        </div>
       </div>
-      <div class="card-body tight">
-        <table class="data">
-          <thead><tr>
-            <th>Material</th><th>Route</th><th>Mode</th><th>Period</th>
-            <th class="num">Weight</th><th class="num">Distance</th>
-            <th class="num">Load%</th><th class="num">EF</th>
-            <th class="num">CO₂e</th><th>Status</th><th></th>
-          </tr></thead>
-          <tbody>
-            ${rows.length ? rows.map(r=>`
-              <tr>
-                <td>${escapeHtml(r.material||'—')}</td>
-                <td style="font-size:11px;color:var(--ink-1)">${escapeHtml(r.origin||'?')} → ${escapeHtml(r.dest||'?')}${r.returnTrip?' ↺':''}</td>
-                <td>${escapeHtml(r.mode)}</td>
-                <td style="font-family:var(--mono);font-size:11px;color:var(--ink-2)">${escapeHtml(r.period||'—')}</td>
-                <td class="num">${fmt(r.weightKg)} kg</td>
-                <td class="num">${fmt(r.distanceKm,0)} km</td>
-                <td class="num">${r.loadEff||100}%</td>
-                <td class="num">${r.factor.toFixed(3)}</td>
-                <td class="num" style="color:var(--accent)">${fmtCO2(r.co2e)}</td>
-                <td>${rowMetaHtml(r)}</td>
-                <td>${rowActionsHtml('transport', r)}</td>
-              </tr>`).join('') :
-              `<tr><td colspan="11" class="empty">No shipments logged</td></tr>`}
-          </tbody>
-          ${rows.length?`<tfoot><tr style="border-top:2px solid var(--line)">
-            <td colspan="8" style="font-family:var(--mono);font-size:10px;letter-spacing:0.15em;color:var(--ink-2)">TOTAL</td>
-            <td class="num" style="font-weight:700;color:var(--accent)">${fmtCO2(total)}</td>
-            <td></td><td></td>
-          </tr></tfoot>`:''}
-        </table>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">Commuting Log</div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2)">${cmRows.length} ENTRIES · SCOPE 3 CAT.7</div>
+        </div>
+        <div class="card-body tight">
+          <table class="data">
+            <thead><tr>
+              <th>Mode</th><th>Department</th><th>Period</th>
+              <th class="num">Employees</th><th class="num">Distance (km)</th>
+              <th class="num">Days/mo</th><th class="num">EF</th>
+              <th class="num">CO₂e (kg)</th><th>Status</th><th></th>
+            </tr></thead>
+            <tbody>
+              ${cmRows.length ? cmRows.map(r=>`
+                <tr>
+                  <td>${escapeHtml(r.mode)}</td>
+                  <td>${escapeHtml(r.dept||'—')}</td>
+                  <td style="font-family:var(--mono);font-size:11px;color:var(--ink-2)">${escapeHtml(r.period||'—')}</td>
+                  <td class="num">${r.employees||1}</td>
+                  <td class="num">${fmt(r.distanceKm,1)} km</td>
+                  <td class="num">${r.workingDays||22}</td>
+                  <td class="num">${r.factor.toFixed(4)}</td>
+                  <td class="num" style="color:var(--accent)">${fmtCO2(r.co2e)}</td>
+                  <td>${rowMetaHtml(r)}</td>
+                  <td>${rowActionsHtml('commuting', r)}</td>
+                </tr>`).join('') :
+                `<tr><td colspan="10" class="empty">No commuting entries — log employee travel above</td></tr>`}
+            </tbody>
+            ${cmRows.length?`<tfoot><tr style="border-top:2px solid var(--line)">
+              <td colspan="7" style="font-family:var(--mono);font-size:10px;letter-spacing:0.15em;color:var(--ink-2)">TOTAL</td>
+              <td class="num" style="font-weight:700;color:var(--accent)">${fmtCO2(cmTotal)}</td>
+              <td></td><td></td>
+            </tr></tfoot>`:''}
+          </table>
+        </div>
       </div>
     </div>
   `;
@@ -3405,35 +3541,127 @@ PAGES.transport = () => {
 
 POST_RENDER.transport = () => {
   const cc = chartColors();
+
+  // Tab switching
+  document.querySelectorAll('.tab[data-tab]').forEach(t => {
+    t.onclick = () => {
+      document.querySelectorAll('.tab[data-tab]').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+      document.getElementById('tab-freight').style.display   = t.dataset.tab === 'freight'   ? '' : 'none';
+      document.getElementById('tab-commuting').style.display = t.dataset.tab === 'commuting' ? '' : 'none';
+      if (t.dataset.tab === 'commuting') renderCommuteCharts();
+      if (t.dataset.tab === 'freight')   renderFreightCharts();
+    };
+  });
+  renderFreightCharts();
+  // Pre-fill commute unit on load
+  updateCommuteUnit();
+};
+
+function renderFreightCharts(){
+  const cc = chartColors();
   const rows = state.transport.map(calcTransportRow);
   const byMode = {};
   rows.forEach(r => { byMode[r.mode] = (byMode[r.mode]||0) + r.co2e; });
-  const modeLabels = Object.keys(byMode);
-  const modeData = Object.values(byMode);
-
-  chartInstances.modes = new Chart(document.getElementById('chart-modes'), {
+  const el1 = document.getElementById('chart-modes');
+  const el2 = document.getElementById('chart-dist');
+  if (!el1 || !el2) return;
+  if (chartInstances.modes) chartInstances.modes.destroy();
+  if (chartInstances.dist)  chartInstances.dist.destroy();
+  chartInstances.modes = new Chart(el1, {
     type:'bar',
-    data:{ labels: modeLabels.length?modeLabels:['No data'],
-      datasets:[{ label:'kg CO₂e', data: modeData.length?modeData:[0],
+    data:{ labels: Object.keys(byMode).length ? Object.keys(byMode) : ['No data'],
+      datasets:[{ label:'kg CO₂e', data: Object.values(byMode).length ? Object.values(byMode) : [0],
         backgroundColor:cc.a3 }] },
     options: chartOpts({ legend:false })
   });
-
   const scatterData = rows.map(r => ({ x:r.distanceKm, y:r.co2e, r:Math.max(4,Math.sqrt(r.weightKg)/3) }));
-  chartInstances.dist = new Chart(document.getElementById('chart-dist'), {
+  chartInstances.dist = new Chart(el2, {
     type:'bubble',
-    data:{ datasets:[{ label:'Shipments', data: scatterData,
-      backgroundColor:hexToRgba(cc.a,0.4), borderColor:cc.a }] },
-    options: { ...chartOpts({ legend:false }),
+    data:{ datasets:[{ label:'Shipments', data: scatterData, backgroundColor:hexToRgba(cc.a,0.4), borderColor:cc.a }] },
+    options:{ ...chartOpts({legend:false}),
       scales:{
-        x:{ title:{display:true,text:'Distance (km)',color:'#6b7785'},
-            ticks:{color:'#6b7785'}, grid:{color:'#1e2733'} },
-        y:{ title:{display:true,text:'kg CO₂e',color:'#6b7785'},
-            ticks:{color:'#6b7785'}, grid:{color:'#1e2733'}, beginAtZero:true }
+        x:{ title:{display:true,text:'Distance (km)',color:'#6b7785'}, ticks:{color:'#6b7785'}, grid:{color:'#1e2733'} },
+        y:{ title:{display:true,text:'kg CO₂e',color:'#6b7785'}, ticks:{color:'#6b7785'}, grid:{color:'#1e2733'}, beginAtZero:true }
       }
     }
   });
-};
+}
+
+function renderCommuteCharts(){
+  const cc = chartColors();
+  const cmRows = (state.commuting||[]).map(calcCommutingRow);
+  const byMode = {}, byDept = {};
+  cmRows.forEach(r => {
+    byMode[r.mode] = (byMode[r.mode]||0) + r.co2e;
+    const d = r.dept||'Other';
+    byDept[d] = (byDept[d]||0) + r.co2e;
+  });
+  const el1 = document.getElementById('chart-commute-modes');
+  const el2 = document.getElementById('chart-commute-dept');
+  if (!el1 || !el2) return;
+  if (chartInstances.commuteModes) chartInstances.commuteModes.destroy();
+  if (chartInstances.commuteDept)  chartInstances.commuteDept.destroy();
+  chartInstances.commuteModes = new Chart(el1, {
+    type:'doughnut',
+    data:{ labels: Object.keys(byMode).length ? Object.keys(byMode) : ['No data'],
+      datasets:[{ data: Object.values(byMode).length ? Object.values(byMode) : [1],
+        backgroundColor:[cc.a,cc.a2,cc.a3,cc.dng,'#8b5cf6','#f59e0b','#06b6d4','#10b981','#ef4444','#64748b','#a78bfa'] }] },
+    options: chartOpts({ legend:true })
+  });
+  chartInstances.commuteDept = new Chart(el2, {
+    type:'bar',
+    data:{ labels: Object.keys(byDept).length ? Object.keys(byDept) : ['No data'],
+      datasets:[{ label:'kg CO₂e', data: Object.values(byDept).length ? Object.values(byDept) : [0],
+        backgroundColor:cc.a }] },
+    options: chartOpts({ legend:false })
+  });
+}
+
+function updateCommuteUnit(){
+  const sel = document.getElementById('cm-mode');
+  const unitEl = document.getElementById('cm-unit');
+  if (!sel || !unitEl) return;
+  const meta = EMISSION_FACTORS.commuting[sel.value];
+  unitEl.value = meta ? meta.unit : '';
+}
+
+function addCommuting(){
+  if (!canWriteSection('transport')){ toast('Not assigned to Transport section', 'err'); return; }
+  const mode       = document.getElementById('cm-mode').value;
+  const employees  = parseInt(document.getElementById('cm-employees').value) || 1;
+  const distanceKm = parseFloat(document.getElementById('cm-distance').value);
+  const workingDays= parseInt(document.getElementById('cm-days').value) || 22;
+  if (!mode || !distanceKm || distanceKm <= 0){ toast('Mode and distance are required', 'err'); return; }
+  const row = {
+    id: uid(), mode, employees, distanceKm, workingDays,
+    dept:   document.getElementById('cm-dept').value.trim(),
+    period: document.getElementById('cm-period').value,
+    notes:  document.getElementById('cm-notes').value.trim(),
+    createdAt: new Date().toISOString()
+  };
+  state.commuting = state.commuting || [];
+  state.commuting.push(stampNewRow(row));
+  const calc = calcCommutingRow(row);
+  audit('ADD_COMMUTING', `${mode} · ${employees} employees · ${distanceKm}km · ${workingDays} days`);
+  writeRow('commuting', row);
+  toast(`Added ${mode} — ${fmtCO2(calc.co2e)} kg CO₂e`);
+  renderPage('transport');
+  setTimeout(()=>{ document.querySelector('.tab[data-tab=commuting]')?.click(); }, 50);
+}
+
+function exportCommuting(){
+  const rows = (state.commuting||[]).map(calcCommutingRow);
+  if (!rows.length){ toast('No commuting data to export', 'err'); return; }
+  const wb = XLSX.utils.book_new();
+  const data = [['Mode','Department','Employees','Distance (km)','Working Days/mo','Period','EF (kg/km/person)','Total km','CO₂e (kg)','Notes']];
+  rows.forEach(r => data.push([r.mode, r.dept||'', r.employees||1, r.distanceKm, r.workingDays||22, r.period||'', r.factor, r.qty, Math.round(r.co2e), r.notes||'']));
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  ws['!cols'] = data[0].map(()=>({wch:20}));
+  XLSX.utils.book_append_sheet(wb, ws, 'Employee Commuting');
+  XLSX.writeFile(wb, `commuting-${new Date().toISOString().slice(0,10)}.xlsx`);
+  toast('Commuting data exported');
+}
 
 function addTransport(){
   if (!canWriteSection('transport')){ toast('Not assigned to Transport section', 'err'); return; }
@@ -3849,6 +4077,19 @@ function editRow(section, id){
         <div class="field"><label>PERIOD</label><input type="month" id="edit-period" value="${row.period||''}"></div>
         <div class="field"><label>NOTES</label><input type="text" id="edit-notes" value="${escapeHtml(row.notes||'')}"></div>
       </div>`;
+  } else if (section === 'commuting'){
+    const cmOpts = Object.keys(EMISSION_FACTORS.commuting)
+      .map(k=>`<option value="${k}" ${row.mode===k?'selected':''}>${k}</option>`).join('');
+    fields = `
+      <div class="form-grid">
+        <div class="field"><label>COMMUTE MODE</label><select id="edit-cm-mode">${cmOpts}</select></div>
+        <div class="field"><label>EMPLOYEES</label><input type="number" id="edit-cm-employees" value="${row.employees||1}" min="1"></div>
+        <div class="field"><label>DISTANCE (KM)</label><input type="number" id="edit-cm-distance" value="${row.distanceKm||''}" min="0" step="0.1"></div>
+        <div class="field"><label>WORKING DAYS / MONTH</label><input type="number" id="edit-cm-days" value="${row.workingDays||22}" min="1" max="31"></div>
+        <div class="field"><label>DEPARTMENT</label><input type="text" id="edit-cm-dept" value="${escapeHtml(row.dept||'')}"></div>
+        <div class="field"><label>PERIOD</label><input type="month" id="edit-period" value="${row.period||''}"></div>
+        <div class="field"><label>NOTES</label><input type="text" id="edit-cm-notes" value="${escapeHtml(row.notes||'')}"></div>
+      </div>`;
   }
 
   const modal = document.createElement('div');
@@ -3916,6 +4157,14 @@ async function saveEdit(section, id){
     row.region   = document.getElementById('edit-region').value.trim();
     row.period   = document.getElementById('edit-period').value;
     row.notes    = document.getElementById('edit-notes').value.trim();
+  } else if (section === 'commuting'){
+    row.mode        = document.getElementById('edit-cm-mode').value;
+    row.employees   = parseInt(document.getElementById('edit-cm-employees').value)||1;
+    row.distanceKm  = parseFloat(document.getElementById('edit-cm-distance').value)||0;
+    row.workingDays = parseInt(document.getElementById('edit-cm-days').value)||22;
+    row.dept        = document.getElementById('edit-cm-dept').value.trim();
+    row.period      = document.getElementById('edit-period').value;
+    row.notes       = document.getElementById('edit-cm-notes').value.trim();
   }
 
   // Preserve immutable ownership fields; bump updatedAt; keep status.
