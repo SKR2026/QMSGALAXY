@@ -1195,7 +1195,7 @@
       <div class="nav-item" data-page="factors"><span class="nav-icon">∑</span> Emission Factors</div>
       <div class="nav-item" data-page="audit"><span class="nav-icon">≡</span> Audit Trail</div>
       <div class="nav-item nav-admin" data-page="plants"><span class="nav-icon">🏭</span> Plant Management</div>
-      <div class="nav-item nav-admin" data-page="users"><span class="nav-icon">⚇</span> User Management</div>
+      <div class="nav-item nav-admin" id="nav-users" data-page="users"><span class="nav-icon">⚇</span> User Management</div>
       <div class="nav-item nav-admin" id="nav-devtools" data-page="devtools" style="display:none"><span class="nav-icon">⌥</span> Developer Console</div>
       <div class="nav-item" data-page="settings"><span class="nav-icon">✦</span> Settings</div>
     </div>
@@ -1300,11 +1300,17 @@ const ROW_COLLECTIONS = ['upstream','transport','manufacturing','downstream'];
 function isDeveloper(){
   return state.user && state.user.role === 'developer';
 }
-function isManagerOrAbove(){
-  return state.user && (state.user.role === 'developer' || state.user.role === 'admin' || state.user.role === 'manager');
-}
 function isAdminUser(){
-  return state.user && (state.user.role === 'developer' || state.user.role === 'admin');
+  // Admin only — developer does NOT get admin business privileges
+  return state.user && state.user.role === 'admin';
+}
+function isAdminOrDev(){
+  // For things both roles can do (e.g. view all data, bulk export)
+  return state.user && (state.user.role === 'admin' || state.user.role === 'developer');
+}
+function isManagerOrAbove(){
+  // Data write hierarchy — developer is NOT in this chain (read-only on business data)
+  return state.user && (state.user.role === 'admin' || state.user.role === 'manager');
 }
 function ownsRow(row){
   return row && state.user && row.ownerId === state.user.id;
@@ -1342,11 +1348,11 @@ function canUnlockRow(row){
    - Viewers: never. */
 function canWriteSection(section){
   if (!state.user) return false;
-  if (state.user.role === 'viewer') return false;
+  if (state.user.role === 'viewer' || state.user.role === 'developer') return false;
   if (isManagerOrAbove()) return true;
-  if (!canWrite()) return false;                       // deactivated, etc.
+  if (!canWrite()) return false;
   const sa = state.user.sectionAccess || [];
-  return sa.length === 0 || sa.includes(section);     // empty = all sections
+  return sa.length === 0 || sa.includes(section);
 }
 
 /* Stamp ownership / status / timestamps onto a freshly-created row, in place.
@@ -1590,10 +1596,9 @@ async function deleteRowDoc(col, id){
    The Firestore rules enforce this server-side too; the query just matches. */
 function rowQuery(col){
   const base = rowsCol(col);
-  if (isManagerOrAbove()) return base;
-  // viewer or user: scope to own rows only
+  if (isManagerOrAbove() || isDeveloper()) return base;
   const uid = state.user?.id;
-  if (!uid) return base.where('ownerId', '==', '__none__'); // empty result
+  if (!uid) return base.where('ownerId', '==', '__none__');
   return base.where('ownerId', '==', uid);
 }
 
@@ -2248,7 +2253,12 @@ async function loadUsers(){
 
 /* Save a single user profile document to Firestore */
 async function saveUserDoc(u){
-  await usersCol().doc(u.id).set(u);
+  try {
+    await usersCol().doc(u.id).set(u);
+  } catch(e){
+    console.error('[saveUserDoc]', e);
+    throw e; // re-throw so callers can show the error
+  }
 }
 
 /* Get the profile doc for a Firebase Auth user */
@@ -2329,9 +2339,11 @@ function enterApp(){
   document.getElementById('user-role').textContent  = state.user.roleName || ROLE_NAMES[state.user.role] || 'User';
   document.getElementById('user-avatar').textContent = (state.user.displayName || state.user.email || '?').charAt(0).toUpperCase();
   document.getElementById('org-name').textContent   = state.org.name;
-  document.body.classList.toggle('is-admin', state.user.role === 'admin' || state.user.role === 'developer');
-  const devNav = document.getElementById('nav-devtools');
-  if (devNav) devNav.style.display = isDeveloper() ? '' : 'none';
+  document.body.classList.toggle('is-admin', state.user.role === 'admin');
+  const devNav   = document.getElementById('nav-devtools');
+  const usersNav = document.getElementById('nav-users');
+  if (devNav)   devNav.style.display   = isDeveloper() ? '' : 'none';
+  if (usersNav) usersNav.style.display = (canAdmin() || isDeveloper()) ? '' : 'none';
   updatePlantSwitcher();
   renderPage('dashboard');
   startClock();
@@ -2516,22 +2528,24 @@ function doLogout(){
 
 function canWrite(){
   if (!state.user) return false;
-  if (state.user.role === 'viewer') return false;
-  if (state.user.role === 'developer' || state.user.role === 'admin' || state.user.role === 'manager') return true;
+  if (state.user.role === 'viewer' || state.user.role === 'developer') return false;
+  if (state.user.role === 'admin' || state.user.role === 'manager') return true;
   const access = state.user.plantAccess;
   if (!access || access.length === 0) return true;
   return access.includes(CURRENT_PLANT_ID);
 }
 function canWritePlant(plantId){
   if (!state.user) return false;
-  if (state.user.role === 'viewer') return false;
-  if (state.user.role === 'developer' || state.user.role === 'admin' || state.user.role === 'manager') return true;
+  if (state.user.role === 'viewer' || state.user.role === 'developer') return false;
+  if (state.user.role === 'admin' || state.user.role === 'manager') return true;
   const access = state.user.plantAccess;
   if (!access || access.length === 0) return true;
   return access.includes(plantId);
 }
 function canAdmin(){
-  return state.user && (state.user.role === 'developer' || state.user.role === 'admin');
+  // Business admin actions (user mgmt, plant mgmt, unlock rows, clear audit)
+  // Developer cannot do these — use isDeveloper() for dev-specific gates
+  return state.user && state.user.role === 'admin';
 }
 
 /* ===================================================================
@@ -4632,7 +4646,7 @@ PAGES.bulk = () => `
   </div>
 
   <!-- IMPORT SECTION -->
-  <div class="card">
+  ${canWrite() ? `<div class="card">
     <div class="card-head"><div class="card-title">Import Data (Excel / CSV)</div></div>
     <div class="card-body">
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px">
@@ -4650,7 +4664,7 @@ PAGES.bulk = () => `
           </div>`).join('')}
       </div>
     </div>
-  </div>
+  </div>` : `<div class="card"><div class="card-body"><div class="empty" style="color:var(--ink-2)">Import is not available for your role. Contact an Administrator.</div></div></div>`}
 
   <!-- PREVIEW TABLE (filled by bulkImportWithPreview) -->
   <div id="bulk-preview-wrap"></div>
@@ -5399,7 +5413,7 @@ async function deletePlant(id){
 }
 
 PAGES.users = () => {
-  if (!canAdmin()){
+  if (!canAdmin() && !isDeveloper()){
     return `<div class="page-header"><div><div class="page-title">Access Denied</div>
       <div class="page-sub">ADMINISTRATOR PRIVILEGES REQUIRED</div></div></div>
       <div class="card"><div class="card-body" style="padding:40px;text-align:center;color:var(--ink-1)">
@@ -5747,7 +5761,12 @@ async function saveUserDialog(){
     const plantAccess   = (role === 'analyst') ? getSelectedPlantIds()   : [];
     const sectionAccess = (role === 'analyst') ? getSelectedSectionIds() : [];
     const updated = { ...u, email, displayName, role, active, plantAccess, sectionAccess };
-    await saveUserDoc(updated);
+    try {
+      await saveUserDoc(updated);
+    } catch(e){
+      toast('Save failed: ' + (e.code === 'permission-denied' ? 'Permission denied — only Admins can edit users. Developer role cannot modify user records.' : e.message), 'err');
+      return;
+    }
     const idx = state.users.findIndex(x => x.id === id);
     if (idx >= 0) state.users[idx] = updated;
     // Update live session if user edited themselves
