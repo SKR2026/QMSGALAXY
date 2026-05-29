@@ -2072,21 +2072,23 @@ async function loadAllPlantsData(){
         const ref = baseCol.collection(colName);
         return seeAll ? ref : ref.where('ownerId', '==', uid || '__none__');
       };
-      const [up, tr, mf, dn] = await Promise.all([
+      const [up, tr, mf, dn, cm] = await Promise.all([
         buildQuery('upstream').get(),
         buildQuery('transport').get(),
         buildQuery('manufacturing').get(),
-        buildQuery('downstream').get()
+        buildQuery('downstream').get(),
+        buildQuery('commuting').get()
       ]);
       cache[plant.id] = {
         upstream:      up.docs.map(d => d.data()),
         transport:     tr.docs.map(d => d.data()),
         manufacturing: mf.docs.map(d => d.data()),
-        downstream:    dn.docs.map(d => d.data())
+        downstream:    dn.docs.map(d => d.data()),
+        commuting:     cm.docs.map(d => d.data())
       };
     } catch(e){
       console.warn('loadAllPlantsData: failed for plant', plant.id, e);
-      cache[plant.id] = { upstream:[], transport:[], manufacturing:[], downstream:[] };
+      cache[plant.id] = { upstream:[], transport:[], manufacturing:[], downstream:[], commuting:[] };
     }
   }));
   // Always include the current plant's freshly-loaded in-memory state
@@ -2096,7 +2098,8 @@ async function loadAllPlantsData(){
       upstream:      state.upstream      || [],
       transport:     state.transport     || [],
       manufacturing: state.manufacturing || [],
-      downstream:    state.downstream    || []
+      downstream:    state.downstream    || [],
+      commuting:     state.commuting     || []
     };
   }
   state.allPlantsData = cache;
@@ -2130,17 +2133,18 @@ function getMonthlyActualSeries(){
   state.dashboardFilter.month = savedMonth;
 
   // Tally CO₂e per month per stage
-  const buckets = {}; // { 'YYYY-MM': { up, tr, mf, dn } }
+  const buckets = {}; // { 'YYYY-MM': { up, tr, cm, mf, dn } }
   const bump = (row, stage, calc) => {
     const m = rowMonth(row);
     if (!m) return;
-    if (!buckets[m]) buckets[m] = { up:0, tr:0, mf:0, dn:0 };
+    if (!buckets[m]) buckets[m] = { up:0, tr:0, cm:0, mf:0, dn:0 };
     buckets[m][stage] += calc(row).co2e || 0;
   };
   rows.upstream     .forEach(r => bump(r, 'up', calcUpstreamRow));
   rows.transport    .forEach(r => bump(r, 'tr', calcTransportRow));
   rows.manufacturing.forEach(r => bump(r, 'mf', calcMfgRow));
   rows.downstream   .forEach(r => bump(r, 'dn', calcDownstreamRow));
+  (rows.commuting||[]).forEach(r => bump(r, 'cm', calcCommutingRow));
 
   // Sort oldest → newest for chronological bars (limit to the most recent 12
   // months so the chart stays readable even if the user has years of data).
@@ -2149,12 +2153,13 @@ function getMonthlyActualSeries(){
 
   return {
     months,
-    labels: months.map(fmtMonthLabel),
+    labels:        months.map(fmtMonthLabel),
     upstream:      months.map(m => buckets[m].up),
     transport:     months.map(m => buckets[m].tr),
+    commuting:     months.map(m => buckets[m].cm),
     manufacturing: months.map(m => buckets[m].mf),
     downstream:    months.map(m => buckets[m].dn),
-    totals:        months.map(m => buckets[m].up + buckets[m].tr + buckets[m].mf + buckets[m].dn)
+    totals:        months.map(m => buckets[m].up + buckets[m].tr + buckets[m].cm + buckets[m].mf + buckets[m].dn)
   };
 }
 
@@ -2162,16 +2167,18 @@ function getMonthlyActualSeries(){
    currently selected month if any. Used to show counts on plant tabs. */
 function countRowsForPlant(plantId){
   const f = state.dashboardFilter;
-  let up, tr, mf, dn;
+  let up, tr, mf, dn, cm;
   if (plantId === CURRENT_PLANT_ID){
-    up = state.upstream || [];
-    tr = state.transport || [];
+    up = state.upstream      || [];
+    tr = state.transport     || [];
     mf = state.manufacturing || [];
-    dn = state.downstream || [];
+    dn = state.downstream    || [];
+    cm = state.commuting     || [];
   } else {
     const p = (state.allPlantsData || {})[plantId] || {};
-    up = p.upstream || []; tr = p.transport || [];
-    mf = p.manufacturing || []; dn = p.downstream || [];
+    up = p.upstream      || []; tr = p.transport     || [];
+    mf = p.manufacturing || []; dn = p.downstream    || [];
+    cm = p.commuting     || [];
   }
   if (f.month && f.month !== 'all'){
     const m = f.month;
@@ -2179,8 +2186,9 @@ function countRowsForPlant(plantId){
     tr = tr.filter(r => rowMonth(r) === m);
     mf = mf.filter(r => rowMonth(r) === m);
     dn = dn.filter(r => rowMonth(r) === m);
+    cm = cm.filter(r => rowMonth(r) === m);
   }
-  return up.length + tr.length + mf.length + dn.length;
+  return up.length + tr.length + mf.length + dn.length + cm.length;
 }
 
 /* Format YYYY-MM → "Jan 2026" for tab labels */
@@ -3069,13 +3077,15 @@ POST_RENDER.dashboard = () => {
         labels: s.labels.length ? s.labels : ['No data yet'],
         datasets: s.labels.length ? [
           { label:'Upstream',      data:s.upstream,
-            backgroundColor: s.months.map((_,i)=>colorFor(cc.a,  i)),  stack:'co2' },
-          { label:'Transport',     data:s.transport,
-            backgroundColor: s.months.map((_,i)=>colorFor(cc.a3, i)),  stack:'co2' },
+            backgroundColor: s.months.map((_,i)=>colorFor(cc.a,       i)), stack:'co2' },
+          { label:'Freight',       data:s.transport,
+            backgroundColor: s.months.map((_,i)=>colorFor(cc.a3,      i)), stack:'co2' },
+          { label:'Commuting',     data:s.commuting,
+            backgroundColor: s.months.map((_,i)=>colorFor('#8b5cf6',  i)), stack:'co2' },
           { label:'Manufacturing', data:s.manufacturing,
-            backgroundColor: s.months.map((_,i)=>colorFor(cc.a2, i)),  stack:'co2' },
+            backgroundColor: s.months.map((_,i)=>colorFor(cc.a2,      i)), stack:'co2' },
           { label:'Downstream',    data:s.downstream,
-            backgroundColor: s.months.map((_,i)=>colorFor(cc.s1, i)),  stack:'co2' }
+            backgroundColor: s.months.map((_,i)=>colorFor(cc.s1,      i)), stack:'co2' }
         ] : [{ label:'kg CO₂e', data:[0], backgroundColor: hexToRgba(cc.a, 0.2) }]
       },
       options: Object.assign(chartOpts({ legend: s.labels.length > 0 }), {
@@ -3131,7 +3141,8 @@ POST_RENDER.dashboard = () => {
 function renderTopSources(t){
   const all = [
     ...t.up.map(r=>({label:r.material+' / '+(r.supplier||'—'), stage:'Upstream', scope:3, co2e:r.co2e})),
-    ...t.tr.map(r=>({label:r.mode+' / '+(r.material||'shipment'), stage:'Transport', scope:3, co2e:r.co2e})),
+    ...t.tr.map(r=>({label:r.mode+' / '+(r.material||'shipment'), stage:'Freight', scope:3, co2e:r.co2e})),
+    ...(t.cm||[]).map(r=>({label:r.mode+' / '+(r.dept||'—'), stage:'Commuting', scope:3, co2e:r.co2e})),
     ...t.mf.map(r=>({label:r.source, stage:'Manufacturing', scope:r.scope, co2e:r.co2e})),
     ...t.dn.map(r=>({label:r.activity, stage:'Downstream', scope:3, co2e:r.co2e}))
   ].sort((a,b)=>b.co2e-a.co2e).slice(0,5);
