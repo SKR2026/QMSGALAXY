@@ -1096,23 +1096,23 @@ function doEntry() {
   if(!ep){showEntErr('Please select your Plant / Location');return;}
   var btn=G('vEntBtn'); if(btn){btn.disabled=true;btn.textContent='Verifying...';}
   hide('vEntErr');
-  // Find attempt by employee code
-  DB().collection('attempts').where('examId','==',S.exam.id).where('employeeCode','==',ec).limit(1).get()
+  // Query attempts by examId only (single where = no composite index needed)
+  // Then filter by employeeCode in JavaScript
+  DB().collection('attempts').where('examId','==',S.exam.id).get()
     .then(function(aSnap){
-      if(aSnap.empty){
-        // Also try by candidateId via candidates collection
-        return DB().collection('candidates').where('employeeCode','==',ec).where('isActive','==',true).limit(1).get()
-          .then(function(cSnap){
-            if(cSnap.empty){throw new Error('Employee Code "'+ec+'" is not registered for this exam. Please contact your administrator.');}
-            var cid=cSnap.docs[0].id;
-            return DB().collection('attempts').where('examId','==',S.exam.id).where('candidateId','==',cid).limit(1).get()
-              .then(function(aSnap2){
-                if(aSnap2.empty){throw new Error('You are not assigned to this exam. Please contact your administrator.');}
-                return aSnap2;
-              });
-          });
+      // Find matching attempt by employee code (case-insensitive)
+      var matchDoc = null;
+      aSnap.docs.forEach(function(d){
+        var data = d.data();
+        var storedCode = (data.employeeCode||'').toUpperCase().trim();
+        if(storedCode === ec) matchDoc = d;
+      });
+
+      if(!matchDoc){
+        throw new Error('Employee Code "'+ec+'" is not registered for this exam. Please contact your administrator.');
       }
-      return aSnap;
+      // Wrap as a fake snap with .docs[0]
+      return { docs: [matchDoc] };
     })
     .then(function(aSnap){
       var att=Object.assign({id:aSnap.docs[0].id},aSnap.docs[0].data());
@@ -1133,7 +1133,12 @@ function doEntry() {
       loadExamQs(S.att,S.exam);
     })
     .catch(function(e){
-      showEntErr(e.message);
+      // Show full error for debugging
+      var msg = e.message || 'Unknown error';
+      if(msg.indexOf('permission')>-1 || msg.indexOf('insufficient')>-1){
+        msg = 'Permission denied reading exam data. Please ask your administrator to update the Firestore security rules (questions and attempts need public read access).';
+      }
+      showEntErr(msg);
       if(btn){btn.disabled=false;btn.textContent='Start Exam →';}
     });
 }
@@ -1141,22 +1146,51 @@ function showEntErr(m){var e=G('vEntErr');if(e){e.textContent=m;show('vEntErr');
 
 // ── EXAM INTERFACE ────────────────────────────────────────────
 function loadExamQs(att, exam) {
+  // Safety check — make sure attempt has assigned questions
+  if (!att.assignedQuestions || att.assignedQuestions.length === 0) {
+    showEntErr('No questions assigned to this exam attempt. Please ask your administrator to re-assign you to this exam.');
+    var btn=G('vEntBtn'); if(btn){btn.disabled=false;btn.textContent='Start Exam →';}
+    return;
+  }
+
   var qIds=att.assignedQuestions.map(function(aq){return aq.questionId;});
   var chunks=[], all=[];
   for(var i=0;i<qIds.length;i+=10) chunks.push(qIds.slice(i,i+10));
+
   var promises=chunks.map(function(chunk){
     return DB().collection('questions').where(firebase.firestore.FieldPath.documentId(),'in',chunk).get()
-      .then(function(sn){sn.docs.forEach(function(d){all.push(Object.assign({id:d.id},d.data()));});});
+      .then(function(sn){
+        sn.docs.forEach(function(d){all.push(Object.assign({id:d.id},d.data()));});
+      });
   });
+
   Promise.all(promises).then(function(){
-    var qMap={};all.forEach(function(q){qMap[q.id]=q;});
+    var qMap={};
+    all.forEach(function(q){qMap[q.id]=q;});
+
     S.qs=att.assignedQuestions.map(function(aq){
-      return Object.assign({},qMap[aq.questionId],{id:aq.questionId,shuffledOptions:aq.shuffledOptions||qMap[aq.questionId].options||[]});
-    }).filter(function(q){return q.text;});
+      var q=qMap[aq.questionId];
+      if(!q) return null;
+      return Object.assign({},q,{
+        id:aq.questionId,
+        shuffledOptions:aq.shuffledOptions||(q.options||[])
+      });
+    }).filter(function(q){return q && q.text;});
+
     S.ans=Object.assign({},att.answers||{});
     S.qi=0;
+
+    if(S.qs.length===0){
+      showEntErr('Questions could not be loaded. The questions may have been deleted. Please contact your administrator.');
+      var btn=G('vEntBtn'); if(btn){btn.disabled=false;btn.textContent='Start Exam →';}
+      return;
+    }
+
     startExam(att,exam);
-  }).catch(function(e){toast('Error loading questions: '+e.message,'er');});
+  }).catch(function(e){
+    showEntErr('Error loading questions: '+e.message+'. Please try again or contact your administrator.');
+    var btn=G('vEntBtn'); if(btn){btn.disabled=false;btn.textContent='Start Exam →';}
+  });
 }
 function startExam(att, exam) {
   hideAll(); show('vExam');
