@@ -2284,9 +2284,10 @@ function buildDetailedResults(atts,exams,cands) {
   }
   var rows=atts.map(function(a,i){
     var ex=exams[a.examId]||{},cd=cands[a.candidateId]||{};
+    var empCode = a.employeeCode||cd.employeeCode||'\u2014';
     return '<tr>'+
       '<td style="text-align:center;font-weight:700;color:var(--am)">'+(i+1)+'</td>'+
-      '<td class="tc">'+(a.employeeCode||cd.employeeCode||'\u2014')+'</td>'+
+      '<td class="tc"><button class="ob" style="font-family:var(--mo);font-size:11px;font-weight:700;color:var(--bl);text-decoration:underline;text-underline-offset:2px;cursor:pointer;padding:0;background:none;border:none" onclick="showAttemptDetail(\''+a.id+'\')">'+esc(empCode)+'</button></td>'+
       '<td class="tn">'+(a.candidateName||cd.name||'\u2014')+'</td>'+
       '<td><span class="bk bb">'+(a.department||ex.department||'\u2014')+'</span></td>'+
       '<td style="color:var(--tx2)">'+(a.plantLocation||cd.plantLocation||'\u2014')+'</td>'+
@@ -2309,6 +2310,151 @@ function buildDetailedResults(atts,exams,cands) {
     '</tr></thead>'+
     '<tbody>'+(rows||noRows(13,'No completed attempts yet.'))+'</tbody></table></div></div>';
 }
+
+// ── Attempt Detail Modal ──────────────────────────────────────
+function showAttemptDetail(attId) {
+  // Find attempt from cached data
+  var atts  = window._ra || [];
+  var exams = window._re || {};
+  var a = null;
+  for(var i=0;i<atts.length;i++){ if(atts[i].id===attId){ a=atts[i]; break; } }
+  if(!a){ toast('Attempt not found','er'); return; }
+
+  var ex  = exams[a.examId] || {};
+  var ans = a.answers || {};
+  var aq  = a.assignedQuestions || [];
+
+  if(!aq.length){ openMo('Exam Response — '+esc(a.candidateName||a.employeeCode||'—'),'<div style="color:var(--tx3);padding:20px 0;text-align:center">No question data stored for this attempt.</div>',[{lbl:'Close',cls:'b bp',fn:'closeMo()'}]); return; }
+
+  // Show loading state immediately
+  openMo(
+    '\uD83D\uDCCB Exam Response — '+esc(a.candidateName||a.employeeCode||'—'),
+    '<div style="text-align:center;padding:24px;color:var(--tx3)"><div style="font-size:22px;margin-bottom:8px">\u23F3</div>Loading questions...</div>',
+    [{lbl:'Close',cls:'b bp',fn:'closeMo()'}]
+  );
+
+  // Fetch all question docs in chunks of 10
+  var qIds = aq.map(function(item){ return item.questionId; }).filter(Boolean);
+  var chunks = [], allQDocs = {};
+  for(var c=0;c<qIds.length;c+=10) chunks.push(qIds.slice(c,c+10));
+
+  Promise.all(chunks.map(function(chunk){
+    return DB().collection('questions')
+      .where(firebase.firestore.FieldPath.documentId(),'in',chunk).get()
+      .then(function(sn){ sn.docs.forEach(function(d){ allQDocs[d.id]=Object.assign({id:d.id},d.data()); }); });
+  })).then(function(){
+
+    // Summary header
+    function fmtTS(ts){
+      if(!ts) return '\u2014';
+      try{ var d=ts.toDate?ts.toDate():new Date(ts); return d.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})+' '+d.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true}); }catch(e){return '\u2014';}
+    }
+    function fmtDurLocal(s,e){
+      if(!s||!e) return '\u2014';
+      try{ var sec=Math.round(((e.toDate?e.toDate():new Date(e))-(s.toDate?s.toDate():new Date(s)))/1000); if(sec<0) return '\u2014'; return Math.floor(sec/60)+'m '+sec%60+'s'; }catch(e){return '\u2014';}
+    }
+
+    var isPass = a.result==='pass';
+    var pct    = a.percentage||0;
+
+    var summaryBar =
+      '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px">'+
+        adCard('\uD83D\uDC64','Candidate', esc(a.candidateName||'\u2014'))+
+        adCard('\uD83C\uDD94','Emp Code',  esc(a.employeeCode||'\u2014'))+
+        adCard('\uD83C\uDFED','Dept / Plant', esc((a.department||'\u2014')+' \u2022 '+(a.plantLocation||'\u2014')))+
+        adCard('\uD83D\uDCDD','Exam',      esc((ex.name||'\u2014').substring(0,28)))+
+      '</div>'+
+      '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:22px">'+
+        adCard('\u2705','Score', (a.marksObtained||0)+'/'+(ex.totalMarks||100)+' ('+pct+'%)')+
+        adCard(isPass?'\uD83C\uDFC5':'\u274C','Result', isPass?'PASS':'FAIL')+
+        adCard('\u23F0','Start Time', fmtTS(a.startedAt))+
+        adCard('\u23F1','Time Taken', fmtDurLocal(a.startedAt,a.submittedAt))+
+      '</div>';
+
+    // Per-question breakdown
+    var palette=['#5b9cf6','#e91e8c','#26c6c6','#9b59b6','#f97316','#22c55e'];
+    var qHtml = aq.map(function(aqItem, qi){
+      var qid  = aqItem.questionId;
+      var q    = allQDocs[qid];
+      if(!q) return '<div style="padding:10px 0;color:var(--tx3);font-size:12px">Q'+(qi+1)+': Question not found (may have been deleted)</div>';
+
+      var userAns  = ans[qid] || [];
+      var corrAns  = q.correctAnswers || [];
+      var isCorrect= JSON.stringify(userAns.slice().sort()) === JSON.stringify(corrAns.slice().sort());
+
+      // Use shuffledOptions if stored, else fall back to q.options
+      var opts = aqItem.shuffledOptions || q.options || [];
+
+      var optRows = opts.map(function(opt,oi){
+        var oid   = typeof opt==='object' ? (opt.id||String.fromCharCode(97+oi)) : opt;
+        var otext = typeof opt==='object' ? (opt.text||String(opt)) : String(opt);
+        var isChosen = userAns.indexOf(oid)>-1;
+        var isRight  = corrAns.indexOf(oid)>-1;
+
+        var bg='', borderCol='var(--bd)', labelIcon='';
+        if(isChosen && isRight)  { bg='var(--gnbg)';  borderCol='var(--gnbd)'; labelIcon=' <span style="color:var(--gn);font-size:13px">\u2713 Correct</span>'; }
+        else if(isChosen && !isRight){ bg='var(--rdbg)'; borderCol='var(--rdbd)'; labelIcon=' <span style="color:var(--rd);font-size:13px">\u2717 Wrong</span>'; }
+        else if(!isChosen && isRight){ bg='rgba(52,211,153,.06)'; borderCol='var(--gnbd)'; labelIcon=' <span style="color:var(--gn);font-size:11px;opacity:.7">(Correct answer)</span>'; }
+
+        var optLabel = String.fromCharCode(65+oi); // A, B, C, D
+
+        return '<div style="display:flex;align-items:flex-start;gap:10px;padding:8px 12px;margin-bottom:6px;'+
+          'border:1px solid '+borderCol+';border-radius:7px;background:'+bg+'">'+
+          '<div style="flex-shrink:0;width:22px;height:22px;border-radius:50%;'+
+            'background:'+(isChosen?(isRight?'var(--gn)':'var(--rd)'):(isRight?'rgba(52,211,153,.2)':'var(--bg3)'))+
+            ';display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;'+
+            'color:'+(isChosen?'#fff':(isRight?'var(--gn)':'var(--tx3)'))+';margin-top:1px">'+
+            optLabel+
+          '</div>'+
+          '<div style="font-size:13px;color:var(--tx);line-height:1.5;flex:1">'+esc(otext)+labelIcon+'</div>'+
+        '</div>';
+      }).join('');
+
+      var statusIcon = isCorrect
+        ? '<span style="color:var(--gn);font-size:13px;font-weight:700">\u2713 Correct</span>'
+        : (userAns.length===0
+          ? '<span style="color:var(--tx3);font-size:13px">Not answered</span>'
+          : '<span style="color:var(--rd);font-size:13px;font-weight:700">\u2717 Incorrect</span>');
+
+      var qBg  = isCorrect ? 'var(--gnbg)' : (userAns.length===0 ? 'var(--bg3)' : 'var(--rdbg)');
+      var qBdr = isCorrect ? 'var(--gnbd)' : (userAns.length===0 ? 'var(--bd)'   : 'var(--rdbd)');
+
+      return '<div style="border:1px solid '+qBdr+';border-radius:10px;padding:14px 16px;margin-bottom:12px;background:'+qBg+'">'+
+        '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px">'+
+          '<div style="font-size:13px;font-weight:600;color:var(--tx);line-height:1.5">'+
+            '<span style="font-family:var(--mo);font-size:10px;color:var(--tx3);margin-right:6px">Q'+(qi+1)+'</span>'+
+            esc(q.text||q.question||'—')+
+          '</div>'+
+          '<div style="flex-shrink:0;font-size:11px;text-align:right">'+
+            statusIcon+'<br>'+
+            '<span style="color:var(--tx3);font-size:10px">'+(q.marks||2)+' pts</span>'+
+          '</div>'+
+        '</div>'+
+        optRows+
+      '</div>';
+    }).join('');
+
+    var body =
+      summaryBar+
+      '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--tx3);margin-bottom:10px">'+
+        '\uD83D\uDCCB Question-by-Question Breakdown ('+aq.length+' questions)'+
+      '</div>'+
+      qHtml;
+
+    setHtml('vMoBd', body);
+
+  }).catch(function(e){
+    setHtml('vMoBd','<div style="color:var(--rd);padding:12px">Error loading questions: '+esc(e.message)+'</div>');
+  });
+}
+
+function adCard(icon,label,val){
+  return '<div style="background:var(--bg2);border:1px solid var(--bd);border-radius:9px;padding:10px 13px">'+
+    '<div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--tx3);margin-bottom:3px">'+icon+' '+label+'</div>'+
+    '<div style="font-size:12px;font-weight:700;color:var(--tx);line-height:1.4">'+val+'</div>'+
+  '</div>';
+}
+
 
 
 
