@@ -786,48 +786,11 @@ function boot() {
   }
 
   // licStatus === 'valid' — proceed to Firebase auth
+  // onAuthStateChanged handles returning visits where user is already signed in
   AUTH().onAuthStateChanged(function(user) {
-    // Hide loader once we know auth state
     var ld = G('vLoader'); if(ld) ld.style.display='none';
     if (!user) { hideAll(); show('vAdmLog'); return; }
-    DB().collection('users').doc(user.uid).get()
-      .then(function(doc) {
-        if (doc.exists) {
-          var d = doc.data();
-          if (d.role === 'admin' || d.role === 'super_admin') {
-            showAdmin(d);
-          } else {
-            // Logged in but role not set correctly
-            showE('aErr', 'Account found but role is "' + (d.role||'not set') + '". It must be "super_admin" or "admin". Check your Firestore users collection.');
-            hideAll(); show('vAdmLog');
-          }
-        } else {
-          // Doc doesn't exist — offer to auto-create it
-          showE('aErr', 'No admin profile found for this account. Creating one now...');
-          hideAll(); show('vAdmLog');
-          // Auto-create the user document with super_admin role
-          DB().collection('users').doc(user.uid).set({
-            role: 'super_admin',
-            displayName: user.displayName || user.email.split('@')[0],
-            email: user.email,
-            createdAt: firebase.firestore.FieldValue.serverTimestamp()
-          }).then(function() {
-            showE('aErr', 'Admin profile created! Signing in...');
-            // Re-fetch and show admin
-            DB().collection('users').doc(user.uid).get().then(function(doc2) {
-              if (doc2.exists) showAdmin(doc2.data());
-            });
-          }).catch(function(err2) {
-            showE('aErr', 'Could not create profile: ' + err2.message + '. Go to Firestore → users → create document with ID = your UID and field role = "super_admin"');
-            hideAll(); show('vAdmLog');
-          });
-        }
-      })
-      .catch(function(err) {
-        // Show the real error — most common: Firestore rules blocking the read
-        showE('aErr', 'Firestore error: ' + err.message + ' (Check Firestore rules are published and collection "users" exists)');
-        hideAll(); show('vAdmLog');
-      });
+    resolveAdminUser(user);
   });
 }
 
@@ -838,13 +801,54 @@ function doLogin() {
   var btn = document.querySelector('#vAdmLog .bp');
   if (btn) { btn.disabled = true; btn.textContent = 'Signing in...'; }
   AUTH().signInWithEmailAndPassword(e, p)
-    .then(function(){
+    .then(function(cred) {
       hide('aErr');
       if (btn) { btn.disabled = false; btn.textContent = 'Sign In'; }
+      // ── Directly load the user profile and enter the app ──
+      // (onAuthStateChanged may not be active if boot() ran before
+      //  license was validated, so we drive the flow from here.)
+      resolveAdminUser(cred.user);
     })
     .catch(function(err){
       showE('aErr', fErr(err));
       if (btn) { btn.disabled = false; btn.textContent = 'Sign In'; }
+    });
+}
+
+/** Load the Firestore user doc and show the admin shell (or error). */
+function resolveAdminUser(user) {
+  if (!user) { hideAll(); show('vAdmLog'); return; }
+  DB().collection('users').doc(user.uid).get()
+    .then(function(doc) {
+      if (doc.exists) {
+        var d = doc.data();
+        if (d.role === 'admin' || d.role === 'super_admin') {
+          showAdmin(d);
+        } else {
+          showE('aErr', 'Account role is "' + (d.role||'not set') + '". Must be "admin" or "super_admin".');
+          hideAll(); show('vAdmLog');
+        }
+      } else {
+        // Auto-create user doc with super_admin role on first login
+        showE('aErr', 'No profile found — creating one now...');
+        DB().collection('users').doc(user.uid).set({
+          role: 'super_admin',
+          displayName: user.displayName || user.email.split('@')[0],
+          email: user.email,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        }).then(function() {
+          DB().collection('users').doc(user.uid).get().then(function(doc2) {
+            if (doc2.exists) showAdmin(doc2.data());
+          });
+        }).catch(function(err2) {
+          showE('aErr', 'Could not create profile: ' + err2.message);
+          hideAll(); show('vAdmLog');
+        });
+      }
+    })
+    .catch(function(err) {
+      showE('aErr', 'Firestore error: ' + err.message);
+      hideAll(); show('vAdmLog');
     });
 }
 function doLogout() {
