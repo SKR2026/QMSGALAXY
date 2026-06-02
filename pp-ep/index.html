@@ -548,6 +548,22 @@ function toast(msg, type, ms) {
 function DB()   { return firebase.firestore(); }
 function AUTH() { return firebase.auth(); }
 
+// ── PRE-BOOT: warm license memory cache from localStorage immediately ──
+// This runs synchronously before any async code so licCacheStatus()
+// always sees the saved key even on the very first tick.
+(function() {
+  try {
+    var raw = localStorage.getItem('exampro_license_v1');
+    if (raw) {
+      var parsed = JSON.parse(raw);
+      if (parsed && parsed.key) {
+        _licMemCache = parsed;
+        console.log('[License] Pre-boot: cache warmed from localStorage →', parsed.key);
+      }
+    }
+  } catch(e) { console.warn('[License] Pre-boot localStorage read failed:', e); }
+})();
+
 // ── VALIDATE CONFIG & BOOT ──────────────────────────────────
 (function() {
   if (!FCFG || FCFG.apiKey.indexOf('PASTE_') > -1 || FCFG.projectId.indexOf('PASTE_') > -1) {
@@ -650,18 +666,49 @@ function tOpts(sel) {
    Only re-checks when: no cache, expiry reached, or admin clears it.
 ══════════════════════════════════════════ */
 var LIC_STORE_KEY = 'exampro_license_v1';
+var _licMemCache  = null; // in-memory fallback — survives within same page session
 
-function getLicCache()  { try { return JSON.parse(localStorage.getItem(LIC_STORE_KEY)||'null'); } catch(e) { return null; } }
-function setLicCache(o) { try { localStorage.setItem(LIC_STORE_KEY, JSON.stringify(o)); } catch(e) {} }
-function clearLicCache(){ localStorage.removeItem(LIC_STORE_KEY); }
+function getLicCache() {
+  // 1. Try in-memory first (set this session)
+  if (_licMemCache) return _licMemCache;
+  // 2. Fall back to localStorage (set in a previous session)
+  try {
+    var raw = localStorage.getItem(LIC_STORE_KEY);
+    if (raw) {
+      var parsed = JSON.parse(raw);
+      if (parsed && parsed.key) {
+        _licMemCache = parsed; // warm the memory cache
+        return parsed;
+      }
+    }
+  } catch(e) { console.warn('[License] localStorage read error:', e); }
+  return null;
+}
+
+function setLicCache(o) {
+  _licMemCache = o; // always set in memory — survives within this page load
+  try {
+    localStorage.setItem(LIC_STORE_KEY, JSON.stringify(o));
+    console.log('[License] Cache saved to localStorage:', o.key, '| expiry:', o.expiry);
+  } catch(e) {
+    console.warn('[License] localStorage write failed (private mode?), using memory only:', e);
+  }
+}
+
+function clearLicCache() {
+  _licMemCache = null;
+  try { localStorage.removeItem(LIC_STORE_KEY); } catch(e) {}
+  console.log('[License] Cache cleared');
+}
 
 /** Returns 'valid' | 'expired' | 'none' */
 function licCacheStatus() {
   var c = getLicCache();
   if (!c || !c.key) return 'none';
-  // If no expiry stored, treat as valid indefinitely
+  // No expiry = valid forever
   if (!c.expiry) return 'valid';
   var exp = new Date(c.expiry);
+  if (isNaN(exp.getTime())) return 'valid'; // unparseable date = treat as valid
   var today = new Date(); today.setHours(0,0,0,0);
   return exp < today ? 'expired' : 'valid';
 }
