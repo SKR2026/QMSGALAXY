@@ -548,21 +548,51 @@ function toast(msg, type, ms) {
 function DB()   { return firebase.firestore(); }
 function AUTH() { return firebase.auth(); }
 
-// ── PRE-BOOT: warm license memory cache from localStorage immediately ──
-// This runs synchronously before any async code so licCacheStatus()
-// always sees the saved key even on the very first tick.
-(function() {
+var LIC_STORE_KEY = 'exampro_license_v1';
+
+// Initialise memory cache immediately from localStorage at declaration time.
+// This is the ONLY correct place — variables are hoisted but values assigned
+// in declaration order, so this runs before boot() is ever called.
+var _licMemCache = (function() {
   try {
     var raw = localStorage.getItem('exampro_license_v1');
     if (raw) {
-      var parsed = JSON.parse(raw);
-      if (parsed && parsed.key) {
-        _licMemCache = parsed;
-        console.log('[License] Pre-boot: cache warmed from localStorage →', parsed.key);
-      }
+      var p = JSON.parse(raw);
+      if (p && p.key) { console.log('[License] Loaded from localStorage:', p.key); return p; }
     }
-  } catch(e) { console.warn('[License] Pre-boot localStorage read failed:', e); }
+  } catch(e) {}
+  return null;
 })();
+
+function getLicCache() {
+  return _licMemCache;
+}
+
+function setLicCache(o) {
+  _licMemCache = o;
+  try {
+    localStorage.setItem(LIC_STORE_KEY, JSON.stringify(o));
+    console.log('[License] Saved:', o.key, 'expiry:', o.expiry || 'none');
+  } catch(e) {
+    console.warn('[License] localStorage write failed:', e.message);
+  }
+}
+
+function clearLicCache() {
+  _licMemCache = null;
+  try { localStorage.removeItem(LIC_STORE_KEY); } catch(e) {}
+}
+
+/** Returns 'valid' | 'expired' | 'none' */
+function licCacheStatus() {
+  var c = getLicCache();
+  if (!c || !c.key) return 'none';
+  if (!c.expiry) return 'valid'; // no expiry = valid forever
+  var exp = new Date(c.expiry);
+  if (isNaN(exp.getTime())) return 'valid';
+  var today = new Date(); today.setHours(0,0,0,0);
+  return exp < today ? 'expired' : 'valid';
+}
 
 // ── VALIDATE CONFIG & BOOT ──────────────────────────────────
 (function() {
@@ -665,53 +695,7 @@ function tOpts(sel) {
    Validates the license key once and caches the result in localStorage.
    Only re-checks when: no cache, expiry reached, or admin clears it.
 ══════════════════════════════════════════ */
-var LIC_STORE_KEY = 'exampro_license_v1';
-var _licMemCache  = null; // in-memory fallback — survives within same page session
 
-function getLicCache() {
-  // 1. Try in-memory first (set this session)
-  if (_licMemCache) return _licMemCache;
-  // 2. Fall back to localStorage (set in a previous session)
-  try {
-    var raw = localStorage.getItem(LIC_STORE_KEY);
-    if (raw) {
-      var parsed = JSON.parse(raw);
-      if (parsed && parsed.key) {
-        _licMemCache = parsed; // warm the memory cache
-        return parsed;
-      }
-    }
-  } catch(e) { console.warn('[License] localStorage read error:', e); }
-  return null;
-}
-
-function setLicCache(o) {
-  _licMemCache = o; // always set in memory — survives within this page load
-  try {
-    localStorage.setItem(LIC_STORE_KEY, JSON.stringify(o));
-    console.log('[License] Cache saved to localStorage:', o.key, '| expiry:', o.expiry);
-  } catch(e) {
-    console.warn('[License] localStorage write failed (private mode?), using memory only:', e);
-  }
-}
-
-function clearLicCache() {
-  _licMemCache = null;
-  try { localStorage.removeItem(LIC_STORE_KEY); } catch(e) {}
-  console.log('[License] Cache cleared');
-}
-
-/** Returns 'valid' | 'expired' | 'none' */
-function licCacheStatus() {
-  var c = getLicCache();
-  if (!c || !c.key) return 'none';
-  // No expiry = valid forever
-  if (!c.expiry) return 'valid';
-  var exp = new Date(c.expiry);
-  if (isNaN(exp.getTime())) return 'valid'; // unparseable date = treat as valid
-  var today = new Date(); today.setHours(0,0,0,0);
-  return exp < today ? 'expired' : 'valid';
-}
 
 /** Show the license gate WITHOUT clearing cache (first-run / expired redirect) */
 function showLicGate() {
@@ -815,7 +799,6 @@ function boot() {
 
   // ── LICENSE CHECK (admin path only) ──
   var licStatus = licCacheStatus();
-  console.log('[License] Cache status on boot:', licStatus, '| cache:', getLicCache());
 
   if (licStatus === 'expired') {
     var ld = G('vLoader'); if(ld) ld.style.display='none';
