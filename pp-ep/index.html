@@ -791,6 +791,8 @@ function boot() {
   var params = new URLSearchParams(window.location.search);
   var examId  = params.get('exam');
   var portal  = params.get('results');
+
+  // Candidate exam and result portal — skip license check entirely
   if (examId) {
     var ld = G('vLoader'); if(ld) ld.style.display='none';
     S.examId = examId; showEntry(examId); return;
@@ -800,10 +802,16 @@ function boot() {
     showResultPortal(); return;
   }
 
-  // ── LICENSE CHECK (admin path only) ──
+  // ── LICENSE CHECK — admin path ────────────────────────────────
   var licStatus = licCacheStatus();
-  console.log('[Boot] licStatus=', licStatus, 'cache=', getLicCache());
 
+  // No cache at all → show gate (first run)
+  if (licStatus === 'none') {
+    var ld = G('vLoader'); if(ld) ld.style.display='none';
+    hideAll(); show('vLicGate'); return;
+  }
+
+  // Locally expired → show expired screen
   if (licStatus === 'expired') {
     var ld = G('vLoader'); if(ld) ld.style.display='none';
     var c = getLicCache();
@@ -817,23 +825,83 @@ function boot() {
     hideAll(); show('vLicExpired'); return;
   }
 
-  if (licStatus === 'none') {
-    var ld = G('vLoader'); if(ld) ld.style.display='none';
-    hideAll(); show('vLicGate'); return;
-  }
+  // Cache looks valid locally — but ALWAYS re-verify against Firestore.
+  // This ensures revoke/expiry/plan changes in DevLicense panel
+  // take effect on the very next login without the user re-entering the key.
+  var cachedKey = getLicCache().key;
+  setTx('vLoaderMsg', 'Verifying license...');
 
-  // licStatus === 'valid' — populate CFG from cache so badge works on reload
-  var cached = getLicCache();
-  if (cached && cached.expiry) {
-    CFG.licenseExpiry = cached.expiry;
-  }
+  DB().collection('licenses').doc(cachedKey).get()
+    .then(function(snap) {
+      var ld = G('vLoader'); if(ld) ld.style.display='none';
 
-  // Proceed to Firebase auth
-  AUTH().onAuthStateChanged(function(user) {
-    var ld = G('vLoader'); if(ld) ld.style.display='none';
-    if (!user) { hideAll(); show('vAdmLog'); return; }
-    resolveAdminUser(user);
-  });
+      // Key deleted from Firestore
+      if (!snap.exists) {
+        clearLicCache();
+        hideAll(); show('vLicGate');
+        return;
+      }
+
+      var lic = snap.data();
+
+      // Key revoked in DevLicense panel
+      if (lic.isActive === false) {
+        clearLicCache();
+        hideAll(); show('vLicGate');
+        // Show a clear message on the gate
+        setTimeout(function() {
+          showLicErrMsg('Your license has been revoked. Please contact your administrator.');
+        }, 100);
+        return;
+      }
+
+      // Check expiry from Firestore (may differ from local cache)
+      var expiryStr = lic.expiryDate || lic.expiry || '';
+      if (expiryStr) {
+        var expDate = new Date(expiryStr);
+        var today = new Date(); today.setHours(0,0,0,0);
+        if (expDate < today) {
+          // Update cache with new expiry then show expired screen
+          setLicCache({ key: cachedKey, expiry: expiryStr, plan: lic.plan||'', company: lic.company||'' });
+          var expMsgEl = G('vLicExpMsg');
+          if (expMsgEl) {
+            expMsgEl.textContent = 'License key ' + cachedKey + ' expired on ' +
+              expDate.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) +
+              '. Please enter a new key to continue.';
+          }
+          hideAll(); show('vLicExpired');
+          return;
+        }
+      }
+
+      // ✅ Still valid — refresh cache with latest Firestore data
+      setLicCache({
+        key: cachedKey,
+        expiry: expiryStr || '',
+        plan: lic.plan || '',
+        company: lic.company || ''
+      });
+      CFG.licenseExpiry = expiryStr || '';
+      renderLicBadge();
+
+      // Proceed to Firebase auth
+      AUTH().onAuthStateChanged(function(user) {
+        if (!user) { hideAll(); show('vAdmLog'); return; }
+        resolveAdminUser(user);
+      });
+    })
+    .catch(function(e) {
+      // Firestore unreachable — fall back to local cache so offline doesn't break login
+      var ld = G('vLoader'); if(ld) ld.style.display='none';
+      console.warn('[License] Firestore check failed, using cache:', e.message);
+      var cached = getLicCache();
+      if (cached && cached.expiry) CFG.licenseExpiry = cached.expiry;
+      renderLicBadge();
+      AUTH().onAuthStateChanged(function(user) {
+        if (!user) { hideAll(); show('vAdmLog'); return; }
+        resolveAdminUser(user);
+      });
+    });
 }
 
 // ── ADMIN AUTH ───────────────────────────────────────────────
