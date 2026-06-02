@@ -548,31 +548,33 @@ function toast(msg, type, ms) {
 function DB()   { return firebase.firestore(); }
 function AUTH() { return firebase.auth(); }
 
-var LIC_STORE_KEY = 'exampro_license_v1';
+var LIC_STORE_KEY = 'exampro_license_v2'; // v2 = requires validated flag
 
-// Initialise memory cache immediately from localStorage at declaration time.
-// This is the ONLY correct place — variables are hoisted but values assigned
-// in declaration order, so this runs before boot() is ever called.
+// Read from localStorage synchronously at declaration time —
+// MUST be before the Firebase init IIFE that calls boot().
 var _licMemCache = (function() {
   try {
-    var raw = localStorage.getItem('exampro_license_v1');
+    var raw = localStorage.getItem('exampro_license_v2');
     if (raw) {
       var p = JSON.parse(raw);
-      if (p && p.key) { console.log('[License] Loaded from localStorage:', p.key); return p; }
+      // Only accept entries explicitly written by activateLicense() (validated:true)
+      if (p && p.key && p.validated === true) {
+        console.log('[License] Cache loaded:', p.key);
+        return p;
+      }
     }
   } catch(e) {}
   return null;
 })();
 
-function getLicCache() {
-  return _licMemCache;
-}
+function getLicCache() { return _licMemCache; }
 
 function setLicCache(o) {
+  o.validated = true; // mark as properly validated — rejects any stale data
   _licMemCache = o;
   try {
     localStorage.setItem(LIC_STORE_KEY, JSON.stringify(o));
-    console.log('[License] Saved:', o.key, 'expiry:', o.expiry || 'none');
+    console.log('[License] Cache saved:', o.key, '| expiry:', o.expiry || 'none');
   } catch(e) {
     console.warn('[License] localStorage write failed:', e.message);
   }
@@ -581,15 +583,16 @@ function setLicCache(o) {
 function clearLicCache() {
   _licMemCache = null;
   try { localStorage.removeItem(LIC_STORE_KEY); } catch(e) {}
+  console.log('[License] Cache cleared');
 }
 
 /** Returns 'valid' | 'expired' | 'none' */
 function licCacheStatus() {
   var c = getLicCache();
-  if (!c || !c.key) return 'none';
-  if (!c.expiry) return 'valid'; // no expiry = valid forever
+  if (!c || !c.key || !c.validated) return 'none'; // no validated entry = ask for key
+  if (!c.expiry) return 'valid';                    // no expiry date = valid forever
   var exp = new Date(c.expiry);
-  if (isNaN(exp.getTime())) return 'valid';
+  if (isNaN(exp.getTime())) return 'valid';         // bad date format = treat as valid
   var today = new Date(); today.setHours(0,0,0,0);
   return exp < today ? 'expired' : 'valid';
 }
@@ -799,6 +802,7 @@ function boot() {
 
   // ── LICENSE CHECK (admin path only) ──
   var licStatus = licCacheStatus();
+  console.log('[Boot] licStatus=', licStatus, 'cache=', getLicCache());
 
   if (licStatus === 'expired') {
     var ld = G('vLoader'); if(ld) ld.style.display='none';
@@ -818,8 +822,13 @@ function boot() {
     hideAll(); show('vLicGate'); return;
   }
 
-  // licStatus === 'valid' — proceed to Firebase auth
-  // onAuthStateChanged handles returning visits where user is already signed in
+  // licStatus === 'valid' — populate CFG from cache so badge works on reload
+  var cached = getLicCache();
+  if (cached && cached.expiry) {
+    CFG.licenseExpiry = cached.expiry;
+  }
+
+  // Proceed to Firebase auth
   AUTH().onAuthStateChanged(function(user) {
     var ld = G('vLoader'); if(ld) ld.style.display='none';
     if (!user) { hideAll(); show('vAdmLog'); return; }
@@ -4132,7 +4141,12 @@ function shuf(a){var ar=a.slice();for(var i=ar.length-1;i>0;i--){var j=Math.floo
 function renderLicBadge() {
   var el = document.getElementById('vLicBadge');
   if (!el) return;
-  var exp = (typeof CFG !== 'undefined') ? CFG.licenseExpiry : '';
+  // Use CFG first; fall back to cache (covers page-reload case where CFG not yet set)
+  var exp = (typeof CFG !== 'undefined' && CFG.licenseExpiry) ? CFG.licenseExpiry : '';
+  if (!exp) {
+    var cached = getLicCache();
+    if (cached && cached.expiry) exp = cached.expiry;
+  }
   if (!exp) {
     el.innerHTML = '\u26AA <span style="color:var(--tx3)">No licence date</span>';
     el.style.background  = 'var(--bg2)';
