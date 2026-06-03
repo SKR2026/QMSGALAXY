@@ -1764,16 +1764,24 @@ function pgDash() {
     DB().collection('attempts').where('status','==','completed').get(),
   ]).then(function(res) {
     var qS=res[0], eS=res[1], cS=res[2], aS=res[3];
-    var atts=aS.docs.map(function(d){return d.data();});
+    var atts=aS.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+    var examsMap={};
+    eS.docs.forEach(function(d){examsMap[d.id]=Object.assign({id:d.id},d.data());});
     var pass=atts.filter(function(a){return a.result==='pass';}).length;
+    var fail=atts.length-pass;
     var pr=atts.length?Math.round(pass/atts.length*100):0;
+    var avg=atts.length?(atts.reduce(function(s,a){return s+(a.percentage||0);},0)/atts.length).toFixed(1):0;
+
+    // Questions by dept bar chart
     var depts={};
     qS.docs.forEach(function(d){var dt=d.data().department||'Other';depts[dt]=(depts[dt]||0)+1;});
     var dRows = Object.entries(depts).sort(function(a,b){return b[1]-a[1];}).slice(0,8).map(function(kv){
       return '<div class="hr_"><div class="hl">'+kv[0].substring(0,10)+'</div><div class="hbg"><div class="hbf" style="width:'+Math.round(kv[1]/qS.size*100)+'%;background:var(--bl)"></div></div><div class="hv">'+kv[1]+'</div></div>';
     }).join('');
-    var exams=eS.docs.map(function(d){return Object.assign({id:d.id},d.data());}).sort(function(a,b){return (b.createdAt&&b.createdAt.seconds||0)-(a.createdAt&&a.createdAt.seconds||0);}).slice(0,6);
-    var eRows=exams.map(function(e){
+
+    // Recent exams
+    var recentExams=eS.docs.map(function(d){return Object.assign({id:d.id},d.data());}).sort(function(a,b){return (b.createdAt&&b.createdAt.seconds||0)-(a.createdAt&&a.createdAt.seconds||0);}).slice(0,6);
+    var eRows=recentExams.map(function(e){
       return '<tr><td class="tn">'+esc(e.name||'—')+'</td>'+
         '<td style="font-family:var(--mo);font-size:10px;color:var(--bl)">'+(e.examNumber||'—')+'</td>'+
         '<td>'+(e.questionSelectionMode==='topic'?'<span class="bk bt">'+esc(e.selectedTopic||e.topic||'—')+'</span><span class="bk bt" style="margin-left:3px;font-size:9px">TOPIC</span>':'<span class="bk bb">'+esc(e.department||'—')+'</span>')+'</td>'+
@@ -1781,17 +1789,136 @@ function pgDash() {
         '<td><span class="bk '+sBk(e.status)+'">'+esc(e.status||'draft')+'</span></td>'+
         '<td><button class="b bam bxs" onclick="showQR(\''+e.id+'\',\''+esc(e.name||'')+'\',\''+esc(e.department||'')+'\',\''+fmtD(e.startDateTime&&e.startDateTime.toDate())+'\',\''+fmtD(e.endDateTime&&e.endDateTime.toDate())+'\',\''+(e.durationMinutes||30)+'\')">📱 QR</button></td></tr>';
     }).join('');
+
+    // ── Grade helpers ──────────────────────────────────────────
+    var gradeKeys   = ['excellent','verygood','good','fair','poor'];
+    var gradeLabels = {excellent:'Excellent ≥90%',verygood:'Very Good 80–89%',good:'Good 70–79%',fair:'Fair 60–69%',poor:'Need Impr. <60%'};
+    var gradeColors = {excellent:'var(--gn)',verygood:'#84cc16',good:'var(--am)',fair:'#f97316',poor:'var(--rd)'};
+    var gradeBg     = {excellent:'var(--gnbg)',verygood:'rgba(132,204,22,.1)',good:'var(--ambg)',fair:'rgba(249,115,22,.1)',poor:'var(--rdbg)'};
+    var gradeBd     = {excellent:'var(--gnbd)',verygood:'rgba(132,204,22,.25)',good:'var(--ambd)',fair:'rgba(249,115,22,.25)',poor:'var(--rdbd)'};
+    function dashGradeKey(a){var p=a.percentage||0;return p>=90?'excellent':p>=80?'verygood':p>=70?'good':p>=60?'fair':'poor';}
+    function dashGradeLabel(pct){return pct>=90?'EXCELLENT':pct>=80?'VERY GOOD':pct>=70?'GOOD':pct>=60?'FAIR':'NEED IMP.';}
+
+    // ── Distribution map builder ───────────────────────────────
+    function buildDashMap(groupFn){
+      var map={};
+      atts.forEach(function(a){
+        var key=groupFn(a)||'—';
+        if(!map[key])map[key]={excellent:0,verygood:0,good:0,fair:0,poor:0,total:0};
+        map[key][dashGradeKey(a)]++;
+        map[key].total++;
+      });
+      return map;
+    }
+
+    // ── Distribution table (admin theme) ──────────────────────
+    function buildDashDistTable(map, caption, badgeText){
+      var rows=Object.keys(map).sort();
+      var totals={excellent:0,verygood:0,good:0,fair:0,poor:0,total:0};
+      rows.forEach(function(k){gradeKeys.forEach(function(g){totals[g]+=map[k][g];});totals.total+=map[k].total;});
+      var thead='<thead><tr>'+
+        '<th style="text-align:left">'+caption+'</th>'+
+        gradeKeys.map(function(g){
+          return '<th style="text-align:center"><span class="bk" style="background:'+gradeBg[g]+';color:'+gradeColors[g]+';border:1px solid '+gradeBd[g]+';font-size:9px;letter-spacing:.3px">'+gradeLabels[g]+'</span></th>';
+        }).join('')+
+        '<th style="text-align:center">Total</th></tr></thead>';
+      var tbody='<tbody>'+rows.map(function(k){
+        var c=map[k];
+        return '<tr>'+
+          '<td class="tn">'+esc(k)+'</td>'+
+          gradeKeys.map(function(g){
+            return '<td style="text-align:center;font-family:var(--mo);font-size:12px;font-weight:'+(c[g]?'700':'400')+';color:'+(c[g]?gradeColors[g]:'var(--tx3)')+'">'+( c[g]||'—')+'</td>';
+          }).join('')+
+          '<td style="text-align:center;font-family:var(--mo);font-size:12px;font-weight:700;color:var(--bl)">'+c.total+'</td>'+
+        '</tr>';
+      }).join('')+'</tbody>';
+      var tfoot='<tfoot><tr>'+
+        '<td style="font-weight:700;color:var(--tx)">TOTAL</td>'+
+        gradeKeys.map(function(g){return '<td style="text-align:center;font-family:var(--mo);font-size:12px;font-weight:700;color:'+gradeColors[g]+'">'+totals[g]+'</td>';}).join('')+
+        '<td style="text-align:center;font-family:var(--mo);font-size:12px;font-weight:700;color:var(--bl)">'+totals.total+'</td>'+
+      '</tr></tfoot>';
+      return '<div class="card" style="margin-bottom:14px">'+
+        '<div class="ch"><span class="ct">'+caption+'-wise Score Distribution</span><span class="bk bb" style="font-size:10px">'+badgeText+'</span></div>'+
+        '<div class="tw"><table style="width:100%;border-collapse:collapse;font-size:13px">'+thead+tbody+tfoot+'</table></div>'+
+      '</div>';
+    }
+
+    // ── Department Toppers ─────────────────────────────────────
+    var byDept={};
+    atts.forEach(function(a){var d=a.department||'General';if(!byDept[d])byDept[d]=[];byDept[d].push(a);});
+    var topperCards=Object.keys(byDept).sort().map(function(dept){
+      var sorted=byDept[dept].slice().sort(function(a,b){return(b.percentage||0)-(a.percentage||0);});
+      var top=sorted[0]; if(!top) return '';
+      var pct=top.percentage||0, gKey=dashGradeKey(top), gLbl=dashGradeLabel(pct);
+      var ex=examsMap[top.examId]||{};
+      var initials=(top.candidateName||'?').split(' ').map(function(n){return n[0]||'';}).join('').slice(0,2).toUpperCase();
+      return '<div style="background:var(--bg2);border:1px solid var(--bd);border-top:3px solid '+gradeColors[gKey]+';border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:4px">'+
+        '<div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--tx3)">🏆 Dept. Topper</div>'+
+        '<div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:'+gradeColors[gKey]+';margin-bottom:4px">'+esc(dept)+'</div>'+
+        '<div style="display:flex;align-items:center;gap:9px">'+
+          '<div style="width:32px;height:32px;background:var(--blbg);border:1px solid var(--bd2);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:var(--bl);flex-shrink:0">'+initials+'</div>'+
+          '<div>'+
+            '<div style="font-size:13px;font-weight:700;color:var(--tx);line-height:1.2">'+esc(top.candidateName||'—')+'</div>'+
+            '<div style="font-family:var(--mo);font-size:10px;color:var(--tx3);margin-top:1px">'+esc(top.employeeCode||'')+(top.plantLocation?' · '+top.plantLocation:'')+'</div>'+
+          '</div>'+
+        '</div>'+
+        '<div style="display:flex;align-items:center;gap:8px;margin-top:6px">'+
+          '<span style="font-size:26px;font-weight:900;letter-spacing:-1px;color:'+gradeColors[gKey]+'">'+pct+'%</span>'+
+          '<div>'+
+            '<span class="bk" style="background:'+gradeBg[gKey]+';color:'+gradeColors[gKey]+';border:1px solid '+gradeBd[gKey]+';font-size:9px">'+gLbl+'</span>'+
+            (ex.name?'<div style="font-size:10px;color:var(--tx3);margin-top:3px">'+esc(ex.name.substring(0,24))+'</div>':'')+
+          '</div>'+
+        '</div>'+
+      '</div>';
+    }).join('');
+
+    // ── Distribution maps ──────────────────────────────────────
+    var plantMap=buildDashMap(function(a){return a.plantLocation||'—';});
+    var deptMap =buildDashMap(function(a){return a.department||'—';});
+
+    // ── Render ─────────────────────────────────────────────────
     setHtml('vPgCnt',
-      '<div class="sg">'+
+      // ── Stat strip ──
+      '<div class="sg" style="grid-template-columns:repeat(6,1fr)">'+
         sc('Questions','color:var(--bl)',qS.size,Object.keys(depts).length+' depts')+
         sc('Exams','color:var(--pu)',eS.size,'total created')+
         sc('Candidates','color:var(--gn)',cS.size,'active')+
-        sc('Pass Rate','color:'+(pr>=60?'var(--gn)':'var(--rd)'),pr+'%',atts.length+' completed')+
+        sc('Responses','color:var(--te)',atts.length,'completed')+
+        sc('Pass Rate','color:'+(pr>=60?'var(--gn)':'var(--rd)'),pr+'%',pass+' passed')+
+        sc('Avg Score','color:var(--am)',avg+'%',fail+' failed')+
       '</div>'+
-      '<div style="display:grid;grid-template-columns:1.4fr 1fr;gap:14px">'+
-        '<div class="card"><div class="ch"><span class="ct">Recent Exams</span><button class="b bp bsm" onclick="goPage(\'exams\')">+ New Exam</button></div><div class="tw"><table><thead><tr><th>Name</th><th>Exam #</th><th>Dept / Mode</th><th>Start</th><th>Status</th><th>QR</th></tr></thead><tbody>'+(eRows||noRows(6,'No exams yet'))+' </tbody></table></div></div>'+
+
+      // ── Recent exams + Q by dept ──
+      '<div style="display:grid;grid-template-columns:1.4fr 1fr;gap:14px;margin-bottom:14px">'+
+        '<div class="card"><div class="ch"><span class="ct">Recent Exams</span><button class="b bp bsm" onclick="goPage(\'exams\')">+ New Exam</button></div><div class="tw"><table><thead><tr><th>Name</th><th>Exam #</th><th>Dept / Mode</th><th>Start</th><th>Status</th><th>QR</th></tr></thead><tbody>'+(eRows||noRows(6,'No exams yet'))+'</tbody></table></div></div>'+
         '<div class="card"><div class="ch"><span class="ct">Questions by Dept</span></div><div class="cb"><div class="hc">'+(dRows||'<div style="color:var(--tx3);font-size:13px">No questions yet.</div>')+'</div></div></div>'+
-      '</div>'
+      '</div>'+
+
+      // ── Performance section header ──
+      (atts.length ? (
+        '<div style="border-top:2px solid var(--bd);padding-top:18px;margin-bottom:14px">'+
+          '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:2px;color:var(--tx3);margin-bottom:4px">// Employee Performance</div>'+
+          '<div style="font-size:18px;font-weight:800;letter-spacing:-.5px;color:var(--tx);margin-bottom:2px">Organisation Analytics</div>'+
+          '<div style="font-size:12px;color:var(--tx3)">Live toppers, plant-wise & department-wise score distribution across all completed assessments.</div>'+
+        '</div>'+
+
+        // ── Toppers grid ──
+        '<div style="margin-bottom:14px">'+
+          '<div class="ch" style="padding:0 0 10px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">'+
+            '<span class="ct">Department Toppers</span>'+
+            '<span class="bk bb" style="font-size:10px">🏆 #1 Per Department</span>'+
+          '</div>'+
+          (topperCards
+            ? '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px">'+topperCards+'</div>'
+            : '<div style="color:var(--tx3);font-size:13px;padding:12px 0">No completed attempts yet.</div>'
+          )+
+        '</div>'+
+
+        // ── Distribution tables ──
+        buildDashDistTable(plantMap,'Plant',Object.keys(plantMap).length+' Plants')+
+        buildDashDistTable(deptMap,'Department',Object.keys(deptMap).length+' Depts')
+
+      ) : '')
     );
   }).catch(function(e){ setHtml('vPgCnt', errB(e.message)); });
 }
