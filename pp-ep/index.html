@@ -445,7 +445,7 @@ tr:hover td{background:rgba(255,255,255,.012);color:var(--tx)}
       <div class="ni" id="n-settings" onclick="goPage('settings')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"/></svg>Settings</div>
     </nav>
     <div class="sf">
-      <div class="uc"><div class="ua" id="vUAv">A</div><div><div style="font-size:12px;font-weight:600" id="vUNm">Admin</div><div style="font-size:10px;color:var(--tx3)">Super Admin</div></div></div>
+      <div class="uc"><div class="ua" id="vUAv">A</div><div><div style="font-size:12px;font-weight:600" id="vUNm">Admin</div><div style="font-size:10px;color:var(--tx3)" id="vURoleLbl">Super Admin</div></div></div>
       <button class="b bg w bsm" style="justify-content:center;margin-top:8px" onclick="doLogout()">Sign Out</button>
       <button class="b w bsm" style="justify-content:center;margin-top:5px;background:transparent;border-color:var(--rdbd);color:var(--rd)" onclick="resetLicGate()" title="Re-enter or change license key">🔑 Change License</button>
     </div>
@@ -1250,6 +1250,25 @@ var DEPTS  = ['Quality','Production','Maintenance','HR','SCM','Finance','EHS','E
 var PLANTS = ['Plant A','Plant B','Plant C','Head Office'];
 var TOPICS = ['Safety','ISO 9001','Fire Safety','Inventory','5S','Quality Tools','Environment','HR Policies'];
 
+// ── CURRENT LOGGED-IN ADMIN ──────────────────────────────────
+var CURRENT_USER = { role: 'super_admin', plant: '', displayName: '', email: '' };
+
+/** Returns true if the current user is a super admin */
+function isSuperAdmin() { return CURRENT_USER.role === 'super_admin'; }
+
+/** For plant admins: returns a Firestore query with plant filter added.
+ *  For super admins: returns the collection ref unfiltered. */
+function plantQuery(colRef) {
+  if (isSuperAdmin() || !CURRENT_USER.plant) return colRef;
+  return colRef.where('plantLocation', '==', CURRENT_USER.plant);
+}
+
+/** Build a plant-filter <select> option list restricted to admin's plant (or all for super admin) */
+function pOptsRestricted(sel) {
+  var list = isSuperAdmin() ? PLANTS : (CURRENT_USER.plant ? [CURRENT_USER.plant] : PLANTS);
+  return list.map(function(p){ return '<option value="'+p+'"'+(p===sel?' selected':'')+'>'+p+'</option>'; }).join('');
+}
+
 // DOM helpers — defined before anything runs
 function G(id)      { return document.getElementById(id); }
 
@@ -1699,6 +1718,12 @@ function resolveAdminUser(user) {
       if (doc.exists) {
         var d = doc.data();
         if (d.role === 'admin' || d.role === 'super_admin') {
+          // Populate CURRENT_USER global
+          CURRENT_USER.role        = d.role;
+          CURRENT_USER.plant       = d.plant || '';
+          CURRENT_USER.displayName = d.displayName || (d.email||'').split('@')[0];
+          CURRENT_USER.email       = d.email || user.email || '';
+          CURRENT_USER.uid         = user.uid;
           showAdmin(d);
         } else {
           showE('aErr', 'Account role is "' + (d.role||'not set') + '". Must be "admin" or "super_admin".');
@@ -1714,7 +1739,15 @@ function resolveAdminUser(user) {
           createdAt: firebase.firestore.FieldValue.serverTimestamp()
         }).then(function() {
           DB().collection('users').doc(user.uid).get().then(function(doc2) {
-            if (doc2.exists) showAdmin(doc2.data());
+            if (doc2.exists) {
+              var d2 = doc2.data();
+              CURRENT_USER.role        = 'super_admin';
+              CURRENT_USER.plant       = '';
+              CURRENT_USER.displayName = d2.displayName || user.email.split('@')[0];
+              CURRENT_USER.email       = d2.email || user.email;
+              CURRENT_USER.uid         = user.uid;
+              showAdmin(d2);
+            }
           });
         }).catch(function(err2) {
           showE('aErr', 'Could not create profile: ' + err2.message);
@@ -1740,6 +1773,26 @@ function showAdmin(d) {
   var av = nm.split(' ').map(function(n){return n[0];}).join('').slice(0,2).toUpperCase();
   setTx('vUAv', av);
   setTx('vUNm', d.displayName || (d.email||'').split('@')[0] || 'Admin');
+
+  // Show role label and plant in sidebar footer
+  var roleEl = document.getElementById('vURoleLbl');
+  if (roleEl) {
+    if (isSuperAdmin()) {
+      roleEl.textContent = '⭐ Super Admin';
+      roleEl.style.color = 'var(--am)';
+    } else {
+      roleEl.textContent = '🏭 Admin — ' + (CURRENT_USER.plant || 'All Plants');
+      roleEl.style.color = 'var(--te)';
+    }
+  }
+
+  // Settings nav visible to all — content is role-restricted inside pgSettings
+  var settingsNav = document.getElementById('n-settings');
+  if (settingsNav) settingsNav.style.display = '';
+
+  // Hide Certificates nav for plant admins? No — let them see their plant's certs.
+  // Certificates page will be filtered by plant automatically.
+
   renderLicBadge();
   loadNotifications();
   goPage('dashboard');
@@ -1771,10 +1824,10 @@ function goPage(p) {
 function pgDash() {
   setHtml('vPgCnt', loading());
   Promise.all([
-    DB().collection('questions').where('isActive','==',true).get(),
-    DB().collection('exams').get(),
-    DB().collection('candidates').where('isActive','==',true).get(),
-    DB().collection('attempts').where('status','==','completed').get(),
+    plantQuery(DB().collection('questions').where('isActive','==',true)).get(),
+    plantQuery(DB().collection('exams')).get(),
+    plantQuery(DB().collection('candidates').where('isActive','==',true)).get(),
+    plantQuery(DB().collection('attempts').where('status','==','completed')).get(),
   ]).then(function(res) {
     var qS=res[0], eS=res[1], cS=res[2], aS=res[3];
     var atts=aS.docs.map(function(d){return Object.assign({id:d.id},d.data());});
@@ -1865,23 +1918,18 @@ function pgDash() {
       var pct=top.percentage||0, gKey=dashGradeKey(top), gLbl=dashGradeLabel(pct);
       var ex=examsMap[top.examId]||{};
       var initials=(top.candidateName||'?').split(' ').map(function(n){return n[0]||'';}).join('').slice(0,2).toUpperCase();
+      // Use department name from DEPTS master (exact casing), fall back to stored value
+      var deptDisplay = (DEPTS.indexOf(dept) > -1) ? dept : dept;
       return '<div style="background:var(--bg2);border:1px solid var(--bd);border-top:3px solid '+gradeColors[gKey]+';border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:4px">'+
-        '<div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--tx3)">🏆 Dept. Topper</div>'+
-        '<div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:'+gradeColors[gKey]+';margin-bottom:4px">'+esc(dept)+'</div>'+
-        '<div style="display:flex;align-items:center;gap:9px">'+
-          '<div style="width:32px;height:32px;background:var(--blbg);border:1px solid var(--bd2);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:var(--bl);flex-shrink:0">'+initials+'</div>'+
-          '<div>'+
-            '<div style="font-size:13px;font-weight:700;color:var(--tx);line-height:1.2">'+esc(top.candidateName||'—')+'</div>'+
-            '<div style="font-family:var(--mo);font-size:10px;color:var(--tx3);margin-top:1px">'+esc(top.employeeCode||'')+(top.plantLocation?' · '+top.plantLocation:'')+'</div>'+
-          '</div>'+
+        '<div style="font-family:\'IBM Plex Mono\',monospace;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:2px;color:var(--tx3)">🏆 DEPT. TOPPER</div>'+
+        '<div style="font-family:\'IBM Plex Mono\',monospace;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--tx3);margin-bottom:4px">'+esc(deptDisplay)+'</div>'+
+        '<div style="font-family:\'Bebas Neue\',sans-serif;font-size:22px;letter-spacing:1px;color:var(--tx);line-height:1;margin-bottom:2px">'+esc(top.candidateName||'—')+'</div>'+
+        '<div style="font-family:\'IBM Plex Mono\',monospace;font-size:10px;color:var(--tx3);letter-spacing:.5px;margin-bottom:8px">'+esc(top.employeeCode||'')+(top.plantLocation?' &nbsp;|&nbsp; '+top.plantLocation:'')+'</div>'+
+        '<div style="display:flex;align-items:baseline;gap:8px;margin-top:2px">'+
+          '<span style="font-family:\'Bebas Neue\',sans-serif;font-size:34px;letter-spacing:-1px;line-height:1;color:'+gradeColors[gKey]+'">'+pct+'%</span>'+
+          '<span style="font-family:\'IBM Plex Mono\',monospace;font-size:9px;font-weight:600;letter-spacing:2px;padding:2px 8px;border-radius:2px;background:'+gradeBg[gKey]+';color:'+gradeColors[gKey]+';border:1px solid '+gradeBd[gKey]+'">'+gLbl+'</span>'+
         '</div>'+
-        '<div style="display:flex;align-items:center;gap:8px;margin-top:6px">'+
-          '<span style="font-size:26px;font-weight:900;letter-spacing:-1px;color:'+gradeColors[gKey]+'">'+pct+'%</span>'+
-          '<div>'+
-            '<span class="bk" style="background:'+gradeBg[gKey]+';color:'+gradeColors[gKey]+';border:1px solid '+gradeBd[gKey]+';font-size:9px">'+gLbl+'</span>'+
-            (ex.name?'<div style="font-size:10px;color:var(--tx3);margin-top:3px">'+esc(ex.name.substring(0,24))+'</div>':'')+
-          '</div>'+
-        '</div>'+
+        (ex.name?'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:9px;color:var(--tx3);letter-spacing:.5px;margin-top:4px;line-height:1.6">'+esc(ex.name.substring(0,28))+'</div>':'')+
       '</div>';
     }).join('');
 
@@ -2322,7 +2370,7 @@ function printQR(id, name, dept, start, end, dur, url) {
 function pgQ() {
   setHtml('vPgAct','<button class="b bg bsm" onclick="dlQTpl()">⬇ Template</button><button class="b bg bsm" onclick="impQXls()">⬆ Import</button><button class="b bg bsm" onclick="expQXls()">📊 Excel</button><button class="b bg bsm" onclick="expQPdf()">📄 PDF</button><button class="b bp bsm" onclick="addQMo()">+ Add Question</button>');
   setHtml('vPgCnt', loading());
-  DB().collection('questions').where('isActive','==',true).get()
+  plantQuery(DB().collection('questions').where('isActive','==',true)).get()
     .then(function(snap) {
       var qs = snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
       qs.sort(function(a,b){ return (b.createdAt&&b.createdAt.seconds||0)-(a.createdAt&&a.createdAt.seconds||0); });
@@ -2881,7 +2929,10 @@ function pgExams() {
     '<button class="b bp bsm" onclick="addExamMo()">+ Create Exam</button>'
   );
   setHtml('vPgCnt', loading());
-  DB().collection('exams').orderBy('createdAt','desc').get().then(function(snap){
+  (isSuperAdmin()
+    ? DB().collection('exams').orderBy('createdAt','desc').get()
+    : DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get()
+  ).then(function(snap){
     var exams=snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
     window._exams=exams;
     var depts=[];
@@ -3232,6 +3283,10 @@ function addExamMo() {
   /* ── Basic Info ── */
   '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--tx3);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--bd)">📋 Basic Information</div>'+
   '<div class="fg"><label class="fl">Exam / Topic Name *</label><input class="fi" id="eN" placeholder="e.g. Safety Compliance 2026 — Q2 Review"></div>'+
+  (isSuperAdmin()
+    ? '<div class="fg"><label class="fl">Plant / Location</label><select class="fi fsel" id="ePlant"><option value="">— All Plants —</option>'+pOpts()+'</select></div>'
+    : '<div class="fg"><label class="fl">Plant / Location</label><div class="fi" style="opacity:.7;cursor:not-allowed">'+esc(CURRENT_USER.plant||'—')+'</div></div>'
+  )+
   '<div style="background:var(--blbg);border:1px solid rgba(79,142,247,.2);border-radius:7px;padding:8px 11px;font-size:12px;color:var(--bl);margin-bottom:10px">ℹ️ A unique <strong>Exam Number</strong> (EXAM-YYYY-XXXX) will be auto-generated and displayed on question papers, certificates, results, and all reports.</div>'+
 
   '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--tx3);margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--bd)">🗂️ Question Selection Mode</div>'+
@@ -3424,6 +3479,7 @@ function saveExam() {
     examNumber: examNum,
     topic: val('eTop'),
     department: val('eDt'),
+    plantLocation: !isSuperAdmin() ? CURRENT_USER.plant : (val('ePlant')||''),
     questionSelectionMode: qSelMode,
     selectedTopic: qSelMode==='topic' ? val('eTopSel') : null,
     passingMarks: parseInt(val('ePa'))||60,
@@ -3511,7 +3567,7 @@ function doAssign(cid, eid, cname, ecode, ename) {
 function pgCands() {
   setHtml('vPgAct','<button class="b bg bsm" onclick="dlCandTpl()">⬇ Template</button><button class="b bg bsm" onclick="impCandXls()">⬆ Import</button><button class="b bp bsm" onclick="addCandMo()">+ Add</button>');
   setHtml('vPgCnt',loading());
-  DB().collection('candidates').where('isActive','==',true).get().then(function(snap){
+  plantQuery(DB().collection('candidates').where('isActive','==',true)).get().then(function(snap){
     var cs=snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
     cs.sort(function(a,b){ return (a.name||'').localeCompare(b.name||''); });
     window._cands=cs;
@@ -3600,11 +3656,12 @@ function saveEditCand(id) {
     .catch(function(e){toast('Error: '+e.message,'er');});
 }
 function addCandMo() {
+  var plantDisabled = !isSuperAdmin() && CURRENT_USER.plant ? ' disabled style="opacity:.7"' : '';
   openMo('Add Candidate',
     '<div class="fr"><div class="fg"><label class="fl">Employee Code *</label><input class="fi" id="cCd" placeholder="EMP-001"></div>'+
     '<div class="fg"><label class="fl">Full Name *</label><input class="fi" id="cNm" placeholder="John Doe"></div></div>'+
     '<div class="fr"><div class="fg"><label class="fl">Department</label><select class="fi fsel" id="cDp"><option value="">— Select —</option>'+dOpts()+'</select></div>'+
-    '<div class="fg"><label class="fl">Plant / Location</label><select class="fi fsel" id="cPl"><option value="">— Select —</option>'+pOpts()+'</select></div></div>'+
+    '<div class="fg"><label class="fl">Plant / Location</label><select class="fi fsel" id="cPl"'+plantDisabled+'><option value="">— Select —</option>'+pOptsRestricted(CURRENT_USER.plant||'')+'</select></div></div>'+
     '<div class="fr"><div class="fg"><label class="fl">Designation</label><input class="fi" id="cDg" placeholder="Engineer"></div>'+
     '<div class="fg"><label class="fl">Phone</label><input class="fi" id="cPh" placeholder="+91 9876543210"></div></div>'+
     '<div class="fg"><label class="fl">Email Address <span style="color:var(--tx3);font-weight:400">(used for exam invitations)</span></label>'+
@@ -3618,7 +3675,9 @@ function saveCand() {
   DB().collection('candidates').where('employeeCode','==',code).get().then(function(ex){
     if(!ex.empty){toast('Employee Code already exists','er');return;}
     DB().collection('candidates').add({employeeCode:code,name:name,
-      department:val('cDp'),plantLocation:val('cPl'),designation:val('cDg'),phone:val('cPh'),email:val('cEm'),
+      department:val('cDp'),
+      plantLocation: !isSuperAdmin() && CURRENT_USER.plant ? CURRENT_USER.plant : val('cPl'),
+      designation:val('cDg'),phone:val('cPh'),email:val('cEm'),
       isActive:true,createdAt:firebase.firestore.FieldValue.serverTimestamp()})
       .then(function(){closeMo();toast('Added!','ok');pgCands();})
       .catch(function(e){toast('Error: '+e.message,'er');});
@@ -3636,10 +3695,10 @@ function pgResults() {
   );
   setHtml('vPgCnt',loading());
   Promise.all([
-    DB().collection('exams').get(),
-    DB().collection('attempts').get(),
-    DB().collection('candidates').get(),
-    DB().collection('questions').where('isActive','==',true).get()
+    isSuperAdmin() ? DB().collection('exams').get() : DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get(),
+    plantQuery(DB().collection('attempts')).get(),
+    plantQuery(DB().collection('candidates')).get(),
+    plantQuery(DB().collection('questions').where('isActive','==',true)).get()
   ]).then(function(res){
     var exams={}, cands={}, questions={};
     res[0].docs.forEach(function(d){exams[d.id]=d.data();});
@@ -3906,6 +3965,26 @@ function buildDetailedResults(atts,exams,cands) {
     return '<option value="'+id+'">'+esc(detailExamIds[id])+'</option>';
   }).join('');
 
+  // Build plant filter options from PLANTS master + any extra values in data
+  var usedPlants = {};
+  atts.forEach(function(a){ var p=a.plantLocation||''; if(p) usedPlants[p]=1; });
+  var allPlants = PLANTS.slice();
+  Object.keys(usedPlants).forEach(function(p){ if(allPlants.indexOf(p)===-1) allPlants.push(p); });
+  allPlants.sort();
+  var detailPlantOpts = '<option value="">All Plants</option>' + allPlants.map(function(p){
+    return '<option value="'+p.toLowerCase()+'">'+esc(p)+'</option>';
+  }).join('');
+
+  // Build department filter options from DEPTS master + any extra values in data
+  var usedDepts = {};
+  atts.forEach(function(a){ var d=a.department||''; if(d) usedDepts[d]=1; });
+  var allDepts = DEPTS.slice();
+  Object.keys(usedDepts).forEach(function(d){ if(allDepts.indexOf(d)===-1) allDepts.push(d); });
+  allDepts.sort();
+  var detailDeptOpts = '<option value="">All Departments</option>' + allDepts.map(function(d){
+    return '<option value="'+d.toLowerCase()+'">'+esc(d)+'</option>';
+  }).join('');
+
   var rows=atts.map(function(a,i){
     var ex=exams[a.examId]||{},cd=cands[a.candidateId]||{};
     var empCode = a.employeeCode||cd.employeeCode||'\u2014';
@@ -3924,7 +4003,9 @@ function buildDetailedResults(atts,exams,cands) {
       date: fmtD(a.submittedAt&&(a.submittedAt.toDate?a.submittedAt.toDate():new Date(a.submittedAt))),
       certNo: a.certNo||('CERT-'+new Date().getFullYear()+'-'+(ex.department||'GEN').substring(0,3).toUpperCase()+'-'+(a.employeeCode||'XXX')+'-'+rnd())
     };
-    return '<tr class="drRow" data-exam="'+esc(a.examId||'')+'" data-code="'+esc(empCode.toLowerCase())+'">'+
+    var rowPlant = (a.plantLocation||cd.plantLocation||'').toLowerCase();
+    var rowDept  = (a.department||ex.department||'').toLowerCase();
+    return '<tr class="drRow" data-exam="'+esc(a.examId||'')+'" data-code="'+esc(empCode.toLowerCase())+'" data-plant="'+esc(rowPlant)+'" data-dept="'+esc(rowDept)+'">'+
       '<td style="text-align:center"><input type="checkbox" class="drChk" data-id="'+esc(a.id)+'" onchange="drChkChange()" style="accent-color:var(--bl);width:14px;height:14px;cursor:pointer"></td>'+
       '<td style="text-align:center;font-weight:700;color:var(--am)">'+(i+1)+'</td>'+
       '<td class="tc"><button class="ob" style="font-family:var(--mo);font-size:11px;font-weight:700;color:var(--bl);text-decoration:underline;text-underline-offset:2px;cursor:pointer;padding:0;background:none;border:none" onclick="showAttemptDetail(\''+a.id+'\')">'+esc(empCode)+'</button></td>'+
@@ -3948,7 +4029,9 @@ function buildDetailedResults(atts,exams,cands) {
       '<span class="bk ba" id="drCompletedBadge" style="font-size:10px">'+atts.length+' completed</span>'+
       '<div style="margin-left:auto;display:flex;gap:7px;align-items:center;flex-wrap:wrap">'+
         '<select class="fi fsel" id="drExamFilter" style="width:160px;font-size:12px" onchange="drApplyFilters()">'+detailExamOpts+'</select>'+
-        '<input class="fi" id="drCodeSearch" placeholder="🔍 Employee Code..." style="width:150px;font-size:12px" oninput="drApplyFilters()">'+
+        '<select class="fi fsel" id="drPlantFilter" style="width:140px;font-size:12px" onchange="drApplyFilters()">'+detailPlantOpts+'</select>'+
+        '<select class="fi fsel" id="drDeptFilter" style="width:150px;font-size:12px" onchange="drApplyFilters()">'+detailDeptOpts+'</select>'+
+        '<input class="fi" id="drCodeSearch" placeholder="🔍 Employee Code..." style="width:140px;font-size:12px" oninput="drApplyFilters()">'+
         '<button id="drDelSelBtn" class="b bd_ bsm h" onclick="drDelSelected()">\uD83D\uDDD1 Delete Selected</button>'+
       '</div>'+
     '</div>'+
@@ -3962,13 +4045,17 @@ function buildDetailedResults(atts,exams,cands) {
 }
 
 function drApplyFilters() {
-  var examVal = (document.getElementById('drExamFilter')||{}).value || '';
-  var codeVal = ((document.getElementById('drCodeSearch')||{}).value||'').toLowerCase().trim();
+  var examVal  = (document.getElementById('drExamFilter')||{}).value || '';
+  var plantVal = (document.getElementById('drPlantFilter')||{}).value || '';
+  var deptVal  = (document.getElementById('drDeptFilter')||{}).value || '';
+  var codeVal  = ((document.getElementById('drCodeSearch')||{}).value||'').toLowerCase().trim();
   var visibleCount = 0;
   document.querySelectorAll('.drRow').forEach(function(tr){
-    var examMatch = !examVal || tr.getAttribute('data-exam') === examVal;
-    var codeMatch = !codeVal || (tr.getAttribute('data-code')||'').indexOf(codeVal) > -1;
-    var show = examMatch && codeMatch;
+    var examMatch  = !examVal  || tr.getAttribute('data-exam')  === examVal;
+    var plantMatch = !plantVal || (tr.getAttribute('data-plant')||'') === plantVal;
+    var deptMatch  = !deptVal  || (tr.getAttribute('data-dept')||'')  === deptVal;
+    var codeMatch  = !codeVal  || (tr.getAttribute('data-code')||'').indexOf(codeVal) > -1;
+    var show = examMatch && plantMatch && deptMatch && codeMatch;
     tr.style.display = show ? '' : 'none';
     if (show) visibleCount++;
   });
@@ -4169,7 +4256,10 @@ function expXls() {
 // ── CERTIFICATES ──────────────────────────────────────────────
 function pgCerts() {
   setHtml('vPgCnt',loading());
-  Promise.all([DB().collection('attempts').where('status','==','completed').get(),DB().collection('exams').get()])
+  Promise.all([
+    plantQuery(DB().collection('attempts').where('status','==','completed')).get(),
+    isSuperAdmin() ? DB().collection('exams').get() : DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get()
+  ])
     .then(function(res){
       var exams={};res[1].docs.forEach(function(d){exams[d.id]=d.data();});
       var atts=res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());});
@@ -4300,7 +4390,7 @@ function dlCert(d) {
   .body{ padding:4mm 10mm 3mm; flex:1; display:flex; flex-direction:column; }
   .cert-intro{
     font-family:'IBM Plex Mono',monospace;
-    font-size:7pt; letter-spacing:3px; text-transform:uppercase; color:#111; margin-bottom:1mm;
+    font-size:7pt; letter-spacing:3px; text-transform:uppercase; color:#777; margin-bottom:1mm;
   }
   .cert-heading{
     font-family:'Bebas Neue',sans-serif;
@@ -4309,7 +4399,7 @@ function dlCert(d) {
   }
   .presented{
     font-family:'IBM Plex Sans',sans-serif;
-    font-size:8.5pt; color:#222; margin-bottom:1mm; font-style:italic;
+    font-size:8.5pt; color:#555; margin-bottom:1mm; font-style:italic;
   }
   .emp-name{
     font-family:'Bebas Neue',sans-serif;
@@ -4318,18 +4408,18 @@ function dlCert(d) {
   }
   .emp-id{
     font-family:'IBM Plex Mono',monospace;
-    font-size:7.5pt; letter-spacing:2px; color:#333; margin-bottom:2mm;
+    font-size:7.5pt; letter-spacing:2px; color:#888; margin-bottom:2mm;
   }
   .cert-participation{
     font-family:'IBM Plex Sans',sans-serif;
-    font-size:8.5pt; color:#222; margin-bottom:3mm; font-style:italic;
+    font-size:8.5pt; color:#444; margin-bottom:3mm; font-style:italic;
   }
   .info-row{ display:flex; gap:0; margin-bottom:3mm; border:1px solid #e0e0e0; flex-shrink:0; }
   .info-cell{ flex:1; padding:2.5mm 4mm; border-right:1px solid #e0e0e0; }
   .info-cell:last-child{ border-right:none; }
   .info-lbl{
     font-family:'IBM Plex Mono',monospace;
-    font-size:5.5pt; color:#111; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:0.5mm;
+    font-size:5.5pt; color:#aaa; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:0.5mm;
   }
   .info-val{
     font-family:'IBM Plex Sans',sans-serif;
@@ -4362,14 +4452,14 @@ function dlCert(d) {
   }
   .footer{ display:flex; justify-content:space-between; align-items:flex-end; padding:0 6mm; flex-shrink:0; margin-top:auto; }
   .sig{ text-align:center; width:58mm; }
-  .sig-line{ border-top:1.5px solid #333; margin-bottom:1.5mm; }
+  .sig-line{ border-top:1.5px solid #555; margin-bottom:1.5mm; }
   .sig-name{
     font-family:'IBM Plex Sans',sans-serif;
     font-size:7.5pt; color:#222; font-weight:600; letter-spacing:0.5px;
   }
   .sig-title{
     font-family:'IBM Plex Mono',monospace;
-    font-size:6pt; color:#111; letter-spacing:0.5px; margin-top:0.5mm;
+    font-size:6pt; color:#777; letter-spacing:0.5px; margin-top:0.5mm;
   }
   .seal-centre{ text-align:center; }
   .seal-outer-ring{
@@ -4402,7 +4492,7 @@ function dlCert(d) {
   }
   .seal-date{
     font-family:'IBM Plex Mono',monospace;
-    font-size:6pt; color:#111; margin-top:1mm;
+    font-size:6pt; color:#888; margin-top:1mm;
   }
   /* QR block — in-flow, right-aligned under score-band, no border */
   .qr-block{
@@ -4413,7 +4503,7 @@ function dlCert(d) {
     padding-right:0;
   }
   .qr-box{
-    width:21mm; height:21mm;
+    width:28mm; height:28mm;
     background:#fff;
     display:flex; align-items:center; justify-content:center;
   }
@@ -4426,7 +4516,7 @@ function dlCert(d) {
   }
   .qr-info{
     font-family:'IBM Plex Mono',monospace;
-    font-size:4pt; color:#111; text-align:right; max-width:26mm; line-height:1.4;
+    font-size:4pt; color:#aaa; text-align:right; max-width:26mm; line-height:1.4;
   }
 </style></head><body>
 
@@ -4438,7 +4528,7 @@ function dlCert(d) {
   <div class="cert-wrap">
 
     <div class="header">
-      ${(CFG.mainLogoDataUrl||logoSrc) ? '<div style="background:#fff;border-radius:10px;padding:2mm;display:inline-flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.18);">' +   '<img src="' + (CFG.mainLogoDataUrl||logoSrc) + '" alt="Logo" style="width:50mm;height:auto;object-fit:contain;display:block;">' + '</div>' : '<div style="background:#fff;border-radius:10px;padding:6px 14px;display:inline-flex;align-items:center;box-shadow:0 2px 8px rgba(0,0,0,0.18);">' +     '<span style=\'font-family:Bebas Neue,sans-serif;font-size:18pt;color:' + accent + ';letter-spacing:2px;line-height:1;\'>' + (CFG.company||'POLYPLASTICS') + '</span>' +   '</div>'}
+      ${(CFG.mainLogoDataUrl||logoSrc) ? '<div style="background:#fff;border-radius:10px;padding:5px 12px;display:inline-flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.18);min-width:56px;min-height:40px;">' +   '<img src="' + (CFG.mainLogoDataUrl||logoSrc) + '" alt="Logo" style="height:32px;width:auto;max-width:140px;object-fit:contain;display:block;">' + '</div>' : '<div style="background:#fff;border-radius:10px;padding:6px 14px;display:inline-flex;align-items:center;box-shadow:0 2px 8px rgba(0,0,0,0.18);">' +     '<span style=\'font-family:Bebas Neue,sans-serif;font-size:17pt;color:' + accent + ';letter-spacing:2px;line-height:1;\'>' + (CFG.company||'POLYPLASTICS') + '</span>' +   '</div>'}
       <div class="header-right">
         <div class="cert-type">Assessment Certificate</div>
         <div class="cert-ref">Emp ID: ${empId} &nbsp;·&nbsp; Date: ${today}</div>
@@ -4532,8 +4622,7 @@ function dlCert(d) {
         <div class="sig">
           <div class="sig-line"></div>
           <div class="sig-name">${CFG.certMD || 'Kapil Gupta'}</div>
-          <div class="sig-title">${CFG.certMDTitle || 'Jt. Managing Director'}</div>
-          <div class="sig-title">${CFG.company || 'Polyplastics Industries (I) Pvt. Ltd.'}</div>
+          <div class="sig-title">${CFG.certMDTitle || 'Jt. Managing Director'} | ${CFG.company || 'Polyplastics Industries India Pvt. Ltd.'}</div>
         </div>
       </div>
     </div>
@@ -4556,7 +4645,7 @@ window.onload = function() {
 
   new QRCode(document.getElementById('qr-canvas-wrap'), {
     text: qrData,
-    width: 83, height: 83,
+    width: 110, height: 110,
     colorDark: '#000000',
     colorLight: '#ffffff',
     correctLevel: QRCode.CorrectLevel.L
@@ -4580,6 +4669,11 @@ window.onload = function() {
 
 // ── SETTINGS ─────────────────────────────────────────────────
 function pgSettings() {
+  if (!isSuperAdmin()) {
+    // Plant admins only get limited settings (password change is in topbar)
+    renderPlantAdminSettings();
+    return;
+  }
   renderSettings();
 }
 function renderSettings() {
@@ -4657,7 +4751,10 @@ function renderSettings() {
 
       // ── Main Logo upload (prominent, white-bg on certificate) ──
       '<div style="margin-bottom:18px;padding:14px 16px;background:var(--bg3);border:1px solid var(--bd);border-radius:10px">'+ 
-        '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--tx3);margin-bottom:10px">🏢 Main Company Logo — Certificate Header</div>'+
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">'+
+          '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--tx3)">🏢 Main Company Logo — Certificate Header</div>'+
+          '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd);font-size:10px">⭐ Super Admin Only</span>'+
+        '</div>'+
         '<div style="display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap">'+
           // Preview box — white bg with rounded corners (mirrors certificate appearance)
           '<div style="flex-shrink:0;text-align:center">'+
@@ -4687,6 +4784,7 @@ function renderSettings() {
         // Logo
         '<div style="flex-shrink:0;text-align:center">'+
           '<div style="font-size:11px;font-weight:700;color:var(--tx2);margin-bottom:5px;text-transform:uppercase;letter-spacing:.4px">Company Logo</div>'+
+          '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd);font-size:9px;margin-bottom:5px;display:inline-block">⭐ Super Admin Only</span>'+
           '<div id="vLogoPreview" style="width:80px;height:80px;border:2px dashed var(--bd2);border-radius:10px;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--bg3)">'+
             (CFG.logoDataUrl ? '<img src="'+CFG.logoDataUrl+'" style="max-width:100%;max-height:100%;object-fit:contain">' : '<span style="font-size:28px;color:var(--tx3)">🏢</span>')+
           '</div>'+
@@ -4697,6 +4795,7 @@ function renderSettings() {
         // Seal
         '<div style="flex-shrink:0;text-align:center">'+
           '<div style="font-size:11px;font-weight:700;color:var(--tx2);margin-bottom:5px;text-transform:uppercase;letter-spacing:.4px">Official Seal</div>'+
+          '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd);font-size:9px;margin-bottom:5px;display:inline-block">⭐ Super Admin Only</span>'+
           '<div id="vSealPreview" style="width:80px;height:80px;border:2px dashed var(--bd2);border-radius:50%;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--bg3)">'+
             (CFG.sealDataUrl ? '<img src="'+CFG.sealDataUrl+'" style="max-width:100%;max-height:100%;object-fit:contain">' : '<span style="font-size:28px;color:var(--tx3)">🔏</span>')+
           '</div>'+
@@ -4810,6 +4909,19 @@ function renderSettings() {
       'ℹ️ All changes save to Firestore instantly and appear in all dropdowns immediately.'+
     '</div>'+
 
+    // ── User Management (Super Admin) ──
+    '<div style="max-width:820px;margin-top:20px">'+
+    '<div class="card"><div class="ch">'+
+      '<span class="ct">👥 Admin User Management</span>'+
+      '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd);font-size:10px">⭐ Super Admin Only</span>'+
+    '</div><div class="cb">'+
+      '<div style="font-size:12px;color:var(--tx2);margin-bottom:12px;line-height:1.6">'+
+        'Create Plant Admin accounts — each admin can only see and manage data for their assigned plant. '+
+        'Super Admin has access to all plants. Logo and Seal on certificates are Super Admin–only.'+
+      '</div>'+
+      '<div id="vUserMgmtSection">Loading...</div>'+
+    '</div></div></div>'+
+
     // ── Data Management ──
     '<div style="max-width:820px;margin-top:20px">'+
     '<div class="card" style="border:1.5px solid var(--rdbd)">'+
@@ -4869,6 +4981,197 @@ function renderSettings() {
     '</div></div>'
   );
 }
+// ── PLANT ADMIN SETTINGS (limited view) ──────────────────────
+function renderPlantAdminSettings() {
+  setHtml('vPgCnt',
+    '<div style="max-width:820px">'+
+    '<div style="background:var(--blbg);border:1px solid rgba(79,142,247,.2);border-radius:9px;padding:12px 15px;font-size:13px;color:var(--bl);margin-bottom:16px">'+
+      '🏭 You are logged in as <strong>Plant Admin — '+esc(CURRENT_USER.plant||'All Plants')+'</strong>. '+
+      'Full system settings are managed by the Super Admin.'+
+    '</div>'+
+
+    // Certificate Text Settings (admins CAN edit these)
+    '<div class="card" style="margin-bottom:16px"><div class="ch">'+
+      '<span class="ct">📄 Certificate Text Settings</span>'+
+      '<span class="bk bg_" style="font-size:10px">✏️ Editable by Admins</span>'+
+    '</div><div class="cb">'+
+      '<div class="fr">'+
+        '<div class="fg"><label class="fl">Certificate Pass Title</label>'+
+          '<input class="fi" id="cfgCertPassTitle" value="'+esc(CFG.certPassTitle||'CERTIFICATE OF ASSESSMENT')+'" placeholder="Title for passing candidates"></div>'+
+        '<div class="fg"><label class="fl">Certificate Fail Title</label>'+
+          '<input class="fi" id="cfgCertFailTitle" value="'+esc(CFG.certFailTitle||'CERTIFICATE OF ASSESSMENT')+'" placeholder="Title for failing candidates"></div>'+
+      '</div>'+
+      '<div class="fr">'+
+        '<div class="fg"><label class="fl">Intro Text</label>'+
+          '<input class="fi" id="cfgCertIntro" value="'+esc(CFG.certIntro||'This is to certify that')+'" placeholder="This is to certify that"></div>'+
+        '<div class="fg"><label class="fl">Event Title on Certificate</label>'+
+          '<input class="fi" id="cfgCertEventTitle" value="'+esc(CFG.certEventTitle||'')+'" placeholder="Annual Training Assessment 2026"></div>'+
+      '</div>'+
+      '<div class="fg"><label class="fl">Pass Body Text</label>'+
+        '<input class="fi" id="cfgCertPassBody" value="'+esc(CFG.certPassBody||'')+'" placeholder="has successfully participated..."></div>'+
+      '<div class="fg"><label class="fl">Fail Body Text</label>'+
+        '<input class="fi" id="cfgCertFailBody" value="'+esc(CFG.certFailBody||'')+'" placeholder="has participated..."></div>'+
+      '<div class="fr">'+
+        '<div class="fg"><label class="fl">Signatory Name</label>'+
+          '<input class="fi" id="cfgCertSign" value="'+esc(CFG.certSignatory||'')+'" placeholder="Signatory name"></div>'+
+        '<div class="fg"><label class="fl">Signatory Title</label>'+
+          '<input class="fi" id="cfgCertSignTitle" value="'+esc(CFG.certSignatoryTitle||'')+'" placeholder="Head - QMS"></div>'+
+      '</div>'+
+      '<div class="fr">'+
+        '<div class="fg"><label class="fl">MD/Director Name</label>'+
+          '<input class="fi" id="cfgCertMD" value="'+esc(CFG.certMD||'')+'" placeholder="Managing Director name"></div>'+
+        '<div class="fg"><label class="fl">MD/Director Title</label>'+
+          '<input class="fi" id="cfgCertMDTitle" value="'+esc(CFG.certMDTitle||'')+'" placeholder="Jt. Managing Director"></div>'+
+      '</div>'+
+      '<div class="fg"><label class="fl">Footer Note</label>'+
+        '<input class="fi" id="cfgCertFooter" value="'+esc(CFG.certFooter||'')+'" placeholder="Optional footer text"></div>'+
+      '<div style="background:var(--ambg);border:1px solid var(--ambd);border-radius:7px;padding:9px 12px;font-size:12px;color:var(--am);margin-bottom:12px">'+
+        '⭐ <strong>Logo, Seal, and Organisation Subtitle</strong> on certificates are managed by the Super Admin only.'+
+      '</div>'+
+      '<button class="b bp bsm" onclick="saveCertTextSettings()">💾 Save Certificate Settings</button>'+
+    '</div></div>'+
+
+    // Change Password
+    '<div class="card"><div class="ch"><span class="ct">🔒 Account Security</span></div><div class="cb">'+
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">'+
+        '<div>'+
+          '<div style="font-size:13px;font-weight:600;color:var(--tx)">Change Password</div>'+
+          '<div style="font-size:12px;color:var(--tx3)">Update your admin login password.</div>'+
+        '</div>'+
+        '<button class="b bp bsm" onclick="openChangePwdModal()">🔒 Change Password</button>'+
+      '</div>'+
+    '</div></div>'+
+    '</div>'
+  );
+  // Populate User Management table asynchronously
+  setTimeout(renderUserMgmt, 50);
+}
+
+/** Save only cert text fields (accessible by plant admins too) */
+function saveCertTextSettings() {
+  CFG.certPassTitle      = val('cfgCertPassTitle') || CFG.certPassTitle;
+  CFG.certFailTitle      = val('cfgCertFailTitle') || CFG.certFailTitle;
+  CFG.certIntro          = val('cfgCertIntro')     || CFG.certIntro;
+  CFG.certEventTitle     = val('cfgCertEventTitle')|| CFG.certEventTitle;
+  CFG.certPassBody       = val('cfgCertPassBody')  || CFG.certPassBody;
+  CFG.certFailBody       = val('cfgCertFailBody')  || CFG.certFailBody;
+  CFG.certSignatory      = val('cfgCertSign')      !== undefined ? val('cfgCertSign') : CFG.certSignatory;
+  CFG.certSignatoryTitle = val('cfgCertSignTitle') || CFG.certSignatoryTitle;
+  CFG.certMD             = val('cfgCertMD')        !== undefined ? val('cfgCertMD') : CFG.certMD;
+  CFG.certMDTitle        = val('cfgCertMDTitle')   || CFG.certMDTitle;
+  CFG.certFooter         = val('cfgCertFooter');
+  DB().collection('settings').doc('config').set({
+    certPassTitle: CFG.certPassTitle, certFailTitle: CFG.certFailTitle,
+    certIntro: CFG.certIntro, certEventTitle: CFG.certEventTitle,
+    certPassBody: CFG.certPassBody, certFailBody: CFG.certFailBody,
+    certSignatory: CFG.certSignatory, certSignatoryTitle: CFG.certSignatoryTitle,
+    certMD: CFG.certMD, certMDTitle: CFG.certMDTitle, certFooter: CFG.certFooter
+  }, {merge:true})
+    .then(function(){ toast('Certificate settings saved!','ok'); })
+    .catch(function(e){ toast('Error: '+e.message,'er'); });
+}
+
+// ── USER MANAGEMENT (Super Admin) ────────────────────────────
+function renderUserMgmt() {
+  var umEl = G('vUserMgmtSection');
+  if (!umEl) return;
+  setHtml('vUserMgmtSection', '<div style="padding:10px 0;color:var(--tx3);font-size:13px">Loading users...</div>');
+  DB().collection('users').get().then(function(snap) {
+    var users = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
+    users.sort(function(a,b){ return (a.email||'').localeCompare(b.email||''); });
+    var rows = users.map(function(u) {
+      var isSA = u.role === 'super_admin';
+      var roleTag = isSA
+        ? '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd)">⭐ Super Admin</span>'
+        : '<span class="bk bt">🏭 Plant Admin</span>';
+      var plantTag = u.plant ? '<span class="bk bb" style="margin-left:4px">'+esc(u.plant)+'</span>' : '<span style="color:var(--tx3);font-size:11px">—</span>';
+      return '<tr>'+
+        '<td class="tn">'+esc(u.displayName||u.email||'—')+'</td>'+
+        '<td style="color:var(--tx2);font-size:12px">'+esc(u.email||'—')+'</td>'+
+        '<td>'+roleTag+'</td>'+
+        '<td>'+plantTag+'</td>'+
+        '<td style="display:flex;gap:4px">'+
+          (!isSA ? '<button class="b bd_ bxs" onclick="deleteAdminUser(\''+u.id+'\',\''+esc(u.email||'')+'\')">🗑 Delete</button>' : '<span style="color:var(--tx3);font-size:11px">—</span>')+
+        '</td>'+
+      '</tr>';
+    }).join('');
+    setHtml('vUserMgmtSection',
+      '<div class="tw"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Plant</th><th></th></tr></thead>'+
+      '<tbody>'+(rows||noRows(5,'No admin users found.'))+'</tbody></table></div>'+
+      '<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--bd)">'+
+        '<div style="font-size:13px;font-weight:700;margin-bottom:10px">➕ Create Plant Admin</div>'+
+        '<div class="fr">'+
+          '<div class="fg"><label class="fl">Display Name</label>'+
+            '<input class="fi" id="newAdmName" placeholder="e.g. Plant A Manager"></div>'+
+          '<div class="fg"><label class="fl">Email</label>'+
+            '<input class="fi" id="newAdmEmail" type="email" placeholder="admin@company.com"></div>'+
+        '</div>'+
+        '<div class="fr">'+
+          '<div class="fg"><label class="fl">Temporary Password</label>'+
+            '<input class="fi" id="newAdmPwd" type="password" placeholder="Min 6 characters"></div>'+
+          '<div class="fg"><label class="fl">Assign Plant</label>'+
+            '<select class="fi fsel" id="newAdmPlant"><option value="">— Select Plant —</option>'+PLANTS.map(function(p){return'<option>'+p+'</option>';}).join('')+'</select></div>'+
+        '</div>'+
+        '<div id="vNewAdmErr" class="h" style="margin-bottom:8px;padding:8px 11px;background:var(--rdbg);border:1px solid var(--rdbd);border-radius:7px;font-size:12px;color:var(--rd)"></div>'+
+        '<button class="b bp bsm" onclick="createPlantAdmin()">➕ Create Plant Admin</button>'+
+      '</div>'
+    );
+  }).catch(function(e){ setHtml('vUserMgmtSection', '<div style="color:var(--rd)">Error: '+esc(e.message)+'</div>'); });
+}
+
+function createPlantAdmin() {
+  var nm   = val('newAdmName');
+  var em   = val('newAdmEmail');
+  var pw   = val('newAdmPwd');
+  var pl   = val('newAdmPlant');
+  var errEl = G('vNewAdmErr');
+  function showAdmErr(m){ if(errEl){errEl.textContent=m; errEl.classList.remove('h');} }
+  if (!nm) { showAdmErr('Enter a display name.'); return; }
+  if (!em || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) { showAdmErr('Enter a valid email address.'); return; }
+  if (!pw || pw.length < 6) { showAdmErr('Password must be at least 6 characters.'); return; }
+  if (!pl) { showAdmErr('Select a plant for this admin.'); return; }
+
+  var btn = document.querySelector('#vUserMgmtSection .bp');
+  if(btn){ btn.disabled=true; btn.textContent='Creating…'; }
+  if(errEl) errEl.classList.add('h');
+
+  // We use a secondary Firebase Auth approach: create via REST API so we don't
+  // lose the current super admin session. Sign-in to a temp credential then
+  // immediately write the Firestore profile.
+  // Simpler: use Firebase Admin REST (Identity Toolkit) createNewUser
+  var apiKey = FCFG.apiKey;
+  fetch('https://identitytoolkit.googleapis.com/v1/accounts:signUp?key='+apiKey, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email:em, password:pw, displayName:nm, returnSecureToken:false })
+  }).then(function(r){ return r.json(); }).then(function(data) {
+    if (data.error) { showAdmErr(data.error.message||'Firebase error'); if(btn){btn.disabled=false;btn.textContent='➕ Create Plant Admin';} return; }
+    var uid = data.localId;
+    // Write Firestore profile
+    DB().collection('users').doc(uid).set({
+      role: 'admin',
+      plant: pl,
+      displayName: nm,
+      email: em,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      createdBy: CURRENT_USER.uid || ''
+    }).then(function(){
+      toast('Plant admin created for '+pl+'!','ok');
+      // Clear form
+      ['newAdmName','newAdmEmail','newAdmPwd','newAdmPlant'].forEach(function(id){var e=G(id);if(e)e.value='';});
+      renderUserMgmt();
+    }).catch(function(e){ showAdmErr('Firestore error: '+e.message); if(btn){btn.disabled=false;btn.textContent='➕ Create Plant Admin';} });
+  }).catch(function(e){ showAdmErr('Network error: '+e.message); if(btn){btn.disabled=false;btn.textContent='➕ Create Plant Admin';} });
+}
+
+function deleteAdminUser(uid, email) {
+  if (!confirm('Delete admin account for '+email+'? This removes their Firestore profile.\n\nNote: You will need to delete their Firebase Auth account from the Firebase console separately.')) return;
+  DB().collection('users').doc(uid).delete().then(function(){
+    toast('Admin profile deleted for '+email,'wn');
+    renderUserMgmt();
+  }).catch(function(e){ toast('Error: '+e.message,'er'); });
+}
+
 // ── DATA MANAGEMENT ──────────────────────────────────────────
 function dataMgmtDel(collection) {
   var labels = {
