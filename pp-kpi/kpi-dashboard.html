@@ -675,6 +675,11 @@ tr:hover td{background:var(--surface2)}
             <div class="field"><label>Weightage (%)</label><input type="number" id="editKPIWeight" min="0" max="100"></div>
             <div class="field" style="grid-column:1/-1"><label>Description</label><textarea id="editKPIDesc" rows="2"></textarea></div>
           </div>
+          <div class="field">
+            <label>Plant mapping</label>
+            <div style="font-size:11px;color:var(--text3);margin-bottom:6px">Uncheck a plant if this KPI doesn't apply there, or set a plant-specific target.</div>
+            <div class="table-wrap"><table><thead><tr><th style="width:70px">Applies</th><th>Plant</th><th style="width:140px">Target override</th></tr></thead><tbody id="editKPIPlantMap"></tbody></table></div>
+          </div>
           <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:4px">
             <button class="btn" onclick="closeModal('editKPIModal')">Cancel</button>
             <button class="btn btn-primary" onclick="saveEditKPI()">Save changes</button>
@@ -856,6 +861,11 @@ tr:hover td{background:var(--surface2)}
         <div class="field"><label>Weightage (%)</label><input type="number" id="nKPIWeight" placeholder="10" min="0" max="100"></div>
       </div>
       <div class="field"><label>Description</label><textarea id="nKPIDesc" placeholder="Brief description..."></textarea></div>
+      <div class="field">
+        <label>Plant mapping</label>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:6px">Uncheck a plant if this KPI doesn't apply there, or set a plant-specific target.</div>
+        <div class="table-wrap"><table><thead><tr><th style="width:70px">Applies</th><th>Plant</th><th style="width:140px">Target override</th></tr></thead><tbody id="nKPIPlantMap"></tbody></table></div>
+      </div>
       <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:4px">
         <button class="btn" onclick="closeModal('addKPIModal')">Cancel</button>
         <button class="btn btn-primary" onclick="saveKPI()">Save KPI</button>
@@ -895,6 +905,7 @@ const kpiMaster = [
   {id:7,name:'Scrap Rate',unit:'%',target:1,dir:'lower',dept:'Production',weight:12},
   {id:8,name:'Training Hrs/Employee',unit:'Hrs',target:8,dir:'higher',dept:'HR',weight:8},
 ];
+kpiMaster.forEach(k=>{ if(!k.plantOverrides) k.plantOverrides = {}; });
 
 // Rich monthly data for all KPIs across months and plants
 const kpiData = [
@@ -1027,6 +1038,20 @@ function statusOf(pct, actual, target, dir) {
   if (dir === 'lower') { if (actual <= target) return 'achieved'; if (dev <= 10) return 'near-miss'; return 'missed'; }
   else { if (actual >= target) return 'achieved'; if (dev <= 10) return 'near-miss'; return 'missed'; }
 }
+
+// ── KPI ↔ Plant mapping ──────────────────────────────────────────
+// k.plantOverrides = { "Chennai": {applicable:true/false, target:number|null}, ... }
+// A plant with no entry is treated as applicable, using the KPI's base target.
+function kpiApplicable(k, plant){
+  if(!plant || plant==='All') return true;
+  const o = k.plantOverrides && k.plantOverrides[plant];
+  return !(o && o.applicable === false);
+}
+function kpiTargetFor(k, plant){
+  if(!plant || plant==='All') return k.target;
+  const o = k.plantOverrides && k.plantOverrides[plant];
+  return (o && o.target != null && o.target !== '') ? o.target : k.target;
+}
 function badgeFor(status) {
   if (status==='achieved') return '<span class="badge badge-green"><span class="dot"></span>Achieved</span>';
   if (status==='near-miss') return '<span class="badge badge-amber"><span class="dot"></span>Near miss</span>';
@@ -1044,7 +1069,10 @@ function showToast(msg) {
   setTimeout(() => t.classList.remove('show'), 2800);
 }
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
-function openKPIModal() { document.getElementById('addKPIModal').classList.add('open'); }
+function openKPIModal() {
+  renderPlantMapTable('nKPIPlantMap', {}, document.getElementById('nKPITarget').value || 0);
+  document.getElementById('addKPIModal').classList.add('open');
+}
 
 // ══ EXCEL / PDF EXPORT & IMPORT ══
 
@@ -1416,8 +1444,13 @@ function renderTrendPage() {
     const allPts = [...kpiData,...recentEntries].filter(d=>String(d.year)===year&&d.kpiId===k.id&&(filterState.plant==='All'||d.plant===filterState.plant));
     const latestPts = allPts.filter(d=>d.month===statMonth);
     const latestAvg = latestPts.length ? Math.round(latestPts.reduce((s,d)=>s+d.actual,0)/latestPts.length*10)/10 : null;
-    const latestPct = latestAvg!==null ? calcAch(latestAvg,k.target,k.dir) : null;
-    const latestStatus = latestPct!==null ? statusOf(latestPct,latestAvg,k.target,k.dir) : 'pending';
+    // When a single plant is selected, use that plant's target override (if any)
+    const displayTarget = (filterState.plant!=='All') ? kpiTargetFor(k, filterState.plant) : k.target;
+    const notApplicable = (filterState.plant!=='All') && !kpiApplicable(k, filterState.plant);
+    const latestPct = latestAvg!==null ? calcAch(latestAvg,displayTarget,k.dir) : null;
+    const latestStatus = latestPct!==null ? statusOf(latestPct,latestAvg,displayTarget,k.dir) : 'pending';
+
+    if (notApplicable) return; // KPI not mapped to the selected plant
 
     const cardId = 'tc_'+k.id+'_'+Date.now();
     const canvasId = 'tCanvas_'+k.id;
@@ -1428,12 +1461,12 @@ function renderTrendPage() {
       <div class="kpi-trend-header">
         <div>
           <div class="kpi-trend-name">${k.name}</div>
-          <div class="kpi-trend-meta">${k.dept} · Target: ${k.dir==='lower'?'≤':'≥'} ${k.target} ${k.unit}</div>
+          <div class="kpi-trend-meta">${k.dept} · Target: ${k.dir==='lower'?'≤':'≥'} ${displayTarget} ${k.unit}</div>
         </div>
         ${badgeFor(latestStatus)}
       </div>
       <div class="kpi-trend-stats">
-        <div class="kpi-stat-box"><div class="kpi-stat-label">Target</div><div class="kpi-stat-val" style="color:var(--text2)">${k.target}<span style="font-size:11px;font-weight:400"> ${k.unit}</span></div></div>
+        <div class="kpi-stat-box"><div class="kpi-stat-label">Target</div><div class="kpi-stat-val" style="color:var(--text2)">${displayTarget}<span style="font-size:11px;font-weight:400"> ${k.unit}</span></div></div>
         <div class="kpi-stat-box"><div class="kpi-stat-label">Latest (${statMonth.slice(0,3)})</div><div class="kpi-stat-val" style="color:${colorFor(latestStatus)}">${latestAvg!==null?latestAvg:'—'}<span style="font-size:11px;font-weight:400"> ${k.unit}</span></div></div>
         <div class="kpi-stat-box"><div class="kpi-stat-label">Achievement</div><div class="kpi-stat-val" style="color:${colorFor(latestStatus)}">${latestPct!==null?latestPct+'%':'—'}</div></div>
       </div>
@@ -1451,7 +1484,7 @@ function renderTrendPage() {
       datalabels:{anchor:'end',align:'top',font:{size:9,weight:'600'},color:'#5f5e5a',display:true}
     }));
     // Target line
-    datasets.push({label:'Target',data:MONTHS_SHORT.slice(0,6).map(()=>k.target),type:'line',borderColor:'rgba(0,0,0,0.35)',borderDash:[5,4],pointRadius:0,borderWidth:1.5,tension:0,spanGaps:true,datalabels:{display:false}});
+    datasets.push({label:'Target',data:MONTHS_SHORT.slice(0,6).map(()=>displayTarget),type:'line',borderColor:'rgba(0,0,0,0.35)',borderDash:[5,4],pointRadius:0,borderWidth:1.5,tension:0,spanGaps:true,datalabels:{display:false}});
 
     const ctx = document.getElementById(canvasId);
     trendCharts[canvasId] = new Chart(ctx, {
@@ -1568,7 +1601,8 @@ function updateDepts(){
 }
 function updateKPIs(){
   const dept=document.getElementById('entryDept').value;
-  const kpis=kpiMaster.filter(k=>k.dept===dept||k.dept==='All');
+  const plant=document.getElementById('entryPlant').value;
+  const kpis=kpiMaster.filter(k=>(k.dept===dept||k.dept==='All') && kpiApplicable(k,plant));
   const sel=document.getElementById('entryKPI');
   sel.innerHTML='<option value="">— Select KPI —</option>'+kpis.map(k=>`<option value="${k.id}">${k.name}</option>`).join('');
   document.getElementById('entryTarget').value='';
@@ -1579,8 +1613,9 @@ function updateKPIs(){
 }
 function loadKPITarget(){
   const kpiId=parseInt(document.getElementById('entryKPI').value);
+  const plant=document.getElementById('entryPlant').value;
   const k=kpiMaster.find(k=>k.id===kpiId);
-  if(k){document.getElementById('entryTarget').value=k.target;document.getElementById('entryUnit').value=k.unit;}
+  if(k){document.getElementById('entryTarget').value=kpiTargetFor(k,plant);document.getElementById('entryUnit').value=k.unit;}
   calcAchievement();
 }
 function calcAchievement(){
@@ -1610,11 +1645,12 @@ function saveEntry(){
   const actual=parseFloat(document.getElementById('entryActual').value);
   if(!plant||!kpiId||isNaN(actual)){showToast('Please fill all required fields');return;}
   const k=kpiMaster.find(k=>k.id===kpiId);
-  const s=statusOf(calcAch(actual,k.target,k.dir),actual,k.target,k.dir);
+  const target=kpiTargetFor(k,plant);
+  const s=statusOf(calcAch(actual,target,k.dir),actual,target,k.dir);
   const reason=document.getElementById('entryReason').value;
   const action=document.getElementById('entryAction').value;
   if(s==='missed'&&(!reason||!action)){showToast('Action plan required for missed KPI');return;}
-  const entry={id:nextId++,year:parseInt(document.getElementById('entryYear').value),month:document.getElementById('entryMonth').value,plant,dept,kpiId,target:k.target,actual,reason,action,resp:document.getElementById('entryResp').value,dueDate:document.getElementById('entryDate').value,actionStatus:reason?'in-progress':null};
+  const entry={id:nextId++,year:parseInt(document.getElementById('entryYear').value),month:document.getElementById('entryMonth').value,plant,dept,kpiId,target,actual,reason,action,resp:document.getElementById('entryResp').value,dueDate:document.getElementById('entryDate').value,actionStatus:reason?'in-progress':null};
   recentEntries.unshift(entry);
   renderRecentEntries();
   showToast('KPI data saved');
@@ -1646,8 +1682,8 @@ function renderKPIMaster(){
       <td>${k.dept}</td><td>${k.weight}%</td>
       <td>
         <div style="display:flex;gap:6px">
-          <button class="btn btn-sm btn-icon" title="Edit" onclick="openEditKPI(${k.id})"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
-          <button class="btn btn-sm btn-icon" title="Delete" style="color:var(--red)" onclick="deleteKPI(${k.id})"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg></button>
+          <button class="btn btn-sm btn-icon" title="Edit" onclick="openEditKPI('${k.id}')"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+          <button class="btn btn-sm btn-icon" title="Delete" style="color:var(--red)" onclick="deleteKPI('${k.id}')"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg></button>
         </div>
       </td>
     </tr>`).join('');
@@ -1657,9 +1693,144 @@ function saveKPI(){
   const unit=document.getElementById('nKPIUnit').value.trim();
   const target=parseFloat(document.getElementById('nKPITarget').value);
   if(!name||!unit||isNaN(target)){showToast('Please fill all required fields');return;}
-  kpiMaster.push({id:kpiMaster.length+1,name,unit,target,dir:document.getElementById('nKPIDir').value,dept:document.getElementById('nKPIDept').value,plant:'All',weight:parseInt(document.getElementById('nKPIWeight').value)||0,desc:document.getElementById('nKPIDesc').value});
+  const plantOverrides = readPlantMapTable('nKPIPlantMap');
+  kpiMaster.push({id:kpiMaster.length+1,name,unit,target,dir:document.getElementById('nKPIDir').value,dept:document.getElementById('nKPIDept').value,plant:'All',weight:parseInt(document.getElementById('nKPIWeight').value)||0,desc:document.getElementById('nKPIDesc').value,plantOverrides});
   renderKPIMaster();closeModal('addKPIModal');showToast('KPI "'+name+'" added');
   ['nKPIName','nKPIUnit','nKPITarget','nKPIWeight','nKPIDesc'].forEach(id=>document.getElementById(id).value='');
+}
+
+// ── Edit / delete KPI ─────────────────────────────────────────────
+function openEditKPI(id){
+  const k = kpiMaster.find(k=>String(k.id)===String(id));
+  if(!k) return;
+  document.getElementById('editKPIId').value = k.id;
+  document.getElementById('editKPIName').value = k.name;
+  document.getElementById('editKPIUnit').value = k.unit;
+  document.getElementById('editKPITarget').value = k.target;
+  document.getElementById('editKPIDir').value = k.dir;
+  document.getElementById('editKPIDept').value = k.dept;
+  document.getElementById('editKPIWeight').value = k.weight;
+  document.getElementById('editKPIDesc').value = k.desc || '';
+  renderPlantMapTable('editKPIPlantMap', k.plantOverrides || {}, k.target);
+  document.getElementById('editKPIModal').classList.add('open');
+}
+
+async function saveEditKPI(){
+  const id = document.getElementById('editKPIId').value;
+  const k = kpiMaster.find(k=>String(k.id)===String(id));
+  if(!k) return;
+
+  const name   = document.getElementById('editKPIName').value.trim();
+  const unit   = document.getElementById('editKPIUnit').value.trim();
+  const target = parseFloat(document.getElementById('editKPITarget').value);
+  if(!name||!unit||isNaN(target)){ showToast('Please fill all required fields'); return; }
+
+  k.name   = name;
+  k.unit   = unit;
+  k.target = target;
+  k.dir    = document.getElementById('editKPIDir').value;
+  k.dept   = document.getElementById('editKPIDept').value;
+  k.weight = parseInt(document.getElementById('editKPIWeight').value) || 0;
+  k.desc   = document.getElementById('editKPIDesc').value;
+  k.plantOverrides = readPlantMapTable('editKPIPlantMap');
+
+  renderKPIMaster();
+  closeModal('editKPIModal');
+  showToast('KPI "'+name+'" updated');
+
+  if (window.FB && window.FB.updateKPI && typeof k.id === 'string') {
+    try {
+      await window.FB.updateKPI(k.id, {
+        name: k.name, unit: k.unit, target: k.target, direction: k.dir,
+        department: k.dept, weightage: k.weight, description: k.desc,
+        plantOverrides: k.plantOverrides
+      });
+    } catch (err) {
+      console.warn('Firebase KPI update failed:', err);
+      showToast('Saved locally — Firebase update failed');
+    }
+  }
+}
+
+function deleteKPI(id){
+  const idx = kpiMaster.findIndex(k=>String(k.id)===String(id));
+  if(idx===-1) return;
+  const k = kpiMaster[idx];
+  if(!confirm('Delete KPI "'+k.name+'"? This cannot be undone.')) return;
+  kpiMaster.splice(idx,1);
+  renderKPIMaster();
+  showToast('KPI "'+k.name+'" deleted');
+  if (window.FB && window.FB.deleteKPI && typeof k.id === 'string') {
+    window.FB.deleteKPI(k.id).catch(err=>console.warn('Firebase KPI delete failed:', err));
+  }
+}
+
+function bulkDeleteKPIs(){
+  const ids = getSelectedIds('kpiMasterBody');
+  if(!ids.length) return;
+  if(!confirm('Delete '+ids.length+' selected KPI(s)? This cannot be undone.')) return;
+  ids.forEach(id=>{
+    const idx = kpiMaster.findIndex(k=>String(k.id)===String(id));
+    if(idx===-1) return;
+    const k = kpiMaster[idx];
+    kpiMaster.splice(idx,1);
+    if (window.FB && window.FB.deleteKPI && typeof k.id === 'string') {
+      window.FB.deleteKPI(k.id).catch(err=>console.warn('Firebase KPI delete failed:', err));
+    }
+  });
+  renderKPIMaster();
+  showToast(ids.length+' KPI(s) deleted');
+}
+
+// ══ GENERIC BULK-SELECT HELPERS ══
+function toggleSelectAll(bodyId, selectAllId, bulkBtnId, countId){
+  const checked = document.getElementById(selectAllId).checked;
+  document.querySelectorAll('#'+bodyId+' .row-cb').forEach(cb=>cb.checked=checked);
+  updateBulkBar(bodyId, bulkBtnId, countId, selectAllId);
+}
+function updateBulkBar(bodyId, bulkBtnId, countId, selectAllId){
+  const cbs = [...document.querySelectorAll('#'+bodyId+' .row-cb')];
+  const checked = cbs.filter(c=>c.checked);
+  const btn = document.getElementById(bulkBtnId);
+  document.getElementById(countId).textContent = checked.length;
+  if(btn) btn.style.display = checked.length ? 'flex' : 'none';
+  const selectAll = document.getElementById(selectAllId);
+  if(selectAll) selectAll.checked = cbs.length>0 && checked.length===cbs.length;
+}
+function getSelectedIds(bodyId){
+  return [...document.querySelectorAll('#'+bodyId+' .row-cb:checked')].map(c=>c.dataset.id);
+}
+
+// ── Plant mapping table (used by Add / Edit KPI modals) ──────────
+function renderPlantMapTable(containerId, overrides, baseTarget){
+  const ov = overrides || {};
+  document.getElementById(containerId).innerHTML = plantsList.map(p=>{
+    const o = ov[p.name] || {};
+    const applicable = o.applicable !== false;
+    const target = (o.target != null) ? o.target : '';
+    const safeName = p.name.replace(/'/g,"\\'");
+    return `<tr>
+      <td><input type="checkbox" data-plant="${safeName}" class="pm-applicable" ${applicable?'checked':''} onchange="this.closest('tr').querySelector('.pm-target').disabled=!this.checked" style="cursor:pointer"></td>
+      <td>${p.name}</td>
+      <td><input type="number" class="pm-target" data-plant="${safeName}" placeholder="${baseTarget}" value="${target}" ${applicable?'':'disabled'} style="width:120px;padding:6px 8px;border:0.5px solid var(--border2);border-radius:var(--r-md);background:var(--surface);color:var(--text);font-size:12px"></td>
+    </tr>`;
+  }).join('');
+}
+function readPlantMapTable(containerId){
+  const overrides = {};
+  document.querySelectorAll('#'+containerId+' tr').forEach(tr=>{
+    const cb = tr.querySelector('.pm-applicable');
+    const ti = tr.querySelector('.pm-target');
+    if(!cb) return;
+    const plant = cb.dataset.plant;
+    const applicable = cb.checked;
+    const targetVal = ti.value.trim();
+    const target = targetVal === '' ? null : parseFloat(targetVal);
+    if(!applicable || target != null){
+      overrides[plant] = { applicable, target: applicable ? target : null };
+    }
+  });
+  return overrides;
 }
 
 // ══ NOTIFICATION BELL ══
@@ -1819,12 +1990,13 @@ function renderUsersPage(){
   if(!body) return;
   if(!usersList.length){body.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:20px">No users found</td></tr>';return;}
   body.innerHTML = usersList.map((u,i)=>{
-    const initials = u.name.split(' ').map(n=>n[0]).join('').slice(0,2).toUpperCase();
+    const safeName = u.name || u.email || 'User';
+    const initials = safeName.split(' ').filter(Boolean).map(n=>n[0]).join('').slice(0,2).toUpperCase() || '?';
     const roleClass = u.role==='Super Admin'?'badge-blue':u.role==='Plant Admin'?'badge-amber':'';
     const statusBadge = u.active!==false ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-amber">Inactive</span>';
     return `<tr>
-      <td><input type="checkbox" class="row-cb" data-id="${i}" onchange="updateBulkBar('usersBody','userBulkDeleteBtn','userSelCount','userSelectAll')" style="cursor:pointer"></td>
-      <td><div style="display:flex;align-items:center;gap:8px"><div class="avatar" style="width:28px;height:28px;font-size:10px">${initials}</div>${u.name}</div></td>
+      <td><input type="checkbox" class="row-cb" data-id="${u.email}" onchange="updateBulkBar('usersBody','userBulkDeleteBtn','userSelCount','userSelectAll')" style="cursor:pointer"></td>
+      <td><div style="display:flex;align-items:center;gap:8px"><div class="avatar" style="width:28px;height:28px;font-size:10px">${initials}</div>${safeName}</div></td>
       <td>${u.email}</td>
       <td><span class="badge ${roleClass}">${u.role}</span></td>
       <td>${u.plant}</td><td>${u.department}</td><td>${statusBadge}</td>
@@ -1864,13 +2036,14 @@ async function saveUser(){
   const profile = { name, role, plant, department };
 
   try {
+    let newId = null;
     if (window.FB && window.FB.registerUser) {
-      await window.FB.registerUser(email, password, profile);
+      newId = await window.FB.registerUser(email, password, profile);
       showToast('User "'+name+'" created ✓');
     } else {
       showToast('User "'+name+'" added (local only — Firebase unavailable)');
     }
-    usersList.push({ ...profile, email, active:true });
+    usersList.push({ id: newId, ...profile, email, active:true });
     renderUsersPage();
     closeModal('addUserModal');
     ['nUserName','nUserEmail','nUserPassword'].forEach(id=>document.getElementById(id).value='');
@@ -1887,16 +2060,113 @@ async function saveUser(){
     btn.disabled = false;
   }
 }
+
+// ── Edit / delete user ────────────────────────────────────────────
+function openEditUser(email){
+  const u = usersList.find(u=>u.email===email);
+  if(!u) return;
+  document.getElementById('editUserError').style.display = 'none';
+  document.getElementById('editUserOrigEmail').value = u.email;
+  document.getElementById('editUserName').value = u.name || '';
+  document.getElementById('editUserEmail').value = u.email;
+  document.getElementById('editUserRole').value = u.role;
+  document.getElementById('editUserActive').value = u.active!==false ? 'true' : 'false';
+  document.getElementById('editUserPlant').value = u.plant;
+  document.getElementById('editUserDept').value = u.department;
+  document.getElementById('editUserModal').classList.add('open');
+}
+
+async function saveEditUser(){
+  const origEmail = document.getElementById('editUserOrigEmail').value;
+  const u = usersList.find(u=>u.email===origEmail);
+  const errEl = document.getElementById('editUserError');
+  errEl.style.display = 'none';
+  if(!u) return;
+
+  const name   = document.getElementById('editUserName').value.trim();
+  const email  = document.getElementById('editUserEmail').value.trim();
+  const role   = document.getElementById('editUserRole').value;
+  const active = document.getElementById('editUserActive').value === 'true';
+  const plant  = document.getElementById('editUserPlant').value;
+  const department = document.getElementById('editUserDept').value;
+
+  if(!name||!email||!role){ errEl.textContent='Please fill all required fields'; errEl.style.display='block'; return; }
+  if(email.toLowerCase()!==origEmail.toLowerCase() && usersList.some(x=>x.email.toLowerCase()===email.toLowerCase())){
+    errEl.textContent='A user with this email already exists'; errEl.style.display='block'; return;
+  }
+
+  u.name = name; u.email = email; u.role = role; u.active = active; u.plant = plant; u.department = department;
+
+  renderUsersPage();
+  closeModal('editUserModal');
+  showToast('User "'+name+'" updated');
+
+  // Note: this only updates the Firestore profile doc — email changes here do
+  // NOT change the Firebase Auth login credentials for that account.
+  if (window.FB && window.FB.updateUser && u.id) {
+    try { await window.FB.updateUser(u.id, { name, email, role, active, plant, department }); }
+    catch(err){ console.warn('Firebase user update failed:', err); }
+  }
+}
+
+function deleteUser(email){
+  const idx = usersList.findIndex(u=>u.email===email);
+  if(idx===-1) return;
+  const u = usersList[idx];
+  if(!confirm('Remove "'+(u.name||u.email)+'" from the system? Their login will stop working once their access is revoked, but the Firebase Auth account itself must be deleted separately by an administrator.')) return;
+  usersList.splice(idx,1);
+  renderUsersPage();
+  showToast('User "'+(u.name||u.email)+'" removed');
+  if (window.FB && window.FB.deleteUserDoc && u.id) {
+    window.FB.deleteUserDoc(u.id).catch(err=>console.warn('Firebase user delete failed:', err));
+  }
+}
+
+function bulkDeleteUsers(){
+  const emails = getSelectedIds('usersBody');
+  if(!emails.length) return;
+  if(!confirm('Remove '+emails.length+' selected user(s)? See per-user delete for details on Auth accounts.')) return;
+  emails.forEach(email=>{
+    const idx = usersList.findIndex(u=>u.email===email);
+    if(idx===-1) return;
+    const u = usersList[idx];
+    usersList.splice(idx,1);
+    if (window.FB && window.FB.deleteUserDoc && u.id) {
+      window.FB.deleteUserDoc(u.id).catch(err=>console.warn('Firebase user delete failed:', err));
+    }
+  });
+  renderUsersPage();
+  showToast(emails.length+' user(s) removed');
+}
+
 function renderPlantsPage(){
   const pBody=document.getElementById('plantsBody');
   if(pBody) pBody.innerHTML = plantsList.map(p=>
-    `<tr><td><span class="badge badge-blue">${p.code}</span></td><td>${p.name}</td><td>${p.kpis||0}</td></tr>`
+    `<tr>
+      <td><input type="checkbox" class="row-cb" data-id="${p.code}" onchange="updateBulkBar('plantsBody','plantBulkDeleteBtn','plantSelCount','plantSelectAll')" style="cursor:pointer"></td>
+      <td><span class="badge badge-blue">${p.code}</span></td><td>${p.name}</td><td>${p.kpis||0}</td>
+      <td>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-sm btn-icon" title="Edit" onclick="openEditPlant('${p.code}')"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+          <button class="btn btn-sm btn-icon" title="Delete" style="color:var(--red)" onclick="deletePlantRow('${p.code}')"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg></button>
+        </div>
+      </td>
+    </tr>`
   ).join('');
 
   const dBody=document.getElementById('deptsBody');
   if(dBody) dBody.innerHTML = deptList.map(d=>{
     const cls = d.ach>=90?'badge-green':d.ach>=80?'badge-amber':'badge-red';
-    return `<tr><td>${d.name}</td><td>${d.kpis||0}</td><td><span class="badge ${cls}">${d.ach}%</span></td></tr>`;
+    return `<tr>
+      <td><input type="checkbox" class="row-cb" data-id="${d.name}" onchange="updateBulkBar('deptsBody','deptBulkDeleteBtn','deptSelCount','deptSelectAll')" style="cursor:pointer"></td>
+      <td>${d.name}</td><td>${d.kpis||0}</td><td><span class="badge ${cls}">${d.ach}%</span></td>
+      <td>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-sm btn-icon" title="Edit" onclick="openEditDept('${d.name}')"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+          <button class="btn btn-sm btn-icon" title="Delete" style="color:var(--red)" onclick="deleteDeptRow('${d.name}')"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg></button>
+        </div>
+      </td>
+    </tr>`;
   }).join('');
 }
 
@@ -1947,6 +2217,147 @@ function saveDept(){
 
   // Refresh department selectors across the app
   refreshDeptSelectors();
+}
+
+// ── Edit / delete plant ────────────────────────────────────────────
+function openEditPlant(code){
+  const p = plantsList.find(p=>p.code===code);
+  if(!p) return;
+  document.getElementById('editPlantOrigCode').value = p.code;
+  document.getElementById('editPlantCode').value = p.code;
+  document.getElementById('editPlantName').value = p.name;
+  document.getElementById('editPlantModal').classList.add('open');
+}
+
+async function saveEditPlant(){
+  const origCode = document.getElementById('editPlantOrigCode').value;
+  const p = plantsList.find(p=>p.code===origCode);
+  if(!p) return;
+
+  const newCode = document.getElementById('editPlantCode').value.trim().toUpperCase();
+  const newName = document.getElementById('editPlantName').value.trim();
+  if(!newCode||!newName){ showToast('Please fill all required fields'); return; }
+  if(newCode!==origCode && plantsList.some(pl=>pl.code===newCode)){ showToast('Plant code already exists'); return; }
+
+  const oldName = p.name;
+  p.code = newCode;
+  p.id   = newCode;
+  p.name = newName;
+
+  // Keep KPI plant-mapping overrides keyed correctly if the plant name changed
+  if(oldName !== newName){
+    kpiMaster.forEach(k=>{
+      if(k.plantOverrides && k.plantOverrides[oldName] !== undefined){
+        k.plantOverrides[newName] = k.plantOverrides[oldName];
+        delete k.plantOverrides[oldName];
+      }
+    });
+  }
+
+  renderPlantsPage();
+  renderKPIMaster();
+  closeModal('editPlantModal');
+  showToast('Plant "'+newName+'" updated');
+  refreshPlantSelectors();
+
+  if (window.FB && window.FB.updatePlant) {
+    try { await window.FB.updatePlant(origCode, { plantCode: newCode, plantName: newName }); }
+    catch(err){ console.warn('Firebase plant update failed:', err); }
+  }
+}
+
+function deletePlantRow(code){
+  const idx = plantsList.findIndex(p=>p.code===code);
+  if(idx===-1) return;
+  const p = plantsList[idx];
+  if(!confirm('Delete plant "'+p.name+'"? This cannot be undone.')) return;
+  plantsList.splice(idx,1);
+  renderPlantsPage();
+  refreshPlantSelectors();
+  showToast('Plant "'+p.name+'" deleted');
+  if (window.FB && window.FB.deletePlant) {
+    window.FB.deletePlant(p.id).catch(err=>console.warn('Firebase plant delete failed:', err));
+  }
+}
+
+function bulkDeletePlants(){
+  const codes = getSelectedIds('plantsBody');
+  if(!codes.length) return;
+  if(!confirm('Delete '+codes.length+' selected plant(s)? This cannot be undone.')) return;
+  codes.forEach(code=>{
+    const idx = plantsList.findIndex(p=>p.code===code);
+    if(idx===-1) return;
+    const p = plantsList[idx];
+    plantsList.splice(idx,1);
+    if (window.FB && window.FB.deletePlant) {
+      window.FB.deletePlant(p.id).catch(err=>console.warn('Firebase plant delete failed:', err));
+    }
+  });
+  renderPlantsPage();
+  refreshPlantSelectors();
+  showToast(codes.length+' plant(s) deleted');
+}
+
+// ── Edit / delete department ──────────────────────────────────────
+function openEditDept(name){
+  const d = deptList.find(d=>d.name===name);
+  if(!d) return;
+  document.getElementById('editDeptOrigName').value = d.name;
+  document.getElementById('editDeptName').value = d.name;
+  document.getElementById('editDeptModal').classList.add('open');
+}
+
+function saveEditDept(){
+  const origName = document.getElementById('editDeptOrigName').value;
+  const d = deptList.find(d=>d.name===origName);
+  if(!d) return;
+
+  const newName = document.getElementById('editDeptName').value.trim();
+  if(!newName){ showToast('Please fill all required fields'); return; }
+  if(newName!==origName && deptList.some(dp=>dp.name.toLowerCase()===newName.toLowerCase())){ showToast('Department already exists'); return; }
+
+  d.name = newName;
+
+  // Keep KPI department references and plant-mapping in sync
+  if(origName !== newName){
+    kpiMaster.forEach(k=>{ if(k.dept===origName) k.dept = newName; });
+  }
+
+  renderPlantsPage();
+  renderKPIMaster();
+  closeModal('editDeptModal');
+  showToast('Department "'+newName+'" updated');
+  refreshDeptSelectors();
+}
+
+function deleteDeptRow(name){
+  const idx = deptList.findIndex(d=>d.name===name);
+  if(idx===-1) return;
+  const d = deptList[idx];
+  if(kpiMaster.some(k=>k.dept===name)){
+    showToast('Cannot delete — KPIs are still assigned to "'+name+'"');
+    return;
+  }
+  if(!confirm('Delete department "'+d.name+'"? This cannot be undone.')) return;
+  deptList.splice(idx,1);
+  renderPlantsPage();
+  refreshDeptSelectors();
+  showToast('Department "'+d.name+'" deleted');
+}
+
+function bulkDeleteDepts(){
+  const names = getSelectedIds('deptsBody');
+  if(!names.length) return;
+  const blocked = names.filter(n=>kpiMaster.some(k=>k.dept===n));
+  if(blocked.length){ showToast('Cannot delete — KPIs assigned to: '+blocked.join(', ')); return; }
+  if(!confirm('Delete '+names.length+' selected department(s)? This cannot be undone.')) return;
+  names.forEach(name=>{
+    const idx = deptList.findIndex(d=>d.name===name);
+    if(idx>-1) deptList.splice(idx,1);
+  });
+  renderPlantsPage();
+  refreshDeptSelectors();
+  showToast(names.length+' department(s) deleted');
 }
 
 // Update <select> elements that list plants (entry form + filter tabs)
@@ -2149,6 +2560,16 @@ export async function updatePlant(plantId, updates) {
 
 export async function deletePlant(plantId) {
   await deleteDoc(doc(db, "plants", plantId));
+}
+
+export async function updatePlant(plantId, updates) {
+  await updateDoc(doc(db, "plants", plantId), updates);
+}
+
+export async function deleteUserDoc(uid) {
+  // Removes the Firestore profile only. The Firebase Auth account itself
+  // can only be deleted via the Admin SDK / a Cloud Function.
+  await deleteDoc(doc(db, "users", uid));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -2520,9 +2941,9 @@ function computeStatus(actual, target, direction, pct) {
 // ── Expose to global scope so existing inline handlers can call them ──
 window.FB = {
   loginUser, logoutUser, onAuthChange,
-  getUserProfile, getAllUsers, createUser, updateUser, registerUser,
-  getPlants, addPlant,
-  getKPIMaster, addKPI, updateKPI,
+  getUserProfile, getAllUsers, createUser, updateUser, registerUser, deleteUserDoc,
+  getPlants, addPlant, updatePlant, deletePlant,
+  getKPIMaster, addKPI, updateKPI, deleteKPI,
   saveKPIEntry, updateKPIEntry, getKPIEntries, listenKPIEntries,
   getOpenActionPlans, closeActionPlan,
   listenLiveKPI, raiseAlert, listenAlerts, acknowledgeAlert,
@@ -2614,7 +3035,8 @@ async function loadFirebaseData() {
         dir:    k.direction,
         dept:   k.department,
         plant:  k.plant || 'All',
-        weight: k.weightage || 0
+        weight: k.weightage || 0,
+        plantOverrides: k.plantOverrides || {}
       }));
       renderKPIMaster();
 
@@ -2662,6 +3084,7 @@ async function loadFirebaseData() {
     const fsUsers = await getAllUsers();
     if (fsUsers.length > 0) {
       usersList = fsUsers.map(u => ({
+        id: u.id,
         name: u.name || u.email || 'Unnamed',
         email: u.email || '',
         role: u.role || 'Dept User',
@@ -2793,18 +3216,20 @@ window.saveKPI = async function() {
   const target = parseFloat(document.getElementById('nKPITarget').value);
   if (!name || !unit || isNaN(target)) { showToast('Please fill all required fields'); return; }
 
+  const plantOverrides = readPlantMapTable('nKPIPlantMap');
   const kpiData_ = {
     name, unit, target,
     direction:   document.getElementById('nKPIDir').value,
     department:  document.getElementById('nKPIDept').value,
     plant:       'All',
     weightage:   parseInt(document.getElementById('nKPIWeight').value) || 0,
-    description: document.getElementById('nKPIDesc').value
+    description: document.getElementById('nKPIDesc').value,
+    plantOverrides
   };
 
   try {
     const ref = await addKPI(kpiData_);
-    kpiMaster.push({ id: ref.id, name, unit, target, dir: kpiData_.direction, dept: kpiData_.department, plant: 'All', weight: kpiData_.weightage });
+    kpiMaster.push({ id: ref.id, name, unit, target, dir: kpiData_.direction, dept: kpiData_.department, plant: 'All', weight: kpiData_.weightage, plantOverrides });
     renderKPIMaster();
     closeModal('addKPIModal');
     showToast('KPI "' + name + '" saved to Firebase ✓');
