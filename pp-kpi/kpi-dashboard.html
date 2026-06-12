@@ -20,6 +20,9 @@
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -292,8 +295,15 @@ tr:hover td{background:var(--surface2)}
           <option value="sky">Sky</option>
         </select>
       </div>
+      <button class="btn btn-sm" onclick="document.getElementById('importExcelInput').click()">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Import Excel
+      </button>
+      <input type="file" id="importExcelInput" accept=".xlsx,.xls,.csv" style="display:none" onchange="importExcel(this.files[0])">
+      <button class="btn btn-sm" onclick="exportExcel()">
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>Export Excel
+      </button>
       <button class="btn btn-sm" onclick="exportPDF()">
-        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>Export
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>Export PDF
       </button>
     </div>
   </header>
@@ -762,7 +772,165 @@ function showToast(msg) {
 }
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 function openKPIModal() { document.getElementById('addKPIModal').classList.add('open'); }
-function exportPDF() { showToast('Export requires server-side integration'); }
+
+// ══ EXCEL / PDF EXPORT & IMPORT ══
+
+// Build a flat array of row objects from current filtered data (kpiData + recentEntries)
+function buildExportRows() {
+  const rows = getFiltered();
+  return rows.map(d => {
+    const k = kpiMaster.find(k => k.id === d.kpiId);
+    const target = d.target != null ? d.target : (k ? k.target : null);
+    const dir = k ? k.dir : 'lower';
+    const pct = calcAch(d.actual, target, dir);
+    const status = statusOf(pct, d.actual, target, dir);
+    return {
+      Year: d.year,
+      Month: d.month,
+      Plant: d.plant,
+      Department: d.dept,
+      KPI: k ? k.name : (d.kpiName || ''),
+      Unit: k ? k.unit : (d.unit || ''),
+      Target: target,
+      Actual: d.actual,
+      'Achievement %': pct,
+      Status: status,
+      'Action Status': d.actionStatus || '',
+      Reason: d.reason || '',
+      'Action Plan': d.action || '',
+      'Responsible': d.resp || '',
+      'Due Date': d.dueDate || ''
+    };
+  });
+}
+
+function exportExcel() {
+  if (typeof XLSX === 'undefined') { showToast('Excel library failed to load'); return; }
+  const rows = buildExportRows();
+  if (!rows.length) { showToast('No data to export for current filters'); return; }
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'KPI Data');
+  const fname = `KPI_Data_${filterState.year}_${filterState.plant}_${filterState.month}.xlsx`;
+  XLSX.writeFile(wb, fname);
+  showToast('Excel file downloaded ✓');
+}
+
+function exportPDF() {
+  if (typeof window.jspdf === 'undefined') { showToast('PDF library failed to load'); return; }
+  const rows = buildExportRows();
+  if (!rows.length) { showToast('No data to export for current filters'); return; }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: 'landscape' });
+
+  doc.setFontSize(13);
+  doc.text('Polyplastics India — KPI Report', 14, 14);
+  doc.setFontSize(9);
+  doc.setTextColor(120);
+  doc.text(`Year: ${filterState.year}  ·  Month: ${filterState.month}  ·  Plant: ${filterState.plant}  ·  Department: ${filterState.dept}`, 14, 20);
+
+  const head = [['Month','Plant','Dept','KPI','Unit','Target','Actual','Ach %','Status','Action Status','Responsible','Due Date']];
+  const body = rows.map(r => [r.Month, r.Plant, r.Department, r.KPI, r.Unit, r.Target, r.Actual, r['Achievement %']!=null?r['Achievement %']+'%':'', r.Status, r['Action Status'], r.Responsible, r['Due Date']]);
+
+  doc.autoTable({
+    head, body,
+    startY: 26,
+    styles: { fontSize: 8, cellPadding: 2 },
+    headStyles: { fillColor: [24, 95, 165] },
+    didParseCell: (data) => {
+      if (data.section === 'body' && data.column.index === 8) {
+        const v = data.cell.raw;
+        if (v === 'achieved') data.cell.styles.textColor = [59, 109, 17];
+        else if (v === 'missed') data.cell.styles.textColor = [163, 45, 45];
+        else if (v === 'near-miss') data.cell.styles.textColor = [133, 79, 11];
+      }
+    }
+  });
+
+  const fname = `KPI_Report_${filterState.year}_${filterState.plant}_${filterState.month}.pdf`;
+  doc.save(fname);
+  showToast('PDF report downloaded ✓');
+}
+
+// Import KPI entries from an Excel/CSV file.
+// Expected columns (case-insensitive): Year, Month, Plant, Department, KPI,
+// Actual, Reason, Action Plan, Responsible, Due Date
+async function importExcel(file) {
+  if (!file) return;
+  if (typeof XLSX === 'undefined') { showToast('Excel library failed to load'); return; }
+  try {
+    const data = await file.arrayBuffer();
+    const wb = XLSX.read(data, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const json = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+    if (!json.length) { showToast('No rows found in file'); return; }
+
+    let imported = 0, skipped = 0;
+    for (const row of json) {
+      const get = (...names) => {
+        for (const n of names) {
+          for (const key of Object.keys(row)) {
+            if (key.toLowerCase().trim() === n.toLowerCase()) return row[key];
+          }
+        }
+        return '';
+      };
+
+      const kpiName = String(get('KPI','KPI Name','kpiName')).trim();
+      const plant   = String(get('Plant')).trim();
+      const dept    = String(get('Department','Dept')).trim();
+      const month   = String(get('Month')).trim();
+      const year    = parseInt(get('Year')) || parseInt(filterState.year);
+      const actual  = parseFloat(get('Actual'));
+
+      const k = kpiMaster.find(k => k.name.toLowerCase() === kpiName.toLowerCase());
+      if (!k || !plant || !month || isNaN(actual)) { skipped++; continue; }
+
+      const reason = String(get('Reason')).trim();
+      const action = String(get('Action Plan','ActionPlan','Action')).trim();
+      const resp   = String(get('Responsible','Responsible Person')).trim();
+      const dueDate = String(get('Due Date','DueDate','Target Date')).trim();
+
+      const pct = calcAch(actual, k.target, k.dir);
+      const s = statusOf(pct, actual, k.target, k.dir);
+
+      const entry = {
+        id: nextId++, year, month, plant, dept: dept || k.dept, kpiId: k.id,
+        target: k.target, actual, reason, action, resp, dueDate,
+        actionStatus: reason ? 'in-progress' : null
+      };
+
+      // Persist to Firebase if available
+      if (window.FB && window.FB.saveKPIEntry) {
+        try {
+          await window.FB.saveKPIEntry({
+            year, month, plant, department: dept || k.dept,
+            kpiId: k.id, kpiName: k.name, target: k.target, actual,
+            unit: k.unit, direction: k.dir, reason, actionPlan: action,
+            responsiblePerson: resp, targetDate: dueDate,
+            actionStatus: entry.actionStatus || '',
+            submittedBy: 'import'
+          });
+        } catch (err) {
+          console.warn('Firebase import save error:', err);
+        }
+      }
+
+      recentEntries.unshift(entry);
+      imported++;
+    }
+
+    renderRecentEntries();
+    refreshAll();
+    showToast(`Imported ${imported} row(s)${skipped ? `, skipped ${skipped} (unmatched KPI/missing fields)` : ''}`);
+  } catch (err) {
+    console.error('Excel import error:', err);
+    showToast('Failed to read file — check format');
+  } finally {
+    document.getElementById('importExcelInput').value = '';
+  }
+}
 
 // ══ NAVIGATION ══
 const pageTitles = {dashboard:'Dashboard',trends:'KPI Trends',['action-plans']:'Action Plans',entry:'Enter KPI Data',['kpi-master']:'KPI Master',plants:'Plants & Departments',users:'Users'};
@@ -930,7 +1098,8 @@ function buildInitCharts() {
         const k = kpiMaster.find(k=>k.id===kpiId);
         goToActionPlans({kpiId, month}, (k?k.name:'KPI')+' — '+month);
       },plugins:{legend:{display:false}},scales:{y:{ticks:{font:{size:11}},grid:{color:'rgba(0,0,0,0.05)'}},x:{ticks:{font:{size:11}},grid:{display:false}}}}
-  }); = new Chart(document.getElementById('radarChart'),{
+  });
+  charts.radar = new Chart(document.getElementById('radarChart'),{
     type:'radar',
     data:{labels:['Quality','Production','HR','Maintenance','Finance','SCM'],datasets:[{label:'Achievement %',data:[0,0,0,0,0,0],backgroundColor:'rgba(24,95,165,0.1)',borderColor:'#185FA5',pointBackgroundColor:'#185FA5',pointRadius:3,borderWidth:1.8}]},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},datalabels:{display:false}},scales:{r:{min:0,max:100,ticks:{stepSize:25,font:{size:9},backdropColor:'transparent'},pointLabels:{font:{size:11}},grid:{color:'rgba(0,0,0,0.07)'}}}}
