@@ -559,7 +559,7 @@ tr:hover td{background:var(--surface2)}
             <button class="btn btn-primary btn-sm" onclick="openKPIModal()">+ Add KPI</button>
           </div>
         </div>
-        <div class="table-wrap"><table><thead><tr><th style="width:36px"><input type="checkbox" id="kpiSelectAll" onchange="toggleSelectAll('kpiMasterBody','kpiSelectAll','kpiBulkDeleteBtn','kpiSelCount')" style="cursor:pointer"></th><th>KPI Name</th><th>Unit</th><th>Target</th><th>Direction</th><th>Dept</th><th>Weightage</th><th>Actions</th></tr></thead><tbody id="kpiMasterBody"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th style="width:36px"><input type="checkbox" id="kpiSelectAll" onchange="toggleSelectAll('kpiMasterBody','kpiSelectAll','kpiBulkDeleteBtn','kpiSelCount')" style="cursor:pointer"></th><th style="width:60px">Seq</th><th>KPI Name</th><th>Unit</th><th>Target</th><th>Direction</th><th>Dept</th><th>Weightage</th><th>Actions</th></tr></thead><tbody id="kpiMasterBody"></tbody></table></div>
       </div>
     </div>
 
@@ -938,6 +938,7 @@ const kpiMaster = [
   {id:8,name:'Training Hrs/Employee',unit:'Hrs',target:8,dir:'higher',dept:'HR',weight:8},
 ];
 kpiMaster.forEach(k=>{ if(!k.plantOverrides) k.plantOverrides = {}; });
+kpiMaster.forEach((k,i)=>{ if(k.seq==null) k.seq = (i+1)*10; });
 
 // Rich monthly data for all KPIs across months and plants
 const kpiData = [
@@ -1453,42 +1454,38 @@ function buildInitCharts() {
 // ══ KPI TRENDS PAGE ══
 let trendCharts = {};
 
-// ── KPI Trends card ordering (persisted per-browser) ──────────────
-function getKPIOrder(){
-  try {
-    const raw = localStorage.getItem('kpiTrendOrder');
-    return raw ? JSON.parse(raw) : [];
-  } catch(e){ return []; }
-}
-function saveKPIOrder(order){
-  try { localStorage.setItem('kpiTrendOrder', JSON.stringify(order)); } catch(e){}
-}
+// ── KPI Trends card ordering — driven by KPI Master "Seq" field ───
 function sortByKPIOrder(list){
-  const order = getKPIOrder();
-  if(!order.length) return list;
-  const pos = id => { const i = order.indexOf(String(id)); return i===-1 ? Infinity : i; };
-  return [...list].sort((a,b) => {
-    const pa = pos(a.id), pb = pos(b.id);
-    if(pa!==pb) return pa-pb;
-    return 0;
-  });
+  return [...list].sort((a,b) => (a.seq||0)-(b.seq||0) || (a.id>b.id?1:-1));
 }
 function moveTrendCard(id, dir){
-  // Build the current full order (all KPIs, in their current displayed sequence)
-  let order = getKPIOrder();
-  const allIds = kpiMaster.map(k=>String(k.id));
-  if(!order.length) order = allIds.slice();
-  else {
-    // append any KPIs missing from the saved order (newly added KPIs)
-    allIds.forEach(i=>{ if(!order.includes(i)) order.push(i); });
-    order = order.filter(i=>allIds.includes(i)); // drop deleted KPIs
-  }
-  const idx = order.indexOf(String(id));
+  const sorted = sortByKPIOrder(kpiMaster);
+  const idx = sorted.findIndex(k=>String(k.id)===String(id));
   const newIdx = idx + dir;
-  if(idx===-1 || newIdx<0 || newIdx>=order.length) return;
-  [order[idx], order[newIdx]] = [order[newIdx], order[idx]];
-  saveKPIOrder(order);
+  if(idx===-1 || newIdx<0 || newIdx>=sorted.length) return;
+  // Swap seq values between the two KPIs
+  const a = sorted[idx], b = sorted[newIdx];
+  const tmp = a.seq; a.seq = b.seq; b.seq = tmp;
+  if(a.seq===b.seq) b.seq = a.seq + (dir>0?1:-1); // avoid identical seq ties
+  persistKPISeq(a);
+  persistKPISeq(b);
   renderTrendPage();
+  renderKPIMaster();
+}
+function setKPISeq(id, value){
+  const k = kpiMaster.find(k=>String(k.id)===String(id));
+  if(!k) return;
+  const seq = parseFloat(value);
+  k.seq = isNaN(seq) ? 0 : seq;
+  persistKPISeq(k);
+  renderKPIMaster();
+  const trendsPage = document.getElementById('page-trends');
+  if (trendsPage && trendsPage.classList.contains('active')) renderTrendPage();
+}
+function persistKPISeq(k){
+  if (window.FB && window.FB.updateKPI && typeof k.id === 'string') {
+    window.FB.updateKPI(k.id, { seq: k.seq }).catch(err=>console.warn('Firebase seq update failed:', err));
+  }
 }
 
 function renderTrendPage() {
@@ -1769,9 +1766,10 @@ function renderKPIMaster(){
   const editDeptSel = document.getElementById('editKPIDept');
   if(editDeptSel) editDeptSel.innerHTML = '<option value="">— Unassigned —</option>' + deptList.map(d=>`<option>${d.name}</option>`).join('');
 
-  document.getElementById('kpiMasterBody').innerHTML=kpiMaster.map(k=>`
+  document.getElementById('kpiMasterBody').innerHTML=[...kpiMaster].sort((a,b)=>(a.seq||0)-(b.seq||0)).map(k=>`
     <tr>
       <td><input type="checkbox" class="row-cb" data-id="${k.id}" onchange="updateBulkBar('kpiMasterBody','kpiBulkDeleteBtn','kpiSelCount','kpiSelectAll')" style="cursor:pointer"></td>
+      <td><input type="number" value="${k.seq||0}" onchange="setKPISeq('${k.id}',this.value)" style="width:56px;padding:4px 6px;border:0.5px solid var(--border2);border-radius:var(--r-sm);background:var(--surface);color:var(--text);font-size:12px;text-align:center"></td>
       <td style="font-weight:500">${k.name}</td><td>${k.unit}</td><td>${k.target}</td>
       <td><span style="font-size:11px;color:var(--text3)">${k.dir==='lower'?'↓ lower is better':'↑ higher is better'}</span></td>
       <td>${k.dept || '<span style="color:var(--text3)">— Unassigned —</span>'}</td><td>${k.weight}%</td>
@@ -1789,7 +1787,8 @@ function saveKPI(){
   const target=parseFloat(document.getElementById('nKPITarget').value);
   if(!name||!unit||isNaN(target)){showToast('Please fill all required fields');return;}
   const plantOverrides = readPlantMapTable('nKPIPlantMap');
-  kpiMaster.push({id:kpiMaster.length+1,name,unit,target,dir:document.getElementById('nKPIDir').value,dept:document.getElementById('nKPIDept').value,plant:'All',weight:parseInt(document.getElementById('nKPIWeight').value)||0,desc:document.getElementById('nKPIDesc').value,plantOverrides});
+  const maxSeq = kpiMaster.reduce((m,k)=>Math.max(m,k.seq||0),0);
+  kpiMaster.push({id:kpiMaster.length+1,name,unit,target,dir:document.getElementById('nKPIDir').value,dept:document.getElementById('nKPIDept').value,plant:'All',weight:parseInt(document.getElementById('nKPIWeight').value)||0,desc:document.getElementById('nKPIDesc').value,plantOverrides,seq:maxSeq+10});
   renderKPIMaster();closeModal('addKPIModal');showToast('KPI "'+name+'" added');
   ['nKPIName','nKPIUnit','nKPITarget','nKPIWeight','nKPIDesc'].forEach(id=>document.getElementById(id).value='');
 }
@@ -1838,7 +1837,7 @@ async function saveEditKPI(){
       await window.FB.updateKPI(k.id, {
         name: k.name, unit: k.unit, target: k.target, direction: k.dir,
         department: k.dept, weightage: k.weight, description: k.desc,
-        plantOverrides: k.plantOverrides
+        plantOverrides: k.plantOverrides, seq: k.seq
       });
     } catch (err) {
       console.warn('Firebase KPI update failed:', err);
@@ -3276,7 +3275,8 @@ async function loadFirebaseData() {
         dept:   k.department,
         plant:  k.plant || 'All',
         weight: k.weightage || 0,
-        plantOverrides: k.plantOverrides || {}
+        plantOverrides: k.plantOverrides || {},
+        seq: k.seq != null ? k.seq : (i+1)*10
       }));
       renderKPIMaster();
 
@@ -3464,12 +3464,13 @@ window.saveKPI = async function() {
     plant:       'All',
     weightage:   parseInt(document.getElementById('nKPIWeight').value) || 0,
     description: document.getElementById('nKPIDesc').value,
-    plantOverrides
+    plantOverrides,
+    seq: kpiMaster.reduce((m,k)=>Math.max(m,k.seq||0),0) + 10
   };
 
   try {
     const ref = await addKPI(kpiData_);
-    kpiMaster.push({ id: ref.id, name, unit, target, dir: kpiData_.direction, dept: kpiData_.department, plant: 'All', weight: kpiData_.weightage, plantOverrides });
+    kpiMaster.push({ id: ref.id, name, unit, target, dir: kpiData_.direction, dept: kpiData_.department, plant: 'All', weight: kpiData_.weightage, plantOverrides, seq: kpiData_.seq });
     renderKPIMaster();
     closeModal('addKPIModal');
     showToast('KPI "' + name + '" saved to Firebase ✓');
