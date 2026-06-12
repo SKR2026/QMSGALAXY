@@ -2129,18 +2129,32 @@ export async function updateKPIEntry(entryId, updates) {
  */
 export async function getKPIEntries(filters = {}) {
   let q = collection(db, "kpiData");
-  const constraints = [orderBy("createdAt", "desc")];
+  const constraints = [];
 
-  if (filters.year)       constraints.unshift(where("year",       "==", filters.year));
+  if (filters.year)       constraints.push(where("year",       "==", filters.year));
   if (filters.month && filters.month !== "All")
-                          constraints.unshift(where("month",      "==", filters.month));
+                          constraints.push(where("month",      "==", filters.month));
   if (filters.plant && filters.plant !== "All")
-                          constraints.unshift(where("plant",      "==", filters.plant));
+                          constraints.push(where("plant",      "==", filters.plant));
   if (filters.department && filters.department !== "All")
-                          constraints.unshift(where("department", "==", filters.department));
+                          constraints.push(where("department", "==", filters.department));
+
+  // Only add orderBy when there are no equality filters — combining `where`
+  // on multiple fields with `orderBy` requires a Firestore composite index.
+  // Sort client-side instead so this works without any index setup.
+  if (constraints.length === 0) constraints.push(orderBy("createdAt", "desc"));
 
   const snap = await getDocs(query(q, ...constraints));
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+  if (constraints.length > 0) {
+    docs.sort((a, b) => {
+      const at = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+      const bt = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+      return bt - at;
+    });
+  }
+  return docs;
 }
 
 /**
@@ -2150,18 +2164,29 @@ export async function getKPIEntries(filters = {}) {
  */
 export function listenKPIEntries(filters = {}, callback) {
   let q = collection(db, "kpiData");
-  const constraints = [orderBy("createdAt", "desc")];
+  const constraints = [];
 
-  if (filters.year)       constraints.unshift(where("year",       "==", filters.year));
+  if (filters.year)       constraints.push(where("year",       "==", filters.year));
   if (filters.month && filters.month !== "All")
-                          constraints.unshift(where("month",      "==", filters.month));
+                          constraints.push(where("month",      "==", filters.month));
   if (filters.plant && filters.plant !== "All")
-                          constraints.unshift(where("plant",      "==", filters.plant));
+                          constraints.push(where("plant",      "==", filters.plant));
   if (filters.department && filters.department !== "All")
-                          constraints.unshift(where("department", "==", filters.department));
+                          constraints.push(where("department", "==", filters.department));
+
+  const hasFilters = constraints.length > 0;
+  if (!hasFilters) constraints.push(orderBy("createdAt", "desc"));
 
   return onSnapshot(query(q, ...constraints), snap => {
-    callback(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (hasFilters) {
+      docs.sort((a, b) => {
+        const at = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+        const bt = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+        return bt - at;
+      });
+    }
+    callback(docs);
   });
 }
 
@@ -2170,12 +2195,16 @@ export function listenKPIEntries(filters = {}, callback) {
 // ════════════════════════════════════════════════════════════════
 
 export async function getOpenActionPlans() {
+  // `where(... "in" ...)` combined with `orderBy` on a different field requires
+  // a Firestore composite index. Sort client-side instead so this works with
+  // no index setup.
   const snap = await getDocs(
     query(collection(db, "kpiData"),
-      where("actionStatus", "in", ["open", "in-progress", "overdue"]),
-      orderBy("targetDate", "asc"))
+      where("actionStatus", "in", ["open", "in-progress", "overdue"]))
   );
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  docs.sort((a, b) => String(a.targetDate || '').localeCompare(String(b.targetDate || '')));
+  return docs;
 }
 
 export async function closeActionPlan(entryId) {
@@ -2432,11 +2461,11 @@ onAuthChange(async user => {
 
 // ── Load master + entry data from Firestore ──────────────────────
 async function loadFirebaseData() {
-  try {
-    // 0. Org / escalation settings (applies company name to sidebar)
-    try { await loadEscalationSettingsUI(); } catch (err) { console.warn('Settings load error:', err); }
+  // 0. Org / escalation settings (applies company name to sidebar)
+  try { await loadEscalationSettingsUI(); } catch (err) { console.warn('Settings load error:', err); }
 
-    // 1. KPI Master
+  // 1. KPI Master
+  try {
     const fsKPIs = await getKPIMaster();
     if (fsKPIs.length > 0) {
       // Replace local kpiMaster array with Firestore data
@@ -2460,8 +2489,12 @@ async function loadFirebaseData() {
           `<option value="${k.id}">${k.name}</option>`).join('');
       }
     }
+  } catch (err) {
+    console.warn('KPI master load error:', err);
+  }
 
-    // 2. KPI Entries — initial load
+  // 2. KPI Entries — initial load
+  try {
     const fsEntries = await getKPIEntries({
       year:  parseInt(filterState.year),
       month: filterState.month,
@@ -2472,35 +2505,38 @@ async function loadFirebaseData() {
       mergeFirebaseEntries(fsEntries);
       refreshAll();
     }
+  } catch (err) {
+    console.warn('KPI entries load error (may need a Firestore composite index — see console link):', err);
+    showToast('KPI entries unavailable — using sample data');
+  }
 
-    // 3. Action plans
+  // 3. Action plans
+  try {
     const actions = await getOpenActionPlans();
     if (actions.length > 0) {
       mergeFirebaseEntries(actions);
       renderActionPlans('all');
     }
-
-    // 4. Users
-    try {
-      const fsUsers = await getAllUsers();
-      if (fsUsers.length > 0) {
-        usersList = fsUsers.map(u => ({
-          name: u.name || u.email || 'Unnamed',
-          email: u.email || '',
-          role: u.role || 'Dept User',
-          plant: u.plant || 'All',
-          department: u.department || 'All',
-          active: u.active !== false
-        }));
-        renderUsersPage();
-      }
-    } catch (err) {
-      console.warn('Could not load users list:', err);
-    }
-
   } catch (err) {
-    console.warn('Firebase load error — using local sample data.', err);
-    showToast('Firebase unavailable — using sample data');
+    console.warn('Action plans load error:', err);
+  }
+
+  // 4. Users
+  try {
+    const fsUsers = await getAllUsers();
+    if (fsUsers.length > 0) {
+      usersList = fsUsers.map(u => ({
+        name: u.name || u.email || 'Unnamed',
+        email: u.email || '',
+        role: u.role || 'Dept User',
+        plant: u.plant || 'All',
+        department: u.department || 'All',
+        active: u.active !== false
+      }));
+      renderUsersPage();
+    }
+  } catch (err) {
+    console.warn('Could not load users list:', err);
   }
 }
 
