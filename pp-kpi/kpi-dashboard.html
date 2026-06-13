@@ -535,6 +535,10 @@ tr:hover td{background:var(--surface2)}
             </div>
           </div>
         </div>
+        <div id="editingBanner" style="display:none;align-items:center;justify-content:space-between;background:var(--blue-bg);color:var(--blue);border-radius:var(--r-md);padding:8px 12px;font-size:12px;margin-bottom:10px">
+          <span>Editing a saved draft entry</span>
+          <span style="cursor:pointer;font-weight:600" onclick="clearForm()">Cancel ✕</span>
+        </div>
         <div style="display:flex;gap:10px;justify-content:flex-end">
           <button class="btn" onclick="clearForm()">Clear</button>
           <button class="btn" onclick="saveEntry('draft')">Save draft</button>
@@ -1725,11 +1729,15 @@ function calcAchievement(){
   fill.style.width=Math.min(100,pct)+'%';fill.style.background=colorFor(s);
   document.getElementById('gapPanel').style.display=(s==='missed'||s==='near-miss')?'block':'none';
 }
+let editingEntryId = null;
 function clearForm(){
   ['entryPlant','entryDept','entryKPI'].forEach(id=>{const el=document.getElementById(id);if(el)el.selectedIndex=0});
   ['entryTarget','entryUnit','entryActual','entryAchPct','entryReason','entryAction','entryResp','entryDate'].forEach(id=>{const el=document.getElementById(id);if(el)el.value=''});
   document.getElementById('gapPanel').style.display='none';
   document.getElementById('achievementBar').style.display='none';
+  editingEntryId = null;
+  const banner = document.getElementById('editingBanner');
+  if(banner) banner.style.display='none';
 }
 function saveEntry(mode){
   const plant=document.getElementById('entryPlant').value;
@@ -1744,23 +1752,80 @@ function saveEntry(mode){
   const action=document.getElementById('entryAction').value;
   if(mode==='submitted' && s==='missed'&&(!reason||!action)){showToast('Action plan required for missed KPI');return;}
   const entryStatus = mode==='submitted' ? 'submitted' : 'draft';
-  const entry={id:nextId++,year:parseInt(document.getElementById('entryYear').value),month:document.getElementById('entryMonth').value,plant,dept,kpiId,target,actual,reason,action,resp:document.getElementById('entryResp').value,dueDate:document.getElementById('entryDate').value,actionStatus:reason?'in-progress':null,entryStatus,locked:mode==='submitted'};
-  recentEntries.unshift(entry);
+  const common = {year:parseInt(document.getElementById('entryYear').value),month:document.getElementById('entryMonth').value,plant,dept,kpiId,target,actual,reason,action,resp:document.getElementById('entryResp').value,dueDate:document.getElementById('entryDate').value,actionStatus:reason?'in-progress':null,entryStatus,locked:mode==='submitted'};
+
+  let entry;
+  if(editingEntryId!=null){
+    entry = recentEntries.find(d=>String(d.id)===String(editingEntryId));
+    if(!entry){ showToast('That entry no longer exists'); clearForm(); return; }
+    if(entry.locked){ showToast('This entry is locked and cannot be edited'); return; }
+    Object.assign(entry, common);
+  } else {
+    entry = {id:nextId++, ...common};
+    recentEntries.unshift(entry);
+  }
+
   renderRecentEntries();
   showToast(mode==='submitted' ? 'KPI data submitted — locked for editing' : 'Draft saved');
   clearForm();
   refreshAll();
 
-  if (window.FB && window.FB.saveKPIEntry) {
-    window.FB.saveKPIEntry({
+  if (window.FB) {
+    const payload = {
       year: entry.year, month: entry.month, plant, department: dept,
       kpiId: k.id, kpiName: k.name, target, actual, unit: k.unit, direction: k.dir,
       reason, actionPlan: action, responsiblePerson: entry.resp, targetDate: entry.dueDate,
       actionStatus: entry.actionStatus || '', entryStatus, locked: entry.locked,
       submittedBy: (window._fbProfile && window._fbProfile.email) || ''
-    }).then(ref=>{ if(ref && ref.id) entry.fsId = ref.id; })
-      .catch(err=>console.warn('Firebase entry save failed:', err));
+    };
+    if(entry.fsId && window.FB.updateKPIEntry){
+      window.FB.updateKPIEntry(entry.fsId, payload).catch(err=>console.warn('Firebase entry update failed:', err));
+    } else if(window.FB.saveKPIEntry){
+      window.FB.saveKPIEntry(payload).then(ref=>{ if(ref && ref.id) entry.fsId = ref.id; })
+        .catch(err=>console.warn('Firebase entry save failed:', err));
+    }
   }
+}
+
+// Load a draft entry back into the form for editing
+function editEntry(id){
+  const entry = recentEntries.find(d=>String(d.id)===String(id));
+  if(!entry) return;
+  if(entry.locked){ showToast('Submitted entries are locked — ask a Super Admin to unlock'); return; }
+
+  document.getElementById('entryYear').value = entry.year;
+  document.getElementById('entryMonth').value = entry.month;
+  document.getElementById('entryPlant').value = entry.plant;
+  updateDepts();
+  document.getElementById('entryDept').value = entry.dept;
+  updateKPIs();
+  document.getElementById('entryKPI').value = entry.kpiId;
+  loadKPITarget();
+  document.getElementById('entryTarget').value = entry.target;
+  document.getElementById('entryActual').value = entry.actual;
+  calcAchievement();
+  document.getElementById('entryReason').value = entry.reason || '';
+  document.getElementById('entryAction').value = entry.action || '';
+  document.getElementById('entryResp').value = entry.resp || '';
+  document.getElementById('entryDate').value = entry.dueDate || '';
+
+  editingEntryId = entry.id;
+  const banner = document.getElementById('editingBanner');
+  if(banner) banner.style.display='flex';
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+// Remove a draft entry entirely
+function deleteEntry(id){
+  const idx = recentEntries.findIndex(d=>String(d.id)===String(id));
+  if(idx===-1) return;
+  const entry = recentEntries[idx];
+  if(entry.locked){ showToast('Submitted entries are locked — ask a Super Admin to unlock'); return; }
+  if(!confirm('Delete this draft entry?')) return;
+  recentEntries.splice(idx,1);
+  if(editingEntryId===entry.id) clearForm();
+  renderRecentEntries();
+  refreshAll();
 }
 
 // Super Admin only — unlocks a submitted entry so it can be edited again
@@ -1795,7 +1860,9 @@ function renderRecentEntries(){
         entryCell += ` <button class="btn btn-sm" style="margin-left:6px" onclick="unlockEntry(${d.id})">Unlock</button>`;
       }
     } else {
-      entryCell = '<span class="badge">Draft</span>';
+      entryCell = `<span class="badge">Draft</span>
+        <button class="btn btn-sm" style="margin-left:6px" onclick="editEntry(${d.id})">Edit</button>
+        <button class="btn btn-sm" style="margin-left:4px;color:var(--red)" onclick="deleteEntry(${d.id})">Delete</button>`;
     }
     return `<tr><td>${d.month} ${d.year}</td><td>${d.plant}</td><td>${d.dept}</td><td style="font-weight:500">${k?k.name:'—'}</td><td style="color:var(--text3)">${d.target}</td><td>${d.actual}</td><td>${badgeFor(s)}</td><td>${entryCell}</td></tr>`;
   }).join('');
