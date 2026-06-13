@@ -1776,7 +1776,7 @@ function saveEntry(mode){
       kpiId: k.id, kpiName: k.name, target, actual, unit: k.unit, direction: k.dir,
       reason, actionPlan: action, responsiblePerson: entry.resp, targetDate: entry.dueDate,
       actionStatus: entry.actionStatus || '', entryStatus, locked: entry.locked,
-      submittedBy: (window._fbProfile && window._fbProfile.email) || ''
+      submittedBy: (window._fbProfile && window._fbProfile.email) || (currentUser && currentUser.email) || ''
     };
     if(entry.fsId && window.FB.updateKPIEntry){
       window.FB.updateKPIEntry(entry.fsId, payload).catch(err=>console.warn('Firebase entry update failed:', err));
@@ -1857,12 +1857,12 @@ function renderRecentEntries(){
     if(d.entryStatus==='submitted' || d.locked){
       entryCell = '<span class="badge badge-blue">🔒 Submitted</span>';
       if(isSuperAdmin){
-        entryCell += ` <button class="btn btn-sm" style="margin-left:6px" onclick="unlockEntry(${d.id})">Unlock</button>`;
+        entryCell += ` <button class="btn btn-sm" style="margin-left:6px" onclick="unlockEntry('${d.id}')">Unlock</button>`;
       }
     } else {
       entryCell = `<span class="badge">Draft</span>
-        <button class="btn btn-sm" style="margin-left:6px" onclick="editEntry(${d.id})">Edit</button>
-        <button class="btn btn-sm" style="margin-left:4px;color:var(--red)" onclick="deleteEntry(${d.id})">Delete</button>`;
+        <button class="btn btn-sm" style="margin-left:6px" onclick="editEntry('${d.id}')">Edit</button>
+        <button class="btn btn-sm" style="margin-left:4px;color:var(--red)" onclick="deleteEntry('${d.id}')">Delete</button>`;
     }
     return `<tr><td>${d.month} ${d.year}</td><td>${d.plant}</td><td>${d.dept}</td><td style="font-weight:500">${k?k.name:'—'}</td><td style="color:var(--text3)">${d.target}</td><td>${d.actual}</td><td>${badgeFor(s)}</td><td>${entryCell}</td></tr>`;
   }).join('');
@@ -3032,6 +3032,25 @@ export async function updateKPIEntry(entryId, updates) {
  * Get all entries — optionally filtered.
  * filters: { year, month, plant, department }  (any combination, all optional)
  */
+/**
+ * Get all kpiData entries created by a given user (matched on `submittedBy`),
+ * regardless of the current Year/Month/Plant/Department filter. Used to
+ * restore a user's draft/submitted entries on page reload.
+ */
+export async function getMyEntries(email) {
+  if (!email) return [];
+  const snap = await getDocs(
+    query(collection(db, "kpiData"), where("submittedBy", "==", email))
+  );
+  const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  docs.sort((a, b) => {
+    const at = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+    const bt = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+    return bt - at;
+  });
+  return docs;
+}
+
 export async function getKPIEntries(filters = {}) {
   let q = collection(db, "kpiData");
   const constraints = [];
@@ -3292,7 +3311,7 @@ window.FB = {
   getUserProfile, getAllUsers, createUser, updateUser, registerUser, deleteUserDoc,
   getPlants, addPlant, updatePlant, deletePlant,
   getKPIMaster, addKPI, updateKPI, deleteKPI,
-  saveKPIEntry, updateKPIEntry, getKPIEntries, listenKPIEntries,
+  saveKPIEntry, updateKPIEntry, getKPIEntries, getMyEntries, listenKPIEntries,
   getOpenActionPlans, closeActionPlan,
   listenLiveKPI, raiseAlert, listenAlerts, acknowledgeAlert,
   getEscalationSettings, saveEscalationSettings,
@@ -3412,10 +3431,26 @@ async function loadFirebaseData() {
     if (fsEntries.length > 0) {
       mergeFirebaseEntries(fsEntries);
       refreshAll();
+      renderRecentEntries();
     }
   } catch (err) {
     console.warn('KPI entries load error (may need a Firestore composite index — see console link):', err);
     showToast('KPI entries unavailable — using sample data');
+  }
+
+  // 2b. My own draft / submitted entries (independent of the Year/Month/Plant
+  // filter, so a draft saved for a different month is still visible & editable)
+  try {
+    const email = (window._fbProfile && window._fbProfile.email) || (currentUser && currentUser.email);
+    if (email && window.FB && window.FB.getMyEntries) {
+      const mine = await getMyEntries(email);
+      if (mine.length > 0) {
+        mergeFirebaseEntries(mine);
+        renderRecentEntries();
+      }
+    }
+  } catch (err) {
+    console.warn('Could not load your saved entries:', err);
   }
 
   // 3. Action plans
@@ -3452,6 +3487,34 @@ async function loadFirebaseData() {
 // Merge Firestore entries into local kpiData array (avoid duplicates)
 function mergeFirebaseEntries(fsEntries) {
   fsEntries.forEach(fe => {
+    // Entries created via the Entry form carry entryStatus (draft/submitted).
+    // Keep those in recentEntries so they show in "Recent entries" and remain
+    // editable; everything else (legacy/seed-style docs) goes into kpiData.
+    if (fe.entryStatus) {
+      const mapped = {
+        id:           fe.id,
+        fsId:         fe.id,
+        year:         fe.year,
+        month:        fe.month,
+        plant:        fe.plant,
+        dept:         fe.department,
+        kpiId:        fe.kpiId,
+        target:       fe.target,
+        actual:       fe.actual,
+        reason:       fe.reason        || '',
+        action:       fe.actionPlan    || '',
+        resp:         fe.responsiblePerson || '',
+        dueDate:      fe.targetDate    || '',
+        actionStatus: fe.actionStatus  || null,
+        entryStatus:  fe.entryStatus,
+        locked:       !!fe.locked
+      };
+      const exists = recentEntries.findIndex(d => String(d.fsId||d.id) === String(fe.id));
+      if (exists >= 0) recentEntries[exists] = mapped;
+      else recentEntries.push(mapped);
+      return;
+    }
+
     const exists = kpiData.findIndex(d => d.id === fe.id);
     const mapped = {
       id:           fe.id,
