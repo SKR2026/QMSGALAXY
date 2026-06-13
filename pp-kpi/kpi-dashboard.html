@@ -537,12 +537,13 @@ tr:hover td{background:var(--surface2)}
         </div>
         <div style="display:flex;gap:10px;justify-content:flex-end">
           <button class="btn" onclick="clearForm()">Clear</button>
-          <button class="btn btn-primary" onclick="saveEntry()">Save KPI data</button>
+          <button class="btn" onclick="saveEntry('draft')">Save draft</button>
+          <button class="btn btn-primary" onclick="saveEntry('submitted')">Submit</button>
         </div>
       </div>
       <div class="card" style="margin-top:14px">
         <div class="card-title">Recent entries</div>
-        <div class="table-wrap"><table><thead><tr><th>Month</th><th>Plant</th><th>Dept</th><th>KPI</th><th>Target</th><th>Actual</th><th>Status</th></tr></thead><tbody id="recentBody"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Month</th><th>Plant</th><th>Dept</th><th>KPI</th><th>Target</th><th>Actual</th><th>Status</th><th>Entry</th></tr></thead><tbody id="recentBody"></tbody></table></div>
       </div>
     </div>
 
@@ -1730,7 +1731,7 @@ function clearForm(){
   document.getElementById('gapPanel').style.display='none';
   document.getElementById('achievementBar').style.display='none';
 }
-function saveEntry(){
+function saveEntry(mode){
   const plant=document.getElementById('entryPlant').value;
   const dept=document.getElementById('entryDept').value;
   const kpiId=parseInt(document.getElementById('entryKPI').value);
@@ -1741,22 +1742,62 @@ function saveEntry(){
   const s=statusOf(calcAch(actual,target,k.dir),actual,target,k.dir);
   const reason=document.getElementById('entryReason').value;
   const action=document.getElementById('entryAction').value;
-  if(s==='missed'&&(!reason||!action)){showToast('Action plan required for missed KPI');return;}
-  const entry={id:nextId++,year:parseInt(document.getElementById('entryYear').value),month:document.getElementById('entryMonth').value,plant,dept,kpiId,target,actual,reason,action,resp:document.getElementById('entryResp').value,dueDate:document.getElementById('entryDate').value,actionStatus:reason?'in-progress':null};
+  if(mode==='submitted' && s==='missed'&&(!reason||!action)){showToast('Action plan required for missed KPI');return;}
+  const entryStatus = mode==='submitted' ? 'submitted' : 'draft';
+  const entry={id:nextId++,year:parseInt(document.getElementById('entryYear').value),month:document.getElementById('entryMonth').value,plant,dept,kpiId,target,actual,reason,action,resp:document.getElementById('entryResp').value,dueDate:document.getElementById('entryDate').value,actionStatus:reason?'in-progress':null,entryStatus,locked:mode==='submitted'};
   recentEntries.unshift(entry);
   renderRecentEntries();
-  showToast('KPI data saved');
+  showToast(mode==='submitted' ? 'KPI data submitted — locked for editing' : 'Draft saved');
   clearForm();
   refreshAll();
+
+  if (window.FB && window.FB.saveKPIEntry) {
+    window.FB.saveKPIEntry({
+      year: entry.year, month: entry.month, plant, department: dept,
+      kpiId: k.id, kpiName: k.name, target, actual, unit: k.unit, direction: k.dir,
+      reason, actionPlan: action, responsiblePerson: entry.resp, targetDate: entry.dueDate,
+      actionStatus: entry.actionStatus || '', entryStatus, locked: entry.locked,
+      submittedBy: (window._fbProfile && window._fbProfile.email) || ''
+    }).then(ref=>{ if(ref && ref.id) entry.fsId = ref.id; })
+      .catch(err=>console.warn('Firebase entry save failed:', err));
+  }
+}
+
+// Super Admin only — unlocks a submitted entry so it can be edited again
+function unlockEntry(id){
+  const entry = recentEntries.find(d=>String(d.id)===String(id));
+  if(!entry) return;
+  if(!(window._roleInfo && window._roleInfo.isSuperAdmin)){
+    showToast('Only Super Admin can unlock entries');
+    return;
+  }
+  entry.locked = false;
+  entry.entryStatus = 'draft';
+  renderRecentEntries();
+  showToast('Entry unlocked');
+  if (window.FB && window.FB.updateKPIEntry && entry.fsId) {
+    window.FB.updateKPIEntry(entry.fsId, { locked: false, entryStatus: 'draft' })
+      .catch(err=>console.warn('Firebase unlock failed:', err));
+  }
 }
 function renderRecentEntries(){
   const body=document.getElementById('recentBody');
-  if(!recentEntries.length){body.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:20px">No entries yet this session</td></tr>';return;}
+  if(!recentEntries.length){body.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:20px">No entries yet this session</td></tr>';return;}
+  const isSuperAdmin = window._roleInfo && window._roleInfo.isSuperAdmin;
   body.innerHTML=recentEntries.map(d=>{
     const k=kpiMaster.find(k=>k.id===d.kpiId);
     const pct=calcAch(d.actual,d.target,k?k.dir:'lower');
     const s=statusOf(pct,d.actual,d.target,k?k.dir:'lower');
-    return `<tr><td>${d.month} ${d.year}</td><td>${d.plant}</td><td>${d.dept}</td><td style="font-weight:500">${k?k.name:'—'}</td><td style="color:var(--text3)">${d.target}</td><td>${d.actual}</td><td>${badgeFor(s)}</td></tr>`;
+    let entryCell;
+    if(d.entryStatus==='submitted' || d.locked){
+      entryCell = '<span class="badge badge-blue">🔒 Submitted</span>';
+      if(isSuperAdmin){
+        entryCell += ` <button class="btn btn-sm" style="margin-left:6px" onclick="unlockEntry(${d.id})">Unlock</button>`;
+      }
+    } else {
+      entryCell = '<span class="badge">Draft</span>';
+    }
+    return `<tr><td>${d.month} ${d.year}</td><td>${d.plant}</td><td>${d.dept}</td><td style="font-weight:500">${k?k.name:'—'}</td><td style="color:var(--text3)">${d.target}</td><td>${d.actual}</td><td>${badgeFor(s)}</td><td>${entryCell}</td></tr>`;
   }).join('');
 }
 
@@ -1909,6 +1950,8 @@ function applyRoleRestrictions(profile){
 
   // Re-render Users page (Plant Admins only see their own plant's users)
   renderUsersPage();
+  // Re-render entries so the Unlock action shows up for Super Admins
+  renderRecentEntries();
 }
 
 // ══ GENERIC BULK-SELECT HELPERS ══
