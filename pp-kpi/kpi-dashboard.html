@@ -1752,12 +1752,31 @@ function saveEntry(mode){
   const action=document.getElementById('entryAction').value;
   if(mode==='submitted' && s==='missed'&&(!reason||!action)){showToast('Action plan required for missed KPI');return;}
   const entryStatus = mode==='submitted' ? 'submitted' : 'draft';
-  const common = {year:parseInt(document.getElementById('entryYear').value),month:document.getElementById('entryMonth').value,plant,dept,kpiId,target,actual,reason,action,resp:document.getElementById('entryResp').value,dueDate:document.getElementById('entryDate').value,actionStatus:reason?'in-progress':null,entryStatus,locked:mode==='submitted'};
+  const year=parseInt(document.getElementById('entryYear').value);
+  const month=document.getElementById('entryMonth').value;
+  const common = {year,month,plant,dept,kpiId,target,actual,reason,action,resp:document.getElementById('entryResp').value,dueDate:document.getElementById('entryDate').value,actionStatus:reason?'in-progress':null,entryStatus,locked:mode==='submitted'};
+
+  // A KPI can only have one entry per plant/month/year — edit it instead of
+  // creating a duplicate.
+  if(editingEntryId==null){
+    const dup = recentEntries.find(d=>d.kpiId===kpiId && d.plant===plant && d.month===month && String(d.year)===String(year));
+    if(dup){
+      if(dup.locked){
+        showToast('An entry for this KPI/month is already submitted and locked. Ask a Super Admin to unlock it to make changes.');
+      } else {
+        showToast('An entry for this KPI/month already exists — opened it for editing instead.');
+        editEntry(dup.id);
+      }
+      return;
+    }
+  }
 
   let entry;
   if(editingEntryId!=null){
     entry = recentEntries.find(d=>String(d.id)===String(editingEntryId));
     if(!entry){ showToast('That entry no longer exists'); clearForm(); return; }
+    const collision = recentEntries.find(d=>String(d.id)!==String(editingEntryId) && d.kpiId===kpiId && d.plant===plant && d.month===month && String(d.year)===String(year));
+    if(collision){ showToast('Another entry already exists for this KPI/plant/month'); return; }
     if(entry.locked){ showToast('This entry is locked and cannot be edited'); return; }
     Object.assign(entry, common);
   } else {
@@ -1779,10 +1798,13 @@ function saveEntry(mode){
       submittedBy: (window._fbProfile && window._fbProfile.email) || (currentUser && currentUser.email) || ''
     };
     if(entry.fsId && window.FB.updateKPIEntry){
-      window.FB.updateKPIEntry(entry.fsId, payload).catch(err=>console.warn('Firebase entry update failed:', err));
+      window.FB.updateKPIEntry(entry.fsId, payload)
+        .then(()=>console.log('Entry updated in Firestore:', entry.fsId))
+        .catch(err=>{ console.warn('Firebase entry update failed:', err); showToast('Saved locally — Firebase sync failed (see console)'); });
     } else if(window.FB.saveKPIEntry){
-      window.FB.saveKPIEntry(payload).then(ref=>{ if(ref && ref.id) entry.fsId = ref.id; })
-        .catch(err=>console.warn('Firebase entry save failed:', err));
+      window.FB.saveKPIEntry(payload).then(id=>{
+        if(id){ entry.fsId = id; console.log('Entry saved to Firestore:', id, payload); }
+      }).catch(err=>{ console.warn('Firebase entry save failed:', err); showToast('Saved locally — Firebase sync failed (see console)'); });
     }
   }
 }
@@ -3005,15 +3027,20 @@ export async function saveKPIEntry(entryData) {
 
   const docRef = await addDoc(collection(db, "kpiData"), payload);
 
-  // Mirror to Realtime DB for live dashboard updates
-  await set(ref(rtdb, `kpiLive/${entryData.plant}/${entryData.year}/${entryData.month}/${docRef.id}`), {
-    kpiName: entryData.kpiName,
-    actual,
-    target,
-    status,
-    achievementPct: pct,
-    department: entryData.department
-  });
+  // Mirror to Realtime DB for live dashboard updates (best-effort — a failure
+  // here must not prevent the Firestore save from being treated as successful)
+  try {
+    await set(ref(rtdb, `kpiLive/${entryData.plant}/${entryData.year}/${entryData.month}/${docRef.id}`), {
+      kpiName: entryData.kpiName,
+      actual,
+      target,
+      status,
+      achievementPct: pct,
+      department: entryData.department
+    });
+  } catch (err) {
+    console.warn('Realtime DB mirror failed (entry was still saved to Firestore):', err);
+  }
 
   return docRef.id;
 }
@@ -3442,8 +3469,10 @@ async function loadFirebaseData() {
   // filter, so a draft saved for a different month is still visible & editable)
   try {
     const email = (window._fbProfile && window._fbProfile.email) || (currentUser && currentUser.email);
+    console.log('Loading my entries for:', email);
     if (email && window.FB && window.FB.getMyEntries) {
       const mine = await getMyEntries(email);
+      console.log('My saved entries found:', mine.length, mine);
       if (mine.length > 0) {
         mergeFirebaseEntries(mine);
         renderRecentEntries();
