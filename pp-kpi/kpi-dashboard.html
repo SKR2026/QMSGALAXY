@@ -452,6 +452,34 @@ tr:hover td{background:var(--surface2)}
         </div>
       </div>
 
+      <!-- ══ CUMULATIVE KPI TREND SECTION ══ -->
+      <div class="card mb-14">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+          <div>
+            <div class="card-title" style="margin-bottom:2px">Cumulative KPI Trend (All Plants)</div>
+            <div style="font-size:11px;color:var(--text3)">Monthly average across all plants for the selected year — one bar per month, target line overlaid</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <div style="display:flex;align-items:center;gap:6px">
+              <span style="font-size:11px;color:var(--text3)">Dept:</span>
+              <select id="cumDeptFilter" onchange="renderCumulativeTrends()" style="font-size:11px;padding:4px 8px;border:0.5px solid var(--border2);border-radius:var(--r-md);background:var(--surface);color:var(--text)">
+                <option value="All">All</option>
+                <option>Quality</option><option>Production</option><option>HR</option>
+                <option>Maintenance</option><option>Finance</option><option>SCM</option>
+              </select>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px">
+              <span style="font-size:11px;color:var(--text3)">KPI:</span>
+              <select id="cumKPIFilter" onchange="renderCumulativeTrends()" style="font-size:11px;padding:4px 8px;border:0.5px solid var(--border2);border-radius:var(--r-md);background:var(--surface);color:var(--text)">
+                <option value="All">All KPIs</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="kpi-trend-grid" id="cumulativeTrendGrid" style="grid-template-columns:repeat(auto-fill,minmax(320px,1fr))"></div>
+        <div id="cumulativeTrendEmpty" style="display:none;text-align:center;color:var(--text3);padding:32px;font-size:13px">No KPI data for the current filter selection.</div>
+      </div>
+
       <div class="card">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
           <div class="card-title" style="margin-bottom:0">KPI status detail</div>
@@ -1349,6 +1377,7 @@ function navigate(page, el) {
   if (page === 'kpi-master') renderKPIMaster();
   if (page === 'settings') loadEscalationSettingsUI();
   if (page === 'my-entries') renderMyEntries();
+  if (page === 'dashboard') renderCumulativeTrends();
 }
 
 // ══ DASHBOARD ══
@@ -1362,6 +1391,9 @@ function refreshAll() {
   if (trendsPage && trendsPage.classList.contains('active')) renderTrendPage();
   const actionsPage = document.getElementById('page-action-plans');
   if (actionsPage && actionsPage.classList.contains('active')) renderActionPlans(currentActionFilter);
+  // Cumulative KPI trend section lives on the dashboard — always refresh it
+  const dashPage = document.getElementById('page-dashboard');
+  if (dashPage && dashPage.classList.contains('active')) renderCumulativeTrends();
 }
 
 function refreshMetrics() {
@@ -1533,6 +1565,8 @@ function buildInitCharts() {
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},datalabels:{display:false}},scales:{r:{min:0,max:100,ticks:{stepSize:25,font:{size:9},backdropColor:'transparent'},pointLabels:{font:{size:11}},grid:{color:'rgba(0,0,0,0.07)'}}}}
   });
   rebuildCharts();
+  // Render cumulative KPI trend section on initial load
+  setTimeout(renderCumulativeTrends, 0);
 }
 
 // ══ KPI TRENDS PAGE ══
@@ -1680,7 +1714,178 @@ function renderTrendPage() {
   });
 }
 
-// ══ ACTION PLANS ══
+// ══ CUMULATIVE KPI TREND (Dashboard) ══
+// Shows one chart per KPI with a single aggregated series (all-plant average)
+let cumulativeCharts = {};
+
+function renderCumulativeTrends() {
+  const grid  = document.getElementById('cumulativeTrendGrid');
+  const empty = document.getElementById('cumulativeTrendEmpty');
+  if (!grid) return;
+
+  // Destroy previous charts
+  Object.values(cumulativeCharts).forEach(c => c.destroy());
+  cumulativeCharts = {};
+  grid.innerHTML = '';
+
+  const year       = filterState.year;
+  const deptFilter = (document.getElementById('cumDeptFilter') || {}).value || 'All';
+  const kpiFilter  = (document.getElementById('cumKPIFilter')  || {}).value || 'All';
+
+  // Sync dept filter dropdown with the global Dept tab
+  const deptSel = document.getElementById('cumDeptFilter');
+  if (deptSel && filterState.dept !== 'All' && deptSel.value !== filterState.dept) {
+    deptSel.value = filterState.dept;
+  }
+
+  // Populate KPI selector from master (all or dept-filtered)
+  const kpiSel = document.getElementById('cumKPIFilter');
+  if (kpiSel) {
+    const filtered = deptFilter === 'All' ? kpiMaster : kpiMaster.filter(k => k.dept === deptFilter);
+    const current  = kpiSel.value;
+    kpiSel.innerHTML = '<option value="All">All KPIs</option>' +
+      sortByKPIOrder(filtered).map(k => `<option value="${k.id}">${k.name}</option>`).join('');
+    // Restore selection if still valid
+    if (current !== 'All' && kpiSel.querySelector(`option[value="${current}"]`)) {
+      kpiSel.value = current;
+    }
+  }
+
+  // Determine which KPIs to render
+  let kpisToShow = sortByKPIOrder(
+    deptFilter === 'All' ? kpiMaster : kpiMaster.filter(k => k.dept === deptFilter)
+  );
+  const finalKpiFilter = (document.getElementById('cumKPIFilter') || {}).value || 'All';
+  if (finalKpiFilter !== 'All') {
+    kpisToShow = kpisToShow.filter(k => String(k.id) === String(finalKpiFilter));
+  }
+
+  // Determine which plants to aggregate
+  const activePlants = filterState.plant === 'All'
+    ? plantsList.map(p => p.name)
+    : [filterState.plant];
+
+  const allData = [...kpiData, ...recentEntries];
+
+  kpisToShow.forEach(k => {
+    // Per-month average across all active plants
+    const monthlyAvg = MONTHS.map(mon => {
+      const pts = allData.filter(d =>
+        String(d.year) === year &&
+        String(d.kpiId) === String(k.id) &&
+        activePlants.includes(d.plant) &&
+        d.month === mon
+      );
+      if (!pts.length) return null;
+      return Math.round(pts.reduce((s, d) => s + d.actual, 0) / pts.length * 10) / 10;
+    });
+
+    const hasAnyData = monthlyAvg.some(v => v !== null);
+    if (!hasAnyData) return;
+
+    // Status for the most recent non-null month
+    const displayTarget = k.target;
+    const lastVal = [...monthlyAvg].reverse().find(v => v !== null);
+    const lastPct = lastVal !== null && lastVal !== undefined ? calcAch(lastVal, displayTarget, k.dir) : null;
+    const lastStatus = lastPct !== null ? statusOf(lastPct, lastVal, displayTarget, k.dir) : 'pending';
+
+    // Month label for "Latest" stat box
+    const statMonthIdx = monthlyAvg.reduceRight((found, v, i) => found === -1 && v !== null ? i : found, -1);
+    const statMonthLabel = statMonthIdx >= 0 ? MONTHS[statMonthIdx].slice(0, 3) : '—';
+
+    const canvasId = 'cumCanvas_' + k.id;
+    const card = document.createElement('div');
+    card.className = 'kpi-trend-card';
+    card.innerHTML = `
+      <div class="kpi-trend-header">
+        <div>
+          <div class="kpi-trend-name">${k.name}</div>
+          <div class="kpi-trend-meta">${k.dept} · Target: ${k.dir === 'lower' ? '≤' : '≥'} ${displayTarget} ${k.unit} · All plants avg</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px">
+          ${badgeFor(lastStatus)}
+        </div>
+      </div>
+      <div class="kpi-trend-stats">
+        <div class="kpi-stat-box"><div class="kpi-stat-label">Target</div><div class="kpi-stat-val" style="color:var(--text2)">${displayTarget}<span style="font-size:11px;font-weight:400"> ${k.unit}</span></div></div>
+        <div class="kpi-stat-box"><div class="kpi-stat-label">Latest (${statMonthLabel})</div><div class="kpi-stat-val" style="color:${colorFor(lastStatus)}">${lastVal !== null && lastVal !== undefined ? lastVal : '—'}<span style="font-size:11px;font-weight:400"> ${k.unit}</span></div></div>
+        <div class="kpi-stat-box"><div class="kpi-stat-label">Achievement</div><div class="kpi-stat-val" style="color:${colorFor(lastStatus)}">${lastPct !== null ? lastPct + '%' : '—'}</div></div>
+      </div>
+      <div style="position:relative;width:100%;height:130px">
+        <canvas id="${canvasId}" role="img" aria-label="${k.name} cumulative trend">${k.name} cumulative trend</canvas>
+      </div>
+    `;
+    grid.appendChild(card);
+
+    // Colour bars by per-month status
+    const barColors = monthlyAvg.map(v => {
+      if (v === null) return 'rgba(0,0,0,0.08)';
+      const pct = calcAch(v, displayTarget, k.dir);
+      const st  = statusOf(pct, v, displayTarget, k.dir);
+      return colorFor(st);
+    });
+
+    const ctx = document.getElementById(canvasId);
+    cumulativeCharts[canvasId] = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: MONTHS_SHORT,
+        datasets: [
+          {
+            label: 'Avg Actual (' + k.unit + ')',
+            data: monthlyAvg,
+            backgroundColor: barColors,
+            borderRadius: 4,
+            borderSkipped: false,
+            datalabels: {
+              anchor: 'end', align: 'top',
+              font: { size: 9, weight: '600' },
+              color: '#5f5e5a',
+              display: ctx => ctx.dataset.data[ctx.dataIndex] !== null,
+              formatter: v => v !== null ? v : ''
+            }
+          },
+          {
+            label: 'Target',
+            data: MONTHS_SHORT.map(() => displayTarget),
+            type: 'line',
+            borderColor: 'rgba(0,0,0,0.35)',
+            borderDash: [5, 4],
+            pointRadius: 0,
+            borderWidth: 1.5,
+            tension: 0,
+            spanGaps: true,
+            datalabels: { display: false }
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        onClick: (evt, els, chart) => {
+          if (!els.length) return;
+          const el = els[0];
+          if (chart.data.datasets[el.datasetIndex].label === 'Target') return;
+          const month = MONTHS[el.index];
+          goToActionPlans({ kpiId: k.id, month }, k.name + ' — ' + month);
+        },
+        plugins: {
+          legend: { display: false },
+          datalabels: {}
+        },
+        scales: {
+          y: { ticks: { font: { size: 9 }, maxTicksLimit: 5 }, grid: { color: 'rgba(0,0,0,0.04)' } },
+          x: { ticks: { font: { size: 9 } }, grid: { display: false } }
+        }
+      }
+    });
+  });
+
+  const shown = grid.children.length > 0;
+  grid.style.display = shown ? '' : 'none';
+  empty.style.display = shown ? 'none' : '';
+}
+
 let actionFocus = null; // {plant, kpiId, month, label}
 function goToActionPlans(criteria, label) {
   actionFocus = {...criteria, label};
