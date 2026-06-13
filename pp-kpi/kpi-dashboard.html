@@ -1838,7 +1838,7 @@ function saveEntry(mode){
   // A KPI can only have one entry per plant/month/year — edit it instead of
   // creating a duplicate.
   if(editingEntryId==null){
-    const dup = recentEntries.find(d=>d.kpiId===kpiId && d.plant===plant && d.month===month && String(d.year)===String(year));
+    const dup = recentEntries.find(d=>String(d.kpiId)===String(kpiId) && d.plant===plant && d.month===month && String(d.year)===String(year));
     if(dup){
       if(dup.locked){
         showToast('An entry for this KPI/month is already submitted and locked. Ask a Super Admin to unlock it to make changes.');
@@ -1865,6 +1865,7 @@ function saveEntry(mode){
   }
 
   renderRecentEntries();
+  renderMyEntries(); // keep My Entries page in sync
   showToast(mode==='submitted' ? 'KPI data submitted — locked for editing' : 'Draft saved — click Submit when ready to lock it');
   if(mode==='submitted'){
     clearForm();
@@ -3911,9 +3912,16 @@ function startLiveListeners() {
 }
 
 // ── Override saveEntry to write to Firestore ─────────────────────
-// Patch the global saveEntry function to also persist to Firebase
+// Patch the global saveEntry function to also persist to Firebase.
+// FIX: accept the same `mode` argument the buttons pass ('draft'/'submitted'),
+//      include entryStatus + locked in the payload so mergeFirebaseEntries
+//      routes the doc to recentEntries (My Entries) not kpiData (charts only),
+//      fix field-name mapping, and call renderMyEntries() after save.
 const _localSaveEntry = window.saveEntry;
-window.saveEntry = async function() {
+window.saveEntry = async function(mode) {
+  // Default to 'submitted' when called without argument (backward-compat)
+  mode = mode || 'submitted';
+
   const plant  = document.getElementById('entryPlant').value;
   const dept   = document.getElementById('entryDept').value;
   const kpiId  = document.getElementById('entryKPI').value;
@@ -3921,26 +3929,47 @@ window.saveEntry = async function() {
 
   if (!plant || !kpiId || isNaN(actual)) { showToast('Please fill all required fields'); return; }
 
-  const k      = kpiMaster.find(k => String(k.id) === String(kpiId));
+  const k = kpiMaster.find(k => String(k.id) === String(kpiId));
   if (!k) { showToast('KPI not found'); return; }
 
+  const target = kpiTargetFor(k, plant);
   const reason = document.getElementById('entryReason').value;
   const action = document.getElementById('entryAction').value;
-  const pct    = calcAch(actual, k.target, k.dir);
-  const s      = statusOf(pct, actual, k.target, k.dir);
+  const pct    = calcAch(actual, target, k.dir);
+  const s      = statusOf(pct, actual, target, k.dir);
 
-  if (s === 'missed' && (!reason || !action)) {
+  if (mode === 'submitted' && s === 'missed' && (!reason || !action)) {
     showToast('Action plan required for missed KPI'); return;
   }
 
-  const entry = {
-    year:              parseInt(document.getElementById('entryYear').value),
-    month:             document.getElementById('entryMonth').value,
-    plant, 
+  const entryStatus = (mode === 'submitted') ? 'submitted' : 'draft';
+  const locked      = (mode === 'submitted');
+  const year        = parseInt(document.getElementById('entryYear').value);
+  const month       = document.getElementById('entryMonth').value;
+
+  // Check for duplicates / editing — reuse local logic
+  if (editingEntryId == null) {
+    const dup = recentEntries.find(d =>
+      String(d.kpiId) === String(kpiId) && d.plant === plant &&
+      d.month === month && String(d.year) === String(year)
+    );
+    if (dup) {
+      if (dup.locked) {
+        showToast('An entry for this KPI/month is already submitted and locked. Ask a Super Admin to unlock it.');
+      } else {
+        showToast('An entry for this KPI/month already exists — opened it for editing instead.');
+        editEntry(dup.id);
+      }
+      return;
+    }
+  }
+
+  const payload = {
+    year, month, plant,
     department:        dept,
     kpiId:             k.id,
     kpiName:           k.name,
-    target:            k.target,
+    target,
     actual,
     unit:              k.unit,
     direction:         k.dir,
@@ -3949,30 +3978,80 @@ window.saveEntry = async function() {
     responsiblePerson: document.getElementById('entryResp').value,
     targetDate:        document.getElementById('entryDate').value,
     actionStatus:      reason ? 'in-progress' : '',
-    submittedBy:       currentUser ? currentUser.uid : 'anonymous'
+    entryStatus,          // ← CRITICAL: tells mergeFirebaseEntries to put this in recentEntries
+    locked,               // ← CRITICAL: lock flag for submitted entries
+    submittedBy:       (window._fbProfile && window._fbProfile.email) || (currentUser ? currentUser.email : 'anonymous')
   };
 
   try {
-    const newId = await saveKPIEntry(entry);
-    // Raise alert if missed
-    if (s === 'missed') {
-      await raiseAlert({
-        plant, department: dept, kpiName: k.name,
-        actual, target: k.target,
-        month: entry.month, year: entry.year,
-        raisedBy: currentUser ? currentUser.uid : 'anonymous'
+    let fsId;
+    if (editingEntryId != null) {
+      // Editing an existing entry
+      const existing = recentEntries.find(d => String(d.id) === String(editingEntryId));
+      if (!existing) { showToast('That entry no longer exists'); clearForm(); return; }
+      if (existing.locked) { showToast('This entry is locked and cannot be edited'); return; }
+      if (!canEditEntry(existing)) { showToast('You can only edit entries for your own plant'); return; }
+      fsId = existing.fsId;
+      if (fsId && window.FB.updateKPIEntry) {
+        await window.FB.updateKPIEntry(fsId, payload);
+      }
+      Object.assign(existing, {
+        year, month, plant, dept, kpiId: k.id, target, actual,
+        reason, action, resp: payload.responsiblePerson, dueDate: payload.targetDate,
+        actionStatus: payload.actionStatus || null, entryStatus, locked
       });
+    } else {
+      // New entry
+      fsId = await saveKPIEntry(payload);
+      const localEntry = {
+        id:           fsId,
+        fsId:         fsId,
+        year, month, plant, dept,
+        kpiId:        k.id,
+        target, actual,
+        reason,
+        action,
+        resp:         payload.responsiblePerson,
+        dueDate:      payload.targetDate,
+        actionStatus: payload.actionStatus || null,
+        entryStatus,
+        locked
+      };
+      recentEntries.unshift(localEntry);
     }
-    // Add to local arrays for immediate UI update
-    recentEntries.unshift({ id: newId, kpiId: k.id, dept, ...entry, action });
+
+    // Raise alert if missed on submission
+    if (mode === 'submitted' && s === 'missed') {
+      try {
+        await raiseAlert({
+          plant, department: dept, kpiName: k.name,
+          actual, target,
+          month, year,
+          raisedBy: currentUser ? currentUser.uid : 'anonymous'
+        });
+      } catch(alertErr) { console.warn('Alert raise failed:', alertErr); }
+    }
+
     renderRecentEntries();
-    showToast('Saved to Firebase ✓');
-    clearForm();
+    renderMyEntries();   // ← FIX: also refresh the My Entries page table
     refreshAll();
+
+    if (mode === 'submitted') {
+      showToast('KPI data submitted — locked for editing ✓');
+      clearForm();
+    } else {
+      showToast('Draft saved ✓ — click Submit when ready to lock');
+      // Keep form loaded for immediate Submit
+      const existingEntry = recentEntries.find(d => String(d.fsId) === String(fsId) || String(d.id) === String(fsId));
+      if (existingEntry) editingEntryId = existingEntry.id;
+      const banner = document.getElementById('editingBanner');
+      if (banner) banner.style.display = 'flex';
+    }
+
   } catch (err) {
     console.error('Firebase save error:', err);
-    showToast('Firebase error — saved locally only');
-    _localSaveEntry();  // fallback to local save
+    showToast('Firebase error — saved locally only: ' + (err.code || err.message || err));
+    _localSaveEntry(mode);  // fallback to local save with mode
   }
 };
 
