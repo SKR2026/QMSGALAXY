@@ -3154,26 +3154,26 @@ async function saveDept(){
   const derivedId = name.trim().replace(/[^a-zA-Z0-9]+/g, '_');
   const newDept = {id: derivedId, name, kpis:0, ach:0};
 
-  // Persist to Firebase if available
+  // Persist to Firebase — REQUIRED for delete to work later
   if (window.FB && window.FB.addDept) {
     try {
       const ref = await window.FB.addDept({ deptName: name });
-      if (ref && ref.id) newDept.id = ref.id; // use real Firestore ID if returned
-      showToast('Department "'+name+'" saved to Firebase ✓');
+      if (ref && ref.id) newDept.id = ref.id; // use confirmed Firestore doc ID
+      console.log('[saveDept] Saved to Firestore with id:', newDept.id);
+      showToast('Department "'+name+'" saved ✓');
     } catch(err){
-      console.error('Firebase department save error:', err);
-      showToast('Firebase error — department added locally only');
+      console.error('[saveDept] Firebase error:', err);
+      showToast('Firebase error ('+( err.code||err.message||'unknown')+'): department saved locally only — delete may not persist', 8000);
     }
   } else {
-    showToast('Department "'+name+'" added');
+    console.warn('[saveDept] window.FB not available yet');
+    showToast('Department "'+name+'" added (offline — reload to sync)');
   }
 
   deptList.push(newDept);
   renderPlantsPage();
   closeModal('addDeptModal');
   document.getElementById('nDeptName').value='';
-
-  // Refresh department selectors across the app
   refreshDeptSelectors();
 }
 
@@ -3313,62 +3313,101 @@ function saveEditDept(){
   }
 }
 
-function deleteDeptRow(name){
+async function deleteDeptRow(name){
   const idx = deptList.findIndex(d=>d.name===name);
-  if(idx===-1) return;
+  if(idx===-1){ console.warn('[Dept Delete] Not found in deptList:', name); return; }
   const d = deptList[idx];
   const affected = kpiMaster.filter(k=>k.dept===name);
   const warn = affected.length ? ' '+affected.length+' KPI(s) currently assigned to it will become Unassigned.' : '';
   if(!confirm('Delete department "'+d.name+'"?'+warn+' This cannot be undone.')) return;
+
+  // Capture deptId BEFORE any array mutation
+  const deptId = d.id || name.trim().replace(/[^a-zA-Z0-9]+/g, '_');
+  console.log('[Dept Delete] Attempting delete — name:', name, '| deptId:', deptId, '| window.FB:', !!window.FB);
+
+  // 1. Delete from Firestore FIRST — if this fails, abort so UI stays consistent
+  if (window.FB && window.FB.deleteDept) {
+    try {
+      await window.FB.deleteDept(deptId);
+      console.log('[Dept Delete] Firestore delete succeeded for id:', deptId);
+    } catch(err) {
+      console.error('[Dept Delete] Firestore delete FAILED:', err);
+      showToast('Delete failed: ' + (err.code || err.message || 'Firebase error'), 8000);
+      return; // abort — don't remove from UI if Firestore failed
+    }
+  } else {
+    console.warn('[Dept Delete] window.FB.deleteDept not available — deleting locally only');
+  }
+
+  // 2. Clear dept from KPIs (Firestore + local)
   affected.forEach(k=>{
     k.dept = '';
     if (window.FB && window.FB.updateKPI && typeof k.id === 'string') {
       window.FB.updateKPI(k.id, { department: '' }).catch(err=>console.warn('Firebase KPI dept clear failed:', err));
     }
   });
-  // Capture deptId BEFORE splicing so d remains valid
-  const deptId = d.id || name.trim().replace(/[^a-zA-Z0-9]+/g, '_');
-  deptList.splice(idx,1);
+
+  // 3. Remove from local array and re-render
+  deptList.splice(idx, 1);
   renderPlantsPage();
   renderKPIMaster();
   refreshDeptSelectors();
   showToast('Department "'+d.name+'" deleted');
-
-  // Persist to Firebase
-  if (window.FB && window.FB.deleteDept) {
-    window.FB.deleteDept(deptId).catch(err=>console.warn('Firebase department delete failed:', err));
-  }
 }
 
-function bulkDeleteDepts(){
+async function bulkDeleteDepts(){
   const names = getSelectedIds('deptsBody');
   if(!names.length) return;
   const affected = kpiMaster.filter(k=>names.includes(k.dept));
   const warn = affected.length ? ' '+affected.length+' KPI(s) will become Unassigned.' : '';
   if(!confirm('Delete '+names.length+' selected department(s)?'+warn+' This cannot be undone.')) return;
-  affected.forEach(k=>{
-    k.dept = '';
-    if (window.FB && window.FB.updateKPI && typeof k.id === 'string') {
-      window.FB.updateKPI(k.id, { department: '' }).catch(err=>console.warn('Firebase KPI dept clear failed:', err));
-    }
-  });
-  names.forEach(name=>{
+
+  let deletedCount = 0;
+  const failedNames = [];
+
+  for (const name of names) {
     const idx = deptList.findIndex(d=>d.name===name);
-    if(idx>-1){
-      const d = deptList[idx];
-      // Capture deptId BEFORE splicing
-      const deptId = d.id || name.trim().replace(/[^a-zA-Z0-9]+/g, '_');
-      deptList.splice(idx,1);
-      // Persist to Firebase
-      if (window.FB && window.FB.deleteDept) {
-        window.FB.deleteDept(deptId).catch(err=>console.warn('Firebase department delete failed:', err));
+    if(idx === -1) continue;
+    const d = deptList[idx];
+    const deptId = d.id || name.trim().replace(/[^a-zA-Z0-9]+/g, '_');
+    console.log('[Bulk Delete] Deleting dept — name:', name, '| id:', deptId);
+
+    // Delete from Firestore first
+    if (window.FB && window.FB.deleteDept) {
+      try {
+        await window.FB.deleteDept(deptId);
+        console.log('[Bulk Delete] Firestore OK for:', deptId);
+      } catch(err) {
+        console.error('[Bulk Delete] Firestore FAILED for:', deptId, err);
+        failedNames.push(name);
+        continue; // skip local removal if Firestore failed
+      }
+    }
+
+    // Remove from local array (find again after possible prior splices shifting indices)
+    const currentIdx = deptList.findIndex(d=>d.name===name);
+    if(currentIdx > -1) deptList.splice(currentIdx, 1);
+    deletedCount++;
+  }
+
+  // Clear dept on affected KPIs
+  affected.forEach(k=>{
+    if(!failedNames.includes(k.dept)){
+      k.dept = '';
+      if (window.FB && window.FB.updateKPI && typeof k.id === 'string') {
+        window.FB.updateKPI(k.id, { department: '' }).catch(err=>console.warn('KPI dept clear failed:', err));
       }
     }
   });
+
   renderPlantsPage();
   renderKPIMaster();
   refreshDeptSelectors();
-  showToast(names.length+' department(s) deleted');
+  if(failedNames.length){
+    showToast(deletedCount+' deleted. Failed: '+failedNames.join(', '), 8000);
+  } else {
+    showToast(deletedCount+' department(s) deleted');
+  }
 }
 
 // Update <select> elements that list plants (entry form + filter tabs)
@@ -4179,31 +4218,44 @@ async function loadFirebaseData() {
   // Even an empty result means "no saved departments" — don't fall back to
   // the hardcoded list, or deleted departments will reappear on every reload.
   try {
+    console.log('[loadFirebaseData] Fetching departments from Firestore...');
     const fsDepts = await getDepts();
+    console.log('[loadFirebaseData] Firestore departments received:', fsDepts.length, fsDepts.map(d=>({id:d.id,name:d.deptName||d.name})));
+
     deptList.length = 0;
-    fsDepts.forEach(d => deptList.push({
-      id:   d.id,
-      name: d.deptName || d.name,
-      kpis: d.kpis || 0,
-      ach:  d.ach || 0
-    }));
-    // If Firestore has no departments yet, seed it with the defaults
-    if (fsDepts.length === 0) {
+
+    if (fsDepts.length > 0) {
+      // Firestore has departments — use them as source of truth
+      fsDepts.forEach(d => deptList.push({
+        id:   d.id,
+        name: d.deptName || d.name,
+        kpis: d.kpis || 0,
+        ach:  d.ach  || 0
+      }));
+      console.log('[loadFirebaseData] deptList populated from Firestore:', deptList.map(d=>d.name));
+    } else {
+      // First-ever use — seed defaults into Firestore so future deletes persist
+      console.log('[loadFirebaseData] No departments in Firestore — seeding defaults...');
       const defaults = [
-        {id:'Quality',name:'Quality'},{id:'Production',name:'Production'},
-        {id:'HR',name:'HR'},{id:'Maintenance',name:'Maintenance'},
-        {id:'Finance',name:'Finance'},{id:'SCM',name:'SCM'}
+        {name:'Quality'},{name:'Production'},{name:'HR'},
+        {name:'Maintenance'},{name:'Finance'},{name:'SCM'}
       ];
       for (const dept of defaults) {
-        try { await addDept({ deptName: dept.name }); } catch(e) { /* already exists */ }
-        deptList.push({ id: dept.id, name: dept.name, kpis: 0, ach: 0 });
+        try {
+          const ref = await addDept({ deptName: dept.name });
+          const seededId = (ref && ref.id) ? ref.id : dept.name.replace(/[^a-zA-Z0-9]+/g,'_');
+          deptList.push({ id: seededId, name: dept.name, kpis: 0, ach: 0 });
+          console.log('[loadFirebaseData] Seeded dept:', dept.name, '→ id:', seededId);
+        } catch(e) {
+          console.error('[loadFirebaseData] Failed to seed dept:', dept.name, e);
+        }
       }
     }
     refreshDeptSelectors();
     renderPlantsPage();
     refreshAll();
   } catch (err) {
-    console.warn('Departments load error:', err);
+    console.error('[loadFirebaseData] Departments load error:', err.code || err.message || err);
   }
 
   // 1. KPI Master
