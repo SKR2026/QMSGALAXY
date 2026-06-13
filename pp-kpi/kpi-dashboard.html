@@ -2435,17 +2435,39 @@ function setUnitValue(selectId, otherInputId, value){
   else { sel.value = 'Other'; other.style.display='block'; other.value = value; }
 }
 
-function saveKPI(){
+async function saveKPI(){
   const name=document.getElementById('nKPIName').value.trim();
   const unit=getUnitValue('nKPIUnit','nKPIUnitOther');
   const target=parseFloat(document.getElementById('nKPITarget').value);
   if(!name||!unit||isNaN(target)){showToast('Please fill all required fields');return;}
   const plantOverrides = readPlantMapTable('nKPIPlantMap');
   const maxSeq = kpiMaster.reduce((m,k)=>Math.max(m,k.seq||0),0);
-  kpiMaster.push({id:kpiMaster.length+1,name,unit,target,dir:document.getElementById('nKPIDir').value,dept:document.getElementById('nKPIDept').value,plant:'All',weight:parseInt(document.getElementById('nKPIWeight').value)||0,desc:document.getElementById('nKPIDesc').value,plantOverrides,seq:maxSeq+10});
-  renderKPIMaster();closeModal('addKPIModal');showToast('KPI "'+name+'" added');
+  const dir = document.getElementById('nKPIDir').value;
+  const dept = document.getElementById('nKPIDept').value;
+  const weight = parseInt(document.getElementById('nKPIWeight').value)||0;
+  const desc = document.getElementById('nKPIDesc').value;
+  const seq = maxSeq+10;
+  let newId = kpiMaster.length+1;
+
+  // Persist to Firebase if available
+  if (window.FB && window.FB.addKPI) {
+    try {
+      const ref = await window.FB.addKPI({ name, unit, target, dir, dept, plant:'All', weight, desc, plantOverrides, seq });
+      if (ref && ref.id) newId = ref.id;
+      showToast('KPI "'+name+'" saved to Firebase ✓');
+    } catch(err){
+      console.error('Firebase KPI save error:', err);
+      showToast('Firebase error — KPI added locally only');
+    }
+  } else {
+    showToast('KPI "'+name+'" added');
+  }
+
+  kpiMaster.push({id:newId,name,unit,target,dir,dept,plant:'All',weight,desc,plantOverrides,seq});
+  renderKPIMaster();closeModal('addKPIModal');
   ['nKPIName','nKPITarget','nKPIWeight','nKPIDesc'].forEach(id=>document.getElementById(id).value='');
   setUnitValue('nKPIUnit','nKPIUnitOther','');
+  refreshAll();
 }
 
 // ── Edit / delete KPI ─────────────────────────────────────────────
@@ -3120,16 +3142,31 @@ async function savePlant(){
   refreshPlantSelectors();
 }
 
-function saveDept(){
+async function saveDept(){
   const name = document.getElementById('nDeptName').value.trim();
   if(!name){ showToast('Please fill all required fields'); return; }
   if(deptList.some(d=>d.name.toLowerCase()===name.toLowerCase())){ showToast('Department already exists'); return; }
 
-  deptList.push({name, kpis:0, ach:0});
+  const newDept = {name, kpis:0, ach:0};
+
+  // Persist to Firebase if available
+  if (window.FB && window.FB.addDept) {
+    try {
+      const ref = await window.FB.addDept({ deptName: name });
+      if (ref && ref.id) newDept.id = ref.id;
+      showToast('Department "'+name+'" saved to Firebase ✓');
+    } catch(err){
+      console.error('Firebase department save error:', err);
+      showToast('Firebase error — department added locally only');
+    }
+  } else {
+    showToast('Department "'+name+'" added');
+  }
+
+  deptList.push(newDept);
   renderPlantsPage();
   closeModal('addDeptModal');
   document.getElementById('nDeptName').value='';
-  showToast('Department "'+name+'" added');
 
   // Refresh department selectors across the app
   refreshDeptSelectors();
@@ -3305,6 +3342,19 @@ function refreshPlantSelectors(){
       plantsList.map(p=>`<option>${p.name}</option>`).join('');
     entryPlant.value = cur;
   }
+
+  // Rebuild the top "Plant" filter tabs from plantsList so newly added
+  // plants appear immediately, preserving the currently active selection.
+  const plantTabs = document.getElementById('plantTabs');
+  if(plantTabs){
+    const activeBtn = plantTabs.querySelector('.ftab.active');
+    const activeVal = activeBtn ? activeBtn.getAttribute('onclick').match(/'plant','([^']*)'/)[1] : (filterState.plant || 'All');
+    plantTabs.innerHTML = '<button class="ftab" onclick="setFilter(\'plant\',\'All\',this)">All Plants</button>' +
+      plantsList.map(p=>`<button class="ftab" onclick="setFilter('plant','${p.name}',this)">${p.name}</button>`).join('');
+    let toActivate = plantTabs.querySelector(`.ftab[onclick*="'${activeVal}'"]`) || plantTabs.querySelector('.ftab');
+    plantTabs.querySelectorAll('.ftab').forEach(b=>b.classList.remove('active'));
+    if(toActivate) toActivate.classList.add('active');
+  }
 }
 
 // Update <select>/option lists that reference departments (KPI master form, entry filters)
@@ -3328,6 +3378,7 @@ renderRecentEntries();
 renderKPIMaster();
 renderActionPlans('all');
 renderPlantsPage();
+refreshPlantSelectors();
 renderUsersPage();
 window.addEventListener('load', () => {
   buildInitCharts();
@@ -3532,6 +3583,21 @@ export async function addKPI(kpiData) {
     ...kpiData,
     createdAt: serverTimestamp()
   });
+}
+
+export async function addDept(deptData) {
+  return await addDoc(collection(db, "departments"), {
+    ...deptData,
+    createdAt: serverTimestamp()
+  });
+}
+
+export async function updateDept(deptId, updates) {
+  await updateDoc(doc(db, "departments", deptId), updates);
+}
+
+export async function deleteDept(deptId) {
+  await deleteDoc(doc(db, "departments", deptId));
 }
 
 export async function updateKPI(kpiId, updates) {
@@ -3939,6 +4005,7 @@ window.FB = {
   getUserProfile, getAllUsers, createUser, updateUser, registerUser, deleteUserDoc,
   getPlants, addPlant, updatePlant, deletePlant,
   getKPIMaster, addKPI, updateKPI, deleteKPI,
+  addDept, updateDept, deleteDept,
   saveKPIEntry, updateKPIEntry, deleteKPIEntry, getKPIEntries, getMyEntries, listenKPIEntries,
   getOpenActionPlans, closeActionPlan,
   listenLiveKPI, raiseAlert, listenAlerts, acknowledgeAlert,
