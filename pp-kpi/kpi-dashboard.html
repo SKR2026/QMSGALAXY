@@ -1337,7 +1337,7 @@ async function importExcel(file) {
 
     if (!json.length) { showToast('No rows found in file'); return; }
 
-    let imported = 0, skipped = 0;
+    let imported = 0, skipped = 0, duplicates = 0, updated = 0;
     for (const row of json) {
       const get = (...names) => {
         for (const n of names) {
@@ -1365,6 +1365,44 @@ async function importExcel(file) {
 
       const pct = calcAch(actual, k.target, k.dir);
       const s = statusOf(pct, actual, k.target, k.dir);
+
+      // A KPI can only have one entry per plant/month/year — same rule as
+      // the manual entry form. Re-importing the same file should update
+      // the existing draft (or be skipped if it's already submitted/locked)
+      // instead of creating a second row.
+      const existing = recentEntries.find(d =>
+        String(d.kpiId) === String(k.id) &&
+        String(d.plant).trim().toLowerCase() === plant.toLowerCase() &&
+        String(d.month).trim().toLowerCase() === month.toLowerCase() &&
+        String(d.year) === String(year)
+      );
+      if (existing) {
+        if (existing.locked || existing.entryStatus === 'submitted') {
+          duplicates++; skipped++; continue;
+        }
+        Object.assign(existing, {
+          dept: dept || k.dept, target: k.target, actual, reason, action, resp, dueDate,
+          actionStatus: reason ? 'in-progress' : null
+        });
+        if (existing.fsId && window.FB && window.FB.saveKPIEntry) {
+          const submittedBy = (window._fbProfile && window._fbProfile.email) || 'import';
+          try {
+            await window.FB.saveKPIEntry({
+              id: existing.fsId, year, month, plant, department: dept || k.dept,
+              kpiId: k.id, kpiName: k.name, target: k.target, actual,
+              unit: k.unit, direction: k.dir, reason, actionPlan: action,
+              responsiblePerson: resp, targetDate: dueDate,
+              actionStatus: existing.actionStatus || '',
+              entryStatus: 'draft', locked: false,
+              submittedBy
+            });
+          } catch (err) {
+            console.warn('Firebase import update error:', err);
+          }
+        }
+        updated++;
+        continue;
+      }
 
       const entry = {
         id: nextId++, year, month, plant, dept: dept || k.dept, kpiId: k.id,
@@ -1397,8 +1435,13 @@ async function importExcel(file) {
     }
 
     renderRecentEntries();
+    renderMyEntries();
     refreshAll();
-    showToast(`Imported ${imported} row(s)${skipped ? `, skipped ${skipped} (unmatched KPI/missing fields)` : ''}`);
+    const parts = [];
+    if (updated) parts.push(`updated ${updated} existing draft(s)`);
+    if (duplicates) parts.push(`skipped ${duplicates} already-submitted duplicate(s)`);
+    if (skipped - duplicates > 0) parts.push(`skipped ${skipped - duplicates} (unmatched KPI/missing fields)`);
+    showToast(`Imported ${imported} new row(s)${parts.length ? `, ${parts.join(', ')}` : ''}`);
   } catch (err) {
     console.error('Excel import error:', err);
     showToast('Failed to read file — check format');
