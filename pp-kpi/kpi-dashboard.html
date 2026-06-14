@@ -2933,28 +2933,25 @@ function saveEntry(mode){
   }
   refreshAll();
 
-  if (window.FB) {
+  if (window.FB && window.FB.saveKPIEntry) {
     const payload = {
+      // Pass fsId as 'id' so saveKPIEntry uses updateDoc for existing entries
+      id: entry.fsId || null,
       year: entry.year, month: entry.month, plant, department: dept,
       kpiId: k.id, kpiName: k.name, target, actual, unit: k.unit, direction: k.dir,
       reason, actionPlan: action, responsiblePerson: entry.resp, targetDate: entry.dueDate,
       actionStatus: entry.actionStatus || '', entryStatus, locked: entry.locked,
       submittedBy: (window._fbProfile && window._fbProfile.email) || ''
     };
-    if(entry.fsId && window.FB.updateKPIEntry){
-      window.FB.updateKPIEntry(entry.fsId, payload)
-        .then(()=>{ console.log('Entry updated in Firestore:', entry.fsId); setTimeout(()=>showToast('✓ Synced to Firestore ('+entry.fsId+')', 4000), 1500); })
-        .catch(err=>{ console.error('Firebase entry update failed:', err); setTimeout(()=>showToast('Firebase sync FAILED: ' + (err.code || err.message || err), 10000), 1500); });
-    } else if(window.FB.saveKPIEntry){
-      window.FB.saveKPIEntry(payload).then(id=>{
-        if(id){ entry.fsId = id; console.log('Entry saved to Firestore:', id, payload); setTimeout(()=>showToast('✓ Synced to Firestore ('+id+')', 4000), 1500); }
-        else { setTimeout(()=>showToast('Firebase save returned no id — not synced', 10000), 1500); }
-      }).catch(err=>{ console.error('Firebase entry save failed:', err); setTimeout(()=>showToast('Firebase sync FAILED: ' + (err.code || err.message || err), 10000), 1500); });
-    } else {
-      setTimeout(()=>showToast('window.FB.saveKPIEntry not available — Firebase not connected', 10000), 1500);
-    }
+    window.FB.saveKPIEntry(payload).then(id => {
+      if(id && !entry.fsId){ entry.fsId = id; }
+      setTimeout(()=>showToast('✓ Saved to Firestore'), 1500);
+    }).catch(err=>{
+      console.error('Firebase entry save failed:', err);
+      setTimeout(()=>showToast('Firebase sync FAILED: ' + (err.code || err.message || err), 8000), 1500);
+    });
   } else {
-    setTimeout(()=>showToast('window.FB not available — Firebase not connected', 10000), 1500);
+    setTimeout(()=>showToast('Firebase not connected — saved locally only', 5000), 1500);
   }
 }
 
@@ -2998,19 +2995,32 @@ function editEntry(id){
 
 // Remove a draft entry entirely
 function deleteEntry(id){
-  const idx = recentEntries.findIndex(d=>String(d.id)===String(id));
-  if(idx===-1) return;
-  const entry = recentEntries[idx];
+  // Find in recentEntries first, then kpiData (Firebase-loaded historical entries)
+  let idx = recentEntries.findIndex(d=>String(d.id)===String(id));
+  let fromKpiData = false;
+  let entry;
+  if(idx !== -1){
+    entry = recentEntries[idx];
+  } else {
+    idx = kpiData.findIndex(d=>String(d.id)===String(id));
+    if(idx === -1) return;
+    entry = kpiData[idx];
+    fromKpiData = true;
+  }
   const isSuperAdmin = window._roleInfo && window._roleInfo.isSuperAdmin;
   if(entry.locked && !isSuperAdmin){ showToast('Submitted entries are locked — ask a Super Admin to unlock or delete'); return; }
   if(!entry.locked && !canEditEntry(entry)){ showToast('You can only delete entries for your own plant'); return; }
   if(!confirm(entry.locked ? 'Delete this submitted/locked entry permanently?' : 'Delete this draft entry?')) return;
-  recentEntries.splice(idx,1);
+  if(fromKpiData) kpiData.splice(idx, 1);
+  else recentEntries.splice(idx, 1);
   if(editingEntryId===entry.id) clearForm();
   renderRecentEntries();
+  renderMyEntries();
   refreshAll();
-  if(entry.fsId && window.FB && window.FB.deleteKPIEntry){
-    window.FB.deleteKPIEntry(entry.fsId).catch(err=>{
+  // Delete from Firestore — use fsId or id (Firebase entries have id = Firestore doc id)
+  const fsId = entry.fsId || (fromKpiData ? String(entry.id) : null);
+  if(fsId && window.FB && window.FB.deleteKPIEntry){
+    window.FB.deleteKPIEntry(fsId).catch(err=>{
       console.error('Firebase entry delete failed:', err);
       showToast('Firebase delete FAILED: ' + (err.code || err.message || err), 10000);
     });
@@ -3067,7 +3077,14 @@ function renderMyEntries(){
   const fStatus = document.getElementById('myEntriesStatus').value;
   const sortBy  = document.getElementById('myEntriesSort').value;
 
-  let rows = recentEntries.filter(d=>{
+  // Combine Firebase-loaded historical entries (kpiData) with newly entered ones (recentEntries)
+  // De-duplicate by fsId so reloading doesn't double-count
+  const allEntries = [...kpiData, ...recentEntries].filter((d, i, arr) => {
+    if(!d.fsId) return true;
+    return arr.findIndex(x => x.fsId === d.fsId) === i;
+  });
+
+  let rows = allEntries.filter(d=>{
     // Plant admins / dept users may only ever see their own plant's entries
     if(r && (r.isPlantAdmin || r.isDeptUser) && r.plant && d.plant !== r.plant) return false;
     if(fYear!=='All'){
@@ -3166,15 +3183,26 @@ function bulkDeleteMyEntries(){
   if(!confirm(`Delete ${ids.length} selected entr${ids.length===1?'y':'ies'}${warn}? This cannot be undone.`)) return;
 
   ids.forEach(id=>{
-    const idx = recentEntries.findIndex(d=>String(d.id)===String(id));
-    if(idx===-1) return;
-    const entry = recentEntries[idx];
-    if(entry.locked && !isSuperAdmin) return; // shouldn't happen, but be safe
+    let idx = recentEntries.findIndex(d=>String(d.id)===String(id));
+    let fromKpiData = false;
+    let entry;
+    if(idx !== -1){
+      entry = recentEntries[idx];
+    } else {
+      idx = kpiData.findIndex(d=>String(d.id)===String(id));
+      if(idx === -1) return;
+      entry = kpiData[idx];
+      fromKpiData = true;
+    }
+    if(entry.locked && !isSuperAdmin) return;
     if(!entry.locked && !canEditEntry(entry)) return;
-    recentEntries.splice(idx,1);
+    if(fromKpiData) kpiData.splice(idx,1);
+    else recentEntries.splice(idx,1);
     if(editingEntryId===entry.id) clearForm();
-    if(entry.fsId && window.FB && window.FB.deleteKPIEntry){
-      window.FB.deleteKPIEntry(entry.fsId).catch(err=>{
+    // Delete from Firestore
+    const fsId = entry.fsId || (fromKpiData ? String(entry.id) : null);
+    if(fsId && window.FB && window.FB.deleteKPIEntry){
+      window.FB.deleteKPIEntry(fsId).catch(err=>{
         console.error('Firebase entry delete failed:', err);
         showToast('Firebase delete FAILED: ' + (err.code || err.message || err), 10000);
       });
@@ -3217,6 +3245,24 @@ function bulkSubmitMyEntries(){
     entry.entryStatus = 'submitted';
     entry.locked = true;
     submitted++;
+
+    // Persist submit status to Firestore immediately
+    if(entry.fsId && window.FB && window.FB.saveKPIEntry){
+      const k2 = kpiMaster.find(k=>String(k.id)===String(entry.kpiId));
+      window.FB.saveKPIEntry({
+        id: entry.fsId,
+        year: entry.year, month: entry.month, plant: entry.plant,
+        department: entry.dept,
+        kpiId: entry.kpiId, kpiName: k2 ? k2.name : '',
+        target: liveTarget(entry), actual: entry.actual,
+        unit: k2 ? k2.unit : '', direction: k2 ? k2.dir : 'lower',
+        reason: entry.reason || '', actionPlan: entry.action || '',
+        responsiblePerson: entry.resp || '', targetDate: entry.dueDate || '',
+        actionStatus: entry.actionStatus || '',
+        entryStatus: 'submitted', locked: true,
+        submittedBy: (window._fbProfile && window._fbProfile.email) || ''
+      }).catch(err => console.warn('Bulk submit Firebase sync failed:', err));
+    }
   });
 
   renderRecentEntries();
@@ -5950,33 +5996,56 @@ export async function deleteKPI(kpiId) {
  */
 export async function saveKPIEntry(entryData) {
   const { actual, target, direction } = entryData;
-  const pct   = computeAchievement(actual, target, direction);
+  const pct    = computeAchievement(actual, target, direction);
   const status = computeStatus(actual, target, direction, pct);
 
   const payload = {
-    ...entryData,
-    achievementPct: pct,
+    year:             entryData.year,
+    month:            entryData.month,
+    plant:            entryData.plant,
+    department:       entryData.department,
+    kpiId:            entryData.kpiId,
+    kpiName:          entryData.kpiName,
+    target:           entryData.target,
+    actual:           entryData.actual,
+    unit:             entryData.unit,
+    direction:        entryData.direction,
+    reason:           entryData.reason           || '',
+    actionPlan:       entryData.actionPlan       || '',
+    responsiblePerson:entryData.responsiblePerson|| '',
+    targetDate:       entryData.targetDate       || '',
+    actionStatus:     entryData.actionStatus     || '',
+    entryStatus:      entryData.entryStatus      || 'draft',
+    locked:           entryData.locked           || false,
+    submittedBy:      entryData.submittedBy      || '',
+    achievementPct:   pct,
     status,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp()
+    updatedAt:        serverTimestamp()
   };
 
-  const docRef = await addDoc(collection(db, "kpiData"), payload);
+  // If an id is provided, UPDATE the existing Firestore document
+  if (entryData.id && typeof entryData.id === 'string') {
+    await updateDoc(doc(db, 'kpiData', entryData.id), payload);
+    // Sync to Realtime DB
+    try {
+      await set(ref(rtdb, `kpiLive/${entryData.plant}/${entryData.year}/${entryData.month}/${entryData.id}`), {
+        kpiName: entryData.kpiName, actual, target, status, achievementPct: pct,
+        department: entryData.department
+      });
+    } catch (err) { console.warn('Realtime DB mirror failed:', err); }
+    return entryData.id;
+  }
 
-  // Mirror to Realtime DB for live dashboard updates (best-effort — a failure
-  // here must not prevent the Firestore save from being treated as successful)
+  // Otherwise CREATE a new document
+  payload.createdAt = serverTimestamp();
+  const docRef = await addDoc(collection(db, 'kpiData'), payload);
+
   try {
     await set(ref(rtdb, `kpiLive/${entryData.plant}/${entryData.year}/${entryData.month}/${docRef.id}`), {
-      kpiName: entryData.kpiName,
-      actual,
-      target,
-      status,
-      achievementPct: pct,
+      kpiName: entryData.kpiName, actual, target, status, achievementPct: pct,
       department: entryData.department
     });
-  } catch (err) {
-    console.warn('Realtime DB mirror failed (entry was still saved to Firestore):', err);
-  }
+  } catch (err) { console.warn('Realtime DB mirror failed (entry was still saved to Firestore):', err); }
 
   return docRef.id;
 }
