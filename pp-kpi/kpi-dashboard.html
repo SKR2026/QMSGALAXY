@@ -3800,14 +3800,6 @@ function renderMatrix(){
       <th style="padding:7px 10px;text-align:center;white-space:nowrap">CY Target</th>
       <th style="padding:7px 10px;text-align:center;white-space:nowrap">YTD</th>
       ${monthsShort.map(m=>`<th style="padding:7px 8px;text-align:center;white-space:nowrap">${m}</th>`).join('')}
-    </tr>
-    <tr style="background:#1a4f8a;color:#cfe3f8;font-size:10px">
-      <th></th><th></th><th></th><th></th>
-      <th style="padding:3px 6px;text-align:center;font-weight:400;letter-spacing:.04em">Tgt</th>
-      <th style="padding:3px 6px;text-align:center;font-weight:400;letter-spacing:.04em">Act</th>
-      <th style="padding:3px 6px;text-align:center;font-weight:400;letter-spacing:.04em">Ann.Tgt</th>
-      <th style="padding:3px 6px;text-align:center;font-weight:400;letter-spacing:.04em">Tgt/Act</th>
-      ${monthsShort.map(()=>`<th style="padding:3px 4px;text-align:center;font-weight:400">T/A</th>`).join('')}
     </tr>`;
 
   if(!rows.length){
@@ -3873,86 +3865,118 @@ function exportMatrixExcel(){
   const dept  = document.getElementById('matrixDept').value;
   const monthsShort = orderedMonths.map(m=>m.slice(0,3));
 
-  const wsData = [];
-  wsData.push([`KPI Matrix Report — ${plant==='All'?'All Plants':plant} | ${dept==='All'?'All Departments':dept} | Year: ${fmtYear(year)}`]);
-  wsData.push([]);
-  wsData.push(['S.No.','Department','KPI','UOM','Last Year Target','Last Year Actual','Current Year Target','CY YTD',
-    ...monthsShort]);
-
-  rows.forEach(({idx,k,annualTarget,ytdTarget,lyTarget,lyActual,ytdActual,monthActuals,monthTargets})=>{
-    // Target row first
-    const targetRow = [
-      idx, k.dept, k.name, k.unit, lyTarget,
-      '—',
-      annualTarget,
-      ytdTarget!==null?ytdTarget:'—',
-      ...orderedMonths.map(m=>monthTargets[m]!=null?monthTargets[m]:'—')
-    ];
-    wsData.push(targetRow);
-    // Actual row second
-    const actualRow = [
-      '', '', '', '', '—',
-      lyActual!==null?lyActual:'—',
-      '—',
-      ytdActual!==null?ytdActual:'—',
-      ...orderedMonths.map(m=>monthActuals[m]!==null?monthActuals[m]:'—')
-    ];
-    wsData.push(actualRow);
-  });
-
-  const ws = XLSX.utils.aoa_to_sheet(wsData);
-  ws['!cols'] = [
-    {wch:6},{wch:14},{wch:28},{wch:8},{wch:14},{wch:14},{wch:16},{wch:10},
-    ...monthsShort.map(()=>({wch:7}))
-  ];
-
-  const headerRow = 2;
+  const wb   = XLSX.utils.book_new();
+  const ws   = {};
+  const ref  = {s:{r:0,c:0}, e:{r:0,c:0}};
   const totalCols = 8 + 12;
-  for(let c=0;c<totalCols;c++){
-    const cell = XLSX.utils.encode_cell({r:headerRow,c});
-    if(ws[cell]){
-      ws[cell].s = {
-        font:{bold:true,color:{rgb:'FFFFFF'}},
-        fill:{fgColor:{rgb:'185FA5'}},
-        alignment:{horizontal:'center',vertical:'center',wrapText:true},
-        border:{bottom:{style:'thin',color:{rgb:'CCCCCC'}}}
-      };
-    }
+
+  // Helpers
+  function setCell(r, c, v, s){
+    const addr = XLSX.utils.encode_cell({r,c});
+    ws[addr] = { v, t: typeof v==='number'?'n':'s', s: s||{} };
+    if(r > ref.e.r) ref.e.r = r;
+    if(c > ref.e.c) ref.e.c = c;
   }
 
-  rows.forEach(({k,annualTarget,ytdTarget,lyTarget,lyActual,ytdActual,monthActuals,monthTargets},ri)=>{
-    const excelActualRow = headerRow + 1 + ri*2;
-    const excelTargetRow = excelActualRow + 1;
+  const BLUE     = '185FA5';
+  const BLUE_BG  = 'EBF3FB';
+  const BLUE_LT  = 'DCEEFA';  // slightly deeper for target row
+  const WHITE    = 'FFFFFF';
+  const BORDER   = { top:{style:'thin',color:{rgb:'CCCCCC'}}, bottom:{style:'thin',color:{rgb:'CCCCCC'}}, left:{style:'thin',color:{rgb:'CCCCCC'}}, right:{style:'thin',color:{rgb:'CCCCCC'}} };
 
-    // Colour actual row cells by status
-    const colMap = {5:{actual:lyActual,tgt:lyTarget}, 7:{actual:ytdActual,tgt:ytdTarget}};
-    orderedMonths.forEach((m,mi)=>{ colMap[8+mi]={actual:monthActuals[m],tgt:monthTargets[m]??annualTarget}; });
-    Object.entries(colMap).forEach(([col,{actual,tgt}])=>{
-      const cell = XLSX.utils.encode_cell({r:excelActualRow,c:parseInt(col)});
-      if(!ws[cell]||actual===null||actual==='—') return;
-      const s = statusOf(calcAch(actual,tgt,k.dir),actual,tgt,k.dir);
-      const rgb = s==='achieved'?'EAF3DE':s==='near-miss'?'FFF8E1':'FCEBEB';
-      const fgRgb = s==='achieved'?'3B6D11':s==='near-miss'?'7A5C00':'A32D2D';
-      ws[cell].s = { fill:{fgColor:{rgb}}, font:{color:{rgb:fgRgb},bold:true}, alignment:{horizontal:'center'} };
+  function hdrStyle(){ return { font:{bold:true,color:{rgb:WHITE},name:'Arial',sz:9}, fill:{fgColor:{rgb:BLUE}}, alignment:{horizontal:'center',vertical:'center',wrapText:true}, border:BORDER }; }
+  function tgtStyle(bold){ return { font:{bold:!!bold,color:{rgb:BLUE},name:'Arial',sz:9}, fill:{fgColor:{rgb:BLUE_BG}}, alignment:{horizontal:'center',vertical:'center'}, border:BORDER }; }
+  function actStyle(rgb, fgRgb){ return { font:{bold:true,color:{rgb:fgRgb||'333333'},name:'Arial',sz:9}, fill:{fgColor:{rgb:rgb||WHITE}}, alignment:{horizontal:'center',vertical:'center'}, border:BORDER }; }
+  function plainStyle(left){ return { font:{name:'Arial',sz:9}, fill:{fgColor:{rgb:WHITE}}, alignment:{horizontal:left?'left':'center',vertical:'center'}, border:BORDER }; }
+  function kpiNameStyle(){ return { font:{bold:true,name:'Arial',sz:9}, fill:{fgColor:{rgb:WHITE}}, alignment:{horizontal:'left',vertical:'center',wrapText:true}, border:BORDER }; }
+
+  // ── Title row ───────────────────────────────────────────────────
+  let row = 0;
+  setCell(row, 0, `KPI Matrix Report — ${plant==='All'?'All Plants':plant} | ${dept==='All'?'All Departments':dept} | Year: ${fmtYear(year)}`,
+    { font:{bold:true,sz:12,name:'Arial'}, alignment:{horizontal:'left'} });
+  row++;
+
+  // ── Column header row ────────────────────────────────────────────
+  const headers = ['#','Department','KPI','UOM','LY Target','LY Actual','CY Target','CY YTD',...monthsShort];
+  headers.forEach((h,c)=> setCell(row, c, h, hdrStyle()));
+  const headerRowIdx = row;
+  row++;
+
+  // ── Merges (title + KPI rowspans) ───────────────────────────────
+  const merges = [{s:{r:0,c:0}, e:{r:0,c:totalCols-1}}];
+
+  // ── Data rows ────────────────────────────────────────────────────
+  rows.forEach(({idx,k,annualTarget,ytdTarget,lyTarget,lyActual,ytdActual,monthActuals,monthTargets},ri)=>{
+    const tRow = row;       // Target row
+    const aRow = row + 1;  // Actual row
+
+    // Merge: #, Dept, KPI, UOM span both rows
+    merges.push({s:{r:tRow,c:0},e:{r:aRow,c:0}}); // #
+    merges.push({s:{r:tRow,c:1},e:{r:aRow,c:1}}); // Dept
+    merges.push({s:{r:tRow,c:2},e:{r:aRow,c:2}}); // KPI name
+    merges.push({s:{r:tRow,c:3},e:{r:aRow,c:3}}); // UOM
+
+    // Shared identity cells
+    setCell(tRow, 0, idx,    { ...kpiNameStyle(), alignment:{horizontal:'center',vertical:'center'}, font:{name:'Arial',sz:9,color:{rgb:'888888'}} });
+    setCell(tRow, 1, k.dept, { ...kpiNameStyle(), font:{bold:true,name:'Arial',sz:9} });
+    setCell(tRow, 2, k.name, kpiNameStyle());
+    setCell(tRow, 3, k.unit, { ...plainStyle(), alignment:{horizontal:'center',vertical:'center'}, font:{name:'Arial',sz:9,color:{rgb:'888888'}} });
+
+    // ── TARGET ROW ────────────────────────────────────────────────
+    setCell(tRow, 4, lyTarget, tgtStyle(false));
+    setCell(tRow, 5, '—',     tgtStyle(false));
+    setCell(tRow, 6, annualTarget, tgtStyle(true));
+    setCell(tRow, 7, ytdTarget!=null?ytdTarget:'—', tgtStyle(true));
+    orderedMonths.forEach((m,mi)=>{
+      const tgt = monthTargets[m]!=null ? monthTargets[m] : annualTarget;
+      setCell(tRow, 8+mi, tgt!=null?tgt:'—', tgtStyle(false));
     });
-    for(let c=4;c<totalCols;c++){
-      const cell=XLSX.utils.encode_cell({r:excelActualRow,c});
-      if(ws[cell]&&!ws[cell].s) ws[cell].s={alignment:{horizontal:'center'}};
-    }
-    // Target row — light blue tint
-    for(let c=0;c<totalCols;c++){
-      const cell=XLSX.utils.encode_cell({r:excelTargetRow,c});
-      if(ws[cell]) ws[cell].s={ fill:{fgColor:{rgb:'EBF3FB'}}, font:{color:{rgb:'185FA5'},italic:true}, alignment:{horizontal:'center'} };
-    }
+
+    // ── ACTUAL ROW ────────────────────────────────────────────────
+    // LY Actual — coloured
+    const lyS = lyActual!=null ? statusOf(calcAch(lyActual,lyTarget,k.dir),lyActual,lyTarget,k.dir) : null;
+    const lyBg = lyS==='achieved'?'EAF3DE':lyS==='near-miss'?'FFF8E1':lyS==='missed'?'FCEBEB':WHITE;
+    const lyFg = lyS==='achieved'?'3B6D11':lyS==='near-miss'?'7A5C00':lyS==='missed'?'A32D2D':'333333';
+    setCell(aRow, 4, '—',     plainStyle());
+    setCell(aRow, 5, lyActual!=null?lyActual:'—', actStyle(lyBg, lyFg));
+    setCell(aRow, 6, '—',     plainStyle());
+
+    // YTD Actual — coloured
+    const ytdS = ytdActual!=null ? statusOf(calcAch(ytdActual,ytdTarget,k.dir),ytdActual,ytdTarget,k.dir) : null;
+    const ytdBg = ytdS==='achieved'?'EAF3DE':ytdS==='near-miss'?'FFF8E1':ytdS==='missed'?'FCEBEB':WHITE;
+    const ytdFg = ytdS==='achieved'?'3B6D11':ytdS==='near-miss'?'7A5C00':ytdS==='missed'?'A32D2D':'333333';
+    setCell(aRow, 7, ytdActual!=null?ytdActual:'—', actStyle(ytdBg, ytdFg));
+
+    // Monthly actuals — coloured by status
+    orderedMonths.forEach((m,mi)=>{
+      const act = monthActuals[m];
+      const tgt = monthTargets[m]!=null ? monthTargets[m] : annualTarget;
+      if(act===null){ setCell(aRow,8+mi,'—',plainStyle()); return; }
+      const s   = statusOf(calcAch(act,tgt,k.dir),act,tgt,k.dir);
+      const bg  = s==='achieved'?'EAF3DE':s==='near-miss'?'FFF8E1':'FCEBEB';
+      const fg  = s==='achieved'?'3B6D11':s==='near-miss'?'7A5C00':'A32D2D';
+      setCell(aRow, 8+mi, act, actStyle(bg, fg));
+    });
+
+    row += 2;
   });
 
-  ws['!merges']=[{s:{r:0,c:0},e:{r:0,c:totalCols-1}}];
-  if(ws['A1']) ws['A1'].s={font:{bold:true,sz:13},alignment:{horizontal:'left'}};
+  // ── Sheet metadata ───────────────────────────────────────────────
+  ws['!ref']  = XLSX.utils.encode_range(ref);
+  ws['!merges'] = merges;
+  ws['!cols'] = [
+    {wch:5},{wch:14},{wch:30},{wch:8},{wch:11},{wch:11},{wch:11},{wch:10},
+    ...monthsShort.map(()=>({wch:8}))
+  ];
+  ws['!rows'] = [];
+  ws['!rows'][headerRowIdx] = {hpt:22};
 
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb,ws,'KPI Matrix');
-  const fname=`KPI_Matrix_${plant==='All'?'AllPlants':plant}_${fmtYear(year)}.xlsx`;
-  XLSX.writeFile(wb,fname);
+  // Freeze panes: first 4 cols + header row
+  ws['!freeze'] = {xSplit:4, ySplit:headerRowIdx+1, topLeftCell:'E'+(headerRowIdx+2), activePane:'bottomRight'};
+
+  XLSX.utils.book_append_sheet(wb, ws, 'KPI Matrix');
+  const fname = `KPI_Matrix_${plant==='All'?'AllPlants':plant}_${fmtYear(year)}.xlsx`;
+  XLSX.writeFile(wb, fname);
   showToast('Excel exported: '+fname);
 }
 
@@ -3979,7 +4003,7 @@ function exportMatrixPDF(){
       const tgt=monthTargets[m]??annualTarget;
       return `<td style="background:#EBF3FB;color:#185FA5">${tgt!=null?tgt:'—'}</td>`;
     }).join('');
-    tableRows+=`<tr${deptLabel?' class="dept-start"':''} style="background:#EBF3FB">
+    tableRows+=`<tr style="background:#EBF3FB">
       <td rowspan="2" style="text-align:center;color:#888;vertical-align:middle">${idx}</td>
       <td rowspan="2" style="font-weight:600;vertical-align:middle">${deptLabel}</td>
       <td rowspan="2" style="vertical-align:middle">${k.name}</td>
@@ -4003,20 +4027,19 @@ function exportMatrixPDF(){
   <title>KPI Matrix</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:Arial,sans-serif;font-size:9px;color:#1a1a18;padding:12px}
-    h2{font-size:13px;margin-bottom:4px}
-    .meta{font-size:9px;color:#666;margin-bottom:10px}
+    body{font-family:Arial,sans-serif;font-size:8.5px;color:#1a1a18;padding:10px}
+    h2{font-size:12px;margin-bottom:3px;color:#185FA5}
+    .meta{font-size:8px;color:#666;margin-bottom:8px}
     table{width:100%;border-collapse:collapse;table-layout:fixed}
-    th,td{border:0.5px solid #ccc;padding:4px 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    th{background:#185FA5;color:#fff;text-align:center;font-size:8.5px}
-    td{font-size:8.5px}
-    tr.dept-start td{background:#f0efeb!important}
-    .legend{display:flex;gap:14px;margin-top:8px;font-size:8px}
-    .dot{width:10px;height:10px;border-radius:2px;display:inline-block;margin-right:3px;vertical-align:middle}
-    @media print{@page{size:A3 landscape;margin:10mm} body{padding:0}}
+    th,td{border:0.5px solid #ccc;padding:3px 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    th{background:#185FA5;color:#fff;text-align:center;font-size:8px;font-weight:700}
+    td{font-size:8px}
+    .legend{display:flex;gap:12px;margin-top:8px;font-size:8px}
+    .dot{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:3px;vertical-align:middle}
+    @media print{@page{size:A3 landscape;margin:8mm} body{padding:0}}
   </style></head><body>
-  <h2>KPI Matrix Report — ${plant==='All'?'All Plants':plant}</h2>
-  <div class="meta">Department: ${dept==='All'?'All Departments':dept} &nbsp;|&nbsp; Year: ${fmtYear(parseInt(year))} &nbsp;|&nbsp; Printed: ${new Date().toLocaleDateString()}</div>
+  <h2>KPI Matrix — ${plant==='All'?'All Plants':plant}</h2>
+  <div class="meta">Dept: ${dept==='All'?'All':dept} &nbsp;·&nbsp; Year: ${fmtYear(parseInt(year))} &nbsp;·&nbsp; Printed: ${new Date().toLocaleDateString()} &nbsp;·&nbsp; <span style="color:#185FA5">Blue row = Target &nbsp;|&nbsp; Coloured row = Actual</span></div>
   <table>
     <thead><tr>
       <th style="width:28px">#</th>
@@ -4035,7 +4058,7 @@ function exportMatrixPDF(){
     <span><span class="dot" style="background:#EAF3DE;border:1px solid #3B6D11"></span>Achieved</span>
     <span><span class="dot" style="background:#FFF8E1;border:1px solid #7A5C00"></span>Near Miss</span>
     <span><span class="dot" style="background:#FCEBEB;border:1px solid #A32D2D"></span>Missed</span>
-    <span><span class="dot" style="background:#f0efeb;border:1px solid #ccc"></span>No Data</span>
+    <span><span class="dot" style="background:#EBF3FB;border:1px solid #185FA5"></span>Target (blue row)</span>
   </div>
   <script>window.onload=()=>{window.print();}<\/script>
   </body></html>`;
