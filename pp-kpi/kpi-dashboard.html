@@ -1823,18 +1823,23 @@ async function importExcel(file) {
       const resp    = String(get('Responsible','Responsible Person')).trim();
       const dueDate = String(get('Due Date','DueDate','Target Date')).trim();
 
-      // Duplicate check — one entry per KPI/plant/month/year
-      const existing = recentEntries.find(d =>
+      // ── Duplicate check ──────────────────────────────────────────────
+      // Check both kpiData (Firebase-loaded) AND recentEntries (newly added
+      // this session), so re-uploading same file or uploading a file that
+      // duplicates an existing Firebase entry is caught.
+      const isDup = (d) =>
         String(d.kpiId) === String(k.id) &&
         String(d.plant).trim().toLowerCase() === plant.toLowerCase() &&
         String(d.month).trim().toLowerCase() === month.toLowerCase() &&
-        String(d.year) === String(year)
-      );
+        String(d.year) === String(year);
+
+      const existing = recentEntries.find(isDup) || kpiData.find(isDup);
 
       if (existing) {
         if (existing.locked || existing.entryStatus === 'submitted') {
           duplicates++; skipped++; continue;
         }
+        // Update the existing draft in-place
         Object.assign(existing, {
           dept: dept || k.dept, target: resolvedTarget, actual, reason, action, resp, dueDate,
           actionStatus: reason ? 'in-progress' : null
@@ -2730,7 +2735,8 @@ function saveEntry(mode){
   // A KPI can only have one entry per plant/month/year — edit it instead of
   // creating a duplicate.
   if(editingEntryId==null){
-    const dup = recentEntries.find(d=>String(d.kpiId)===String(kpiId) && String(d.plant).trim().toLowerCase()===String(plant).trim().toLowerCase() && String(d.month).trim().toLowerCase()===String(month).trim().toLowerCase() && String(d.year)===String(year));
+    const dupCheck = d => String(d.kpiId)===String(kpiId) && String(d.plant).trim().toLowerCase()===String(plant).trim().toLowerCase() && String(d.month).trim().toLowerCase()===String(month).trim().toLowerCase() && String(d.year)===String(year);
+    const dup = recentEntries.find(dupCheck) || kpiData.find(dupCheck);
     if(dup){
       if(dup.locked){
         showToast('An entry for this KPI/month is already submitted and locked. Ask a Super Admin to unlock it to make changes.');
@@ -3015,14 +3021,26 @@ function bulkSubmitMyEntries(){
   const ids = getSelectedIds('myEntriesBody');
   if(!ids.length) return;
 
-  let submitted = 0, skippedLocked = 0, skippedNotMine = 0, skippedNeedsAction = 0;
+  let submitted = 0, skippedLocked = 0, skippedNotMine = 0, skippedNeedsAction = 0, skippedDup = 0;
   ids.forEach(id=>{
     const entry = recentEntries.find(d=>String(d.id)===String(id));
     if(!entry) return;
     if(entry.locked || entry.entryStatus==='submitted'){ skippedLocked++; return; }
     if(!canEditEntry(entry)){ skippedNotMine++; return; }
+
+    // Check if a submitted/locked duplicate already exists in kpiData (Firebase historical)
+    const dupInHistory = kpiData.find(d=>
+      String(d.kpiId)===String(entry.kpiId) &&
+      String(d.plant).trim().toLowerCase()===String(entry.plant).trim().toLowerCase() &&
+      String(d.month).trim().toLowerCase()===String(entry.month).trim().toLowerCase() &&
+      String(d.year)===String(entry.year) &&
+      (d.locked || d.entryStatus==='submitted')
+    );
+    if(dupInHistory){ skippedDup++; return; }
+
     const k = kpiMaster.find(k=>String(k.id)===String(entry.kpiId));
-    const s = statusOf(calcAch(entry.actual,entry.target,k?k.dir:'lower'),entry.actual,entry.target,k?k.dir:'lower');
+    const tgt = liveTarget(entry);
+    const s = statusOf(calcAch(entry.actual,tgt,k?k.dir:'lower'),entry.actual,tgt,k?k.dir:'lower');
     if(s==='missed' && (!entry.reason || !entry.action)){ skippedNeedsAction++; return; }
     entry.entryStatus = 'submitted';
     entry.locked = true;
@@ -3042,8 +3060,9 @@ function bulkSubmitMyEntries(){
     showToast(submitted+' entr'+(submitted===1?'y':'ies')+' submitted — locked for editing');
   }
   const issues = [];
-  if(skippedLocked) issues.push(skippedLocked+' already submitted');
-  if(skippedNotMine) issues.push(skippedNotMine+' not yours to submit');
+  if(skippedLocked)     issues.push(skippedLocked+' already submitted');
+  if(skippedDup)        issues.push(skippedDup+' duplicate of an existing submitted entry');
+  if(skippedNotMine)    issues.push(skippedNotMine+' not yours to submit');
   if(skippedNeedsAction) issues.push(skippedNeedsAction+' missing reason/action plan for a missed KPI');
   if(issues.length) showToast('Skipped: '+issues.join(', '), 6000);
 }
