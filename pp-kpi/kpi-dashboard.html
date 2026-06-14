@@ -1349,6 +1349,22 @@ function getFYMonths(){ return appSettings.fyMode==='apr'
   : ['January','February','March','April','May','June','July','August','September','October','November','December'];
 }
 
+// For a given FY start-year and month name, return the calendar year that
+// month's data is stored under.
+// e.g. FY2025 (Apr-Mar): Apr-Dec → 2025, Jan-Mar → 2026
+//      CY2025 (Jan-Dec): all months → 2025
+function getFYDataYear(fyStartYear, monthName){
+  const n = parseInt(fyStartYear);
+  if(appSettings.fyMode !== 'apr') return n;
+  const lateMonths = ['January','February','March']; // belong to year+1 in Apr-Mar FY
+  return lateMonths.includes(monthName) ? n+1 : n;
+}
+
+// Build a lookup: for each month in getFYMonths(), what calendar year does its data live in?
+function getFYMonthYearPairs(fyStartYear){
+  return getFYMonths().map(m => ({ month: m, year: getFYDataYear(fyStartYear, m) }));
+}
+
 // Display label for a numeric year  (e.g. 2025 → "2025-26" or "2025")
 function fmtYear(y){
   const n = parseInt(y);
@@ -1466,8 +1482,11 @@ function syncDeptTabs() {
 }
 
 function getFiltered() {
+  const fyPairs = getFYMonthYearPairs(filterState.year); // [{month, year}] correct cal-year per FY month
   return [...kpiData, ...recentEntries].filter(d => {
-    if (String(d.year) !== filterState.year) return false;
+    // In Apr-Mar mode the FY spans two calendar years; check each month maps to its calendar year
+    const pair = fyPairs.find(p => p.month === d.month && String(p.year) === String(d.year));
+    if (!pair) return false; // not part of this FY
     if (filterState.month !== 'All' && d.month !== filterState.month) return false;
     if (filterState.plant !== 'All' && d.plant !== filterState.plant) return false;
     if (filterState.dept !== 'All' && d.dept !== filterState.dept) return false;
@@ -2039,6 +2058,7 @@ function rebuildCharts() {
 function updateTrendChart() {
   const fyMonths      = getFYMonths();
   const fyMonthsShort = fyMonths.map(m => m.slice(0,3));
+  const fyPairs       = getFYMonthYearPairs(filterState.year);
   const kpiId = document.getElementById('trendKPISelect').value;
   const k = kpiMaster.find(k=>String(k.id)===String(kpiId));
   if(!k){
@@ -2051,13 +2071,13 @@ function updateTrendChart() {
     }
     return;
   }
-  const all = [...kpiData,...recentEntries].filter(d=>
-    String(d.year)===filterState.year &&
+  const allEntries = [...kpiData,...recentEntries].filter(d=>
     String(d.kpiId)===String(kpiId) &&
     (filterState.plant==='All' || d.plant===filterState.plant)
   );
-  const monthlyAvg = fyMonths.map(mon=>{
-    const pts=all.filter(d=>d.month===mon);
+  // Each month queries its own calendar year
+  const monthlyAvg = fyPairs.map(({month: mon, year: dataYear})=>{
+    const pts = allEntries.filter(d=>String(d.year)===String(dataYear)&&d.month===mon);
     return aggregateMonthlyValues(pts, k.unit);
   });
   const barColors = monthlyAvg.map(v=>{
@@ -2173,21 +2193,28 @@ function renderTrendPage() {
   const plants = filterState.plant==='All' ? plantsList.map(p=>p.name) : [filterState.plant];
   const year = filterState.year;
 
+  const fyPairs = getFYMonthYearPairs(year); // [{month, year}] in FY order
+
   kpisToShow.forEach(k => {
-    // build month series per plant using FY order
+    // build month series per plant using FY order with correct calendar years
     const seriesData = plants.map(plant => {
-      return fyMonths.map(mon => {
-        const pts = [...kpiData,...recentEntries].filter(d=>String(d.year)===year&&d.kpiId===k.id&&d.plant===plant&&d.month===mon);
+      return fyPairs.map(({month: mon, year: dataYear}) => {
+        const pts = [...kpiData,...recentEntries].filter(d=>String(d.year)===String(dataYear)&&d.kpiId===k.id&&d.plant===plant&&d.month===mon);
         if(!pts.length) return null;
         return Math.round(pts.reduce((s,d)=>s+d.actual,0)/pts.length * 10)/10;
       });
     });
 
-    // latest month = last month in FY order that has data
-    const allPts = [...kpiData,...recentEntries].filter(d=>String(d.year)===year&&d.kpiId===k.id&&(filterState.plant==='All'||d.plant===filterState.plant));
-    const lastFYMonthWithData = [...fyMonths].reverse().find(m => allPts.some(d=>d.month===m));
-    const statMonth = filterState.month !== 'All' ? filterState.month : (lastFYMonthWithData || fyMonths[fyMonths.length-1]);
-    const latestPts = allPts.filter(d=>d.month===statMonth);
+    // latest month = last month in FY order that has data (across correct years)
+    const allPts = [...kpiData,...recentEntries].filter(d=>
+      fyPairs.some(p=>String(d.year)===String(p.year)&&d.month===p.month) &&
+      d.kpiId===k.id &&
+      (filterState.plant==='All'||d.plant===filterState.plant)
+    );
+    const lastFYPairWithData = [...fyPairs].reverse().find(p => allPts.some(d=>String(d.year)===String(p.year)&&d.month===p.month));
+    const statMonth = filterState.month !== 'All' ? filterState.month : (lastFYPairWithData ? lastFYPairWithData.month : fyMonths[fyMonths.length-1]);
+    const statYear  = lastFYPairWithData ? lastFYPairWithData.year : parseInt(year);
+    const latestPts = allPts.filter(d=>d.month===statMonth&&String(d.year)===String(statYear));
     const latestAvg = latestPts.length ? Math.round(latestPts.reduce((s,d)=>s+d.actual,0)/latestPts.length*10)/10 : null;
     const displayTarget = (filterState.plant!=='All') ? kpiTargetFor(k, filterState.plant) : k.target;
     const notApplicable = (filterState.plant!=='All') && !kpiApplicable(k, filterState.plant);
@@ -2307,12 +2334,13 @@ function renderCumulativeTrends() {
   }
 
   const allData = [...kpiData, ...recentEntries];
+  const fyPairs = getFYMonthYearPairs(year); // [{month, year}] in FY order
 
   kpisToShow.forEach(k => {
-    // Per-month average across all active plants — in FY order
-    const monthlyAvg = fyMonths.map(mon => {
+    // Per-month average — each month queries its correct calendar year
+    const monthlyAvg = fyPairs.map(({month: mon, year: dataYear}) => {
       const pts = allData.filter(d =>
-        String(d.year) === year &&
+        String(d.year) === String(dataYear) &&
         String(d.kpiId) === String(k.id) &&
         (filterState.plant === 'All' || d.plant === filterState.plant) &&
         d.month === mon
@@ -2741,7 +2769,12 @@ function renderMyEntries(){
   let rows = recentEntries.filter(d=>{
     // Plant admins / dept users may only ever see their own plant's entries
     if(r && (r.isPlantAdmin || r.isDeptUser) && r.plant && d.plant !== r.plant) return false;
-    if(fYear!=='All' && String(d.year)!==String(fYear)) return false;
+    if(fYear!=='All'){
+      // In Apr-Mar FY mode, Jan/Feb/Mar of the NEXT calendar year belong to this FY
+      const fyPairs = getFYMonthYearPairs(fYear);
+      const inFY = fyPairs.some(p=>String(p.year)===String(d.year)&&p.month===d.month);
+      if(!inFY) return false;
+    }
     if(fMonth!=='All' && d.month!==fMonth) return false;
     if(fPlant!=='All' && d.plant!==fPlant) return false;
     if(fDept!=='All' && d.dept!==fDept) return false;
@@ -2749,12 +2782,18 @@ function renderMyEntries(){
     return true;
   });
 
-  const monthIdx = m => MONTHS.indexOf(m);
+  const fyMonthsSorted = getFYMonths();
+  const monthIdx = m => { const i = fyMonthsSorted.indexOf(m); return i === -1 ? 99 : i; };
   rows = [...rows].sort((a,b)=>{
     switch(sortBy){
       case 'date_asc':  return a.id - b.id || 0;
       case 'date_desc': return (b.id - a.id) || 0;
-      case 'month':     return String(a.year).localeCompare(String(b.year)) || monthIdx(a.month)-monthIdx(b.month);
+      case 'month': {
+        // Sort by FY position: pair each entry's calendar year+month into its FY slot
+        const fyA = getFYMonthYearPairs(fYear==='All'?filterState.year:fYear).findIndex(p=>p.month===a.month&&String(p.year)===String(a.year));
+        const fyB = getFYMonthYearPairs(fYear==='All'?filterState.year:fYear).findIndex(p=>p.month===b.month&&String(p.year)===String(b.year));
+        return (fyA===-1?99:fyA)-(fyB===-1?99:fyB);
+      }
       case 'dept':      return (a.dept||'').localeCompare(b.dept||'');
       case 'plant':     return (a.plant||'').localeCompare(b.plant||'');
       case 'kpi': {
