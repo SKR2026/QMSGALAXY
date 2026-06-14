@@ -654,7 +654,7 @@ tr:hover td{background:var(--surface2)}
         <!-- Filters -->
         <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px">
           <div class="field" style="min-width:100px"><label>Year</label>
-            <select id="matrixYear" onchange="renderMatrix()">
+            <select id="matrixYear" onchange="try{localStorage.setItem('kpiMatrixYear',this.value)}catch(e){}renderMatrix()">
               <option>2026</option><option>2025</option><option>2024</option>
             </select>
           </div>
@@ -669,13 +669,13 @@ tr:hover td{background:var(--surface2)}
             </select>
           </div>
           <div class="field" style="min-width:130px"><label>View by</label>
-            <select id="matrixView" onchange="renderMatrix()">
+            <select id="matrixView" onchange="try{localStorage.setItem('kpiMatrixView',this.value)}catch(e){}renderMatrix()">
               <option value="actual">Actual Value</option>
               <option value="ach">Achievement %</option>
             </select>
           </div>
           <div class="field" style="min-width:130px"><label>Month start</label>
-            <select id="matrixMonthStart" onchange="renderMatrix()">
+            <select id="matrixMonthStart" onchange="try{localStorage.setItem('kpiMatrixMonthStart',this.value)}catch(e){}renderMatrix()">
               <option value="0">January (Jan–Dec)</option>
               <option value="3">April (Apr–Mar)</option>
             </select>
@@ -3029,6 +3029,7 @@ function restoreTabOrders(){
     }
   } catch(e){}
   try {
+    // Initial resolve — may use numeric ids pre-Firebase; resolveMatrixKPIOrder() re-runs after Firebase loads
     const matrixOrder = JSON.parse(localStorage.getItem('kpiMatrixOrder') || 'null');
     if(matrixOrder && Array.isArray(matrixOrder)) _matrixKPIOrder = matrixOrder;
   } catch(e){}
@@ -3062,8 +3063,8 @@ function buildMatrixKPIList(){
   }
 
   const list = document.getElementById('matrixKPIList');
-  list.innerHTML = kpis.map(k=>`
-    <div class="matrix-kpi-row" data-id="${k.id}"
+  list.innerHTML = kpis.map((k,i)=>`
+    <div class="matrix-kpi-row" data-id="${k.id}" data-name="${k.name.replace(/"/g,'&quot;')}"
       draggable="true"
       ondragstart="kpiRowDragStart(event)"
       ondragover="kpiRowDragOver(event)"
@@ -3071,7 +3072,7 @@ function buildMatrixKPIList(){
       ondrop="kpiRowDrop(event)"
       ondragend="kpiRowDragEnd(event)">
       <svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:var(--text3);fill:none;stroke-width:2;flex-shrink:0"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-      <span style="color:var(--text3);min-width:18px;font-size:11px">${kpis.indexOf(k)+1}.</span>
+      <span style="color:var(--text3);min-width:18px;font-size:11px">${i+1}.</span>
       <span style="flex:1">${k.name}</span>
       <span style="color:var(--text3);font-size:11px">${k.dept} · ${k.unit}</span>
     </div>`).join('');
@@ -3112,18 +3113,43 @@ function kpiRowDrop(e){
 
 function saveMatrixKPIOrder(){
   const rows = [...document.querySelectorAll('#matrixKPIList .matrix-kpi-row')];
+  // Save by KPI NAME (not id) so it survives Firebase reload which changes numeric→string ids
+  const orderByName = rows.map(r => r.dataset.name);
   _matrixKPIOrder = rows.map(r => r.dataset.id);
-  try { localStorage.setItem('kpiMatrixOrder', JSON.stringify(_matrixKPIOrder)); } catch(e){}
+  try {
+    localStorage.setItem('kpiMatrixOrder', JSON.stringify(_matrixKPIOrder));
+    localStorage.setItem('kpiMatrixOrderByName', JSON.stringify(orderByName));
+  } catch(e){}
   document.getElementById('matrixKPIPanel').style.display = 'none';
   renderMatrix();
   showToast('KPI order saved');
 }
 function resetMatrixKPIOrder(){
   _matrixKPIOrder = null;
-  try { localStorage.removeItem('kpiMatrixOrder'); } catch(e){}
+  try {
+    localStorage.removeItem('kpiMatrixOrder');
+    localStorage.removeItem('kpiMatrixOrderByName');
+  } catch(e){}
   buildMatrixKPIList();
   renderMatrix();
   showToast('KPI order reset to default');
+}
+
+// Re-resolve _matrixKPIOrder against current kpiMaster ids (call after Firebase loads KPIs)
+function resolveMatrixKPIOrder(){
+  try {
+    const byName = JSON.parse(localStorage.getItem('kpiMatrixOrderByName') || 'null');
+    if(byName && Array.isArray(byName) && byName.length){
+      // Map saved names → current ids
+      const resolved = byName
+        .map(name => { const k = kpiMaster.find(k=>k.name===name); return k ? String(k.id) : null; })
+        .filter(Boolean);
+      if(resolved.length){ _matrixKPIOrder = resolved; return; }
+    }
+    // Fallback: try by id directly
+    const byId = JSON.parse(localStorage.getItem('kpiMatrixOrder') || 'null');
+    if(byId && Array.isArray(byId)) _matrixKPIOrder = byId;
+  } catch(e){}
 }
 
 // ══════════════════════════════════════════════
@@ -3454,6 +3480,17 @@ function exportMatrixPDF(){
 // Init matrix when navigated to
 function initMatrixPage(){
   matrixInitFilters();
+  // Restore saved filter selections
+  try {
+    const ms = localStorage.getItem('kpiMatrixMonthStart');
+    if(ms !== null){ const el=document.getElementById('matrixMonthStart'); if(el) el.value=ms; }
+    const yr = localStorage.getItem('kpiMatrixYear');
+    if(yr){ const el=document.getElementById('matrixYear'); if(el) el.value=yr; }
+    const vw = localStorage.getItem('kpiMatrixView');
+    if(vw){ const el=document.getElementById('matrixView'); if(el) el.value=vw; }
+  } catch(e){}
+  // Ensure KPI order is resolved against current kpiMaster ids
+  resolveMatrixKPIOrder();
   renderMatrix();
 }
 
@@ -5234,6 +5271,8 @@ async function loadFirebaseData() {
         seq: k.seq != null ? k.seq : (i+1)*10
       }));
       renderKPIMaster();
+      // Re-resolve saved KPI matrix order now that real ids are known
+      resolveMatrixKPIOrder();
 
       // Re-populate KPI trend selector
       const tSel = document.getElementById('trendKPISelect');
