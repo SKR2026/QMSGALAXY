@@ -3221,9 +3221,12 @@ function bulkSubmitMyEntries(){
       }).then(newId => {
         if(newId && !entry.fsId) entry.fsId = newId;
       }).catch(err => {
-        // Revert local state if Firebase fails
-        entry.entryStatus = 'draft';
-        entry.locked = false;
+        // saveKPIEntry handles not-found internally by creating a new doc.
+        // Only revert local state for unexpected/permission errors.
+        if(err.code !== 'not-found'){
+          entry.entryStatus = 'draft';
+          entry.locked = false;
+        }
         console.error('Submit failed for', entry.kpiId, entry.month, err);
         showToast('Submit failed: ' + (err.code || err.message || err) + ' — check Firestore rules', 8000);
       });
@@ -3242,6 +3245,7 @@ function bulkSubmitMyEntries(){
   } else {
     showToast(`${submitted} entr${submitted===1?'y':'ies'} submitted — syncing to Firestore...`);
     // Re-fetch from Firestore after a short delay to confirm all writes succeeded
+    // and update local fsIds to match the current Firestore document IDs
     setTimeout(async ()=>{
       if(window.FB && window.FB.getKPIEntries){
         try{
@@ -3249,7 +3253,6 @@ function bulkSubmitMyEntries(){
           if(refreshed.length){
             kpiData.length = 0;
             recentEntries.length = 0;
-            // Deduplicate by business key
             const bizMap = new Map();
             refreshed.forEach(fe=>{
               const key=`${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
@@ -3265,6 +3268,7 @@ function bulkSubmitMyEntries(){
             renderRecentEntries();
             renderMyEntries();
             refreshAll();
+            showToast('Sync complete ✓');
           }
         }catch(e){ console.warn('Post-submit refresh failed:', e); }
       }
@@ -6081,10 +6085,12 @@ export async function saveKPIEntry(entryData) {
     updatedAt:        serverTimestamp()
   };
 
-  // If a Firestore doc ID is provided, UPDATE the existing document
+  // If a Firestore doc ID is provided, UPSERT (setDoc merge) the existing document.
+  // Using setDoc with merge:true instead of updateDoc — this works even if the doc
+  // was deleted (not-found error), creating it fresh with the correct ID.
   const fsId = entryData.id && isNaN(Number(entryData.id)) ? String(entryData.id) : null;
   if (fsId) {
-    await updateDoc(doc(db, 'kpiData', fsId), payload);
+    await setDoc(doc(db, 'kpiData', fsId), { ...payload, createdAt: serverTimestamp() }, { merge: true });
     try {
       await set(ref(rtdb, `kpiLive/${entryData.plant}/${entryData.year}/${entryData.month}/${fsId}`), {
         kpiName: entryData.kpiName, actual, target, status, achievementPct: pct,
