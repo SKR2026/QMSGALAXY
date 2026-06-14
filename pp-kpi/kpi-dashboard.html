@@ -1426,7 +1426,17 @@ function applyFYSettings(){
   // Re-render everything
   refreshAll();
   renderMyEntries();
-  renderMatrix && renderMatrix();
+  if(typeof renderMatrix === 'function') renderMatrix();
+  // Rebuild dashboard trend chart labels live
+  if(charts.trend){
+    const fyms = getFYMonths().map(m=>m.slice(0,3));
+    charts.trend.data.labels = fyms;
+    charts.trend.update('none');
+  }
+  setTimeout(()=>{
+    if(typeof renderCumulativeTrends==='function') renderCumulativeTrends();
+    if(typeof renderTrendPage==='function' && document.getElementById('page-trends')?.classList.contains('active')) renderTrendPage();
+  }, 0);
 }
 
 // Restore saved FY settings on load
@@ -2027,40 +2037,40 @@ function rebuildCharts() {
 }
 
 function updateTrendChart() {
+  const fyMonths      = getFYMonths();
+  const fyMonthsShort = fyMonths.map(m => m.slice(0,3));
   const kpiId = document.getElementById('trendKPISelect').value;
   const k = kpiMaster.find(k=>String(k.id)===String(kpiId));
   if(!k){
     if(charts.trend){
-      charts.trend.data.datasets[0].data = MONTHS.map(()=>null);
+      charts.trend.data.labels = fyMonthsShort;
+      charts.trend.data.datasets[0].data = fyMonths.map(()=>null);
       charts.trend.data.datasets[0].label = 'Actual';
-      charts.trend.data.datasets[1].data = MONTHS_SHORT.map(()=>null);
+      charts.trend.data.datasets[1].data = fyMonthsShort.map(()=>null);
       charts.trend.update();
     }
     return;
   }
-  // Always aggregate across all plants for a true cumulative monthly trend.
-  // When plant='All' we skip the plant filter entirely so data from any plant
-  // (including Firestore plants not yet in the local plantsList) is included.
   const all = [...kpiData,...recentEntries].filter(d=>
     String(d.year)===filterState.year &&
     String(d.kpiId)===String(kpiId) &&
     (filterState.plant==='All' || d.plant===filterState.plant)
   );
-  const monthlyAvg = MONTHS.map(mon=>{
+  const monthlyAvg = fyMonths.map(mon=>{
     const pts=all.filter(d=>d.month===mon);
     return aggregateMonthlyValues(pts, k.unit);
   });
-  // Per-bar colour driven by that month's achievement status
   const barColors = monthlyAvg.map(v=>{
     if(v===null) return 'rgba(0,0,0,0.08)';
     const pct=calcAch(v,k.target,k.dir);
     return colorFor(statusOf(pct,v,k.target,k.dir));
   });
   if(charts.trend){
+    charts.trend.data.labels = fyMonthsShort;
     charts.trend.data.datasets[0].data=monthlyAvg;
     charts.trend.data.datasets[0].label=(k.unit==='%'||k.unit==='PPM'?'Avg Actual ':'Total Actual ')+k.unit;
     charts.trend.data.datasets[0].backgroundColor=barColors;
-    charts.trend.data.datasets[1].data=MONTHS_SHORT.map(()=>k.target);
+    charts.trend.data.datasets[1].data=fyMonthsShort.map(()=>k.target);
     charts.trend.update();
   }
 }
@@ -2081,16 +2091,17 @@ function buildInitCharts() {
     data:{labels:['Achieved','Missed','Near miss'],datasets:[{data:[0,0,0],backgroundColor:['#639922','#E24B4A','#EF9F27'],borderWidth:0,hoverOffset:4}]},
     options:{responsive:true,maintainAspectRatio:false,cutout:'74%',plugins:{legend:{display:false},datalabels:{display:false}}}
   });
+  const fyMonthsShort = getFYMonths().map(m=>m.slice(0,3));
   charts.trend = new Chart(document.getElementById('trendChart'),{
     type:'bar',
-    data:{labels:MONTHS_SHORT,datasets:[
+    data:{labels:fyMonthsShort,datasets:[
       {label:'Actual',data:[],backgroundColor:[],borderRadius:4,borderSkipped:false,datalabels:{anchor:'end',align:'top',font:{size:10,weight:'600'},color:'#5f5e5a'}},
       {label:'Target',data:[],type:'line',borderColor:'#639922',borderDash:[6,4],pointRadius:0,borderWidth:1.5,tension:0,datalabels:{display:false}}
     ]},
     options:{responsive:true,maintainAspectRatio:false,onClick:(evt,els,chart)=>{
         if(!els.length) return;
         const idx = els[0].index;
-        const month = MONTHS[idx];
+        const month = getFYMonths()[idx];
         const kpiId = document.getElementById('trendKPISelect').value;
         const k = kpiMaster.find(k=>String(k.id)===String(kpiId));
         goToActionPlans({kpiId, month}, (k?k.name:'KPI')+' — '+month);
@@ -2144,6 +2155,9 @@ function persistKPISeq(k){
 }
 
 function renderTrendPage() {
+  const fyMonths      = getFYMonths();
+  const fyMonthsShort = fyMonths.map(m => m.slice(0,3));
+
   // Keep the page's own dept dropdown in sync with the global Department filter tabs
   const deptSel = document.getElementById('trendDeptFilter');
   if (deptSel && deptSel.value !== filterState.dept) deptSel.value = filterState.dept;
@@ -2156,32 +2170,31 @@ function renderTrendPage() {
 
   let kpisToShow = deptFilter==='All' ? kpiMaster : kpiMaster.filter(k=>k.dept===deptFilter);
   kpisToShow = sortByKPIOrder(kpisToShow);
-  const plants = filterState.plant==='All' ? ['Chennai','Daslana','Noida'] : [filterState.plant];
+  const plants = filterState.plant==='All' ? plantsList.map(p=>p.name) : [filterState.plant];
   const year = filterState.year;
 
   kpisToShow.forEach(k => {
-    // build month series per plant
+    // build month series per plant using FY order
     const seriesData = plants.map(plant => {
-      return MONTHS.map(mon => {
+      return fyMonths.map(mon => {
         const pts = [...kpiData,...recentEntries].filter(d=>String(d.year)===year&&d.kpiId===k.id&&d.plant===plant&&d.month===mon);
         if(!pts.length) return null;
         return Math.round(pts.reduce((s,d)=>s+d.actual,0)/pts.length * 10)/10;
       });
     });
 
-    // latest month value for stats — respects the Month filter tab,
-    // defaulting to June (the last month in the displayed range) when "All"
-    const statMonth = filterState.month !== 'All' ? filterState.month : 'June';
+    // latest month = last month in FY order that has data
     const allPts = [...kpiData,...recentEntries].filter(d=>String(d.year)===year&&d.kpiId===k.id&&(filterState.plant==='All'||d.plant===filterState.plant));
+    const lastFYMonthWithData = [...fyMonths].reverse().find(m => allPts.some(d=>d.month===m));
+    const statMonth = filterState.month !== 'All' ? filterState.month : (lastFYMonthWithData || fyMonths[fyMonths.length-1]);
     const latestPts = allPts.filter(d=>d.month===statMonth);
     const latestAvg = latestPts.length ? Math.round(latestPts.reduce((s,d)=>s+d.actual,0)/latestPts.length*10)/10 : null;
-    // When a single plant is selected, use that plant's target override (if any)
     const displayTarget = (filterState.plant!=='All') ? kpiTargetFor(k, filterState.plant) : k.target;
     const notApplicable = (filterState.plant!=='All') && !kpiApplicable(k, filterState.plant);
     const latestPct = latestAvg!==null ? calcAch(latestAvg,displayTarget,k.dir) : null;
     const latestStatus = latestPct!==null ? statusOf(latestPct,latestAvg,displayTarget,k.dir) : 'pending';
 
-    if (notApplicable) return; // KPI not mapped to the selected plant
+    if (notApplicable) return;
 
     const cardId = 'tc_'+k.id+'_'+Date.now();
     const canvasId = 'tCanvas_'+k.id;
@@ -2211,7 +2224,6 @@ function renderTrendPage() {
     `;
     grid.appendChild(card);
 
-    // Build chart after appending
     const colors = ['#185FA5','#E24B4A','#EF9F27'];
     const datasets = plants.map((plant,i)=>({
       label: plant,
@@ -2220,20 +2232,19 @@ function renderTrendPage() {
       borderRadius:4,borderSkipped:false,
       datalabels:{anchor:'end',align:'top',font:{size:9,weight:'600'},color:'#5f5e5a',display:true}
     }));
-    // Target line
-    datasets.push({label:'Target',data:MONTHS_SHORT.map(()=>displayTarget),type:'line',borderColor:'rgba(0,0,0,0.35)',borderDash:[5,4],pointRadius:0,borderWidth:1.5,tension:0,spanGaps:true,datalabels:{display:false}});
+    datasets.push({label:'Target',data:fyMonthsShort.map(()=>displayTarget),type:'line',borderColor:'rgba(0,0,0,0.35)',borderDash:[5,4],pointRadius:0,borderWidth:1.5,tension:0,spanGaps:true,datalabels:{display:false}});
 
     const ctx = document.getElementById(canvasId);
     trendCharts[canvasId] = new Chart(ctx, {
       type:'bar',
-      data:{labels:MONTHS_SHORT,datasets},
+      data:{labels:fyMonthsShort,datasets},
       options:{
         responsive:true,maintainAspectRatio:false,
         onClick:(evt,els,chart)=>{
           if(!els.length) return;
           const el = els[0];
           const idx = el.index;
-          const month = MONTHS[idx];
+          const month = fyMonths[idx];
           const ds = chart.data.datasets[el.datasetIndex];
           if (ds.label === 'Target') return;
           const plant = plants.length>1 ? ds.label : (filterState.plant!=='All' ? filterState.plant : null);
@@ -2256,11 +2267,13 @@ function renderTrendPage() {
 let cumulativeCharts = {};
 
 function renderCumulativeTrends() {
+  const fyMonths      = getFYMonths();
+  const fyMonthsShort = fyMonths.map(m => m.slice(0,3));
+
   const grid  = document.getElementById('cumulativeTrendGrid');
   const empty = document.getElementById('cumulativeTrendEmpty');
   if (!grid) return;
 
-  // Destroy previous charts
   Object.values(cumulativeCharts).forEach(c => c.destroy());
   cumulativeCharts = {};
   grid.innerHTML = '';
@@ -2269,26 +2282,22 @@ function renderCumulativeTrends() {
   const deptFilter = (document.getElementById('cumDeptFilter') || {}).value || 'All';
   const kpiFilter  = (document.getElementById('cumKPIFilter')  || {}).value || 'All';
 
-  // Sync dept filter dropdown with the global Dept tab
   const deptSel = document.getElementById('cumDeptFilter');
   if (deptSel && filterState.dept !== 'All' && deptSel.value !== filterState.dept) {
     deptSel.value = filterState.dept;
   }
 
-  // Populate KPI selector from master (all or dept-filtered)
   const kpiSel = document.getElementById('cumKPIFilter');
   if (kpiSel) {
     const filtered = deptFilter === 'All' ? kpiMaster : kpiMaster.filter(k => k.dept === deptFilter);
     const current  = kpiSel.value;
     kpiSel.innerHTML = '<option value="All">All KPIs</option>' +
       sortByKPIOrder(filtered).map(k => `<option value="${k.id}">${k.name}</option>`).join('');
-    // Restore selection if still valid
     if (current !== 'All' && kpiSel.querySelector(`option[value="${current}"]`)) {
       kpiSel.value = current;
     }
   }
 
-  // Determine which KPIs to render
   let kpisToShow = sortByKPIOrder(
     deptFilter === 'All' ? kpiMaster : kpiMaster.filter(k => k.dept === deptFilter)
   );
@@ -2297,13 +2306,11 @@ function renderCumulativeTrends() {
     kpisToShow = kpisToShow.filter(k => String(k.id) === String(finalKpiFilter));
   }
 
-  // When plant='All', skip plant filtering entirely so data from any plant
-  // (including dynamically added Firestore plants) is included in the average.
   const allData = [...kpiData, ...recentEntries];
 
   kpisToShow.forEach(k => {
-    // Per-month average across all active plants
-    const monthlyAvg = MONTHS.map(mon => {
+    // Per-month average across all active plants — in FY order
+    const monthlyAvg = fyMonths.map(mon => {
       const pts = allData.filter(d =>
         String(d.year) === year &&
         String(d.kpiId) === String(k.id) &&
@@ -2317,15 +2324,14 @@ function renderCumulativeTrends() {
     const hasAnyData = monthlyAvg.some(v => v !== null);
     if (!hasAnyData) return;
 
-    // Status for the most recent non-null month
     const displayTarget = k.target;
     const lastVal = [...monthlyAvg].reverse().find(v => v !== null);
     const lastPct = lastVal !== null && lastVal !== undefined ? calcAch(lastVal, displayTarget, k.dir) : null;
     const lastStatus = lastPct !== null ? statusOf(lastPct, lastVal, displayTarget, k.dir) : 'pending';
 
-    // Month label for "Latest" stat box
+    // Latest month label in FY order
     const statMonthIdx = monthlyAvg.reduceRight((found, v, i) => found === -1 && v !== null ? i : found, -1);
-    const statMonthLabel = statMonthIdx >= 0 ? MONTHS[statMonthIdx].slice(0, 3) : '—';
+    const statMonthLabel = statMonthIdx >= 0 ? fyMonths[statMonthIdx].slice(0, 3) : '—';
 
     const canvasId = 'cumCanvas_' + k.id;
     const card = document.createElement('div');
@@ -2351,7 +2357,6 @@ function renderCumulativeTrends() {
     `;
     grid.appendChild(card);
 
-    // Colour bars by per-month status
     const barColors = monthlyAvg.map(v => {
       if (v === null) return 'rgba(0,0,0,0.08)';
       const pct = calcAch(v, displayTarget, k.dir);
@@ -2363,7 +2368,7 @@ function renderCumulativeTrends() {
     cumulativeCharts[canvasId] = new Chart(ctx, {
       type: 'bar',
       data: {
-        labels: MONTHS_SHORT,
+        labels: fyMonthsShort,
         datasets: [
           {
             label: (k.unit==='%'||k.unit==='PPM'?'Avg Actual (':'Total Actual (') + k.unit + ')',
@@ -2381,7 +2386,7 @@ function renderCumulativeTrends() {
           },
           {
             label: 'Target',
-            data: MONTHS_SHORT.map(() => displayTarget),
+            data: fyMonthsShort.map(() => displayTarget),
             type: 'line',
             borderColor: 'rgba(0,0,0,0.35)',
             borderDash: [5, 4],
@@ -2400,13 +2405,10 @@ function renderCumulativeTrends() {
           if (!els.length) return;
           const el = els[0];
           if (chart.data.datasets[el.datasetIndex].label === 'Target') return;
-          const month = MONTHS[el.index];
+          const month = fyMonths[el.index];
           goToActionPlans({ kpiId: k.id, month }, k.name + ' — ' + month);
         },
-        plugins: {
-          legend: { display: false },
-          datalabels: {}
-        },
+        plugins: { legend: { display: false }, datalabels: {} },
         scales: {
           y: { ticks: { font: { size: 9 }, maxTicksLimit: 5 }, grid: { color: 'rgba(0,0,0,0.04)' } },
           x: { ticks: { font: { size: 9 } }, grid: { display: false } }
