@@ -3247,27 +3247,33 @@ function bulkSubmitMyEntries(){
     showToast('No entries were submitted — check the issues below.');
   } else {
     showToast(`${submitted} entr${submitted===1?'y':'ies'} submitted — syncing to Firestore...`);
-    // Re-fetch from Firestore after a short delay to confirm all writes succeeded
-    // and update local fsIds to match the current Firestore document IDs
+    // Re-fetch from Firestore after a short delay to confirm all writes succeeded.
+    // We merge Firestore state WITH local submitted state — local submitted always wins
+    // over any incoming draft (handles the case where Firestore write is still propagating)
     setTimeout(async ()=>{
       if(window.FB && window.FB.getKPIEntries){
         try{
           const refreshed = await window.FB.getKPIEntries({});
           if(refreshed.length){
-            kpiData.length = 0;
-            recentEntries.length = 0;
+            // Deduplicate Firestore entries by business key
             const bizMap = new Map();
             refreshed.forEach(fe=>{
               const key=`${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
               const ex=bizMap.get(key);
-              if(!ex||(fe.locked&&!ex.locked)){bizMap.set(key,fe);}
-              else if(!fe.locked&&!ex.locked){
+              if(!ex){ bizMap.set(key,fe); return; }
+              const feS = fe.locked||fe.entryStatus==='submitted';
+              const exS = ex.locked||ex.entryStatus==='submitted';
+              if(feS&&!exS) bizMap.set(key,fe);
+              else if(!feS&&!exS){
                 const fTs=fe.updatedAt?.toMillis?fe.updatedAt.toMillis():0;
                 const eTs=ex.updatedAt?.toMillis?ex.updatedAt.toMillis():0;
-                if(fTs>eTs)bizMap.set(key,fe);
+                if(fTs>eTs) bizMap.set(key,fe);
               }
             });
-            mergeFirebaseEntries([...bizMap.values()]);
+
+            // Merge into existing arrays WITHOUT clearing —
+            // local submitted state takes priority over Firestore draft
+            mergeFirebaseEntriesKeepSubmitted([...bizMap.values()]);
             renderRecentEntries();
             renderMyEntries();
             refreshAll();
@@ -6858,7 +6864,65 @@ function mergeFirebaseEntries(fsEntries) {
   });
 }
 
-// ── Real-time listeners ──────────────────────────────────────────
+// Like mergeFirebaseEntries but protects locally-submitted entries from being
+// overwritten by an incoming draft from Firestore (handles propagation delay).
+function mergeFirebaseEntriesKeepSubmitted(fsEntries) {
+  fsEntries.forEach(fe => {
+    const mapped = {
+      id:           fe.id,
+      fsId:         fe.id,
+      year:         fe.year,
+      month:        fe.month,
+      plant:        fe.plant,
+      dept:         fe.department,
+      kpiId:        fe.kpiId,
+      target:       fe.target,
+      actual:       fe.actual,
+      reason:       fe.reason           || '',
+      action:       fe.actionPlan       || '',
+      resp:         fe.responsiblePerson|| '',
+      dueDate:      fe.targetDate       || '',
+      actionStatus: fe.actionStatus     || null,
+      entryStatus:  fe.entryStatus      || 'draft',
+      locked:       !!fe.locked
+    };
+
+    // Check by fsId first
+    const byFsId = recentEntries.findIndex(d => String(d.fsId) === String(fe.id));
+    if (byFsId >= 0) {
+      const local = recentEntries[byFsId];
+      // If local is submitted but Firestore returns draft — Firestore hasn't caught up yet. Keep local.
+      if((local.locked || local.entryStatus==='submitted') && !mapped.locked && mapped.entryStatus!=='submitted'){
+        return; // keep local submitted state
+      }
+      recentEntries[byFsId] = mapped;
+      return;
+    }
+
+    // Business-key check
+    const bizKey = d =>
+      String(d.kpiId) === String(fe.kpiId) &&
+      String(d.plant||'').trim().toLowerCase() === String(fe.plant||'').trim().toLowerCase() &&
+      String(d.month||'').trim().toLowerCase() === String(fe.month||'').trim().toLowerCase() &&
+      String(d.year) === String(fe.year);
+
+    const byBiz = recentEntries.findIndex(bizKey);
+    if (byBiz >= 0) {
+      const local = recentEntries[byBiz];
+      // Local submitted beats incoming draft
+      if((local.locked || local.entryStatus==='submitted') && !mapped.locked && mapped.entryStatus!=='submitted'){
+        return;
+      }
+      recentEntries[byBiz] = mapped;
+      return;
+    }
+
+    // No match — new entry from Firestore
+    recentEntries.push(mapped);
+  });
+}
+
+
 function startLiveListeners() {
   // Live KPI feed from Realtime DB
   if (filterState.plant !== 'All') {
@@ -6913,14 +6977,14 @@ window.saveEntry = async function(mode) {
   const year        = parseInt(document.getElementById('entryYear').value);
   const month       = document.getElementById('entryMonth').value;
 
-  // Check for duplicates / editing — reuse local logic
+  // Check for duplicates — search both recentEntries and kpiData
   if (editingEntryId == null) {
-    const dup = recentEntries.find(d =>
+    const dupCheck = d =>
       String(d.kpiId) === String(kpiId) && d.plant === plant &&
-      d.month === month && String(d.year) === String(year)
-    );
+      d.month === month && String(d.year) === String(year);
+    const dup = recentEntries.find(dupCheck) || kpiData.find(dupCheck);
     if (dup) {
-      if (dup.locked) {
+      if (dup.locked || dup.entryStatus === 'submitted') {
         showToast('An entry for this KPI/month is already submitted and locked. Ask a Super Admin to unlock it.');
       } else {
         showToast('An entry for this KPI/month already exists — opened it for editing instead.');
@@ -6953,19 +7017,22 @@ window.saveEntry = async function(mode) {
     let fsId;
     if (editingEntryId != null) {
       // Editing an existing entry
-      const existing = recentEntries.find(d => String(d.id) === String(editingEntryId));
+      const existing = [...recentEntries, ...kpiData].find(d => String(d.id) === String(editingEntryId));
       if (!existing) { showToast('That entry no longer exists'); clearForm(); return; }
       if (existing.locked) { showToast('This entry is locked and cannot be edited'); return; }
       if (!canEditEntry(existing)) { showToast('You can only edit entries for your own plant'); return; }
-      fsId = existing.fsId;
-      if (fsId && window.FB.updateKPIEntry) {
-        await window.FB.updateKPIEntry(fsId, payload);
-      }
+      fsId = existing.fsId || null;
+      // Use saveKPIEntry with the fsId so it does setDoc(merge:true) — works even if doc was deleted
+      const updatedFsId = await saveKPIEntry({ id: fsId, ...payload });
+      if(updatedFsId && !existing.fsId) existing.fsId = updatedFsId;
       Object.assign(existing, {
         year, month, plant, dept, kpiId: k.id, target, actual,
         reason, action, resp: payload.responsiblePerson, dueDate: payload.targetDate,
         actionStatus: payload.actionStatus || null, entryStatus, locked
       });
+      // Also update in kpiData if it was there
+      const kpiDataIdx = kpiData.findIndex(d => String(d.id) === String(editingEntryId));
+      if(kpiDataIdx >= 0) Object.assign(kpiData[kpiDataIdx], existing);
     } else {
       // New entry
       fsId = await saveKPIEntry(payload);
