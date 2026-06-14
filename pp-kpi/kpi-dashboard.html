@@ -714,7 +714,40 @@ tr:hover td{background:var(--surface2)}
       </div>
     </div>
 
-    <!-- ══ KPI MASTER ══ -->
+    <!-- ══ BULK IMPORT PROGRESS OVERLAY ══ -->
+    <div id="importProgressOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:500;align-items:center;justify-content:center">
+      <div style="background:var(--surface);border-radius:16px;padding:28px 32px;min-width:320px;max-width:420px;width:90%;box-shadow:0 16px 48px rgba(0,0,0,0.22)">
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px" id="importProgressTitle">Uploading…</div>
+        <div style="font-size:12px;color:var(--text3);margin-bottom:16px" id="importProgressSub">Reading file</div>
+        <!-- Progress bar -->
+        <div style="background:var(--surface2);border-radius:6px;height:8px;overflow:hidden;margin-bottom:10px">
+          <div id="importProgressBar" style="height:8px;width:0%;background:var(--blue);border-radius:6px;transition:width .2s ease"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text3)">
+          <span id="importProgressCount">0 of 0 rows</span>
+          <span id="importProgressPct">0%</span>
+        </div>
+        <!-- Live counters -->
+        <div style="display:flex;gap:16px;margin-top:14px;flex-wrap:wrap">
+          <div style="text-align:center">
+            <div style="font-size:18px;font-weight:700;color:var(--green)" id="impCntNew">0</div>
+            <div style="font-size:10px;color:var(--text3)">New</div>
+          </div>
+          <div style="text-align:center">
+            <div style="font-size:18px;font-weight:700;color:var(--blue)" id="impCntUpd">0</div>
+            <div style="font-size:10px;color:var(--text3)">Updated</div>
+          </div>
+          <div style="text-align:center">
+            <div style="font-size:18px;font-weight:700;color:var(--text3)" id="impCntSkip">0</div>
+            <div style="font-size:10px;color:var(--text3)">Skipped</div>
+          </div>
+          <div style="text-align:center">
+            <div style="font-size:18px;font-weight:700;color:var(--amber)" id="impCntDup">0</div>
+            <div style="font-size:10px;color:var(--text3)">Duplicates</div>
+          </div>
+        </div>
+      </div>
+    </div>
     <div class="page" id="page-kpi-master">
       <div class="card">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
@@ -1416,22 +1449,77 @@ function exportPDF() {
 async function importExcel(file) {
   if (!file) return;
   if (typeof XLSX === 'undefined') { showToast('Excel library failed to load'); return; }
+
+  // ── helpers ──────────────────────────────────────────────────────
+  const overlay   = document.getElementById('importProgressOverlay');
+  const titleEl   = document.getElementById('importProgressTitle');
+  const subEl     = document.getElementById('importProgressSub');
+  const barEl     = document.getElementById('importProgressBar');
+  const countEl   = document.getElementById('importProgressCount');
+  const pctEl     = document.getElementById('importProgressPct');
+  const cntNew    = document.getElementById('impCntNew');
+  const cntUpd    = document.getElementById('impCntUpd');
+  const cntSkip   = document.getElementById('impCntSkip');
+  const cntDup    = document.getElementById('impCntDup');
+
+  function showProgress(title, sub){
+    titleEl.textContent = title || 'Uploading…';
+    subEl.textContent   = sub   || '';
+    overlay.style.display = 'flex';
+  }
+  function setProgress(done, total){
+    const pct = total ? Math.round(done / total * 100) : 0;
+    barEl.style.width  = pct + '%';
+    countEl.textContent = `${done} of ${total} rows`;
+    pctEl.textContent   = pct + '%';
+  }
+  function updateCounters(imp, upd, skip, dup){
+    cntNew.textContent  = imp;
+    cntUpd.textContent  = upd;
+    cntSkip.textContent = skip - dup;
+    cntDup.textContent  = dup;
+  }
+  function hideProgress(){ overlay.style.display = 'none'; }
+
+  // reset counters
+  barEl.style.width='0%'; countEl.textContent='0 of 0 rows'; pctEl.textContent='0%';
+  cntNew.textContent=cntUpd.textContent=cntSkip.textContent=cntDup.textContent='0';
+
   try {
+    showProgress('Reading file…', 'Parsing Excel sheet');
+    // yield to browser so overlay renders before heavy parse
+    await new Promise(r => setTimeout(r, 30));
+
     const data = await file.arrayBuffer();
-    const wb = XLSX.read(data, { type: 'array' });
-    const ws = wb.Sheets[wb.SheetNames[0]];
+    const wb   = XLSX.read(data, { type: 'array' });
+    const ws   = wb.Sheets[wb.SheetNames[0]];
     const json = XLSX.utils.sheet_to_json(ws, { defval: '' });
 
-    if (!json.length) { showToast('No rows found in file'); return; }
+    if (!json.length) { hideProgress(); showToast('No rows found in file'); return; }
+
+    const total = json.length;
+    showProgress(`Importing ${total} rows…`, 'Processing…');
+    setProgress(0, total);
 
     let imported = 0, skipped = 0, duplicates = 0, updated = 0;
-    for (const row of json) {
+    const submittedBy = (window._fbProfile && window._fbProfile.email) || 'import';
+    const FB_BATCH = 5; // update UI every N rows so browser stays responsive
+
+    for (let i = 0; i < json.length; i++) {
+      const row = json[i];
+
+      // yield every batch so the progress bar repaints
+      if (i % FB_BATCH === 0) {
+        setProgress(i, total);
+        updateCounters(imported, updated, skipped, duplicates);
+        subEl.textContent = `Row ${i + 1} of ${total}…`;
+        await new Promise(r => setTimeout(r, 0));
+      }
+
       const get = (...names) => {
-        for (const n of names) {
-          for (const key of Object.keys(row)) {
+        for (const n of names)
+          for (const key of Object.keys(row))
             if (key.toLowerCase().trim() === n.toLowerCase()) return row[key];
-          }
-        }
         return '';
       };
 
@@ -1445,24 +1533,19 @@ async function importExcel(file) {
       const k = kpiMaster.find(k => k.name.toLowerCase() === kpiName.toLowerCase());
       if (!k || !plant || !month || isNaN(actual)) { skipped++; continue; }
 
-      const reason = String(get('Reason')).trim();
-      const action = String(get('Action Plan','ActionPlan','Action')).trim();
-      const resp   = String(get('Responsible','Responsible Person')).trim();
+      const reason  = String(get('Reason')).trim();
+      const action  = String(get('Action Plan','ActionPlan','Action')).trim();
+      const resp    = String(get('Responsible','Responsible Person')).trim();
       const dueDate = String(get('Due Date','DueDate','Target Date')).trim();
 
-      const pct = calcAch(actual, k.target, k.dir);
-      const s = statusOf(pct, actual, k.target, k.dir);
-
-      // A KPI can only have one entry per plant/month/year — same rule as
-      // the manual entry form. Re-importing the same file should update
-      // the existing draft (or be skipped if it's already submitted/locked)
-      // instead of creating a second row.
+      // Duplicate check — one entry per KPI/plant/month/year
       const existing = recentEntries.find(d =>
         String(d.kpiId) === String(k.id) &&
         String(d.plant).trim().toLowerCase() === plant.toLowerCase() &&
         String(d.month).trim().toLowerCase() === month.toLowerCase() &&
         String(d.year) === String(year)
       );
+
       if (existing) {
         if (existing.locked || existing.entryStatus === 'submitted') {
           duplicates++; skipped++; continue;
@@ -1472,7 +1555,6 @@ async function importExcel(file) {
           actionStatus: reason ? 'in-progress' : null
         });
         if (existing.fsId && window.FB && window.FB.saveKPIEntry) {
-          const submittedBy = (window._fbProfile && window._fbProfile.email) || 'import';
           try {
             await window.FB.saveKPIEntry({
               id: existing.fsId, year, month, plant, department: dept || k.dept,
@@ -1480,12 +1562,9 @@ async function importExcel(file) {
               unit: k.unit, direction: k.dir, reason, actionPlan: action,
               responsiblePerson: resp, targetDate: dueDate,
               actionStatus: existing.actionStatus || '',
-              entryStatus: 'draft', locked: false,
-              submittedBy
+              entryStatus: 'draft', locked: false, submittedBy
             });
-          } catch (err) {
-            console.warn('Firebase import update error:', err);
-          }
+          } catch (err) { console.warn('Firebase import update error:', err); }
         }
         updated++;
         continue;
@@ -1498,8 +1577,6 @@ async function importExcel(file) {
         entryStatus: 'draft', locked: false
       };
 
-      // Persist to Firebase if available
-      const submittedBy = (window._fbProfile && window._fbProfile.email) || 'import';
       if (window.FB && window.FB.saveKPIEntry) {
         try {
           const id = await window.FB.saveKPIEntry({
@@ -1508,28 +1585,38 @@ async function importExcel(file) {
             unit: k.unit, direction: k.dir, reason, actionPlan: action,
             responsiblePerson: resp, targetDate: dueDate,
             actionStatus: entry.actionStatus || '',
-            entryStatus: 'draft', locked: false,
-            submittedBy
+            entryStatus: 'draft', locked: false, submittedBy
           });
-          if(id) entry.fsId = id;
-        } catch (err) {
-          console.warn('Firebase import save error:', err);
-        }
+          if (id) entry.fsId = id;
+        } catch (err) { console.warn('Firebase import save error:', err); }
       }
 
       recentEntries.unshift(entry);
       imported++;
     }
 
+    // Final update
+    setProgress(total, total);
+    updateCounters(imported, updated, skipped, duplicates);
+    subEl.textContent = 'Done!';
+    titleEl.textContent = 'Import complete';
+
     renderRecentEntries();
     renderMyEntries();
     refreshAll();
+
+    // Brief pause so user sees 100% before overlay closes
+    await new Promise(r => setTimeout(r, 900));
+    hideProgress();
+
     const parts = [];
-    if (updated) parts.push(`updated ${updated} existing draft(s)`);
+    if (updated)  parts.push(`updated ${updated} existing draft(s)`);
     if (duplicates) parts.push(`skipped ${duplicates} already-submitted duplicate(s)`);
     if (skipped - duplicates > 0) parts.push(`skipped ${skipped - duplicates} (unmatched KPI/missing fields)`);
-    showToast(`Imported ${imported} new row(s)${parts.length ? `, ${parts.join(', ')}` : ''}`);
+    showToast(`Imported ${imported} new row(s)${parts.length ? `, ${parts.join(', ')}` : ''}`, 5000);
+
   } catch (err) {
+    hideProgress();
     console.error('Excel import error:', err);
     showToast('Failed to read file — check format');
   } finally {
