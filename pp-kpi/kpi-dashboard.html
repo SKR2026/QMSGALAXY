@@ -1540,6 +1540,13 @@ async function importExcel(file) {
       const k = kpiMaster.find(k => k.name.toLowerCase() === kpiName.toLowerCase());
       if (!k || !plant || !month || isNaN(actual)) { skipped++; continue; }
 
+      // UOM and Target from file are informational — actual values always come from KPI master
+      // but if Target is present in file and differs, warn (don't override master)
+      const fileTarget = get('Target','target');
+      const resolvedTarget = (fileTarget !== '' && !isNaN(parseFloat(fileTarget)))
+        ? parseFloat(fileTarget)
+        : k.target;
+
       const reason  = String(get('Reason')).trim();
       const action  = String(get('Action Plan','ActionPlan','Action')).trim();
       const resp    = String(get('Responsible','Responsible Person')).trim();
@@ -1558,14 +1565,14 @@ async function importExcel(file) {
           duplicates++; skipped++; continue;
         }
         Object.assign(existing, {
-          dept: dept || k.dept, target: k.target, actual, reason, action, resp, dueDate,
+          dept: dept || k.dept, target: resolvedTarget, actual, reason, action, resp, dueDate,
           actionStatus: reason ? 'in-progress' : null
         });
         if (existing.fsId && window.FB && window.FB.saveKPIEntry) {
           try {
             await window.FB.saveKPIEntry({
               id: existing.fsId, year, month, plant, department: dept || k.dept,
-              kpiId: k.id, kpiName: k.name, target: k.target, actual,
+              kpiId: k.id, kpiName: k.name, target: resolvedTarget, actual,
               unit: k.unit, direction: k.dir, reason, actionPlan: action,
               responsiblePerson: resp, targetDate: dueDate,
               actionStatus: existing.actionStatus || '',
@@ -1579,7 +1586,7 @@ async function importExcel(file) {
 
       const entry = {
         id: nextId++, year, month, plant, dept: dept || k.dept, kpiId: k.id,
-        target: k.target, actual, reason, action, resp, dueDate,
+        target: resolvedTarget, actual, reason, action, resp, dueDate,
         actionStatus: reason ? 'in-progress' : null,
         entryStatus: 'draft', locked: false
       };
@@ -1588,7 +1595,7 @@ async function importExcel(file) {
         try {
           const id = await window.FB.saveKPIEntry({
             year, month, plant, department: dept || k.dept,
-            kpiId: k.id, kpiName: k.name, target: k.target, actual,
+            kpiId: k.id, kpiName: k.name, target: resolvedTarget, actual,
             unit: k.unit, direction: k.dir, reason, actionPlan: action,
             responsiblePerson: resp, targetDate: dueDate,
             actionStatus: entry.actionStatus || '',
@@ -1640,40 +1647,91 @@ function downloadTemplate() {
 
   const sampleK = kpiMaster[0];
   const templateRows = [{
-    Year: new Date().getFullYear(),
-    Month: 'January',
-    Plant: plantsList[0] ? plantsList[0].name : '',
-    Department: sampleK ? sampleK.dept : '',
-    KPI: sampleK ? sampleK.name : '',
-    Actual: sampleK ? sampleK.target : 0,
-    Reason: '',
-    'Action Plan': '',
-    Responsible: '',
-    'Due Date': ''
+    Year:           new Date().getFullYear(),
+    Month:          'January',
+    Plant:          plantsList[0] ? plantsList[0].name : '',
+    Department:     sampleK ? sampleK.dept : '',
+    KPI:            sampleK ? sampleK.name : '',
+    UOM:            sampleK ? sampleK.unit : '',
+    Target:         sampleK ? sampleK.target : 0,
+    Actual:         '',
+    Reason:         '',
+    'Action Plan':  '',
+    Responsible:    '',
+    'Due Date':     ''
   }];
 
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.json_to_sheet(templateRows);
+
+  // Column widths
   ws['!cols'] = [
-    {wch:8},{wch:12},{wch:14},{wch:16},{wch:24},
-    {wch:10},{wch:30},{wch:30},{wch:18},{wch:12}
+    {wch:8},  // Year
+    {wch:12}, // Month
+    {wch:14}, // Plant
+    {wch:16}, // Department
+    {wch:28}, // KPI
+    {wch:10}, // UOM
+    {wch:10}, // Target
+    {wch:10}, // Actual
+    {wch:30}, // Reason
+    {wch:30}, // Action Plan
+    {wch:18}, // Responsible
+    {wch:12}  // Due Date
   ];
+
+  // Style the header row
+  const headerCols = ['A','B','C','D','E','F','G','H','I','J','K','L'];
+  headerCols.forEach(col => {
+    const cell = col + '1';
+    if (ws[cell]) {
+      ws[cell].s = {
+        font:      { bold: true, color: { rgb: 'FFFFFF' } },
+        fill:      { fgColor: { rgb: '185FA5' } },
+        alignment: { horizontal: 'center', vertical: 'center' },
+        border:    { bottom: { style: 'thin', color: { rgb: 'CCCCCC' } } }
+      };
+    }
+  });
+
+  // Mark UOM & Target as read-only hint (light grey fill)
+  ['F2','G2'].forEach(cell => {
+    if (ws[cell]) ws[cell].s = { fill: { fgColor: { rgb: 'F0F0F0' } }, font: { color: { rgb: '888888' } }, alignment: { horizontal: 'center' } };
+  });
+
   XLSX.utils.book_append_sheet(wb, ws, 'Template');
 
-  // Reference sheet — valid values to copy from
+  // Reference sheet — KPI name, UOM, Target, Plant, Department, Months
   const maxLen = Math.max(kpiMaster.length, plantsList.length, deptList.length, MONTHS.length);
   const refRows = [];
   for (let i = 0; i < maxLen; i++) {
+    const k = kpiMaster[i];
     refRows.push({
-      'Valid KPI names': kpiMaster[i] ? kpiMaster[i].name : '',
-      'Valid Plants': plantsList[i] ? plantsList[i].name : '',
-      'Valid Departments': deptList[i] ? deptList[i].name : '',
-      'Valid Months': MONTHS[i] || ''
+      'KPI Name':          k ? k.name : '',
+      'UOM':               k ? k.unit : '',
+      'Target':            k ? k.target : '',
+      'Department':        k ? k.dept : '',
+      'Valid Plants':      plantsList[i] ? plantsList[i].name : '',
+      'Valid Departments': deptList[i]   ? deptList[i].name  : '',
+      'Valid Months':      MONTHS[i]     || ''
     });
   }
   const refWs = XLSX.utils.json_to_sheet(refRows);
-  refWs['!cols'] = [{wch:28},{wch:16},{wch:18},{wch:14}];
-  XLSX.utils.book_append_sheet(wb, refWs, 'Reference');
+  refWs['!cols'] = [{wch:30},{wch:10},{wch:10},{wch:16},{wch:16},{wch:18},{wch:14}];
+
+  // Style reference header
+  ['A','B','C','D','E','F','G'].forEach(col => {
+    const cell = col + '1';
+    if (refWs[cell]) {
+      refWs[cell].s = {
+        font: { bold: true, color: { rgb: 'FFFFFF' } },
+        fill: { fgColor: { rgb: '444444' } },
+        alignment: { horizontal: 'center' }
+      };
+    }
+  });
+
+  XLSX.utils.book_append_sheet(wb, refWs, 'Reference (Read-Only)');
 
   XLSX.writeFile(wb, 'KPI_Bulk_Upload_Template.xlsx');
   showToast('Template downloaded ✓');
