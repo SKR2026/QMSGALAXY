@@ -3246,22 +3246,33 @@ function bulkSubmitMyEntries(){
     entry.locked = true;
     submitted++;
 
-    // Persist submit status to Firestore immediately
-    if(entry.fsId && window.FB && window.FB.saveKPIEntry){
+    // Persist to Firestore — use updateKPIEntry if we have a Firestore ID,
+    // otherwise saveKPIEntry will create a new doc with locked:true
+    if(window.FB){
       const k2 = kpiMaster.find(k=>String(k.id)===String(entry.kpiId));
-      window.FB.saveKPIEntry({
-        id: entry.fsId,
+      const fsPayload = {
+        entryStatus: 'submitted', locked: true,
+        submittedBy: (window._fbProfile && window._fbProfile.email) || '',
         year: entry.year, month: entry.month, plant: entry.plant,
-        department: entry.dept,
-        kpiId: entry.kpiId, kpiName: k2 ? k2.name : '',
-        target: liveTarget(entry), actual: entry.actual,
-        unit: k2 ? k2.unit : '', direction: k2 ? k2.dir : 'lower',
+        department: entry.dept, kpiId: entry.kpiId,
+        kpiName: k2 ? k2.name : '', target: liveTarget(entry),
+        actual: entry.actual, unit: k2 ? k2.unit : '',
+        direction: k2 ? k2.dir : 'lower',
         reason: entry.reason || '', actionPlan: entry.action || '',
         responsiblePerson: entry.resp || '', targetDate: entry.dueDate || '',
-        actionStatus: entry.actionStatus || '',
-        entryStatus: 'submitted', locked: true,
-        submittedBy: (window._fbProfile && window._fbProfile.email) || ''
-      }).catch(err => console.warn('Bulk submit Firebase sync failed:', err));
+        actionStatus: entry.actionStatus || ''
+      };
+      if(entry.fsId && window.FB.updateKPIEntry){
+        // Has Firestore ID — just update the existing doc
+        window.FB.updateKPIEntry(entry.fsId, { entryStatus:'submitted', locked:true,
+          submittedBy: fsPayload.submittedBy })
+          .catch(err => console.warn('Bulk submit update failed:', err));
+      } else if(window.FB.saveKPIEntry){
+        // No Firestore ID yet (e.g. locally created draft) — create submitted doc
+        window.FB.saveKPIEntry({ id: null, ...fsPayload })
+          .then(newId => { if(newId) entry.fsId = newId; })
+          .catch(err => console.warn('Bulk submit save failed:', err));
+      }
     }
   });
 
@@ -3285,8 +3296,55 @@ function bulkSubmitMyEntries(){
   if(issues.length) showToast('Skipped: '+issues.join(', '), 6000);
 }
 
-// Edit from the My Entries page — jump to the Entry form with the record loaded
-function editFromMyEntries(id){
+// Submit a single entry from My Entries — persists to Firestore immediately
+function submitSingleEntry(id){
+  const entry = [...recentEntries, ...kpiData].find(d=>String(d.id)===String(id));
+  if(!entry){ showToast('Entry not found'); return; }
+  if(entry.locked || entry.entryStatus==='submitted'){ showToast('Already submitted'); return; }
+  if(!canEditEntry(entry)){ showToast('You can only submit entries for your own plant'); return; }
+
+  const k = kpiMaster.find(k=>String(k.id)===String(entry.kpiId));
+  const tgt = liveTarget(entry);
+  const s = statusOf(calcAch(entry.actual,tgt,k?k.dir:'lower'),entry.actual,tgt,k?k.dir:'lower');
+  if(s==='missed' && (!entry.reason || !entry.action)){
+    showToast('Please add a reason and action plan before submitting a missed KPI');
+    editEntry(id);
+    return;
+  }
+
+  entry.entryStatus = 'submitted';
+  entry.locked = true;
+
+  const email = (window._fbProfile && window._fbProfile.email) || '';
+  if(window.FB){
+    if(entry.fsId && window.FB.updateKPIEntry){
+      window.FB.updateKPIEntry(entry.fsId, { entryStatus:'submitted', locked:true, submittedBy:email })
+        .then(()=>showToast('Entry submitted and locked ✓'))
+        .catch(err=>{ console.error(err); showToast('Submit failed: '+err.message); });
+    } else if(window.FB.saveKPIEntry){
+      window.FB.saveKPIEntry({
+        id: null,
+        year:entry.year, month:entry.month, plant:entry.plant, department:entry.dept,
+        kpiId:entry.kpiId, kpiName:k?k.name:'', target:tgt, actual:entry.actual,
+        unit:k?k.unit:'', direction:k?k.dir:'lower',
+        reason:entry.reason||'', actionPlan:entry.action||'',
+        responsiblePerson:entry.resp||'', targetDate:entry.dueDate||'',
+        actionStatus:entry.actionStatus||'', entryStatus:'submitted', locked:true,
+        submittedBy:email
+      }).then(newId=>{
+        if(newId) entry.fsId = newId;
+        showToast('Entry submitted and locked ✓');
+      }).catch(err=>{ console.error(err); showToast('Submit failed: '+err.message); });
+    }
+  } else {
+    showToast('Entry submitted locally (Firebase not connected)');
+  }
+
+  renderRecentEntries();
+  renderMyEntries();
+}
+
+
   navigate('entry', document.querySelector('.nav-item[onclick*="\'entry\'"]'));
   editEntry(id);
 }
@@ -3314,7 +3372,8 @@ function renderRecentEntries(){
       entryCell = `<span class="badge">Draft</span>`;
       if(canEditEntry(d)){
         entryCell += `
-        <button class="btn btn-sm" style="margin-left:6px" onclick="editEntry('${d.id}')">Edit</button>
+        <button class="btn btn-sm" style="margin-left:6px;color:var(--blue);border-color:var(--blue)" onclick="submitSingleEntry('${d.id}')">Submit</button>
+        <button class="btn btn-sm" style="margin-left:4px" onclick="editEntry('${d.id}')">Edit</button>
         <button class="btn btn-sm" style="margin-left:4px;color:var(--red)" onclick="deleteEntry('${d.id}')">Delete</button>`;
       }
     }
@@ -6023,17 +6082,17 @@ export async function saveKPIEntry(entryData) {
     updatedAt:        serverTimestamp()
   };
 
-  // If an id is provided, UPDATE the existing Firestore document
-  if (entryData.id && typeof entryData.id === 'string') {
-    await updateDoc(doc(db, 'kpiData', entryData.id), payload);
-    // Sync to Realtime DB
+  // If a Firestore doc ID is provided, UPDATE the existing document
+  const fsId = entryData.id && isNaN(Number(entryData.id)) ? String(entryData.id) : null;
+  if (fsId) {
+    await updateDoc(doc(db, 'kpiData', fsId), payload);
     try {
-      await set(ref(rtdb, `kpiLive/${entryData.plant}/${entryData.year}/${entryData.month}/${entryData.id}`), {
+      await set(ref(rtdb, `kpiLive/${entryData.plant}/${entryData.year}/${entryData.month}/${fsId}`), {
         kpiName: entryData.kpiName, actual, target, status, achievementPct: pct,
         department: entryData.department
       });
     } catch (err) { console.warn('Realtime DB mirror failed:', err); }
-    return entryData.id;
+    return fsId;
   }
 
   // Otherwise CREATE a new document
