@@ -3167,74 +3167,85 @@ function bulkDeleteMyEntries(){
 // Bulk-submit selected draft entries on the My Entries page. Locks each
 // entry, same rules as the single-entry "Submit" button: KPIs that missed
 // target need a reason + action plan before they can be locked.
-function bulkSubmitMyEntries(){
+async function bulkSubmitMyEntries(){
   const ids = getSelectedIds('myEntriesBody');
   if(!ids.length) return;
 
-  let submitted = 0, skippedLocked = 0, skippedNotMine = 0, skippedNeedsAction = 0, skippedDup = 0;
+  let submitted = 0, skippedLocked = 0, skippedNotMine = 0, skippedNeedsAction = 0, skippedDup = 0, failed = 0;
+  const email = (window._fbProfile && window._fbProfile.email) || '';
+
+  // Collect entries to submit first
+  const toSubmit = [];
   ids.forEach(id=>{
-    const entry = recentEntries.find(d=>String(d.id)===String(id));
+    const entry = [...recentEntries, ...kpiData].find(d=>String(d.id)===String(id));
     if(!entry) return;
     if(entry.locked || entry.entryStatus==='submitted'){ skippedLocked++; return; }
     if(!canEditEntry(entry)){ skippedNotMine++; return; }
-
-    // Check if a submitted/locked duplicate already exists in kpiData (Firebase historical)
-    const dupInHistory = kpiData.find(d=>
-      String(d.kpiId)===String(entry.kpiId) &&
-      String(d.plant).trim().toLowerCase()===String(entry.plant).trim().toLowerCase() &&
-      String(d.month).trim().toLowerCase()===String(entry.month).trim().toLowerCase() &&
-      String(d.year)===String(entry.year) &&
-      (d.locked || d.entryStatus==='submitted')
-    );
-    if(dupInHistory){ skippedDup++; return; }
-
     const k = kpiMaster.find(k=>String(k.id)===String(entry.kpiId));
     const tgt = liveTarget(entry);
     const s = statusOf(calcAch(entry.actual,tgt,k?k.dir:'lower'),entry.actual,tgt,k?k.dir:'lower');
     if(s==='missed' && (!entry.reason || !entry.action)){ skippedNeedsAction++; return; }
-    entry.entryStatus = 'submitted';
-    entry.locked = true;
-    submitted++;
-
-    // Persist to Firestore using saveKPIEntry (handles both update and create)
-    if(window.FB && window.FB.saveKPIEntry){
-      const k2 = kpiMaster.find(k=>String(k.id)===String(entry.kpiId));
-      const email = (window._fbProfile && window._fbProfile.email) || '';
-      // Pass fsId as 'id' so saveKPIEntry does updateDoc on the existing Firestore doc
-      window.FB.saveKPIEntry({
-        id:                entry.fsId || null,
-        year:              entry.year,
-        month:             entry.month,
-        plant:             entry.plant,
-        department:        entry.dept,
-        kpiId:             entry.kpiId,
-        kpiName:           k2 ? k2.name : '',
-        target:            liveTarget(entry),
-        actual:            entry.actual,
-        unit:              k2 ? k2.unit : '',
-        direction:         k2 ? k2.dir : 'lower',
-        reason:            entry.reason       || '',
-        actionPlan:        entry.action       || '',
-        responsiblePerson: entry.resp         || '',
-        targetDate:        entry.dueDate      || '',
-        actionStatus:      entry.actionStatus || '',
-        entryStatus:       'submitted',
-        locked:            true,
-        submittedBy:       email
-      }).then(newId => {
-        if(newId && !entry.fsId) entry.fsId = newId;
-      }).catch(err => {
-        // saveKPIEntry handles not-found internally by creating a new doc.
-        // Only revert local state for unexpected/permission errors.
-        if(err.code !== 'not-found'){
-          entry.entryStatus = 'draft';
-          entry.locked = false;
-        }
-        console.error('Submit failed for', entry.kpiId, entry.month, err);
-        showToast('Submit failed: ' + (err.code || err.message || err) + ' — check Firestore rules', 8000);
-      });
-    }
+    toSubmit.push(entry);
   });
+
+  if(!toSubmit.length){
+    showToast('No entries were submitted — check the issues below.');
+    const issues = [];
+    if(skippedLocked)     issues.push(skippedLocked+' already submitted');
+    if(skippedNotMine)    issues.push(skippedNotMine+' not yours to submit');
+    if(skippedNeedsAction) issues.push(skippedNeedsAction+' missing reason/action plan for a missed KPI');
+    if(issues.length) showToast('Skipped: '+issues.join(', '), 6000);
+    return;
+  }
+
+  showToast(`Submitting ${toSubmit.length} entr${toSubmit.length===1?'y':'ies'} to Firestore...`);
+
+  // Submit each entry — AWAIT each Firestore write so we know it actually persisted
+  for(const entry of toSubmit){
+    const k2 = kpiMaster.find(k=>String(k.id)===String(entry.kpiId));
+    try{
+      if(window.FB && window.FB.saveKPIEntry){
+        const newId = await window.FB.saveKPIEntry({
+          id:                entry.fsId || null,
+          year:              entry.year,
+          month:             entry.month,
+          plant:             entry.plant,
+          department:        entry.dept,
+          kpiId:             entry.kpiId,
+          kpiName:           k2 ? k2.name : '',
+          target:            liveTarget(entry),
+          actual:            entry.actual,
+          unit:              k2 ? k2.unit : '',
+          direction:         k2 ? k2.dir : 'lower',
+          reason:            entry.reason       || '',
+          actionPlan:        entry.action       || '',
+          responsiblePerson: entry.resp         || '',
+          targetDate:        entry.dueDate      || '',
+          actionStatus:      entry.actionStatus || '',
+          entryStatus:       'submitted',
+          locked:            true,
+          submittedBy:       email
+        });
+        // Only mark locked locally AFTER Firestore confirms the write
+        if(newId){
+          entry.fsId = newId;
+          entry.entryStatus = 'submitted';
+          entry.locked = true;
+          submitted++;
+        } else {
+          failed++;
+        }
+      } else {
+        // No Firebase — local only
+        entry.entryStatus = 'submitted';
+        entry.locked = true;
+        submitted++;
+      }
+    }catch(err){
+      console.error('Submit failed for', entry.kpiId, entry.month, err);
+      failed++;
+    }
+  }
 
   renderRecentEntries();
   renderMyEntries();
@@ -3242,52 +3253,18 @@ function bulkSubmitMyEntries(){
   document.getElementById('myEntriesBulkDeleteBtn').style.display='none';
   document.getElementById('myEntriesSelCount').textContent='0';
   document.getElementById('myEntriesSubmitCount').textContent='0';
+  refreshAll();
 
-  if(!submitted){
-    showToast('No entries were submitted — check the issues below.');
-  } else {
-    showToast(`${submitted} entr${submitted===1?'y':'ies'} submitted — syncing to Firestore...`);
-    // Re-fetch from Firestore after a short delay to confirm all writes succeeded.
-    // We merge Firestore state WITH local submitted state — local submitted always wins
-    // over any incoming draft (handles the case where Firestore write is still propagating)
-    setTimeout(async ()=>{
-      if(window.FB && window.FB.getKPIEntries){
-        try{
-          const refreshed = await window.FB.getKPIEntries({});
-          if(refreshed.length){
-            // Deduplicate Firestore entries by business key
-            const bizMap = new Map();
-            refreshed.forEach(fe=>{
-              const key=`${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
-              const ex=bizMap.get(key);
-              if(!ex){ bizMap.set(key,fe); return; }
-              const feS = fe.locked||fe.entryStatus==='submitted';
-              const exS = ex.locked||ex.entryStatus==='submitted';
-              if(feS&&!exS) bizMap.set(key,fe);
-              else if(!feS&&!exS){
-                const fTs=fe.updatedAt?.toMillis?fe.updatedAt.toMillis():0;
-                const eTs=ex.updatedAt?.toMillis?ex.updatedAt.toMillis():0;
-                if(fTs>eTs) bizMap.set(key,fe);
-              }
-            });
-
-            // Merge into existing arrays WITHOUT clearing —
-            // local submitted state takes priority over Firestore draft
-            mergeFirebaseEntriesKeepSubmitted([...bizMap.values()]);
-            renderRecentEntries();
-            renderMyEntries();
-            refreshAll();
-            showToast('Sync complete ✓');
-          }
-        }catch(e){ console.warn('Post-submit refresh failed:', e); }
-      }
-    }, 2500);
+  if(submitted){
+    showToast(`✓ ${submitted} entr${submitted===1?'y':'ies'} submitted and locked in Firestore`);
+  }
+  if(failed){
+    showToast(`⚠ ${failed} entr${failed===1?'y':'ies'} failed to save — check Firestore rules`, 8000);
   }
   const issues = [];
   if(skippedLocked)     issues.push(skippedLocked+' already submitted');
-  if(skippedDup)        issues.push(skippedDup+' duplicate of an existing submitted entry');
-  if(skippedNotMine)    issues.push(skippedNotMine+' not yours to submit');
-  if(skippedNeedsAction) issues.push(skippedNeedsAction+' missing reason/action plan for a missed KPI');
+  if(skippedNotMine)    issues.push(skippedNotMine+' not yours');
+  if(skippedNeedsAction) issues.push(skippedNeedsAction+' need action plan');
   if(issues.length) showToast('Skipped: '+issues.join(', '), 6000);
 }
 
@@ -6698,33 +6675,26 @@ async function loadFirebaseData() {
     let fsEntries = await getKPIEntries({}); // no filters — need full dataset
 
     // Deduplicate Firestore entries by business key (kpiId+plant+month+year).
-    // If duplicates exist (caused by old addDoc bug), keep the submitted/locked
-    // one; if both are drafts, keep the most recently updated one.
+    // ALWAYS prefer the submitted/locked doc. If two docs exist for the same
+    // business key (legacy addDoc duplicates), keep submitted; among drafts,
+    // keep the most recently updated. We do NOT auto-delete to avoid any risk
+    // of removing the wrong doc — duplicates simply collapse in the UI.
     const bizMap = new Map();
-    const toDelete = []; // Firestore IDs of duplicate docs to clean up
     fsEntries.forEach(fe => {
       const key = `${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
       const existing = bizMap.get(key);
       if (!existing) { bizMap.set(key, fe); return; }
       const feSubmitted = fe.locked || fe.entryStatus === 'submitted';
       const exSubmitted = existing.locked || existing.entryStatus === 'submitted';
-      if (feSubmitted && !exSubmitted) { toDelete.push(existing.id); bizMap.set(key, fe); return; }
-      if (!feSubmitted && !exSubmitted) {
-        const feTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
-        const exTs = existing.updatedAt?.toMillis ? existing.updatedAt.toMillis() : 0;
-        if (feTs > exTs) { toDelete.push(existing.id); bizMap.set(key, fe); }
-        else toDelete.push(fe.id);
-      } else if (!feSubmitted && exSubmitted) {
-        toDelete.push(fe.id); // existing submitted wins, delete incoming draft
-      }
+      // Submitted always wins over draft
+      if (feSubmitted && !exSubmitted) { bizMap.set(key, fe); return; }
+      if (!feSubmitted && exSubmitted) { return; } // keep existing submitted
+      // Both same status — keep most recently updated
+      const feTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
+      const exTs = existing.updatedAt?.toMillis ? existing.updatedAt.toMillis() : 0;
+      if (feTs >= exTs) bizMap.set(key, fe);
     });
     fsEntries = [...bizMap.values()];
-
-    // Silently delete duplicate docs from Firestore in background
-    if (toDelete.length && window.FB && window.FB.deleteKPIEntry) {
-      console.log(`Cleaning up ${toDelete.length} duplicate Firestore entries`);
-      toDelete.forEach(id => window.FB.deleteKPIEntry(id).catch(()=>{}));
-    }
 
     mergeFirebaseEntries(fsEntries);
     refreshAll();
@@ -6735,28 +6705,27 @@ async function loadFirebaseData() {
   }
 
   // 2b. My own draft / submitted entries (independent of the Year/Month/Plant
-  // filter, so a draft saved for a different month is still visible & editable)
+  // filter, so a draft saved for a different month is still visible & editable).
+  // Use keepSubmitted merge so this never downgrades an already-submitted entry.
   try {
     const email = (window._fbProfile && window._fbProfile.email) || (currentUser && currentUser.email);
-    console.log('Loading my entries for:', email);
     if (email && window.FB && window.FB.getMyEntries) {
       const mine = await getMyEntries(email);
-      console.log('My saved entries found:', mine.length, mine);
       if (mine.length > 0) {
-        mergeFirebaseEntries(mine);
+        mergeFirebaseEntriesKeepSubmitted(mine);
         renderRecentEntries();
+        renderMyEntries();
       }
     }
   } catch (err) {
     console.error('Could not load your saved entries:', err);
-    showToast('Could not load your entries: ' + (err.code || err.message || err), 10000);
   }
 
-  // 3. Action plans
+  // 3. Action plans — keepSubmitted merge (never downgrade submitted entries)
   try {
     const actions = await getOpenActionPlans();
     if (actions.length > 0) {
-      mergeFirebaseEntries(actions);
+      mergeFirebaseEntriesKeepSubmitted(actions);
       renderActionPlans('all');
     }
   } catch (err) {
