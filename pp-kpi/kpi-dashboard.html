@@ -20,7 +20,19 @@
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+// Load xlsx-js-style (supports cell styles). Falls back to standard xlsx if unavailable.
+(function(){
+  var s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js';
+  s.onerror = function(){
+    var s2 = document.createElement('script');
+    s2.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    document.head.appendChild(s2);
+  };
+  document.head.appendChild(s);
+})();
+</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js"></script>
 <style>
@@ -3859,124 +3871,131 @@ function renderMatrix(){
 }
 
 function exportMatrixExcel(){
-  if(typeof XLSX==='undefined'){ showToast('Excel library not loaded'); return; }
+  if(typeof XLSX==='undefined'){ showToast('Excel library not loaded — please reload the page'); return; }
   const {rows, year, orderedMonths} = getMatrixData();
   const plant = document.getElementById('matrixPlant').value;
   const dept  = document.getElementById('matrixDept').value;
   const monthsShort = orderedMonths.map(m=>m.slice(0,3));
-
-  const wb   = XLSX.utils.book_new();
-  const ws   = {};
-  const ref  = {s:{r:0,c:0}, e:{r:0,c:0}};
   const totalCols = 8 + 12;
 
-  // Helpers
-  function setCell(r, c, v, s){
-    const addr = XLSX.utils.encode_cell({r,c});
-    ws[addr] = { v, t: typeof v==='number'?'n':'s', s: s||{} };
-    if(r > ref.e.r) ref.e.r = r;
-    if(c > ref.e.c) ref.e.c = c;
+  // ── Style helpers (xlsx-js-style format) ─────────────────────────
+  const THIN = { style:'thin', color:{ rgb:'CCCCCC' } };
+  const border = { top:THIN, bottom:THIN, left:THIN, right:THIN };
+
+  function cs(fill_rgb, font_rgb, bold, sz){
+    return {
+      fill: fill_rgb ? { patternType:'solid', fgColor:{ rgb: fill_rgb } } : { patternType:'none' },
+      font: { name:'Arial', sz:sz||9, bold:!!bold, color:{ rgb: font_rgb||'1A1A18' } },
+      alignment: { horizontal:'center', vertical:'center', wrapText:false },
+      border
+    };
+  }
+  function csLeft(fill_rgb, font_rgb, bold){
+    const s = cs(fill_rgb, font_rgb, bold);
+    s.alignment.horizontal = 'left';
+    return s;
   }
 
-  const BLUE     = '185FA5';
-  const BLUE_BG  = 'EBF3FB';
-  const BLUE_LT  = 'DCEEFA';  // slightly deeper for target row
-  const WHITE    = 'FFFFFF';
-  const BORDER   = { top:{style:'thin',color:{rgb:'CCCCCC'}}, bottom:{style:'thin',color:{rgb:'CCCCCC'}}, left:{style:'thin',color:{rgb:'CCCCCC'}}, right:{style:'thin',color:{rgb:'CCCCCC'}} };
+  const S_HDR   = cs('185FA5','FFFFFF',true,9);
+  const S_TGT   = cs('EBF3FB','185FA5',true);
+  const S_TGT_N = cs('EBF3FB','185FA5',false);  // non-bold target cell
+  const S_PLAIN = cs('FFFFFF','5F5E5A',false);
+  const S_DASH  = cs('FFFFFF','AAAAAA',false);
+  const S_NAME  = csLeft('FFFFFF','1A1A18',true);
+  const S_DEPT  = csLeft('FFFFFF','1A1A18',true);
+  const S_UOM   = cs('FFFFFF','888780',false);
+  const S_NUM   = cs('FFFFFF','1A1A18',false);
 
-  function hdrStyle(){ return { font:{bold:true,color:{rgb:WHITE},name:'Arial',sz:9}, fill:{fgColor:{rgb:BLUE}}, alignment:{horizontal:'center',vertical:'center',wrapText:true}, border:BORDER }; }
-  function tgtStyle(bold){ return { font:{bold:!!bold,color:{rgb:BLUE},name:'Arial',sz:9}, fill:{fgColor:{rgb:BLUE_BG}}, alignment:{horizontal:'center',vertical:'center'}, border:BORDER }; }
-  function actStyle(rgb, fgRgb){ return { font:{bold:true,color:{rgb:fgRgb||'333333'},name:'Arial',sz:9}, fill:{fgColor:{rgb:rgb||WHITE}}, alignment:{horizontal:'center',vertical:'center'}, border:BORDER }; }
-  function plainStyle(left){ return { font:{name:'Arial',sz:9}, fill:{fgColor:{rgb:WHITE}}, alignment:{horizontal:left?'left':'center',vertical:'center'}, border:BORDER }; }
-  function kpiNameStyle(){ return { font:{bold:true,name:'Arial',sz:9}, fill:{fgColor:{rgb:WHITE}}, alignment:{horizontal:'left',vertical:'center',wrapText:true}, border:BORDER }; }
+  function sAch(status){
+    if(status==='achieved')  return cs('EAF3DE','3B6D11',true);
+    if(status==='near-miss') return cs('FFF8E1','7A5C00',true);
+    if(status==='missed')    return cs('FCEBEB','A32D2D',true);
+    return S_NUM;
+  }
 
-  // ── Title row ───────────────────────────────────────────────────
-  let row = 0;
-  setCell(row, 0, `KPI Matrix Report — ${plant==='All'?'All Plants':plant} | ${dept==='All'?'All Departments':dept} | Year: ${fmtYear(year)}`,
-    { font:{bold:true,sz:12,name:'Arial'}, alignment:{horizontal:'left'} });
-  row++;
+  // ── Build worksheet manually ─────────────────────────────────────
+  const ws = {};
+  const merges = [];
+  let R = 0;
 
-  // ── Column header row ────────────────────────────────────────────
-  const headers = ['#','Department','KPI','UOM','LY Target','LY Actual','CY Target','CY YTD',...monthsShort];
-  headers.forEach((h,c)=> setCell(row, c, h, hdrStyle()));
-  const headerRowIdx = row;
-  row++;
+  function cell(r,c,v,s){
+    const addr = XLSX.utils.encode_cell({r,c});
+    ws[addr] = { v, t: (typeof v==='number'&&v===v)?'n':'s', s };
+  }
+  function num(r,c,v,s){ ws[XLSX.utils.encode_cell({r,c})] = { v:v!=null&&v!=='—'?+v:v, t:v!=null&&v!=='—'?'n':'s', s }; }
 
-  // ── Merges (title + KPI rowspans) ───────────────────────────────
-  const merges = [{s:{r:0,c:0}, e:{r:0,c:totalCols-1}}];
+  // Title
+  cell(R,0,`KPI Matrix — ${plant==='All'?'All Plants':plant} | ${dept==='All'?'All':dept} | Year: ${fmtYear(year)}`,
+    { font:{name:'Arial',sz:12,bold:true}, alignment:{horizontal:'left'} });
+  merges.push({s:{r:R,c:0},e:{r:R,c:totalCols-1}});
+  R++;
 
-  // ── Data rows ────────────────────────────────────────────────────
-  rows.forEach(({idx,k,annualTarget,ytdTarget,lyTarget,lyActual,ytdActual,monthActuals,monthTargets},ri)=>{
-    const tRow = row;       // Target row
-    const aRow = row + 1;  // Actual row
+  // Header row
+  const hdrs = ['#','Department','KPI','UOM','LY Target','LY Actual','CY Target','CY YTD',...monthsShort];
+  hdrs.forEach((h,c)=> cell(R,c,h,S_HDR));
+  const HDR_ROW = R; R++;
 
-    // Merge: #, Dept, KPI, UOM span both rows
-    merges.push({s:{r:tRow,c:0},e:{r:aRow,c:0}}); // #
-    merges.push({s:{r:tRow,c:1},e:{r:aRow,c:1}}); // Dept
-    merges.push({s:{r:tRow,c:2},e:{r:aRow,c:2}}); // KPI name
-    merges.push({s:{r:tRow,c:3},e:{r:aRow,c:3}}); // UOM
+  // Data rows
+  rows.forEach(({idx,k,annualTarget,ytdTarget,lyTarget,lyActual,ytdActual,monthActuals,monthTargets})=>{
+    const TR = R;   // target row
+    const AR = R+1; // actual row
 
-    // Shared identity cells
-    setCell(tRow, 0, idx,    { ...kpiNameStyle(), alignment:{horizontal:'center',vertical:'center'}, font:{name:'Arial',sz:9,color:{rgb:'888888'}} });
-    setCell(tRow, 1, k.dept, { ...kpiNameStyle(), font:{bold:true,name:'Arial',sz:9} });
-    setCell(tRow, 2, k.name, kpiNameStyle());
-    setCell(tRow, 3, k.unit, { ...plainStyle(), alignment:{horizontal:'center',vertical:'center'}, font:{name:'Arial',sz:9,color:{rgb:'888888'}} });
+    // Merged identity cells (span 2 rows)
+    merges.push({s:{r:TR,c:0},e:{r:AR,c:0}});
+    merges.push({s:{r:TR,c:1},e:{r:AR,c:1}});
+    merges.push({s:{r:TR,c:2},e:{r:AR,c:2}});
+    merges.push({s:{r:TR,c:3},e:{r:AR,c:3}});
+    cell(TR,0,idx,  cs('FFFFFF','888780',false));
+    cell(TR,1,k.dept,S_DEPT);
+    cell(TR,2,k.name,S_NAME);
+    cell(TR,3,k.unit,S_UOM);
 
-    // ── TARGET ROW ────────────────────────────────────────────────
-    setCell(tRow, 4, lyTarget, tgtStyle(false));
-    setCell(tRow, 5, '—',     tgtStyle(false));
-    setCell(tRow, 6, annualTarget, tgtStyle(true));
-    setCell(tRow, 7, ytdTarget!=null?ytdTarget:'—', tgtStyle(true));
+    // ── Target row ────────────────────────────────────────────────
+    num(TR,4,lyTarget,   S_TGT_N);
+    cell(TR,5,'—',       S_TGT_N);
+    num(TR,6,annualTarget,S_TGT);
+    num(TR,7,ytdTarget,  S_TGT);
     orderedMonths.forEach((m,mi)=>{
       const tgt = monthTargets[m]!=null ? monthTargets[m] : annualTarget;
-      setCell(tRow, 8+mi, tgt!=null?tgt:'—', tgtStyle(false));
+      num(TR,8+mi,tgt,S_TGT_N);
     });
 
-    // ── ACTUAL ROW ────────────────────────────────────────────────
-    // LY Actual — coloured
-    const lyS = lyActual!=null ? statusOf(calcAch(lyActual,lyTarget,k.dir),lyActual,lyTarget,k.dir) : null;
-    const lyBg = lyS==='achieved'?'EAF3DE':lyS==='near-miss'?'FFF8E1':lyS==='missed'?'FCEBEB':WHITE;
-    const lyFg = lyS==='achieved'?'3B6D11':lyS==='near-miss'?'7A5C00':lyS==='missed'?'A32D2D':'333333';
-    setCell(aRow, 4, '—',     plainStyle());
-    setCell(aRow, 5, lyActual!=null?lyActual:'—', actStyle(lyBg, lyFg));
-    setCell(aRow, 6, '—',     plainStyle());
-
-    // YTD Actual — coloured
-    const ytdS = ytdActual!=null ? statusOf(calcAch(ytdActual,ytdTarget,k.dir),ytdActual,ytdTarget,k.dir) : null;
-    const ytdBg = ytdS==='achieved'?'EAF3DE':ytdS==='near-miss'?'FFF8E1':ytdS==='missed'?'FCEBEB':WHITE;
-    const ytdFg = ytdS==='achieved'?'3B6D11':ytdS==='near-miss'?'7A5C00':ytdS==='missed'?'A32D2D':'333333';
-    setCell(aRow, 7, ytdActual!=null?ytdActual:'—', actStyle(ytdBg, ytdFg));
-
-    // Monthly actuals — coloured by status
+    // ── Actual row ────────────────────────────────────────────────
+    cell(AR,4,'—',S_DASH);
+    // LY Actual
+    if(lyActual!=null){
+      const s=statusOf(calcAch(lyActual,lyTarget,k.dir),lyActual,lyTarget,k.dir);
+      num(AR,5,lyActual,sAch(s));
+    } else cell(AR,5,'—',S_DASH);
+    cell(AR,6,'—',S_DASH);
+    // YTD Actual
+    if(ytdActual!=null){
+      const s=statusOf(calcAch(ytdActual,ytdTarget,k.dir),ytdActual,ytdTarget,k.dir);
+      num(AR,7,ytdActual,sAch(s));
+    } else cell(AR,7,'—',S_DASH);
+    // Monthly actuals
     orderedMonths.forEach((m,mi)=>{
-      const act = monthActuals[m];
-      const tgt = monthTargets[m]!=null ? monthTargets[m] : annualTarget;
-      if(act===null){ setCell(aRow,8+mi,'—',plainStyle()); return; }
-      const s   = statusOf(calcAch(act,tgt,k.dir),act,tgt,k.dir);
-      const bg  = s==='achieved'?'EAF3DE':s==='near-miss'?'FFF8E1':'FCEBEB';
-      const fg  = s==='achieved'?'3B6D11':s==='near-miss'?'7A5C00':'A32D2D';
-      setCell(aRow, 8+mi, act, actStyle(bg, fg));
+      const act=monthActuals[m];
+      const tgt=monthTargets[m]!=null?monthTargets[m]:annualTarget;
+      if(act===null){ cell(AR,8+mi,'—',S_DASH); return; }
+      const s=statusOf(calcAch(act,tgt,k.dir),act,tgt,k.dir);
+      num(AR,8+mi,act,sAch(s));
     });
 
-    row += 2;
+    R += 2;
   });
 
-  // ── Sheet metadata ───────────────────────────────────────────────
-  ws['!ref']  = XLSX.utils.encode_range(ref);
+  // Sheet ref, merges, col widths
+  ws['!ref'] = XLSX.utils.encode_range({s:{r:0,c:0},e:{r:R-1,c:totalCols-1}});
   ws['!merges'] = merges;
-  ws['!cols'] = [
-    {wch:5},{wch:14},{wch:30},{wch:8},{wch:11},{wch:11},{wch:11},{wch:10},
-    ...monthsShort.map(()=>({wch:8}))
-  ];
-  ws['!rows'] = [];
-  ws['!rows'][headerRowIdx] = {hpt:22};
+  ws['!cols'] = [{wch:5},{wch:14},{wch:30},{wch:8},{wch:10},{wch:10},{wch:10},{wch:10},
+    ...monthsShort.map(()=>({wch:8}))];
+  ws['!rows'] = []; ws['!rows'][HDR_ROW] = {hpt:22};
 
-  // Freeze panes: first 4 cols + header row
-  ws['!freeze'] = {xSplit:4, ySplit:headerRowIdx+1, topLeftCell:'E'+(headerRowIdx+2), activePane:'bottomRight'};
-
-  XLSX.utils.book_append_sheet(wb, ws, 'KPI Matrix');
-  const fname = `KPI_Matrix_${plant==='All'?'AllPlants':plant}_${fmtYear(year)}.xlsx`;
-  XLSX.writeFile(wb, fname);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'KPI Matrix');
+  const fname=`KPI_Matrix_${plant==='All'?'AllPlants':plant}_${fmtYear(year)}.xlsx`;
+  XLSX.writeFile(wb,fname);
   showToast('Excel exported: '+fname);
 }
 
