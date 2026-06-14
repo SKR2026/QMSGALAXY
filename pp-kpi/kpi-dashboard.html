@@ -3193,33 +3193,40 @@ function bulkSubmitMyEntries(){
     entry.locked = true;
     submitted++;
 
-    // Persist to Firestore — use updateKPIEntry if we have a Firestore ID,
-    // otherwise saveKPIEntry will create a new doc with locked:true
-    if(window.FB){
+    // Persist to Firestore using saveKPIEntry (handles both update and create)
+    if(window.FB && window.FB.saveKPIEntry){
       const k2 = kpiMaster.find(k=>String(k.id)===String(entry.kpiId));
-      const fsPayload = {
-        entryStatus: 'submitted', locked: true,
-        submittedBy: (window._fbProfile && window._fbProfile.email) || '',
-        year: entry.year, month: entry.month, plant: entry.plant,
-        department: entry.dept, kpiId: entry.kpiId,
-        kpiName: k2 ? k2.name : '', target: liveTarget(entry),
-        actual: entry.actual, unit: k2 ? k2.unit : '',
-        direction: k2 ? k2.dir : 'lower',
-        reason: entry.reason || '', actionPlan: entry.action || '',
-        responsiblePerson: entry.resp || '', targetDate: entry.dueDate || '',
-        actionStatus: entry.actionStatus || ''
-      };
-      if(entry.fsId && window.FB.updateKPIEntry){
-        // Has Firestore ID — just update the existing doc
-        window.FB.updateKPIEntry(entry.fsId, { entryStatus:'submitted', locked:true,
-          submittedBy: fsPayload.submittedBy })
-          .catch(err => console.warn('Bulk submit update failed:', err));
-      } else if(window.FB.saveKPIEntry){
-        // No Firestore ID yet (e.g. locally created draft) — create submitted doc
-        window.FB.saveKPIEntry({ id: null, ...fsPayload })
-          .then(newId => { if(newId) entry.fsId = newId; })
-          .catch(err => console.warn('Bulk submit save failed:', err));
-      }
+      const email = (window._fbProfile && window._fbProfile.email) || '';
+      // Pass fsId as 'id' so saveKPIEntry does updateDoc on the existing Firestore doc
+      window.FB.saveKPIEntry({
+        id:                entry.fsId || null,
+        year:              entry.year,
+        month:             entry.month,
+        plant:             entry.plant,
+        department:        entry.dept,
+        kpiId:             entry.kpiId,
+        kpiName:           k2 ? k2.name : '',
+        target:            liveTarget(entry),
+        actual:            entry.actual,
+        unit:              k2 ? k2.unit : '',
+        direction:         k2 ? k2.dir : 'lower',
+        reason:            entry.reason       || '',
+        actionPlan:        entry.action       || '',
+        responsiblePerson: entry.resp         || '',
+        targetDate:        entry.dueDate      || '',
+        actionStatus:      entry.actionStatus || '',
+        entryStatus:       'submitted',
+        locked:            true,
+        submittedBy:       email
+      }).then(newId => {
+        if(newId && !entry.fsId) entry.fsId = newId;
+      }).catch(err => {
+        // Revert local state if Firebase fails
+        entry.entryStatus = 'draft';
+        entry.locked = false;
+        console.error('Submit failed for', entry.kpiId, entry.month, err);
+        showToast('Submit failed: ' + (err.code || err.message || err) + ' — check Firestore rules', 8000);
+      });
     }
   });
 
@@ -3233,7 +3240,9 @@ function bulkSubmitMyEntries(){
   if(!submitted){
     showToast('No entries were submitted — check the issues below.');
   } else {
-    showToast(submitted+' entr'+(submitted===1?'y':'ies')+' submitted — locked for editing');
+    showToast(`${submitted} entr${submitted===1?'y':'ies'} submitted — saving to Firestore...`);
+    // Give Firebase a moment, then refresh to confirm persisted state
+    setTimeout(()=>{ renderRecentEntries(); renderMyEntries(); }, 2000);
   }
   const issues = [];
   if(skippedLocked)     issues.push(skippedLocked+' already submitted');
@@ -3263,32 +3272,47 @@ function submitSingleEntry(id){
   entry.locked = true;
 
   const email = (window._fbProfile && window._fbProfile.email) || '';
-  if(window.FB){
-    if(entry.fsId && window.FB.updateKPIEntry){
-      window.FB.updateKPIEntry(entry.fsId, { entryStatus:'submitted', locked:true, submittedBy:email })
-        .then(()=>showToast('Entry submitted and locked ✓'))
-        .catch(err=>{ console.error(err); showToast('Submit failed: '+err.message); });
-    } else if(window.FB.saveKPIEntry){
-      window.FB.saveKPIEntry({
-        id: null,
-        year:entry.year, month:entry.month, plant:entry.plant, department:entry.dept,
-        kpiId:entry.kpiId, kpiName:k?k.name:'', target:tgt, actual:entry.actual,
-        unit:k?k.unit:'', direction:k?k.dir:'lower',
-        reason:entry.reason||'', actionPlan:entry.action||'',
-        responsiblePerson:entry.resp||'', targetDate:entry.dueDate||'',
-        actionStatus:entry.actionStatus||'', entryStatus:'submitted', locked:true,
-        submittedBy:email
-      }).then(newId=>{
-        if(newId) entry.fsId = newId;
-        showToast('Entry submitted and locked ✓');
-      }).catch(err=>{ console.error(err); showToast('Submit failed: '+err.message); });
-    }
+  if(window.FB && window.FB.saveKPIEntry){
+    const k2 = kpiMaster.find(k2=>String(k2.id)===String(entry.kpiId));
+    window.FB.saveKPIEntry({
+      id:                entry.fsId || null,
+      year:              entry.year,
+      month:             entry.month,
+      plant:             entry.plant,
+      department:        entry.dept,
+      kpiId:             entry.kpiId,
+      kpiName:           k2 ? k2.name : '',
+      target:            tgt,
+      actual:            entry.actual,
+      unit:              k2 ? k2.unit : '',
+      direction:         k2 ? k2.dir : 'lower',
+      reason:            entry.reason       || '',
+      actionPlan:        entry.action       || '',
+      responsiblePerson: entry.resp         || '',
+      targetDate:        entry.dueDate      || '',
+      actionStatus:      entry.actionStatus || '',
+      entryStatus:       'submitted',
+      locked:            true,
+      submittedBy:       email
+    }).then(newId => {
+      if(newId && !entry.fsId) entry.fsId = newId;
+      showToast('Entry submitted and locked ✓');
+      renderRecentEntries();
+      renderMyEntries();
+    }).catch(err => {
+      // Revert local state if Firebase fails
+      entry.entryStatus = 'draft';
+      entry.locked = false;
+      renderRecentEntries();
+      renderMyEntries();
+      console.error('Submit failed:', err);
+      showToast('Submit failed: ' + (err.code || err.message || err) + ' — check Firestore rules', 8000);
+    });
   } else {
     showToast('Entry submitted locally (Firebase not connected)');
+    renderRecentEntries();
+    renderMyEntries();
   }
-
-  renderRecentEntries();
-  renderMyEntries();
 }
 
 
@@ -6059,7 +6083,19 @@ export async function saveKPIEntry(entryData) {
 }
 
 /**
- * Update an existing entry (e.g. close an action plan).
+ * Update an existing entry (e.g. close an action plan, submit, unlock).
+ *
+ * ⚠️  FIRESTORE RULES — Add these to Firebase Console → Firestore → Rules:
+ *
+ *   match /kpiData/{entryId} {
+ *     allow read: if request.auth != null;
+ *     allow create: if request.auth != null;
+ *     allow update: if request.auth != null;   // allow all authenticated users to update
+ *     allow delete: if request.auth != null;
+ *   }
+ *
+ *  If you have stricter rules, at minimum allow the `submittedBy` user OR
+ *  a Super Admin to update `entryStatus` and `locked` fields.
  */
 export async function updateKPIEntry(entryId, updates) {
   await updateDoc(doc(db, "kpiData", entryId), {
