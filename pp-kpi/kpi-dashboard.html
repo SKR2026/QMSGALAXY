@@ -6621,15 +6621,43 @@ async function loadFirebaseData() {
   }
 
   // 2. KPI Entries — initial load
-  // Once Firebase is connected, Firestore is the source of truth for kpiData.
-  // Clear the hardcoded sample/seed array so deleted entries don't reappear
-  // and Firestore data isn't double-counted.
+  // Firestore is the authoritative source. Clear BOTH local arrays so nothing
+  // persists from before login and all data comes fresh from Firestore.
   try {
     kpiData.length = 0;
-    const fsEntries = await getKPIEntries({}); // no filters — need full dataset for charts
-    console.log('Fetched kpiData docs:', fsEntries.length, fsEntries);
+    recentEntries.length = 0; // ← critical: prevents stale local entries surviving across sessions
+    let fsEntries = await getKPIEntries({}); // no filters — need full dataset
+
+    // Deduplicate Firestore entries by business key (kpiId+plant+month+year).
+    // If duplicates exist (caused by old addDoc bug), keep the submitted/locked
+    // one; if both are drafts, keep the most recently updated one.
+    const bizMap = new Map();
+    const toDelete = []; // Firestore IDs of duplicate docs to clean up
+    fsEntries.forEach(fe => {
+      const key = `${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
+      const existing = bizMap.get(key);
+      if (!existing) { bizMap.set(key, fe); return; }
+      const feSubmitted = fe.locked || fe.entryStatus === 'submitted';
+      const exSubmitted = existing.locked || existing.entryStatus === 'submitted';
+      if (feSubmitted && !exSubmitted) { toDelete.push(existing.id); bizMap.set(key, fe); return; }
+      if (!feSubmitted && !exSubmitted) {
+        const feTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
+        const exTs = existing.updatedAt?.toMillis ? existing.updatedAt.toMillis() : 0;
+        if (feTs > exTs) { toDelete.push(existing.id); bizMap.set(key, fe); }
+        else toDelete.push(fe.id);
+      } else if (!feSubmitted && exSubmitted) {
+        toDelete.push(fe.id); // existing submitted wins, delete incoming draft
+      }
+    });
+    fsEntries = [...bizMap.values()];
+
+    // Silently delete duplicate docs from Firestore in background
+    if (toDelete.length && window.FB && window.FB.deleteKPIEntry) {
+      console.log(`Cleaning up ${toDelete.length} duplicate Firestore entries`);
+      toDelete.forEach(id => window.FB.deleteKPIEntry(id).catch(()=>{}));
+    }
+
     mergeFirebaseEntries(fsEntries);
-    console.log('After merge — kpiData:', kpiData.length, 'recentEntries:', recentEntries.length);
     refreshAll();
     renderRecentEntries();
   } catch (err) {
@@ -6686,40 +6714,14 @@ async function loadFirebaseData() {
   }
 }
 
-// Merge Firestore entries into local kpiData array (avoid duplicates)
+// Merge Firestore entries into local arrays — single source of truth.
+// Deduplication: first by fsId (Firestore doc ID), then by business key (kpiId+plant+month+year).
+// A submitted/locked entry always wins over a draft for the same business key.
 function mergeFirebaseEntries(fsEntries) {
   fsEntries.forEach(fe => {
-    // Entries created via the Entry form carry entryStatus (draft/submitted).
-    // Keep those in recentEntries so they show in "Recent entries" and remain
-    // editable; everything else (legacy/seed-style docs) goes into kpiData.
-    if (fe.entryStatus) {
-      const mapped = {
-        id:           fe.id,
-        fsId:         fe.id,
-        year:         fe.year,
-        month:        fe.month,
-        plant:        fe.plant,
-        dept:         fe.department,
-        kpiId:        fe.kpiId,
-        target:       fe.target,
-        actual:       fe.actual,
-        reason:       fe.reason        || '',
-        action:       fe.actionPlan    || '',
-        resp:         fe.responsiblePerson || '',
-        dueDate:      fe.targetDate    || '',
-        actionStatus: fe.actionStatus  || null,
-        entryStatus:  fe.entryStatus,
-        locked:       !!fe.locked
-      };
-      const exists = recentEntries.findIndex(d => String(d.fsId||d.id) === String(fe.id));
-      if (exists >= 0) recentEntries[exists] = mapped;
-      else recentEntries.push(mapped);
-      return;
-    }
-
-    const exists = kpiData.findIndex(d => d.id === fe.id);
     const mapped = {
-      id:           fe.id,
+      id:           fe.id,           // Firestore doc id used as local id too
+      fsId:         fe.id,           // explicit Firestore ref for updates/deletes
       year:         fe.year,
       month:        fe.month,
       plant:        fe.plant,
@@ -6727,14 +6729,53 @@ function mergeFirebaseEntries(fsEntries) {
       kpiId:        fe.kpiId,
       target:       fe.target,
       actual:       fe.actual,
-      reason:       fe.reason        || '',
-      action:       fe.actionPlan    || '',
-      resp:         fe.responsiblePerson || '',
-      dueDate:      fe.targetDate    || '',
-      actionStatus: fe.actionStatus  || null
+      reason:       fe.reason           || '',
+      action:       fe.actionPlan       || '',
+      resp:         fe.responsiblePerson|| '',
+      dueDate:      fe.targetDate       || '',
+      actionStatus: fe.actionStatus     || null,
+      entryStatus:  fe.entryStatus      || 'draft',
+      locked:       !!fe.locked
     };
-    if (exists >= 0) kpiData[exists] = mapped;
-    else kpiData.push(mapped);
+
+    // 1. Check if already in recentEntries by fsId — update in place
+    const byFsId = recentEntries.findIndex(d => String(d.fsId) === String(fe.id));
+    if (byFsId >= 0) {
+      // If incoming is submitted/locked, always overwrite regardless of local state
+      if(fe.locked || fe.entryStatus==='submitted' || !recentEntries[byFsId].locked) {
+        recentEntries[byFsId] = mapped;
+      }
+      return;
+    }
+
+    // 2. Check for business-key duplicate (same KPI+plant+month+year)
+    const bizKey = d =>
+      String(d.kpiId)   === String(fe.kpiId) &&
+      String(d.plant).trim().toLowerCase() === String(fe.plant||'').trim().toLowerCase() &&
+      String(d.month).trim().toLowerCase() === String(fe.month||'').trim().toLowerCase() &&
+      String(d.year)    === String(fe.year);
+
+    const byBizKey = recentEntries.findIndex(bizKey);
+    if (byBizKey >= 0) {
+      const existing = recentEntries[byBizKey];
+      // Submitted/locked wins; if same status, latest updatedAt wins
+      const incomingLocked = fe.locked || fe.entryStatus === 'submitted';
+      const existingLocked = existing.locked || existing.entryStatus === 'submitted';
+      if (incomingLocked && !existingLocked) {
+        recentEntries[byBizKey] = mapped; // submitted overwrites draft
+      } else if (!incomingLocked && !existingLocked) {
+        // Both drafts — keep newer one (Firestore updatedAt)
+        const inTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
+        const exTs = existing._updatedAt || 0;
+        if (inTs >= exTs) { mapped._updatedAt = inTs; recentEntries[byBizKey] = mapped; }
+      }
+      // If existing is submitted and incoming is draft, keep existing — do nothing
+      return;
+    }
+
+    // 3. No match — add as new entry
+    mapped._updatedAt = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
+    recentEntries.push(mapped);
   });
 }
 
