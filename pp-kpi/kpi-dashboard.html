@@ -1597,23 +1597,37 @@ function kpiTargetFor(k, plant, year, month){
 function resolveTarget(k, year, month, plant){
   if(!k) return 0;
 
-  // Convert any calendar year + month back to the FY start year.
-  // In Apr-Mar mode, Jan/Feb/Mar of calYear N belong to FY start year N-1.
+  // Convert calendar year + month back to the FY start year key
+  // In Apr-Mar mode, Jan/Feb/Mar of calYear N belong to FY start year N-1
   let fyStartYear = parseInt(year || filterState.year || new Date().getFullYear());
   if(appSettings.fyMode === 'apr' && month && ['January','February','March'].includes(month)){
     fyStartYear = fyStartYear - 1;
   }
-  const y = String(fyStartYear);
-  const m = month || null;
-  const p = plant || null;
+  const y  = String(fyStartYear);
+  const m  = month || null;
+  const p  = plant || null;
+
+  // Helper: look up a map that may have string OR numeric keys (Firestore quirk)
+  function mapGet(obj, key){
+    if(!obj) return undefined;
+    if(obj[key] != null) return obj[key];
+    // try numeric key
+    const numKey = parseInt(key);
+    if(!isNaN(numKey) && obj[numKey] != null) return obj[numKey];
+    return undefined;
+  }
 
   // 1. Month-wise target for this FY year + month
-  if(m && k.monthTargets && k.monthTargets[y] && k.monthTargets[y][m] != null)
-    return k.monthTargets[y][m];
+  if(m && k.monthTargets){
+    const yearMap = mapGet(k.monthTargets, y);
+    if(yearMap && yearMap[m] != null) return yearMap[m];
+  }
 
   // 2. Year-wise target (keyed by FY start year)
-  if(k.yearTargets && k.yearTargets[y] != null)
-    return k.yearTargets[y];
+  if(k.yearTargets){
+    const yt = mapGet(k.yearTargets, y);
+    if(yt != null) return yt;
+  }
 
   // 3. Plant-specific override
   if(p && p !== 'All'){
@@ -2054,6 +2068,7 @@ function refreshAll() {
   refreshMetrics();
   refreshKPITable();
   rebuildCharts();
+  updateTrendChart(); // refresh mini trend chart with latest monthly targets
   const trendsPage = document.getElementById('page-trends');
   if (trendsPage && trendsPage.classList.contains('active')) renderTrendPage();
   const actionsPage = document.getElementById('page-action-plans');
@@ -2098,11 +2113,7 @@ function refreshMetrics() {
   document.getElementById('m-best').textContent = bestPlant==='—' ? '—' : bestPlant+' — '+bestPct+'%';
   document.getElementById('m-best-sub').textContent = filterState.month !== 'All' ? filterState.month+' '+fmtYear(filterState.year) : fmtYear(filterState.year);
 
-  const today = new Date().toISOString().slice(0,10);
-  const overdue = [...kpiData, ...recentEntries].filter(d =>
-    d.action && d.dueDate && d.dueDate < today &&
-    d.actionStatus !== 'closed' && d.actionStatus !== 'completed'
-  ).length;
+  const overdue = [...kpiData, ...recentEntries].filter(isOverdue).length;
   const overdueEl = document.getElementById('m-overdue');
   if(overdueEl) overdueEl.textContent = overdue;
 }
@@ -2666,6 +2677,22 @@ function clearActionFocus() {
   renderActionPlans(currentActionFilter);
 }
 let currentActionFilter = 'all';
+// Parse any dueDate value (Firestore Timestamp, JS Date, or string) → "YYYY-MM-DD" string
+function parseDueDate(v){
+  if(!v) return '';
+  if(typeof v === 'object' && typeof v.toDate === 'function') return v.toDate().toISOString().slice(0,10);
+  if(v instanceof Date) return v.toISOString().slice(0,10);
+  return String(v).slice(0,10);
+}
+
+// Is an entry's action plan currently overdue?
+function isOverdue(d){
+  if(!d.action || !d.dueDate) return false;
+  if(d.actionStatus === 'closed' || d.actionStatus === 'completed') return false;
+  const due = parseDueDate(d.dueDate);
+  return due && due < new Date().toISOString().slice(0,10);
+}
+
 function renderActionPlans(filter) {
   currentActionFilter = filter;
   let actions=[...kpiData,...recentEntries].filter(d=>d.reason&&d.action);
@@ -2684,7 +2711,10 @@ function renderActionPlans(filter) {
     if (actionFocus.kpiId!=null) actions = actions.filter(d=>String(d.kpiId)===String(actionFocus.kpiId));
     if (actionFocus.month)  actions = actions.filter(d=>d.month===actionFocus.month);
   }
-  const filtered=filter==='all'?actions:actions.filter(d=>d.actionStatus===filter);
+  const filtered = filter==='all'  ? actions
+    : filter==='overdue'             ? actions.filter(d=>isOverdue(d))
+    : filter==='closed'              ? actions.filter(d=>d.actionStatus==='closed'||d.actionStatus==='completed')
+    : actions.filter(d=>d.actionStatus===filter);
   const list=document.getElementById('actionList');
 
   const chip = actionFocus
@@ -2697,12 +2727,19 @@ function renderActionPlans(filter) {
   if(!filtered.length){list.innerHTML=chip+'<div style="text-align:center;color:var(--text3);padding:32px;font-size:13px;">No action plans match this filter.</div>';return;}
   list.innerHTML=chip+filtered.map(d=>{
     const k=kpiMaster.find(k=>String(k.id)===String(d.kpiId));
-    const badge=d.actionStatus==='overdue'?'<span class="badge badge-red">Overdue</span>':d.actionStatus==='in-progress'?'<span class="badge badge-amber">In progress</span>':'<span class="badge badge-green">Closed</span>';
+    // Determine effective status — auto-detect overdue from dueDate if not explicitly closed
+    const effectiveStatus = (d.actionStatus==='closed'||d.actionStatus==='completed') ? 'closed'
+      : isOverdue(d) ? 'overdue'
+      : (d.actionStatus||'in-progress');
+    const badge = effectiveStatus==='overdue'   ? '<span class="badge badge-red">Overdue</span>'
+                : effectiveStatus==='in-progress'? '<span class="badge badge-amber">In progress</span>'
+                : '<span class="badge badge-green">Closed</span>';
+    const dueDateStr = parseDueDate(d.dueDate) || '—';
     return `<div class="action-item">
       <div>
-        <div style="font-size:13px;font-weight:500;color:${d.actionStatus==='overdue'?'var(--red)':'var(--text)'};margin-bottom:3px">${k?k.name:'KPI'} — ${d.plant} / ${d.dept} <span style="font-size:11px;color:var(--text3);font-weight:400">${d.month} ${d.year}</span></div>
+        <div style="font-size:13px;font-weight:500;color:${effectiveStatus==='overdue'?'var(--red)':'var(--text)'};margin-bottom:3px">${k?k.name:'KPI'} — ${d.plant} / ${d.dept} <span style="font-size:11px;color:var(--text3);font-weight:400">${d.month} ${d.year}</span></div>
         <div style="font-size:12px;color:var(--text2);margin-bottom:6px">${d.action}</div>
-        <div style="font-size:11px;color:var(--text3);display:flex;gap:14px"><span>👤 ${d.resp||'—'}</span><span>📅 ${d.dueDate||'—'}</span></div>
+        <div style="font-size:11px;color:var(--text3);display:flex;gap:14px"><span>👤 ${d.resp||'—'}</span><span>📅 ${dueDateStr}</span></div>
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px">
         ${badge}
