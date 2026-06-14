@@ -1575,26 +1575,40 @@ function kpiApplicable(k, plant){
   return !(o && o.applicable === false);
 }
 function kpiTargetFor(k, plant, year, month){
-  // Priority: month target > year target > plant override > base target
-  const y = String(year || filterState.year || '');
-  const m = month || null;
+  return resolveTarget(k, year, month, plant);
+}
 
-  // 1. Month-wise target (year+month specific)
-  if(m && k.monthTargets && k.monthTargets[y] && k.monthTargets[y][m] != null)
+// Canonical target resolver — used everywhere targets appear in charts/metrics
+// Priority: month-wise > year-wise > plant override > base
+function resolveTarget(k, year, month, plant){
+  if(!k) return 0;
+  const y = String(year  || filterState.year || '');
+  const m = month || null;
+  const p = plant || null;
+
+  // 1. Month-wise target for this year+month
+  if(m && y && k.monthTargets && k.monthTargets[y] && k.monthTargets[y][m] != null)
     return k.monthTargets[y][m];
 
   // 2. Year-wise target
   if(y && k.yearTargets && k.yearTargets[y] != null)
     return k.yearTargets[y];
 
-  // 3. Plant-specific target override
-  if(plant && plant !== 'All'){
-    const o = k.plantOverrides && k.plantOverrides[plant];
+  // 3. Plant-specific override
+  if(p && p !== 'All'){
+    const o = k.plantOverrides && k.plantOverrides[p];
     if(o && o.target != null) return o.target;
   }
 
   // 4. Base target
   return k.target;
+}
+
+// For a stored entry d, get the live resolved target (ignores d.target which may be stale)
+function liveTarget(d){
+  const k = kpiMaster.find(k=>String(k.id)===String(d.kpiId));
+  if(!k) return d.target;
+  return resolveTarget(k, d.year, d.month, d.plant);
 }
 function badgeFor(status) {
   if (status==='achieved') return '<span class="badge badge-green"><span class="dot"></span>Achieved</span>';
@@ -2029,8 +2043,9 @@ function refreshMetrics() {
   data.forEach(d => {
     const k = kpiMaster.find(k=>String(k.id)===String(d.kpiId));
     if(!k) return;
-    const pct = calcAch(d.actual, d.target, k.dir);
-    const s = statusOf(pct, d.actual, d.target, k.dir);
+    const tgt = liveTarget(d);
+    const pct = calcAch(d.actual, tgt, k.dir);
+    const s = statusOf(pct, d.actual, tgt, k.dir);
     if(s==='achieved') ach++;
     else if(s==='missed') missed++;
     else if(s==='near-miss') near++;
@@ -2045,8 +2060,9 @@ function refreshMetrics() {
   const plantScores = {};
   data.forEach(d => {
     const k = kpiMaster.find(k=>String(k.id)===String(d.kpiId)); if(!k) return;
-    const pct = calcAch(d.actual,d.target,k.dir);
-    const s = statusOf(pct,d.actual,d.target,k.dir);
+    const tgt = liveTarget(d);
+    const pct = calcAch(d.actual,tgt,k.dir);
+    const s = statusOf(pct,d.actual,tgt,k.dir);
     if(!plantScores[d.plant]) plantScores[d.plant]={ach:0,total:0};
     if(s==='achieved') plantScores[d.plant].ach++;
     plantScores[d.plant].total++;
@@ -2056,7 +2072,6 @@ function refreshMetrics() {
   document.getElementById('m-best').textContent = bestPlant==='—' ? '—' : bestPlant+' — '+bestPct+'%';
   document.getElementById('m-best-sub').textContent = filterState.month !== 'All' ? filterState.month+' '+fmtYear(filterState.year) : fmtYear(filterState.year);
 
-  // Overdue actions: open action plans whose due date has passed (across all data, not just the current filter)
   const today = new Date().toISOString().slice(0,10);
   const overdue = [...kpiData, ...recentEntries].filter(d =>
     d.action && d.dueDate && d.dueDate < today &&
@@ -2072,12 +2087,13 @@ function refreshKPITable() {
   if (!data.length) { body.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:24px;">No data for selected filters</td></tr>'; return; }
   body.innerHTML = data.map(d => {
     const k = kpiMaster.find(k=>String(k.id)===String(d.kpiId)); if(!k) return '';
-    const pct = calcAch(d.actual,d.target,k.dir);
-    const s = statusOf(pct,d.actual,d.target,k.dir);
+    const tgt = liveTarget(d);
+    const pct = calcAch(d.actual,tgt,k.dir);
+    const s = statusOf(pct,d.actual,tgt,k.dir);
     const bp = Math.min(100,pct||0);
     return `<tr>
       <td style="font-weight:500">${k.name}</td><td>${d.plant}</td><td>${d.dept}</td>
-      <td style="color:var(--text3)">${d.target} ${k.unit}</td>
+      <td style="color:var(--text3)">${tgt} ${k.unit}</td>
       <td>${d.actual} ${k.unit}</td>
       <td><div class="progress-wrap"><div class="progress-bg"><div class="progress-fill" style="width:${bp}%;background:${colorFor(s)}"></div></div><span style="font-size:11px;color:var(--text3)">${pct!==null?pct+'%':'—'}</span></div></td>
       <td>${badgeFor(s)}</td>
@@ -2092,7 +2108,8 @@ function rebuildCharts() {
   const ps = {};
   data.forEach(d=>{
     const k=kpiMaster.find(k=>String(k.id)===String(d.kpiId));if(!k)return;
-    const pct=calcAch(d.actual,d.target,k.dir),s=statusOf(pct,d.actual,d.target,k.dir);
+    const tgt=liveTarget(d);
+    const pct=calcAch(d.actual,tgt,k.dir),s=statusOf(pct,d.actual,tgt,k.dir);
     if(!ps[d.plant])ps[d.plant]={ach:0,total:0};
     if(s==='achieved')ps[d.plant].ach++;
     ps[d.plant].total++;
@@ -2104,7 +2121,7 @@ function rebuildCharts() {
 
   // Donut
   let a=0,m=0,n=0;
-  data.forEach(d=>{const k=kpiMaster.find(k=>String(k.id)===String(d.kpiId));if(!k)return;const pct=calcAch(d.actual,d.target,k.dir),s=statusOf(pct,d.actual,d.target,k.dir);if(s==='achieved')a++;else if(s==='missed')m++;else if(s==='near-miss')n++;});
+  data.forEach(d=>{const k=kpiMaster.find(k=>String(k.id)===String(d.kpiId));if(!k)return;const tgt=liveTarget(d);const pct=calcAch(d.actual,tgt,k.dir),s=statusOf(pct,d.actual,tgt,k.dir);if(s==='achieved')a++;else if(s==='missed')m++;else if(s==='near-miss')n++;});
   if(charts.donut){charts.donut.data.datasets[0].data=[a,m,n];charts.donut.update();}
   document.getElementById('donutLegend').innerHTML=`
     <div><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--green-mid);margin-right:6px"></span><span style="color:var(--text3)">Achieved</span><div style="font-size:20px;font-weight:600;color:var(--green);margin-left:16px">${a}</div></div>
@@ -2125,7 +2142,7 @@ function rebuildCharts() {
   const radarVals=depts.map(dep=>{
     const dd=all.filter(d=>d.dept===dep);
     if(!dd.length)return 0;
-    let a=0;dd.forEach(d=>{const k=kpiMaster.find(k=>String(k.id)===String(d.kpiId));if(!k)return;const pct=calcAch(d.actual,d.target,k.dir),s=statusOf(pct,d.actual,d.target,k.dir);if(s==='achieved')a++;});
+    let a=0;dd.forEach(d=>{const k=kpiMaster.find(k=>String(k.id)===String(d.kpiId));if(!k)return;const tgt=liveTarget(d);const pct=calcAch(d.actual,tgt,k.dir),s=statusOf(pct,d.actual,tgt,k.dir);if(s==='achieved')a++;});
     return Math.round(a/dd.length*100);
   });
   if(charts.radar){charts.radar.data.labels=depts;charts.radar.data.datasets[0].data=radarVals;charts.radar.update();}
@@ -2152,21 +2169,26 @@ function updateTrendChart() {
     (filterState.plant==='All' || d.plant===filterState.plant)
   );
   // Each month queries its own calendar year
+  // Each month queries its own calendar year and resolved target
   const monthlyAvg = fyPairs.map(({month: mon, year: dataYear})=>{
     const pts = allEntries.filter(d=>String(d.year)===String(dataYear)&&d.month===mon);
     return aggregateMonthlyValues(pts, k.unit);
   });
-  const barColors = monthlyAvg.map(v=>{
+  const monthlyTargets = fyPairs.map(({month: mon, year: dataYear})=>
+    resolveTarget(k, dataYear, mon, filterState.plant==='All'?null:filterState.plant)
+  );
+  const barColors = monthlyAvg.map((v,i)=>{
     if(v===null) return 'rgba(0,0,0,0.08)';
-    const pct=calcAch(v,k.target,k.dir);
-    return colorFor(statusOf(pct,v,k.target,k.dir));
+    const tgt = monthlyTargets[i];
+    const pct=calcAch(v,tgt,k.dir);
+    return colorFor(statusOf(pct,v,tgt,k.dir));
   });
   if(charts.trend){
     charts.trend.data.labels = fyMonthsShort;
     charts.trend.data.datasets[0].data=monthlyAvg;
     charts.trend.data.datasets[0].label=(k.unit==='%'||k.unit==='PPM'?'Avg Actual ':'Total Actual ')+k.unit;
     charts.trend.data.datasets[0].backgroundColor=barColors;
-    charts.trend.data.datasets[1].data=fyMonthsShort.map(()=>k.target);
+    charts.trend.data.datasets[1].data=monthlyTargets;
     charts.trend.update();
   }
 }
@@ -2281,6 +2303,11 @@ function renderTrendPage() {
       });
     });
 
+    // Per-month resolved targets for the target line (varies by year+month+plant)
+    const resolvedMonthTargets = fyPairs.map(({month: mon, year: dataYear})=>
+      resolveTarget(k, dataYear, mon, filterState.plant==='All' ? null : filterState.plant)
+    );
+
     // latest month = last month in FY order that has data (across correct years)
     const allPts = [...kpiData,...recentEntries].filter(d=>
       fyPairs.some(p=>String(d.year)===String(p.year)&&d.month===p.month) &&
@@ -2292,7 +2319,7 @@ function renderTrendPage() {
     const statYear  = lastFYPairWithData ? lastFYPairWithData.year : parseInt(year);
     const latestPts = allPts.filter(d=>d.month===statMonth&&String(d.year)===String(statYear));
     const latestAvg = latestPts.length ? Math.round(latestPts.reduce((s,d)=>s+d.actual,0)/latestPts.length*10)/10 : null;
-    const displayTarget = (filterState.plant!=='All') ? kpiTargetFor(k, filterState.plant) : k.target;
+    const displayTarget = resolveTarget(k, statYear, statMonth, filterState.plant==='All' ? null : filterState.plant);
     const notApplicable = (filterState.plant!=='All') && !kpiApplicable(k, filterState.plant);
     const latestPct = latestAvg!==null ? calcAch(latestAvg,displayTarget,k.dir) : null;
     const latestStatus = latestPct!==null ? statusOf(latestPct,latestAvg,displayTarget,k.dir) : 'pending';
@@ -2335,7 +2362,7 @@ function renderTrendPage() {
       borderRadius:4,borderSkipped:false,
       datalabels:{anchor:'end',align:'top',font:{size:9,weight:'600'},color:'#5f5e5a',display:true}
     }));
-    datasets.push({label:'Target',data:fyMonthsShort.map(()=>displayTarget),type:'line',borderColor:'rgba(0,0,0,0.35)',borderDash:[5,4],pointRadius:0,borderWidth:1.5,tension:0,spanGaps:true,datalabels:{display:false}});
+    datasets.push({label:'Target',data:resolvedMonthTargets,type:'line',borderColor:'rgba(0,0,0,0.35)',borderDash:[5,4],pointRadius:0,borderWidth:1.5,tension:0,spanGaps:true,datalabels:{display:false}});
 
     const ctx = document.getElementById(canvasId);
     trendCharts[canvasId] = new Chart(ctx, {
@@ -2428,13 +2455,17 @@ function renderCumulativeTrends() {
     const hasAnyData = monthlyAvg.some(v => v !== null);
     if (!hasAnyData) return;
 
-    const displayTarget = k.target;
-    const lastVal = [...monthlyAvg].reverse().find(v => v !== null);
-    const lastPct = lastVal !== null && lastVal !== undefined ? calcAch(lastVal, displayTarget, k.dir) : null;
-    const lastStatus = lastPct !== null ? statusOf(lastPct, lastVal, displayTarget, k.dir) : 'pending';
+    // Per-month resolved targets (vary by year+month)
+    const monthlyTargets = fyPairs.map(({month: mon, year: dataYear})=>
+      resolveTarget(k, dataYear, mon, filterState.plant==='All' ? null : filterState.plant)
+    );
 
-    // Latest month label in FY order
+    // displayTarget = resolved target for the latest non-null month
     const statMonthIdx = monthlyAvg.reduceRight((found, v, i) => found === -1 && v !== null ? i : found, -1);
+    const displayTarget = statMonthIdx >= 0 ? monthlyTargets[statMonthIdx] : resolveTarget(k, year, null, null);
+    const lastVal   = statMonthIdx >= 0 ? monthlyAvg[statMonthIdx] : null;
+    const lastPct   = lastVal !== null ? calcAch(lastVal, displayTarget, k.dir) : null;
+    const lastStatus = lastPct !== null ? statusOf(lastPct, lastVal, displayTarget, k.dir) : 'pending';
     const statMonthLabel = statMonthIdx >= 0 ? fyMonths[statMonthIdx].slice(0, 3) : '—';
 
     const canvasId = 'cumCanvas_' + k.id;
@@ -2461,10 +2492,11 @@ function renderCumulativeTrends() {
     `;
     grid.appendChild(card);
 
-    const barColors = monthlyAvg.map(v => {
+    const barColors = monthlyAvg.map((v, i) => {
       if (v === null) return 'rgba(0,0,0,0.08)';
-      const pct = calcAch(v, displayTarget, k.dir);
-      const st  = statusOf(pct, v, displayTarget, k.dir);
+      const tgt = monthlyTargets[i];
+      const pct = calcAch(v, tgt, k.dir);
+      const st  = statusOf(pct, v, tgt, k.dir);
       return colorFor(st);
     });
 
@@ -2490,7 +2522,7 @@ function renderCumulativeTrends() {
           },
           {
             label: 'Target',
-            data: fyMonthsShort.map(() => displayTarget),
+            data: monthlyTargets,
             type: 'line',
             borderColor: 'rgba(0,0,0,0.35)',
             borderDash: [5, 4],
@@ -2592,13 +2624,14 @@ function filterActions(f,btn){
 function showKPIDetail(id) {
   const d=[...kpiData,...recentEntries].find(x=>x.id===id);if(!d)return;
   const k=kpiMaster.find(k=>String(k.id)===String(d.kpiId));
-  const pct=calcAch(d.actual,d.target,k?k.dir:'lower');
-  const s=statusOf(pct,d.actual,d.target,k?k.dir:'lower');
+  const tgt=liveTarget(d);
+  const pct=calcAch(d.actual,tgt,k?k.dir:'lower');
+  const s=statusOf(pct,d.actual,tgt,k?k.dir:'lower');
   document.getElementById('modalTitle').textContent=(k?k.name:'KPI')+' — '+d.plant+' / '+d.dept+' ('+d.month+')';
   const hasGap=d.reason||d.action;
   document.getElementById('modalBody').innerHTML=`
     <div class="kpi-detail-grid">
-      <div class="kd-box"><div class="kd-label">Target</div><div class="kd-value" style="color:var(--text2)">${d.target}<span style="font-size:12px;font-weight:400"> ${k?k.unit:''}</span></div></div>
+      <div class="kd-box"><div class="kd-label">Target</div><div class="kd-value" style="color:var(--text2)">${tgt}<span style="font-size:12px;font-weight:400"> ${k?k.unit:''}</span></div></div>
       <div class="kd-box"><div class="kd-label">Actual</div><div class="kd-value" style="color:${colorFor(s)}">${d.actual}<span style="font-size:12px;font-weight:400"> ${k?k.unit:''}</span></div></div>
       <div class="kd-box"><div class="kd-label">Achievement</div><div class="kd-value" style="color:${colorFor(s)}">${pct!==null?pct+'%':'—'}</div></div>
     </div>
@@ -2900,8 +2933,9 @@ function renderMyEntries(){
   const isSuperAdmin = window._roleInfo && window._roleInfo.isSuperAdmin;
   body.innerHTML = rows.map(d=>{
     const k = kpiMaster.find(k=>String(k.id)===String(d.kpiId));
-    const pct = calcAch(d.actual,d.target,k?k.dir:'lower');
-    const s = statusOf(pct,d.actual,d.target,k?k.dir:'lower');
+    const tgt = liveTarget(d);
+    const pct = calcAch(d.actual,tgt,k?k.dir:'lower');
+    const s = statusOf(pct,d.actual,tgt,k?k.dir:'lower');
     let entryCell;
     if(d.entryStatus==='submitted' || d.locked){
       entryCell = '<span class="badge badge-blue">🔒 Submitted</span>';
@@ -3021,8 +3055,9 @@ function renderRecentEntries(){
   const isSuperAdmin = window._roleInfo && window._roleInfo.isSuperAdmin;
   body.innerHTML=visibleEntries.map(d=>{
     const k=kpiMaster.find(k=>String(k.id)===String(d.kpiId));
-    const pct=calcAch(d.actual,d.target,k?k.dir:'lower');
-    const s=statusOf(pct,d.actual,d.target,k?k.dir:'lower');
+    const tgt=liveTarget(d);
+    const pct=calcAch(d.actual,tgt,k?k.dir:'lower');
+    const s=statusOf(pct,d.actual,tgt,k?k.dir:'lower');
     let entryCell;
     if(d.entryStatus==='submitted' || d.locked){
       entryCell = '<span class="badge badge-blue">🔒 Submitted</span>';
