@@ -2044,14 +2044,9 @@ function navigate(page, el) {
   if (page === 'dashboard') renderCumulativeTrends();
   if (page === 'kpi-matrix') initMatrixPage();
   if (page === 'entry'){
-    // Restore last-entry context so all dropdowns pre-fill
-    setTimeout(()=>{
-      _restoreEntryContext();
-      // If context was restored, show the reminder banner
-      try {
-        if(localStorage.getItem('kpiEntryContext')) _showStickyBanner();
-      } catch(e){}
-    }, 0);
+    // Restore last-entry context so all dropdowns pre-fill.
+    // _restoreEntryContext retries internally until reference data is loaded.
+    setTimeout(()=>_restoreEntryContext(), 50);
   }
 }
 
@@ -3028,54 +3023,59 @@ function _saveEntryContext(){
   } catch(e){}
 }
 // Restore the last-saved context into the entry form cascade.
-// Must be called AFTER the page is visible and deptList/kpiMaster are loaded.
-// The cascade: Plant → updateDepts() rebuilds entryDept → updateKPIs() rebuilds entryKPI
-// So we must set Dept AFTER updateDepts, and KPI AFTER updateKPIs.
-function _restoreEntryContext(){
+// Retries until plantsList/deptList/kpiMaster are loaded (they arrive async from Firebase).
+function _restoreEntryContext(attempt){
+  attempt = attempt || 0;
   try {
     const raw = localStorage.getItem('kpiEntryContext');
     if(!raw) return;
     const ctx = JSON.parse(raw);
 
+    // If reference data isn't loaded yet, retry shortly (up to ~3s)
+    const dataReady = (Array.isArray(plantsList) && plantsList.length)
+                   && (Array.isArray(deptList) && deptList.length)
+                   && (Array.isArray(kpiMaster) && kpiMaster.length);
+    if(!dataReady && attempt < 30){
+      setTimeout(()=>_restoreEntryContext(attempt+1), 100);
+      return;
+    }
+
     // Step 1 — Year & Month (simple selects, no cascade)
     if(ctx.year){
       const el = document.getElementById('entryYear');
-      if(el) el.value = ctx.year;
+      if(el && [...el.options].some(o=>o.value===String(ctx.year))) el.value = ctx.year;
     }
     if(ctx.month){
       const el = document.getElementById('entryMonth');
-      if(el) el.value = ctx.month;
+      if(el && [...el.options].some(o=>o.value===ctx.month)) el.value = ctx.month;
     }
 
-    // Step 2 — Plant: set value, then call updateDepts() which rebuilds entryDept
-    if(ctx.plant){
-      const el = document.getElementById('entryPlant');
-      if(el) el.value = ctx.plant;
+    // Step 2 — Plant. Make sure the plant dropdown is populated first.
+    if(typeof refreshPlantSelectors === 'function') refreshPlantSelectors();
+    const plantEl = document.getElementById('entryPlant');
+    if(ctx.plant && plantEl && !plantEl.disabled){
+      if([...plantEl.options].some(o=>o.value===ctx.plant)) plantEl.value = ctx.plant;
     }
-    // updateDepts() calls refreshDeptSelectors() (rebuilds entryDept, preserving cur)
-    // then updateKPIs() (rebuilds entryKPI dropdown, clears target/unit).
-    // We call it manually so the dept dropdown is populated before we set dept.
+
+    // Step 3 — Dept: rebuild dept options (depends on plant), then set value
     if(typeof refreshDeptSelectors === 'function') refreshDeptSelectors();
-
-    // Step 3 — Dept: set AFTER refreshDeptSelectors rebuilt the options
-    if(ctx.dept){
-      const el = document.getElementById('entryDept');
-      if(el && [...el.options].some(o => o.value === ctx.dept)){
-        el.value = ctx.dept;
-      }
+    const deptEl = document.getElementById('entryDept');
+    if(ctx.dept && deptEl){
+      if([...deptEl.options].some(o => o.value === ctx.dept)) deptEl.value = ctx.dept;
     }
 
-    // Step 4 — KPI: rebuild entryKPI options for this dept/plant, then set value
-    if(typeof updateKPIs === 'function') updateKPIs(true); // silent=true: don't clear target/unit
-    if(ctx.kpi){
-      const el = document.getElementById('entryKPI');
-      if(el && [...el.options].some(o => String(o.value) === String(ctx.kpi))){
-        el.value = ctx.kpi;
-      }
+    // Step 4 — KPI: rebuild KPI options for this dept/plant, then set value
+    if(typeof updateKPIs === 'function') updateKPIs(true); // silent: don't wipe target/unit
+    const kpiEl = document.getElementById('entryKPI');
+    if(ctx.kpi && kpiEl){
+      if([...kpiEl.options].some(o => String(o.value) === String(ctx.kpi))) kpiEl.value = ctx.kpi;
     }
 
     // Step 5 — Load target/unit for the restored KPI
     if(typeof loadKPITarget === 'function') loadKPITarget();
+
+    // Refresh the banner so it shows the restored context
+    if(typeof _showStickyBanner === 'function') _showStickyBanner();
 
   } catch(e){ console.warn('_restoreEntryContext error', e); }
 }
