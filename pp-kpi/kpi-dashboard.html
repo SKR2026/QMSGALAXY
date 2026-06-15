@@ -2351,26 +2351,32 @@ function persistKPISeq(k){
 }
 
 // ── KPI Trend: multi-plant comparison ────────────────────────────────────
-// Empty array = follow the global plant filter (default behaviour).
-// Otherwise, these are the specific plants to compare side-by-side.
-let selectedTrendPlants = [];
+// selectedTrendPlants holds the EXACT set of plants currently shown.
+// null = not yet initialised → defaults to all plants on first build.
+let selectedTrendPlants = null;
+
+function _trendPlantNames(){ return plantsList.map(p=>p.name); }
+function _ensureTrendPlantsInit(){
+  const names = _trendPlantNames();
+  if(selectedTrendPlants === null){ selectedTrendPlants = names.slice(); } // default: all
+  selectedTrendPlants = selectedTrendPlants.filter(p=>names.includes(p));   // prune stale
+}
 
 function buildTrendPlantMenu(){
   const menu = document.getElementById('trendPlantMenu');
   if(!menu) return;
-  const names = plantsList.map(p=>p.name);
-  // Drop any stale selections no longer in the plant list
-  selectedTrendPlants = selectedTrendPlants.filter(p=>names.includes(p));
-  const allChecked = selectedTrendPlants.length===0 || selectedTrendPlants.length===names.length;
+  _ensureTrendPlantsInit();
+  const names = _trendPlantNames();
+  const allChecked = selectedTrendPlants.length===names.length;
   let html = `
     <label style="display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:var(--r-sm);cursor:pointer;font-size:12px;font-weight:600;border-bottom:0.5px solid var(--border)">
       <input type="checkbox" id="trendPlantAll" ${allChecked?'checked':''} onchange="onTrendPlantAll(this.checked)" style="cursor:pointer">
       All plants
     </label>`;
   html += names.map(name=>{
-    const checked = allChecked || selectedTrendPlants.includes(name);
+    const checked = selectedTrendPlants.includes(name);
     return `<label style="display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:var(--r-sm);cursor:pointer;font-size:12px">
-      <input type="checkbox" class="trendPlantChk" value="${name}" ${checked?'checked':''} onchange="onTrendPlantChange()" style="cursor:pointer">
+      <input type="checkbox" class="trendPlantChk" value="${name}" ${checked?'checked':''} onchange="onTrendPlantChange(this)" style="cursor:pointer">
       ${name}
     </label>`;
   }).join('');
@@ -2381,16 +2387,13 @@ function buildTrendPlantMenu(){
 function updateTrendPlantLabel(){
   const lbl = document.getElementById('trendPlantLabel');
   if(!lbl) return;
-  const names = plantsList.map(p=>p.name);
-  if(selectedTrendPlants.length===0 || selectedTrendPlants.length===names.length){
-    lbl.textContent = 'All plants';
-  } else if(selectedTrendPlants.length===1){
-    lbl.textContent = selectedTrendPlants[0];
-  } else if(selectedTrendPlants.length===2){
-    lbl.textContent = selectedTrendPlants.join(', ');
-  } else {
-    lbl.textContent = selectedTrendPlants.length + ' plants';
-  }
+  const names = _trendPlantNames();
+  const n = selectedTrendPlants ? selectedTrendPlants.length : 0;
+  if(n===0) lbl.textContent = 'No plants';
+  else if(n===names.length) lbl.textContent = 'All plants';
+  else if(n===1) lbl.textContent = selectedTrendPlants[0];
+  else if(n===2) lbl.textContent = selectedTrendPlants.join(', ');
+  else lbl.textContent = n + ' plants';
 }
 
 function toggleTrendPlantMenu(e){
@@ -2405,22 +2408,28 @@ function toggleTrendPlantMenu(e){
   }
 }
 
+// "All plants" master: tick = select all, untick = clear all.
+// Update the individual boxes in place (no innerHTML rebuild) so nothing snaps back.
 function onTrendPlantAll(checked){
-  // Checking "All" clears the specific selection (= show all plants)
-  selectedTrendPlants = [];
-  buildTrendPlantMenu();
+  const names = _trendPlantNames();
+  selectedTrendPlants = checked ? names.slice() : [];
+  [...document.querySelectorAll('.trendPlantChk')].forEach(c=>{ c.checked = checked; });
+  updateTrendPlantLabel();
   renderTrendPage();
 }
 
-function onTrendPlantChange(){
-  const checks = [...document.querySelectorAll('.trendPlantChk')];
-  const picked = checks.filter(c=>c.checked).map(c=>c.value);
-  const names = plantsList.map(p=>p.name);
-  // If everything is ticked, treat as "All" (empty selection)
-  selectedTrendPlants = (picked.length===0 || picked.length===names.length) ? [] : picked;
-  // Sync the "All" checkbox
+// Individual plant: add/remove based on the clicked checkbox directly.
+function onTrendPlantChange(cb){
+  _ensureTrendPlantsInit();
+  const name = cb.value;
+  if(cb.checked){
+    if(!selectedTrendPlants.includes(name)) selectedTrendPlants.push(name);
+  } else {
+    selectedTrendPlants = selectedTrendPlants.filter(p=>p!==name);
+  }
+  // Master checkbox reflects "all selected"
   const allChk = document.getElementById('trendPlantAll');
-  if(allChk) allChk.checked = (selectedTrendPlants.length===0);
+  if(allChk) allChk.checked = (selectedTrendPlants.length===_trendPlantNames().length);
   updateTrendPlantLabel();
   renderTrendPage();
 }
@@ -2451,17 +2460,17 @@ function renderTrendPage() {
   let kpisToShow = deptFilter==='All' ? kpiMaster : kpiMaster.filter(k=>k.dept===deptFilter);
   kpisToShow = sortByKPIOrder(kpisToShow);
 
-  // Which plants to compare:
-  //  - selectedTrendPlants (multi-select) takes priority when non-empty
-  //  - otherwise fall back to the global plant filter
+  // Which plants to compare — driven by the multi-select on this page.
   const allPlantNames = plantsList.map(p=>p.name);
-  let plants;
-  if(selectedTrendPlants && selectedTrendPlants.length){
-    plants = selectedTrendPlants.filter(p=>allPlantNames.includes(p));
+  _ensureTrendPlantsInit();
+  let plants = selectedTrendPlants.filter(p=>allPlantNames.includes(p));
+
+  // Nothing selected → prompt the user instead of drawing empty charts.
+  if(!plants.length){
+    grid.innerHTML = '<div style="grid-column:1/-1;padding:48px 16px;text-align:center;color:var(--text3);font-size:13px">Select one or more plants from the <strong>plant menu</strong> above to compare performance.</div>';
+    return;
   }
-  if(!plants || !plants.length){
-    plants = filterState.plant==='All' ? allPlantNames : [filterState.plant];
-  }
+
   // For target / LY / summary-stat resolution: use the plant when exactly one
   // is shown, otherwise null = aggregate across the shown plants.
   const singlePlant = plants.length===1 ? plants[0] : null;
