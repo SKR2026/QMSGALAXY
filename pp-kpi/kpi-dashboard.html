@@ -6136,10 +6136,68 @@ async function saveUser(){
     ['nUserName','nUserEmail','nUserPassword'].forEach(id=>document.getElementById(id).value='');
   } catch (err) {
     console.error('Create user error:', err);
-    let msg = 'Could not create user.';
-    if (err.code === 'auth/email-already-in-use') msg = 'This email is already registered.';
-    else if (err.code === 'auth/weak-password') msg = 'Password is too weak (min 6 characters).';
-    else if (err.code === 'auth/invalid-email') msg = 'Invalid email address.';
+    if (err.code === 'auth/email-already-in-use') {
+      // Show orphan repair option — Auth account exists but Firestore profile may be missing
+      errEl.innerHTML = `This email is already registered in Firebase Auth but may be missing its profile.
+        <br><button onclick="repairOrphanProfile()" style="margin-top:8px;padding:5px 12px;background:var(--amber);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;font-family:inherit">
+          Fix missing profile →
+        </button>`;
+      errEl.style.display = 'block';
+    } else {
+      let msg = 'Could not create user.';
+      if (err.code === 'auth/weak-password') msg = 'Password is too weak (min 6 characters).';
+      else if (err.code === 'auth/invalid-email') msg = 'Invalid email address.';
+      else if (err.message) msg = err.message;
+      errEl.textContent = msg;
+      errEl.style.display = 'block';
+    }
+  } finally {
+    btn.textContent = 'Create user';
+    btn.disabled = false;
+  }
+}
+
+// ── Orphan profile repair ─────────────────────────────────────────
+// Called when Firebase Auth already has the email but no Firestore /users/{uid} doc exists.
+// Uses the secondaryAuth instance (same password the admin just entered) to resolve the UID,
+// writes the missing profile doc, then signs secondary back out.
+async function repairOrphanProfile(){
+  const name       = document.getElementById('nUserName').value.trim();
+  const email      = document.getElementById('nUserEmail').value.trim();
+  const password   = document.getElementById('nUserPassword').value;
+  const role       = document.getElementById('nUserRole').value;
+  const plant      = document.getElementById('nUserPlant').value;
+  const department = document.getElementById('nUserDept').value;
+  const errEl      = document.getElementById('userError');
+  const btn        = document.getElementById('saveUserBtn');
+
+  if(!password){ errEl.textContent='Enter the existing password for this account to verify ownership'; errEl.style.display='block'; return; }
+
+  btn.textContent = 'Repairing…';
+  btn.disabled = true;
+  errEl.style.display = 'none';
+
+  try {
+    if(!window.FB || !window.FB.repairOrphanProfile) throw new Error('Firebase not available');
+    const uid = await window.FB.repairOrphanProfile(email, password, { name, role, plant, department });
+
+    // Add to local list
+    const already = usersList.find(u => u.email.toLowerCase() === email.toLowerCase());
+    if(!already){
+      usersList.push({ id: uid, name, email, role, plant, department, active: true });
+    } else {
+      already.id = uid; already.role = role; already.plant = plant; already.department = department;
+    }
+    renderUsersPage();
+    closeModal('addUserModal');
+    ['nUserName','nUserEmail','nUserPassword'].forEach(id => document.getElementById(id).value = '');
+    showToast('Profile repaired for ' + (name||email) + ' ✓ — they can now sign in normally', 6000);
+  } catch(err){
+    console.error('Repair orphan error:', err);
+    let msg = 'Could not repair profile.';
+    if(err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') msg = 'Wrong password — enter the correct existing password for this account.';
+    else if(err.code === 'auth/too-many-requests') msg = 'Too many attempts — wait a minute and try again.';
+    else if(err.message) msg = err.message;
     errEl.textContent = msg;
     errEl.style.display = 'block';
   } finally {
@@ -6884,6 +6942,36 @@ export async function registerUser(email, password, profile) {
   return cred.user.uid;
 }
 
+/**
+ * Repair an orphan Firebase Auth account that has no Firestore /users/{uid} doc.
+ * Signs in with the existing credentials using secondaryAuth to resolve the UID,
+ * writes the missing profile doc, then signs secondary out.
+ * profile: { name, role, plant, department }
+ */
+export async function repairOrphanProfile(email, password, profile) {
+  // Sign in as that user on the secondary instance to get their UID
+  const cred = await signInWithEmailAndPassword(secondaryAuth, email, password);
+  const uid  = cred.user.uid;
+
+  // Check if a Firestore doc already exists — if so, just update it
+  const snap = await getDoc(doc(db, "users", uid));
+  if(snap.exists()){
+    // Doc exists — patch it with the supplied profile details
+    await updateDoc(doc(db, "users", uid), {
+      ...profile, email, active: true
+    });
+  } else {
+    // Doc is missing — create it fresh
+    await setDoc(doc(db, "users", uid), {
+      ...profile, email, active: true,
+      repairedAt: serverTimestamp()
+    });
+  }
+
+  await signOut(secondaryAuth);
+  return uid;
+}
+
 // ════════════════════════════════════════════════════════════════
 //  PLANTS  (Firestore: /plants/{plantId})
 // ════════════════════════════════════════════════════════════════
@@ -7411,7 +7499,7 @@ function computeStatus(actual, target, direction, pct) {
 // ── Expose to global scope so existing inline handlers can call them ──
 window.FB = {
   loginUser, logoutUser, onAuthChange,
-  getUserProfile, getAllUsers, createUser, updateUser, registerUser, deleteUserDoc,
+  getUserProfile, getAllUsers, createUser, updateUser, registerUser, deleteUserDoc, repairOrphanProfile,
   getPlants, addPlant, updatePlant, deletePlant,
   getKPIMaster, addKPI, updateKPI, deleteKPI,
   addDept, updateDept, deleteDept, getDepts,
@@ -8144,7 +8232,7 @@ if (footer) {
 console.log('%cFirebase connected — skr-msa project', 'color:#185FA5;font-weight:600');
 console.log('To seed Firestore: window.FB.seedFirestore(kpiMaster, kpiData)');
 console.log('To remove seeded demo entries: await window.FB.clearSeedData()');
-console.log('%cKPI Dashboard build: 2026-06-16-r4 (Fix Role modal for Super Admin; Nos/Count to ABSOLUTE)', 'color:#185FA5;font-weight:600');
+console.log('%cKPI Dashboard build: 2026-06-16-r5 (orphan profile repair on email-already-in-use)', 'color:#185FA5;font-weight:600');
 </script>
 
 <script>
