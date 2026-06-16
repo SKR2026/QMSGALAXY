@@ -7578,6 +7578,82 @@ function resetAppState() {
   if (unsubLive)    { try{ unsubLive();    }catch(e){} unsubLive    = null; }
 }
 
+// Robust profile fetch — retries with exponential backoff so users on fresh
+// devices / slower networks load correctly without needing Super Admin to open
+// the app first. Returns the profile object, or null if every attempt failed.
+async function fetchProfileWithRetry(uid, maxAttempts = 6) {
+  let delay = 500;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const p = await getUserProfile(uid);
+      if (p && p.role) return p;          // success — got a real profile
+      // Doc may not be readable yet (token not propagated) — wait and retry
+      console.warn(`Profile attempt ${attempt}/${maxAttempts}: no role yet`);
+    } catch (err) {
+      console.warn(`Profile attempt ${attempt}/${maxAttempts} failed:`, err.code || err.message || err);
+    }
+    if (attempt < maxAttempts) {
+      await new Promise(r => setTimeout(r, delay));
+      delay = Math.min(delay * 1.6, 4000);   // exponential backoff, cap 4s
+    }
+  }
+  return null;
+}
+
+// Shown only when the profile genuinely cannot be read after all retries.
+// Gives the user a Retry button (no need for anyone else to log in) and a
+// Sign-out button — never silently grants access or bounces them in a loop.
+function showProfileErrorScreen(user) {
+  const gate = document.getElementById('authGate');
+  if (gate) gate.remove();
+  let el = document.getElementById('profileErrorScreen');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'profileErrorScreen';
+    document.body.appendChild(el);
+  }
+  el.innerHTML = `
+    <div style="position:fixed;inset:0;background:rgba(245,245,243,0.98);z-index:9999;display:flex;align-items:center;justify-content:center">
+      <div style="background:#fff;border:0.5px solid rgba(0,0,0,0.12);border-radius:16px;padding:32px;width:360px;box-shadow:0 4px 24px rgba(0,0,0,0.08);text-align:center">
+        <div style="font-size:14px;font-weight:600;color:#1a1a18;margin-bottom:8px">Couldn't load your profile</div>
+        <div style="font-size:12px;color:#5f5e5a;margin-bottom:20px;line-height:1.5">
+          Your sign-in worked, but we couldn't read your account details just now.
+          This is usually a brief network delay — please retry.
+        </div>
+        <div style="display:flex;gap:10px;justify-content:center">
+          <button id="profileRetryBtn" style="padding:9px 18px;background:#185FA5;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;font-family:inherit">Retry</button>
+          <button id="profileSignoutBtn" style="padding:9px 18px;background:none;color:#888780;border:0.5px solid rgba(0,0,0,0.16);border-radius:8px;font-size:13px;cursor:pointer;font-family:inherit">Sign out</button>
+        </div>
+      </div>
+    </div>`;
+  document.getElementById('profileRetryBtn').onclick = async () => {
+    const btn = document.getElementById('profileRetryBtn');
+    btn.textContent = 'Retrying…'; btn.disabled = true;
+    const profile = await fetchProfileWithRetry(user.uid, 6);
+    if (profile && profile.role) {
+      el.remove();
+      currentProfile = profile;
+      if (!currentProfile.email) currentProfile.email = user.email;
+      window._fbProfile = currentProfile;
+      applyRoleRestrictions(currentProfile);
+      const safeName = (currentProfile.name && String(currentProfile.name).trim()) || currentProfile.email || 'User';
+      const initials = safeName.split(' ').filter(Boolean).map(n=>n[0]).join('').slice(0,2).toUpperCase() || '?';
+      const av = document.querySelector('.avatar'); if (av) av.textContent = initials;
+      const nm = document.querySelector('.user-name'); if (nm) nm.textContent = safeName;
+      const rl = document.querySelector('.user-role'); if (rl) rl.textContent = currentProfile.role || '—';
+      try { await loadFirebaseData(); startLiveListeners(); showToast('Signed in ✓'); }
+      catch(e){ console.error(e); showToast('Signed in — some data failed to load'); }
+    } else {
+      btn.textContent = 'Retry'; btn.disabled = false;
+      showToast('Still couldn\'t load profile — check your connection or contact your admin');
+    }
+  };
+  document.getElementById('profileSignoutBtn').onclick = async () => {
+    el.remove();
+    await logoutUser();
+  };
+}
+
 onAuthChange(async user => {
   const gate = document.getElementById('authGate');
   if (gate) gate.remove();
@@ -7590,36 +7666,25 @@ onAuthChange(async user => {
     const overlay = document.getElementById('loginOverlay');
     if (overlay) overlay.style.display = 'none';
 
-    // Fetch profile, with one retry — right after sign-in, the Firestore
-    // SDK's auth token sometimes hasn't propagated yet on the first request.
-    try {
-      currentProfile = await getUserProfile(user.uid);
-    } catch (err) {
-      console.warn('Profile fetch failed, retrying…', err);
-      try {
-        await new Promise(r => setTimeout(r, 800));
-        currentProfile = await getUserProfile(user.uid);
-      } catch (err2) {
-        console.warn('Profile fetch retry failed:', err2);
-        currentProfile = null;
-      }
-    }
-    // Always ensure the profile has an email (some /users/{uid} docs may
-    // not store one) — this is used as the key for submittedBy/getMyEntries.
-    if (!currentProfile) currentProfile = {};
-    if (!currentProfile.email) currentProfile.email = user.email;
+    // Fetch profile with robust retries. On a fresh device or slower network the
+    // Firestore SDK auth token can take a few seconds to propagate, so a single
+    // quick retry is not enough — that was causing legitimate users to fail to
+    // load on systems where Super Admin had not "warmed up" the connection first.
+    currentProfile = await fetchProfileWithRetry(user.uid, 6);
 
-    window._fbProfile = currentProfile;
+    // Ensure the profile has an email even if the doc omits one.
+    if (currentProfile && !currentProfile.email) currentProfile.email = user.email;
 
-    // Only apply role restrictions once we have a real profile with a role.
-    // If profile is empty (fetch failed), force sign-out rather than defaulting
-    // to Super Admin which would expose admin pages to unknown users.
+    // If after all retries we STILL have no profile/role, do NOT default to
+    // Super Admin (security) and do NOT silently bounce the user. Show a clear
+    // retry screen so they can try again without needing anyone else to log in.
     if (!currentProfile || !currentProfile.role) {
-      console.warn('No role found for user — signing out for safety');
-      showToast('Could not verify your role — please sign in again');
-      await logoutUser();
+      console.warn('No role found for user after retries — showing retry screen');
+      showProfileErrorScreen(user);
       return;
     }
+
+    window._fbProfile = currentProfile;
     applyRoleRestrictions(currentProfile);
 
     // Update sidebar footer
@@ -8308,7 +8373,7 @@ if (footer) {
 console.log('%cFirebase connected — skr-msa project', 'color:#185FA5;font-weight:600');
 console.log('To seed Firestore: window.FB.seedFirestore(kpiMaster, kpiData)');
 console.log('To remove seeded demo entries: await window.FB.clearSeedData()');
-console.log('%cKPI Dashboard build: 2026-06-16-r9 (full auth isolation: resetAppState, listener cleanup, role guard)', 'color:#185FA5;font-weight:600');
+console.log('%cKPI Dashboard build: 2026-06-16-r10 (robust profile retry — any user, any system, no Super Admin warm-up needed)', 'color:#185FA5;font-weight:600');
 </script>
 
 <script>
