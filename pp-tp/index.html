@@ -2583,143 +2583,363 @@ function deleteTask(id){
 // ═══════════════════════════════════════════════════════════════════════
 //  GANTT CHART
 // ═══════════════════════════════════════════════════════════════════════
-let _ganttFilter = 'All';
+let _ganttFilter   = 'All';
+let _ganttAssignee = '';
+let _ganttPage     = 0;
+const _GANTT_PAGE_SIZE = 25;
 
 function renderGantt(){
   if(mode==='user'){showPanel('user');return;}
   const c = document.getElementById('content');
 
   const allTasks = getScopedTasks();
-  // Only tasks with a due date; use created as start fallback
-  const tasks = allTasks
-    .filter(t => t.due)
-    .map(t => ({
-      ...t,
-      _start: t.start || t.created || t.due,
-      _end:   t.due
-    }))
-    .filter(t => t._start <= t._end)
-    .sort((a,b) => a._start.localeCompare(b._start));
 
-  // Filter by status
-  const filtered = _ganttFilter === 'All' ? tasks : tasks.filter(t => t.status === _ganttFilter);
+  const tasks = allTasks.map(t => {
+    const end   = t.due || today();
+    let   start = t.start || t.created || end;
+    if(start > end) start = end;
+    return { ...t, _start: start, _end: end };
+  }).sort((a,b) => a._start.localeCompare(b._start));
 
-  // Date range: earliest start → latest due, at least covering today ±15 days
+  // ── Status filter
+  let filtered = _ganttFilter === 'All' ? tasks : tasks.filter(t => t.status === _ganttFilter);
+
+  // ── Assignee search filter
+  const assigneeQ = (_ganttAssignee||'').trim().toLowerCase();
+  if(assigneeQ) filtered = filtered.filter(t => (t.assignee||'').toLowerCase().includes(assigneeQ));
+
+  // ── Unique assignees for datalist
+  const allAssignees = [...new Set(tasks.map(t=>t.assignee||'').filter(Boolean))].sort();
+  const assigneeOptions = allAssignees.map(a=>`<option value="${esc(a)}">`).join('');
+
+  // ── Pagination
+  const totalPages = Math.max(1, Math.ceil(filtered.length / _GANTT_PAGE_SIZE));
+  if(_ganttPage >= totalPages) _ganttPage = totalPages - 1;
+  const pageTasks = filtered.slice(_ganttPage * _GANTT_PAGE_SIZE, (_ganttPage + 1) * _GANTT_PAGE_SIZE);
+  const pageOffset = _ganttPage * _GANTT_PAGE_SIZE; // for S.No.
+
+  // ── Date range from full filtered set
   const todayStr = today();
-  let minD = filtered.length ? filtered.reduce((m,t)=>t._start<m?t._start:m, filtered[0]._start) : todayStr;
-  let maxD = filtered.length ? filtered.reduce((m,t)=>t._end>m?t._end:m, filtered[0]._end) : todayStr;
-  // Expand a bit
+  const allStarts = filtered.map(t=>t._start);
+  const allEnds   = filtered.map(t=>t._end);
+  let   minD = allStarts.length ? allStarts.reduce((a,b)=>a<b?a:b) : todayStr;
+  let   maxD = allEnds.length   ? allEnds.reduce((a,b)=>a>b?a:b)   : todayStr;
+
   const minDate = new Date(Math.min(new Date(minD), new Date(todayStr)));
   const maxDate = new Date(Math.max(new Date(maxD), new Date(todayStr)));
-  minDate.setDate(1); // start of month
-  maxDate.setMonth(maxDate.getMonth()+1,0); // end of month
+  minDate.setDate(1);
+  maxDate.setMonth(maxDate.getMonth()+1, 0);
 
-  const totalMs = maxDate - minDate;
+  const totalMs   = maxDate - minDate || 1;
   const totalDays = totalMs / 86400000;
 
   function pct(dateStr){
-    const ms = new Date(dateStr) - minDate;
-    return Math.min(100, Math.max(0, (ms / totalMs) * 100));
+    return Math.min(100, Math.max(0, ((new Date(dateStr) - minDate) / totalMs) * 100));
   }
-  function widthPct(startStr, endStr){
-    const s = new Date(Math.max(new Date(startStr), minDate));
-    const e = new Date(Math.min(new Date(endStr), maxDate));
-    const w = ((e - s) / totalMs) * 100;
-    return Math.max(0.4, w);
+  function widthPct(s, e){
+    const ms = new Date(Math.min(new Date(e), maxDate)) - new Date(Math.max(new Date(s), minDate));
+    return Math.max(0.5, (ms / totalMs) * 100);
   }
 
-  // Build month header labels
+  // ── Month header
   const months = [];
   const cur = new Date(minDate);
   while(cur <= maxDate){
-    const label = cur.toLocaleString('default',{month:'short'}) + ' ' + cur.getFullYear();
-    const startPct = pct(cur.toISOString().slice(0,10));
-    const endCur = new Date(cur.getFullYear(), cur.getMonth()+1, 0);
-    const endPct = Math.min(100, pct(endCur.toISOString().slice(0,10)) + (1/totalDays)*100);
-    months.push({ label, startPct, widthPct: endPct - startPct });
-    cur.setMonth(cur.getMonth()+1);
-    cur.setDate(1);
+    const sp = pct(cur.toISOString().slice(0,10));
+    const ec = new Date(cur.getFullYear(), cur.getMonth()+1, 0);
+    const ep = Math.min(100, pct(ec.toISOString().slice(0,10)) + (1/totalDays)*100);
+    months.push({ label: cur.toLocaleString('default',{month:'short'})+' '+cur.getFullYear(), sp, wp: ep-sp });
+    cur.setMonth(cur.getMonth()+1); cur.setDate(1);
   }
-
-  const monthHeaderHTML = months.map(m =>
-    `<div style="position:absolute;left:${m.startPct}%;width:${m.widthPct}%;text-align:center;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;padding:4px 0;border-right:1px solid var(--border);box-sizing:border-box;">${m.label}</div>`
+  const monthHeaderHTML = months.map(m=>
+    `<div style="position:absolute;left:${m.sp.toFixed(2)}%;width:${m.wp.toFixed(2)}%;text-align:center;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;padding:4px 0;border-right:1px solid var(--border);box-sizing:border-box;overflow:hidden;">${m.label}</div>`
   ).join('');
-
-  const gridLinesHTML = months.map(m =>
-    `<div style="position:absolute;left:${m.startPct}%;top:0;bottom:0;width:1px;background:var(--border);opacity:.4;"></div>`
+  const gridLinesHTML = months.map(m=>
+    `<div style="position:absolute;left:${m.sp.toFixed(2)}%;top:0;bottom:0;width:1px;background:var(--border);opacity:.35;"></div>`
   ).join('');
 
   const todayPct = pct(todayStr);
-  const todayLineHTML = (todayPct >= 0 && todayPct <= 100)
-    ? `<div style="position:absolute;left:${todayPct}%;top:0;bottom:0;width:2px;background:var(--red);opacity:.7;z-index:3;">
-         <span style="position:absolute;top:-18px;left:50%;transform:translateX(-50%);font-size:9px;font-weight:700;color:var(--red);white-space:nowrap;">Today</span>
-       </div>` : '';
+  const todayLineHTML = (todayPct>=0&&todayPct<=100)
+    ? `<div style="position:absolute;left:${todayPct.toFixed(2)}%;top:0;bottom:0;width:2px;background:var(--red);opacity:.75;z-index:3;"><span style="position:absolute;top:-18px;left:50%;transform:translateX(-50%);font-size:9px;font-weight:700;color:var(--red);white-space:nowrap;">Today</span></div>`
+    : '';
 
   function barColor(t){
-    if(t.status==='Done') return 'var(--green)';
-    if(isOverdue(t)) return 'var(--red)';
-    if(t.status==='In Progress') return 'var(--accent)';
-    if(t.status==='Review') return 'var(--purple)';
-    return 'var(--text3)';
+    if(t.status==='Done') return '#34d399';
+    if(isOverdue(t))      return '#f87171';
+    if(t.status==='In Progress') return '#5b8dee';
+    if(t.status==='Review')      return '#a78bfa';
+    return '#9ca3af';
   }
 
-  const rowsHTML = filtered.length === 0
-    ? `<div style="padding:32px;text-align:center;color:var(--text3);font-size:13px;">No tasks with due dates found for this filter.</div>`
-    : filtered.map(t => {
+  // ── Column widths
+  const COL_SNO      = '38px';
+  const COL_ASSIGNEE = '130px';
+  const COL_TASK     = '180px';
+
+  const rowsHTML = pageTasks.length === 0
+    ? `<div style="padding:32px;text-align:center;color:var(--text3);font-size:13px;">No tasks found for this filter.</div>`
+    : pageTasks.map((t,i) => {
+        const sno  = pageOffset + i + 1;
         const left = pct(t._start);
-        const w = widthPct(t._start, t._end);
-        const color = barColor(t);
-        const overdue = isOverdue(t);
-        const label = w > 8 ? esc(t.title||'Untitled') : '';
-        return `<div class="gantt-row">
-          <div class="gantt-label" onclick="openDrawer('${t.id}')" title="${esc(t.title||'Untitled')}">${esc(t.title||'Untitled')}</div>
+        const w    = widthPct(t._start, t._end);
+        const col  = barColor(t);
+        const lbl  = w > 7 ? esc(t.title||'Untitled') : '';
+        const rowBg = i%2===1 ? 'background:rgba(255,255,255,.018);' : '';
+        const assigneeShort = (t.assignee||'—').split('@')[0]; // show local part of email
+        return `<div class="gantt-row" style="${rowBg}display:flex;align-items:center;">
+          <div style="width:${COL_SNO};flex-shrink:0;font-size:11px;font-weight:700;color:var(--text3);text-align:center;">${sno}</div>
+          <div class="gantt-label" style="width:${COL_TASK};min-width:0;flex-shrink:0;" onclick="openDrawer('${t.id}')" title="${esc(t.title||'Untitled')} | ${t._start} → ${t._end}">${esc(t.title||'Untitled')}</div>
+          <div style="width:${COL_ASSIGNEE};flex-shrink:0;font-size:11px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:10px;" title="${esc(t.assignee||'—')}">${esc(assigneeShort)}</div>
           <div style="flex:1;position:relative;height:26px;">
-            ${gridLinesHTML}
-            ${todayLineHTML}
-            <div class="gantt-bar"
-              style="left:${left}%;width:${w}%;background:${color};opacity:${t.status==='Done'?'.7':'1'};"
+            ${gridLinesHTML}${todayLineHTML}
+            <div class="gantt-bar" style="left:${left.toFixed(2)}%;width:${w.toFixed(2)}%;background:${col};opacity:${t.status==='Done'?.65:1};"
               onclick="openDrawer('${t.id}')"
-              title="${esc(t.title)} | ${t._start} → ${t._end} | ${t.status} | ${t.priority||''}">
-              ${label}
-            </div>
+              title="${esc(t.title||'')} · ${t._start} → ${t._end} · ${t.status} · ${t.priority||'—'}">${lbl}</div>
           </div>
         </div>`;
       }).join('');
 
-  const filterBtns = ['All',...STATUSES].map(s =>
-    `<button class="gantt-filter-btn${_ganttFilter===s?' active':''}" onclick="_ganttFilter='${s}';renderGantt()">${s}</button>`
+  // ── Pagination controls
+  const pageInfo = `<span style="font-size:12px;color:var(--text2);">Showing ${_ganttPage*_GANTT_PAGE_SIZE+1}–${Math.min((_ganttPage+1)*_GANTT_PAGE_SIZE,filtered.length)} of <strong>${filtered.length}</strong></span>`;
+  const prevBtn  = `<button class="btn btn-ghost btn-sm" ${_ganttPage===0?'disabled style="opacity:.4"':''} onclick="_ganttPage--;renderGantt()">‹ Prev</button>`;
+  const nextBtn  = `<button class="btn btn-ghost btn-sm" ${_ganttPage>=totalPages-1?'disabled style="opacity:.4"':''} onclick="_ganttPage++;renderGantt()">Next ›</button>`;
+  const paginationHTML = totalPages > 1
+    ? `<div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px;padding-top:12px;border-top:1px solid var(--border);">${pageInfo}<div style="display:flex;gap:8px;">${prevBtn}${nextBtn}</div></div>`
+    : `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">${pageInfo}</div>`;
+
+  // ── Filter buttons
+  const filterBtns = ['All',...STATUSES].map(s=>
+    `<button class="gantt-filter-btn${_ganttFilter===s?' active':''}" onclick="_ganttFilter='${s}';_ganttPage=0;renderGantt()">${s}</button>`
   ).join('');
 
+  // ── Legend
   const legendHTML = [
-    {color:'var(--accent)',  label:'In Progress'},
-    {color:'var(--purple)',  label:'Review'},
-    {color:'var(--green)',   label:'Done'},
-    {color:'var(--red)',     label:'Overdue'},
-    {color:'var(--text3)',   label:'To Do'},
-  ].map(l=>`<div class="gantt-leg"><div class="gantt-leg-dot" style="background:${l.color}"></div>${l.label}</div>`).join('');
+    {c:'#5b8dee',l:'In Progress'},{c:'#a78bfa',l:'Review'},
+    {c:'#34d399',l:'Done'},{c:'#f87171',l:'Overdue'},{c:'#9ca3af',l:'To Do'},
+  ].map(x=>`<div class="gantt-leg"><div class="gantt-leg-dot" style="background:${x.c}"></div>${x.l}</div>`).join('');
+
+  // ── Stats row
+  const statsHTML = STATUSES.map(s=>{
+    const n=filtered.filter(t=>t.status===s).length;
+    const col = s==='Done'?'var(--green)':s==='In Progress'?'var(--accent)':s==='Review'?'var(--purple)':'var(--text3)';
+    return `<div style="display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 14px;background:var(--card2);border-radius:8px;border:1px solid var(--border);">
+      <span style="font-size:18px;font-weight:800;color:${col};">${n}</span>
+      <span style="font-size:10px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;">${s}</span>
+    </div>`;
+  }).join('');
 
   c.innerHTML = `
+    <datalist id="gantt-assignee-list">${assigneeOptions}</datalist>
     <div class="panel-title fade-in">Gantt Chart</div>
-    <div class="panel-sub" style="margin-bottom:20px;">Timeline view of all tasks — click any bar to open task details</div>
+    <div class="panel-sub" style="margin-bottom:18px;">Timeline view of all ${allTasks.length} tasks — click any bar to open details</div>
+
+    <!-- Stats strip -->
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px;" class="fade-in">
+      <div style="display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 14px;background:var(--card2);border-radius:8px;border:1px solid var(--accent);min-width:60px;">
+        <span style="font-size:18px;font-weight:800;color:var(--accent);">${allTasks.length}</span>
+        <span style="font-size:10px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;">Total</span>
+      </div>
+      ${statsHTML}
+    </div>
 
     <div class="gantt-wrap fade-in">
-      <div class="gantt-header">
-        <div class="gantt-title">📅 Task Timeline <span style="font-size:11px;font-weight:500;color:var(--text3);">(${filtered.length} task${filtered.length!==1?'s':''})</span></div>
-        <div class="gantt-controls">${filterBtns}</div>
+      <!-- Header: title + filters + assignee search + exports -->
+      <div class="gantt-header" style="flex-wrap:wrap;gap:10px;">
+        <div class="gantt-title">📅 Task Timeline
+          <span style="font-size:11px;font-weight:500;color:var(--text3);">(${filtered.length} task${filtered.length!==1?'s':''}${_ganttFilter!=='All'?' · '+_ganttFilter:''}${assigneeQ?' · 👤 '+_ganttAssignee:''})</span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <!-- Status filter pills -->
+          <div class="gantt-controls">${filterBtns}</div>
+          <div style="width:1px;height:20px;background:var(--border);flex-shrink:0;"></div>
+          <!-- Assignee search -->
+          <div style="position:relative;display:flex;align-items:center;">
+            <span style="position:absolute;left:9px;font-size:13px;pointer-events:none;">👤</span>
+            <input id="gantt-assignee-inp" type="text" list="gantt-assignee-list"
+              value="${esc(_ganttAssignee)}"
+              placeholder="Filter by assignee…"
+              autocomplete="off"
+              style="padding:5px 10px 5px 28px;border-radius:20px;border:1px solid var(--border2);background:var(--card2);color:var(--text);font-size:12px;font-family:var(--font-body);outline:none;width:170px;transition:border-color .15s;"
+              oninput="_ganttAssignee=this.value;_ganttPage=0;renderGantt()"
+              onfocus="this.style.borderColor='var(--accent)'"
+              onblur="this.style.borderColor='var(--border2)'"
+            />
+            ${assigneeQ?`<button onclick="_ganttAssignee='';_ganttPage=0;renderGantt()" title="Clear" style="position:absolute;right:8px;background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;line-height:1;padding:0;">×</button>`:''}
+          </div>
+          <div style="width:1px;height:20px;background:var(--border);flex-shrink:0;"></div>
+          <button class="btn btn-ghost btn-sm" onclick="ganttExportExcel()" title="Export to Excel" style="gap:5px;">📊 Excel</button>
+          <button class="btn btn-ghost btn-sm" onclick="ganttExportPDF()" title="Export to PDF" style="gap:5px;">📄 PDF</button>
+        </div>
       </div>
 
-      <!-- Month header row -->
-      <div style="display:flex;margin-bottom:6px;">
-        <div style="width:200px;min-width:160px;flex-shrink:0;"></div>
+      <!-- Column header row -->
+      <div style="display:flex;align-items:center;padding:6px 0 6px;border-bottom:1px solid var(--border);margin-bottom:2px;">
+        <div style="width:${COL_SNO};flex-shrink:0;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;text-align:center;">S.No.</div>
+        <div style="width:${COL_TASK};flex-shrink:0;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;">Task</div>
+        <div style="width:${COL_ASSIGNEE};flex-shrink:0;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;">Assignee</div>
         <div style="flex:1;position:relative;height:24px;">${monthHeaderHTML}</div>
       </div>
 
       <!-- Task rows -->
-      <div style="margin-top:6px;">${rowsHTML}</div>
+      <div style="margin-top:2px;">${rowsHTML}</div>
+
+      <!-- Pagination -->
+      ${paginationHTML}
 
       <!-- Legend -->
       <div class="gantt-legend">${legendHTML}</div>
     </div>`;
+}
+
+/* ── Gantt → Excel export ─────────────────────────────────────────────── */
+function ganttExportExcel(){
+  const tasks = getScopedTasks();
+  let filtered = _ganttFilter==='All' ? tasks : tasks.filter(t=>t.status===_ganttFilter);
+  const aq = (_ganttAssignee||'').trim().toLowerCase();
+  if(aq) filtered = filtered.filter(t=>(t.assignee||'').toLowerCase().includes(aq));
+  if(!filtered.length){ toast('⚠ No tasks to export.','var(--amber)'); return; }
+
+  // Build CSV (Excel-compatible)
+  const cols = ['S.No.','Title','Assignee','Priority','Status','Start Date','Due Date','Completion Date','Tags','Description'];
+  const rows = filtered.map((t,i)=>{
+    const start = t.start || t.created || t.due || '';
+    return [
+      i+1,
+      '"'+(t.title||'').replace(/"/g,'""')+'"',
+      '"'+(t.assignee||'').replace(/"/g,'""')+'"',
+      t.priority||'',
+      t.status||'',
+      start,
+      t.due||'',
+      t.completedDate||'',
+      '"'+(Array.isArray(t.tags)?t.tags.join(', '):(t.tags||'')).replace(/"/g,'""')+'"',
+      '"'+(t.desc||t.description||'').replace(/"/g,'""')+'"'
+    ].join(',');
+  });
+  const csv = '\uFEFF' + [cols.join(','), ...rows].join('\r\n'); // BOM for Excel
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'Gantt_Tasks_'+new Date().toISOString().slice(0,10)+'.csv';
+  a.click();
+  toast('✅ Excel CSV exported ('+filtered.length+' tasks)!');
+}
+
+/* ── Gantt → PDF export ───────────────────────────────────────────────── */
+function ganttExportPDF(){
+  const tasks = getScopedTasks();
+  let filtered = (_ganttFilter==='All' ? tasks : tasks.filter(t=>t.status===_ganttFilter));
+  const aq = (_ganttAssignee||'').trim().toLowerCase();
+  if(aq) filtered = filtered.filter(t=>(t.assignee||'').toLowerCase().includes(aq));
+  filtered = filtered
+    .map(t=>({ ...t, _start: t.start||t.created||t.due||today(), _end: t.due||today() }))
+    .sort((a,b)=>a._start.localeCompare(b._start));
+  if(!filtered.length){ toast('⚠ No tasks to export.','var(--amber)'); return; }
+
+  const date = new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
+  const statusColor={'To Do':'#9ca3af','In Progress':'#5b8dee','Review':'#a78bfa','Done':'#34d399'};
+  const prioColor={'High':'#f87171','Medium':'#fbbf24','Low':'#34d399'};
+
+  // ── Build a simple horizontal bar chart using inline SVG
+  const allDates = filtered.flatMap(t=>[t._start,t._end]).filter(Boolean).sort();
+  const minD = allDates[0]||today();
+  const maxD = allDates[allDates.length-1]||today();
+  const minMs = new Date(minD).setDate(new Date(minD).getDate()-2);
+  const maxMs = new Date(maxD).setDate(new Date(maxD).getDate()+2);
+  const spanMs = maxMs - minMs || 1;
+
+  const ROW_H=22, SNO_W=28, LABEL_W=160, ASSIGNEE_W=110, CHART_W=480;
+  const svgH = filtered.length*ROW_H + 30;
+  const todayMs = new Date(today()).getTime();
+  const totalSVGW = SNO_W + LABEL_W + ASSIGNEE_W + CHART_W;
+
+  // Month tick marks
+  const tickMonths=[];
+  const tc=new Date(minMs); tc.setDate(1);
+  while(tc.getTime()<=maxMs){ tickMonths.push(new Date(tc)); tc.setMonth(tc.getMonth()+1); }
+  const ticksHTML = tickMonths.map(d=>{
+    const x = SNO_W + LABEL_W + ASSIGNEE_W + ((d.getTime()-minMs)/spanMs)*CHART_W;
+    const lbl = d.toLocaleString('default',{month:'short'})+"'"+String(d.getFullYear()).slice(2);
+    return `<line x1="${x}" y1="18" x2="${x}" y2="${svgH}" stroke="#e5e7eb" stroke-width="1"/>
+            <text x="${x+3}" y="14" font-size="8" fill="#9ca3af">${lbl}</text>`;
+  }).join('');
+
+  // Today line
+  const todayX = SNO_W + LABEL_W + ASSIGNEE_W + ((todayMs-minMs)/spanMs)*CHART_W;
+  const todayLineS = todayMs>=minMs&&todayMs<=maxMs
+    ? `<line x1="${todayX}" y1="18" x2="${todayX}" y2="${svgH}" stroke="#f87171" stroke-width="1.5" stroke-dasharray="3,2"/>
+       <text x="${todayX+2}" y="14" font-size="8" fill="#f87171" font-weight="bold">Today</text>` : '';
+
+  const barsHTML = filtered.map((t,i)=>{
+    const y = 22 + i*ROW_H;
+    const barX1 = SNO_W + LABEL_W + ASSIGNEE_W + ((new Date(t._start).getTime()-minMs)/spanMs)*CHART_W;
+    const barX2 = SNO_W + LABEL_W + ASSIGNEE_W + ((new Date(t._end).getTime()-minMs)/spanMs)*CHART_W;
+    const bw = Math.max(4, barX2-barX1);
+    const col = statusColor[t.status]||'#9ca3af';
+    const shortTitle = (t.title||'Untitled').slice(0,22);
+    const shortAssignee = (t.assignee||'—').split('@')[0].slice(0,14);
+    const rowBg = i%2===0?'#fafafa':'#ffffff';
+    return `<rect x="0" y="${y-ROW_H+2}" width="${totalSVGW}" height="${ROW_H}" fill="${rowBg}"/>
+            <text x="4" y="${y-3}" font-size="9" fill="#9ca3af" font-family="Arial" text-anchor="middle" dominant-baseline="auto">${i+1}</text>
+            <text x="${SNO_W+4}" y="${y-3}" font-size="9" fill="#374151" font-family="Arial">${shortTitle.replace(/</g,'&lt;')}</text>
+            <text x="${SNO_W+LABEL_W+4}" y="${y-3}" font-size="9" fill="#6b7280" font-family="Arial">${shortAssignee.replace(/</g,'&lt;')}</text>
+            <rect x="${barX1}" y="${y-ROW_H+5}" width="${bw}" height="${ROW_H-8}" rx="3" fill="${col}" opacity="${t.status==='Done'?.6:1}"/>
+            ${bw>30?`<text x="${barX1+4}" y="${y-3}" font-size="8" fill="white" font-family="Arial">${shortTitle.slice(0,18).replace(/</g,'&lt;')}</text>`:''}`;
+  }).join('');
+
+  const svgGantt = `<svg xmlns="http://www.w3.org/2000/svg" width="${totalSVGW}" height="${svgH}" style="max-width:100%;display:block;">
+    ${ticksHTML}${todayLineS}${barsHTML}
+  </svg>`;
+
+  // ── Table rows
+  const tableRows = filtered.map((t,i)=>`
+    <tr>
+      <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-size:11px;color:#9ca3af;text-align:center;font-weight:600;">${i+1}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-weight:600;font-size:11px;color:#111;max-width:180px;word-break:break-word;">${(t.title||'').replace(/</g,'&lt;')}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-size:11px;color:#555;">${(t.assignee||'—').replace(/</g,'&lt;')}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-size:11px;"><span style="background:${prioColor[t.priority]||'#ccc'}22;color:${prioColor[t.priority]||'#777'};border-radius:3px;padding:1px 6px;font-weight:700;">${t.priority||'—'}</span></td>
+      <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-size:11px;"><span style="background:${statusColor[t.status]||'#ccc'}22;color:${statusColor[t.status]||'#777'};border-radius:3px;padding:1px 6px;font-weight:700;">${t.status||'—'}</span></td>
+      <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-size:11px;color:#555;">${fmt(t._start)||'—'}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-size:11px;color:#555;">${fmt(t.due)||'—'}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;font-size:11px;color:${t.completedDate?'#16a34a':'#aaa'};font-weight:${t.completedDate?700:400}">${t.completedDate?fmt(t.completedDate):'—'}</td>
+    </tr>`).join('');
+
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8">
+  <title>Gantt Report — ${date}</title>
+  <style>
+    body{font-family:'Segoe UI',Arial,sans-serif;color:#111;margin:0;padding:20px;font-size:12px;}
+    h1{font-size:20px;margin-bottom:2px;color:#1a1e2e;}
+    .sub{font-size:12px;color:#888;margin-bottom:16px;}
+    .section{font-size:13px;font-weight:700;color:#374151;margin:20px 0 8px;padding-bottom:4px;border-bottom:2px solid #e5e7eb;}
+    table{width:100%;border-collapse:collapse;margin-top:8px;}
+    th{background:#f3f4f6;padding:7px 8px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#6b7280;border-bottom:2px solid #e5e7eb;}
+    tr:nth-child(even) td{background:#fafafa;}
+    .stat-row{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;}
+    .stat-box{padding:8px 16px;border-radius:6px;border:1px solid #e5e7eb;background:#f9fafb;}
+    .stat-num{font-size:20px;font-weight:800;color:#5b8dee;}
+    .stat-lbl{font-size:10px;font-weight:600;color:#9ca3af;text-transform:uppercase;}
+    @media print{body{padding:0;}@page{margin:15mm;}}
+  </style></head><body>
+  <h1>📅 Gantt Report — POLYPLASTICS</h1>
+  <div class="sub">Generated: ${date} &nbsp;·&nbsp; Filter: ${_ganttFilter}${aq?' · Assignee: '+_ganttAssignee:''} &nbsp;·&nbsp; Tasks: ${filtered.length}</div>
+  <div class="stat-row">
+    ${STATUSES.map(s=>{const n=filtered.filter(t=>t.status===s).length; return `<div class="stat-box"><div class="stat-num" style="color:${statusColor[s]||'#9ca3af'}">${n}</div><div class="stat-lbl">${s}</div></div>`}).join('')}
+  </div>
+  <div class="section">📊 Timeline Chart</div>
+  ${svgGantt}
+  <div class="section">📋 Task Details</div>
+  <table>
+    <thead><tr><th style="width:32px;">#</th><th>Title</th><th>Assignee</th><th>Priority</th><th>Status</th><th>Start</th><th>Due Date</th><th>Completed</th></tr></thead>
+    <tbody>${tableRows}</tbody>
+  </table>
+  <script>window.onload=()=>window.print();<\/script>
+  </body></html>`;
+
+  const w=window.open('','_blank');
+  if(!w){ toast('⚠ Please allow popups to export PDF.','var(--amber)'); return; }
+  w.document.write(html);
+  w.document.close();
+  toast('✅ PDF report opened ('+filtered.length+' tasks) — print to save!');
 }
 
 function renderKanban(){
