@@ -4604,7 +4604,7 @@ PAGES.transport = () => {
               <div>FROM</div>
               <div style="text-align:center">→</div>
               <div>TO</div>
-              <div style="text-align:right">DIST (KM)</div>
+              <div style="text-align:right">DIST / QTY</div>
               <div style="text-align:right">↺ RETURN</div>
               <div style="text-align:right">CO₂e (kg)</div>
               <div></div>
@@ -4737,7 +4737,12 @@ POST_RENDER.transport = () => {
     document.getElementById('tab-biztravel').style.display  = tabId === 'biztravel' ? '' : 'none';
     if (tabId === 'commuting')  renderCommuteCharts();
     if (tabId === 'freight')    renderFreightCharts();
-    if (tabId === 'biztravel')  renderBTCharts();
+    if (tabId === 'biztravel'){
+      renderBTCharts();
+      // Seed legs if container is empty
+      const bbc = document.getElementById('bt-legs-container');
+      if (bbc && bbc.children.length === 0){ _btLegCount=0; btResetForm(); }
+    }
   }
 
   document.querySelectorAll('.tab[data-tab]').forEach(t => {
@@ -4749,8 +4754,6 @@ POST_RENDER.transport = () => {
 
   activateTab(activeTab);
   updateCommuteUnit();
-  // Init new itinerary leg toggles (car fuel fields)
-  if (activeTab === 'biztravel') { _btLegCount=0; btResetForm(); }
 };
 
 /* ── Business Travel — dynamic itinerary builder ───────────────── */
@@ -4839,11 +4842,12 @@ function btAddLeg(presets){
         style="width:100%;padding:6px 8px;background:var(--bg-2);border:1px solid var(--line);color:var(--ink-0);font-size:12px;outline:none;border-radius:4px"
         oninput="btCalcTotal()">
     </div>
-    <!-- km -->
-    <div style="padding-right:6px">
-      <input type="number" id="bt-leg-km-${n}" placeholder="km" value="${presets?.km||''}" min="0" step="1"
+    <!-- qty (km OR litres/kg — switches on vehicle change) -->
+    <div id="bt-leg-qty-wrap-${n}" style="padding-right:6px">
+      <input type="number" id="bt-leg-km-${n}" placeholder="km" value="${presets?.km||''}" min="0" step="0.01"
         style="width:100%;padding:6px 8px;background:var(--bg-2);border:1px solid var(--line);color:var(--ink-0);font-size:12px;outline:none;border-radius:4px;text-align:right"
         oninput="btCalcTotal()">
+      <div id="bt-leg-qty-label-${n}" style="font-family:var(--mono);font-size:9px;color:var(--ink-3);text-align:right;margin-top:2px">KM</div>
     </div>
     <!-- return checkbox -->
     <div style="text-align:center">
@@ -4861,9 +4865,11 @@ function btAddLeg(presets){
     </div>`;
 
   container.appendChild(row);
+  // Apply correct input type (km vs fuel) for the seeded vehicle
+  btUpdateLegInput(n, defaultVehicle);
   btCalcTotal();
-  // Focus the From field
-  setTimeout(()=>{ document.getElementById('bt-leg-from-'+n)?.focus(); }, 50);
+  // Focus the From field of newly added legs (not seeded ones)
+  if (!presets) setTimeout(()=>{ document.getElementById('bt-leg-from-'+n)?.focus(); }, 50);
 }
 
 function btRemoveLeg(n){
@@ -4873,9 +4879,50 @@ function btRemoveLeg(n){
 
 function btOnVehicleChange(n){
   const vehicle = document.getElementById('bt-leg-vehicle-'+n)?.value;
-  const icon    = document.getElementById('bt-leg-icon-'+n);
+  // Update icon
+  const icon = document.getElementById('bt-leg-icon-'+n);
   if (icon) icon.textContent = btModeIcon(vehicle);
+  // Update input: km vs litres/kg
+  btUpdateLegInput(n, vehicle);
   btCalcTotal();
+}
+
+/* Switch the quantity input between km and fuel units based on vehicle method */
+function btUpdateLegInput(n, vehicle){
+  const meta   = EMISSION_FACTORS.business_travel[vehicle] || {};
+  const isFuel = meta.method === 'fuel';
+  const unit   = meta.unit || 'km';
+
+  const input  = document.getElementById('bt-leg-km-'+n);
+  const label  = document.getElementById('bt-leg-qty-label-'+n);
+  const retCb  = document.getElementById('bt-leg-return-'+n);
+  // The return cell is the next sibling div after the qty-wrap div
+  const qtyWrap = document.getElementById('bt-leg-qty-wrap-'+n);
+  const retCell = qtyWrap?.nextElementSibling;
+
+  if (!input) return;
+
+  if (isFuel){
+    input.placeholder = unit;
+    input.step        = '0.01';
+    if (label){
+      label.textContent  = unit.toUpperCase();
+      label.style.color  = 'var(--accent-2)';
+      label.style.fontWeight = '700';
+    }
+    if (retCell) retCell.style.opacity = '0.25';
+    if (retCb){ retCb.checked = false; retCb.disabled = true; retCb.title = 'Not applicable for fuel-based entries'; }
+  } else {
+    input.placeholder = 'km';
+    input.step        = '1';
+    if (label){
+      label.textContent  = 'KM';
+      label.style.color  = 'var(--ink-3)';
+      label.style.fontWeight = '400';
+    }
+    if (retCell) retCell.style.opacity = '1';
+    if (retCb){ retCb.disabled = false; retCb.title = 'Return trip (×2)'; }
+  }
 }
 
 function btLegCO2(vehicleKey, km, travelers){
@@ -4898,30 +4945,48 @@ function btCalcTotal(){
   legRows.forEach(row => {
     const n       = row.dataset.legn;
     const vehicle = document.getElementById('bt-leg-vehicle-'+n)?.value;
-    const km      = parseFloat(document.getElementById('bt-leg-km-'+n)?.value) || 0;
+    const qty     = parseFloat(document.getElementById('bt-leg-km-'+n)?.value) || 0;
     const from    = document.getElementById('bt-leg-from-'+n)?.value.trim() || '?';
     const to      = document.getElementById('bt-leg-to-'+n)?.value.trim()   || '?';
     const legRet  = document.getElementById('bt-leg-return-'+n)?.checked    || false;
-    const ret     = legRet || globalReturn;
-    const mult    = ret ? 2 : 1;
     const icon    = btModeIcon(vehicle);
 
-    const co2e = btLegCO2(vehicle, km * mult, travelers);
+    const meta    = EMISSION_FACTORS.business_travel[vehicle] || {};
+    const isFuel  = meta.method === 'fuel';
+    const unit    = meta.unit || 'km';
+
+    // Return multiplier only applies to distance-based legs
+    const ret     = !isFuel && (legRet || globalReturn);
+    const mult    = ret ? 2 : 1;
+
+    let co2e = 0;
+    if (isFuel){
+      // fuel-based: qty (litres/kg) × factor per unit × travelers
+      co2e = qty * (meta.factor||0) * travelers;
+    } else {
+      co2e = btLegCO2(vehicle, qty * mult, travelers);
+    }
     total += co2e;
 
     const co2El = document.getElementById('bt-leg-co2-'+n);
     if (co2El){
-      if (km > 0){
-        co2El.textContent = (ret ? '↺ ' : '') + fmt(co2e, 0) + ' kg';
+      if (qty > 0){
+        const label = isFuel
+          ? fmt(qty,2) + ' ' + unit
+          : fmt(qty*mult,0) + ' km' + (ret?' (×2)':'');
+        co2El.textContent = label + ' · ' + fmt(co2e,0) + ' kg';
         co2El.style.color = ret ? 'var(--accent-2)' : 'var(--accent)';
       } else {
         co2El.textContent = '';
       }
     }
 
-    if (km > 0){
+    if (qty > 0){
+      const qtyLabel = isFuel
+        ? fmt(qty,2)+' '+unit
+        : fmt(qty*mult,0)+' km'+(ret?' <small>(×2)</small>':'');
       lines.push(icon + ' L' + n + ': <b>' + escapeHtml(from) + ' → ' + escapeHtml(to) + '</b>'
-        + ' &nbsp;' + fmt(km*mult,0) + ' km' + (ret?' <small>(×2)</small>':'')
+        + ' &nbsp;' + qtyLabel
         + ' &nbsp;·&nbsp; <b>' + fmt(co2e,0) + ' kg</b>');
     }
   });
@@ -4991,21 +5056,25 @@ function addBusinessTravelItinerary(){
   legRows.forEach(row => {
     const n       = row.dataset.legn;
     const vehicle = document.getElementById('bt-leg-vehicle-'+n)?.value;
-    const km      = parseFloat(document.getElementById('bt-leg-km-'+n)?.value) || 0;
+    const qty     = parseFloat(document.getElementById('bt-leg-km-'+n)?.value) || 0;
     const from    = document.getElementById('bt-leg-from-'+n)?.value.trim() || '';
     const to      = document.getElementById('bt-leg-to-'+n)?.value.trim()   || '';
     const legRet  = document.getElementById('bt-leg-return-'+n)?.checked    || false;
-    if (!km) return;  // skip blank legs
+    if (!qty) return;  // skip blank legs
+    const meta    = EMISSION_FACTORS.business_travel[vehicle] || {};
+    const isFuel  = meta.method === 'fuel';
     legNum++;
     rows.push({
       id:         uid(),
       vehicle,
       legType:    btLegType(vehicle),
       legNum,
-      calcMethod: 'distance',
+      calcMethod: isFuel ? 'fuel' : 'distance',
       travelers,
-      distanceKm: km,
-      returnTrip: legRet || globalReturn,
+      distanceKm: isFuel ? null : qty,
+      fuelQty:    isFuel ? qty   : null,
+      fuelUnit:   isFuel ? (meta.unit||'litre') : null,
+      returnTrip: isFuel ? false : (legRet || globalReturn),
       origin:     from,
       dest:       to,
       purpose, officer, travelDate, period, notes,
