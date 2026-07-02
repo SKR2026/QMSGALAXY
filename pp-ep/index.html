@@ -1226,6 +1226,7 @@ var CFG = {
   passScore:  60,
   logo:       "📋",
   resultsPublished: false,
+  publishedPlants: {},
   baseUrl:    "https://www.qmsgalaxy.com/pp-ep/index.html",
   logoDataUrl: "",
   sealDataUrl: "",
@@ -1296,6 +1297,27 @@ function filterAttemptsByPlant(attempts, candsMapAll) {
 function pOptsRestricted(sel) {
   var list = isSuperAdmin() ? PLANTS : (CURRENT_USER.plant ? [CURRENT_USER.plant] : PLANTS);
   return list.map(function(p){ return '<option value="'+p+'"'+(p===sel?' selected':'')+'>'+p+'</option>'; }).join('');
+}
+
+/** Whether results are published for a given plant. Falls back to the global
+ *  resultsPublished flag for any plant that has never been explicitly toggled,
+ *  so existing single-plant / pre-upgrade setups keep working unchanged. */
+function isPlantPublished(plant) {
+  if (!plant) return !!CFG.resultsPublished;
+  var pp = CFG.publishedPlants || {};
+  if (Object.prototype.hasOwnProperty.call(pp, plant)) return !!pp[plant];
+  return !!CFG.resultsPublished;
+}
+/** Whether results are currently published for the *logged-in* admin's own scope —
+ *  global flag for Super Admin, own plant only for a Plant Admin. */
+function myPlantPublished() {
+  return isSuperAdmin() ? !!CFG.resultsPublished : isPlantPublished(CURRENT_USER.plant);
+}
+/** Name of the currently active sidebar page, so a shared action (like the
+ *  publish toggle) can refresh whichever page it was actually clicked from. */
+function currentPageName() {
+  var el = document.querySelector('.ni.a');
+  return el && el.id ? el.id.replace('n-','') : '';
 }
 
 // DOM helpers — defined before anything runs
@@ -1429,6 +1451,7 @@ function loadSettings(cb) {
         if (d.companyName) CFG.company = d.companyName;
         if (d.companyEmail) CFG.companyEmail = d.companyEmail;
         if (d.resultsPublished !== undefined) CFG.resultsPublished = d.resultsPublished;
+        if (d.publishedPlants !== undefined) CFG.publishedPlants = d.publishedPlants || {};
         if (d.logoDataUrl !== undefined) CFG.logoDataUrl = d.logoDataUrl;
         if (d.sealDataUrl !== undefined) CFG.sealDataUrl = d.sealDataUrl;
         if (d.mainLogoDataUrl !== undefined) CFG.mainLogoDataUrl = d.mainLogoDataUrl;
@@ -1485,6 +1508,7 @@ function saveSettings(cb) {
     departments: DEPTS, plants: PLANTS, topics: TOPICS,
     companyName: CFG.company, companyEmail: CFG.companyEmail||'',
     resultsPublished: CFG.resultsPublished||false,
+    publishedPlants: CFG.publishedPlants||{},
     logoDataUrl: CFG.logoDataUrl||'',
     sealDataUrl: CFG.sealDataUrl||'',
     mainLogoDataUrl: CFG.mainLogoDataUrl||'',
@@ -3638,7 +3662,7 @@ function delExam(id){
 }
 function assignMo(eid, ename) {
   Promise.all([
-    DB().collection('candidates').where('isActive','==',true).get(),
+    plantQuery(DB().collection('candidates').where('isActive','==',true)).get(),
     DB().collection('attempts').where('examId','==',eid).get()
   ]).then(function(res){
     var cands=res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());});
@@ -3800,11 +3824,13 @@ function delCand(id){if(!confirm('Remove?'))return;DB().collection('candidates')
 
 // ── RESULTS ───────────────────────────────────────────────────
 function pgResults() {
-  var pubLabel = CFG.resultsPublished ? '\uD83D\uDD12 Unpublish' : '\uD83D\uDE80 Publish Results';
+  var pubStatus = myPlantPublished();
+  var pubLabel = pubStatus ? '\uD83D\uDD12 Unpublish' : '\uD83D\uDE80 Publish Results';
+  if (!isSuperAdmin()) pubLabel += ' (' + CURRENT_USER.plant + ')';
   setHtml('vPgAct',
     '<button class="b bg bsm" onclick="expXls()">📊 Export Excel</button>'+
     '<button class="b bg bsm" onclick="expResultPdf()">📄 Export PDF</button>'+
-    '<button class="b '+(CFG.resultsPublished?'bd_':'bs')+' bsm" onclick="quickPublishToggle()">'+pubLabel+'</button>'
+    '<button class="b '+(pubStatus?'bd_':'bs')+' bsm" onclick="quickPublishToggle()">'+pubLabel+'</button>'
   );
   setHtml('vPgCnt',loading());
   Promise.all([
@@ -4346,10 +4372,19 @@ function adCard(icon,label,val){
 
 
 function quickPublishToggle() {
-  CFG.resultsPublished = !CFG.resultsPublished;
+  if (isSuperAdmin()) {
+    CFG.resultsPublished = !CFG.resultsPublished;
+  } else {
+    if (!CURRENT_USER.plant) { toast('No plant assigned to this account — contact Super Admin.', 'er'); return; }
+    CFG.publishedPlants = CFG.publishedPlants || {};
+    CFG.publishedPlants[CURRENT_USER.plant] = !isPlantPublished(CURRENT_USER.plant);
+  }
   saveSettings(function(){
-    toast(CFG.resultsPublished ? '✅ Results published! Employees can now check results.' : '🔒 Results unpublished.', CFG.resultsPublished ? 'ok' : 'wn');
-    pgResults();
+    var nowPublished = myPlantPublished();
+    var scopeLabel = isSuperAdmin() ? 'Employees' : (CURRENT_USER.plant + ' employees');
+    toast(nowPublished ? '✅ Results published! '+scopeLabel+' can now check results.' : '🔒 Results unpublished.', nowPublished ? 'ok' : 'wn');
+    var p = currentPageName();
+    if (p === 'portal') pgPortalAdmin(); else pgResults();
   });
 }
 function expXls() {
@@ -6049,9 +6084,12 @@ function closeMo(){ hide('vMo'); _mailEmails = []; }
 // ── PORTAL ADMIN PAGE ─────────────────────────────────────────
 function pgPortalAdmin() {
   var portalUrl = CFG.baseUrl.replace(/(\?.*)?$/, '') + '?results=1';
-  var statusColor = CFG.resultsPublished ? 'var(--gn)' : 'var(--rd)';
-  var statusLabel = CFG.resultsPublished ? '● LIVE — Employees can access results' : '● UNPUBLISHED — Not visible to employees';
-  setHtml('vPgAct', '<button class="b '+(CFG.resultsPublished?'bd_':'bs')+' bsm" onclick="quickPublishToggle()">'+(CFG.resultsPublished?'🔒 Unpublish':'🚀 Publish Results')+'</button>');
+  var pubStatus = myPlantPublished();
+  var scopeSuffix = isSuperAdmin() ? '' : (' — ' + CURRENT_USER.plant);
+  var statusColor = pubStatus ? 'var(--gn)' : 'var(--rd)';
+  var statusLabel = (pubStatus ? '● LIVE — Employees can access results' : '● UNPUBLISHED — Not visible to employees') + scopeSuffix;
+  var btnLabel = (pubStatus?'🔒 Unpublish':'🚀 Publish Results') + (isSuperAdmin() ? '' : ' ('+CURRENT_USER.plant+')');
+  setHtml('vPgAct', '<button class="b '+(pubStatus?'bd_':'bs')+' bsm" onclick="quickPublishToggle()">'+btnLabel+'</button>');
   setHtml('vPgCnt',
     '<div style="max-width:660px">'+
     '<div class="card" style="margin-bottom:16px"><div class="ch"><span class="ct">📊 Portal Status</span></div><div class="cb">'+
@@ -6060,9 +6098,7 @@ function pgPortalAdmin() {
       '<div style="font-size:11px;font-weight:700;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Employee Portal URL</div>'+
       '<div class="lnk"><div class="ld">'+portalUrl+'</div><button class="b bg bsm" onclick="navigator.clipboard.writeText(\''+esc(portalUrl)+'\').then(function(){toast(\'Copied!\',\'ok\');})">Copy</button><button class="b bp bsm" onclick="window.open(\''+esc(portalUrl)+'\',\'_blank\')">Open →</button></div>'+
       '<div style="margin-top:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+
-        '<button class="b '+(CFG.resultsPublished?'bd_':'bs')+'" onclick="quickPublishToggle()">'+
-          (CFG.resultsPublished?'🔒 Unpublish Results':'🚀 Publish Results to Employees')+
-        '</button>'+
+        '<button class="b '+(pubStatus?'bd_':'bs')+'" onclick="quickPublishToggle()">'+btnLabel+'</button>'+
         '<div style="font-size:12px;color:var(--tx3)">Go to Settings to configure company name & email</div>'+
       '</div>'+
     '</div></div>'+
@@ -6114,7 +6150,9 @@ function showResultPortal() {
   loadSettings(function(){
     var co = document.getElementById('epCompany');
     if(co) co.textContent = CFG.company || 'ExamPro';
-    if (!CFG.resultsPublished) {
+    var anyPublished = !!CFG.resultsPublished ||
+      Object.keys(CFG.publishedPlants||{}).some(function(p){ return !!CFG.publishedPlants[p]; });
+    if (!anyPublished) {
       var rpErr = document.getElementById('rpErr');
       if (rpErr) {
         rpErr.textContent = '🔒 Results have not been published yet. Please check back later.';
@@ -6130,23 +6168,28 @@ function fetchEmployeeResult() {
   var errEl = document.getElementById('rpErr');
   if(errEl){ errEl.classList.remove('show'); }
   hide('rpPersonal');
-  DB().collection('settings').doc('config').get().then(function(snap){
-    var published = snap.exists && snap.data().resultsPublished;
-    if (!published) { showRpErr('Results have not been published yet. Please check back later.'); return; }
+  Promise.all([
+    DB().collection('settings').doc('config').get(),
     DB().collection('attempts').where('employeeCode','==',code).where('status','==','completed').get()
-      .then(function(snap){
-        if (snap.empty) { showRpErr('No completed results found for Employee ID "'+code+'". Ensure you used the correct ID.'); return; }
-        var atts = snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
-        var examIds = [...new Set(atts.map(function(a){return a.examId;}))];
-        Promise.all(examIds.map(function(eid){return DB().collection('exams').doc(eid).get();}))
-          .then(function(eds){
-            var exams={};
-            eds.forEach(function(ed){if(ed.exists)exams[ed.id]=Object.assign({id:ed.id},ed.data());});
-            renderPersonalResults(atts, exams, code);
-          });
-      })
-      .catch(function(e){ showRpErr('Error fetching results: '+e.message); });
-  }).catch(function(e){ showRpErr('Error: '+e.message); });
+  ]).then(function(res){
+    var cfgSnap = res[0], snap = res[1];
+    if (snap.empty) { showRpErr('No completed results found for Employee ID "'+code+'". Ensure you used the correct ID.'); return; }
+    var atts = snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+    var cfgData = cfgSnap.exists ? cfgSnap.data() : {};
+    var globalPublished = !!cfgData.resultsPublished;
+    var pp = cfgData.publishedPlants || {};
+    var empPlant = atts[0].plantLocation || '';
+    var published = (empPlant && Object.prototype.hasOwnProperty.call(pp, empPlant))
+      ? !!pp[empPlant] : globalPublished;
+    if (!published) { showRpErr('Results have not been published yet. Please check back later.'); return; }
+    var examIds = [...new Set(atts.map(function(a){return a.examId;}))];
+    Promise.all(examIds.map(function(eid){return DB().collection('exams').doc(eid).get();}))
+      .then(function(eds){
+        var exams={};
+        eds.forEach(function(ed){if(ed.exists)exams[ed.id]=Object.assign({id:ed.id},ed.data());});
+        renderPersonalResults(atts, exams, code);
+      });
+  }).catch(function(e){ showRpErr('Error fetching results: '+e.message); });
 }
 function showRpErr(msg){
   var el=G('rpErr');
@@ -6243,7 +6286,7 @@ function renderPersonalResults(atts, exams, code) {
         '</div>'+
 
         '<div class="ep-result-footer">'+
-          (CFG.resultsPublished||ex.receiptAfter
+          (true /* publish check already passed per-plant before this renders */
             ? '<span class="ep-cert-note">Your personalised assessment certificate is ready to download.</span>'+
               '<button class="ep-cert-btn '+(isPass?'pass':'')+'" onclick=\'dlCert('+JSON.stringify(cd)+')\'>⬇ Download Certificate</button>'
             : '<span class="ep-cert-note">🔒 Certificate will be provided by the administrator.</span>'+
@@ -7122,41 +7165,41 @@ function loginEmpLookup() {
   card.classList.remove('vis');
   if (!code) { errEl.textContent = 'Please enter your Employee ID.'; errEl.classList.remove('h'); return; }
 
-  // Check published first
-  DB().collection('settings').doc('config').get().then(function(snap){
-    var published = snap.exists && snap.data().resultsPublished;
+  Promise.all([
+    DB().collection('settings').doc('config').get(),
+    DB().collection('attempts').where('employeeCode','==',code).where('status','==','completed').get()
+  ]).then(function(res){
+    var cfgSnap = res[0], snap = res[1];
+    if (snap.empty) {
+      errEl.textContent = 'No completed results found for "'+code+'". Please check your Employee ID.';
+      errEl.classList.remove('h');
+      return;
+    }
+
+    // Sort by submission date, pick latest
+    var atts = snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+    atts.sort(function(a,b){
+      return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0);
+    });
+    var latest = atts[0];
+
+    var cfgData = cfgSnap.exists ? cfgSnap.data() : {};
+    var globalPublished = !!cfgData.resultsPublished;
+    var pp = cfgData.publishedPlants || {};
+    var empPlant = latest.plantLocation || '';
+    var published = (empPlant && Object.prototype.hasOwnProperty.call(pp, empPlant))
+      ? !!pp[empPlant] : globalPublished;
     if (!published) {
       errEl.textContent = '🔒 Results have not been published yet. Please check back later.';
       errEl.classList.remove('h');
       return;
     }
 
-    DB().collection('attempts')
-      .where('employeeCode','==',code)
-      .where('status','==','completed')
-      .get()
-      .then(function(snap){
-        if(snap.empty){
-          errEl.textContent = 'No completed results found for "'+code+'". Please check your Employee ID.';
-          errEl.classList.remove('h');
-          return;
-        }
-
-        // Sort by submission date, pick latest
-        var atts = snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
-        atts.sort(function(a,b){
-          return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0);
-        });
-        var latest = atts[0];
-
-        // Fetch exam details for the latest attempt
-        DB().collection('exams').doc(latest.examId).get().then(function(ed){
-          var ex = ed.exists ? Object.assign({id:ed.id},ed.data()) : {};
-          renderLoginEmpCard(latest, ex, atts.length);
-        });
-      })
-      .catch(function(e){ errEl.textContent = 'Error: '+e.message; errEl.classList.remove('h'); });
-
+    // Fetch exam details for the latest attempt
+    DB().collection('exams').doc(latest.examId).get().then(function(ed){
+      var ex = ed.exists ? Object.assign({id:ed.id},ed.data()) : {};
+      renderLoginEmpCard(latest, ex, atts.length);
+    });
   }).catch(function(e){ errEl.textContent = 'Error: '+e.message; errEl.classList.remove('h'); });
 }
 
