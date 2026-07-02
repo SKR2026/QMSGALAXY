@@ -1910,13 +1910,10 @@ function pgDash(plantFilter) {
     plantQuery(DB().collection('questions').where('isActive','==',true)).get(),
     plantQuery(DB().collection('exams')).get(),
     plantQuery(DB().collection('candidates').where('isActive','==',true)).get(),
-    DB().collection('attempts').where('status','==','completed').get(),
-    DB().collection('candidates').get(),
+    plantQuery(DB().collection('attempts').where('status','==','completed')).get(),
   ]).then(function(res) {
-    var qS=res[0], eS=res[1], cS=res[2];
-    var candsAllAtDash={};
-    res[4].docs.forEach(function(d){ candsAllAtDash[d.id]=d.data(); });
-    var allAtts=filterAttemptsByPlant(res[3].docs.map(function(d){return Object.assign({id:d.id},d.data());}), candsAllAtDash);
+    var qS=res[0], eS=res[1], cS=res[2], aS=res[3];
+    var allAtts=aS.docs.map(function(d){return Object.assign({id:d.id},d.data());});
 
     // ── Plant tab strip (super admin only) ──────────────────
     var plantTabHtml = '';
@@ -1935,11 +1932,7 @@ function pgDash(plantFilter) {
 
     // ── Filter attempts by active plant tab ─────────────────
     var atts = _dashActivePlant
-      ? allAtts.filter(function(a){
-          if (a.plantLocation) return a.plantLocation === _dashActivePlant;
-          var c = candsAllAtDash[a.candidateId];
-          return !!c && c.plantLocation === _dashActivePlant;
-        })
+      ? allAtts.filter(function(a){ return a.plantLocation === _dashActivePlant; })
       : allAtts;
 
     var examsMap={};
@@ -3816,19 +3809,16 @@ function pgResults() {
   setHtml('vPgCnt',loading());
   Promise.all([
     isSuperAdmin() ? DB().collection('exams').get() : DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get(),
-    DB().collection('attempts').get(),
-    DB().collection('candidates').get(),
+    plantQuery(DB().collection('attempts')).get(),
+    plantQuery(DB().collection('candidates')).get(),
     plantQuery(DB().collection('questions').where('isActive','==',true)).get()
   ]).then(function(res){
-    var exams={}, candsAll={}, cands={}, questions={};
+    var exams={}, cands={}, questions={};
     res[0].docs.forEach(function(d){exams[d.id]=d.data();});
-    res[2].docs.forEach(function(d){
-      candsAll[d.id]=d.data();
-      if (isSuperAdmin() || d.data().plantLocation===CURRENT_USER.plant) cands[d.id]=d.data();
-    });
+    res[2].docs.forEach(function(d){cands[d.id]=d.data();});
     res[3].docs.forEach(function(d){questions[d.id]=Object.assign({id:d.id},d.data());});
 
-    var atts = filterAttemptsByPlant(res[1].docs.map(function(d){return Object.assign({id:d.id},d.data());}), candsAll)
+    var atts = res[1].docs.map(function(d){return Object.assign({id:d.id},d.data());})
                           .filter(function(a){return a.status==='completed';});
     atts.sort(function(a,b){return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0);});
     window._ra=atts; window._re=exams; window._rc=cands; window._rq=questions;
@@ -4380,14 +4370,12 @@ function expXls() {
 function pgCerts() {
   setHtml('vPgCnt',loading());
   Promise.all([
-    DB().collection('attempts').where('status','==','completed').get(),
-    isSuperAdmin() ? DB().collection('exams').get() : DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get(),
-    DB().collection('candidates').get()
+    plantQuery(DB().collection('attempts').where('status','==','completed')).get(),
+    isSuperAdmin() ? DB().collection('exams').get() : DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get()
   ])
     .then(function(res){
       var exams={};res[1].docs.forEach(function(d){exams[d.id]=d.data();});
-      var candsAllForCerts={};res[2].docs.forEach(function(d){candsAllForCerts[d.id]=d.data();});
-      var atts=filterAttemptsByPlant(res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());}), candsAllForCerts);
+      var atts=res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());});
       atts.sort(function(a,b){ return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0); });
       var pass=atts.filter(function(a){return a.result==='pass';}).length;
       var rows=atts.map(function(a){
@@ -5079,6 +5067,22 @@ function renderSettings() {
       'ℹ️ All changes save to Firestore instantly and appear in all dropdowns immediately.'+
     '</div>'+
 
+    // ── Maintenance ──
+    '<div style="max-width:820px;margin-top:20px">'+
+    '<div class="card">'+
+      '<div class="ch"><span class="ct">🔧 Maintenance</span></div>'+
+      '<div class="cb">'+
+        '<div style="font-size:12px;font-weight:700;margin-bottom:4px">Fix missing plant data on old results</div>'+
+        '<div style="font-size:11px;color:var(--tx3);margin-bottom:10px">'+
+          'Exam attempts assigned to candidates before a recent update may be missing their Plant / Location, '+
+          'which hides them from Plant Admin accounts under Results, Dashboard, and Certificates. '+
+          'This scans all attempts and fills in the missing plant from the assigned candidate\'s record. Safe to run any time — already-correct records are left untouched.'+
+        '</div>'+
+        '<button class="b bg bsm" onclick="backfillAttemptPlants()" id="vBackfillBtn">🔧 Fix Missing Plant Data</button>'+
+        '<div id="vBackfillResult" style="margin-top:10px;font-size:12px"></div>'+
+      '</div>'+
+    '</div>'+
+    '</div>'+
 
     // ── Data Management ──
     '<div style="max-width:820px;margin-top:20px">'+
@@ -5330,6 +5334,67 @@ function deleteAdminUser(uid, email) {
     toast('Admin profile deleted for '+email,'wn');
     renderUserMgmt();
   }).catch(function(e){ toast('Error: '+e.message,'er'); });
+}
+
+// ── MAINTENANCE ──────────────────────────────────────────────
+/** One-time repair for attempts created via the old "Assign" flow, which didn't
+ *  save the candidate's plantLocation/department onto the attempt document.
+ *  Those attempts are invisible to Plant Admins (Results/Dashboard/Certificates
+ *  all filter attempts by plantLocation). Runs as Super Admin so it has full
+ *  read access to every attempt and candidate, then patches only the records
+ *  that actually need it. Safe to re-run — already-tagged attempts are skipped. */
+function backfillAttemptPlants() {
+  if (!isSuperAdmin()) { toast('Only Super Admin can run this.', 'er'); return; }
+  var btn = G('vBackfillBtn'), resEl = G('vBackfillResult');
+  if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
+  if (resEl) resEl.textContent = '';
+  Promise.all([
+    DB().collection('attempts').get(),
+    DB().collection('candidates').get()
+  ]).then(function(res){
+    var candsAll = {};
+    res[1].docs.forEach(function(d){ candsAll[d.id] = d.data(); });
+
+    var toFix = [];
+    res[0].docs.forEach(function(d){
+      var a = d.data();
+      if (a.plantLocation) return; // already has it — skip
+      var c = candsAll[a.candidateId];
+      if (c && c.plantLocation) {
+        toFix.push({ ref: d.ref, plantLocation: c.plantLocation, department: a.department || c.department || '' });
+      }
+    });
+
+    if (!toFix.length) {
+      if (btn) { btn.disabled = false; btn.textContent = '🔧 Fix Missing Plant Data'; }
+      if (resEl) resEl.innerHTML = '<span style="color:var(--gn)">✓ Nothing to fix — every attempt already has its plant recorded.</span>';
+      return;
+    }
+
+    // Batch writes in chunks of 400 (Firestore batch limit is 500)
+    var chunks = [];
+    for (var i=0; i<toFix.length; i+=400) chunks.push(toFix.slice(i, i+400));
+
+    var chain = Promise.resolve();
+    chunks.forEach(function(chunk){
+      chain = chain.then(function(){
+        var batch = DB().batch();
+        chunk.forEach(function(item){
+          batch.update(item.ref, { plantLocation: item.plantLocation, department: item.department });
+        });
+        return batch.commit();
+      });
+    });
+
+    return chain.then(function(){
+      if (btn) { btn.disabled = false; btn.textContent = '🔧 Fix Missing Plant Data'; }
+      if (resEl) resEl.innerHTML = '<span style="color:var(--gn)">✓ Fixed '+toFix.length+' attempt(s). Plant Admins will now see them in Results, Dashboard, and Certificates.</span>';
+      toast('Fixed '+toFix.length+' attempt(s)!', 'ok');
+    });
+  }).catch(function(e){
+    if (btn) { btn.disabled = false; btn.textContent = '🔧 Fix Missing Plant Data'; }
+    if (resEl) resEl.innerHTML = '<span style="color:var(--rd)">Error: '+e.message+'</span>';
+  });
 }
 
 // ── DATA MANAGEMENT ──────────────────────────────────────────
