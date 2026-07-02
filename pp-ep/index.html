@@ -1320,6 +1320,36 @@ function currentPageName() {
   return el && el.id ? el.id.replace('n-','') : '';
 }
 
+/** Checkbox grid for picking which plants an exam applies to (Super Admin only).
+ *  Leaving everything unchecked means "All Plants" — same as the old blank-select behaviour. */
+function plantChecklistHtml(selected, prefix) {
+  selected = selected || [];
+  return '<div style="display:flex;flex-wrap:wrap;gap:7px;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg3)">' +
+    PLANTS.map(function(p){
+      var checked = selected.indexOf(p) > -1 ? 'checked' : '';
+      return '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:5px 9px;border:1px solid var(--bd2);border-radius:6px;background:var(--bg2)">' +
+        '<input type="checkbox" class="'+prefix+'PlantChk" value="'+esc(p)+'" '+checked+' style="accent-color:var(--bl);cursor:pointer;width:13px;height:13px">'+esc(p)+
+      '</label>';
+    }).join('') +
+    '</div>' +
+    '<div style="font-size:11px;color:var(--tx3);margin-top:5px">✓ Check one or more plants this exam applies to. Leave all unchecked for <strong>All Plants</strong>.</div>';
+}
+/** Reads the checked plant checkboxes for a given prefix ('e' create / 'ee' edit). */
+function readPlantChecklist(prefix) {
+  var out = [];
+  document.querySelectorAll('.'+prefix+'PlantChk:checked').forEach(function(cb){ out.push(cb.value); });
+  return out;
+}
+/** Does this exam apply to the given plant? Handles the new plantLocations array,
+ *  the legacy single plantLocation string, and "no restriction set" (= all plants). */
+function examAppliesToPlant(exam, plant) {
+  if (!plant) return true;
+  var pls = exam.plantLocations;
+  if (Array.isArray(pls) && pls.length) return pls.indexOf(plant) > -1;
+  if (exam.plantLocation) return exam.plantLocation === plant;
+  return true; // no plant restriction recorded at all => visible to every plant
+}
+
 // DOM helpers — defined before anything runs
 function G(id)      { return document.getElementById(id); }
 
@@ -3039,6 +3069,10 @@ function expQwiseBoth(examId, examName) {
 function clearAllExams() {
   var exams = window._exams || [];
   if (!exams.length) { toast('No exams to clear','wn'); return; }
+  if (!isSuperAdmin()) {
+    var shared = exams.some(function(e){ var pls=e.plantLocations; return !Array.isArray(pls) || pls.length!==1; });
+    if (shared) { toast('Some exams here are managed centrally by Super Admin and apply to more than just your plant — they can\'t be bulk-cleared from this account.', 'er'); return; }
+  }
   if (!confirm('⚠️ This will PERMANENTLY DELETE all ' + exams.length + ' exam(s) and their attempt data. This cannot be undone.\n\nType "DELETE" to confirm then click OK.')) return;
   var conf = prompt('Type DELETE to confirm:','');
   if ((conf||'').trim().toUpperCase() !== 'DELETE') { toast('Cancelled — nothing deleted','wn'); return; }
@@ -3063,11 +3097,10 @@ function pgExams() {
     '<button class="b bp bsm" onclick="addExamMo()">+ Create Exam</button>'
   );
   setHtml('vPgCnt', loading());
-  (isSuperAdmin()
-    ? DB().collection('exams').orderBy('createdAt','desc').get()
-    : DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get()
-  ).then(function(snap){
+  DB().collection('exams').orderBy('createdAt','desc').get()
+  .then(function(snap){
     var exams=snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+    if (!isSuperAdmin()) exams = exams.filter(function(e){ return examAppliesToPlant(e, CURRENT_USER.plant); });
     window._exams=exams;
     var depts=[];
     exams.forEach(function(e){if(e.department&&depts.indexOf(e.department)<0)depts.push(e.department);});
@@ -3091,7 +3124,7 @@ function pgExams() {
           '<button class="b bg bxs" onclick="assignMo(\''+e.id+'\',\''+esc(e.name||'')+'\')">Assign</button>'+
           '<button class="b bp_ bxs" onclick="editExamMo(\''+e.id+'\')">Edit</button>'+
           '<button class="b bt bxs" onclick="showQwiseExportMo(\''+e.id+'\',\''+esc(e.name||'')+'\')">📊 Responses</button>'+
-          '<button class="b bd_ bxs" onclick="delExam(\''+e.id+'\')">Del</button>'+
+          ((isSuperAdmin()||(Array.isArray(e.plantLocations)&&e.plantLocations.length===1)) ? '<button class="b bd_ bxs" onclick="delExam(\''+e.id+'\')">Del</button>' : '')+
         '</td></tr>';
     }).join('');
     setHtml('vPgCnt',
@@ -3134,7 +3167,7 @@ function filExams() {
         '<button class="b bg bxs" onclick="assignMo(\''+e.id+'\',\''+esc(e.name||'')+'\')">Assign</button>'+
         '<button class="b bp_ bxs" onclick="editExamMo(\''+e.id+'\')">Edit</button>'+
         '<button class="b bt bxs" onclick="showQwiseExportMo(\''+e.id+'\',\''+esc(e.name||'')+'\')">📊 Responses</button>'+
-        '<button class="b bd_ bxs" onclick="delExam(\''+e.id+'\')">Del</button>'+
+        ((isSuperAdmin()||(Array.isArray(e.plantLocations)&&e.plantLocations.length===1)) ? '<button class="b bd_ bxs" onclick="delExam(\''+e.id+'\')">Del</button>' : '')+
       '</td></tr>';
   }).join('');
   var tb=G('vExTb'); if(tb) tb.innerHTML=rows||noRows(8,'No exams found.');
@@ -3154,6 +3187,14 @@ function exChkChange() {
 function delSelExams() {
   var ids=[]; document.querySelectorAll('.exChk:checked').forEach(function(c){ids.push(c.getAttribute('data-id'));});
   if(!ids.length){toast('No exams selected','wn');return;}
+  if (!isSuperAdmin()) {
+    var byId={}; (window._exams||[]).forEach(function(e){byId[e.id]=e;});
+    var blocked = ids.some(function(id){
+      var ex=byId[id], pls=ex&&ex.plantLocations;
+      return !ex || !Array.isArray(pls) || pls.length!==1;
+    });
+    if (blocked) { toast('One or more selected exams are managed centrally by Super Admin and apply to more than just your plant — deselect them to continue.', 'er'); return; }
+  }
   if(!confirm('Permanently delete '+ids.length+' selected exam(s) and all their attempt data? This cannot be undone.')) return;
   // Delete exams + their attempts
   Promise.all(ids.map(function(id){
@@ -3186,6 +3227,10 @@ function editExamMo(id) {
     '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--tx3);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--bd)">📋 Basic Information</div>'+
     '<div class="fg"><label class="fl">Exam / Topic Name *</label><input class="fi" id="eeN" value="'+esc(e.name||'')+'"></div>'+
     (e.examNumber?'<div style="background:var(--blbg);border:1px solid rgba(79,142,247,.2);border-radius:7px;padding:8px 11px;font-size:12px;color:var(--bl);margin-bottom:10px">ℹ️ Exam Number: <strong>'+esc(e.examNumber)+'</strong></div>':'')+
+    (isSuperAdmin()
+      ? '<div class="fg"><label class="fl">Applicable Plant(s)</label>'+plantChecklistHtml(Array.isArray(e.plantLocations)&&e.plantLocations.length ? e.plantLocations : (e.plantLocation?[e.plantLocation]:[]), 'ee')+'</div>'
+      : ''
+    )+
 
     /* ── Question Selection Mode ── */
     '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--tx3);margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--bd)">🗂️ Question Selection Mode</div>'+
@@ -3365,6 +3410,12 @@ function saveEditExam(id) {
     department: qSelMode==='topic' ? val('eeDtTopic') : val('eeDt'),
     questionSelectionMode: qSelMode,
     selectedTopic: qSelMode==='topic' ? topicVal : null,
+    plantLocation: (function(){
+      if (!isSuperAdmin()) return CURRENT_USER.plant || '';
+      var pl = readPlantChecklist('ee');
+      return pl.length===1 ? pl[0] : '';
+    })(),
+    plantLocations: isSuperAdmin() ? readPlantChecklist('ee') : (CURRENT_USER.plant ? [CURRENT_USER.plant] : []),
     passingMarks: parseInt(val('eePa'))||60,
     totalMarks: parseInt(val('eeTm'))||100,
     examQuestionCount: parseInt(val('eeQc'))||20,
@@ -3418,7 +3469,7 @@ function addExamMo() {
   '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--tx3);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--bd)">📋 Basic Information</div>'+
   '<div class="fg"><label class="fl">Exam / Topic Name *</label><input class="fi" id="eN" placeholder="e.g. Safety Compliance 2026 — Q2 Review"></div>'+
   (isSuperAdmin()
-    ? '<div class="fg"><label class="fl">Plant / Location</label><select class="fi fsel" id="ePlant"><option value="">— All Plants —</option>'+pOpts()+'</select></div>'
+    ? '<div class="fg"><label class="fl">Applicable Plant(s)</label>'+plantChecklistHtml([], 'e')+'</div>'
     : '<div class="fg"><label class="fl">Plant / Location</label><div class="fi" style="opacity:.7;cursor:not-allowed">'+esc(CURRENT_USER.plant||'—')+'</div></div>'
   )+
   '<div style="background:var(--blbg);border:1px solid rgba(79,142,247,.2);border-radius:7px;padding:8px 11px;font-size:12px;color:var(--bl);margin-bottom:10px">ℹ️ A unique <strong>Exam Number</strong> (EXAM-YYYY-XXXX) will be auto-generated and displayed on question papers, certificates, results, and all reports.</div>'+
@@ -3608,12 +3659,17 @@ function saveExam() {
   var yr = new Date().getFullYear();
   var examNum = 'EXAM-'+yr+'-'+Math.random().toString(36).substring(2,6).toUpperCase()+rnd();
 
+  var plantLocations = !isSuperAdmin()
+    ? (CURRENT_USER.plant ? [CURRENT_USER.plant] : [])
+    : readPlantChecklist('e');
+
   var data = {
     name: n,
     examNumber: examNum,
     topic: val('eTop'),
     department: val('eDt'),
-    plantLocation: !isSuperAdmin() ? CURRENT_USER.plant : (val('ePlant')||''),
+    plantLocation: plantLocations.length===1 ? plantLocations[0] : '',
+    plantLocations: plantLocations,
     questionSelectionMode: qSelMode,
     selectedTopic: qSelMode==='topic' ? val('eTopSel') : null,
     passingMarks: parseInt(val('ePa'))||60,
@@ -3648,6 +3704,15 @@ function saveExam() {
     }).catch(function(err){toast('Error: '+err.message,'er');});
 }
 function delExam(id){
+  if (!isSuperAdmin()) {
+    var ex = (window._exams||[]).filter(function(e){return e.id===id;})[0];
+    var pls = ex && ex.plantLocations;
+    var sharedAcrossPlants = !ex || !Array.isArray(pls) || pls.length!==1;
+    if (sharedAcrossPlants) {
+      toast('This exam is managed centrally by Super Admin and applies to more than just your plant — it cannot be deleted here.', 'er');
+      return;
+    }
+  }
   if(!confirm('Permanently delete this exam? This cannot be undone.')) return;
   // Delete the exam doc AND its linked attempts
   var batch = DB().batch();
@@ -3834,13 +3899,16 @@ function pgResults() {
   );
   setHtml('vPgCnt',loading());
   Promise.all([
-    isSuperAdmin() ? DB().collection('exams').get() : DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get(),
+    DB().collection('exams').get(),
     plantQuery(DB().collection('attempts')).get(),
     plantQuery(DB().collection('candidates')).get(),
     plantQuery(DB().collection('questions').where('isActive','==',true)).get()
   ]).then(function(res){
     var exams={}, cands={}, questions={};
-    res[0].docs.forEach(function(d){exams[d.id]=d.data();});
+    res[0].docs.forEach(function(d){
+      var ex = d.data();
+      if (isSuperAdmin() || examAppliesToPlant(ex, CURRENT_USER.plant)) exams[d.id]=ex;
+    });
     res[2].docs.forEach(function(d){cands[d.id]=d.data();});
     res[3].docs.forEach(function(d){questions[d.id]=Object.assign({id:d.id},d.data());});
 
@@ -4406,7 +4474,7 @@ function pgCerts() {
   setHtml('vPgCnt',loading());
   Promise.all([
     plantQuery(DB().collection('attempts').where('status','==','completed')).get(),
-    isSuperAdmin() ? DB().collection('exams').get() : DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get()
+    DB().collection('exams').get()
   ])
     .then(function(res){
       var exams={};res[1].docs.forEach(function(d){exams[d.id]=d.data();});
