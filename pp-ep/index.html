@@ -1324,7 +1324,11 @@ function currentPageName() {
  *  Leaving everything unchecked keeps the exam visible to Super Admin only. */
 function plantChecklistHtml(selected, prefix) {
   selected = selected || [];
-  return '<div style="display:flex;flex-wrap:wrap;gap:7px;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg3)">' +
+  return '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'+
+      '<span style="font-size:11px;color:var(--tx3)">'+PLANTS.length+' plant(s) available</span>'+
+      '<button type="button" class="b bg bxs" onclick="toggleAllPlantChks(\''+prefix+'\')">☑ Select All / Unselect All</button>'+
+    '</div>'+
+    '<div style="display:flex;flex-wrap:wrap;gap:7px;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg3)">' +
     PLANTS.map(function(p){
       var checked = selected.indexOf(p) > -1 ? 'checked' : '';
       return '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:5px 9px;border:1px solid var(--bd2);border-radius:6px;background:var(--bg2)">' +
@@ -1333,6 +1337,14 @@ function plantChecklistHtml(selected, prefix) {
     }).join('') +
     '</div>' +
     '<div style="font-size:11px;color:var(--tx3);margin-top:5px">✓ Check the plant(s) this exam should be assigned to — it will appear in that plant admin\'s account. Leave all unchecked to keep this exam <strong>visible to Super Admin only</strong>.</div>';
+}
+/** Select-all-or-none toggle for a plant checklist: if every box is currently
+ *  checked, unchecks them all; otherwise checks them all — one click either way. */
+function toggleAllPlantChks(prefix) {
+  var boxes = document.querySelectorAll('.'+prefix+'PlantChk');
+  if (!boxes.length) return;
+  var allChecked = Array.prototype.every.call(boxes, function(cb){ return cb.checked; });
+  boxes.forEach(function(cb){ cb.checked = !allChecked; });
 }
 /** Reads the checked plant checkboxes for a given prefix ('e' create / 'ee' edit). */
 function readPlantChecklist(prefix) {
@@ -3098,10 +3110,25 @@ function pgExams() {
     '<button class="b bp bsm" onclick="addExamMo()">+ Create Exam</button>'
   );
   setHtml('vPgCnt', loading());
-  DB().collection('exams').orderBy('createdAt','desc').get()
-  .then(function(snap){
-    var exams=snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
-    if (!isSuperAdmin()) exams = exams.filter(function(e){ return examAppliesToPlant(e, CURRENT_USER.plant); });
+  (isSuperAdmin()
+    ? DB().collection('exams').orderBy('createdAt','desc').get().then(function(snap){
+        return snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+      })
+    : Promise.all([
+        DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get(),
+        DB().collection('exams').where('plantLocations','array-contains',CURRENT_USER.plant).get()
+          .catch(function(e){
+            console.warn('plantLocations array-contains query was rejected — Firestore security rules likely need updating for the new multi-plant field. Falling back to single-plant exams only.', e.message);
+            return { docs: [] };
+          })
+      ]).then(function(snaps){
+        var byId = {};
+        snaps.forEach(function(snap){ snap.docs.forEach(function(d){ byId[d.id] = Object.assign({id:d.id},d.data()); }); });
+        var list = Object.keys(byId).map(function(k){return byId[k];});
+        list.sort(function(a,b){ return (b.createdAt&&b.createdAt.seconds||0)-(a.createdAt&&a.createdAt.seconds||0); });
+        return list;
+      })
+  ).then(function(exams){
     window._exams=exams;
     var depts=[];
     exams.forEach(function(e){if(e.department&&depts.indexOf(e.department)<0)depts.push(e.department);});
@@ -3900,16 +3927,19 @@ function pgResults() {
   );
   setHtml('vPgCnt',loading());
   Promise.all([
-    DB().collection('exams').get(),
+    isSuperAdmin()
+      ? DB().collection('exams').get()
+      : Promise.all([
+          DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get(),
+          DB().collection('exams').where('plantLocations','array-contains',CURRENT_USER.plant).get()
+            .catch(function(e){ console.warn('plantLocations array-contains query rejected — check Firestore rules:', e.message); return { docs: [] }; })
+        ]).then(function(snaps){ return { docs: snaps[0].docs.concat(snaps[1].docs) }; }),
     plantQuery(DB().collection('attempts')).get(),
     plantQuery(DB().collection('candidates')).get(),
     plantQuery(DB().collection('questions').where('isActive','==',true)).get()
   ]).then(function(res){
     var exams={}, cands={}, questions={};
-    res[0].docs.forEach(function(d){
-      var ex = d.data();
-      if (isSuperAdmin() || examAppliesToPlant(ex, CURRENT_USER.plant)) exams[d.id]=ex;
-    });
+    res[0].docs.forEach(function(d){ exams[d.id]=d.data(); });
     res[2].docs.forEach(function(d){cands[d.id]=d.data();});
     res[3].docs.forEach(function(d){questions[d.id]=Object.assign({id:d.id},d.data());});
 
@@ -4475,7 +4505,13 @@ function pgCerts() {
   setHtml('vPgCnt',loading());
   Promise.all([
     plantQuery(DB().collection('attempts').where('status','==','completed')).get(),
-    DB().collection('exams').get()
+    isSuperAdmin()
+      ? DB().collection('exams').get()
+      : Promise.all([
+          DB().collection('exams').where('plantLocation','==',CURRENT_USER.plant).get(),
+          DB().collection('exams').where('plantLocations','array-contains',CURRENT_USER.plant).get()
+            .catch(function(e){ console.warn('plantLocations array-contains query rejected — check Firestore rules:', e.message); return { docs: [] }; })
+        ]).then(function(snaps){ return { docs: snaps[0].docs.concat(snaps[1].docs) }; })
   ])
     .then(function(res){
       var exams={};res[1].docs.forEach(function(d){exams[d.id]=d.data();});
