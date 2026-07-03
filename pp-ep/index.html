@@ -1279,6 +1279,13 @@ function plantQuery(colRef) {
   return colRef.where('plantLocation', '==', CURRENT_USER.plant);
 }
 
+/** Normalize a plant name for tolerant comparison (trims + lowercases). Guards
+ *  against the #1 cause of "nothing shows for the plant admin": the plant string
+ *  stored on the exam/candidate/attempt differing from the admin's assigned plant
+ *  only by case or stray whitespace (e.g. "Plant A" vs "plant a" vs "Plant A "). */
+function normPlant(x){ return (x||'').toString().trim().toLowerCase(); }
+function samePlant(a, b){ return normPlant(a) === normPlant(b); }
+
 /** Attempts created via the old "Assign" flow (before this fix) don't carry their
  *  own plantLocation field, so a plain plantQuery() on 'attempts' silently returns
  *  nothing for plant admins. This filters a full attempts array client-side,
@@ -1287,10 +1294,18 @@ function plantQuery(colRef) {
 function filterAttemptsByPlant(attempts, candsMapAll) {
   if (isSuperAdmin() || !CURRENT_USER.plant) return attempts;
   return attempts.filter(function(a){
-    if (a.plantLocation) return a.plantLocation === CURRENT_USER.plant;
+    if (a.plantLocation) return samePlant(a.plantLocation, CURRENT_USER.plant);
     var c = candsMapAll && candsMapAll[a.candidateId];
-    return !!c && c.plantLocation === CURRENT_USER.plant;
+    return !!c && samePlant(c.plantLocation, CURRENT_USER.plant);
   });
+}
+
+/** Client-side tolerant plant filter for a docs array (id + data). Use this instead
+ *  of the server-side plantQuery() on user-facing lists so that case/whitespace
+ *  mismatches in stored plant names don't silently hide a plant admin's own data. */
+function filterDocsByPlant(docs) {
+  if (isSuperAdmin() || !CURRENT_USER.plant) return docs;
+  return docs.filter(function(d){ return samePlant(d.plantLocation, CURRENT_USER.plant); });
 }
 
 /** Build a plant-filter <select> option list restricted to admin's plant (or all for super admin) */
@@ -1368,9 +1383,13 @@ function readPlantChecklist(prefix) {
  *  treated as Super-Admin-only — it will not appear for any Plant Admin. */
 function examAppliesToPlant(exam, plant) {
   if (!plant) return true; // Super Admin always sees everything
+  var norm = function(x){ return (x||'').toString().trim().toLowerCase(); };
+  var target = norm(plant);
   var pls = exam.plantLocations;
-  if (Array.isArray(pls) && pls.length) return pls.indexOf(plant) > -1;
-  if (exam.plantLocation) return exam.plantLocation === plant;
+  if (Array.isArray(pls) && pls.length) {
+    return pls.some(function(p){ return norm(p) === target; });
+  }
+  if (exam.plantLocation) return norm(exam.plantLocation) === target;
   return false; // no plant checked at creation => Super Admin only
 }
 
@@ -1943,7 +1962,11 @@ function showAdmin(d) {
 
   renderLicBadge();
   loadNotifications();
-  goPage('dashboard');
+  // Make sure the real configured PLANTS/departments/topics are loaded from
+  // settings BEFORE the first page renders. Otherwise a plant admin could be
+  // filtered against stale default plant names (race condition), or an exam's
+  // plant checklist could show defaults — both cause "nothing shows" bugs.
+  loadSettings(function(){ goPage('dashboard'); });
 }
 
 var PAGES = {
@@ -1985,13 +2008,17 @@ function pgDash(plantFilter) {
   if (plantFilter !== undefined) _dashActivePlant = plantFilter;
   setHtml('vPgCnt', loading());
   Promise.all([
-    plantQuery(DB().collection('questions').where('isActive','==',true)).get(),
+    DB().collection('questions').where('isActive','==',true).get(),
     DB().collection('exams').get(),
-    plantQuery(DB().collection('candidates').where('isActive','==',true)).get(),
+    DB().collection('candidates').where('isActive','==',true).get(),
     DB().collection('attempts').where('status','==','completed').get(),
     isSuperAdmin() ? Promise.resolve(null) : DB().collection('candidates').get()
   ]).then(function(res) {
-    var qS=res[0], eSraw=res[1], cS=res[2], aSraw=res[3], candsAllSnap=res[4];
+    var qSdocs = filterDocsByPlant(res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());}));
+    var qS = { docs: qSdocs, size: qSdocs.length };
+    var eSraw=res[1], aSraw=res[3], candsAllSnap=res[4];
+    var cSdocs = filterDocsByPlant(res[2].docs.map(function(d){return Object.assign({id:d.id},d.data());}));
+    var cS = { docs: cSdocs, size: cSdocs.length };
     var eSDocs = isSuperAdmin() ? eSraw.docs : eSraw.docs.filter(function(d){ return examAppliesToPlant(d.data(), CURRENT_USER.plant); });
     var eS = { docs: eSDocs, size: eSDocs.length };
     var allAttsRaw = aSraw.docs.map(function(d){return Object.assign({id:d.id},d.data());});
@@ -2031,7 +2058,7 @@ function pgDash(plantFilter) {
 
     // Questions by dept bar chart
     var depts={};
-    qS.docs.forEach(function(d){var dt=d.data().department||'Other';depts[dt]=(depts[dt]||0)+1;});
+    qS.docs.forEach(function(d){var dt=d.department||'Other';depts[dt]=(depts[dt]||0)+1;});
     var dRows = Object.entries(depts).sort(function(a,b){return b[1]-a[1];}).slice(0,8).map(function(kv){
       return '<div class="hr_"><div class="hl">'+kv[0].substring(0,10)+'</div><div class="hbg"><div class="hbf" style="width:'+Math.round(kv[1]/qS.size*100)+'%;background:var(--bl)"></div></div><div class="hv">'+kv[1]+'</div></div>';
     }).join('');
@@ -3770,10 +3797,10 @@ function delExam(id){
 }
 function assignMo(eid, ename) {
   Promise.all([
-    plantQuery(DB().collection('candidates').where('isActive','==',true)).get(),
+    DB().collection('candidates').where('isActive','==',true).get(),
     DB().collection('attempts').where('examId','==',eid).get()
   ]).then(function(res){
-    var cands=res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());});
+    var cands=filterDocsByPlant(res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());}));
     var assigned={};
     res[1].docs.forEach(function(d){ assigned[d.data().candidateId]=true; });
     var html='<div style="font-size:12px;color:var(--tx2);margin-bottom:10px">Assign candidates so they can access this exam with their Employee Code.</div>'+
@@ -3812,8 +3839,9 @@ function doAssign(cid, eid, cname, ecode, ename, cdept, cplant) {
 function pgCands() {
   setHtml('vPgAct','<button class="b bg bsm" onclick="dlCandTpl()">⬇ Template</button><button class="b bg bsm" onclick="impCandXls()">⬆ Import</button>'+(isSuperAdmin()?'<button class="b bd_ bsm" onclick="findOrphanCands()">⚠️ Fix Missing Plants</button>':'')+'<button class="b bp bsm" onclick="addCandMo()">+ Add</button>');
   setHtml('vPgCnt',loading());
-  plantQuery(DB().collection('candidates').where('isActive','==',true)).get().then(function(snap){
+  DB().collection('candidates').where('isActive','==',true).get().then(function(snap){
     var cs=snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+    cs = filterDocsByPlant(cs);
     cs.sort(function(a,b){ return (a.name||'').localeCompare(b.name||''); });
     window._cands=cs;
     var depts=[];
@@ -3938,22 +3966,28 @@ function findOrphanCands() {
   setHtml('vPgCnt', loading());
   DB().collection('candidates').where('isActive','==',true).get().then(function(snap){
     var all = snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
-    var orphans = all.filter(function(c){ return !c.plantLocation; });
+    var knownPlants = PLANTS.map(function(p){ return normPlant(p); });
+    var orphans = all.filter(function(c){
+      if (!c.plantLocation) return true; // blank
+      return knownPlants.indexOf(normPlant(c.plantLocation)) === -1; // doesn't match any configured plant
+    });
     if (!orphans.length) {
-      toast('✅ No orphaned candidates found — every active candidate has a plant assigned.', 'ok');
+      toast('✅ No problem candidates found — every active candidate has a valid, recognized plant assigned.', 'ok');
       pgCands();
       return;
     }
     var rows = orphans.map(function(c){
+      var cur = c.plantLocation ? '<span class="bk" style="background:var(--rdbg);color:var(--rd);border:1px solid var(--rdbd)">'+esc(c.plantLocation)+'</span>' : '<span style="color:var(--tx3);font-size:11px">(blank)</span>';
       return '<tr><td class="tc">'+esc(c.employeeCode||'—')+'</td><td class="tn">'+esc(c.name||'—')+'</td>'+
         '<td><span class="bk bb">'+esc(c.department||'—')+'</span></td>'+
+        '<td>'+cur+'</td>'+
         '<td><select class="fi fsel orphanPlantSel" data-id="'+c.id+'" style="font-size:12px"><option value="">— Assign plant —</option>'+pOpts()+'</select></td></tr>';
     }).join('');
     setHtml('vPgCnt',
       '<div style="background:var(--rdbg);border:1px solid var(--rdbd);border-radius:9px;padding:12px 14px;margin-bottom:13px;font-size:13px;color:var(--rd)">'+
-        '⚠️ Found <strong>'+orphans.length+'</strong> candidate(s) with no plant assigned. These are invisible to every Plant Admin\'s account — their exam results silently never show up anywhere except this Super Admin view. This usually happens from an Excel import where the "plant_location" column was blank or missing. Assign a plant to each row below, then click Save.'+
+        '⚠️ Found <strong>'+orphans.length+'</strong> candidate(s) whose plant is blank or does not match any configured plant. These are invisible to their Plant Admin — their exam results silently never show up anywhere except this Super Admin view. This usually happens from an Excel import with a blank/typo\'d "plant_location" column, or a plant that was later renamed. Pick the correct plant for each row below, then click Save.'+
       '</div>'+
-      '<div class="card"><div class="ch"><span class="ct">Orphaned Candidates ('+orphans.length+')</span>'+
+      '<div class="card"><div class="ch"><span class="ct">Problem Candidates ('+orphans.length+')</span>'+
         '<div style="display:flex;gap:7px;align-items:center">'+
           '<select class="fi fsel" id="orphanBulkPlant" style="width:160px;font-size:12px"><option value="">Bulk-set all to…</option>'+pOpts()+'</select>'+
           '<button class="b bg bsm" onclick="applyOrphanBulkPlant()">Apply to All</button>'+
@@ -3961,7 +3995,7 @@ function findOrphanCands() {
           '<button class="b bg bsm" onclick="pgCands()">Cancel</button>'+
         '</div>'+
       '</div>'+
-      '<div class="tw"><table><thead><tr><th>Code</th><th>Name</th><th>Dept</th><th>Assign Plant</th></tr></thead>'+
+      '<div class="tw"><table><thead><tr><th>Code</th><th>Name</th><th>Dept</th><th>Current</th><th>Assign Plant</th></tr></thead>'+
       '<tbody>'+rows+'</tbody></table></div></div>'
     );
   }).catch(function(e){ setHtml('vPgCnt',errB(e.message)); });
@@ -4002,7 +4036,7 @@ function pgResults() {
     DB().collection('exams').get(),
     DB().collection('attempts').get(),
     DB().collection('candidates').get(),
-    plantQuery(DB().collection('questions').where('isActive','==',true)).get()
+    DB().collection('questions').where('isActive','==',true).get()
   ]).then(function(res){
     var exams={}, cands={}, questions={};
     res[0].docs.forEach(function(d){
@@ -4069,7 +4103,18 @@ function pgResults() {
         '</div>'+
       '</div>';
 
+    var diagBanner = '';
+    if (!isSuperAdmin() && atts.length === 0 && attsRaw.length > 0) {
+      diagBanner =
+        '<div style="background:var(--ambg);border:1px solid var(--ambd);border-radius:9px;padding:12px 14px;margin-bottom:14px;font-size:13px;color:var(--am);line-height:1.6">'+
+          '⚠️ There are <strong>'+attsRaw.length+'</strong> completed exam result(s) in the system, but none are matched to your plant (<strong>'+esc(CURRENT_USER.plant||'—')+'</strong>). '+
+          'This usually means the employees\' candidate records have a different (or blank) plant name than your account. '+
+          'Ask your Super Admin to open <strong>Candidates → ⚠️ Fix Missing Plants</strong> and assign these employees to "'+esc(CURRENT_USER.plant||'—')+'". Their results will then appear here automatically.'+
+        '</div>';
+    }
+
     setHtml('vPgCnt',
+      diagBanner+
       tabBar+
       '<div id="rpanel-overview">'+buildOverview(atts,pass,avg,avgTime,deptMap,plantMap,qStats)+'</div>'+
       '<div id="rpanel-detailed" style="display:none">'+buildDetailedResults(atts,exams,cands)+'</div>'
