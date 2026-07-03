@@ -1262,7 +1262,7 @@ var PLANTS = ['Plant A','Plant B','Plant C','Head Office'];
 var TOPICS = ['Safety','ISO 9001','Fire Safety','Inventory','5S','Quality Tools','Environment','HR Policies'];
 
 // ── CURRENT LOGGED-IN ADMIN ──────────────────────────────────
-var CURRENT_USER = { role: 'super_admin', plant: '', displayName: '', email: '' };
+var CURRENT_USER = { role: 'super_admin', plant: '', plants: [], displayName: '', email: '' };
 
 /** Returns true if the current user is a super admin */
 function isSuperAdmin() { return CURRENT_USER.role === 'super_admin'; }
@@ -1274,43 +1274,58 @@ function plantCertDocId() {
 
 /** For plant admins: returns a Firestore query with plant filter added.
  *  For super admins: returns the collection ref unfiltered. */
+/** Returns true if the logged-in user should see data for `plant`.
+ *  Super Admin: always yes. Multi-plant admin: yes if plant is in their plants array.
+ *  Single-plant admin: yes if plant matches their one plant. */
+function userCanSeePlant(plant) {
+  if (isSuperAdmin()) return true;
+  var up = CURRENT_USER.plants;
+  if (Array.isArray(up) && up.length > 1) {
+    return up.some(function(p){ return samePlant(p, plant); });
+  }
+  var sp = CURRENT_USER.plant || (up && up[0]) || '';
+  return samePlant(sp, plant);
+}
+/** The single "primary" plant for this user — used only where a single value is
+ *  needed (e.g. new-candidate default, publish-toggle scope). For multi-plant
+ *  users this returns '' which falls through to all-plant behaviour. */
+function userPrimaryPlant() {
+  if (isSuperAdmin()) return '';
+  var up = CURRENT_USER.plants;
+  if (Array.isArray(up) && up.length > 1) return ''; // multi-plant: no single primary
+  return CURRENT_USER.plant || (up && up[0]) || '';
+}
 function plantQuery(colRef) {
-  if (isSuperAdmin() || !CURRENT_USER.plant) return colRef;
-  return colRef.where('plantLocation', '==', CURRENT_USER.plant);
+  if (isSuperAdmin()) return colRef;
+  var sp = userPrimaryPlant();
+  if (!sp) return colRef; // multi-plant or unassigned — caller will filter client-side
+  return colRef.where('plantLocation', '==', sp);
 }
 
-/** Normalize a plant name for tolerant comparison (trims + lowercases). Guards
- *  against the #1 cause of "nothing shows for the plant admin": the plant string
- *  stored on the exam/candidate/attempt differing from the admin's assigned plant
- *  only by case or stray whitespace (e.g. "Plant A" vs "plant a" vs "Plant A "). */
+/** Normalize a plant name for tolerant comparison. */
 function normPlant(x){ return (x||'').toString().trim().toLowerCase(); }
 function samePlant(a, b){ return normPlant(a) === normPlant(b); }
 
-/** Attempts created via the old "Assign" flow (before this fix) don't carry their
- *  own plantLocation field, so a plain plantQuery() on 'attempts' silently returns
- *  nothing for plant admins. This filters a full attempts array client-side,
- *  falling back to the assigned candidate's plant when the attempt itself has none.
- *  Pass in an UNFILTERED candidates map (id -> candidate data) for the fallback lookup. */
+/** Client-side attempt filter — supports single-plant and multi-plant admins. */
 function filterAttemptsByPlant(attempts, candsMapAll) {
-  if (isSuperAdmin() || !CURRENT_USER.plant) return attempts;
+  if (isSuperAdmin()) return attempts;
   return attempts.filter(function(a){
-    if (a.plantLocation) return samePlant(a.plantLocation, CURRENT_USER.plant);
-    var c = candsMapAll && candsMapAll[a.candidateId];
-    return !!c && samePlant(c.plantLocation, CURRENT_USER.plant);
+    var p = a.plantLocation || (candsMapAll && candsMapAll[a.candidateId] && candsMapAll[a.candidateId].plantLocation) || '';
+    return userCanSeePlant(p);
   });
 }
 
-/** Client-side tolerant plant filter for a docs array (id + data). Use this instead
- *  of the server-side plantQuery() on user-facing lists so that case/whitespace
- *  mismatches in stored plant names don't silently hide a plant admin's own data. */
+/** Client-side doc filter — supports single-plant and multi-plant admins. */
 function filterDocsByPlant(docs) {
-  if (isSuperAdmin() || !CURRENT_USER.plant) return docs;
-  return docs.filter(function(d){ return samePlant(d.plantLocation, CURRENT_USER.plant); });
+  if (isSuperAdmin()) return docs;
+  return docs.filter(function(d){ return userCanSeePlant(d.plantLocation); });
 }
 
 /** Build a plant-filter <select> option list restricted to admin's plant (or all for super admin) */
 function pOptsRestricted(sel) {
-  var list = isSuperAdmin() ? PLANTS : (CURRENT_USER.plant ? [CURRENT_USER.plant] : PLANTS);
+  var up = CURRENT_USER.plants;
+  var list = isSuperAdmin() ? PLANTS
+    : (Array.isArray(up) && up.length ? up : (CURRENT_USER.plant ? [CURRENT_USER.plant] : PLANTS));
   return list.map(function(p){ return '<option value="'+p+'"'+(p===sel?' selected':'')+'>'+p+'</option>'; }).join('');
 }
 
@@ -1323,10 +1338,14 @@ function isPlantPublished(plant) {
   if (Object.prototype.hasOwnProperty.call(pp, plant)) return !!pp[plant];
   return !!CFG.resultsPublished;
 }
-/** Whether results are currently published for the *logged-in* admin's own scope —
- *  global flag for Super Admin, own plant only for a Plant Admin. */
+/** Whether results are currently published for the *logged-in* admin's own scope. */
 function myPlantPublished() {
-  return isSuperAdmin() ? !!CFG.resultsPublished : isPlantPublished(CURRENT_USER.plant);
+  if (isSuperAdmin()) return !!CFG.resultsPublished;
+  var up = CURRENT_USER.plants;
+  if (Array.isArray(up) && up.length > 1) {
+    return up.some(function(p){ return isPlantPublished(p); });
+  }
+  return isPlantPublished(userPrimaryPlant());
 }
 /** Name of the currently active sidebar page, so a shared action (like the
  *  publish toggle) can refresh whichever page it was actually clicked from. */
@@ -1382,14 +1401,22 @@ function readPlantChecklist(prefix) {
  *  the legacy single plantLocation string. If NO plant is set at all, the exam is
  *  treated as Super-Admin-only — it will not appear for any Plant Admin. */
 function examAppliesToPlant(exam, plant) {
-  if (!plant) return true; // Super Admin always sees everything
-  var norm = function(x){ return (x||'').toString().trim().toLowerCase(); };
-  var target = norm(plant);
+  if (isSuperAdmin()) return true;
+  var up = CURRENT_USER.plants;
+  var isMulti = Array.isArray(up) && up.length > 1;
   var pls = exam.plantLocations;
-  if (Array.isArray(pls) && pls.length) {
-    return pls.some(function(p){ return norm(p) === target; });
+  var hasPls = Array.isArray(pls) && pls.length > 0;
+  if (isMulti) {
+    // Multi-plant admin: exam must apply to at least one of their plants
+    if (hasPls) return up.some(function(u){ return pls.some(function(e){ return samePlant(u,e); }); });
+    if (exam.plantLocation) return up.some(function(u){ return samePlant(u, exam.plantLocation); });
+    return false;
   }
-  if (exam.plantLocation) return norm(exam.plantLocation) === target;
+  // Single-plant admin
+  var target = normPlant(plant || userPrimaryPlant());
+  if (!target) return false;
+  if (hasPls) return pls.some(function(p){ return normPlant(p) === target; });
+  if (exam.plantLocation) return normPlant(exam.plantLocation) === target;
   return false; // no plant checked at creation => Super Admin only
 }
 
@@ -1880,6 +1907,16 @@ function resolveAdminUser(user) {
               // Populate CURRENT_USER global
               CURRENT_USER.role        = canonicalRole;
               CURRENT_USER.plant       = d.plant || '';
+              // Multi-plant support: 'plants' array overrides single 'plant' field.
+              // If 'plants' has entries, CURRENT_USER.plants is that array and
+              // CURRENT_USER.plant is left as '' so all plant filters switch to
+              // the array-aware helpers automatically.
+              if (Array.isArray(d.plants) && d.plants.length) {
+                CURRENT_USER.plants  = d.plants;
+                CURRENT_USER.plant   = ''; // signal: use .plants array instead
+              } else {
+                CURRENT_USER.plants  = d.plant ? [d.plant] : [];
+              }
               CURRENT_USER.displayName = d.displayName || (d.email||'').split('@')[0];
               CURRENT_USER.email       = d.email || user.email || '';
               CURRENT_USER.uid         = user.uid;
@@ -1904,6 +1941,7 @@ function resolveAdminUser(user) {
               var d2 = doc2.data();
               CURRENT_USER.role        = 'super_admin';
               CURRENT_USER.plant       = '';
+              CURRENT_USER.plants      = [];
               CURRENT_USER.displayName = d2.displayName || user.email.split('@')[0];
               CURRENT_USER.email       = d2.email || user.email;
               CURRENT_USER.uid         = user.uid;
@@ -1942,7 +1980,11 @@ function showAdmin(d) {
       roleEl.textContent = '⭐ Super Admin';
       roleEl.style.color = 'var(--am)';
     } else {
-      roleEl.textContent = '🏭 Admin — ' + (CURRENT_USER.plant || 'All Plants');
+      var up = CURRENT_USER.plants;
+      var isMulti = Array.isArray(up) && up.length > 1;
+      roleEl.textContent = isMulti
+        ? '🏢 Multi-Plant: ' + up.join(', ')
+        : '🏭 Admin — ' + (CURRENT_USER.plant || 'All Plants');
       roleEl.style.color = 'var(--te)';
     }
   }
@@ -3929,7 +3971,7 @@ function saveEditCand(id) {
     .catch(function(e){toast('Error: '+e.message,'er');});
 }
 function addCandMo() {
-  var plantDisabled = !isSuperAdmin() && CURRENT_USER.plant ? ' disabled style="opacity:.7"' : '';
+  var sp = userPrimaryPlant(); var plantDisabled = (!isSuperAdmin() && sp) ? ' disabled style="opacity:.7"' : '';
   openMo('Add Candidate',
     '<div class="fr"><div class="fg"><label class="fl">Employee Code *</label><input class="fi" id="cCd" placeholder="EMP-001"></div>'+
     '<div class="fg"><label class="fl">Full Name *</label><input class="fi" id="cNm" placeholder="John Doe"></div></div>'+
@@ -3949,7 +3991,7 @@ function saveCand() {
     if(!ex.empty){toast('Employee Code already exists','er');return;}
     DB().collection('candidates').add({employeeCode:code,name:name,
       department:val('cDp'),
-      plantLocation: !isSuperAdmin() && CURRENT_USER.plant ? CURRENT_USER.plant : val('cPl'),
+      plantLocation: (!isSuperAdmin() && userPrimaryPlant()) ? userPrimaryPlant() : val('cPl'),
       designation:val('cDg'),phone:val('cPh'),email:val('cEm'),
       isActive:true,createdAt:firebase.firestore.FieldValue.serverTimestamp()})
       .then(function(){closeMo();toast('Added!','ok');pgCands();})
@@ -5505,10 +5547,15 @@ function renderUserMgmt() {
     users.sort(function(a,b){ return (a.email||'').localeCompare(b.email||''); });
     var rows = users.map(function(u) {
       var isSA = u.role === 'super_admin';
+      var isMultiPlant = Array.isArray(u.plants) && u.plants.length > 1;
       var roleTag = isSA
         ? '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd)">⭐ Super Admin</span>'
-        : '<span class="bk bt">🏭 Plant Admin</span>';
-      var plantTag = u.plant ? '<span class="bk bb" style="margin-left:4px">'+esc(u.plant)+'</span>' : '<span style="color:var(--tx3);font-size:11px">—</span>';
+        : (isMultiPlant
+          ? '<span class="bk" style="background:var(--blbg);color:var(--bl);border:1px solid rgba(79,142,247,.3)">🏢 Multi-Plant Admin</span>'
+          : '<span class="bk bt">🏭 Plant Admin</span>');
+      var plantTag = isMultiPlant
+        ? u.plants.map(function(p){ return '<span class="bk bb" style="margin-left:3px">'+esc(p)+'</span>'; }).join('')
+        : (u.plant ? '<span class="bk bb" style="margin-left:4px">'+esc(u.plant)+'</span>' : '<span style="color:var(--tx3);font-size:11px">—</span>');
       return '<tr>'+
         '<td class="tn">'+esc(u.displayName||u.email||'—')+'</td>'+
         '<td style="color:var(--tx2);font-size:12px">'+esc(u.email||'—')+'</td>'+
@@ -5523,69 +5570,114 @@ function renderUserMgmt() {
       '<div class="tw"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Plant</th><th></th></tr></thead>'+
       '<tbody>'+(rows||noRows(5,'No admin users found.'))+'</tbody></table></div>'+
       '<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--bd)">'+
-        '<div style="font-size:13px;font-weight:700;margin-bottom:10px">➕ Create Plant Admin</div>'+
+        '<div style="font-size:13px;font-weight:700;margin-bottom:10px">➕ Create Admin User</div>'+
         '<div class="fr">'+
-          '<div class="fg"><label class="fl">Display Name</label>'+
+          '<div class="fg"><label class="fl">Display Name *</label>'+
             '<input class="fi" id="newAdmName" placeholder="e.g. Plant A Manager"></div>'+
-          '<div class="fg"><label class="fl">Email</label>'+
+          '<div class="fg"><label class="fl">Email *</label>'+
             '<input class="fi" id="newAdmEmail" type="email" placeholder="admin@company.com"></div>'+
         '</div>'+
         '<div class="fr">'+
-          '<div class="fg"><label class="fl">Temporary Password</label>'+
+          '<div class="fg"><label class="fl">Temporary Password *</label>'+
             '<input class="fi" id="newAdmPwd" type="password" placeholder="Min 6 characters"></div>'+
-          '<div class="fg"><label class="fl">Assign Plant</label>'+
-            '<select class="fi fsel" id="newAdmPlant"><option value="">— Select Plant —</option>'+PLANTS.map(function(p){return'<option>'+p+'</option>';}).join('')+'</select></div>'+
+          '<div class="fg"><label class="fl">Role *</label>'+
+            '<select class="fi fsel" id="newAdmRole" onchange="onAdmRoleChange()">'+
+              '<option value="">— Select Role —</option>'+
+              '<option value="plant">🏭 Plant Admin (single plant)</option>'+
+              '<option value="multi">🏢 Multi-Plant Admin (e.g. Top Management)</option>'+
+            '</select></div>'+
+        '</div>'+
+        '<div id="vNewAdmPlantWrap" class="h">'+
+          '<div class="fg" id="vNewAdmSinglePlantRow">'+
+            '<label class="fl">Assign Plant</label>'+
+            '<select class="fi fsel" id="newAdmPlant"><option value="">— Select Plant —</option>'+PLANTS.map(function(p){return'<option>'+p+'</option>';}).join('')+'</select>'+
+          '</div>'+
+          '<div class="fg h" id="vNewAdmMultiPlantRow">'+
+            '<label class="fl">Assign Plants *</label>'+
+            '<div style="display:flex;flex-wrap:wrap;gap:7px;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg3)" id="vNewAdmPlantChks">'+
+              PLANTS.map(function(p){ return '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:5px 9px;border:1px solid var(--bd2);border-radius:6px;background:var(--bg2)"><input type="checkbox" class="newAdmPChk" value="'+p+'" style="accent-color:var(--bl);width:13px;height:13px">'+esc(p)+'</label>'; }).join('')+
+            '</div>'+
+            '<div style="font-size:11px;color:var(--tx3);margin-top:5px">Check all plants this user can access.</div>'+
+          '</div>'+
         '</div>'+
         '<div id="vNewAdmErr" class="h" style="margin-bottom:8px;padding:8px 11px;background:var(--rdbg);border:1px solid var(--rdbd);border-radius:7px;font-size:12px;color:var(--rd)"></div>'+
-        '<button class="b bp bsm" onclick="createPlantAdmin()">➕ Create Plant Admin</button>'+
+        '<button class="b bp bsm" onclick="createPlantAdmin()">➕ Create Admin</button>'+
       '</div>'
     );
   }).catch(function(e){ setHtml('vUserMgmtSection', '<div style="color:var(--rd)">Error: '+esc(e.message)+'</div>'); });
+}
+
+function onAdmRoleChange() {
+  var role = val('newAdmRole');
+  var wrap = G('vNewAdmPlantWrap');
+  var single = G('vNewAdmSinglePlantRow');
+  var multi  = G('vNewAdmMultiPlantRow');
+  if (!wrap) return;
+  if (!role) { wrap.classList.add('h'); return; }
+  wrap.classList.remove('h');
+  if (role === 'plant') {
+    if (single) single.classList.remove('h');
+    if (multi)  multi.classList.add('h');
+  } else {
+    if (single) single.classList.add('h');
+    if (multi)  multi.classList.remove('h');
+  }
 }
 
 function createPlantAdmin() {
   var nm   = val('newAdmName');
   var em   = val('newAdmEmail');
   var pw   = val('newAdmPwd');
-  var pl   = val('newAdmPlant');
+  var role = val('newAdmRole');
   var errEl = G('vNewAdmErr');
   function showAdmErr(m){ if(errEl){errEl.textContent=m; errEl.classList.remove('h');} }
   if (!nm) { showAdmErr('Enter a display name.'); return; }
   if (!em || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) { showAdmErr('Enter a valid email address.'); return; }
   if (!pw || pw.length < 6) { showAdmErr('Password must be at least 6 characters.'); return; }
-  if (!pl) { showAdmErr('Select a plant for this admin.'); return; }
+  if (!role) { showAdmErr('Select a role.'); return; }
+
+  var pl = '', plants = [];
+  if (role === 'plant') {
+    pl = val('newAdmPlant');
+    if (!pl) { showAdmErr('Select a plant for this admin.'); return; }
+    plants = [pl];
+  } else {
+    // Multi-plant
+    document.querySelectorAll('.newAdmPChk:checked').forEach(function(cb){ plants.push(cb.value); });
+    if (!plants.length) { showAdmErr('Select at least one plant.'); return; }
+    pl = ''; // stored in plants array only
+  }
 
   var btn = document.querySelector('#vUserMgmtSection .bp');
-  if(btn){ btn.disabled=true; btn.textContent='Creating…'; }
-  if(errEl) errEl.classList.add('h');
+  if (btn) { btn.disabled=true; btn.textContent='Creating…'; }
+  if (errEl) errEl.classList.add('h');
 
-  // We use a secondary Firebase Auth approach: create via REST API so we don't
-  // lose the current super admin session. Sign-in to a temp credential then
-  // immediately write the Firestore profile.
-  // Simpler: use Firebase Admin REST (Identity Toolkit) createNewUser
   var apiKey = FCFG.apiKey;
   fetch('https://identitytoolkit.googleapis.com/v1/accounts:signUp?key='+apiKey, {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ email:em, password:pw, displayName:nm, returnSecureToken:false })
   }).then(function(r){ return r.json(); }).then(function(data) {
-    if (data.error) { showAdmErr(data.error.message||'Firebase error'); if(btn){btn.disabled=false;btn.textContent='➕ Create Plant Admin';} return; }
+    if (data.error) { showAdmErr(data.error.message||'Firebase error'); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} return; }
     var uid = data.localId;
-    // Write Firestore profile
-    DB().collection('users').doc(uid).set({
+    var userDoc = {
       role: 'admin',
       plant: pl,
+      plants: plants,
       displayName: nm,
       email: em,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       createdBy: CURRENT_USER.uid || ''
-    }).then(function(){
-      toast('Plant admin created for '+pl+'!','ok');
-      // Clear form
-      ['newAdmName','newAdmEmail','newAdmPwd','newAdmPlant'].forEach(function(id){var e=G(id);if(e)e.value='';});
+    };
+    DB().collection('users').doc(uid).set(userDoc).then(function(){
+      var scopeLabel = plants.length > 1 ? plants.join(', ') : pl;
+      toast('Admin created for '+scopeLabel+'!','ok');
+      ['newAdmName','newAdmEmail','newAdmPwd','newAdmRole','newAdmPlant'].forEach(function(id){var e=G(id);if(e)e.value='';});
+      document.querySelectorAll('.newAdmPChk').forEach(function(cb){cb.checked=false;});
+      var wrap=G('vNewAdmPlantWrap'); if(wrap) wrap.classList.add('h');
       renderUserMgmt();
-    }).catch(function(e){ showAdmErr('Firestore error: '+e.message); if(btn){btn.disabled=false;btn.textContent='➕ Create Plant Admin';} });
-  }).catch(function(e){ showAdmErr('Network error: '+e.message); if(btn){btn.disabled=false;btn.textContent='➕ Create Plant Admin';} });
+    }).catch(function(e){ showAdmErr('Firestore error: '+e.message); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} });
+  }).catch(function(e){ showAdmErr('Network error: '+e.message); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} });
 }
 
 function deleteAdminUser(uid, email) {
@@ -5883,61 +5975,97 @@ function showEntry(examId) {
       if (!ed.exists) { setEntryErr('Exam not found. Please check the QR code.'); return; }
       var exam = Object.assign({id:ed.id}, ed.data());
       S.exam = exam;
+      S._entryCand = null;
       var now=new Date(), start=exam.startDateTime&&exam.startDateTime.toDate(), end=exam.endDateTime&&exam.endDateTime.toDate();
       setTx('vEntNm', exam.name||'Examination');
       if (start && now < start) { setTx('vEntMt','Opens: '+fmtDT(start)); setEntryErr('This exam has not started yet. Please return at the scheduled time.'); return; }
       if (end && now > end)     { setTx('vEntMt','Closed: '+fmtDT(end)); setEntryErr('This exam window has closed. Please contact your administrator.'); return; }
       var modeLabel = exam.questionSelectionMode==='topic' ? ('Topic: '+(exam.selectedTopic||exam.topic||'')) : (exam.department||'');
-      var examNumLabel = exam.examNumber ? (' · Exam #: '+exam.examNumber) : '';
-      setTx('vEntMt', modeLabel+' · '+(exam.examQuestionCount||20)+' Questions · '+(exam.durationMinutes||30)+' Minutes'+examNumLabel);
+      var examNumLabel = exam.examNumber ? (' \u00b7 Exam #: '+exam.examNumber) : '';
+      setTx('vEntMt', modeLabel+' \u00b7 '+(exam.examQuestionCount||20)+' Questions \u00b7 '+(exam.durationMinutes||30)+' Minutes'+examNumLabel);
       setHtml('vEntBd',
         '<div style="background:var(--blbg);border:1px solid rgba(79,142,247,.2);border-radius:8px;padding:10px 12px;font-size:13px;color:var(--bl);margin-bottom:16px">'+
-          '📋 Fill in your details below to begin the exam'+
+          '\u{1F4CB} Enter your Employee Code. Your details will be verified automatically.'+
         '</div>'+
-        '<div class="fr"><div class="fg"><label class="fl">Employee Code *</label>'+
-          '<input class="fi" id="eEC" type="text" placeholder="EMP-001" autocomplete="off" style="font-family:var(--mo);text-transform:uppercase;letter-spacing:1px"></div>'+
-        '<div class="fg"><label class="fl">Full Name *</label>'+
-          '<input class="fi" id="eEN" type="text" placeholder="Your full name"></div></div>'+
-        '<div class="fr"><div class="fg"><label class="fl">Department *</label>'+
-          '<select class="fi fsel" id="eED"><option value="">— Select Department —</option>'+dOpts()+'</select></div>'+
-        '<div class="fg"><label class="fl">Plant / Location *</label>'+
-          '<select class="fi fsel" id="eEP"><option value="">— Select Plant —</option>'+pOpts()+'</select></div></div>'+
-        '<button class="b bp w" id="vEntBtn" style="justify-content:center;padding:12px;font-size:15px;font-weight:700;margin-top:8px" onclick="doEntry()">Start Exam →</button>'+
+        '<div class="fg">'+
+          '<label class="fl">Employee Code *</label>'+
+          '<div style="display:flex;gap:8px">'+
+            '<input class="fi" id="eEC" type="text" placeholder="EMP-001" autocomplete="off" style="font-family:var(--mo);text-transform:uppercase;letter-spacing:1px;flex:1" onkeydown="if(event.key===\'Enter\')lookupEntryCode()">'+
+            '<button class="b bp" id="vEntLookupBtn" onclick="lookupEntryCode()" style="flex-shrink:0;padding:0 18px;font-weight:700">Verify \u2192</button>'+
+          '</div>'+
+        '</div>'+
         '<div id="vEntErr" class="h" style="margin-top:10px;background:var(--rdbg);border:1px solid var(--rdbd);border-radius:7px;padding:10px 12px;font-size:13px;color:var(--rd);text-align:center"></div>'+
-        '<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--bd);font-size:11px;color:var(--tx3);text-align:center;line-height:1.7">Answers save automatically. Exam can only be attempted once.<br>Use the same Employee Code you use in your organisation.</div>'
+        '<div id="vEntCandCard" class="h" style="margin-top:14px"></div>'+
+        '<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--bd);font-size:11px;color:var(--tx3);text-align:center;line-height:1.7">Answers save automatically. Exam can only be attempted once.<br>Contact your administrator if your Employee Code is not recognized.</div>'
       );
     }).catch(function(e){ setEntryErr('Error: '+e.message); });
   });
 }
+
+function lookupEntryCode() {
+  var ec = (val('eEC')||'').toUpperCase().trim();
+  if (!ec) { showEntErr('Please enter your Employee Code'); return; }
+  var btn = G('vEntLookupBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking\u2026'; }
+  var errEl = G('vEntErr'); if (errEl) errEl.classList.add('h');
+  var card  = G('vEntCandCard'); if (card) { card.innerHTML=''; card.classList.add('h'); }
+
+  DB().collection('candidates').where('employeeCode','==',ec).where('isActive','==',true).get()
+    .then(function(snap){
+      if (btn) { btn.disabled = false; btn.textContent = 'Verify \u2192'; }
+      if (snap.empty) {
+        showEntErr('Employee Code "'+ec+'" was not found in the system. Please check your code or contact your administrator.');
+        return;
+      }
+      var c = Object.assign({id:snap.docs[0].id}, snap.docs[0].data());
+      // If exam has a plant restriction, verify this candidate's plant is included
+      var examPlants = S.exam && S.exam.plantLocations;
+      var hasRestriction = Array.isArray(examPlants) && examPlants.length > 0;
+      if (hasRestriction && !examAppliesToPlant(S.exam, c.plantLocation)) {
+        showEntErr('This exam is not available for your plant (' + esc(c.plantLocation||'Not assigned') + '). Please contact your administrator.');
+        return;
+      }
+      S._entryCand = c;
+      var cardHtml =
+        '<div style="background:var(--gnbg);border:1px solid var(--gnbd);border-radius:10px;padding:14px 16px;margin-bottom:12px">'+
+          '<div style="font-size:11px;font-weight:700;color:var(--gn);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">\u2705 Employee found \u2014 please confirm your details</div>'+
+          '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 14px">'+
+            '<div><div style="font-size:10px;color:var(--tx3)">Employee Code</div><div style="font-weight:700;font-family:var(--mo);color:var(--bl)">'+esc(c.employeeCode||'\u2014')+'</div></div>'+
+            '<div><div style="font-size:10px;color:var(--tx3)">Full Name</div><div style="font-weight:700">'+esc(c.name||'\u2014')+'</div></div>'+
+            '<div><div style="font-size:10px;color:var(--tx3)">Department</div><div style="font-weight:600;color:var(--te)">'+esc(c.department||'\u2014')+'</div></div>'+
+            '<div><div style="font-size:10px;color:var(--tx3)">Plant / Location</div><div style="font-weight:600;color:var(--te)">'+esc(c.plantLocation||'\u2014')+'</div></div>'+
+          '</div>'+
+        '</div>'+
+        '<div style="display:flex;gap:8px">'+
+          '<button class="b bp w" id="vEntBtn" style="justify-content:center;padding:12px;font-size:15px;font-weight:700" onclick="doEntry()">\u{1F4DD} Start Exam \u2192</button>'+
+          '<button class="b bg" style="padding:0 14px;flex-shrink:0" onclick="S._entryCand=null;(G(\'vEntCandCard\')||{}).innerHTML=\'\';(G(\'vEntCandCard\')||{className:\'\'}).className=\'h\';var e=G(\'eEC\');if(e){e.value=\'\';e.focus();}">\u2715 Not me</button>'+
+        '</div>';
+      if (card) { card.innerHTML = cardHtml; card.classList.remove('h'); }
+    })
+    .catch(function(e){ if(btn){btn.disabled=false;btn.textContent='Verify \u2192';} showEntErr('Error: '+e.message); });
+}
+
 function setEntryErr(msg) {
   setHtml('vEntBd','<div style="background:var(--rdbg);border:1px solid var(--rdbd);border-radius:9px;padding:18px;font-size:13px;color:var(--rd);text-align:center;line-height:1.65">'+msg+'</div><div style="margin-top:10px;text-align:center;font-size:12px;color:var(--tx3)">Contact your administrator for assistance.</div>');
 }
 function doEntry() {
-  var ec=val('eEC').toUpperCase(), en=val('eEN'), ed=val('eED'), ep=val('eEP');
-  if(!ec){showEntErr('Please enter your Employee Code');return;}
-  if(!en){showEntErr('Please enter your Full Name');return;}
-  if(!ed){showEntErr('Please select your Department');return;}
-  if(!ep){showEntErr('Please select your Plant / Location');return;}
-  var btn=G('vEntBtn'); if(btn){btn.disabled=true;btn.textContent='Verifying...';}
+  var c = S._entryCand;
+  if (!c) { showEntErr('Please verify your Employee Code first.'); return; }
+  var ec = c.employeeCode || '', en = c.name || '', ed = c.department || '', ep = c.plantLocation || '';
+  var btn = G('vEntBtn'); if (btn) { btn.disabled=true; btn.textContent='Starting…'; }
   hide('vEntErr');
-  // Check if this employee already has an attempt for this exam
   DB().collection('attempts').where('examId','==',S.exam.id).get()
     .then(function(aSnap){
-      // Find matching attempt by employee code (case-insensitive)
       var matchDoc = null;
       aSnap.docs.forEach(function(d){
-        var data = d.data();
-        var storedCode = (data.employeeCode||'').toUpperCase().trim();
-        if(storedCode === ec) matchDoc = d;
+        var storedCode = (d.data().employeeCode||'').toUpperCase().trim();
+        if (storedCode === ec.toUpperCase()) matchDoc = d;
       });
-
-      if(matchDoc){
-        // Found existing attempt
-        var att=Object.assign({id:matchDoc.id},matchDoc.data());
-        if(att.status==='completed'){
-          var isPass=att.result==='pass';
-          // Check if the exam allows employees to view their result
-          var allowView = S.exam && (S.exam.allowResultView !== false); // default: allow unless explicitly false
+      if (matchDoc) {
+        var att = Object.assign({id:matchDoc.id}, matchDoc.data());
+        if (att.status==='completed') {
+          var isPass = att.result==='pass';
+          var allowView = S.exam && (S.exam.allowResultView !== false);
           if (!allowView) {
             setHtml('vEntBd','<div style="background:var(--ambg);border:1px solid var(--ambd);border-radius:9px;padding:20px;text-align:center">'+
               '<div style="font-size:32px;margin-bottom:8px">🔒</div>'+
@@ -5954,41 +6082,35 @@ function doEntry() {
           '</div>');
           return;
         }
-        // Resume existing attempt
+        // Resume in-progress attempt
         DB().collection('attempts').doc(att.id).update({candidateName:en,employeeCode:ec,department:ed,plantLocation:ep});
-        S.cand={id:att.candidateId||att.id,employeeCode:ec,name:en,department:ed,plantLocation:ep};
-        S.att=Object.assign(att,{candidateName:en,employeeCode:ec,department:ed,plantLocation:ep});
-        loadExamQs(S.att,S.exam);
+        S.cand = {id:c.id||ec, employeeCode:ec, name:en, department:ed, plantLocation:ep};
+        S.att  = Object.assign(att, {candidateName:en, employeeCode:ec, department:ed, plantLocation:ep});
+        loadExamQs(S.att, S.exam);
       } else {
-        // NEW: Open access — create attempt on the fly
         DB().collection('exams').doc(S.exam.id).get().then(function(ed_){
-          var exam=Object.assign({id:ed_.id},ed_.data());
+          var exam = Object.assign({id:ed_.id}, ed_.data());
           return fetchQuestionsForExam(exam, ed).then(function(allQs){
-              if(!allQs.length){
-                // Fallback: try all active questions
-                return DB().collection('questions').where('isActive','==',true).get()
-                  .then(function(qs2){
-                    allQs=qs2.docs.map(function(d){return Object.assign({id:d.id},d.data());});
-                    return createAttempt(allQs,exam,ec,en,ed,ep);
-                  });
-              }
-              return createAttempt(allQs,exam,ec,en,ed,ep);
-            });
+            if (!allQs.length) {
+              return DB().collection('questions').where('isActive','==',true).get().then(function(qs2){
+                allQs = qs2.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+                return createAttempt(allQs, exam, ec, en, ed, ep);
+              });
+            }
+            return createAttempt(allQs, exam, ec, en, ed, ep);
+          });
         }).catch(function(e){
-          showEntErr('Error creating attempt: '+e.message);
-          if(btn){btn.disabled=false;btn.textContent='Start Exam →';}
+          showEntErr('Error starting exam: '+e.message);
+          if (btn) { btn.disabled=false; btn.textContent='📝 Start Exam →'; }
         });
       }
     })
     .catch(function(e){
-      var msg = e.message || 'Unknown error';
-      if(msg.indexOf('permission')>-1 || msg.indexOf('insufficient')>-1){
-        msg = 'Permission denied. Please ask your administrator to update the Firestore security rules.';
-      }
-      showEntErr(msg);
-      if(btn){btn.disabled=false;btn.textContent='Start Exam →';}
+      showEntErr('Error: '+e.message);
+      if (btn) { btn.disabled=false; btn.textContent='📝 Start Exam →'; }
     });
 }
+
 function createAttempt(allQs,exam,ec,en,ed,ep){
   var shuffled=shuf(allQs).slice(0,exam.examQuestionCount||20);
   var aQs=shuffled.map(function(q,i){return {questionId:q.id,order:i,shuffledOptions:shuf(q.options||[])};});
@@ -6248,7 +6370,7 @@ function impCandXls(){
         if(!code||!name){skip++;return Promise.resolve();}
         return DB().collection('candidates').add({employeeCode:code,name:name,
           department:nr.department||nr.dept||'',
-          plantLocation: (!isSuperAdmin() && CURRENT_USER.plant) ? CURRENT_USER.plant : (nr.plant_location||nr.plant||''),
+          plantLocation: (!isSuperAdmin() && userPrimaryPlant()) ? userPrimaryPlant() : (nr.plant_location||nr.plant||''),
           designation:nr.designation||'',phone:nr.phone||nr.mobile||'',
           isActive:true,createdAt:firebase.firestore.FieldValue.serverTimestamp()})
           .then(function(){added++;}).catch(function(){skip++;});
