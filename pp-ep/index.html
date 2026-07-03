@@ -1346,6 +1346,17 @@ function toggleAllPlantChks(prefix) {
   var allChecked = Array.prototype.every.call(boxes, function(cb){ return cb.checked; });
   boxes.forEach(function(cb){ cb.checked = !allChecked; });
 }
+/** Human-readable "who created this exam" label for the exams table (Super Admin view). */
+function examCreatorLabel(e) {
+  if (e.createdByRole === 'super_admin') {
+    return '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd)">⭐ '+esc(e.createdByName||'Super Admin')+'</span>';
+  }
+  if (e.createdByRole === 'admin') {
+    var who = e.createdByPlant || e.createdByName || 'Plant Admin';
+    return '<span class="bk bt">🏭 '+esc(who)+'</span>';
+  }
+  return '<span style="color:var(--tx3);font-size:11px">—</span>';
+}
 /** Reads the checked plant checkboxes for a given prefix ('e' create / 'ee' edit). */
 function readPlantChecklist(prefix) {
   var out = [];
@@ -1975,12 +1986,21 @@ function pgDash(plantFilter) {
   setHtml('vPgCnt', loading());
   Promise.all([
     plantQuery(DB().collection('questions').where('isActive','==',true)).get(),
-    plantQuery(DB().collection('exams')).get(),
+    DB().collection('exams').get(),
     plantQuery(DB().collection('candidates').where('isActive','==',true)).get(),
-    plantQuery(DB().collection('attempts').where('status','==','completed')).get(),
+    DB().collection('attempts').where('status','==','completed').get(),
+    isSuperAdmin() ? Promise.resolve(null) : DB().collection('candidates').get()
   ]).then(function(res) {
-    var qS=res[0], eS=res[1], cS=res[2], aS=res[3];
-    var allAtts=aS.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+    var qS=res[0], eSraw=res[1], cS=res[2], aSraw=res[3], candsAllSnap=res[4];
+    var eSDocs = isSuperAdmin() ? eSraw.docs : eSraw.docs.filter(function(d){ return examAppliesToPlant(d.data(), CURRENT_USER.plant); });
+    var eS = { docs: eSDocs, size: eSDocs.length };
+    var allAttsRaw = aSraw.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+    var allAtts = allAttsRaw;
+    if (!isSuperAdmin()) {
+      var candsMapAll = {};
+      candsAllSnap.docs.forEach(function(d){ candsMapAll[d.id]=d.data(); });
+      allAtts = filterAttemptsByPlant(allAttsRaw, candsMapAll);
+    }
 
     // ── Plant tab strip (super admin only) ──────────────────
     var plantTabHtml = '';
@@ -3128,6 +3148,7 @@ function pgExams() {
         '<td class="tn">'+esc(e.name||'—')+'</td>'+
         '<td style="font-family:var(--mo);font-size:10px;color:var(--bl)">'+(e.examNumber||'—')+'</td>'+
         '<td>'+deptCell+'</td>'+
+        (isSuperAdmin() ? '<td>'+examCreatorLabel(e)+'</td>' : '')+
         '<td style="font-family:var(--mo);font-size:11px">'+fmtD(e.startDateTime&&e.startDateTime.toDate())+'</td>'+
         '<td style="font-family:var(--mo);font-size:11px">'+fmtD(e.endDateTime&&e.endDateTime.toDate())+'</td>'+
         '<td style="text-align:center">'+(e.durationMinutes||30)+'m/'+(e.examQuestionCount||20)+'Q</td>'+
@@ -3153,8 +3174,8 @@ function pgExams() {
       '</div>'+
       '<div class="tw"><table><thead><tr>'+
         '<th><input type="checkbox" id="exChkAll" onchange="exSelAll(this)" style="accent-color:var(--bl);width:14px;height:14px;cursor:pointer"></th>'+
-        '<th>Name</th><th>Exam #</th><th>Dept / Mode</th><th>Start</th><th>End</th><th>Dur/Qs</th><th>Status</th><th>Actions</th></tr></thead>'+
-      '<tbody id="vExTb">'+(rows||noRows(9, isSuperAdmin()
+        '<th>Name</th><th>Exam #</th><th>Dept / Mode</th>'+(isSuperAdmin()?'<th>Created By</th>':'')+'<th>Start</th><th>End</th><th>Dur/Qs</th><th>Status</th><th>Actions</th></tr></thead>'+
+      '<tbody id="vExTb">'+(rows||noRows(isSuperAdmin()?10:9, isSuperAdmin()
         ? 'No exams yet.'
         : 'No exams assigned to your plant ("'+esc(CURRENT_USER.plant||'—')+'") yet. Ask your Super Admin to check this exact plant when creating or editing an exam.'
       ))+'</tbody></table></div></div>'
@@ -3174,6 +3195,7 @@ function filExams() {
       '<td class="tn">'+esc(e.name||'—')+'</td>'+
       '<td style="font-family:var(--mo);font-size:10px;color:var(--bl)">'+(e.examNumber||'—')+'</td>'+
       '<td>'+deptCell+'</td>'+
+      (isSuperAdmin() ? '<td>'+examCreatorLabel(e)+'</td>' : '')+
       '<td style="font-family:var(--mo);font-size:11px">'+fmtD(e.startDateTime&&e.startDateTime.toDate())+'</td>'+
       '<td style="font-family:var(--mo);font-size:11px">'+fmtD(e.endDateTime&&e.endDateTime.toDate())+'</td>'+
       '<td style="text-align:center">'+(e.durationMinutes||30)+'m/'+(e.examQuestionCount||20)+'Q</td>'+
@@ -3187,7 +3209,7 @@ function filExams() {
         ((isSuperAdmin()||(Array.isArray(e.plantLocations)&&e.plantLocations.length===1)) ? '<button class="b bd_ bxs" onclick="delExam(\''+e.id+'\')">Del</button>' : '')+
       '</td></tr>';
   }).join('');
-  var tb=G('vExTb'); if(tb) tb.innerHTML=rows||noRows(8,'No exams found.');
+  var tb=G('vExTb'); if(tb) tb.innerHTML=rows||noRows(isSuperAdmin()?10:9,'No exams found.');
   var cnt=G('vExCount'); if(cnt) cnt.textContent=r.length;
 }
 function exSelAll(cb) {
@@ -3687,6 +3709,10 @@ function saveExam() {
     department: val('eDt'),
     plantLocation: plantLocations.length===1 ? plantLocations[0] : '',
     plantLocations: plantLocations,
+    createdBy: CURRENT_USER.uid || '',
+    createdByName: CURRENT_USER.displayName || CURRENT_USER.email || '',
+    createdByRole: isSuperAdmin() ? 'super_admin' : 'admin',
+    createdByPlant: !isSuperAdmin() ? (CURRENT_USER.plant||'') : '',
     questionSelectionMode: qSelMode,
     selectedTopic: qSelMode==='topic' ? val('eTopSel') : null,
     passingMarks: parseInt(val('ePa'))||60,
@@ -3917,8 +3943,8 @@ function pgResults() {
   setHtml('vPgCnt',loading());
   Promise.all([
     DB().collection('exams').get(),
-    plantQuery(DB().collection('attempts')).get(),
-    plantQuery(DB().collection('candidates')).get(),
+    DB().collection('attempts').get(),
+    DB().collection('candidates').get(),
     plantQuery(DB().collection('questions').where('isActive','==',true)).get()
   ]).then(function(res){
     var exams={}, cands={}, questions={};
@@ -3929,8 +3955,9 @@ function pgResults() {
     res[2].docs.forEach(function(d){cands[d.id]=d.data();});
     res[3].docs.forEach(function(d){questions[d.id]=Object.assign({id:d.id},d.data());});
 
-    var atts = res[1].docs.map(function(d){return Object.assign({id:d.id},d.data());})
+    var attsRaw = res[1].docs.map(function(d){return Object.assign({id:d.id},d.data());})
                           .filter(function(a){return a.status==='completed';});
+    var atts = isSuperAdmin() ? attsRaw : filterAttemptsByPlant(attsRaw, cands);
     atts.sort(function(a,b){return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0);});
     window._ra=atts; window._re=exams; window._rc=cands; window._rq=questions;
 
@@ -4490,8 +4517,9 @@ function expXls() {
 function pgCerts() {
   setHtml('vPgCnt',loading());
   Promise.all([
-    plantQuery(DB().collection('attempts').where('status','==','completed')).get(),
-    DB().collection('exams').get()
+    DB().collection('attempts').where('status','==','completed').get(),
+    DB().collection('exams').get(),
+    isSuperAdmin() ? Promise.resolve(null) : DB().collection('candidates').get()
   ])
     .then(function(res){
       var exams={};
@@ -4499,7 +4527,13 @@ function pgCerts() {
         var ex=d.data();
         if (isSuperAdmin() || examAppliesToPlant(ex, CURRENT_USER.plant)) exams[d.id]=ex;
       });
-      var atts=res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());});
+      var attsRaw=res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());});
+      var atts = attsRaw;
+      if (!isSuperAdmin()) {
+        var candsMapAll = {};
+        (res[2] ? res[2].docs : []).forEach(function(d){ candsMapAll[d.id]=d.data(); });
+        atts = filterAttemptsByPlant(attsRaw, candsMapAll);
+      }
       atts.sort(function(a,b){ return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0); });
       var pass=atts.filter(function(a){return a.result==='pass';}).length;
       var rows=atts.map(function(a){
