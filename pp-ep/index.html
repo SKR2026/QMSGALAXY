@@ -3810,7 +3810,7 @@ function doAssign(cid, eid, cname, ecode, ename, cdept, cplant) {
 }
 
 function pgCands() {
-  setHtml('vPgAct','<button class="b bg bsm" onclick="dlCandTpl()">⬇ Template</button><button class="b bg bsm" onclick="impCandXls()">⬆ Import</button><button class="b bp bsm" onclick="addCandMo()">+ Add</button>');
+  setHtml('vPgAct','<button class="b bg bsm" onclick="dlCandTpl()">⬇ Template</button><button class="b bg bsm" onclick="impCandXls()">⬆ Import</button>'+(isSuperAdmin()?'<button class="b bd_ bsm" onclick="findOrphanCands()">⚠️ Fix Missing Plants</button>':'')+'<button class="b bp bsm" onclick="addCandMo()">+ Add</button>');
   setHtml('vPgCnt',loading());
   plantQuery(DB().collection('candidates').where('isActive','==',true)).get().then(function(snap){
     var cs=snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
@@ -3929,6 +3929,63 @@ function saveCand() {
   });
 }
 function delCand(id){if(!confirm('Remove?'))return;DB().collection('candidates').doc(id).update({isActive:false}).then(function(){toast('Removed','wn');pgCands();});}
+
+/** Super Admin tool: find candidates with no (or blank) plantLocation — these are
+ *  invisible to every Plant Admin and their exam results silently never show up
+ *  anywhere except the Super Admin's own unfiltered view. Lets Super Admin bulk-
+ *  assign them to the correct plant to repair the damage from bad Excel imports. */
+function findOrphanCands() {
+  setHtml('vPgCnt', loading());
+  DB().collection('candidates').where('isActive','==',true).get().then(function(snap){
+    var all = snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+    var orphans = all.filter(function(c){ return !c.plantLocation; });
+    if (!orphans.length) {
+      toast('✅ No orphaned candidates found — every active candidate has a plant assigned.', 'ok');
+      pgCands();
+      return;
+    }
+    var rows = orphans.map(function(c){
+      return '<tr><td class="tc">'+esc(c.employeeCode||'—')+'</td><td class="tn">'+esc(c.name||'—')+'</td>'+
+        '<td><span class="bk bb">'+esc(c.department||'—')+'</span></td>'+
+        '<td><select class="fi fsel orphanPlantSel" data-id="'+c.id+'" style="font-size:12px"><option value="">— Assign plant —</option>'+pOpts()+'</select></td></tr>';
+    }).join('');
+    setHtml('vPgCnt',
+      '<div style="background:var(--rdbg);border:1px solid var(--rdbd);border-radius:9px;padding:12px 14px;margin-bottom:13px;font-size:13px;color:var(--rd)">'+
+        '⚠️ Found <strong>'+orphans.length+'</strong> candidate(s) with no plant assigned. These are invisible to every Plant Admin\'s account — their exam results silently never show up anywhere except this Super Admin view. This usually happens from an Excel import where the "plant_location" column was blank or missing. Assign a plant to each row below, then click Save.'+
+      '</div>'+
+      '<div class="card"><div class="ch"><span class="ct">Orphaned Candidates ('+orphans.length+')</span>'+
+        '<div style="display:flex;gap:7px;align-items:center">'+
+          '<select class="fi fsel" id="orphanBulkPlant" style="width:160px;font-size:12px"><option value="">Bulk-set all to…</option>'+pOpts()+'</select>'+
+          '<button class="b bg bsm" onclick="applyOrphanBulkPlant()">Apply to All</button>'+
+          '<button class="b bp bsm" onclick="saveOrphanFixes()">💾 Save Assignments</button>'+
+          '<button class="b bg bsm" onclick="pgCands()">Cancel</button>'+
+        '</div>'+
+      '</div>'+
+      '<div class="tw"><table><thead><tr><th>Code</th><th>Name</th><th>Dept</th><th>Assign Plant</th></tr></thead>'+
+      '<tbody>'+rows+'</tbody></table></div></div>'
+    );
+  }).catch(function(e){ setHtml('vPgCnt',errB(e.message)); });
+}
+function applyOrphanBulkPlant() {
+  var v = val('orphanBulkPlant');
+  if (!v) { toast('Pick a plant first','wn'); return; }
+  document.querySelectorAll('.orphanPlantSel').forEach(function(sel){ sel.value = v; });
+}
+function saveOrphanFixes() {
+  var sels = document.querySelectorAll('.orphanPlantSel');
+  var updates = [];
+  sels.forEach(function(sel){
+    var v = sel.value;
+    if (v) updates.push({ id: sel.getAttribute('data-id'), plant: v });
+  });
+  if (!updates.length) { toast('Assign at least one plant before saving','wn'); return; }
+  Promise.all(updates.map(function(u){
+    return DB().collection('candidates').doc(u.id).update({ plantLocation: u.plant });
+  })).then(function(){
+    toast('✅ Fixed '+updates.length+' candidate(s). Their past results should now appear correctly.', 'ok');
+    pgCands();
+  }).catch(function(e){ toast('Error: '+e.message,'er'); });
+}
 
 // ── RESULTS ───────────────────────────────────────────────────
 function pgResults() {
@@ -6145,7 +6202,8 @@ function impCandXls(){
         var name=nr.name||nr.employee_name||'', code=(nr.employee_code||nr.empcode||'').toUpperCase();
         if(!code||!name){skip++;return Promise.resolve();}
         return DB().collection('candidates').add({employeeCode:code,name:name,
-          department:nr.department||nr.dept||'',plantLocation:nr.plant_location||nr.plant||'',
+          department:nr.department||nr.dept||'',
+          plantLocation: (!isSuperAdmin() && CURRENT_USER.plant) ? CURRENT_USER.plant : (nr.plant_location||nr.plant||''),
           designation:nr.designation||'',phone:nr.phone||nr.mobile||'',
           isActive:true,createdAt:firebase.firestore.FieldValue.serverTimestamp()})
           .then(function(){added++;}).catch(function(){skip++;});
