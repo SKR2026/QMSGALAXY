@@ -1395,7 +1395,7 @@ footer{position:relative;z-index:1;background:var(--footer-bg);border-top:1px so
     <div id="auth-form-login">
       <h3>Welcome Back</h3>
       <div class="forum-modal-err" id="login-err"></div>
-      <div class="form-group"><label>Username or Email</label><input id="login-ident" type="text" placeholder="your username or email" onkeyup="if(event.key==='Enter')doLogin()"/></div>
+      <div class="form-group"><label>Email</label><input id="login-ident" type="email" placeholder="you@example.com" onkeyup="if(event.key==='Enter')doLogin()"/></div>
       <div class="form-group"><label>Password</label><input id="login-pass" type="password" placeholder="••••••••" onkeyup="if(event.key==='Enter')doLogin()"/></div>
       <button class="forum-auth-btn" style="width:100%;padding:13px;border-radius:10px;font-size:0.92rem;" onclick="doLogin()">Sign In ✦</button>
     </div>
@@ -1644,6 +1644,15 @@ async function doAdminLogin(){
     document.getElementById('admin-login-screen').style.display='none';
     document.getElementById('admin-content').style.display='block';
     document.getElementById('admin-pin-input').value='';
+    /* Enquiries are admin-only to read now, so fetch them here — a public
+       visitor's page load no longer has permission to see this data. */
+    if(window.fbGetEnquiries){
+      var cloudEnquiries = await window.fbGetEnquiries();
+      if(Array.isArray(cloudEnquiries)){
+        window.messages = cloudEnquiries;
+        localStorage.setItem('qmsg_messages', JSON.stringify(cloudEnquiries));
+      }
+    }
     loadAdminData();
     /* Sync colour theme controls */
     applyColorTheme(currentColorTheme);
@@ -2514,14 +2523,14 @@ applyPaymentData();
 
 /* ══════════════════════════════════════════════════════
    COMMUNITY FORUM — Full Feature JS
-   Data stored in localStorage keys:
-     qms_forum_users   → array of user objects
+   Forum member accounts are real Firebase Authentication accounts
+   (see fbForumRegister/fbForumLogin in firebase-backend.js) — no
+   passwords are ever stored in Firestore or localStorage.
+   Threads are cached locally for fast rendering:
      qms_forum_threads → array of thread objects
    ══════════════════════════════════════════════════════ */
 
 /* ── Data helpers ── */
-function fGetUsers(){try{return JSON.parse(localStorage.getItem('qms_forum_users')||'[]');}catch(e){return[];}}
-function fSaveUsers(u){localStorage.setItem('qms_forum_users',JSON.stringify(u));}
 function fGetThreads(){try{return JSON.parse(localStorage.getItem('qms_forum_threads')||'[]');}catch(e){return[];}}
 function fSaveThreads(t){localStorage.setItem('qms_forum_threads',JSON.stringify(t));}
 function fGetSession(){try{return JSON.parse(sessionStorage.getItem('qms_forum_session')||'null');}catch(e){return null;}}
@@ -2544,10 +2553,6 @@ async function fSyncThreadsFromCloud(force){
     if(window.fbGetThreads){
       var cloud=await window.fbGetThreads();
       if(Array.isArray(cloud)) fSaveThreads(cloud);
-    }
-    if(window.fbGetForumUsers){
-      var u=await window.fbGetForumUsers();
-      if(Array.isArray(u)) localStorage.setItem('qms_forum_users', JSON.stringify(u));
     }
     return true;
   }catch(e){console.warn('Forum cloud sync failed:',e); return false;}
@@ -2605,7 +2610,7 @@ function clearAuthErrors(){
 }
 function showAuthErr(id,msg){var el=document.getElementById(id);el.textContent=msg;el.style.display='block';}
 
-function doRegister(){
+async function doRegister(){
   var name=document.getElementById('reg-name').value.trim();
   var username=document.getElementById('reg-username').value.trim().toLowerCase().replace(/\s+/g,'');
   var email=document.getElementById('reg-email').value.trim().toLowerCase();
@@ -2616,14 +2621,10 @@ function doRegister(){
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){showAuthErr('register-err','Please enter a valid email address.');return;}
   if(pass.length<6){showAuthErr('register-err','Password must be at least 6 characters.');return;}
   if(pass!==pass2){showAuthErr('register-err','Passwords do not match.');return;}
-  var users=fGetUsers();
-  if(users.find(function(u){return u.username===username;})){showAuthErr('register-err','Username already taken. Choose another.');return;}
-  if(users.find(function(u){return u.email===email;})){showAuthErr('register-err','This email is already registered.');return;}
-  var newUser={id:'u_'+Date.now(),name:name,username:username,email:email,pass:pass,role:'Member',joined:fNow()};
-  users.push(newUser);
-  fSaveUsers(users);
-  if(window.fbSaveForumUser) window.fbSaveForumUser(newUser);
-  forumCurrentUser={id:newUser.id,name:newUser.name,username:newUser.username,role:newUser.role};
+  if(!window.fbForumRegister){showAuthErr('register-err','Not connected — please try again in a moment.');return;}
+  var result = await window.fbForumRegister(name, username, email, pass);
+  if(!result.success){ showAuthErr('register-err', result.error); return; }
+  forumCurrentUser={id:result.profile.id,name:result.profile.name,username:result.profile.username,role:result.profile.role};
   fSetSession(forumCurrentUser);
   closeForumModal('forum-auth-modal');
   updateForumAuthBar();
@@ -2631,24 +2632,25 @@ function doRegister(){
   showPayToast('Welcome to the Community, @'+username+'!');
 }
 
-function doLogin(){
-  var ident=document.getElementById('login-ident').value.trim().toLowerCase();
+async function doLogin(){
+  var email=document.getElementById('login-ident').value.trim().toLowerCase();
   var pass=document.getElementById('login-pass').value;
-  if(!ident||!pass){showAuthErr('login-err','Please fill in all fields.');return;}
-  var users=fGetUsers();
-  var user=users.find(function(u){return (u.username===ident||u.email===ident)&&u.pass===pass;});
-  if(!user){showAuthErr('login-err','Invalid credentials. Please try again.');return;}
-  forumCurrentUser={id:user.id,name:user.name,username:user.username,role:user.role};
+  if(!email||!pass){showAuthErr('login-err','Please fill in all fields.');return;}
+  if(!window.fbForumLogin){showAuthErr('login-err','Not connected — please try again in a moment.');return;}
+  var result = await window.fbForumLogin(email, pass);
+  if(!result.success){ showAuthErr('login-err', result.error); return; }
+  forumCurrentUser={id:result.profile.id,name:result.profile.name,username:result.profile.username,role:result.profile.role};
   fSetSession(forumCurrentUser);
   closeForumModal('forum-auth-modal');
   updateForumAuthBar();
   renderThreadList();
-  showPayToast('Welcome back, @'+user.username+'!');
+  showPayToast('Welcome back, @'+result.profile.username+'!');
 }
 
 function forumLogout(){
   forumCurrentUser=null;
   fSetSession(null);
+  if(window.fbForumLogout) window.fbForumLogout();
   updateForumAuthBar();
   closeThreadView();
   renderThreadList();
@@ -2911,10 +2913,10 @@ async function renderAdminForum(){
   if(tCont&&!tCont.innerHTML)tCont.innerHTML='<p style="color:var(--text-muted);font-size:0.88rem;padding:8px;">⟳ Loading from cloud…</p>';
 
   /* Pull latest cloud data and merge into localStorage so subsequent views are fast */
+  var profiles=[];
   try{
-    if(window.fbGetForumUsers){
-      var cloudUsers=await window.fbGetForumUsers();
-      if(Array.isArray(cloudUsers)) fSaveUsers(cloudUsers);
+    if(window.fbGetForumProfiles){
+      profiles = await window.fbGetForumProfiles();
     }
     if(window.fbGetThreads){
       var cloudThreads=await window.fbGetThreads();
@@ -2923,7 +2925,7 @@ async function renderAdminForum(){
   }catch(e){console.warn('Cloud forum refresh failed, using local data:',e);}
 
   /* Users */
-  var users=fGetUsers();
+  var users=profiles;
   if(uCont){
     if(!users.length){uCont.innerHTML='<p style="color:var(--text-muted);font-size:0.88rem;">No registered users yet.</p>';}
     else {
@@ -2932,7 +2934,7 @@ async function renderAdminForum(){
         return '<div class="forum-admin-thread">'+
           '<div class="forum-admin-thread-info">'+
             '<div class="forum-admin-thread-title">'+fEsc(u.name)+' <span style="color:var(--blue-pale);">@'+fEsc(u.username)+'</span></div>'+
-            '<div class="forum-admin-thread-meta">'+fEsc(u.email)+' · Joined: '+fEsc(u.joined)+' · Role: '+fEsc(u.role)+'</div>'+
+            '<div class="forum-admin-thread-meta">Joined: '+fEsc(u.joined)+' · Role: '+fEsc(u.role)+'</div>'+
           '</div>'+
           '<button class="msg-delete" onclick="adminDeleteUser(\''+fEsc(u.id)+'\')">🗑 Remove</button>'+
         '</div>';
@@ -3039,12 +3041,10 @@ async function adminPostReply(tid){
   }
 }
 function adminDeleteUser(uid){
-  if(!confirm('Remove this user from the forum?'))return;
-  var users=fGetUsers().filter(function(u){return u.id!==uid;});
-  fSaveUsers(users);
-  if(window.fbDeleteForumUser) window.fbDeleteForumUser(uid);
+  if(!confirm('Remove this member from the forum? Note: this deletes their forum profile only — their login account isn\'t removed. To fully revoke their access, also delete them under Authentication → Users in the Firebase Console.'))return;
+  if(window.fbDeleteForumProfile) window.fbDeleteForumProfile(uid);
   renderAdminForum();
-  showPayToast('User removed.');
+  showPayToast('Profile removed.');
 }
 function adminDeleteThread(tid){
   if(!confirm('Permanently delete this thread and all its replies?'))return;

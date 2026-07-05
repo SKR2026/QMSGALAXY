@@ -12,8 +12,8 @@
 // ═══════════════════════════════════════════════════════════════
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, setDoc, getDoc, query, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
-import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, updatePassword } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, setDoc, getDoc, query, orderBy, where, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updatePassword } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 // ⚠️ SECURITY: this MUST be a Firebase project dedicated to THIS app only —
 // do not reuse "skr-task" (the project shared by your other 5 apps).
@@ -170,28 +170,78 @@ window.fbLoadSiteConfig = async function(){
   } catch(e){ fbStatus(false,"Settings load failed"); return null; }
 };
 
-// 4. FORUM USERS
-window.fbSaveForumUser = async function(user){
+// 4. FORUM MEMBERS — real Firebase Authentication accounts.
+// Previously this stored a plaintext `pass` field directly in Firestore
+// (readable by anyone with read access to the collection). Passwords are
+// now verified by Firebase's servers and never stored or transmitted as
+// plaintext by this app. Firestore only holds a public, secret-free
+// profile: { name, username, role, joined } — no email, no password.
+window.fbForumRegister = async function(name, username, email, password){
   try{
-    await setDoc(doc(db,"qms_forum_users", user.id), {
-      id:user.id, name:user.name||"", username:user.username||"",
-      email:user.email||"", pass:user.pass||"",
-      role:user.role||"Member", joined:user.joined||""
-    });
-    fbStatus(true,"User registered");
-  } catch(e){ fbStatus(false,"User save failed"); console.error(e); }
+    // Check username availability BEFORE creating the auth account, so a
+    // taken username doesn't leave behind an orphaned login with no profile.
+    var uq = query(collection(db,"qms_forum_profiles"), where("username","==",username));
+    var uSnap = await getDocs(uq);
+    if(!uSnap.empty){
+      return { success:false, error:"Username already taken. Choose another." };
+    }
+    var cred = await createUserWithEmailAndPassword(auth, email, password);
+    var profile = {
+      name: name||"", username: username||"", role:"Member",
+      joined: new Date().toLocaleString("en-IN",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})
+    };
+    await setDoc(doc(db,"qms_forum_profiles", cred.user.uid), profile);
+    fbStatus(true,"Account created");
+    return { success:true, profile: Object.assign({id:cred.user.uid}, profile) };
+  } catch(e){
+    var map = {
+      "auth/email-already-in-use":"This email is already registered.",
+      "auth/weak-password":"Password must be at least 6 characters.",
+      "auth/invalid-email":"Please enter a valid email address."
+    };
+    return { success:false, error: map[e.code] || e.message || "Registration failed." };
+  }
 };
 
-window.fbGetForumUsers = async function(){
+window.fbForumLogin = async function(email, password){
   try{
-    var snap = await getDocs(collection(db,"qms_forum_users"));
-    return snap.docs.map(function(d){ return d.data(); });
-  } catch(e){ fbStatus(false,"Load users failed"); return []; }
+    var cred = await signInWithEmailAndPassword(auth, email, password);
+    var snap = await getDoc(doc(db,"qms_forum_profiles", cred.user.uid));
+    if(!snap.exists()){
+      await signOut(auth);
+      return { success:false, error:"No forum profile found for this account." };
+    }
+    return { success:true, profile: Object.assign({id:cred.user.uid}, snap.data()) };
+  } catch(e){
+    var map = {
+      "auth/user-not-found":"No account found with this email.",
+      "auth/wrong-password":"Incorrect password.",
+      "auth/invalid-credential":"Incorrect email or password.",
+      "auth/invalid-email":"Invalid email address.",
+      "auth/too-many-requests":"Too many attempts. Try again later."
+    };
+    return { success:false, error: map[e.code] || "Login failed. Please try again." };
+  }
 };
 
-window.fbDeleteForumUser = async function(userId){
-  try{ await deleteDoc(doc(db,"qms_forum_users",userId)); fbStatus(true,"User removed"); }
-  catch(e){ fbStatus(false,"User delete failed"); }
+window.fbForumLogout = async function(){ try{ await signOut(auth); }catch(e){} };
+
+// Admin panel: list/remove forum member PROFILES. Note: deleting a profile
+// here removes them from the forum's member list, but does NOT delete
+// their underlying Firebase Authentication account — client code cannot
+// delete other users' auth accounts (this requires the Admin SDK / a
+// server). To fully remove someone's login ability, also delete their
+// entry under Authentication → Users in the Firebase Console.
+window.fbGetForumProfiles = async function(){
+  try{
+    var snap = await getDocs(collection(db,"qms_forum_profiles"));
+    return snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
+  } catch(e){ fbStatus(false,"Load members failed"); return []; }
+};
+
+window.fbDeleteForumProfile = async function(uid){
+  try{ await deleteDoc(doc(db,"qms_forum_profiles",uid)); fbStatus(true,"Profile removed"); }
+  catch(e){ fbStatus(false,"Remove failed"); }
 };
 
 // 5. FORUM THREADS
@@ -397,13 +447,11 @@ window.fbGetOutlineIndex = async function(){
       if(window.applyAllSiteData) window.applyAllSiteData();
       if(window.applyPaymentData) window.applyPaymentData();
     }
-    var cloudEnquiries = await window.fbGetEnquiries();
-    if(cloudEnquiries.length){
-      window.messages = cloudEnquiries;
-      localStorage.setItem("qmsg_messages", JSON.stringify(cloudEnquiries));
-    }
-    var cloudUsers = await window.fbGetForumUsers();
-    if(cloudUsers.length) localStorage.setItem("qms_forum_users", JSON.stringify(cloudUsers));
+    /* NOTE: Enquiries are admin-only to read (see firestore.rules) since
+       they contain customer names/emails/phone numbers. They are no
+       longer fetched here on public page load — every visitor previously
+       got a silent "permission denied" on this call. They're now fetched
+       only after a successful admin login (see doAdminLogin in index.html). */
     var cloudThreads = await window.fbGetThreads();
     if(cloudThreads.length){
       localStorage.setItem("qms_forum_threads", JSON.stringify(cloudThreads));
