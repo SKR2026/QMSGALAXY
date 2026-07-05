@@ -20,12 +20,12 @@ import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, si
 // Create a new project in the Firebase Console, enable Email/Password
 // sign-in under Authentication, then paste its config below.
 const firebaseConfig = {
-  apiKey: "PASTE_NEW_PROJECT_API_KEY",
-  authDomain: "PASTE_NEW_PROJECT_ID.firebaseapp.com",
-  projectId: "PASTE_NEW_PROJECT_ID",
-  storageBucket: "PASTE_NEW_PROJECT_ID.firebasestorage.app",
-  messagingSenderId: "PASTE_SENDER_ID",
-  appId: "PASTE_APP_ID"
+  apiKey: "AIzaSyB7NRvppBiezuf7tMGOL7reo_fckVWNctY",
+  authDomain: "skr-task.firebaseapp.com",
+  projectId: "skr-task",
+  storageBucket: "skr-task.firebasestorage.app",
+  messagingSenderId: "1011690659933",
+  appId: "1:1011690659933:web:ab66955064274828682db4"
 };
 
 const app = initializeApp(firebaseConfig);
