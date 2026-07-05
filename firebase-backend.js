@@ -13,19 +13,19 @@
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, setDoc, getDoc, query, orderBy, where, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
-import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updatePassword } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updatePassword, sendEmailVerification, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 // ⚠️ SECURITY: this MUST be a Firebase project dedicated to THIS app only —
 // do not reuse "skr-task" (the project shared by your other 5 apps).
 // Create a new project in the Firebase Console, enable Email/Password
 // sign-in under Authentication, then paste its config below.
 const firebaseConfig = {
-  apiKey: "AIzaSyB7NRvppBiezuf7tMGOL7reo_fckVWNctY",
-  authDomain: "skr-task.firebaseapp.com",
-  projectId: "skr-task",
-  storageBucket: "skr-task.firebasestorage.app",
-  messagingSenderId: "1011690659933",
-  appId: "1:1011690659933:web:ab66955064274828682db4"
+  apiKey: "PASTE_NEW_PROJECT_API_KEY",
+  authDomain: "PASTE_NEW_PROJECT_ID.firebaseapp.com",
+  projectId: "PASTE_NEW_PROJECT_ID",
+  storageBucket: "PASTE_NEW_PROJECT_ID.firebasestorage.app",
+  messagingSenderId: "PASTE_SENDER_ID",
+  appId: "PASTE_APP_ID"
 };
 
 const app = initializeApp(firebaseConfig);
@@ -77,6 +77,23 @@ window.fbChangeAdminPassword = async function(newPass){
   }
 };
 window.fbOnAdminAuthChange = function(cb){ return onAuthStateChanged(auth, cb); };
+window.fbAdminSendPasswordReset = async function(email){
+  try{
+    await sendPasswordResetEmail(auth, email);
+    return { success:true };
+  } catch(e){
+    var map = {
+      "auth/user-not-found":"No account found with this email.",
+      "auth/invalid-email":"Please enter a valid email address.",
+      "auth/too-many-requests":"Too many attempts. Try again later."
+    };
+    // Note: Firebase intentionally does NOT distinguish "user not found" in
+    // some project configurations (to avoid leaking which emails exist).
+    // If your project has "Email enumeration protection" on, this will
+    // return success even for unregistered emails — that's expected.
+    return { success:false, error: map[e.code] || e.message || "Could not send reset email." };
+  }
+};
 
 function fbStatus(ok, msg){
   var el = document.getElementById("fb-status");
@@ -191,8 +208,9 @@ window.fbForumRegister = async function(name, username, email, password){
       joined: new Date().toLocaleString("en-IN",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})
     };
     await setDoc(doc(db,"qms_forum_profiles", cred.user.uid), profile);
+    try{ await sendEmailVerification(cred.user); }catch(_){ /* non-fatal — account still works */ }
     fbStatus(true,"Account created");
-    return { success:true, profile: Object.assign({id:cred.user.uid}, profile) };
+    return { success:true, profile: Object.assign({id:cred.user.uid, emailVerified:cred.user.emailVerified}, profile) };
   } catch(e){
     var map = {
       "auth/email-already-in-use":"This email is already registered.",
@@ -211,7 +229,7 @@ window.fbForumLogin = async function(email, password){
       await signOut(auth);
       return { success:false, error:"No forum profile found for this account." };
     }
-    return { success:true, profile: Object.assign({id:cred.user.uid}, snap.data()) };
+    return { success:true, profile: Object.assign({id:cred.user.uid, emailVerified:cred.user.emailVerified}, snap.data()) };
   } catch(e){
     var map = {
       "auth/user-not-found":"No account found with this email.",
@@ -225,6 +243,34 @@ window.fbForumLogin = async function(email, password){
 };
 
 window.fbForumLogout = async function(){ try{ await signOut(auth); }catch(e){} };
+
+window.fbForumResendVerification = async function(){
+  try{
+    if(!auth.currentUser) return { success:false, error:"Not signed in." };
+    if(auth.currentUser.emailVerified) return { success:false, error:"This email is already verified." };
+    await sendEmailVerification(auth.currentUser);
+    return { success:true };
+  } catch(e){
+    if(e.code === "auth/too-many-requests"){
+      return { success:false, error:"Too many requests — please wait a bit before retrying." };
+    }
+    return { success:false, error: e.message || "Could not send verification email." };
+  }
+};
+
+window.fbForumSendPasswordReset = async function(email){
+  try{
+    await sendPasswordResetEmail(auth, email);
+    return { success:true };
+  } catch(e){
+    var map = {
+      "auth/user-not-found":"No account found with this email.",
+      "auth/invalid-email":"Please enter a valid email address.",
+      "auth/too-many-requests":"Too many attempts. Try again later."
+    };
+    return { success:false, error: map[e.code] || e.message || "Could not send reset email." };
+  }
+};
 
 // Admin panel: list/remove forum member PROFILES. Note: deleting a profile
 // here removes them from the forum's member list, but does NOT delete
