@@ -1462,6 +1462,19 @@ function saveTasks() {
   }
 }
 function getTask(id) { return tasks.find(t=>t.id===id); }
+
+// A plant admin may only delete tasks that THEY created (self-assigned, or
+// assigned to a team member from within their own plant portal — identified
+// by t.plant === currentPlantSession.id). Tasks assigned to a plant admin
+// BY the superadmin (no matching plant tag) cannot be deleted by that plant admin.
+// Superadmin (not logged in as a plant owner) can always delete.
+function canDeleteTask(t){
+  if(!t) return false;
+  if(plantOwnerAuthenticated && currentPlantSession){
+    return !!(t.plant && t.plant === currentPlantSession.id);
+  }
+  return true;
+}
 function updateTask(t) {
   tasks = tasks.map(x=>x.id===t.id?t:x);
   localStorage.setItem('tf_tasks', JSON.stringify(tasks));
@@ -2519,9 +2532,20 @@ function clearSelection(){
 
 function bulkDeleteTasks(){
   if(_selectedTasks.size===0) return;
-  const count = _selectedTasks.size;
-  if(!confirm(`Permanently delete ${count} task${count>1?'s':''}? This cannot be undone.`)) return;
-  const ids = [..._selectedTasks];
+  let ids = [..._selectedTasks];
+  // Strip out any tasks this session isn't allowed to delete (e.g. a plant
+  // admin trying to bulk-delete tasks the superadmin assigned to them).
+  const blocked = ids.filter(id=>!canDeleteTask(getTask(id)));
+  ids = ids.filter(id=>canDeleteTask(getTask(id)));
+  if(ids.length===0){
+    toast('None of the selected tasks can be deleted — they were assigned by the superadmin.','var(--red)');
+    return;
+  }
+  const count = ids.length;
+  const msg = blocked.length
+    ? `Delete ${count} task${count>1?'s':''}? ${blocked.length} selected task${blocked.length>1?'s were':' was'} skipped (assigned by superadmin).`
+    : `Permanently delete ${count} task${count>1?'s':''}? This cannot be undone.`;
+  if(!confirm(msg)) return;
   tasks = tasks.filter(t=>!ids.includes(t.id));
   localStorage.setItem('tf_tasks', JSON.stringify(tasks));
   if(_fbReady&&_db){
@@ -2553,7 +2577,7 @@ function renderTaskRows(){
   el.innerHTML=filtered.map(t=>`
     <div class="task-row" style="--lc:${PRIO_COLOR[t.priority]};${_selectedTasks.has(t.id)?'background:rgba(248,113,113,.06);border-color:rgba(248,113,113,.3);':''}" onclick="openDrawer('${t.id}')">
       <div style="display:flex;align-items:center;padding:2px 4px 0 0;flex-shrink:0" onclick="event.stopPropagation()">
-        <input type="checkbox" class="task-select-cb" data-id="${t.id}" ${_selectedTasks.has(t.id)?'checked':''} onchange="toggleTaskSelect('${t.id}',this.checked)" style="width:16px;height:16px;cursor:pointer;accent-color:var(--red);"/>
+        ${canDeleteTask(t)?`<input type="checkbox" class="task-select-cb" data-id="${t.id}" ${_selectedTasks.has(t.id)?'checked':''} onchange="toggleTaskSelect('${t.id}',this.checked)" style="width:16px;height:16px;cursor:pointer;accent-color:var(--red);"/>`:`<input type="checkbox" disabled title="Assigned by superadmin — cannot be deleted" style="width:16px;height:16px;opacity:.3;cursor:not-allowed"/>`}
       </div>
       <div class="task-row-body">
         <div class="task-title">${t.title}</div>
@@ -2578,6 +2602,8 @@ function renderTaskRows(){
 }
 
 function deleteTask(id){
+  const t0=getTask(id);
+  if(!canDeleteTask(t0)){ toast('You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task permanently?'))return;
   tasks=tasks.filter(t=>t.id!==id);
   localStorage.setItem('tf_tasks',JSON.stringify(tasks));
@@ -5459,7 +5485,7 @@ function renderDrawerContent(){
       ${mode==='admin'?`
         <button class="btn btn-ghost btn-sm" onclick="editFromDrawer('${t.id}')">✏ Edit</button>
         <button class="btn btn-success btn-sm" title="Email assignee" onclick="sendMailtoEmail('${t.id}')">📧 Email</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteTaskFromDrawer('${t.id}')">🗑 Delete</button>
+        ${canDeleteTask(t)?`<button class="btn btn-danger btn-sm" onclick="deleteTaskFromDrawer('${t.id}')">🗑 Delete</button>`:`<button class="btn btn-danger btn-sm" disabled title="This task was assigned by the superadmin — only they can delete it" style="opacity:.4;cursor:not-allowed">🗑 Delete</button>`}
       `:''}
       <button class="modal-close" onclick="closeDrawer()">✕</button>
     </div>
@@ -5556,6 +5582,8 @@ function editFromDrawer(id){
 }
 
 function deleteTaskFromDrawer(id){
+  const t0=getTask(id);
+  if(!canDeleteTask(t0)){ toast('You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task permanently? This cannot be undone.'))return;
   tasks=tasks.filter(t=>t.id!==id);
   localStorage.setItem('tf_tasks',JSON.stringify(tasks));
@@ -6073,7 +6101,7 @@ function renderMyTaskList(selfEmail, filter='all'){
         ${!isPlantOwner?`<button class="btn btn-ghost btn-sm" title="Edit" onclick="openSelfTaskModal('${t.id}')">✏</button>`:''}
         <button class="btn btn-ghost btn-sm" style="color:var(--cyan)" title="Next status" onclick="quickStatusCycle('${t.id}')">▶</button>
         <button class="btn btn-ghost btn-sm" onclick="openDrawer('${t.id}')">👁</button>
-        ${!isPlantOwner?`<button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteMyTask('${t.id}')">🗑</button>`:''}
+        ${(!isPlantOwner||canDeleteTask(t))?`<button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteMyTask('${t.id}')" title="${isPlantOwner?'Delete task you assigned':'Delete'}">🗑</button>`:`<button class="btn btn-ghost btn-sm" disabled title="Assigned by superadmin — cannot be deleted" style="opacity:.3;cursor:not-allowed;color:var(--red)">🗑</button>`}
       </div>
     </div>`;
   }).join('');
@@ -6110,6 +6138,8 @@ function quickStatusCycle(id){
 }
 
 function deleteMyTask(id){
+  const t0=getTask(id);
+  if(!canDeleteTask(t0)){ toast('You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task?')) return;
   tasks=tasks.filter(t=>t.id!==id);
   localStorage.setItem('tf_tasks',JSON.stringify(tasks));
@@ -6189,10 +6219,12 @@ function saveSelfTask(editId,selfEmail){
       assignee:selfEmail,priority:document.getElementById('st-priority').value,
       status:document.getElementById('st-status').value,
       due,created:today(),token:uid(),replies:[],attachments:[],
-      reminder:document.getElementById('st-reminder').value,tags};
+      reminder:document.getElementById('st-reminder').value,tags,
+      ...(plantOwnerAuthenticated&&currentPlantSession ? {plant: currentPlantSession.id} : {})};
     tasks=[nt,...tasks];
     localStorage.setItem('tf_tasks',JSON.stringify(tasks));
-    if(_fbReady&&_db) _db.collection('tasks').doc(nt.id).set(nt).catch(e=>console.warn('saveSelfTask error',e));
+    const ntClean = Object.fromEntries(Object.entries(nt).filter(([,v])=>v!==undefined));
+    if(_fbReady&&_db) _db.collection('tasks').doc(ntClean.id).set(ntClean).catch(e=>console.warn('saveSelfTask error',e));
     toast('Task added ✅ — no email sent');
   }
   closeSelfTaskModal(); refreshOverdueBadge();
@@ -6385,7 +6417,8 @@ function buildBulkTask(row){
     replies: [],
     attachments: [],
     reminder: row.reminder||'none',
-    tags: tags
+    tags: tags,
+    ...(plantOwnerAuthenticated&&currentPlantSession ? {plant: currentPlantSession.id} : {})
   };
 }
 
