@@ -280,6 +280,14 @@ window.fbForumLogin = async function(email, password){
 
 window.fbForumLogout = async function(){ try{ await signOut(auth); }catch(e){} };
 
+window.fbForumRefreshVerified = async function(){
+  try{
+    if(!auth.currentUser) return null;
+    await auth.currentUser.reload(); // re-fetch fresh state from Firebase's servers
+    return auth.currentUser.emailVerified;
+  } catch(e){ return null; }
+};
+
 window.fbForumResendVerification = async function(){
   try{
     if(!auth.currentUser) return { success:false, error:"Not signed in." };
