@@ -32,6 +32,23 @@ const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const auth = getAuth(app);
 
+// Where Firebase should send the user back to after they click the
+// verification link. Without this, Firebase falls back to its own
+// generic "action handled" page — this keeps them on your site.
+const verifyActionCodeSettings = {
+  url: window.location.origin + window.location.pathname,
+  handleCodeInApp: false
+};
+
+// BUG FIX (resend cooldown): calling sendEmailVerification() a second time
+// invalidates whichever link was issued first. If a user clicks "resend"
+// more than once (or double-clicks), the OLDER email they may still have
+// open becomes dead on arrival — that's the "link expired" symptom even
+// though a mail WAS sent. This cooldown stops the app itself from causing
+// that by rate-limiting how often a new link can be requested.
+var RESEND_COOLDOWN_MS = 60000; // 60s
+var _lastVerifySentAt = 0;
+
 // ════════════════════════════════════════════════════════════════
 //  REAL ADMIN AUTH — replaces the old client-side PIN check.
 //  The PIN was cosmetic: anyone could open devtools, see it was just
@@ -208,9 +225,28 @@ window.fbForumRegister = async function(name, username, email, password){
       joined: new Date().toLocaleString("en-IN",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})
     };
     await setDoc(doc(db,"qms_forum_profiles", cred.user.uid), profile);
-    try{ await sendEmailVerification(cred.user); }catch(_){ /* non-fatal — account still works */ }
+
+    // BUG FIX: previously this error was swallowed entirely, so users saw
+    // "check your email" even when the verification email failed to send
+    // (e.g. rate limit). We now surface it via `verifySent`/`verifyError`
+    // so the UI can tell the user what actually happened, and we log it.
+    var verifySent = true, verifyError = null;
+    try{
+      _lastVerifySentAt = Date.now();
+      await sendEmailVerification(cred.user, verifyActionCodeSettings);
+    }catch(e){
+      verifySent = false;
+      verifyError = e.message || "Could not send verification email.";
+      console.warn("Verification email failed to send:", e.code, e.message);
+    }
+
     fbStatus(true,"Account created");
-    return { success:true, profile: Object.assign({id:cred.user.uid, emailVerified:cred.user.emailVerified}, profile) };
+    return {
+      success:true,
+      verifySent: verifySent,
+      verifyError: verifyError,
+      profile: Object.assign({id:cred.user.uid, emailVerified:cred.user.emailVerified}, profile)
+    };
   } catch(e){
     var map = {
       "auth/email-already-in-use":"This email is already registered.",
@@ -248,7 +284,21 @@ window.fbForumResendVerification = async function(){
   try{
     if(!auth.currentUser) return { success:false, error:"Not signed in." };
     if(auth.currentUser.emailVerified) return { success:false, error:"This email is already verified." };
-    await sendEmailVerification(auth.currentUser);
+
+    // BUG FIX: sending a new verification email invalidates any link the
+    // user already has open in their inbox. Without a cooldown, an
+    // impatient click (or accidental double-click) silently kills the
+    // very email the user is about to open — which shows up to them as
+    // "the link expired" moments after receiving it. This cooldown makes
+    // that failure mode impossible from the client side.
+    var elapsed = Date.now() - _lastVerifySentAt;
+    if(_lastVerifySentAt && elapsed < RESEND_COOLDOWN_MS){
+      var waitSec = Math.ceil((RESEND_COOLDOWN_MS - elapsed)/1000);
+      return { success:false, error:"Please wait " + waitSec + "s before requesting another verification email — requesting a new one invalidates the last one sent." };
+    }
+
+    _lastVerifySentAt = Date.now();
+    await sendEmailVerification(auth.currentUser, verifyActionCodeSettings);
     return { success:true };
   } catch(e){
     if(e.code === "auth/too-many-requests"){
