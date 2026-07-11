@@ -1661,6 +1661,51 @@ function Dashboard({ responses, theme, t, plants, departments, shifts, questions
         y = ty0 + 10;
       }
 
+      // ── Emoji → canvas image helper ───────────────────────────
+      const emojiRe = /[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{1F300}-\u{1FAFF}]/gu;
+      const emojiCache = {};
+      const emojiToDataUrl = (emoji) => {
+        if (emojiCache[emoji]) return emojiCache[emoji];
+        const sz = 32;
+        const cv = document.createElement("canvas");
+        cv.width = cv.height = sz;
+        const ctx = cv.getContext("2d");
+        ctx.font = `${sz * 0.8}px serif`;
+        ctx.textBaseline = "middle";
+        ctx.textAlign = "center";
+        ctx.clearRect(0, 0, sz, sz);
+        ctx.fillText(emoji, sz / 2, sz / 2);
+        const url = cv.toDataURL("image/png");
+        emojiCache[emoji] = url;
+        return url;
+      };
+
+      // Split comment into text+emoji segments
+      const parseComment = (text) => {
+        if (!text) return [{ type: "text", value: "—" }];
+        const parts = [];
+        let last = 0;
+        let m;
+        const re = new RegExp(emojiRe.source, "gu");
+        while ((m = re.exec(text)) !== null) {
+          if (m.index > last) parts.push({ type: "text", value: text.slice(last, m.index) });
+          parts.push({ type: "emoji", value: m[0], dataUrl: emojiToDataUrl(m[0]) });
+          last = m.index + m[0].length;
+        }
+        if (last < text.length) parts.push({ type: "text", value: text.slice(last) });
+        return parts.length ? parts : [{ type: "text", value: text }];
+      };
+
+      // Build body — store raw comment, render in didDrawCell
+      const tableBody = allRows.map((r) => [
+        new Date(r.ts).toLocaleDateString(),
+        r.employeeCode || "—",
+        t.departments[r.department] || r.department,
+        t.shifts[r.shift] || r.shift,
+        fmt1(overallAverage(r)),
+        r.comment || "",
+      ]);
+
       // ── Responses table ────────────────────────────────────────
       doc.addPage();
       y = margin;
@@ -1668,19 +1713,43 @@ function Dashboard({ responses, theme, t, plants, departments, shifts, questions
       doc.autoTable({
         startY: y,
         head: [[t.tableDate, "Code", t.filterDepartmentLabel, t.filterShiftLabel, t.avgScoreTooltip, t.tableComment]],
-        body: allRows.map((r) => [
-          new Date(r.ts).toLocaleDateString(),
-          r.employeeCode || "—",
-          t.departments[r.department] || r.department,
-          t.shifts[r.shift] || r.shift,
-          fmt1(overallAverage(r)),
-          (r.comment || "").replace(/[\u{1F300}-\u{1FFFF}\u{2600}-\u{27BF}]/gu, "").trim(),
-        ]),
+        body: tableBody,
         styles: { fontSize: 7, cellPadding: 2, overflow: "linebreak" },
         headStyles: { fillColor: [62, 143, 176], textColor: 255, fontStyle: "bold", fontSize: 7 },
         alternateRowStyles: { fillColor: [245, 243, 238] },
         columnStyles: { 5: { cellWidth: 55 } },
         margin: { left: margin, right: margin },
+        didParseCell: (data) => {
+          // Replace comment cell text with plain text portion only (emojis drawn in didDrawCell)
+          if (data.section === "body" && data.column.index === 5) {
+            const raw = data.cell.raw || "";
+            data.cell.text = [raw.replace(emojiRe, "").trim() || ""];
+          }
+        },
+        didDrawCell: (data) => {
+          if (data.section !== "body" || data.column.index !== 5) return;
+          const raw = tableBody[data.row.index]?.[5] || "";
+          if (!emojiRe.test(raw)) return;
+          emojiRe.lastIndex = 0;
+          const parts = parseComment(raw);
+          const cellH = data.cell.height;
+          const emojiSizeMm = Math.min(cellH - 2, 4.5);
+          // measure text width to place emojis after text
+          const plainText = raw.replace(emojiRe, "").trim();
+          emojiRe.lastIndex = 0;
+          doc.setFontSize(7);
+          const textW = plainText ? doc.getTextWidth(plainText) + 1 : 0;
+          let ex = data.cell.x + data.cell.padding("left") + textW;
+          const ey = data.cell.y + (cellH - emojiSizeMm) / 2;
+          parts.forEach((p) => {
+            if (p.type === "emoji") {
+              try {
+                doc.addImage(p.dataUrl, "PNG", ex, ey, emojiSizeMm, emojiSizeMm);
+                ex += emojiSizeMm + 0.5;
+              } catch(e) { /* skip */ }
+            }
+          });
+        },
       });
 
       // ── Footer on every page ───────────────────────────────────
