@@ -3499,17 +3499,20 @@ function fitContain(natW, natH, maxW, maxH) {
 }
 
 // Draws the logo (already rasterized to PNG by loadLogoForPdf) into a white
-// rounded box at (boxX,boxY) sized boxW x boxH, with `pad` mm of whitespace
-// around the logo on every side, preserving its original aspect ratio.
-function drawLogoBoxPDF(doc, logo, boxX, boxY, boxW, boxH, pad) {
+// rounded box at (boxX,boxY), sized to the logo's own aspect ratio (capped to
+// maxContentW x maxContentH so an unusually wide/tall logo can't dominate the
+// header) plus exactly `pad` mm of whitespace on every side — no letterboxing
+// gaps like a fixed-size contain-fit box would introduce. Returns the box's
+// actual width/height so the caller can position content after it.
+function drawLogoBoxPDF(doc, logo, boxX, headerH, pad, maxContentW, maxContentH) {
+  if (!logo) return { boxW:0, boxH:0 };
+  const fit = fitContain(logo.w, logo.h, maxContentW, maxContentH);
+  const boxW = fit.w + pad*2, boxH = fit.h + pad*2;
+  const boxY = (headerH - boxH)/2;
   doc.setFillColor(255,255,255);
   doc.roundedRect(boxX, boxY, boxW, boxH, 2, 2, "F");
-  if (!logo) return;
-  try {
-    const maxW = boxW - pad*2, maxH = boxH - pad*2;
-    const fit = fitContain(logo.w, logo.h, maxW, maxH);
-    doc.addImage(logo.dataUrl, "PNG", boxX+pad+fit.offX, boxY+pad+fit.offY, fit.w, fit.h);
-  } catch(e) {}
+  try { doc.addImage(logo.dataUrl, "PNG", boxX+pad, boxY+pad, fit.w, fit.h); } catch(e) {}
+  return { boxW, boxH };
 }
 
 // Draws a 5-point star polygon (filled) centered at (cx,cy).
@@ -3588,9 +3591,14 @@ function drawGaugePDF(doc, cx, cy, r, value) {
   doc.text("OUT OF 5.0", cx, cy+r*0.42+4.2, {align:"center"});
 }
 
-async function exportDashboardPDF(filtered, questions, plants, plantFilter, overallAvg, recPct, recYes, qAvgFn, companyName, logoUrl) {
+async function exportDashboardPDF(filtered, questions, plants, plantFilter, overallAvg, recPct, recYes, qAvgFn, companyName, logoUrl, surveyUrl) {
   if (!filtered.length) { alert("No responses to export."); return; }
   const logo = await loadLogoForPdf(logoUrl);
+  let qrDataUrl = null;
+  if (surveyUrl && window.QRCode && window.QRCode.toDataURL) {
+    try { qrDataUrl = await window.QRCode.toDataURL(surveyUrl, { width:240, margin:1, color:{dark:"#1B3A6B",light:"#ffffff"} }); }
+    catch(e) { qrDataUrl = null; }
+  }
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
   const W=210, margin=14, cW=W-margin*2;
@@ -3599,12 +3607,11 @@ async function exportDashboardPDF(filtered, questions, plants, plantFilter, over
   // ── Header ──
   doc.setFillColor(27,58,107);
   doc.rect(0,0,W,40,"F");
-  // Logo box: whitespace padding increased by 2mm (2mm → 4mm) around the
-  // logo, and the logo itself is fit (not stretched) to preserve its
-  // original aspect ratio inside that space.
-  const logoBoxW=38, logoBoxH=30, logoPad=4;
-  if (logo) drawLogoBoxPDF(doc, logo, margin, (40-logoBoxH)/2, logoBoxW, logoBoxH, logoPad);
-  const textX = logo ? margin+logoBoxW+4 : W/2;
+  // Logo box: exactly 4mm of whitespace around the logo on every side, sized
+  // to the logo's own aspect ratio (no stretching, no letterboxing gaps).
+  const logoPad=4;
+  const logoBox = logo ? drawLogoBoxPDF(doc, logo, margin, 40, logoPad, 44, 22) : {boxW:0};
+  const textX = logo ? margin+logoBox.boxW+6 : W/2;
   const textAlign = logo ? "left" : "center";
   doc.setTextColor(255,255,255);
   doc.setFontSize(15); doc.setFont("helvetica","bold");
@@ -3615,8 +3622,11 @@ async function exportDashboardPDF(filtered, questions, plants, plantFilter, over
   doc.text(`Total: ${filtered.length} responses`, textX, 34, {align:textAlign});
   y=48;
 
-  // ── KPI cards ──
-  const kW=(cW-9)/4, kH=24;
+  // ── KPI cards + QR code (mirrors the live dashboard's kpi-qr-row) ──
+  const qrColW = qrDataUrl ? 32 : 0;
+  const qrGap = qrDataUrl ? 6 : 0;
+  const kpiAreaW = cW - qrColW - qrGap;
+  const kW=(kpiAreaW-9)/4, kH=24;
   const kpis=[
     {label:"Total Responses", value:String(filtered.length)},
     {label:"Avg Satisfaction", value:overallAvg>0?fmt1(overallAvg)+" / 5":"—", accent:overallAvg>0?hexToRgb(scoreColor(overallAvg)):null},
@@ -3634,47 +3644,59 @@ async function exportDashboardPDF(filtered, questions, plants, plantFilter, over
     if(k.accent) doc.setTextColor(...k.accent); else doc.setTextColor(30,34,41);
     doc.text(k.value, kx+3, ky+18);
   });
-  y+=kH+8;
+  if (qrDataUrl) {
+    const qx = margin+kpiAreaW+qrGap;
+    try { doc.addImage(qrDataUrl, "PNG", qx, y, qrColW, qrColW); } catch(e) {}
+    doc.setFontSize(6); doc.setFont("helvetica","normal"); doc.setTextColor(27,58,107);
+    const urlLines = doc.splitTextToSize(surveyUrl, qrColW);
+    urlLines.slice(0,2).forEach((l,i)=> doc.text(l, qx+qrColW/2, y+qrColW+4+i*3.4, {align:"center"}));
+  }
+  y += kH + 10;
 
-  // ── Overall satisfaction gauge (previously missing from the PDF export) ──
-  const gaugeBoxH = 46;
-  if (y+gaugeBoxH > 270) { doc.addPage(); y=20; }
+  // ── Gauge + Question Averages side-by-side (mirrors the live gauge-row) ──
+  const gaugePanelW = 60, panelGap = 6;
+  const catPanelW = cW - gaugePanelW - panelGap;
+  const panelH = Math.max(52, 16 + questions.length*9 + 6);
+  if (y+panelH > 270) { doc.addPage(); y=20; }
+
+  // Gauge panel
   doc.setFillColor(255,255,255); doc.setDrawColor(208,203,189); doc.setLineWidth(0.3);
-  doc.roundedRect(margin, y, cW, gaugeBoxH, 3,3,"FD");
+  doc.roundedRect(margin, y, gaugePanelW, panelH, 3,3,"FD");
   doc.setFontSize(8); doc.setFont("helvetica","bold"); doc.setTextColor(27,58,107);
   doc.text("Overall Satisfaction", margin+4, y+7);
-  drawGaugePDF(doc, margin+cW/2, y+30, 16, overallAvg);
-  y += gaugeBoxH + 6;
+  drawGaugePDF(doc, margin+gaugePanelW/2, y+panelH/2+6, 15, overallAvg);
 
-  // ── Question averages ──
-  if (questions.length>0) {
-    const qBlockH = 10 + questions.length*9 + 4;
-    if(y+qBlockH > 270){ doc.addPage(); y=20; }
-    doc.setFillColor(255,255,255); doc.setDrawColor(208,203,189); doc.setLineWidth(0.3);
-    doc.roundedRect(margin, y, cW, qBlockH, 3,3,"FD");
-    doc.setFontSize(8); doc.setFont("helvetica","bold"); doc.setTextColor(27,58,107);
-    doc.text("Question Averages", margin+4, y+7);
-    questions.forEach((q,i)=>{
-      const avg=qAvgFn(q.id);
-      const qy=y+13+i*9;
-      const bMaxW=cW-55;
-      doc.setFontSize(6.5); doc.setFont("helvetica","normal"); doc.setTextColor(60,60,60);
-      const label=q.text.length>48?q.text.slice(0,46)+"…":q.text;
-      doc.text(label, margin+4, qy);
-      doc.setFillColor(220,215,200);
-      doc.roundedRect(margin+4, qy+1.5, bMaxW, 3.5, 0.5,0.5,"F");
-      if(avg>0){
-        const [br,bg,bb]=hexToRgb(scoreColor(avg));
-        doc.setFillColor(br,bg,bb);
-        doc.roundedRect(margin+4, qy+1.5, bMaxW*(avg/5), 3.5, 0.5,0.5,"F");
-      }
-      doc.setFontSize(7.5); doc.setFont("helvetica","bold");
-      const [cr,cg,cb]=hexToRgb(scoreColor(avg>0?avg:3));
-      doc.setTextColor(cr,cg,cb);
-      doc.text(avg>0?fmt1(avg):"—", margin+4+bMaxW+3, qy+4);
-    });
-    y+=qBlockH+6;
+  // Question averages panel
+  const cpX = margin+gaugePanelW+panelGap;
+  doc.roundedRect(cpX, y, catPanelW, panelH, 3,3,"FD");
+  doc.setFontSize(8); doc.setFont("helvetica","bold"); doc.setTextColor(27,58,107);
+  doc.text("Question Averages", cpX+4, y+7);
+  if (questions.length===0) {
+    doc.setFontSize(7.5); doc.setFont("helvetica","normal"); doc.setTextColor(170,170,170);
+    doc.text("No questions configured.", cpX+4, y+16);
   }
+  const qLabelW=42, qScoreW=12, barMaxW=catPanelW-4-qLabelW-2-qScoreW-3-4;
+  questions.forEach((q,i)=>{
+    const avg=qAvgFn(q.id);
+    const qy=y+15+i*9;
+    const qx=cpX+4;
+    doc.setFontSize(6.2); doc.setFont("helvetica","normal"); doc.setTextColor(60,60,60);
+    const label=q.text.length>34?q.text.slice(0,32)+"…":q.text;
+    doc.text(label, qx, qy);
+    const barX=qx+qLabelW;
+    doc.setFillColor(220,215,200);
+    doc.roundedRect(barX, qy+1.3, barMaxW, 3.2, 0.5,0.5,"F");
+    if(avg>0){
+      const [br,bg,bb]=hexToRgb(scoreColor(avg));
+      doc.setFillColor(br,bg,bb);
+      doc.roundedRect(barX, qy+1.3, barMaxW*(avg/5), 3.2, 0.5,0.5,"F");
+    }
+    doc.setFontSize(7); doc.setFont("helvetica","bold");
+    const [cr,cg,cb]=hexToRgb(scoreColor(avg>0?avg:3));
+    doc.setTextColor(cr,cg,cb);
+    doc.text(avg>0?fmt1(avg):"—", barX+barMaxW+3, qy+3.3);
+  });
+  y += panelH + 8;
 
   // ── Response table ──
   if(y+20 > 270){ doc.addPage(); y=20; }
@@ -3750,12 +3772,11 @@ async function exportDetailPDF(r, questions, companyName, logoUrl) {
 
   // Header
   doc.setFillColor(27,58,107); doc.rect(0,0,W,40,"F");
-  // Logo box: whitespace padding increased by 2mm (2mm → 4mm) around the
-  // logo, and the logo itself is fit (not stretched) to preserve its
-  // original aspect ratio inside that space.
-  const logoBoxW=38, logoBoxH=30, logoPad=4;
-  if (logo) drawLogoBoxPDF(doc, logo, margin, (40-logoBoxH)/2, logoBoxW, logoBoxH, logoPad);
-  const txtX = logo ? margin+logoBoxW+4 : W/2;
+  // Logo box: exactly 4mm of whitespace around the logo on every side, sized
+  // to the logo's own aspect ratio (no stretching, no letterboxing gaps).
+  const logoPad=4;
+  const logoBox = logo ? drawLogoBoxPDF(doc, logo, margin, 40, logoPad, 44, 22) : {boxW:0};
+  const txtX = logo ? margin+logoBox.boxW+6 : W/2;
   const txtAlign = logo ? "left" : "center";
   doc.setTextColor(255,255,255);
   doc.setFontSize(15); doc.setFont("helvetica","bold");
@@ -3904,7 +3925,7 @@ function Dashboard({ responses, plants, questions, surveyUrl, companyName, logoU
     setTimeout(()=>{
       // Export selected rows if any, otherwise export all filtered
       const toExport = selected.size>0 ? filtered.filter(r=>selected.has(r.id)) : filtered;
-      exportDashboardPDF(toExport, questions, plants, plantFilter, overallAvg, recPct, recYes, qAvg, companyName, logoUrl);
+      exportDashboardPDF(toExport, questions, plants, plantFilter, overallAvg, recPct, recYes, qAvg, companyName, logoUrl, surveyUrl);
       setExporting(false);
     }, 100);
   };
