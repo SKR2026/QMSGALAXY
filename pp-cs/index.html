@@ -3463,8 +3463,134 @@ function hexToRgb(hex) {
   return [r,g,b];
 }
 
-function exportDashboardPDF(filtered, questions, plants, plantFilter, overallAvg, recPct, recYes, qAvgFn, companyName, logoUrl) {
+// Rasterizes the logo (whatever its source format — PNG/JPEG/WEBP/SVG) onto a
+// canvas so it can always be embedded as a clean PNG. This avoids jsPDF
+// mis-decoding non-PNG sources (which was causing the "disturbed"/glitched
+// logo in exports) and gives us the true natural width/height so the logo's
+// aspect ratio can be preserved instead of being stretched into a fixed box.
+function loadLogoForPdf(logoUrl) {
+  return new Promise(resolve => {
+    if (!logoUrl) { resolve(null); return; }
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+          if (!w || !h) { resolve(null); return; }
+          const canvas = document.createElement("canvas");
+          canvas.width = w; canvas.height = h;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, w, h);
+          resolve({ dataUrl: canvas.toDataURL("image/png"), w, h });
+        } catch(e) { resolve(null); }
+      };
+      img.onerror = () => resolve(null);
+      img.src = logoUrl;
+    } catch(e) { resolve(null); }
+  });
+}
+
+// Fits (contains) a natW x natH image inside a maxW x maxH box, preserving
+// aspect ratio, and returns the offset needed to center it in that box.
+function fitContain(natW, natH, maxW, maxH) {
+  const scale = Math.min(maxW/natW, maxH/natH);
+  const w = natW*scale, h = natH*scale;
+  return { w, h, offX:(maxW-w)/2, offY:(maxH-h)/2 };
+}
+
+// Draws the logo (already rasterized to PNG by loadLogoForPdf) into a white
+// rounded box at (boxX,boxY) sized boxW x boxH, with `pad` mm of whitespace
+// around the logo on every side, preserving its original aspect ratio.
+function drawLogoBoxPDF(doc, logo, boxX, boxY, boxW, boxH, pad) {
+  doc.setFillColor(255,255,255);
+  doc.roundedRect(boxX, boxY, boxW, boxH, 2, 2, "F");
+  if (!logo) return;
+  try {
+    const maxW = boxW - pad*2, maxH = boxH - pad*2;
+    const fit = fitContain(logo.w, logo.h, maxW, maxH);
+    doc.addImage(logo.dataUrl, "PNG", boxX+pad+fit.offX, boxY+pad+fit.offY, fit.w, fit.h);
+  } catch(e) {}
+}
+
+// Draws a 5-point star polygon (filled) centered at (cx,cy).
+function starPoints(cx, cy, outerR, innerR) {
+  const pts = [];
+  for (let i=0;i<10;i++) {
+    const ang = -Math.PI/2 + i*Math.PI/5;
+    const rad = i%2===0 ? outerR : innerR;
+    pts.push([cx+rad*Math.cos(ang), cy+rad*Math.sin(ang)]);
+  }
+  return pts;
+}
+function drawStarPDF(doc, cx, cy, outerR, rgb) {
+  const pts = starPoints(cx, cy, outerR, outerR*0.4);
+  const lineArr = [];
+  for (let i=1;i<pts.length;i++) lineArr.push([pts[i][0]-pts[i-1][0], pts[i][1]-pts[i-1][1]]);
+  lineArr.push([pts[0][0]-pts[pts.length-1][0], pts[0][1]-pts[pts.length-1][1]]);
+  doc.setFillColor(...rgb);
+  doc.setDrawColor(...rgb);
+  doc.lines(lineArr, pts[0][0], pts[0][1], [1,1], "F", true);
+}
+
+// Vector-draws the speedometer/gauge dial into the PDF (mirrors the on-screen
+// SVG <Gauge> component) — previously the gauge only existed as an SVG in the
+// React UI and was never drawn into the exported PDF at all.
+function drawGaugePDF(doc, cx, cy, r, value) {
+  const bands = [
+    [-180,-144,"#C62828"], [-141,-108,"#E65100"],
+    [-105,-76, "#F9A825"], [-73,-40,  "#7CB342"], [-37,0,"#2E7D32"],
+  ];
+  doc.setLineCap("round");
+  doc.setLineWidth(r*0.22);
+  bands.forEach(([sa,ea,col]) => {
+    const [cr,cg,cb] = hexToRgb(col);
+    doc.setDrawColor(cr,cg,cb);
+    const steps=24;
+    let px=null, py=null;
+    for (let i=0;i<=steps;i++) {
+      const a = sa + (ea-sa)*(i/steps), rad = a*Math.PI/180;
+      const x = cx + r*Math.cos(rad), y = cy + r*Math.sin(rad);
+      if (px!==null) doc.line(px,py,x,y);
+      px=x; py=y;
+    }
+  });
+  doc.setLineCap("butt");
+
+  doc.setFontSize(7); doc.setFont("helvetica","normal"); doc.setTextColor(170,170,170);
+  doc.text("1", cx-r*0.87, cy+5, {align:"center"});
+  doc.text("3", cx, cy-r-2, {align:"center"});
+  doc.text("5", cx+r*0.87, cy+5, {align:"center"});
+
+  if (value>0) {
+    const pct = clamp((value-1)/4,0,1);
+    const ang = -180 + pct*180, rad = ang*Math.PI/180, perp = rad+Math.PI/2;
+    const nLen=r*0.8, bi=r*0.06, bhw=r*0.05, tl=r*0.13, thw=r*0.037;
+    const nx=cx+nLen*Math.cos(rad), ny=cy+nLen*Math.sin(rad);
+    const bx1=cx+bi*Math.cos(rad)+bhw*Math.cos(perp), by1=cy+bi*Math.sin(rad)+bhw*Math.sin(perp);
+    const bx2=cx+bi*Math.cos(rad)-bhw*Math.cos(perp), by2=cy+bi*Math.sin(rad)-bhw*Math.sin(perp);
+    const tx1=cx-tl*Math.cos(rad)+thw*Math.cos(perp), ty1=cy-tl*Math.sin(rad)+thw*Math.sin(perp);
+    const tx2=cx-tl*Math.cos(rad)-thw*Math.cos(perp), ty2=cy-tl*Math.sin(rad)-thw*Math.sin(perp);
+    doc.setFillColor(27,58,107); doc.setDrawColor(27,58,107);
+    doc.triangle(nx,ny,bx1,by1,tx1,ty1,"F");
+    doc.triangle(nx,ny,tx1,ty1,tx2,ty2,"F");
+    doc.triangle(nx,ny,tx2,ty2,bx2,by2,"F");
+    doc.triangle(bx1,by1,tx1,ty1,tx2,ty2,"F");
+    doc.triangle(bx1,by1,tx2,ty2,bx2,by2,"F");
+  }
+  doc.setFillColor(255,255,255); doc.setDrawColor(200,200,200); doc.setLineWidth(0.5);
+  doc.circle(cx,cy,r*0.13,"FD");
+  doc.setFillColor(46,125,50); doc.setDrawColor(46,125,50);
+  doc.circle(cx,cy,r*0.055,"F");
+
+  doc.setFontSize(11); doc.setFont("helvetica","bold"); doc.setTextColor(34,34,34);
+  doc.text(value>0?fmt1(value):"—", cx, cy+r*0.42, {align:"center"});
+  doc.setFontSize(6); doc.setFont("helvetica","normal"); doc.setTextColor(170,170,170);
+  doc.text("OUT OF 5.0", cx, cy+r*0.42+4.2, {align:"center"});
+}
+
+async function exportDashboardPDF(filtered, questions, plants, plantFilter, overallAvg, recPct, recYes, qAvgFn, companyName, logoUrl) {
   if (!filtered.length) { alert("No responses to export."); return; }
+  const logo = await loadLogoForPdf(logoUrl);
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
   const W=210, margin=14, cW=W-margin*2;
@@ -3473,16 +3599,13 @@ function exportDashboardPDF(filtered, questions, plants, plantFilter, overallAvg
   // ── Header ──
   doc.setFillColor(27,58,107);
   doc.rect(0,0,W,40,"F");
-  // Logo with white background padding
-  if (logoUrl) {
-    try {
-      doc.setFillColor(255,255,255);
-      doc.roundedRect(margin, 7, 34, 26, 2, 2, "F");
-      doc.addImage(logoUrl, "PNG", margin+2, 9, 30, 22);
-    } catch(e) {}
-  }
-  const textX = logoUrl ? margin+38 : W/2;
-  const textAlign = logoUrl ? "left" : "center";
+  // Logo box: whitespace padding increased by 2mm (2mm → 4mm) around the
+  // logo, and the logo itself is fit (not stretched) to preserve its
+  // original aspect ratio inside that space.
+  const logoBoxW=38, logoBoxH=30, logoPad=4;
+  if (logo) drawLogoBoxPDF(doc, logo, margin, (40-logoBoxH)/2, logoBoxW, logoBoxH, logoPad);
+  const textX = logo ? margin+logoBoxW+4 : W/2;
+  const textAlign = logo ? "left" : "center";
   doc.setTextColor(255,255,255);
   doc.setFontSize(15); doc.setFont("helvetica","bold");
   doc.text(companyName||"Customer Satisfaction Survey", textX, 18, {align:textAlign});
@@ -3512,6 +3635,16 @@ function exportDashboardPDF(filtered, questions, plants, plantFilter, overallAvg
     doc.text(k.value, kx+3, ky+18);
   });
   y+=kH+8;
+
+  // ── Overall satisfaction gauge (previously missing from the PDF export) ──
+  const gaugeBoxH = 46;
+  if (y+gaugeBoxH > 270) { doc.addPage(); y=20; }
+  doc.setFillColor(255,255,255); doc.setDrawColor(208,203,189); doc.setLineWidth(0.3);
+  doc.roundedRect(margin, y, cW, gaugeBoxH, 3,3,"FD");
+  doc.setFontSize(8); doc.setFont("helvetica","bold"); doc.setTextColor(27,58,107);
+  doc.text("Overall Satisfaction", margin+4, y+7);
+  drawGaugePDF(doc, margin+cW/2, y+30, 16, overallAvg);
+  y += gaugeBoxH + 6;
 
   // ── Question averages ──
   if (questions.length>0) {
@@ -3607,8 +3740,9 @@ function exportDashboardPDF(filtered, questions, plants, plantFilter, overallAvg
   doc.save(fname);
 }
 
-function exportDetailPDF(r, questions, companyName, logoUrl) {
+async function exportDetailPDF(r, questions, companyName, logoUrl) {
   if (!r) return;
+  const logo = await loadLogoForPdf(logoUrl);
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
   const W=210, margin=14, cW=W-margin*2;
@@ -3616,15 +3750,13 @@ function exportDetailPDF(r, questions, companyName, logoUrl) {
 
   // Header
   doc.setFillColor(27,58,107); doc.rect(0,0,W,40,"F");
-  if(logoUrl){
-    try{
-      doc.setFillColor(255,255,255);
-      doc.roundedRect(margin, 7, 34, 26, 2, 2, "F");
-      doc.addImage(logoUrl,"PNG",margin+2,9,30,22);
-    }catch(e){}
-  }
-  const txtX = logoUrl ? margin+38 : W/2;
-  const txtAlign = logoUrl ? "left" : "center";
+  // Logo box: whitespace padding increased by 2mm (2mm → 4mm) around the
+  // logo, and the logo itself is fit (not stretched) to preserve its
+  // original aspect ratio inside that space.
+  const logoBoxW=38, logoBoxH=30, logoPad=4;
+  if (logo) drawLogoBoxPDF(doc, logo, margin, (40-logoBoxH)/2, logoBoxW, logoBoxH, logoPad);
+  const txtX = logo ? margin+logoBoxW+4 : W/2;
+  const txtAlign = logo ? "left" : "center";
   doc.setTextColor(255,255,255);
   doc.setFontSize(15); doc.setFont("helvetica","bold");
   doc.text(companyName||"Customer Satisfaction Survey", txtX, 18, {align:txtAlign});
@@ -3693,17 +3825,17 @@ function exportDetailPDF(r, questions, companyName, logoUrl) {
     doc.setFontSize(7.5); doc.setFont("helvetica","bold"); doc.setTextColor(40,40,40);
     doc.text(`${i+1}. ${q.text.slice(0,70)}`, margin+3, y+6);
 
-    // Stars
+    // Stars — drawn as real vector star shapes (previously a tiny "*" glyph)
+    // so they read clearly in the individual-response PDF export.
+    const starR = 3.2, starGap = 8.5;
     for(let s=1;s<=5;s++){
-      const [sr,sg,sb]=rating>=s?[249,168,37]:[200,195,185];
-      doc.setTextColor(sr,sg,sb);
-      doc.setFontSize(10);
-      doc.text("*", margin+3+(s-1)*6, y+13);
+      const rgb = rating>=s?[249,168,37]:[222,218,208];
+      drawStarPDF(doc, margin+6+(s-1)*starGap, y+11.5, starR, rgb);
     }
     if(rating){
       const [lr,lg,lb]=hexToRgb(scoreColor(rating));
       doc.setTextColor(lr,lg,lb); doc.setFontSize(7.5); doc.setFont("helvetica","bold");
-      doc.text(RATING_LABELS[rating-1], margin+36, y+13);
+      doc.text(RATING_LABELS[rating-1], margin+6+5*starGap+4, y+13);
     }
 
     // Comment
