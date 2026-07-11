@@ -3046,14 +3046,18 @@ function StarRating({ label, value, onChange, comment, onCommentChange }) {
 }
 
 /* ── Response Detail Modal ── */
-function DetailModal({ r, questions, onClose }) {
+function DetailModal({ r, questions, onClose, companyName, logoUrl }) {
   if (!r) return null;
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-box large" onClick={e=>e.stopPropagation()}>
         <div className="modal-hdr">
           <h3>Response Detail</h3>
-          <button className="modal-close" onClick={onClose}>✕</button>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <button className="btn-sm" style={{background:"#1B3A6B",color:"#fff",borderColor:"#1B3A6B"}}
+              onClick={()=>exportDetailPDF(r, questions, companyName, logoUrl)}>Export PDF</button>
+            <button className="modal-close" onClick={onClose}>&#10005;</button>
+          </div>
         </div>
         <div className="modal-body">
           <div className="d-meta">
@@ -3453,13 +3457,243 @@ function Settings({ plants, questions, logoUrl, companyName, surveyUrl, surveyNo
   );
 }
 
+/* ── PDF Export Helpers ── */
+function hexToRgb(hex) {
+  const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+  return [r,g,b];
+}
+
+function exportDashboardPDF(filtered, questions, plants, plantFilter, overallAvg, recPct, recYes, qAvgFn, companyName, logoUrl) {
+  if (!filtered.length) { alert("No responses to export."); return; }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
+  const W=210, margin=14, cW=W-margin*2;
+  let y=0;
+
+  // Header
+  doc.setFillColor(27,58,107);
+  doc.rect(0,0,W,36,"F");
+  if (logoUrl) { try { doc.addImage(logoUrl,"PNG",margin,6,22,22); } catch(e){} }
+  doc.setTextColor(255,255,255);
+  doc.setFontSize(16); doc.setFont("helvetica","bold");
+  doc.text(companyName||"Customer Satisfaction Survey", W/2, 16, {align:"center"});
+  doc.setFontSize(9); doc.setFont("helvetica","normal");
+  const filterLabel = plantFilter==="__all__" ? "All Plants" : plantFilter;
+  doc.text(`CSAT Report — ${filterLabel} | ${new Date().toLocaleDateString()}`, W/2, 25, {align:"center"});
+  doc.text(`${filtered.length} responses`, W-margin, 25, {align:"right"});
+  y=44;
+
+  // KPI cards row
+  const kW=(cW-9)/4, kH=22;
+  const kpis=[
+    {label:"Total Responses", value:String(filtered.length)},
+    {label:"Avg Satisfaction", value:overallAvg>0?fmt1(overallAvg)+" / 5":"—", accent:overallAvg>0?hexToRgb(scoreColor(overallAvg)):null},
+    {label:"Would Recommend",  value:filtered.length?recPct+"%":"—", accent:recPct>=70?[46,125,50]:recPct>=50?[230,81,0]:[198,40,40]},
+    {label:"Plants Covered",   value:String(new Set(filtered.map(r=>r.plant).filter(Boolean)).size)},
+  ];
+  kpis.forEach((k,i)=>{
+    const kx=margin+i*(kW+3), ky=y;
+    doc.setFillColor(255,255,255); doc.setDrawColor(208,203,189); doc.setLineWidth(0.3);
+    doc.roundedRect(kx,ky,kW,kH,2,2,"FD");
+    doc.setFontSize(6.5); doc.setFont("helvetica","normal"); doc.setTextColor(150,150,140);
+    doc.text(k.label.toUpperCase(), kx+3, ky+6);
+    const vSize = k.value.length>10?9:12;
+    doc.setFontSize(vSize); doc.setFont("helvetica","bold");
+    if(k.accent) doc.setTextColor(...k.accent); else doc.setTextColor(30,34,41);
+    doc.text(k.value, kx+3, ky+16);
+  });
+  y+=kH+8;
+
+  // Question averages
+  if (questions.length>0) {
+    doc.setFillColor(255,255,255); doc.setDrawColor(208,203,189); doc.setLineWidth(0.3);
+    doc.roundedRect(margin, y, cW, 10+questions.length*9, 3,3,"FD");
+    doc.setFontSize(8); doc.setFont("helvetica","bold"); doc.setTextColor(27,58,107);
+    doc.text("Question Averages", margin+4, y+7);
+    questions.forEach((q,i)=>{
+      const avg=qAvgFn(q.id);
+      const qy=y+13+i*9;
+      const bMaxW=cW-60;
+      doc.setFontSize(6.5); doc.setFont("helvetica","normal"); doc.setTextColor(60,60,60);
+      const label=q.text.length>42?q.text.slice(0,40)+"…":q.text;
+      doc.text(label, margin+4, qy);
+      doc.setFillColor(220,215,200);
+      doc.roundedRect(margin+4, qy+1.5, bMaxW, 3, 0.5,0.5,"F");
+      if(avg>0){
+        const [br,bg,bb]=hexToRgb(scoreColor(avg));
+        doc.setFillColor(br,bg,bb);
+        doc.roundedRect(margin+4, qy+1.5, bMaxW*(avg/5), 3, 0.5,0.5,"F");
+      }
+      doc.setFontSize(7); doc.setFont("helvetica","bold");
+      const [cr,cg,cb]=hexToRgb(scoreColor(avg>0?avg:3));
+      doc.setTextColor(cr,cg,cb);
+      doc.text(avg>0?fmt1(avg):"—", margin+4+bMaxW+3, qy+4);
+    });
+    y+=14+questions.length*9+6;
+  }
+
+  // Response table
+  doc.setFontSize(8); doc.setFont("helvetica","bold"); doc.setTextColor(30,34,41);
+  doc.text("Individual Responses", margin, y+5);
+  y+=9;
+  const cols=[22,36,42,26,18,20], hdrs=["Date","Representative","Organization","Plant","Score","Rec."];
+  let rx=margin;
+  doc.setFontSize(6.5); doc.setFont("helvetica","bold"); doc.setTextColor(120,118,110);
+  hdrs.forEach((h,i)=>{ doc.text(h.toUpperCase(), rx+2, y+4); rx+=cols[i]; });
+  doc.setDrawColor(208,203,189); doc.setLineWidth(0.2);
+  doc.line(margin, y+5.5, margin+cW, y+5.5);
+  y+=8;
+
+  filtered.forEach((r,ri)=>{
+    if(y>270){ doc.addPage(); y=20; }
+    if(ri%2===0){ doc.setFillColor(248,247,244); doc.rect(margin,y-1,cW,7,"F"); }
+    doc.setFontSize(6.5); doc.setFont("helvetica","normal"); doc.setTextColor(30,34,41);
+    let rx2=margin;
+    const rec=r.recommend==="yes"?"Yes":r.recommend==="no"?"No":"Maybe";
+    const row=[
+      r.ts?new Date(r.ts).toLocaleDateString():"—",
+      (r.repName||"—").slice(0,22),
+      (r.orgName||"—").slice(0,26),
+      (r.plant||"—").slice(0,16),
+      r.overall?fmt1(r.overall):"—",
+      rec,
+    ];
+    row.forEach((v,i)=>{
+      if(i===4&&r.overall){ const [cr,cg,cb]=hexToRgb(scoreColor(r.overall)); doc.setTextColor(cr,cg,cb); }
+      else doc.setTextColor(30,34,41);
+      doc.text(v, rx2+2, y+4); rx2+=cols[i];
+    });
+    y+=7;
+  });
+
+  const fname=`CSAT_${filterLabel.replace(/\s+/g,"_")}_${new Date().toISOString().slice(0,10)}.pdf`;
+  doc.save(fname);
+}
+
+function exportDetailPDF(r, questions, companyName, logoUrl) {
+  if (!r) return;
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
+  const W=210, margin=14, cW=W-margin*2;
+  let y=0;
+
+  // Header
+  doc.setFillColor(27,58,107); doc.rect(0,0,W,36,"F");
+  if(logoUrl){ try{ doc.addImage(logoUrl,"PNG",margin,6,22,22); }catch(e){} }
+  doc.setTextColor(255,255,255);
+  doc.setFontSize(15); doc.setFont("helvetica","bold");
+  doc.text(companyName||"Customer Satisfaction Survey", W/2, 16, {align:"center"});
+  doc.setFontSize(9); doc.setFont("helvetica","normal");
+  doc.text("Individual Response Detail", W/2, 25, {align:"center"});
+  y=44;
+
+  // Info grid
+  doc.setFillColor(245,243,238); doc.setDrawColor(208,203,189); doc.setLineWidth(0.3);
+  doc.roundedRect(margin,y,cW,58,3,3,"FD");
+  doc.setFontSize(8); doc.setFont("helvetica","bold"); doc.setTextColor(27,58,107);
+  doc.text("Respondent Information", margin+4, y+7);
+  const fields=[
+    ["Date",          r.ts?new Date(r.ts).toLocaleString():"—"],
+    ["Representative",r.repName||"—"],
+    ["Organization",  r.orgName||"—"],
+    ["Email",         r.email||"—"],
+    ["Contact No.",   r.contact||"—"],
+    ["Plant",         r.plant||"—"],
+  ];
+  fields.forEach(([k,v],i)=>{
+    const fx=i<3?margin+4:margin+cW/2+4;
+    const fy=y+14+(i%3)*14;
+    doc.setFontSize(7); doc.setFont("helvetica","bold"); doc.setTextColor(120,118,110);
+    doc.text(k.toUpperCase(), fx, fy);
+    doc.setFontSize(8.5); doc.setFont("helvetica","normal"); doc.setTextColor(30,34,41);
+    doc.text(String(v).slice(0,32), fx, fy+5.5);
+  });
+  y+=64;
+
+  // Overall score + recommend
+  const [or,og,ob]=hexToRgb(r.overall?scoreColor(r.overall):"#888888");
+  doc.setFillColor(255,255,255); doc.setDrawColor(208,203,189); doc.setLineWidth(0.3);
+  doc.roundedRect(margin,y,cW/2-4,22,3,3,"FD");
+  doc.setFontSize(7); doc.setFont("helvetica","normal"); doc.setTextColor(120,118,110);
+  doc.text("OVERALL SCORE", margin+4, y+7);
+  doc.setFontSize(16); doc.setFont("helvetica","bold"); doc.setTextColor(or,og,ob);
+  doc.text(r.overall?fmt1(r.overall)+" / 5.0":"—", margin+4, y+18);
+
+  doc.roundedRect(margin+cW/2+4,y,cW/2-4,22,3,3,"FD");
+  doc.setFontSize(7); doc.setFont("helvetica","normal"); doc.setTextColor(120,118,110);
+  doc.text("WOULD RECOMMEND", margin+cW/2+8, y+7);
+  doc.setFontSize(12); doc.setFont("helvetica","bold"); doc.setTextColor(30,34,41);
+  const recText=r.recommend==="yes"?"Yes":r.recommend==="no"?"No":"Maybe";
+  const recColor=r.recommend==="yes"?[46,125,50]:r.recommend==="no"?[198,40,40]:[230,81,0];
+  doc.setTextColor(...recColor);
+  doc.text(recText, margin+cW/2+8, y+18);
+  y+=28;
+
+  // Questions
+  doc.setFontSize(9); doc.setFont("helvetica","bold"); doc.setTextColor(27,58,107);
+  doc.text("Question Ratings & Comments", margin, y+5);
+  y+=10;
+
+  questions.forEach((q,i)=>{
+    if(y>260){ doc.addPage(); y=20; }
+    const rating=r.ratings?.[q.id]||0;
+    const cmt=r.qComments?.[q.id]||"";
+    const blockH=cmt?28:18;
+    doc.setFillColor(i%2===0?255:250,i%2===0?255:249,i%2===0?255:248);
+    doc.setDrawColor(225,220,210); doc.setLineWidth(0.2);
+    doc.rect(margin,y,cW,blockH,"FD");
+
+    // Q label
+    doc.setFontSize(7.5); doc.setFont("helvetica","bold"); doc.setTextColor(40,40,40);
+    doc.text(`${i+1}. ${q.text.slice(0,70)}`, margin+3, y+6);
+
+    // Stars
+    for(let s=1;s<=5;s++){
+      const [sr,sg,sb]=rating>=s?[249,168,37]:[200,195,185];
+      doc.setTextColor(sr,sg,sb);
+      doc.setFontSize(10);
+      doc.text("*", margin+3+(s-1)*6, y+13);
+    }
+    if(rating){
+      const [lr,lg,lb]=hexToRgb(scoreColor(rating));
+      doc.setTextColor(lr,lg,lb); doc.setFontSize(7.5); doc.setFont("helvetica","bold");
+      doc.text(RATING_LABELS[rating-1], margin+36, y+13);
+    }
+
+    // Comment
+    if(cmt){
+      doc.setFontSize(7); doc.setFont("helvetica","italic"); doc.setTextColor(80,80,80);
+      const cmtLines=doc.splitTextToSize(`"${cmt}"`, cW-8);
+      doc.text(cmtLines[0]||"", margin+3, y+21);
+    }
+    y+=blockH+2;
+  });
+
+  // Overall comment
+  if(r.overallComment){
+    if(y>255){ doc.addPage(); y=20; }
+    doc.setFontSize(9); doc.setFont("helvetica","bold"); doc.setTextColor(27,58,107);
+    doc.text("Additional Comments", margin, y+5);
+    y+=10;
+    doc.setFillColor(240,244,250); doc.setDrawColor(195,212,238); doc.setLineWidth(0.3);
+    const cmtLines=doc.splitTextToSize(r.overallComment, cW-10);
+    doc.roundedRect(margin,y,cW,10+cmtLines.length*5,3,3,"FD");
+    doc.setFontSize(8); doc.setFont("helvetica","italic"); doc.setTextColor(50,50,80);
+    cmtLines.forEach((l,i)=>doc.text(l, margin+5, y+8+i*5));
+  }
+
+  const fname=`Response_${r.repName||"Unknown"}_${new Date(r.ts||Date.now()).toISOString().slice(0,10)}.pdf`.replace(/\s+/g,"_");
+  doc.save(fname);
+}
+
 /* ── Dashboard ── */
-function Dashboard({ responses, plants, questions, surveyUrl }) {
+function Dashboard({ responses, plants, questions, surveyUrl, companyName, logoUrl }) {
   const [plantFilter, setPlantFilter] = useState("__all__");
   const [search,      setSearch]      = useState("");
   const [selected,    setSelected]    = useState(new Set());
   const [confirmDel,  setConfirmDel]  = useState(false);
   const [detailRow,   setDetailRow]   = useState(null);
+  const [exporting,   setExporting]   = useState(false);
 
   const filtered = useMemo(()=>{
     return responses.filter(r=>{
@@ -3487,6 +3721,16 @@ function Dashboard({ responses, plants, questions, surveyUrl }) {
     setSelected(new Set()); setConfirmDel(false);
   };
 
+  const handleExport = () => {
+    setExporting(true);
+    setTimeout(()=>{
+      // Export selected rows if any, otherwise export all filtered
+      const toExport = selected.size>0 ? filtered.filter(r=>selected.has(r.id)) : filtered;
+      exportDashboardPDF(toExport, questions, plants, plantFilter, overallAvg, recPct, recYes, qAvg, companyName, logoUrl);
+      setExporting(false);
+    }, 100);
+  };
+
   return (
     <div className="dash-wrap">
       <div className="dash-toprow">
@@ -3496,12 +3740,17 @@ function Dashboard({ responses, plants, questions, surveyUrl }) {
             <button key={p.name} className={"pill"+(plantFilter===p.name?" active":"")} onClick={()=>setPlantFilter(p.name)}>{p.name}</button>
           ))}
         </div>
-        {surveyUrl && (
-          <div className="qr-corner">
-            <QRWidget url={surveyUrl} size={80}/>
-            <a href={surveyUrl} target="_blank" rel="noreferrer" className="survey-link">{surveyUrl}</a>
-          </div>
-        )}
+        <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+          <button className="btn-export" onClick={handleExport} disabled={exporting||!filtered.length}>
+            {exporting?"Exporting...":selected.size>0?`Export Selected (${selected.size})`:`Export PDF${plantFilter!=="__all__"?" - "+plantFilter:""}`}
+          </button>
+          {surveyUrl && (
+            <div className="qr-corner">
+              <QRWidget url={surveyUrl} size={80}/>
+              <a href={surveyUrl} target="_blank" rel="noreferrer" className="survey-link">{surveyUrl}</a>
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="kpi-grid">
@@ -3538,6 +3787,7 @@ function Dashboard({ responses, plants, questions, surveyUrl }) {
           <div className="panel-acts">
             <button className="btn-sm" onClick={selectAll}>Select All</button>
             <button className="btn-sm" onClick={clearSel}>Clear</button>
+            {selected.size>0 && <button className="btn-sm" onClick={handleExport}>Export ({selected.size})</button>}
             {selected.size>0 && <button className="btn-sm danger" onClick={()=>setConfirmDel(true)}>Delete ({selected.size})</button>}
           </div>
         </div>
@@ -3577,7 +3827,7 @@ function Dashboard({ responses, plants, questions, surveyUrl }) {
           </div>
         </div>
       )}
-      {detailRow && <DetailModal r={detailRow} questions={questions} onClose={()=>setDetailRow(null)}/>}
+      {detailRow && <DetailModal r={detailRow} questions={questions} onClose={()=>setDetailRow(null)} companyName={companyName} logoUrl={logoUrl}/>}
     </div>
   );
 }
@@ -3668,7 +3918,7 @@ function App() {
         {tab==="qr"        && isAdmin && <QRPortalPage surveyUrl={surveyUrl} logoUrl={logoUrl} companyName={companyName}/>}
         {tab==="qr"        && !isAdmin && <SurveyForm plants={plants} questions={questions} logoUrl={logoUrl} companyName={companyName} surveyNote={surveyNote}/>}
         {tab==="login"     && !isAdmin && <LoginForm/>}
-        {tab==="dashboard" && isAdmin  && <Dashboard responses={responses} plants={plants} questions={questions} surveyUrl={surveyUrl}/>}
+        {tab==="dashboard" && isAdmin  && <Dashboard responses={responses} plants={plants} questions={questions} surveyUrl={surveyUrl} companyName={companyName} logoUrl={logoUrl}/>}
         {tab==="settings"  && isAdmin  && <Settings plants={plants} questions={questions} logoUrl={logoUrl} companyName={companyName} surveyUrl={surveyUrl} surveyNote={surveyNote} onLogoUpload={handleLogoUpload} uploading={uploading}/>}
       </main>
     </div>
@@ -3830,6 +4080,9 @@ textarea.inp{resize:vertical;}
 .resp-row{cursor:pointer;transition:background 0.1s;}
 .resp-row:hover td{background:#F8F6F2;}
 .resp-row.sel td{background:rgba(27,58,107,0.06);}
+.btn-export{padding:8px 18px;background:#1B3A6B;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;transition:opacity 0.15s;}
+.btn-export:hover:not(:disabled){opacity:0.85;}
+.btn-export:disabled{opacity:0.5;cursor:not-allowed;}
 .click-hint{font-size:11px;color:#ccc;margin-top:10px;text-align:right;}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.52);display:flex;align-items:center;justify-content:center;z-index:300;padding:16px;}
 .modal-box{background:#fff;border-radius:14px;padding:24px;max-width:420px;width:100%;border:1px solid #D0CBBD;box-shadow:0 8px 32px rgba(0,0,0,0.18);}
