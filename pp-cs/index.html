@@ -3673,6 +3673,7 @@ function loadLogoForPdf(logoUrl) {
     if (!logoUrl) { resolve(null); return; }
     try {
       const img = new Image();
+      img.crossOrigin = "anonymous"; // logo is now a real https URL (Firebase Storage), not base64 — needed so canvas.toDataURL() below isn't blocked as tainted
       img.onload = () => {
         try {
           const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
@@ -4447,26 +4448,28 @@ function App() {
     const infoLines = (info||"").split("\n").filter(l=>l.trim());
     const infoRows  = infoLines.map(function(l){ return "<tr><td style=\"padding:3px 0;font-family:Arial,sans-serif;font-size:13px;color:#444;line-height:1.6;\">" + l.trim() + "</td></tr>"; }).join("");
     // Logo: white bg, rounded corners, ~2mm (8px) padding, CENTERED.
-    // Fix: previous version relied only on inline CSS (max-height/width:auto,
-    // no width/height attrs on the plain <img>, no cellpadding/align attrs on
-    // the tables). Rediffmail — and some Outlook builds — strip <style> and
-    // even inline style="" attributes, which made the box collapse to the
-    // image's natural size, left-aligned, with no visible white margin.
-    // This version uses HTML *attributes* (align, cellpadding, height) as a
-    // hard fallback so the layout survives style-stripping, and uses the
-    // SAME height="54" (width omitted, so aspect ratio is preserved by the
-    // browser/client natively) in both branches so the logo renders at an
-    // identical size in Outlook and everywhere else.
+    // The real Polyplastics logo file is 763x131px (measured) = a 5.82:1
+    // wide banner shape — NOT close to square. Hardcoding a fixed WIDTH
+    // (e.g. 200px) while letting height be "auto" (an attribute Outlook's
+    // Word rendering engine doesn't actually support) is what caused the
+    // stretching in Outlook. Fix: both branches now use the SAME explicit
+    // width AND height, computed to match the logo's true aspect ratio
+    // exactly (233x40 ≈ 5.82:1), so no client can distort it.
+    // cellpadding (an HTML attribute, not just CSS) is used for the 8px/2mm
+    // margin, and align="center" is set as an HTML attribute too, so both
+    // survive clients that strip <style>/style="" (see note on Rediffmail
+    // below — attribute-proofing alone won't fix a missing image there).
+    const LOGO_W = 233, LOGO_H = 40; // matches real file's 763x131 ratio
     const logoHtml = logo ? [
-      // ── Outlook VML (centered, fixed box, no stretch) ──
+      // ── Outlook VML (centered, fixed box, exact aspect ratio, no stretch) ──
       "<!--[if mso]>",
       "<v:roundrect xmlns:v=\"urn:schemas-microsoft-com:vml\" xmlns:w=\"urn:schemas-microsoft-com:office:word\"",
       " arcsize=\"10%\" strokecolor=\"#dddddd\" fillcolor=\"#ffffff\"",
-      " style=\"width:220px;height:70px;\">",
+      " style=\"width:" + (LOGO_W+16) + "px;height:" + (LOGO_H+16) + "px;\">",
       "<w:anchorlock/>",
-      "<table border=\"0\" cellpadding=\"8\" cellspacing=\"0\" width=\"220\" height=\"70\"><tr>",
+      "<table border=\"0\" cellpadding=\"8\" cellspacing=\"0\" width=\"" + (LOGO_W+16) + "\" height=\"" + (LOGO_H+16) + "\"><tr>",
       "<td align=\"center\" valign=\"middle\">",
-      "<img src=\"" + logo + "\" height=\"54\" style=\"border:0;display:block;max-height:54px;width:auto;\" />",
+      "<img src=\"" + logo + "\" width=\"" + LOGO_W + "\" height=\"" + LOGO_H + "\" style=\"border:0;display:block;\" />",
       "</td></tr></table>",
       "</v:roundrect>",
       "<![endif]-->",
@@ -4474,7 +4477,7 @@ function App() {
       "<!--[if !mso]><!-->",
       "<table border=\"0\" cellpadding=\"8\" cellspacing=\"0\" bgcolor=\"#ffffff\" align=\"center\" style=\"background:#ffffff;border-radius:12px;border:1px solid #dddddd;\"><tr>",
       "<td align=\"center\" valign=\"middle\" style=\"border-radius:12px;\">",
-      "<img src=\"" + logo + "\" alt=\"logo\" height=\"54\" style=\"display:block;max-height:54px;width:auto;max-width:200px;border:0;\" />",
+      "<img src=\"" + logo + "\" alt=\"logo\" width=\"" + LOGO_W + "\" height=\"" + LOGO_H + "\" style=\"display:block;border:0;\" />",
       "</td></tr></table>",
       "<!--<![endif]-->"
     ].join("") : "";
@@ -4600,20 +4603,37 @@ function App() {
     }
   };
 
-  /* Logo upload: convert to base64 and store in Realtime DB (avoids Storage CORS issues) */
+  /* Logo upload: upload the real file to Firebase Storage and store its
+     https:// download URL (NOT base64). This is the fix for "no logo in
+     Rediffmail": a base64 data: URI embedded in <img src> is stripped by
+     Rediffmail (and many other webmail providers) as a security/anti-abuse
+     measure before the mail is even rendered — no amount of HTML/CSS
+     fixing can work around that, the src has to be a real hosted URL.
+     Outlook and O365 web tolerate data: URIs more often, which is why
+     "only 365 is ok" lined up with this being the cause. Requires: Storage
+     security rules allowing read (public) + write (authenticated), e.g.
+       match /logos/{allPaths=**} { allow read: if true; allow write: if request.auth != null; }
+     If you hit a CORS error on upload, run once from the Firebase CLI:
+       gsutil cors set cors.json gs://skr-legal.firebasestorage.app
+     with cors.json containing an entry allowing your app's origin for
+     PUT/POST/GET (methods: ["GET","PUT","POST"], origin: ["*"] to start). */
   const handleLogoUpload = file => {
     if (!file) return;
     if (file.size > 600*1024) { alert("File too large. Please use an image under 600 KB."); return; }
     setUploading(true);
-    const reader = new FileReader();
-    reader.onload = async e => {
+    (async () => {
       try {
-        await firebase.database().ref(DB.logo).set(e.target.result);
-      } catch(err) { alert("Logo save failed: "+err.message); }
+        const path = "logos/" + Date.now() + "_" + file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const storageRef = firebase.storage().ref(path);
+        await storageRef.put(file, { contentType: file.type || "image/png" });
+        const url = await storageRef.getDownloadURL();
+        await firebase.database().ref(DB.logo).set(url);
+      } catch(err) {
+        alert("Logo upload failed: " + (err && err.message ? err.message : err) +
+              "\n\nIf this mentions CORS, the Storage bucket needs a CORS config — see comment above handleLogoUpload in the source.");
+      }
       setUploading(false);
-    };
-    reader.onerror = () => { alert("Could not read file."); setUploading(false); };
-    reader.readAsDataURL(file);
+    })();
   };
 
   if (authLoading) return <div className="loading">Loading…</div>;
