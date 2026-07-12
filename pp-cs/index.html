@@ -3397,6 +3397,7 @@ function Settings({ plants, questions, logoUrl, companyName, surveyUrl, surveyNo
   const [draftInfo,   setDraftInfo]   = useState(infoText||"");
   const [infoSaved,   setInfoSaved]   = useState(false);
   const [msSaved,     setMsSaved]     = useState(false);
+  const [msSaveErr,   setMsSaveErr]   = useState("");
   useEffect(()=>setDraftEmail(notifEmail||""),[notifEmail]);
   useEffect(()=>setDraftAck(ackText||""),[ackText]);
   useEffect(()=>setDraftTenant(msTenantId||""),[msTenantId]);
@@ -3405,11 +3406,14 @@ function Settings({ plants, questions, logoUrl, companyName, surveyUrl, surveyNo
   useEffect(()=>setDraftSender(msSenderEmail||""),[msSenderEmail]);
 
   const saveMsConfig = async () => {
-    await onSaveMsTenantId(draftTenant);
-    await onSaveMsClientId(draftClient);
-    await onSaveMsSenderEmail(draftSender);
-    setMsSaved(true);
-    setTimeout(()=>setMsSaved(false), 2500);
+    setMsSaveErr("");
+    try {
+      await onSaveMsTenantId(draftTenant);
+      await onSaveMsClientId(draftClient);
+      await onSaveMsSenderEmail(draftSender);
+      setMsSaved(true);
+      setTimeout(()=>setMsSaved(false), 2500);
+    } catch(e) { setMsSaveErr(e && e.message ? e.message : "Save failed — check Firebase rules allow auth writes to csat_settings."); }
   };
   const [ePlantTxt, setEPlantTxt] = useState("");
   const [newQ,      setNewQ]      = useState("");
@@ -3534,6 +3538,7 @@ function Settings({ plants, questions, logoUrl, companyName, surveyUrl, surveyNo
             {msSignedIn ? "✅ Signed In to Microsoft 365" : "🔑 Sign In with Microsoft 365"}
           </button>
         </div>
+        {msSaveErr && <div className="error-box" style={{marginBottom:12}}>⚠ {msSaveErr}</div>}
         {!msSignedIn && (
           <p className="muted" style={{fontSize:12,color:"#E65100",marginBottom:12}}>
             ⚠ Sign in once before submitting survey — after that mail sends silently in background.
@@ -4233,6 +4238,15 @@ function App() {
   const [surveyNote,  setSurveyNote]  = useState("");
   const [uploading,   setUploading]   = useState(false);
 
+  // Refs that mirror live state — used inside sendAckMail so the closure
+  // always reads the *current* value even after state updates.
+  const ackTextRef      = useRef("");
+  const infoTextRef     = useRef("");
+  const msTenantIdRef   = useRef("");
+  const msClientIdRef   = useRef("");
+  const msSenderEmailRef= useRef("");
+  const logoUrlRef      = useRef("");
+
   useEffect(()=>{
     const unsubAuth = firebase.auth().onAuthStateChanged(u=>{
       setUser(u);
@@ -4266,7 +4280,7 @@ function App() {
     }, logErr("questions read"));
 
     const refLogo = firebase.database().ref(DB.logo);
-    refLogo.on("value", s=>setLogoUrl(s.val()||""), logErr("logo read"));
+    refLogo.on("value", s=>{ const v=s.val()||""; setLogoUrl(v); logoUrlRef.current=v; }, logErr("logo read"));
 
     const refSUrl = firebase.database().ref(DB.surveyUrl);
     refSUrl.on("value", s=>setSurveyUrl(s.val()||""), logErr("surveyUrl read"));
@@ -4278,16 +4292,16 @@ function App() {
     refNote.on("value", s=>setSurveyNote(s.val()||""), logErr("surveyNote read"));
 
     const refAT = firebase.database().ref(DB.ackText);
-    refAT.on("value", s=>setAckText(s.val()||"Thank you for your valuable feedback! Your response has been recorded."), logErr("ackText read"));
+    refAT.on("value", s=>{ const v=s.val()||"Thank you for your valuable feedback! Your response has been recorded."; setAckText(v); ackTextRef.current=v; }, logErr("ackText read"));
     const refIT = firebase.database().ref(DB.infoText);
-    refIT.on("value", s=>setInfoText(s.val()||"Your response has been successfully recorded.\nYour feedback helps us continuously improve our products and services.\nIf you have any questions, feel free to contact us."), logErr("infoText read"));
+    refIT.on("value", s=>{ const v=s.val()||"Your response has been successfully recorded.\nYour feedback helps us continuously improve our products and services.\nIf you have any questions, feel free to contact us."; setInfoText(v); infoTextRef.current=v; }, logErr("infoText read"));
 
     const refTn = firebase.database().ref(DB.msTenantId);
-    refTn.on("value", s=>setMsTenantId(s.val()||""), logErr("msTenantId read"));
+    refTn.on("value", s=>{ const v=s.val()||""; setMsTenantId(v); msTenantIdRef.current=v; }, logErr("msTenantId read"));
     const refCi = firebase.database().ref(DB.msClientId);
-    refCi.on("value", s=>setMsClientId(s.val()||""), logErr("msClientId read"));
+    refCi.on("value", s=>{ const v=s.val()||""; setMsClientId(v); msClientIdRef.current=v; }, logErr("msClientId read"));
     const refSe = firebase.database().ref(DB.msSenderEmail);
-    refSe.on("value", s=>setMsSenderEmail(s.val()||""), logErr("msSenderEmail read"));
+    refSe.on("value", s=>{ const v=s.val()||""; setMsSenderEmail(v); msSenderEmailRef.current=v; }, logErr("msSenderEmail read"));
 
     return ()=>{
       refPlants.off("value");
@@ -4485,14 +4499,19 @@ function App() {
   const sendAckMail = async (toEmail, compName) => {
     if (!toEmail) return;
     const logId   = "ml_" + Date.now();
+    // Read from refs — always the live value regardless of closure age
+    const curAckText  = ackTextRef.current;
+    const curInfoText = infoTextRef.current;
+    const curLogo     = logoUrlRef.current;
+    const curTenantId = msTenantIdRef.current;
+    const curClientId = msClientIdRef.current;
+    const curSender   = msSenderEmailRef.current;
     const subject = "Thank you for your feedback - " + compName;
-    const htmlBody = buildAckHtml(toEmail, compName, ackText, logoUrl, infoText);
+    const htmlBody = buildAckHtml(toEmail, compName, curAckText, curLogo, curInfoText);
     let status = "pending", error = "";
     try {
-      if (!msTenantId || !msClientId) throw new Error("Microsoft credentials not configured in Settings.");
-      // Acquire token via MSAL (silent if already signed in, popup on first use)
-      const token = await getMSGraphToken(msClientId, msTenantId);
-      // Use /me/sendMail with delegated Mail.Send — same as Task Planner
+      if (!curTenantId || !curClientId) throw new Error("Microsoft credentials not configured in Settings.");
+      const token = await getMSGraphToken(curClientId, curTenantId);
       const res = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {
         method: "POST",
         headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
@@ -4512,12 +4531,16 @@ function App() {
       error  = e.message || String(e);
       console.error("sendAckMail:", e);
     }
+    // Always write the log entry regardless of send success/failure
     try {
       await firebase.database().ref(DB.mailLog + "/" + logId).set({
-        id:logId, ts:Date.now(), to:toEmail, from:msSenderEmail||"",
+        id:logId, ts:Date.now(), to:toEmail, from:curSender,
         subject, status, error,
       });
-    } catch(e) { console.error("mailLog write:", e); }
+      console.log("mailLog written:", logId, status);
+    } catch(e) {
+      console.error("mailLog write failed:", e && e.message ? e.message : e);
+    }
   };
 
   /* Logo upload: convert to base64 and store in Realtime DB (avoids Storage CORS issues) */
