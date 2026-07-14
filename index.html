@@ -1581,11 +1581,56 @@ function submitForm(){
   var email=document.getElementById('f-email').value.trim();
   var msg=document.getElementById('f-msg').value.trim();
   if(!name||!email||!msg){alert('Please fill in name, email, and message.');return;}
-  var entry={id:Date.now(),name:name,email:email,phone:document.getElementById('f-phone').value,service:document.getElementById('f-service').value||'General',message:msg,time:new Date().toLocaleString('en-IN'),reply:''};
+  var phone=document.getElementById('f-phone').value;
+  var service=document.getElementById('f-service').value||'General';
+  var entry={id:Date.now(),name:name,email:email,phone:phone,service:service,message:msg,time:new Date().toLocaleString('en-IN'),reply:''};
   messages.unshift(entry);localStorage.setItem('qmsg_messages',JSON.stringify(messages));
   if(window.fbSaveEnquiry) window.fbSaveEnquiry(entry);
   ['f-name','f-email','f-phone','f-msg'].forEach(function(id){document.getElementById(id).value='';});document.getElementById('f-service').value='';
   var s=document.getElementById('form-success');s.style.display='block';setTimeout(function(){s.style.display='none';},4000);
+
+  /* ── Notify admin by email ── */
+  sendContactNotificationToAdmin({name:name,email:email,phone:phone,service:service,message:msg});
+}
+
+function sendContactNotificationToAdmin(data){
+  var adminEmail='admin@qmsgalaxy.com';
+  var ejsSvcId=EMAILJS_SERVICE_ID||siteData.emailjsServiceId||'';
+  var ejsKey=EMAILJS_PUBLIC_KEY||siteData.emailjsPublicKey||'';
+  var ejsAdminTplId=siteData.emailjsAdminNotifyTemplateId||EMAILJS_ADMIN_NOTIFY_TEMPLATE_ID||'';
+  /* If a dedicated admin-notify template exists, use it; else fall back to the invoice template and map fields */
+  var ejsTplId=ejsAdminTplId||(EMAILJS_TEMPLATE_ID||siteData.emailjsTemplateId||'');
+  if(ejsSvcId&&ejsTplId&&ejsKey&&typeof emailjs!=='undefined'){
+    emailjs.init(ejsKey);
+    var params={
+      to_name:'Admin',
+      to_email:adminEmail,
+      from_name:data.name,
+      from_email:data.email,
+      phone:data.phone||'—',
+      service:data.service,
+      message:data.message,
+      reply_to:data.email,
+      /* aliases so a generic invoice template also picks these up */
+      subject:'New Contact Enquiry from '+data.name,
+      product_name:data.service,
+      company_name:(siteData&&siteData.brandName)||'QMS GALAXY'
+    };
+    emailjs.send(ejsSvcId,ejsTplId,params)
+      .then(function(){console.log('Admin notification sent.');})
+      .catch(function(err){
+        /* Fallback: open mailto for admin */
+        var sub=encodeURIComponent('New Enquiry from '+data.name+' ['+data.service+']');
+        var body=encodeURIComponent('Name: '+data.name+'\nEmail: '+data.email+'\nPhone: '+(data.phone||'—')+'\nService: '+data.service+'\n\nMessage:\n'+data.message);
+        window.open('mailto:'+adminEmail+'?subject='+sub+'&body='+body,'_blank');
+        console.warn('EmailJS admin notify failed, opened mailto fallback:',err);
+      });
+  } else {
+    /* No EmailJS — open mailto as fallback */
+    var sub=encodeURIComponent('New Enquiry from '+data.name+' ['+data.service+']');
+    var body=encodeURIComponent('Name: '+data.name+'\nEmail: '+data.email+'\nPhone: '+(data.phone||'—')+'\nService: '+data.service+'\n\nMessage:\n'+data.message);
+    window.open('mailto:'+adminEmail+'?subject='+sub+'&body='+body,'_blank');
+  }
 }
 function openConnect(service){document.getElementById('connect').scrollIntoView({behavior:'smooth'});setTimeout(function(){var sel=document.getElementById('f-service');for(var i=0;i<sel.options.length;i++){if(sel.options[i].text===service||sel.options[i].text.includes(service)){sel.value=sel.options[i].value;break;}}},600);}
 
@@ -2115,7 +2160,59 @@ function renderMessages(){
   });
 }
 function toggleReply(i){var b=document.getElementById('reply-'+i);b.style.display=b.style.display==='block'?'none':'block';}
-function sendReply(i){var r=document.getElementById('reply-text-'+i).value.trim();if(!r)return;messages[i].reply=r;localStorage.setItem('qmsg_messages',JSON.stringify(messages));if(messages[i].fbId&&window.fbUpdateEnquiryReply)window.fbUpdateEnquiryReply(messages[i].fbId,r);renderMessages();}
+function sendReply(i){
+  var r=document.getElementById('reply-text-'+i).value.trim();
+  if(!r)return;
+  var m=messages[i];
+  m.reply=r;
+  localStorage.setItem('qmsg_messages',JSON.stringify(messages));
+  if(m.fbId&&window.fbUpdateEnquiryReply) window.fbUpdateEnquiryReply(m.fbId,r);
+  renderMessages();
+  /* ── Notify user by email ── */
+  sendReplyNotificationToUser(m,r);
+}
+
+function sendReplyNotificationToUser(m,replyText){
+  if(!m||!m.email) return;
+  var ejsSvcId=EMAILJS_SERVICE_ID||siteData.emailjsServiceId||'';
+  var ejsKey=EMAILJS_PUBLIC_KEY||siteData.emailjsPublicKey||'';
+  var ejsUserTplId=siteData.emailjsUserReplyTemplateId||EMAILJS_USER_REPLY_TEMPLATE_ID||'';
+  var ejsTplId=ejsUserTplId||(EMAILJS_TEMPLATE_ID||siteData.emailjsTemplateId||'');
+  var adminEmail='admin@qmsgalaxy.com';
+  var brandName=(siteData&&siteData.brandName)||'QMS GALAXY';
+  if(ejsSvcId&&ejsTplId&&ejsKey&&typeof emailjs!=='undefined'){
+    emailjs.init(ejsKey);
+    var params={
+      to_name:m.name||'Customer',
+      to_email:m.email,
+      from_name:brandName+' Support',
+      reply_to:adminEmail,
+      subject:'Re: Your Enquiry — '+m.service,
+      original_message:m.message,
+      reply_message:replyText,
+      service:m.service,
+      company_name:brandName,
+      company_email:adminEmail,
+      /* aliases for generic templates */
+      message:replyText,
+      product_name:m.service
+    };
+    showPayToast('📧 Sending reply to '+m.email+'…');
+    emailjs.send(ejsSvcId,ejsTplId,params)
+      .then(function(){showPayToast('✅ Reply emailed to '+m.email+'!');})
+      .catch(function(err){
+        var sub=encodeURIComponent('Re: Your Enquiry about '+m.service);
+        var body=encodeURIComponent('Dear '+m.name+',\n\n'+replyText+'\n\nBest regards,\n'+brandName+'\n'+adminEmail);
+        window.open('mailto:'+m.email+'?subject='+sub+'&body='+body,'_blank');
+        console.warn('EmailJS user reply failed, opened mailto fallback:',err);
+      });
+  } else {
+    /* No EmailJS — open mailto as fallback */
+    var sub=encodeURIComponent('Re: Your Enquiry about '+m.service);
+    var body=encodeURIComponent('Dear '+m.name+',\n\n'+replyText+'\n\nBest regards,\n'+brandName+'\n'+adminEmail);
+    window.open('mailto:'+m.email+'?subject='+sub+'&body='+body,'_blank');
+  }
+}
 function deleteMsg(i){if(!confirm('Delete this message?'))return;var m=messages[i];if(m&&m.fbId&&window.fbDeleteEnquiry)window.fbDeleteEnquiry(m.fbId);messages.splice(i,1);localStorage.setItem('qmsg_messages',JSON.stringify(messages));renderMessages();}
 function toggleMenu(){var m=document.getElementById('mobile-menu');m.style.display=m.style.display==='none'?'block':'none';}
 
@@ -2311,8 +2408,11 @@ function generateInvoice(mode){
 /* ── EMAIL INVOICE ── */
 /* EmailJS config — set these in Admin → Payments → Email Invoice tab or paste here */
 var EMAILJS_SERVICE_ID = '';
-var EMAILJS_TEMPLATE_ID = '';
+var EMAILJS_TEMPLATE_ID = '';          /* Invoice emails */
 var EMAILJS_PUBLIC_KEY = '';
+/* Contact-form email templates (optional — falls back to EMAILJS_TEMPLATE_ID if blank) */
+var EMAILJS_ADMIN_NOTIFY_TEMPLATE_ID = ''; /* Template to notify admin@qmsgalaxy.com on new contact */
+var EMAILJS_USER_REPLY_TEMPLATE_ID   = ''; /* Template to notify user when admin replies */
 
 function emailInvoice(mode){
   var custName=(document.getElementById('pay-cust-name')||{value:''}).value.trim();
