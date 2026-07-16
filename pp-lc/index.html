@@ -4024,25 +4024,37 @@ function AdminSettings({ dk }) {
         reader.readAsDataURL(file);
       });
 
-      // Ensure anonymous auth session is active (required for Storage rules on all devices)
-      await fbEnsureAuth();
+      // Try Firebase Storage first; fall back to base64 in Firestore if Storage rules block it
+      let downloadUrl = null;
+      try {
+        await fbEnsureAuth();
+        const ref = window.fbStorage.ref(LOGO_STORAGE_PATH);
+        await ref.put(file, { contentType: file.type || 'image/png' });
+        downloadUrl = await ref.getDownloadURL();
+      } catch(storageErr) {
+        console.warn('Firebase Storage upload failed, falling back to base64 in Firestore:', storageErr.message);
+        // Fall back: store base64 directly (logo is small ~27KB, well under Firestore 1MB limit)
+        downloadUrl = null;
+      }
 
-      // Upload blob to Firebase Storage
-      const ref = window.fbStorage.ref(LOGO_STORAGE_PATH);
-      await ref.put(file, { contentType: file.type || 'image/png' });
-      const downloadUrl = await ref.getDownloadURL();
-
-      // Update local settings state with both the base64 preview and the Storage URL
-      setSettings(s => ({ ...s, companyLogo: dataUrl, companyLogoUrl: downloadUrl }));
-
-      // Immediately persist to Firestore (no need to wait for Save button)
       const raw = localStorage.getItem('adminSettings');
       const current = raw ? JSON.parse(raw) : {};
-      const updated = { ...current, companyLogoUrl: downloadUrl };
-      delete updated.companyLogo; // never store base64 in Firestore
-      localStorage.setItem('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
-      storage.set('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
-      await fbSave(FB_SETTINGS, [updated]);
+
+      if (downloadUrl) {
+        // Storage succeeded — store URL only (no base64 in Firestore)
+        const updated = { ...current, companyLogoUrl: downloadUrl, companyLogo: '' };
+        setSettings(s => ({ ...s, companyLogo: dataUrl, companyLogoUrl: downloadUrl }));
+        localStorage.setItem('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
+        storage.set('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
+        await fbSave(FB_SETTINGS, [{ ...updated, companyLogo: '' }]);
+      } else {
+        // Storage unavailable — store base64 in Firestore (cross-device sync via Firestore)
+        const updated = { ...current, companyLogo: dataUrl, companyLogoUrl: '' };
+        setSettings(s => ({ ...s, companyLogo: dataUrl, companyLogoUrl: '' }));
+        localStorage.setItem('adminSettings', JSON.stringify(updated));
+        storage.set('adminSettings', JSON.stringify(updated));
+        await fbSave(FB_SETTINGS, [updated]);
+      }
 
       setLogoStatus('uploaded');
       setTimeout(() => setLogoStatus(null), 3000);
@@ -4096,10 +4108,13 @@ function AdminSettings({ dk }) {
   const save = async () => {
     try {
       const { toast: _t, ...toSave } = settings;
-      // Strip raw base64 from Firestore — only persist the Storage download URL
-      const { companyLogo: _base64, ...toFirestore } = toSave;
       storage.set('adminSettings', JSON.stringify(toSave));
       localStorage.setItem('adminSettings', JSON.stringify(toSave));
+      // Only strip base64 from Firestore when a Storage URL is present (to stay under 1MB limit).
+      // If Storage is unavailable, companyLogo holds the base64 fallback — keep it in Firestore.
+      const toFirestore = toSave.companyLogoUrl
+        ? (({ companyLogo: _b64, ...rest }) => rest)(toSave)
+        : toSave;
       await fbSave(FB_SETTINGS, [toFirestore]);
     } catch(e) { console.error('Save settings failed:', e); }
     setSettings(s => ({ ...s, toast: true }));
@@ -6435,7 +6450,9 @@ function fbListenLogo(cb) {
     return window.db.collection(FB_SETTINGS).doc('data').onSnapshot(snap => {
       if (snap.exists) {
         const items = snap.data().items || [];
-        cb(items[0] ? (items[0].companyLogoUrl || '') : '');
+        // Prefer Storage URL; fall back to base64 stored directly in Firestore
+        const item = items[0];
+        cb(item ? (item.companyLogoUrl || item.companyLogo || '') : '');
       }
     }, e => { console.warn('fbListenLogo error', e); });
   } catch(e) { console.warn('fbListenLogo failed', e); return () => {}; }
@@ -6536,8 +6553,9 @@ function App() {
           const s = fbS[0];
           storage.set('adminSettings', JSON.stringify(s));
           localStorage.setItem('adminSettings', JSON.stringify(s));
-          // If settings has a Storage download URL, use it directly
+          // Use Storage URL if available, else fall back to base64 stored directly in Firestore
           if (s.companyLogoUrl) setLogoUrl(s.companyLogoUrl);
+          else if (s.companyLogo) setLogoUrl(s.companyLogo);
         } else {
           // Push local settings to Firebase so other devices get them
           try {
@@ -6608,8 +6626,9 @@ function App() {
         const s = items[0];
         storage.set('adminSettings', JSON.stringify(s));
         localStorage.setItem('adminSettings', JSON.stringify(s));
-        // Update logo from the Storage download URL (not base64 — avoids 1MB Firestore limit)
+        // Use Storage URL if available, else fall back to base64 stored directly in Firestore
         if (s.companyLogoUrl) setLogoUrl(s.companyLogoUrl);
+        else if (s.companyLogo) setLogoUrl(s.companyLogo);
         window.dispatchEvent(new Event('adminSettingsUpdated'));
       }
     });
