@@ -639,9 +639,7 @@ function AppShell({ dk, toggleTheme, colourKey, cycleColour, changeColour, curre
   const [collapsed, setCollapsed] = useState(false);
   const roleTag = { admin:'Administrator', top_management:'Top Management', plant_head:'Plant Head', user:'Team Member' }[role];
   const roleBg  = { admin:'t-badge-admin', top_management:'bg-purple-100 text-purple-700', plant_head:'bg-teal-100 text-teal-700', user:'bg-green-100 text-green-700' }[role];
-  // logoUrl is now passed as a prop from App (sourced from Firebase), so it syncs across all devices.
-  // We keep a local fallback for any edge cases where the prop isn't available yet.
-  const companyLogo = logoUrl || (() => { try { return JSON.parse(localStorage.getItem('adminSettings')||'{}').companyLogo || ''; } catch(_) { return ''; } })();
+  // logoUrl prop comes from App (Firebase Storage URL), works across all devices
 
   return (
     <div className={`flex h-screen overflow-hidden font-sans ${dk?'bg-gray-900 text-white':'bg-slate-50 text-gray-900'}`}
@@ -650,8 +648,8 @@ function AppShell({ dk, toggleTheme, colourKey, cycleColour, changeColour, curre
       <aside className={`${collapsed?'w-16':'w-60'} transition-all duration-300 flex-shrink-0 flex flex-col`}
         style={{background: dk?'#111827':'#0f172a'}}>
         <div className="flex items-center justify-center px-3 py-4 border-b border-white/10">
-          {companyLogo ? (
-            <img src={companyLogo} alt="Logo" style={{maxHeight:'40px', maxWidth: collapsed?'32px':'120px', objectFit:'contain', mixBlendMode:'lighten'}} />
+          {logoUrl ? (
+            <img src={logoUrl} alt="Logo" style={{maxHeight:'40px', maxWidth: collapsed?'32px':'120px', objectFit:'contain', mixBlendMode:'lighten'}} />
           ) : (
             !collapsed && <span className="text-white font-bold text-sm tracking-wide">Logo</span>
           )}
@@ -693,9 +691,9 @@ function AppShell({ dk, toggleTheme, colourKey, cycleColour, changeColour, curre
         <header className={`h-14 flex items-center justify-between px-6 border-b flex-shrink-0 ${dk?'bg-gray-800 border-gray-700':'bg-white border-gray-200'}`}>
           <div className="flex items-center gap-3">
             {/* Polyplastics Logo */}
-            {companyLogo && (
+            {logoUrl && (
               <div className="flex items-center flex-shrink-0" style={{maxWidth:'130px'}}>
-                <img src={companyLogo} alt="Logo" style={{maxHeight:'28px', maxWidth:'110px', objectFit:'contain', mixBlendMode:'multiply'}} />
+                <img src={logoUrl} alt="Logo" style={{maxHeight:'28px', maxWidth:'110px', objectFit:'contain', mixBlendMode:'multiply'}} />
               </div>
             )}
             <button onClick={() => setCollapsed(!collapsed)} className={`p-2 rounded-lg text-sm ${dk?'hover:bg-gray-700 text-gray-400':'hover:bg-gray-100 text-gray-500'} transition-colors`}>☰</button>
@@ -788,9 +786,7 @@ function StatCard({ label, value, icon, color, sub, trend, dk, onClick, accent }
    LOGIN PAGE
 ═══════════════════════════════════════════ */
 function LoginPage({ login, dk, toggleTheme, colourKey, changeColour, logoUrl }) {
-  // logoUrl is now passed as a prop from App (sourced from Firebase), so it syncs across all devices.
-  // We keep the local fallback for any edge cases where prop isn't available yet.
-  const companyLogo = logoUrl || (() => { try { return JSON.parse(localStorage.getItem('adminSettings')||'{}').companyLogo || ''; } catch(_) { return ''; } })();
+  // logoUrl prop from App — loaded from Firebase Storage, syncs across all devices
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -813,9 +809,9 @@ function LoginPage({ login, dk, toggleTheme, colourKey, changeColour, logoUrl })
         <div className="absolute inset-0 opacity-10"
           style={{backgroundImage:'radial-gradient(circle at 20% 50%, var(--p500) 0%, transparent 50%), radial-gradient(circle at 80% 20%, #06b6d4 0%, transparent 50%)'}} />
         <div className="relative z-10">
-          {companyLogo && (
+          {logoUrl && (
             <div className="mb-10">
-              <img src={companyLogo} alt="Logo" style={{maxHeight:'52px', objectFit:'contain', mixBlendMode:'lighten'}} />
+              <img src={logoUrl} alt="Logo" style={{maxHeight:'52px', objectFit:'contain', mixBlendMode:'lighten'}} />
             </div>
           )}
           <h2 className="text-4xl font-bold text-white leading-tight mb-4" style={{fontFamily:"'Outfit',sans-serif"}}>
@@ -4010,15 +4006,96 @@ function AdminSettings({ dk }) {
   const showToast = (msg, type='success') => { setDigestToast({msg,type}); setTimeout(()=>setDigestToast(null),4000); };
 
   const set = (k,v) => setSettings(s=>({...s,[k]:v}));
+  const [logoSaving,    setLogoSaving]    = useState(false);  // true while uploading to Storage
+  const [logoDeleting,  setLogoDeleting]  = useState(false);  // true while deleting from Storage
+  const [logoStatus,    setLogoStatus]    = useState(null);   // null | 'uploaded' | 'deleted' | 'error'
+
+  // Upload logo: base64 → Firebase Storage → get download URL → persist URL to Firestore
+  const handleUploadLogo = async (file) => {
+    if (!file) return;
+    setLogoSaving(true);
+    setLogoStatus(null);
+    try {
+      // Read file to base64 for local preview
+      const dataUrl = await new Promise((res, rej) => {
+        const reader = new FileReader();
+        reader.onload = ev => res(ev.target.result);
+        reader.onerror = () => rej(new Error('File read failed'));
+        reader.readAsDataURL(file);
+      });
+
+      // Upload blob to Firebase Storage
+      const ref = window.fbStorage.ref(LOGO_STORAGE_PATH);
+      await ref.put(file, { contentType: file.type || 'image/png' });
+      const downloadUrl = await ref.getDownloadURL();
+
+      // Update local settings state with both the base64 preview and the Storage URL
+      setSettings(s => ({ ...s, companyLogo: dataUrl, companyLogoUrl: downloadUrl }));
+
+      // Immediately persist to Firestore (no need to wait for Save button)
+      const raw = localStorage.getItem('adminSettings');
+      const current = raw ? JSON.parse(raw) : {};
+      const updated = { ...current, companyLogoUrl: downloadUrl };
+      delete updated.companyLogo; // never store base64 in Firestore
+      localStorage.setItem('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
+      storage.set('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
+      await fbSave(FB_SETTINGS, [updated]);
+
+      setLogoStatus('uploaded');
+      setTimeout(() => setLogoStatus(null), 3000);
+    } catch(e) {
+      console.error('Logo upload failed:', e);
+      setLogoStatus('error');
+      setTimeout(() => setLogoStatus(null), 4000);
+    }
+    setLogoSaving(false);
+  };
+
+  // Delete logo: remove from Firebase Storage + clear URL from Firestore + clear local state
+  const handleDeleteLogo = async () => {
+    setLogoDeleting(true);
+    setLogoStatus(null);
+    try {
+      // Delete from Firebase Storage
+      try {
+        await window.fbStorage.ref(LOGO_STORAGE_PATH).delete();
+      } catch(e) {
+        // If file doesn't exist in Storage that's fine — still clear everything else
+        if (e.code !== 'storage/object-not-found') console.warn('Storage delete:', e.message);
+      }
+
+      // Clear from settings state
+      setSettings(s => ({ ...s, companyLogo: '', companyLogoUrl: '' }));
+
+      // Persist cleared URL to Firestore
+      const raw = localStorage.getItem('adminSettings');
+      const current = raw ? JSON.parse(raw) : {};
+      const updated = { ...current, companyLogo: '', companyLogoUrl: '' };
+      localStorage.setItem('adminSettings', JSON.stringify(updated));
+      storage.set('adminSettings', JSON.stringify(updated));
+      await fbSave(FB_SETTINGS, [{ ...updated, companyLogo: undefined }]);
+
+      setLogoStatus('deleted');
+      setTimeout(() => setLogoStatus(null), 3000);
+    } catch(e) {
+      console.error('Logo delete failed:', e);
+      setLogoStatus('error');
+      setTimeout(() => setLogoStatus(null), 4000);
+    }
+    setLogoDeleting(false);
+  };
 
   // Save all settings to localStorage + Firebase (cross-device sync)
-  const save = () => {
+  // Logo upload/delete are handled immediately above; save() handles all other settings fields
+  const save = async () => {
     try {
       const { toast: _t, ...toSave } = settings;
+      // Strip raw base64 from Firestore — only persist the Storage download URL
+      const { companyLogo: _base64, ...toFirestore } = toSave;
       storage.set('adminSettings', JSON.stringify(toSave));
       localStorage.setItem('adminSettings', JSON.stringify(toSave));
-      fbSave(FB_SETTINGS, [toSave]);
-    } catch(_) {}
+      await fbSave(FB_SETTINGS, [toFirestore]);
+    } catch(e) { console.error('Save settings failed:', e); }
     setSettings(s => ({ ...s, toast: true }));
   };
 
@@ -4139,32 +4216,64 @@ function AdminSettings({ dk }) {
             <input type="date" value={settings.licenseExpiry||''} onChange={e=>set('licenseExpiry',e.target.value)} className={inputCls} />
           </FormField>
           <FormField label="Company Logo">
-            <div className="flex items-center gap-4">
-              {settings.companyLogo ? (
-                <div className="flex items-center gap-3">
-                  <img src={settings.companyLogo} alt="Logo preview" className="h-14 object-contain rounded-lg border border-gray-200 dark:border-gray-600 bg-white px-2" style={{maxWidth:'160px'}} />
-                  <button onClick={()=>set('companyLogo','')}
-                    className="text-xs px-3 py-1.5 rounded-lg bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-colors">
-                    🗑️ Remove
-                  </button>
+            <div className="flex flex-col gap-3">
+              {/* Preview + Delete */}
+              {(settings.companyLogo || settings.companyLogoUrl) ? (
+                <div className="flex items-center gap-4">
+                  <img
+                    src={settings.companyLogo || settings.companyLogoUrl}
+                    alt="Logo preview"
+                    className="h-14 object-contain rounded-lg border border-gray-200 dark:border-gray-600 bg-white px-2"
+                    style={{maxWidth:'160px'}}
+                  />
+                  <div className="flex flex-col gap-2">
+                    <button
+                      onClick={handleDeleteLogo}
+                      disabled={logoDeleting || logoSaving}
+                      className="text-xs px-3 py-1.5 rounded-lg bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {logoDeleting ? '⏳ Removing…' : '🗑️ Remove Logo'}
+                    </button>
+                    <button
+                      onClick={() => document.getElementById('logo-upload-input').click()}
+                      disabled={logoSaving || logoDeleting}
+                      className="text-xs px-3 py-1.5 rounded-lg bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {logoSaving ? '⏳ Uploading…' : '🔄 Replace Logo'}
+                    </button>
+                  </div>
                 </div>
               ) : (
-                <div className={`flex-1 flex flex-col items-center justify-center gap-2 p-5 rounded-xl border-2 border-dashed transition-colors ${logoUploading?'cursor-wait opacity-60':'cursor-pointer'} ${dk?'border-gray-600 hover:border-[color:var(--p500)] text-gray-400':'border-gray-300 hover:border-[color:var(--p500)] text-gray-400'}`}
-                  onClick={()=>!logoUploading && document.getElementById('logo-upload-input').click()}>
-                  <span className="text-3xl">{logoUploading ? '⏳' : '🖼️'}</span>
-                  <span className="text-xs font-medium">{logoUploading ? 'Uploading…' : 'Click to upload logo'}</span>
-                  <span className="text-[10px]">PNG, JPG, SVG — recommended 200×60px</span>
+                /* Upload drop zone */
+                <div
+                  className={`flex flex-col items-center justify-center gap-2 p-6 rounded-xl border-2 border-dashed transition-colors ${logoSaving ? 'cursor-wait opacity-60' : 'cursor-pointer'} ${dk ? 'border-gray-600 hover:border-[color:var(--p500)] text-gray-400' : 'border-gray-300 hover:border-[color:var(--p500)] text-gray-400'}`}
+                  onClick={() => !logoSaving && document.getElementById('logo-upload-input').click()}
+                >
+                  <span className="text-3xl">{logoSaving ? '⏳' : '🖼️'}</span>
+                  <span className="text-xs font-medium">{logoSaving ? 'Uploading to Firebase…' : 'Click to upload logo'}</span>
+                  <span className="text-[10px]">PNG, JPG, SVG · Max ~500KB recommended</span>
                 </div>
               )}
-              <input id="logo-upload-input" type="file" accept="image/*" className="hidden"
-                onChange={e=>{
-                  const file = e.target.files[0];
-                  if (!file) return;
-                  const reader = new FileReader();
-                  reader.onload = ev => set('companyLogo', ev.target.result);
-                  reader.readAsDataURL(file);
-                  e.target.value='';
-                }} />
+
+              {/* Hidden file input */}
+              <input
+                id="logo-upload-input"
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={e => { const f = e.target.files[0]; e.target.value=''; if (f) handleUploadLogo(f); }}
+              />
+
+              {/* Status feedback */}
+              {logoStatus === 'uploaded' && (
+                <p className="text-xs text-green-600 font-medium">✅ Logo uploaded and synced to all devices.</p>
+              )}
+              {logoStatus === 'deleted' && (
+                <p className="text-xs text-orange-600 font-medium">🗑️ Logo removed from all devices.</p>
+              )}
+              {logoStatus === 'error' && (
+                <p className="text-xs text-red-600 font-medium">❌ Operation failed. Check Firebase Storage rules and try again.</p>
+              )}
             </div>
           </FormField>
         </div>
@@ -4683,7 +4792,7 @@ function AdminSettings({ dk }) {
         </div>
       </div>
 
-      <button onClick={save} className="w-full py-3 text-white rounded-xl font-semibold transition-colors shadow-lg" style={{background:"var(--p600)"}}>
+      <button onClick={save} disabled={logoSaving || logoDeleting} className="w-full py-3 text-white rounded-xl font-semibold transition-colors shadow-lg disabled:opacity-60" style={{background:"var(--p600)"}}>
         💾 Save All Settings
       </button>
     </div>
@@ -6272,6 +6381,60 @@ function fbListen(col, cb) {
   } catch(e) { console.warn('fbListen failed', col, e); return () => {}; }
 }
 
+/* ── Logo stored separately in Firebase Storage (bypasses Firestore 1MB limit) ──
+   Path: company-assets/logo  (single file, always overwritten on upload)
+   Falls back gracefully if Storage is unavailable.                           ── */
+const LOGO_STORAGE_PATH = 'company-assets/logo';
+
+async function uploadLogoToStorage(dataUrl) {
+  try {
+    await fbEnsureAuth();
+    // Convert base64 data URL → Blob
+    const res = await fetch(dataUrl);
+    const blob = await res.blob();
+    const ref = window.fbStorage.ref(LOGO_STORAGE_PATH);
+    await ref.put(blob, { contentType: blob.type || 'image/png' });
+    const downloadUrl = await ref.getDownloadURL();
+    // Also save the download URL into Firestore settings so other devices can load it on boot
+    try {
+      const raw = localStorage.getItem('adminSettings');
+      const s = raw ? JSON.parse(raw) : {};
+      s.companyLogoUrl = downloadUrl;
+      // Strip the base64 blob from Firestore — only keep the Storage URL
+      const { companyLogo: _dropped, ...rest } = s;
+      await fbSave(FB_SETTINGS, [{ ...rest, companyLogoUrl: downloadUrl }]);
+    } catch(_) {}
+    return downloadUrl;
+  } catch(e) {
+    console.error('uploadLogoToStorage failed:', e);
+    return null;
+  }
+}
+
+async function loadLogoFromStorage() {
+  try {
+    await fbEnsureAuth();
+    const ref = window.fbStorage.ref(LOGO_STORAGE_PATH);
+    return await ref.getDownloadURL();
+  } catch(e) {
+    // File doesn't exist yet or Storage unavailable — not an error
+    return null;
+  }
+}
+
+function fbListenLogo(cb) {
+  // Listen to the settings doc for companyLogoUrl changes (written by handleUploadLogo/handleDeleteLogo)
+  // Always fires cb — including with '' when logo is removed — so all devices clear their logoUrl
+  try {
+    return window.db.collection(FB_SETTINGS).doc('data').onSnapshot(snap => {
+      if (snap.exists) {
+        const items = snap.data().items || [];
+        cb(items[0] ? (items[0].companyLogoUrl || '') : '');
+      }
+    }, e => { console.warn('fbListenLogo error', e); });
+  } catch(e) { console.warn('fbListenLogo failed', e); return () => {}; }
+}
+
 /* ═══════════════════════════════════════════
    ROOT APP  (Firebase-synced)
 ═══════════════════════════════════════════ */
@@ -6288,7 +6451,11 @@ function App() {
   });
   const [ready,        setReady]        = useState(false);
   const [syncStatus,   setSyncStatus]   = useState('idle'); // 'idle'|'syncing'|'synced'|'error'
-  const [logoUrl,      setLogoUrl]      = useState(() => { try { return JSON.parse(localStorage.getItem('adminSettings')||'{}').companyLogo || ''; } catch(_) { return ''; } });
+  // logoUrl: loaded from Firebase Storage on boot, updated in real-time via fbListenLogo
+  const [logoUrl,      setLogoUrl]      = useState(() => {
+    // Seed from cached companyLogoUrl (Storage download URL) if available
+    try { return JSON.parse(localStorage.getItem('adminSettings')||'{}').companyLogoUrl || ''; } catch(_) { return ''; }
+  });
 
   /* ── 1. Boot: load from Firebase, block login screen until users are loaded ── */
   useEffect(() => {
@@ -6363,6 +6530,8 @@ function App() {
           const s = fbS[0];
           storage.set('adminSettings', JSON.stringify(s));
           localStorage.setItem('adminSettings', JSON.stringify(s));
+          // If settings has a Storage download URL, use it directly
+          if (s.companyLogoUrl) setLogoUrl(s.companyLogoUrl);
         } else {
           // Push local settings to Firebase so other devices get them
           try {
@@ -6370,6 +6539,13 @@ function App() {
             if (localS) await fbSave(FB_SETTINGS, [JSON.parse(localS)]);
           } catch(_) {}
         }
+
+        // Load logo from Firebase Storage (handles large base64 that Firestore can't store)
+        // This runs regardless of settings, to catch logos uploaded via the new flow
+        try {
+          const storageLogoUrl = await loadLogoFromStorage();
+          if (storageLogoUrl) setLogoUrl(storageLogoUrl);
+        } catch(_) {}
 
         setSyncStatus('synced');
       } catch(err) {
@@ -6426,13 +6602,14 @@ function App() {
         const s = items[0];
         storage.set('adminSettings', JSON.stringify(s));
         localStorage.setItem('adminSettings', JSON.stringify(s));
-        // Update logo state directly — works across all devices without relying on storage events
-        setLogoUrl(s.companyLogo || '');
-        // Also dispatch for any legacy listeners still using adminSettingsUpdated
+        // Update logo from the Storage download URL (not base64 — avoids 1MB Firestore limit)
+        if (s.companyLogoUrl) setLogoUrl(s.companyLogoUrl);
         window.dispatchEvent(new Event('adminSettingsUpdated'));
       }
     });
-    return () => { unsubP(); unsubU(); unsubR(); unsubS(); };
+    // Also subscribe directly via fbListenLogo for real-time logo changes on all devices
+    const unsubLogo = fbListenLogo(url => { setLogoUrl(url || ''); });
+    return () => { unsubP(); unsubU(); unsubR(); unsubS(); unsubLogo(); };
   }, [ready]);
 
   /* ── 4. Persist helpers: write to both localStorage + Firestore ── */
