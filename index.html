@@ -892,6 +892,10 @@ footer{position:relative;z-index:1;background:var(--footer-bg);border-top:1px so
         </div>
         <div class="settings-card full" style="margin-bottom:18px;">
           <h4>Registered Users</h4>
+          <div style="margin-bottom:10px;">
+            <button class="reply-toggle" style="background:rgba(0,229,255,0.08);border-color:rgba(0,229,255,0.3);color:var(--cyan);font-size:0.78rem;" onclick="backfillForumEmails()">⟳ Sync user emails for notifications</button>
+            <span id="backfill-status" style="font-size:0.75rem;color:var(--text-muted);margin-left:10px;"></span>
+          </div>
           <div id="admin-forum-users" style="display:flex;flex-direction:column;gap:8px;max-height:260px;overflow-y:auto;"></div>
         </div>
         <div class="settings-card full">
@@ -3002,10 +3006,7 @@ function doCreateThread(){
   /* ── email admin: new forum thread ── */
   (function(){
     var adminEmail=siteData.emailAdminAddress||siteData.emailAdminTo||'';
-    var apiKey=siteData.brevoApiKey||'';
-    var proxyUrl=siteData.brevoProxyUrl||'';
-    console.log('[Forum] New thread notify → adminEmail:',adminEmail,'apiKey:',apiKey?'set':'MISSING','proxyUrl:',proxyUrl||'MISSING');
-    if(!adminEmail){console.warn('[Forum] No admin email set — skipping notification.');return;}
+    if(!adminEmail) return;
     var brand=(siteData&&siteData.brandName)||'QMS GALAXY';
     _brevoSend(adminEmail,'Admin',
       'New Forum Thread: '+title,
@@ -3015,8 +3016,7 @@ function doCreateThread(){
       +'<p><b>Title:</b> '+title+'</p>'
       +'<hr/><p>'+body.replace(/\n/g,'<br/>')+'</p>'
       +'<p style="color:#888;font-size:12px;">Log in to your admin panel to reply.</p>'
-    ).then(function(){console.log('[Forum] New thread email sent to admin.');})
-     .catch(function(err){console.error('[Forum] New thread email FAILED:',err);});
+    ).catch(function(){});
   })();
 }
 
@@ -3146,6 +3146,37 @@ function doPostReply(threadId){
 /* ── Admin Forum Functions ── */
 /* Always pull the freshest copy of forum data from Firebase before rendering
    so the admin sees users/threads created on ANY device — not just their own. */
+/* Backfill emails into Firestore profiles for existing users who registered
+   before email storage was added. Reads profiles, checks which have no email,
+   then prompts admin to enter them manually if needed. */
+async function backfillForumEmails(){
+  var status=document.getElementById('backfill-status');
+  if(status) status.textContent='Checking profiles...';
+  if(!window.fbGetForumProfiles){if(status)status.textContent='Not connected to Firebase.';return;}
+  var profiles=await window.fbGetForumProfiles();
+  var missing=profiles.filter(function(p){return !p.email;});
+  if(!missing.length){
+    if(status) status.textContent='✅ All '+profiles.length+' users already have emails saved.';
+    return;
+  }
+  if(status) status.textContent=missing.length+' user(s) missing email. Please enter manually below.';
+  for(var i=0;i<missing.length;i++){
+    var p=missing[i];
+    var email=prompt('Enter email for user "'+p.name+'" (@'+p.username+'):
+(Check Firebase Console → Authentication for their email)','');
+    if(email && email.indexOf('@')>-1){
+      try{
+        if(window.fbForumUpdateProfileEmail){
+          var res=await window.fbForumUpdateProfileEmail(p.id, email);
+          if(res.success) status.textContent='✅ Saved email for '+p.name;
+          else status.textContent='❌ Failed: '+res.error;
+        }
+      }catch(e){console.error(e);status.textContent='❌ Error: '+e.message;}
+    }
+  }
+  if(status) status.textContent='Done. Refresh to verify.';
+}
+
 async function renderAdminForum(){
   var uCont=document.getElementById('admin-forum-users');
   var tCont=document.getElementById('admin-forum-threads');
@@ -3315,13 +3346,11 @@ async function adminPostReply(tid){
   }
   /* ── email thread author: admin replied ── */
   (function(){
-    console.log('[Forum] Admin reply notify → authorId:',t.authorId,'fbGetForumUserEmail:',!!window.fbGetForumUserEmail);
-    if(!window.fbGetForumUserEmail || !t.authorId){console.warn('[Forum] Cannot notify author — missing function or authorId.');return;}
+    if(!window.fbGetForumUserEmail || !t.authorId) return;
     var brand=(siteData&&siteData.brandName)||'QMS GALAXY';
     var adminEmail=siteData.emailAdminAddress||siteData.emailAdminTo||'';
     window.fbGetForumUserEmail(t.authorId).then(function(toEmail){
-      console.log('[Forum] Author email retrieved:',toEmail||'EMPTY');
-      if(!toEmail){console.warn('[Forum] No email found for author — skipping.');return;}
+      if(!toEmail) return;
       _brevoSend(toEmail, t.author,
         'Admin replied to your thread: '+t.title,
         '<h3>'+brand+' replied to your forum thread</h3>'
@@ -3331,9 +3360,8 @@ async function adminPostReply(tid){
         +'<p>Visit the forum to continue the discussion.</p>'
         +'<p>Best regards,<br/>'+brand+'</p>',
         adminEmail
-      ).then(function(){console.log('[Forum] Reply notification sent to',toEmail);})
-       .catch(function(err){console.error('[Forum] Reply email FAILED:',err);});
-    }).catch(function(err){console.error('[Forum] fbGetForumUserEmail failed:',err);});
+      ).catch(function(){});
+    }).catch(function(){});
   })();
 }
 function adminDeleteUser(uid){

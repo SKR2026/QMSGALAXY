@@ -265,7 +265,13 @@ window.fbForumLogin = async function(email, password){
       await signOut(auth);
       return { success:false, error:"No forum profile found for this account." };
     }
-    return { success:true, profile: Object.assign({id:cred.user.uid, emailVerified:cred.user.emailVerified}, snap.data()) };
+    /* Backfill email into profile if missing (for users registered before email was stored) */
+    var profileData = snap.data();
+    if(!profileData.email && cred.user.email){
+      try{ await updateDoc(doc(db,"qms_forum_profiles", cred.user.uid), { email: cred.user.email }); }catch(e){}
+      profileData.email = cred.user.email;
+    }
+    return { success:true, profile: Object.assign({id:cred.user.uid, emailVerified:cred.user.emailVerified}, profileData) };
   } catch(e){
     var map = {
       "auth/user-not-found":"No account found with this email.",
@@ -344,15 +350,27 @@ window.fbGetForumProfiles = async function(){
 };
 
 window.fbGetForumUserEmail = async function(uid){
-  /* Returns email from the Firestore profile (stored since the email fix).
-     Falls back to checking Firebase Auth current user if uid matches. */
+  /* Returns email from the Firestore profile.
+     If missing, falls back to Firebase Auth current user email and backfills the profile. */
   try{
     var snap = await getDoc(doc(db,"qms_forum_profiles", uid));
     if(snap.exists() && snap.data().email) return snap.data().email;
-    /* fallback: if this is the currently logged-in user */
-    if(auth.currentUser && auth.currentUser.uid === uid) return auth.currentUser.email||"";
+    /* fallback: if this is the currently logged-in user, get from Auth and backfill */
+    if(auth.currentUser && auth.currentUser.uid === uid && auth.currentUser.email){
+      try{ await updateDoc(doc(db,"qms_forum_profiles", uid), { email: auth.currentUser.email }); }catch(e){}
+      return auth.currentUser.email;
+    }
     return "";
   } catch(e){ return ""; }
+};
+
+window.fbForumUpdateProfileEmail = async function(uid, email){
+  /* Lets admin manually backfill email for existing users who registered
+     before email storage was added. */
+  try{
+    await updateDoc(doc(db,"qms_forum_profiles", uid), { email: email });
+    return { success: true };
+  } catch(e){ return { success:false, error: e.message }; }
 };
 
 window.fbDeleteForumProfile = async function(uid){
