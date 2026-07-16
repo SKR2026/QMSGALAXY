@@ -221,7 +221,7 @@ window.fbForumRegister = async function(name, username, email, password){
     }
     var cred = await createUserWithEmailAndPassword(auth, email, password);
     var profile = {
-      name: name||"", username: username||"", role:"Member",
+      name: name||"", username: username||"", role:"Member", email: email||"",
       joined: new Date().toLocaleString("en-IN",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})
     };
     await setDoc(doc(db,"qms_forum_profiles", cred.user.uid), profile);
@@ -341,6 +341,18 @@ window.fbGetForumProfiles = async function(){
     var snap = await getDocs(collection(db,"qms_forum_profiles"));
     return snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
   } catch(e){ fbStatus(false,"Load members failed"); return []; }
+};
+
+window.fbGetForumUserEmail = async function(uid){
+  /* Returns email from the Firestore profile (stored since the email fix).
+     Falls back to checking Firebase Auth current user if uid matches. */
+  try{
+    var snap = await getDoc(doc(db,"qms_forum_profiles", uid));
+    if(snap.exists() && snap.data().email) return snap.data().email;
+    /* fallback: if this is the currently logged-in user */
+    if(auth.currentUser && auth.currentUser.uid === uid) return auth.currentUser.email||"";
+    return "";
+  } catch(e){ return ""; }
 };
 
 window.fbDeleteForumProfile = async function(uid){
