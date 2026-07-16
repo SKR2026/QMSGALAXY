@@ -970,10 +970,12 @@ footer{position:relative;z-index:1;background:var(--footer-bg);border-top:1px so
           <div class="settings-card full">
             <h4>ℹ How this works</h4>
             <p style="color:var(--text-muted);font-size:0.83rem;line-height:1.6;">
-              Emails are sent directly from the browser using the <strong>Brevo (formerly Sendinblue) API</strong> — no third-party relay or SMTP setup needed.
-              One-time setup on <strong>brevo.com</strong>: Create a free account → go to <strong>SMTP &amp; API → API Keys → Generate a new API key</strong> and paste it below.
-              Then go to <strong>Senders &amp; Domains → Add a Sender</strong> and verify <code>admin@qmsgalaxy.com</code> as your sending address.
-              Free plan allows <strong>300 emails/day</strong> with no monthly cap.
+              Emails are sent via a <strong>Cloudflare Worker proxy → Brevo API</strong> (a proxy is required because browsers block direct Brevo API calls).<br/><br/>
+              <strong>One-time setup (5 minutes):</strong><br/>
+              1️⃣ <strong>Brevo:</strong> Create a free account at <strong>brevo.com</strong> → SMTP &amp; API → API Keys → Generate key. Also go to <strong>Senders &amp; Domains → Add a Sender</strong> and verify your From Email below.<br/>
+              2️⃣ <strong>Cloudflare Worker:</strong> Go to <a href="https://workers.cloudflare.com" target="_blank" style="color:var(--cyan);">workers.cloudflare.com</a> (free account) → Create Worker → paste the <code>brevo-proxy-worker.js</code> file → Save &amp; Deploy → copy the worker URL.<br/>
+              3️⃣ Paste both the API key and the Worker URL below, then click Save.<br/><br/>
+              Free Brevo plan: <strong>300 emails/day</strong>. Free Cloudflare Workers: <strong>100,000 requests/day</strong>.
             </p>
           </div>
           <div class="settings-card">
@@ -986,6 +988,9 @@ footer{position:relative;z-index:1;background:var(--footer-bg);border-top:1px so
             <h4>🔑 Brevo API Key</h4>
             <div class="setting-field"><label>API Key (from Brevo dashboard)</label><input id="s-brevo-key" placeholder="xkeysib-xxxxxxxxxxxxxxxx"/></div>
             <p style="color:var(--text-muted);font-size:0.78rem;margin-top:8px;">Get it from: brevo.com → SMTP &amp; API → API Keys</p>
+            <h4 style="margin-top:16px;">🌐 Cloudflare Worker Proxy URL</h4>
+            <div class="setting-field"><label>Worker URL (from Cloudflare dashboard)</label><input id="s-brevo-proxy" placeholder="https://brevo-proxy.yourname.workers.dev"/></div>
+            <p style="color:var(--text-muted);font-size:0.78rem;margin-top:8px;">Deploy <code>brevo-proxy-worker.js</code> on <a href="https://workers.cloudflare.com" target="_blank" style="color:var(--cyan);">workers.cloudflare.com</a> (free) and paste the URL here.</p>
           </div>
           <div class="settings-card full">
             <button class="setting-save" onclick="saveEmailSettings()">Save Email Settings</button>
@@ -2415,34 +2420,46 @@ function generateInvoice(mode){
 
 /* ── EMAIL INVOICE ── */
 /* Brevo API config — configure via Admin → 📧 Email tab (preferred), or paste fallback values here.
-   Mail is sent directly via Brevo's transactional email API (300 emails/day free).
+   Mail is sent via a Cloudflare Worker proxy (required to avoid browser CORS restrictions).
    Setup: brevo.com → SMTP & API → API Keys → Generate key.
-   Also verify your sender address: brevo.com → Senders & Domains → Add a Sender */
-var BREVO_API_KEY = ''; /* xkeysib-xxxxxxxxxxxxxxxx */
+   Also verify your sender address: brevo.com → Senders & Domains → Add a Sender
+   ──────────────────────────────────────────────────────────────────────────────
+   PROXY SETUP (one-time):
+   1. Go to https://workers.cloudflare.com → Create Worker
+   2. Paste the contents of brevo-proxy-worker.js → Save & Deploy
+   3. Replace the BREVO_PROXY_URL value below with your worker URL
+   ────────────────────────────────────────────────────────────────────────────── */
+var BREVO_API_KEY  = ''; /* fallback — leave blank; set key in Admin → Email tab */
+var BREVO_PROXY_URL = 'https://YOUR-WORKER-NAME.YOUR-SUBDOMAIN.workers.dev'; /* ← paste your Cloudflare Worker URL here */
 
-/* Helper: send email via Brevo API */
+/* Helper: send email via Cloudflare Worker → Brevo API */
 function _brevoSend(to_email, to_name, subject, htmlContent, replyTo){
-  var apiKey = BREVO_API_KEY || (siteData && siteData.brevoApiKey) || '';
+  var apiKey   = BREVO_API_KEY || (siteData && siteData.brevoApiKey) || '';
+  var proxyUrl = (siteData && siteData.brevoProxyUrl) || BREVO_PROXY_URL || '';
   var fromEmail = (siteData && siteData.emailFromAddress) || 'admin@qmsgalaxy.com';
   var fromName  = (siteData && siteData.emailFromName)    || 'QMS GALAXY';
+
   if(!apiKey){
-    console.warn('Brevo API key not configured.');
+    console.warn('Brevo: API key not configured. Go to Admin → Email tab and save your key.');
     return Promise.reject('no-key');
   }
-  return fetch('https://api.brevo.com/v3/smtp/email',{
-    method:'POST',
-    headers:{
-      'accept':'application/json',
-      'api-key': apiKey,
-      'content-type':'application/json'
-    },
-    body: JSON.stringify({
-      sender:{ name: fromName, email: fromEmail },
-      to:[{ email: to_email, name: to_name||to_email }],
-      replyTo: replyTo ? { email: replyTo } : undefined,
-      subject: subject,
-      htmlContent: htmlContent
-    })
+  if(!proxyUrl || proxyUrl.indexOf('YOUR-WORKER-NAME') !== -1){
+    console.warn('Brevo: Proxy URL not set. Deploy the Cloudflare Worker and set BREVO_PROXY_URL.');
+    return Promise.reject('no-proxy');
+  }
+
+  var payload = {
+    sender:  { name: fromName, email: fromEmail },
+    to:      [{ email: to_email, name: to_name || to_email }],
+    subject: subject,
+    htmlContent: htmlContent
+  };
+  if(replyTo) payload.replyTo = { email: replyTo };
+
+  return fetch(proxyUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ apiKey: apiKey, payload: payload })
   }).then(function(r){
     if(!r.ok) return r.json().then(function(e){ throw e; });
     return r.json();
@@ -2611,6 +2628,7 @@ function saveEmailSettings(){
   siteData.emailFromName=document.getElementById('s-email-from-name').value.trim();
   siteData.emailAdminAddress=document.getElementById('s-email-admin-to').value.trim();
   siteData.brevoApiKey=document.getElementById('s-brevo-key').value.trim();
+  siteData.brevoProxyUrl=document.getElementById('s-brevo-proxy').value.trim();
   save();showToast('email-toast');
 }
 
@@ -2619,6 +2637,7 @@ function loadEmailAdminData(){
   setVal('s-email-from-name',siteData.emailFromName||(siteData.brandName||''));
   setVal('s-email-admin-to',siteData.emailAdminAddress||'');
   setVal('s-brevo-key',siteData.brevoApiKey||'');
+  setVal('s-brevo-proxy',siteData.brevoProxyUrl||'');
 }
 
 function savePaymentSettings(){
