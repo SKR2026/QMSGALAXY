@@ -4010,108 +4010,91 @@ function AdminSettings({ dk }) {
   const [logoDeleting,  setLogoDeleting]  = useState(false);  // true while deleting from Storage
   const [logoStatus,    setLogoStatus]    = useState(null);   // null | 'uploaded' | 'deleted' | 'error'
 
-  // Compress image using canvas → target ≤ 80KB base64, safe for Firestore 1MB doc limit
-  const compressImage = (file) => new Promise((res, rej) => {
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      // Resize: max 400px wide (enough for a logo header), maintain aspect ratio
-      const MAX_W = 400;
-      const scale = img.width > MAX_W ? MAX_W / img.width : 1;
-      const w = Math.round(img.width * scale);
-      const h = Math.round(img.height * scale);
-      const canvas = document.createElement('canvas');
-      canvas.width = w; canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, h);
-      // Start at quality 0.8, reduce until under 80KB base64 (~60KB binary)
-      let quality = 0.8;
-      let dataUrl = canvas.toDataURL('image/jpeg', quality);
-      while (dataUrl.length > 80000 && quality > 0.3) {
-        quality -= 0.1;
-        dataUrl = canvas.toDataURL('image/jpeg', quality);
-      }
-      // For PNGs/SVGs with transparency, keep as PNG at reduced size
-      if (file.type === 'image/png' || file.type === 'image/svg+xml') {
-        const pngUrl = canvas.toDataURL('image/png');
-        dataUrl = pngUrl.length < dataUrl.length ? pngUrl : dataUrl;
-      }
-      res(dataUrl);
-    };
-    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('Image load failed')); };
-    img.src = url;
-  });
-
-  // Upload logo: compress in browser → save compressed base64 directly to Firestore
-  // No Firebase Storage needed — avoids quota limits on Spark plan
+  // Upload logo: base64 → Firebase Storage → get download URL → persist URL to Firestore
   const handleUploadLogo = async (file) => {
     if (!file) return;
     setLogoSaving(true);
     setLogoStatus(null);
     try {
-      // Compress to ≤80KB base64 so it fits safely in Firestore
-      const dataUrl = await compressImage(file);
-      const kb = Math.round(dataUrl.length * 0.75 / 1024);
-      console.log(`Logo compressed to ~${kb}KB`);
+      // Read file to base64 for local preview
+      const dataUrl = await new Promise((res, rej) => {
+        const reader = new FileReader();
+        reader.onload = ev => res(ev.target.result);
+        reader.onerror = () => rej(new Error('File read failed'));
+        reader.readAsDataURL(file);
+      });
 
-      // Update local settings state immediately for instant preview
-      setSettings(s => ({ ...s, companyLogo: dataUrl, companyLogoUrl: '' }));
+      // Upload blob to Firebase Storage
+      const ref = window.fbStorage.ref(LOGO_STORAGE_PATH);
+      await ref.put(file, { contentType: file.type || 'image/png' });
+      const downloadUrl = await ref.getDownloadURL();
 
-      // Persist to localStorage + Firestore
+      // Update local settings state with both the base64 preview and the Storage URL
+      setSettings(s => ({ ...s, companyLogo: dataUrl, companyLogoUrl: downloadUrl }));
+
+      // Immediately persist to Firestore (no need to wait for Save button)
       const raw = localStorage.getItem('adminSettings');
       const current = raw ? JSON.parse(raw) : {};
-      const updated = { ...current, companyLogo: dataUrl, companyLogoUrl: '' };
-      localStorage.setItem('adminSettings', JSON.stringify(updated));
-      storage.set('adminSettings', JSON.stringify(updated));
+      const updated = { ...current, companyLogoUrl: downloadUrl };
+      delete updated.companyLogo; // never store base64 in Firestore
+      localStorage.setItem('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
+      storage.set('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
       await fbSave(FB_SETTINGS, [updated]);
 
       setLogoStatus('uploaded');
       setTimeout(() => setLogoStatus(null), 3000);
     } catch(e) {
       console.error('Logo upload failed:', e);
-      const msg = e.code || e.message || 'unknown error';
-      setLogoStatus('error:' + msg);
-      setTimeout(() => setLogoStatus(null), 6000);
+      setLogoStatus('error');
+      setTimeout(() => setLogoStatus(null), 4000);
     }
     setLogoSaving(false);
   };
 
-  // Delete logo: clear from Firestore + local state
+  // Delete logo: remove from Firebase Storage + clear URL from Firestore + clear local state
   const handleDeleteLogo = async () => {
     setLogoDeleting(true);
     setLogoStatus(null);
     try {
+      // Delete from Firebase Storage
+      try {
+        await window.fbStorage.ref(LOGO_STORAGE_PATH).delete();
+      } catch(e) {
+        // If file doesn't exist in Storage that's fine — still clear everything else
+        if (e.code !== 'storage/object-not-found') console.warn('Storage delete:', e.message);
+      }
+
       // Clear from settings state
       setSettings(s => ({ ...s, companyLogo: '', companyLogoUrl: '' }));
 
-      // Persist cleared logo to Firestore
+      // Persist cleared URL to Firestore
       const raw = localStorage.getItem('adminSettings');
       const current = raw ? JSON.parse(raw) : {};
       const updated = { ...current, companyLogo: '', companyLogoUrl: '' };
       localStorage.setItem('adminSettings', JSON.stringify(updated));
       storage.set('adminSettings', JSON.stringify(updated));
-      await fbSave(FB_SETTINGS, [updated]);
+      await fbSave(FB_SETTINGS, [{ ...updated, companyLogo: undefined }]);
 
       setLogoStatus('deleted');
       setTimeout(() => setLogoStatus(null), 3000);
     } catch(e) {
       console.error('Logo delete failed:', e);
-      const msg = e.code || e.message || 'unknown error';
-      setLogoStatus('error:' + msg);
+      setLogoStatus('error');
       setTimeout(() => setLogoStatus(null), 4000);
     }
     setLogoDeleting(false);
   };
 
-  // Save all settings to localStorage + Firebase
-  // Logo is already persisted on upload — save() handles all other settings fields
+  // Save all settings to localStorage + Firebase (cross-device sync)
+  // Logo upload/delete are handled immediately above; save() handles all other settings fields
   const save = async () => {
     try {
       const { toast: _t, ...toSave } = settings;
+      // Strip raw base64 from Firestore — only persist the Storage download URL
+      const { companyLogo: _base64, ...toFirestore } = toSave;
       storage.set('adminSettings', JSON.stringify(toSave));
       localStorage.setItem('adminSettings', JSON.stringify(toSave));
-      await fbSave(FB_SETTINGS, [toSave]);
+      await fbSave(FB_SETTINGS, [toFirestore]);
     } catch(e) { console.error('Save settings failed:', e); }
     setSettings(s => ({ ...s, toast: true }));
   };
@@ -4288,12 +4271,8 @@ function AdminSettings({ dk }) {
               {logoStatus === 'deleted' && (
                 <p className="text-xs text-orange-600 font-medium">🗑️ Logo removed from all devices.</p>
               )}
-              {logoStatus && logoStatus.startsWith('error') && (
-                <p className="text-xs text-red-600 font-medium">
-                  ❌ Upload failed: <code className="bg-red-50 px-1 rounded">{logoStatus.replace('error:','') || 'unknown'}</code>
-                  {logoStatus.includes('unauthorized') && ' — Enable Anonymous Auth in Firebase Console → Authentication → Sign-in providers.'}
-                  {logoStatus.includes('object-not-found') && ' — Storage path not found.'}
-                </p>
+              {logoStatus === 'error' && (
+                <p className="text-xs text-red-600 font-medium">❌ Operation failed. Check Firebase Storage rules and try again.</p>
               )}
             </div>
           </FormField>
@@ -6444,13 +6423,13 @@ async function loadLogoFromStorage() {
 }
 
 function fbListenLogo(cb) {
-  // Listen to the settings doc for companyLogo changes (compressed base64 stored directly in Firestore)
+  // Listen to the settings doc for companyLogoUrl changes (written by handleUploadLogo/handleDeleteLogo)
   // Always fires cb — including with '' when logo is removed — so all devices clear their logoUrl
   try {
     return window.db.collection(FB_SETTINGS).doc('data').onSnapshot(snap => {
       if (snap.exists) {
         const items = snap.data().items || [];
-        cb(items[0] ? (items[0].companyLogo || '') : '');
+        cb(items[0] ? (items[0].companyLogoUrl || '') : '');
       }
     }, e => { console.warn('fbListenLogo error', e); });
   } catch(e) { console.warn('fbListenLogo failed', e); return () => {}; }
@@ -6472,9 +6451,10 @@ function App() {
   });
   const [ready,        setReady]        = useState(false);
   const [syncStatus,   setSyncStatus]   = useState('idle'); // 'idle'|'syncing'|'synced'|'error'
-  // logoUrl: compressed base64 loaded from Firestore on boot, updated in real-time via fbListenLogo
+  // logoUrl: loaded from Firebase Storage on boot, updated in real-time via fbListenLogo
   const [logoUrl,      setLogoUrl]      = useState(() => {
-    try { return JSON.parse(localStorage.getItem('adminSettings')||'{}').companyLogo || ''; } catch(_) { return ''; }
+    // Seed from cached companyLogoUrl (Storage download URL) if available
+    try { return JSON.parse(localStorage.getItem('adminSettings')||'{}').companyLogoUrl || ''; } catch(_) { return ''; }
   });
 
   /* ── 1. Boot: load from Firebase, block login screen until users are loaded ── */
@@ -6550,8 +6530,8 @@ function App() {
           const s = fbS[0];
           storage.set('adminSettings', JSON.stringify(s));
           localStorage.setItem('adminSettings', JSON.stringify(s));
-          // Logo is stored as compressed base64 directly in Firestore
-          if (s.companyLogo) setLogoUrl(s.companyLogo);
+          // If settings has a Storage download URL, use it directly
+          if (s.companyLogoUrl) setLogoUrl(s.companyLogoUrl);
         } else {
           // Push local settings to Firebase so other devices get them
           try {
@@ -6559,6 +6539,13 @@ function App() {
             if (localS) await fbSave(FB_SETTINGS, [JSON.parse(localS)]);
           } catch(_) {}
         }
+
+        // Load logo from Firebase Storage (handles large base64 that Firestore can't store)
+        // This runs regardless of settings, to catch logos uploaded via the new flow
+        try {
+          const storageLogoUrl = await loadLogoFromStorage();
+          if (storageLogoUrl) setLogoUrl(storageLogoUrl);
+        } catch(_) {}
 
         setSyncStatus('synced');
       } catch(err) {
@@ -6615,8 +6602,8 @@ function App() {
         const s = items[0];
         storage.set('adminSettings', JSON.stringify(s));
         localStorage.setItem('adminSettings', JSON.stringify(s));
-        // Logo is compressed base64 stored directly in Firestore
-        setLogoUrl(s.companyLogo || '');
+        // Update logo from the Storage download URL (not base64 — avoids 1MB Firestore limit)
+        if (s.companyLogoUrl) setLogoUrl(s.companyLogoUrl);
         window.dispatchEvent(new Event('adminSettingsUpdated'));
       }
     });
