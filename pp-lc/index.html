@@ -3912,7 +3912,7 @@ function AdminPlants({ dk, plants, updatePlants, currentUser }) {
 /* ═══════════════════════════════════════════
    ADMIN – SETTINGS
 ═══════════════════════════════════════════ */
-function AdminSettings({ dk }) {
+function AdminSettings({ dk, onLogoSave, onLogoRemove }) {
   const [settings, setSettings] = useState(() => {
     const defaults = {
       // Company Branding
@@ -4016,7 +4016,12 @@ function AdminSettings({ dk }) {
     setLogoSaving(true);
     setLogoStatus(null);
     try {
-      // Read file to base64 for local preview
+      // Read file to base64 — this is the ONLY logo storage path now.
+      // (Previously also tried Firebase Storage, but that requires separate
+      // Storage security rules + correct bucket/project match, which was a
+      // recurring source of "logo not visible on other devices" bugs.
+      // Firestore alone — same rule set already used for all other data —
+      // is simpler and just as reliable for a small ~20-30KB logo file.)
       const dataUrl = await new Promise((res, rej) => {
         const reader = new FileReader();
         reader.onload = ev => res(ev.target.result);
@@ -4024,37 +4029,17 @@ function AdminSettings({ dk }) {
         reader.readAsDataURL(file);
       });
 
-      // Try Firebase Storage first; fall back to base64 in Firestore if Storage rules block it
-      let downloadUrl = null;
-      try {
-        await fbEnsureAuth();
-        const ref = window.fbStorage.ref(LOGO_STORAGE_PATH);
-        await ref.put(file, { contentType: file.type || 'image/png' });
-        downloadUrl = await ref.getDownloadURL();
-      } catch(storageErr) {
-        console.warn('Firebase Storage upload failed, falling back to base64 in Firestore:', storageErr.message);
-        // Fall back: store base64 directly (logo is small ~27KB, well under Firestore 1MB limit)
-        downloadUrl = null;
-      }
-
       const raw = localStorage.getItem('adminSettings');
       const current = raw ? JSON.parse(raw) : {};
 
-      if (downloadUrl) {
-        // Storage succeeded — store URL only (no base64 in Firestore)
-        const updated = { ...current, companyLogoUrl: downloadUrl, companyLogo: '' };
-        setSettings(s => ({ ...s, companyLogo: dataUrl, companyLogoUrl: downloadUrl }));
-        localStorage.setItem('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
-        storage.set('adminSettings', JSON.stringify({ ...updated, companyLogo: dataUrl }));
-        await fbSave(FB_SETTINGS, [{ ...updated, companyLogo: '' }]);
-      } else {
-        // Storage unavailable — store base64 in Firestore (cross-device sync via Firestore)
-        const updated = { ...current, companyLogo: dataUrl, companyLogoUrl: '' };
-        setSettings(s => ({ ...s, companyLogo: dataUrl, companyLogoUrl: '' }));
-        localStorage.setItem('adminSettings', JSON.stringify(updated));
-        storage.set('adminSettings', JSON.stringify(updated));
-        await fbSave(FB_SETTINGS, [updated]);
-      }
+      // ── Immediately update App-level logoUrl (no Firebase round-trip needed for this device) ──
+      if (onLogoSave) onLogoSave(dataUrl);
+
+      const updated = { ...current, companyLogo: dataUrl, companyLogoUrl: '' };
+      setSettings(s => ({ ...s, companyLogo: dataUrl, companyLogoUrl: '' }));
+      localStorage.setItem('adminSettings', JSON.stringify(updated));
+      storage.set('adminSettings', JSON.stringify(updated));
+      await fbSave(FB_SETTINGS, [updated]);
 
       setLogoStatus('uploaded');
       setTimeout(() => setLogoStatus(null), 3000);
@@ -4071,27 +4056,19 @@ function AdminSettings({ dk }) {
     setLogoDeleting(true);
     setLogoStatus(null);
     try {
-      // Ensure anonymous auth session is active before Storage operation
-      await fbEnsureAuth();
-
-      // Delete from Firebase Storage
-      try {
-        await window.fbStorage.ref(LOGO_STORAGE_PATH).delete();
-      } catch(e) {
-        // If file doesn't exist in Storage that's fine — still clear everything else
-        if (e.code !== 'storage/object-not-found') console.warn('Storage delete:', e.message);
-      }
+      // ── Immediately clear App-level logoUrl on this device ──
+      if (onLogoRemove) onLogoRemove();
 
       // Clear from settings state
       setSettings(s => ({ ...s, companyLogo: '', companyLogoUrl: '' }));
 
-      // Persist cleared URL to Firestore
+      // Persist cleared logo to Firestore (single source of truth now — no Storage involved)
       const raw = localStorage.getItem('adminSettings');
       const current = raw ? JSON.parse(raw) : {};
       const updated = { ...current, companyLogo: '', companyLogoUrl: '' };
       localStorage.setItem('adminSettings', JSON.stringify(updated));
       storage.set('adminSettings', JSON.stringify(updated));
-      await fbSave(FB_SETTINGS, [{ ...updated, companyLogo: undefined }]);
+      await fbSave(FB_SETTINGS, [updated]);
 
       setLogoStatus('deleted');
       setTimeout(() => setLogoStatus(null), 3000);
@@ -5509,7 +5486,7 @@ function AdminCategories({ dk, categories, updateCategories }) {
 /* ═══════════════════════════════════════════
    ADMIN DASHBOARD
 ═══════════════════════════════════════════ */
-function AdminDashboard({ dk, toggleTheme, colourKey, cycleColour, changeColour, currentUser, plants, users, requirements, updatePlants, updateUsers, updateRequirements, logout, categories, updateCategories, logoUrl }) {
+function AdminDashboard({ dk, toggleTheme, colourKey, cycleColour, changeColour, currentUser, plants, users, requirements, updatePlants, updateUsers, updateRequirements, logout, categories, updateCategories, logoUrl, setLogoUrl }) {
   const [activePage, setActivePage] = useState('overview');
   const overdueCount = requirements.filter(r=>r.status==='Overdue').length;
 
@@ -5541,7 +5518,7 @@ function AdminDashboard({ dk, toggleTheme, colourKey, cycleColour, changeColour,
     users:        <AdminUsers dk={dk} plants={plants} users={users} updateUsers={updateUsers} />,
     plants:       <AdminPlants dk={dk} plants={plants} updatePlants={updatePlants} currentUser={currentUser} />,
     categories:   <AdminCategories dk={dk} categories={categories} updateCategories={updateCategories} />,
-    settings:     <AdminSettings dk={dk} />,
+    settings:     <AdminSettings dk={dk} onLogoSave={url => setLogoUrl(url)} onLogoRemove={() => setLogoUrl('')} />,
   };
 
   return (
@@ -6394,68 +6371,45 @@ async function fbSave(col, items) {
 }
 
 function fbListen(col, cb) {
-  // Auth is already ensured by boot() before listeners are set up
-  try {
-    return window.db.collection(col).doc('data').onSnapshot(snap => {
-      if (snap.exists) cb(snap.data().items || []);
-    }, e => { console.warn('fbListen error', col, e); });
-  } catch(e) { console.warn('fbListen failed', col, e); return () => {}; }
-}
-
-/* ── Logo stored separately in Firebase Storage (bypasses Firestore 1MB limit) ──
-   Path: company-assets/logo  (single file, always overwritten on upload)
-   Falls back gracefully if Storage is unavailable.                           ── */
-const LOGO_STORAGE_PATH = 'company-assets/logo';
-
-async function uploadLogoToStorage(dataUrl) {
-  try {
-    await fbEnsureAuth();
-    // Convert base64 data URL → Blob
-    const res = await fetch(dataUrl);
-    const blob = await res.blob();
-    const ref = window.fbStorage.ref(LOGO_STORAGE_PATH);
-    await ref.put(blob, { contentType: blob.type || 'image/png' });
-    const downloadUrl = await ref.getDownloadURL();
-    // Also save the download URL into Firestore settings so other devices can load it on boot
+  // Waits for auth before subscribing — avoids a race where the listener
+  // attaches before anonymous sign-in completes and gets permission-denied.
+  let unsubscribe = () => {};
+  fbEnsureAuth().then(() => {
     try {
-      const raw = localStorage.getItem('adminSettings');
-      const s = raw ? JSON.parse(raw) : {};
-      s.companyLogoUrl = downloadUrl;
-      // Strip the base64 blob from Firestore — only keep the Storage URL
-      const { companyLogo: _dropped, ...rest } = s;
-      await fbSave(FB_SETTINGS, [{ ...rest, companyLogoUrl: downloadUrl }]);
-    } catch(_) {}
-    return downloadUrl;
-  } catch(e) {
-    console.error('uploadLogoToStorage failed:', e);
-    return null;
-  }
+      unsubscribe = window.db.collection(col).doc('data').onSnapshot(snap => {
+        if (snap.exists) cb(snap.data().items || []);
+      }, e => { console.warn('fbListen error', col, e); });
+    } catch(e) { console.warn('fbListen failed', col, e); }
+  }).catch(e => { console.warn('fbListen auth failed', col, e); });
+  return () => unsubscribe();
 }
 
-async function loadLogoFromStorage() {
-  try {
-    await fbEnsureAuth();
-    const ref = window.fbStorage.ref(LOGO_STORAGE_PATH);
-    return await ref.getDownloadURL();
-  } catch(e) {
-    // File doesn't exist yet or Storage unavailable — not an error
-    return null;
-  }
-}
+/* ── Logo: now stored purely as base64 in Firestore (legalcomp_settings) ──
+   Previously also had a Firebase Storage path, but that required a second,
+   independently-configured security-rule system (Storage rules) plus an
+   exact bucket/project match — this was the repeated cause of the logo
+   working for the admin's own device but not showing on others. A small
+   (~20-30KB) base64 logo fits comfortably in Firestore's 1MB document
+   limit and only needs the one Firestore rule already used for everything
+   else in this collection.                                              ── */
 
 function fbListenLogo(cb) {
-  // Listen to the settings doc for companyLogoUrl changes (written by handleUploadLogo/handleDeleteLogo)
-  // Always fires cb — including with '' when logo is removed — so all devices clear their logoUrl
-  try {
-    return window.db.collection(FB_SETTINGS).doc('data').onSnapshot(snap => {
-      if (snap.exists) {
-        const items = snap.data().items || [];
-        // Prefer Storage URL; fall back to base64 stored directly in Firestore
-        const item = items[0];
-        cb(item ? (item.companyLogoUrl || item.companyLogo || '') : '');
-      }
-    }, e => { console.warn('fbListenLogo error', e); });
-  } catch(e) { console.warn('fbListenLogo failed', e); return () => {}; }
+  // Listen to the settings doc for logo changes (written by handleUploadLogo/handleDeleteLogo)
+  // Always fires cb — including with '' when logo is removed — so all devices clear their logoUrl.
+  // Waits for auth before subscribing to avoid a permission-denied race on first load.
+  let unsubscribe = () => {};
+  fbEnsureAuth().then(() => {
+    try {
+      unsubscribe = window.db.collection(FB_SETTINGS).doc('data').onSnapshot(snap => {
+        if (snap.exists) {
+          const items = snap.data().items || [];
+          const item = items[0];
+          cb(item ? (item.companyLogoUrl || item.companyLogo || '') : '');
+        }
+      }, e => { console.warn('fbListenLogo error', e); });
+    } catch(e) { console.warn('fbListenLogo failed', e); }
+  }).catch(e => { console.warn('fbListenLogo auth failed', e); });
+  return () => unsubscribe();
 }
 
 /* ═══════════════════════════════════════════
@@ -6578,12 +6532,10 @@ function App() {
           } catch(_) {}
         }
 
-        // Load logo from Firebase Storage (handles large base64 that Firestore can't store)
-        // This runs regardless of settings, to catch logos uploaded via the new flow
-        try {
-          const storageLogoUrl = await loadLogoFromStorage();
-          if (storageLogoUrl) setLogoUrl(storageLogoUrl);
-        } catch(_) {}
+        // Note: logo now comes only from Firestore settings (companyLogo, above) —
+        // the separate Firebase Storage lookup was removed since it required its
+        // own Storage security rules + correct bucket/project match, which was
+        // the recurring cause of the logo not appearing on other devices.
 
         setSyncStatus('synced');
       } catch(err) {
@@ -6758,7 +6710,7 @@ function App() {
   );
 
   const ctx = { dk, toggleTheme, colourKey, cycleColour, changeColour, currentUser, plants, users, requirements,
-                updatePlants, updateUsers, updateRequirements, logout, syncStatus, categories, updateCategories, logoUrl };
+                updatePlants, updateUsers, updateRequirements, logout, syncStatus, categories, updateCategories, logoUrl, setLogoUrl };
 
   if (page==='login')          return <LoginPage login={login} dk={dk} toggleTheme={toggleTheme} colourKey={colourKey} changeColour={changeColour} logoUrl={logoUrl} />;
   if (page==='admin')          return <AdminDashboard {...ctx} />;
