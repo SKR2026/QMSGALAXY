@@ -403,6 +403,8 @@ window.fbDeleteThread = async function(threadId){
 
 window.fbUpdateThread = async function(threadId, data){
   try{
+    /* Refresh auth token in case it expired (admin sessions can time out). */
+    if(auth.currentUser) await auth.currentUser.getIdToken(true).catch(function(){});
     /* Touch `ts` on every update so existing threads without it gain one. */
     var payload = Object.assign({}, data, { ts: serverTimestamp() });
     await updateDoc(doc(db,"qms_forum_threads",threadId), payload);
