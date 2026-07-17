@@ -1466,7 +1466,7 @@ const getBrandLogo = () => {
     return null;
   }
 };
-const setBrandLogo = dataUrl => {
+const cacheBrandLogo = dataUrl => {
   try {
     if (dataUrl) window.localStorage.setItem(STORAGE_KEYS.brandLogo, dataUrl);else window.localStorage.removeItem(STORAGE_KEYS.brandLogo);
     // Broadcast to other components via a custom event
@@ -1476,6 +1476,19 @@ const setBrandLogo = dataUrl => {
   }
 };
 
+// Persist the shared logo in Firestore; localStorage is only a fast cache.
+const setBrandLogo = async dataUrl => {
+  cacheBrandLogo(dataUrl);
+  if (!window._firebase) throw new Error('Database is not ready. Please try again.');
+  const f = window._firebase;
+  await f.setDoc(f.doc(f.db, 'appSettings', 'branding'), {
+    logoDataUrl: dataUrl || null,
+    updatedAt: Date.now()
+  }, {
+    merge: true
+  });
+};
+
 // Hook: returns live brand logo (updates when changed in any tab/component)
 const useBrandLogo = () => {
   const [logo, setLogo] = React.useState(getBrandLogo);
@@ -1483,7 +1496,26 @@ const useBrandLogo = () => {
     const handler = () => setLogo(getBrandLogo());
     window.addEventListener('ghm_brand_logo_changed', handler);
     window.addEventListener('storage', handler);
+    let unsubscribe = null;
+    let stopped = false;
+    const connectSharedLogo = async () => {
+      const startedAt = Date.now();
+      while (!stopped && (!window._firebase || !window._fbAuthReady) && Date.now() - startedAt < 15000) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      if (stopped || !window._firebase) return;
+      const f = window._firebase;
+      unsubscribe = f.onSnapshot(f.doc(f.db, 'appSettings', 'branding'), snap => {
+        if (!snap.exists()) return;
+        const sharedLogo = snap.data().logoDataUrl || null;
+        cacheBrandLogo(sharedLogo);
+        setLogo(sharedLogo);
+      }, err => console.warn('Shared logo sync failed:', err.message));
+    };
+    connectSharedLogo();
     return () => {
+      stopped = true;
+      if (unsubscribe) unsubscribe();
       window.removeEventListener('ghm_brand_logo_changed', handler);
       window.removeEventListener('storage', handler);
     };
@@ -1841,8 +1873,8 @@ const defaultCategories = ['Food', 'Grocery', 'Maintenance', 'Utilities', 'DTH',
 // ══════════════════════════════════════════════════════════════════
 /* ══════════════════════════════════════════════════════════════════
    BRANDING SETTINGS — Logo upload with live preview
-   Logo is stored in localStorage as base64 and shown on all devices
-   that open the app (each device stores its own copy via the hook).
+   Logo is stored once in Firestore and synchronized to every device.
+   localStorage is used only as a fast/offline display cache.
    ══════════════════════════════════════════════════════════════════ */
 const BrandingSettingsView = () => {
   const currentLogo = useBrandLogo();
@@ -1863,8 +1895,8 @@ const BrandingSettingsView = () => {
       setErrorMsg('Please upload an image file (PNG, JPG, SVG, WebP, etc.).');
       return;
     }
-    if (file.size > 2 * 1024 * 1024) {
-      setErrorMsg('Image must be smaller than 2 MB. Try compressing it first.');
+    if (file.size > 600 * 1024) {
+      setErrorMsg('Image must be smaller than 600 KB. Please compress it first.');
       return;
     }
     const reader = new FileReader();
@@ -1878,21 +1910,31 @@ const BrandingSettingsView = () => {
     setDragging(false);
     processFile(e.dataTransfer.files[0]);
   };
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!preview) {
       setErrorMsg('No logo selected.');
       return;
     }
-    setBrandLogo(preview);
-    setSavedMsg('✅ Logo saved! It will appear in the header on all devices.');
-    setTimeout(() => setSavedMsg(''), 4000);
+    setErrorMsg('');
+    try {
+      await setBrandLogo(preview);
+      setSavedMsg('✅ Logo saved and synchronized to all devices.');
+      setTimeout(() => setSavedMsg(''), 4000);
+    } catch (err) {
+      setErrorMsg('Could not save the shared logo: ' + err.message);
+    }
   };
-  const handleReset = () => {
-    setBrandLogo(null);
-    setPreview(null);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-    setSavedMsg('✅ Logo reset to default.');
-    setTimeout(() => setSavedMsg(''), 3000);
+  const handleReset = async () => {
+    setErrorMsg('');
+    try {
+      await setBrandLogo(null);
+      setPreview(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      setSavedMsg('✅ Shared logo reset to default on all devices.');
+      setTimeout(() => setSavedMsg(''), 3000);
+    } catch (err) {
+      setErrorMsg('Could not reset the shared logo: ' + err.message);
+    }
   };
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-6 max-w-2xl"
@@ -1959,7 +2001,7 @@ const BrandingSettingsView = () => {
     className: "text-blue-600 dark:text-blue-400 underline"
   }, "click to browse")), /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-slate-400 dark:text-slate-500"
-  }, "Accepted: PNG, JPG, SVG, WebP, GIF · Max 2 MB · Recommended height: 40–60 px")), /*#__PURE__*/React.createElement("input", {
+  }, "Accepted: PNG, JPG, SVG, WebP, GIF · Max 600 KB · Recommended height: 40–60 px")), /*#__PURE__*/React.createElement("input", {
     ref: fileInputRef,
     type: "file",
     accept: "image/*",
@@ -1971,7 +2013,7 @@ const BrandingSettingsView = () => {
     className: "text-sm text-red-500 font-medium"
   }, errorMsg), /*#__PURE__*/React.createElement("div", {
     className: "p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-100 dark:border-amber-800 text-xs text-amber-700 dark:text-amber-300 leading-relaxed"
-  }, "ℹ️ ", /*#__PURE__*/React.createElement("strong", null, "How it works:"), " The logo is stored in this browser's local storage as a Base64 image. Each device that opens the app needs to upload the logo once (or the admin can share the same image file). The logo persists across sessions on the same device.")), /*#__PURE__*/React.createElement("div", {
+  }, "ℹ️ ", /*#__PURE__*/React.createElement("strong", null, "How it works:"), " The logo is saved centrally in Firestore. After the Super Admin saves it, all connected devices receive the same logo automatically. A local cache keeps it visible during brief connection interruptions.")), /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-3 flex-wrap"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: handleSave,
@@ -1988,7 +2030,7 @@ const BrandingSettingsView = () => {
     className: "font-semibold text-slate-700 dark:text-slate-200 mb-3"
   }, "💡 Logo Tips"), /*#__PURE__*/React.createElement("ul", {
     className: "space-y-2 text-sm text-slate-600 dark:text-slate-300 list-disc list-inside leading-relaxed"
-  }, /*#__PURE__*/React.createElement("li", null, "Use a transparent background (PNG or SVG) for the best look on both light and dark themes."), /*#__PURE__*/React.createElement("li", null, "Landscape or square logos work best — the header displays them at 48 px tall."), /*#__PURE__*/React.createElement("li", null, "If the logo looks pixelated, use a higher-resolution source (2× or 3× display size)."), /*#__PURE__*/React.createElement("li", null, "To deploy to multiple devices, share the same image file with each user and have them upload it here."), /*#__PURE__*/React.createElement("li", null, "Clearing browser data will remove the logo — simply re-upload to restore it."))));
+  }, /*#__PURE__*/React.createElement("li", null, "Use a transparent background (PNG or SVG) for the best look on both light and dark themes."), /*#__PURE__*/React.createElement("li", null, "Landscape or square logos work best — the header displays them at 48 px tall."), /*#__PURE__*/React.createElement("li", null, "If the logo looks pixelated, use a higher-resolution source (2× or 3× display size)."), /*#__PURE__*/React.createElement("li", null, "Upload and save the logo once; other devices update automatically."), /*#__PURE__*/React.createElement("li", null, "Clearing browser data does not remove the shared logo; it is downloaded again from Firestore."))));
 };
 const EmailSettingsView = () => {
   const [cfg, setCfg] = React.useState(() => window.getGHMailConfig ? window.getGHMailConfig() : typeof getGHMailConfig !== 'undefined' ? getGHMailConfig() : {
