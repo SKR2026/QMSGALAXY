@@ -376,20 +376,23 @@ var GHM_LICENSE_COLLECTION = 'ghm_licenses';
 async function ghmValidateLicense(key) {
   if (!key || !key.trim()) return { valid: false, reason: 'NO_KEY' };
   var cleanKey = key.trim().toUpperCase();
+  console.log('[GHM] Validating key:', cleanKey);
 
-  /* ── Path A: Firebase SDK (available after module script below runs) ── */
+  /* ── Path A: Firebase SDK — always read from SERVER, never cache ── */
   if (window._firebase && window._firebase.db) {
     try {
       var fb = window._firebase;
       var docRef = fb.doc(fb.db, GHM_LICENSE_COLLECTION, cleanKey);
-      /* getDoc with cache bypass — getDocs on single doc isn't direct, use REST fallback */
-      /* Try SDK getDocs workaround via query on specific doc */
-      var { getDoc } = await import('https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js');
-      var snap = await getDoc(docRef);
+      /* Use getDocFromServer to bypass Firestore local cache */
+      var { getDocFromServer } = await import('https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js');
+      console.log('[GHM] SDK ready, reading doc from server...');
+      var snap = await getDocFromServer(docRef);
+      console.log('[GHM] Doc exists:', snap.exists());
       if (!snap.exists()) return { valid: false, reason: 'INVALID_KEY' };
       var d = snap.data();
+      console.log('[GHM] Doc data:', JSON.stringify(d));
       if (d._deleted) return { valid: false, reason: 'INVALID_KEY' };
-      if (!d.isActive)  return { valid: false, reason: 'REVOKED' };
+      if (!d.isActive) return { valid: false, reason: 'REVOKED' };
       var now = new Date();
       var expiry = null;
       if (d.expiryDate) {
@@ -401,15 +404,18 @@ async function ghmValidateLicense(key) {
         var { updateDoc, serverTimestamp, increment } = await import('https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js');
         updateDoc(docRef, { activationCount: increment(1), lastValidated: serverTimestamp() }).catch(function(){});
       } catch(e) {}
+      console.log('[GHM] License VALID via SDK');
       return { valid: true, data: { isActive: true, expiryDate: expiry, clientName: d.clientName || '' } };
     } catch(sdkErr) {
-      console.warn('[GHM License] SDK error:', sdkErr.message, '→ trying REST');
+      console.warn('[GHM] SDK error:', sdkErr.message, '→ trying REST');
     }
+  } else {
+    console.warn('[GHM] Firebase SDK not ready, using REST fallback');
   }
 
-  /* ── Path B: Firestore REST API fallback ── */
+  /* ── Path B: Firestore REST API — direct HTTP with auth token ── */
   try {
-    /* Get anonymous ID token */
+    /* Get anonymous ID token from Firebase Auth REST */
     var idToken = '';
     try {
       var tokenResp = await fetch(
@@ -417,20 +423,25 @@ async function ghmValidateLicense(key) {
         { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({returnSecureToken:true}) }
       );
       if (tokenResp.ok) { var tj = await tokenResp.json(); idToken = tj.idToken || ''; }
-    } catch(te) {}
+      console.log('[GHM] REST anon token obtained:', !!idToken);
+    } catch(te) { console.warn('[GHM] Token fetch failed:', te.message); }
 
     var url = 'https://firestore.googleapis.com/v1/projects/' + GHM_FB_CONFIG.projectId +
               '/databases/(default)/documents/' + GHM_LICENSE_COLLECTION + '/' + encodeURIComponent(cleanKey);
+    console.log('[GHM] REST URL:', url);
     var hdrs = { 'Content-Type': 'application/json' };
     if (idToken) hdrs['Authorization'] = 'Bearer ' + idToken;
     var resp = await fetch(url, { headers: hdrs });
+    console.log('[GHM] REST status:', resp.status);
     if (resp.status === 404) return { valid: false, reason: 'INVALID_KEY' };
-    if (resp.status === 401 || resp.status === 403) return { valid: false, reason: 'OFFLINE' }; /* auth/rules issue — treat as network error */
+    if (resp.status === 401 || resp.status === 403) return { valid: false, reason: 'OFFLINE' };
     if (!resp.ok) return { valid: false, reason: 'ERROR', message: 'HTTP ' + resp.status };
     var docData = await resp.json();
+    console.log('[GHM] REST doc:', JSON.stringify(docData));
     var f = docData.fields || {};
     if (f._deleted && f._deleted.booleanValue === true) return { valid: false, reason: 'INVALID_KEY' };
-    if (f.isActive && f.isActive.booleanValue === false) return { valid: false, reason: 'REVOKED' };
+    /* isActive must be explicitly true — missing field = not activated */
+    if (!f.isActive || f.isActive.booleanValue !== true) return { valid: false, reason: 'REVOKED' };
     var expiry2 = null;
     if (f.expiryDate) {
       if (f.expiryDate.timestampValue) expiry2 = new Date(f.expiryDate.timestampValue);
@@ -438,9 +449,10 @@ async function ghmValidateLicense(key) {
     }
     if (expiry2 && new Date() > expiry2) return { valid: false, reason: 'EXPIRED', expiry: expiry2 };
     var clientName = (f.clientName && f.clientName.stringValue) ? f.clientName.stringValue : '';
+    console.log('[GHM] License VALID via REST');
     return { valid: true, data: { isActive: true, expiryDate: expiry2, clientName: clientName } };
   } catch(restErr) {
-    console.warn('[GHM License] REST error:', restErr.message);
+    console.warn('[GHM] REST error:', restErr.message);
     return { valid: false, reason: 'OFFLINE' };
   }
 }
@@ -545,7 +557,7 @@ function _ghmHideGate(licData) {
 var GHM_REASON_MSG = {
   NO_KEY:      'Please enter your license key.',
   INVALID_KEY: 'License key not found. Check the key and try again.',
-  REVOKED:     'This license has been revoked. Contact your administrator.',
+  REVOKED:     'License is not active. Ensure isActive=true is set in Firestore for this key.',
   EXPIRED:     'This license has expired. Contact your administrator to renew.',
   OFFLINE:     'Cannot reach the license server. Check your internet connection.',
   ERROR:       'An error occurred verifying your license. Try again.',
