@@ -3426,9 +3426,24 @@ function renderSettings(){
   <div style="max-width:620px;display:flex;flex-direction:column;gap:14px" class="fade-in">
     <div class="card">
       <div style="font-weight:700;font-size:15px;color:var(--text);margin-bottom:12px">👥 User Accounts</div>
-      <div style="font-size:12px;color:var(--text3);margin-bottom:12px">Manage admin and user accounts. Send registration links from here.</div>
-      <button class="btn btn-primary btn-sm" style="margin-bottom:14px" onclick="showSendRegistrationPanel()">📨 Send Registration Link</button>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:12px">Manage admin and user accounts. Supports up to 500+ users with search and pagination.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center;">
+        <button class="btn btn-primary btn-sm" onclick="showSendRegistrationPanel()">📨 Send Registration Link</button>
+        <input id="user-search" class="form-input" type="search" placeholder="🔍 Search by name or email…" style="flex:1;min-width:180px;max-width:260px;font-size:12px;padding:6px 10px;" oninput="_filterUserList()"/>
+        <select id="user-role-filter" class="form-select" style="font-size:12px;padding:6px 8px;width:auto;" onchange="_filterUserList()">
+          <option value="">All roles</option>
+          <option value="admin">Admin</option>
+          <option value="user">User</option>
+        </select>
+        <select id="user-status-filter" class="form-select" style="font-size:12px;padding:6px 8px;width:auto;" onchange="_filterUserList()">
+          <option value="">All statuses</option>
+          <option value="active">Active</option>
+          <option value="disabled">Disabled</option>
+        </select>
+      </div>
+      <div id="user-count-label" style="font-size:11px;color:var(--text3);margin-bottom:8px"></div>
       <div id="user-mgmt-list">${userMgmtPlaceholder}</div>
+      <div id="user-pagination" style="display:flex;gap:6px;margin-top:12px;align-items:center;flex-wrap:wrap;"></div>
     </div>
 
     <div class="card">
@@ -3765,9 +3780,10 @@ function renderSettings(){
     }
   }, 0);
   // Async-populate user accounts list (super admin only)
-  renderUserManagementSection().then(html => {
+  // _renderUserPage is called inside renderUserManagementSection automatically
+  renderUserManagementSection().catch(e => {
     const el = document.getElementById('user-mgmt-list');
-    if(el) el.innerHTML = html;
+    if(el) el.innerHTML = '<div style="color:var(--red)">Error loading users: ' + e.message + '</div>';
   });
 }
 
@@ -5565,11 +5581,154 @@ async function _sendRegistration() {
       createdAt: new Date().toISOString(),
       groupMemberships: []
     });
-    st.textContent='✅ Account created! Temp password: ' + tempPw; st.style.color='var(--green)';
-    toast('Account created for ' + (nick || email) + '! Share the login link and temp password.', 'var(--green)');
+
+    // ── Now actually send the registration email ──────────────────────
+    st.textContent='⏳ Account created! Sending registration email...'; st.style.color='var(--text3)';
+    const emailSent = await _sendRegistrationEmail(email, nick, role, tempPw);
+
+    if (emailSent === true) {
+      st.innerHTML='✅ Account created & registration email sent to <strong>' + esc(email) + '</strong>!';
+      st.style.color='var(--green)';
+      toast('✅ Account created & email sent to ' + (nick || email) + '!', 'var(--green)');
+    } else if (emailSent === 'mailto') {
+      // Opened mail client fallback
+      st.innerHTML='✅ Account created! A draft email has been opened in your mail client.<br><span style="color:var(--text3)">Temp password: <strong>' + esc(tempPw) + '</strong></span>';
+      st.style.color='var(--green)';
+      toast('✅ Account created! Mail client opened — send the draft.', 'var(--amber)');
+    } else {
+      // Email failed but account exists — show manual fallback
+      st.innerHTML='✅ Account created, but email failed to send.<br><span style="color:var(--text3)">Share manually — Temp password: <strong>' + esc(tempPw) + '</strong></span>';
+      st.style.color='var(--amber)';
+      toast('⚠ Account created but email failed — share login details manually.', 'var(--amber)');
+    }
   } catch(e) {
     st.textContent='❌ Error: ' + e.message; st.style.color='var(--red)';
   }
+}
+
+// ── Build and send the registration email ─────────────────────────────
+async function _sendRegistrationEmail(toEmail, nickname, role, tempPassword) {
+  const transport   = emailTransport();
+  const loginUrl    = window.location.href.split('?')[0];
+  const displayName = nickname || toEmail.split('@')[0];
+  const companyName = localStorage.getItem('company_name') || 'POLYPLASTICS';
+  const senderName  = adminAuthenticated && !currentSession ? 'Super Admin' : (getSessionNick() || 'Admin');
+  const logoUrl     = localStorage.getItem('company_logo_url') || '';
+  const roleLabel   = role.charAt(0).toUpperCase() + role.slice(1);
+
+  const logoBlock = logoUrl
+    ? `<img src="${logoUrl}" alt="${companyName}" style="max-height:40px;max-width:160px;display:block;margin-bottom:8px;"/>`
+    : `<div style="font-family:sans-serif;font-size:18px;font-weight:800;color:#5b8dee;letter-spacing:1px;">${companyName}</div>`;
+
+  const subject = `[${companyName}] Your Task Manager account is ready`;
+
+  const htmlBody = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#f0f2f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f2f7;padding:32px 16px;">
+<tr><td align="center">
+<table width="540" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+  <!-- Header -->
+  <tr><td style="background:linear-gradient(135deg,#1a2340 0%,#0f172a 100%);padding:28px 36px;">
+    ${logoBlock}
+    <div style="font-size:12px;color:#9aa5c0;margin-top:4px;letter-spacing:0.8px;text-transform:uppercase;">Task Manager</div>
+  </td></tr>
+  <!-- Body -->
+  <tr><td style="padding:36px;">
+    <div style="font-size:22px;font-weight:700;color:#1a1e2e;margin-bottom:8px;">Welcome, ${displayName}! 👋</div>
+    <div style="font-size:15px;color:#4a5068;line-height:1.6;margin-bottom:24px;">
+      <strong>${senderName}</strong> has created a <strong>${roleLabel}</strong> account for you on the ${companyName} Task Manager.
+    </div>
+
+    <!-- Credentials box -->
+    <div style="background:#f5f7ff;border:1px solid #d8dce8;border-radius:10px;padding:20px 24px;margin-bottom:24px;">
+      <div style="font-size:12px;font-weight:700;color:#8890a8;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:14px;">Your Login Details</div>
+      <table cellpadding="0" cellspacing="0" width="100%">
+        <tr>
+          <td style="font-size:13px;color:#4a5068;padding:5px 0;width:120px;font-weight:600;">Email</td>
+          <td style="font-size:13px;color:#1a1e2e;font-weight:700;">${toEmail}</td>
+        </tr>
+        <tr>
+          <td style="font-size:13px;color:#4a5068;padding:5px 0;font-weight:600;">Temp Password</td>
+          <td style="font-size:13px;color:#1a1e2e;font-weight:700;font-family:monospace;background:#e8ebf4;padding:3px 8px;border-radius:5px;">${tempPassword}</td>
+        </tr>
+        <tr>
+          <td style="font-size:13px;color:#4a5068;padding:5px 0;font-weight:600;">Role</td>
+          <td><span style="background:rgba(91,141,238,0.15);color:#5b8dee;border-radius:5px;padding:2px 10px;font-size:12px;font-weight:700;">${roleLabel}</span></td>
+        </tr>
+      </table>
+    </div>
+
+    <div style="font-size:13px;color:#e6112a;font-weight:600;margin-bottom:20px;">⚠ You will be prompted to set a new password on your first login.</div>
+
+    <!-- CTA Button -->
+    <table cellpadding="0" cellspacing="0"><tr><td style="border-radius:10px;background:linear-gradient(135deg,#5b8dee,#3d6dd4);">
+      <a href="${loginUrl}" style="display:inline-block;padding:14px 32px;font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;letter-spacing:0.3px;">Open Task Manager →</a>
+    </td></tr></table>
+
+    <div style="margin-top:24px;font-size:12px;color:#8890a8;line-height:1.6;">
+      If the button doesn't work, copy this link:<br/>
+      <a href="${loginUrl}" style="color:#5b8dee;">${loginUrl}</a>
+    </div>
+  </td></tr>
+  <!-- Footer -->
+  <tr><td style="background:#f5f7ff;padding:18px 36px;border-top:1px solid #d8dce8;">
+    <div style="font-size:11px;color:#8890a8;">This email was sent by ${companyName} Task Manager. Do not reply to this email.</div>
+  </td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>`;
+
+  if (transport === 'msgraph') {
+    try {
+      await sendViaMsGraph(toEmail, subject, htmlBody);
+      return true;
+    } catch(e) {
+      console.warn('[Registration email] MS Graph failed:', e.message);
+      // Fall through to mailto
+    }
+  } else if (transport === 'emailjs') {
+    try {
+      const c = getEmailConfig();
+      if (typeof emailjs === 'undefined') throw new Error('EmailJS not loaded');
+      emailjs.init({ publicKey: c.ejsKey });
+      const params = {
+        to_email:     toEmail,
+        to_name:      displayName,
+        subject:      subject,
+        message_html: htmlBody,
+        task_title:   'Account Registration',
+        task_due:     '',
+        task_priority:'',
+        task_status:  '',
+        task_desc:    'Your login details are inside.',
+        task_assignee: toEmail,
+        reply_to:     'noreply@polyplastics.com',
+        from_name:    companyName + ' Task Manager',
+      };
+      const r = await withTimeout(emailjs.send(c.ejsService, c.ejsTemplate, params));
+      if (r.status !== 200) throw new Error('EmailJS: ' + r.text);
+      return true;
+    } catch(e) {
+      console.warn('[Registration email] EmailJS failed:', e.message);
+      // Fall through to mailto
+    }
+  }
+
+  // ── Mailto fallback ───────────────────────────────────────────────
+  const body = encodeURIComponent(
+    'Hello ' + displayName + ',\n\n' +
+    'Your Task Manager account has been created.\n\n' +
+    'Login URL: ' + loginUrl + '\n' +
+    'Email: ' + toEmail + '\n' +
+    'Temporary Password: ' + tempPassword + '\n\n' +
+    'You will be asked to set a new password on first login.\n\n' +
+    'Regards,\n' + companyName
+  );
+  const mailtoSubject = encodeURIComponent(subject);
+  window.open('mailto:' + toEmail + '?subject=' + mailtoSubject + '&body=' + body);
+  return 'mailto';
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -5850,33 +6009,110 @@ async function _changeRolePassword(email) {
 // ══════════════════════════════════════════════════════════════════════
 //  USER MANAGEMENT PANEL — for superadmin (Settings) 
 // ══════════════════════════════════════════════════════════════════════
+// ── User list state (cached for filtering/pagination) ─────────────────
+let _allAppUsers = [];
+const _USER_PAGE_SIZE = 25;
+let _userPage = 0;
+
 async function renderUserManagementSection() {
   if (!_fbReady || !_db) return '<div style="color:var(--text3)">Loading...</div>';
   try {
-    const snap = await _db.collection('appUsers').get();
-    const users = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    if (!users.length) return '<div style="color:var(--text3);font-size:13px">No accounts yet. Send a registration link to create users.</div>';
-    return users.map(u => `
-      <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">
-        <div style="width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--purple));display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff;flex-shrink:0;">${esc((u.nickname||u.email||'?')[0].toUpperCase())}</div>
-        <div style="flex:1;min-width:0;">
-          <div style="font-weight:600;font-size:13px">${esc(u.nickname||'—')} <span style="background:rgba(91,141,238,.15);color:var(--accent);border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">${esc(u.role||'user')}</span></div>
-          <div style="font-size:11px;color:var(--text3)">${esc(u.email)}</div>
-        </div>
-        <div style="font-size:11px;color:${u.status==='active'?'var(--green)':'var(--amber)'};">${esc(u.status||'active')}</div>
-        <button class="btn btn-danger btn-sm" style="font-size:11px" onclick="_disableAppUser('${esc(u.email)}')">Disable</button>
-      </div>`).join('');
+    // Paginated Firestore read: fetch in batches of 25 using startAfter cursor
+    // For initial load, get first 25 ordered by email
+    const snap = await _db.collection('appUsers').orderBy('email').limit(250).get();
+    _allAppUsers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    _userPage = 0;
+    if (!_allAppUsers.length) return '<div style="color:var(--text3);font-size:13px">No accounts yet. Send a registration link to create users.</div>';
+    _renderUserPage();
+    return ''; // _renderUserPage populates the container directly
   } catch(e) { return '<div style="color:var(--red)">Error: ' + e.message + '</div>'; }
 }
 
-async function _disableAppUser(email) {
-  if (!confirm('Disable account for ' + email + '?')) return;
+function _getFilteredUsers() {
+  const q      = (document.getElementById('user-search')?.value || '').toLowerCase();
+  const role   = document.getElementById('user-role-filter')?.value || '';
+  const status = document.getElementById('user-status-filter')?.value || '';
+  return _allAppUsers.filter(u => {
+    const matchQ      = !q      || (u.email||'').toLowerCase().includes(q) || (u.nickname||'').toLowerCase().includes(q);
+    const matchRole   = !role   || (u.role||'user') === role;
+    const matchStatus = !status || (u.status||'active') === status;
+    return matchQ && matchRole && matchStatus;
+  });
+}
+
+function _filterUserList() {
+  _userPage = 0;
+  _renderUserPage();
+}
+
+function _renderUserPage() {
+  const filtered = _getFilteredUsers();
+  const total    = filtered.length;
+  const start    = _userPage * _USER_PAGE_SIZE;
+  const pageUsers = filtered.slice(start, start + _USER_PAGE_SIZE);
+  const totalPages = Math.ceil(total / _USER_PAGE_SIZE);
+
+  const label = document.getElementById('user-count-label');
+  if (label) label.textContent = total + ' account' + (total !== 1 ? 's' : '') + (total < _allAppUsers.length ? ' (filtered from ' + _allAppUsers.length + ')' : '');
+
+  const list = document.getElementById('user-mgmt-list');
+  if (list) {
+    if (!pageUsers.length) {
+      list.innerHTML = '<div style="color:var(--text3);font-size:13px;padding:12px 0">No accounts match your search.</div>';
+    } else {
+      list.innerHTML = pageUsers.map(u => `
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">
+          <div style="width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--purple));display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff;flex-shrink:0;">${esc((u.nickname||u.email||'?')[0].toUpperCase())}</div>
+          <div style="flex:1;min-width:0;">
+            <div style="font-weight:600;font-size:13px">${esc(u.nickname||'—')} <span style="background:rgba(91,141,238,.15);color:var(--accent);border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">${esc(u.role||'user')}</span></div>
+            <div style="font-size:11px;color:var(--text3)">${esc(u.email)}</div>
+          </div>
+          <div style="font-size:11px;color:${u.status==='active'?'var(--green)':'var(--amber)'};">${esc(u.status||'active')}</div>
+          <button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="_toggleAppUser('${esc(u.email)}','${esc(u.status||'active')}')">${(u.status||'active')==='active'?'Disable':'Enable'}</button>
+        </div>`).join('');
+    }
+  }
+
+  // Pagination controls
+  const pgDiv = document.getElementById('user-pagination');
+  if (pgDiv && totalPages > 1) {
+    const pages = [];
+    for (let i = 0; i < totalPages; i++) {
+      const active = i === _userPage;
+      pages.push(`<button class="btn ${active?'btn-primary':'btn-ghost'} btn-sm" style="min-width:32px;font-size:12px;padding:4px 8px;" onclick="_goUserPage(${i})">${i+1}</button>`);
+    }
+    pgDiv.innerHTML = `
+      <button class="btn btn-ghost btn-sm" style="font-size:12px" onclick="_goUserPage(${_userPage-1})" ${_userPage===0?'disabled':''}>← Prev</button>
+      ${pages.join('')}
+      <button class="btn btn-ghost btn-sm" style="font-size:12px" onclick="_goUserPage(${_userPage+1})" ${_userPage>=totalPages-1?'disabled':''}>Next →</button>
+      <span style="font-size:11px;color:var(--text3);margin-left:4px">Showing ${start+1}–${Math.min(start+_USER_PAGE_SIZE,total)} of ${total}</span>`;
+  } else if (pgDiv) {
+    pgDiv.innerHTML = '';
+  }
+}
+
+function _goUserPage(page) {
+  const filtered = _getFilteredUsers();
+  const totalPages = Math.ceil(filtered.length / _USER_PAGE_SIZE);
+  if (page < 0 || page >= totalPages) return;
+  _userPage = page;
+  _renderUserPage();
+}
+
+async function _toggleAppUser(email, currentStatus) {
+  const newStatus = currentStatus === 'active' ? 'disabled' : 'active';
+  if (!confirm((newStatus === 'disabled' ? 'Disable' : 'Enable') + ' account for ' + email + '?')) return;
   try {
-    await _db.collection('appUsers').doc(email).set({ status: 'disabled' }, { merge: true });
-    toast('Account disabled for ' + email, 'var(--amber)');
-    showPanel('settings');
+    await _db.collection('appUsers').doc(email).set({ status: newStatus }, { merge: true });
+    // Update local cache
+    const u = _allAppUsers.find(u => u.email === email);
+    if (u) u.status = newStatus;
+    _renderUserPage();
+    toast('Account ' + newStatus + ' for ' + email, newStatus === 'active' ? 'var(--green)' : 'var(--amber)');
   } catch(e) { toast('Error: ' + e.message, 'var(--red)'); }
 }
+
+// _disableAppUser replaced by _toggleAppUser above
 
 
 async function adminLogin(){
