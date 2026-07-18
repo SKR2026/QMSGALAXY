@@ -707,6 +707,7 @@
         <div class="nav-item" onclick="showPanel('reminders')"><span class="nav-icon">🔔</span><span>Reminders</span></div>
         <div class="nav-item" onclick="showPanel('team')"><span class="nav-icon">👥</span><span>Team</span></div>
       </div>
+      <div id="role-nav-items"><!-- injected for admin/user roles --></div>
       <div class="nav-section">🏭 Plants</div>
       <div id="plant-nav-items"><!-- rendered by renderPlantNav() --></div>
       <div class="nav-section">Settings</div>
@@ -800,6 +801,9 @@ const fmt = d => {
 const fmtTime = d => new Date(d).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
 const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 
+// ── Firestore collections used by role system ────────────────────────
+// appUsers/  {email, nickname, role, passwordHash, mustChangePassword, status, groupMemberships, pendingGroupInvites}
+// groups/    {name, ownerEmail, members:[{email,nickname}], pendingRequests:[{email,nickname}]}
 // ── initial data ──────────────────────────────────────────────────────
 const SEED = [
   {id:uid(),title:"Design new landing page",desc:"Create wireframes and final design assets for Q2 launch. Include mobile & desktop variants.",assignee:"priya@example.com",priority:"High",status:"In Progress",due:"2026-04-10",created:"2026-03-20",token:uid(),replies:[{id:uid(),author:"priya@example.com",text:"Started wireframes. Will share Friday.",time:"2026-03-22T10:00:00Z",attachments:[]}],attachments:[],reminder:"daily",tags:["design","ui"]},
@@ -1670,6 +1674,10 @@ function setMode(m){
 //  PANEL ROUTER
 // ═══════════════════════════════════════════════════════════════════════
 function showPanel(name){
+  // Block settings for admin and user roles
+  if (name === 'settings' && currentSession && (currentSession.role === 'admin' || currentSession.role === 'user')) {
+    toast('Settings are only accessible to Super Admin.', 'var(--amber)'); return;
+  }
   // SECURITY: If admin overlay is still up, block navigation
   if(document.getElementById('admin-pwd-overlay')) return;
   // SECURITY: If in user mode, only the 'user' panel is allowed.
@@ -3409,11 +3417,20 @@ function renderSettings(){
     </div>`;
     return;
   }
+  // Pre-render user management asynchronously
+  const userMgmtPlaceholder = 'Loading accounts...';
   c.innerHTML=`
   <div class="panel-title fade-in">Settings</div>
   <div class="panel-sub">Configure your TaskFlow workspace</div>
 
   <div style="max-width:620px;display:flex;flex-direction:column;gap:14px" class="fade-in">
+    <div class="card">
+      <div style="font-weight:700;font-size:15px;color:var(--text);margin-bottom:12px">👥 User Accounts</div>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:12px">Manage admin and user accounts. Send registration links from here.</div>
+      <button class="btn btn-primary btn-sm" style="margin-bottom:14px" onclick="showSendRegistrationPanel()">📨 Send Registration Link</button>
+      <div id="user-mgmt-list">${userMgmtPlaceholder}</div>
+    </div>
+
     <div class="card">
       <div style="font-weight:700;font-size:15px;color:var(--text);margin-bottom:16px">🔐 Admin Password</div>
       <div class="form-group"><label class="form-label">Current Password</label><input type="password" id="pwd-current" class="form-input" placeholder="••••••••"/></div>
@@ -3747,6 +3764,11 @@ function renderSettings(){
       }
     }
   }, 0);
+  // Async-populate user accounts list (super admin only)
+  renderUserManagementSection().then(html => {
+    const el = document.getElementById('user-mgmt-list');
+    if(el) el.innerHTML = html;
+  });
 }
 
 
@@ -4652,6 +4674,17 @@ let adminAuthenticated = false; // will be set true only after password check or
 let plantOwnerAuthenticated = false; // true when a plant owner is logged in
 let currentPlantSession = null;      // the plant object the owner is logged into
 
+// ── Role-based access system ──────────────────────────────────────────
+// Roles: 'superadmin' | 'admin' | 'user'
+let currentSession = null; // { email, nickname, role, uid } — set on login
+// Helper shortcuts
+const isSuperAdmin = () => adminAuthenticated && !plantOwnerAuthenticated && !currentSession?.role;
+const isAdmin      = () => currentSession?.role === 'admin';
+const isUser       = () => currentSession?.role === 'user';
+const isLoggedInAs = role => currentSession?.role === role;
+const getSessionEmail = () => currentSession?.email || '';
+const getSessionNick  = () => currentSession?.nickname || currentSession?.email || '';
+
 // ── Developer Master Account (hidden from client) ─────────────────────
 // This account is NEVER shown in UI, Settings, or any panel.
 // Access: URL param ?devmode=1  OR  Ctrl+Shift+D on login screen
@@ -4671,6 +4704,7 @@ async function _showDevLoginPrompt(){
     await _bfRecord('__dev__',true);
     _devAuthenticated = true;
     adminAuthenticated = true;
+    currentSession = null;
     // Show full admin UI exactly like super admin
     document.getElementById('admin-nav').style.display = 'block';
     document.getElementById('btn-admin-mode').style.display = '';
@@ -4738,25 +4772,30 @@ function showAdminLoginScreen(){
   const sidebarBottom = document.querySelector('.sidebar-bottom');
   if(sidebarBottom) sidebarBottom.style.visibility = 'hidden';
   // Show login in content
-  document.getElementById('topbar-title').textContent = 'Admin Login';
+  document.getElementById('topbar-title').textContent = 'Sign In';
   document.getElementById('content').innerHTML = `
-  <div id="admin-login-screen" style="max-width:420px;margin:80px auto;text-align:center">
+  <div id="admin-login-screen" style="max-width:420px;margin:60px auto;text-align:center">
     <div style="font-size:52px;margin-bottom:16px">🔐</div>
-    <div class="panel-title" style="margin-bottom:8px">Admin Login</div>
-    <div style="color:var(--text3);font-size:14px;margin-bottom:0">Enter your admin password to access the dashboard.</div>
+    <div class="panel-title" style="margin-bottom:6px">Welcome Back</div>
+    <div style="color:var(--text3);font-size:14px;margin-bottom:0">Sign in to your Task Manager account.</div>
     <div class="token-box" style="margin-top:24px;text-align:left">
       <div class="form-group">
-        <label class="form-label">Password</label>
-        <input id="admin-pwd-input" class="form-input" type="password" placeholder="Enter admin password"
-          onkeydown="if(event.key==='Enter')adminLogin()"/>
+        <label class="form-label">Email Address</label>
+        <input id="login-email-input" class="form-input" type="email" placeholder="you@example.com"
+          onkeydown="if(event.key==='Enter')document.getElementById('login-pwd-input')?.focus()"/>
       </div>
-      <div id="admin-login-error" style="color:var(--red);font-size:13px;margin-bottom:10px;display:none">❌ Incorrect password. Try again.</div>
-      <button class="btn btn-primary" style="width:100%;justify-content:center;margin-bottom:10px" onclick="adminLogin()">🔓 Super Admin Login</button>
+      <div class="form-group">
+        <label class="form-label">Password</label>
+        <input id="login-pwd-input" class="form-input" type="password" placeholder="Enter your password"
+          onkeydown="if(event.key==='Enter')unifiedLogin()"/>
+      </div>
+      <div id="admin-login-error" style="color:var(--red);font-size:13px;margin-bottom:10px;display:none">❌ Incorrect credentials.</div>
+      <button class="btn btn-primary" style="width:100%;justify-content:center;margin-bottom:10px" onclick="unifiedLogin()">🔓 Sign In</button>
       <div style="text-align:center;font-size:12px;color:var(--text3);margin:8px 0">— or —</div>
       <button class="btn btn-ghost" style="width:100%;justify-content:center" onclick="showPlantOwnerLoginScreen()">🏭 Plant Owner Login</button>
     </div>
   </div>`;
-  setTimeout(()=>document.getElementById('admin-pwd-input')?.focus(), 50);
+  setTimeout(()=>document.getElementById('login-email-input')?.focus(), 50);
 }
 
 
@@ -5249,6 +5288,597 @@ async function overlayAdminLogin(){
   }
 }
 
+
+// ══════════════════════════════════════════════════════════════════════
+//  UNIFIED LOGIN — handles superadmin / admin / user in one screen
+// ══════════════════════════════════════════════════════════════════════
+async function unifiedLogin() {
+  const email  = (document.getElementById('login-email-input')?.value || '').trim().toLowerCase();
+  const pwd    = document.getElementById('login-pwd-input')?.value || '';
+  const err    = document.getElementById('admin-login-error');
+
+  if (!email) { err.textContent='❌ Enter your email address.'; err.style.display='block'; return; }
+  if (!pwd)   { err.textContent='❌ Enter your password.'; err.style.display='block'; return; }
+
+  // ── 1. Check if it is the super-admin (stored in settings/admin) ──
+  const SUPER_ADMIN_EMAIL = ((await _getSettingDoc('admin'))?.superAdminEmail || 'admin@polyplastics.com').toLowerCase();
+  if (email === SUPER_ADMIN_EMAIL) {
+    // Re-use existing adminLogin flow but with the email field
+    const el = document.createElement('input');
+    el.id = 'admin-pwd-input'; el.value = pwd; el.style.display='none';
+    document.body.appendChild(el);
+    await adminLogin();
+    document.body.removeChild(el);
+    return;
+  }
+
+  // ── 2. Check admin / user accounts stored in Firestore ─────────────
+  const bfKey = 'user:' + email;
+  const bf = await _bfCheck(bfKey);
+  if (bf.locked) {
+    err.textContent = '⏳ Too many failed attempts. Locked for ' + bf.remaining + ' minute(s).';
+    err.style.display = 'block'; return;
+  }
+
+  if (!_fbReady || !_db) {
+    err.textContent = '❌ Database not ready. Please refresh.'; err.style.display='block'; return;
+  }
+
+  try {
+    const snap = await _db.collection('appUsers').doc(email).get();
+    if (!snap.exists) {
+      await _bfRecord(bfKey, false);
+      err.textContent = '❌ Account not found. Contact your admin.'; err.style.display='block'; return;
+    }
+    const u = snap.data();
+
+    // Check if account is active
+    if (u.status === 'pending') {
+      err.textContent = '❌ Your account is pending activation. Check your email.'; err.style.display='block'; return;
+    }
+    if (u.status === 'disabled') {
+      err.textContent = '❌ Your account has been disabled. Contact Super Admin.'; err.style.display='block'; return;
+    }
+
+    // Verify password
+    const pwHash = u.passwordHash || '';
+    const isFirstLogin = u.mustChangePassword === true;
+
+    // Handle first-login case: stored hash is a one-time token
+    let ok = false;
+    if (isFirstLogin) {
+      // First login: compare plain token (set by admin/superadmin on registration)
+      ok = (pwHash === pwd) || await _verifyPw(pwHash, pwd, email);
+    } else {
+      ok = await _verifyPw(pwHash, pwd, email);
+    }
+
+    if (!ok) {
+      await _bfRecord(bfKey, false);
+      const bfA = await _bfCheck(bfKey);
+      const rem = _BF_MAX - (bfA.attempts || 0);
+      err.textContent = '❌ Incorrect password.' + (rem > 0 && rem < _BF_MAX ? ' ' + rem + ' attempt(s) left.' : '');
+      err.style.display = 'block'; return;
+    }
+
+    await _bfRecord(bfKey, true);
+    err.style.display = 'none';
+
+    // Set session
+    currentSession = { email: u.email, nickname: u.nickname || '', role: u.role, uid: snap.id };
+
+    if (isFirstLogin) {
+      // Force password change before proceeding
+      showForcePasswordChange(u, email);
+      return;
+    }
+
+    _activateRoleSession(u.role);
+  } catch(e) {
+    err.textContent = '❌ Login error: ' + e.message; err.style.display='block';
+  }
+}
+
+// Helper: get a Firestore settings doc
+async function _getSettingDoc(docId) {
+  if (!_fbReady || !_db) return {};
+  try {
+    const s = await _db.collection('settings').doc(docId).get();
+    return s.exists ? s.data() : {};
+  } catch(e) { return {}; }
+}
+
+// ── Activate role session (called after successful login) ─────────────
+function _activateRoleSession(role) {
+  const sidebarBottom = document.querySelector('.sidebar-bottom');
+  document.getElementById('admin-nav').style.display = 'block';
+  if (sidebarBottom) { sidebarBottom.style.display=''; sidebarBottom.style.visibility=''; }
+
+  if (role === 'admin') {
+    adminAuthenticated = true;
+    document.getElementById('btn-admin-mode').style.display = '';
+    document.getElementById('btn-user-mode').style.display = '';
+    document.getElementById('btn-export').style.display = 'flex';
+    _setSettingsNavVisible(false);
+    _injectRoleNavItems('admin');
+    toast('Welcome, ' + getSessionNick() + '! (Admin) 👋');
+    showPanel('dashboard');
+  } else if (role === 'user') {
+    adminAuthenticated = true;
+    document.getElementById('btn-new-task').style.display = 'flex';
+    _setSettingsNavVisible(false);
+    _injectRoleNavItems('user');
+    toast('Welcome, ' + getSessionNick() + '! 👋');
+    showPanel('mytasks');
+  }
+
+  _renderTopbarUserBadge();
+}
+
+function _injectRoleNavItems(role) {
+  const container = document.getElementById('role-nav-items');
+  if (!container) return;
+  if (role === 'superadmin') {
+    container.innerHTML = `
+      <div class="nav-section">Account</div>
+      <div class="nav-item" onclick="showSendRegistrationPanel()"><span class="nav-icon">📨</span><span>Send Registration</span></div>
+      <div class="nav-item" onclick="showGroupManagementPanel()"><span class="nav-icon">👥</span><span>My Groups</span></div>
+      <div class="nav-item" onclick="showChangePasswordPanel()"><span class="nav-icon">🔑</span><span>Change Password</span></div>`;
+  } else if (role === 'admin') {
+    container.innerHTML = `
+      <div class="nav-section">Account</div>
+      <div class="nav-item" onclick="showSendRegistrationPanel()"><span class="nav-icon">📨</span><span>Send Registration</span></div>
+      <div class="nav-item" onclick="showGroupManagementPanel()"><span class="nav-icon">👥</span><span>My Groups</span></div>
+      <div class="nav-item" onclick="showChangePasswordPanel()"><span class="nav-icon">🔑</span><span>Change Password</span></div>`;
+  } else if (role === 'user') {
+    container.innerHTML = `
+      <div class="nav-section">Account</div>
+      <div class="nav-item" onclick="showMyGroupInvites()"><span class="nav-icon">📬</span><span>Group Invites</span></div>
+      <div class="nav-item" onclick="showChangePasswordPanel()"><span class="nav-icon">🔑</span><span>Change Password</span></div>`;
+  }
+}
+
+function _setSettingsNavVisible(visible) {
+  const settingsSection = document.querySelector('.nav-section:last-of-type');
+  const settingsItem = document.querySelector('.nav-item[onclick*="settings"]');
+  if (settingsSection) settingsSection.style.display = visible ? '' : 'none';
+  if (settingsItem)    settingsItem.style.display    = visible ? '' : 'none';
+}
+
+function _renderTopbarUserBadge() {
+  if (!currentSession) return;
+  const topbar = document.getElementById('topbar');
+  if (!topbar) return;
+  const old = document.getElementById('role-user-badge');
+  if (old) old.remove();
+  const roleColor = currentSession.role === 'admin' ? 'var(--accent)' : 'var(--green)';
+  const badge = document.createElement('span');
+  badge.id = 'role-user-badge';
+  badge.style.cssText = 'background:rgba(91,141,238,.14);border:1px solid rgba(91,141,238,.3);border-radius:8px;padding:3px 10px;font-size:11px;font-weight:700;color:'+roleColor+';cursor:default;user-select:none;white-space:nowrap;';
+  badge.title = currentSession.email;
+  badge.textContent = (currentSession.nickname || currentSession.email) + ' · ' + currentSession.role.charAt(0).toUpperCase() + currentSession.role.slice(1);
+  const btnArea = topbar.querySelector('[style*="display:flex;align-items:center;gap:10px;"]');
+  if (btnArea) btnArea.insertBefore(badge, btnArea.firstChild);
+}
+
+// ── Force password change on first login ─────────────────────────────
+function showForcePasswordChange(userData, email) {
+  document.getElementById('content').innerHTML = `
+  <div style="max-width:420px;margin:60px auto;text-align:center">
+    <div style="font-size:48px;margin-bottom:12px">🔑</div>
+    <div class="panel-title" style="margin-bottom:6px">Set Your Password</div>
+    <div style="color:var(--text3);font-size:14px;margin-bottom:24px">Welcome! Please set a new password to continue.</div>
+    <div class="token-box" style="text-align:left">
+      <div class="form-group">
+        <label class="form-label">New Password</label>
+        <input id="fp-new" class="form-input" type="password" placeholder="Min. 6 characters"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Confirm Password</label>
+        <input id="fp-confirm" class="form-input" type="password" placeholder="Repeat password"
+          onkeydown="if(event.key==='Enter')_saveFirstPassword('${esc(email)}','${esc(userData.role)}')"/>
+      </div>
+      <div id="fp-status" style="color:var(--red);font-size:12px;min-height:16px;margin-bottom:8px"></div>
+      <button class="btn btn-primary" style="width:100%;justify-content:center"
+        onclick="_saveFirstPassword('${esc(email)}','${esc(userData.role)}')">Set Password & Continue →</button>
+    </div>
+  </div>`;
+  setTimeout(() => document.getElementById('fp-new')?.focus(), 50);
+}
+
+async function _saveFirstPassword(email, role) {
+  const np = document.getElementById('fp-new').value;
+  const cp = document.getElementById('fp-confirm').value;
+  const st = document.getElementById('fp-status');
+  if (np.length < 6) { st.textContent='❌ Password must be at least 6 characters.'; return; }
+  if (np !== cp)     { st.textContent='❌ Passwords do not match.'; return; }
+  st.textContent = '⏳ Saving...'; st.style.color='var(--text3)';
+  try {
+    const hashed = await _hashPw(np, email);
+    await _db.collection('appUsers').doc(email).set({ passwordHash: hashed, mustChangePassword: false }, { merge: true });
+    st.textContent = '✅ Password set!'; st.style.color = 'var(--green)';
+    setTimeout(() => _activateRoleSession(role), 800);
+  } catch(e) {
+    st.textContent = '❌ Error: ' + e.message; st.style.color = 'var(--red)';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  REGISTRATION LINK — send invite (superadmin or admin can use)
+// ══════════════════════════════════════════════════════════════════════
+function showSendRegistrationPanel() {
+  document.getElementById('content').innerHTML = `
+  <div class="panel-title fade-in">📨 Send Registration Link</div>
+  <div class="panel-sub">Invite a new admin or user to join the Task Manager.</div>
+  <div style="max-width:480px;display:flex;flex-direction:column;gap:14px" class="fade-in">
+    <div class="card">
+      <div style="font-weight:700;font-size:15px;color:var(--text);margin-bottom:16px">👤 New Account Details</div>
+      <div class="form-group">
+        <label class="form-label">Email Address</label>
+        <input id="reg-email" class="form-input" type="email" placeholder="newuser@example.com"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Nickname <span style="color:var(--text3);font-size:12px">(display name)</span></label>
+        <input id="reg-nick" class="form-input" type="text" placeholder="e.g. Rahul, Priya"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Role</label>
+        <select id="reg-role" class="form-select">
+          ${adminAuthenticated && !currentSession ? '<option value="admin">Admin</option>' : ''}
+          <option value="user">User</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Temporary Password <span style="color:var(--text3);font-size:12px">(user will change on first login)</span></label>
+        <input id="reg-tempwd" class="form-input" type="text" placeholder="e.g. Welcome@123"/>
+      </div>
+      <div id="reg-status" style="font-size:12px;min-height:16px;margin-bottom:8px"></div>
+      <button class="btn btn-primary" onclick="_sendRegistration()">📨 Create Account & Send Link</button>
+    </div>
+  </div>`;
+}
+
+async function _sendRegistration() {
+  const email  = (document.getElementById('reg-email').value || '').trim().toLowerCase();
+  const nick   = (document.getElementById('reg-nick').value || '').trim();
+  const role   = document.getElementById('reg-role').value;
+  const tempPw = (document.getElementById('reg-tempwd').value || '').trim();
+  const st     = document.getElementById('reg-status');
+
+  if (!email) { st.textContent='❌ Enter an email address.'; st.style.color='var(--red)'; return; }
+  if (!tempPw){ st.textContent='❌ Set a temporary password.'; st.style.color='var(--red)'; return; }
+
+  st.textContent='⏳ Creating account...'; st.style.color='var(--text3)';
+  try {
+    // Check if already exists
+    const existing = await _db.collection('appUsers').doc(email).get();
+    if (existing.exists && existing.data().status !== 'disabled') {
+      st.textContent='❌ An account with this email already exists.'; st.style.color='var(--red)'; return;
+    }
+    const hashed = await _hashPw(tempPw, email);
+    await _db.collection('appUsers').doc(email).set({
+      email, nickname: nick, role,
+      passwordHash: hashed,
+      mustChangePassword: true,
+      status: 'active',
+      createdBy: adminAuthenticated && !currentSession ? 'superadmin' : (currentSession?.email || ''),
+      createdAt: new Date().toISOString(),
+      groupMemberships: []
+    });
+    st.textContent='✅ Account created! Temp password: ' + tempPw; st.style.color='var(--green)';
+    toast('Account created for ' + (nick || email) + '! Share the login link and temp password.', 'var(--green)');
+  } catch(e) {
+    st.textContent='❌ Error: ' + e.message; st.style.color='var(--red)';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  GROUPS — Admin can add team members after access request accepted
+// ══════════════════════════════════════════════════════════════════════
+function showGroupManagementPanel() {
+  // Allow superadmin (adminAuthenticated, no currentSession) and admins
+  const isSA = adminAuthenticated && !currentSession;
+  if (!isSA && (!currentSession || currentSession.role !== 'admin')) {
+    toast('Only admins and Super Admin can manage groups.', 'var(--red)'); return;
+  }
+  const adminEmail = isSA ? 'superadmin' : currentSession.email;
+
+  // Load groups where this admin is owner
+  if (!_fbReady || !_db) { toast('Database not ready.','var(--red)'); return; }
+  _db.collection('groups').where('ownerEmail','==',adminEmail).get().then(snap => {
+    const groups = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    _renderGroupPanel(groups, adminEmail);
+  }).catch(e => toast('Error loading groups: ' + e.message, 'var(--red)'));
+}
+
+function _renderGroupPanel(groups, adminEmail) {
+  const groupCards = groups.length ? groups.map(g => {
+    const members = (g.members || []).map(m =>
+      `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);">
+        <span style="font-size:18px">👤</span>
+        <div><div style="font-size:13px;font-weight:600">${esc(m.nickname||m.email)}</div><div style="font-size:11px;color:var(--text3)">${esc(m.email)}</div></div>
+        <button class="btn btn-danger btn-sm" style="margin-left:auto;font-size:11px" onclick="_removeFromGroup('${esc(g.id)}','${esc(m.email)}')">Remove</button>
+      </div>`
+    ).join('');
+    const pending = (g.pendingRequests || []).map(r =>
+      `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);background:rgba(255,176,32,.05);border-radius:6px;padding:8px;">
+        <span style="font-size:18px">⏳</span>
+        <div><div style="font-size:13px;font-weight:600">${esc(r.nickname||r.email)}</div><div style="font-size:11px;color:var(--text3)">${esc(r.email)} — requested access</div></div>
+        <button class="btn btn-primary btn-sm" style="font-size:11px" onclick="_approveGroupRequest('${esc(g.id)}','${esc(r.email)}')">✅ Accept</button>
+        <button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="_declineGroupRequest('${esc(g.id)}','${esc(r.email)}')">Decline</button>
+      </div>`
+    ).join('');
+    return `<div class="card" style="margin-bottom:12px">
+      <div style="font-weight:700;font-size:15px;margin-bottom:12px">👥 ${esc(g.name)}</div>
+      ${pending ? '<div style="font-size:12px;font-weight:600;color:var(--amber);margin-bottom:6px">⏳ Pending Requests</div>' + pending : ''}
+      <div style="font-size:12px;font-weight:600;color:var(--text2);margin:10px 0 6px">Members</div>
+      ${members || '<div style="font-size:12px;color:var(--text3)">No members yet.</div>'}
+    </div>`;
+  }).join('') : '<div class="card" style="color:var(--text3)">No groups yet. Create one below.</div>';
+
+  document.getElementById('content').innerHTML = `
+  <div class="panel-title fade-in">👥 My Groups</div>
+  <div class="panel-sub">Manage team members in your groups. Members get full access to your account tasks.</div>
+  <div style="max-width:560px;display:flex;flex-direction:column;gap:14px" class="fade-in">
+    ${groupCards}
+    <div class="card">
+      <div style="font-weight:700;font-size:15px;margin-bottom:14px">➕ Create New Group</div>
+      <div class="form-group">
+        <label class="form-label">Group Name</label>
+        <input id="grp-name" class="form-input" placeholder="e.g. Dev Team"/>
+      </div>
+      <div id="grp-status" style="font-size:12px;min-height:16px;margin-bottom:6px"></div>
+      <button class="btn btn-primary" onclick="_createGroup('${esc(adminEmail)}')">Create Group</button>
+    </div>
+    <div class="card">
+      <div style="font-weight:700;font-size:15px;margin-bottom:14px">📨 Send Group Access Request</div>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:12px">Send a request to a user asking them to join your group. They must accept before you can add them.</div>
+      <div class="form-group">
+        <label class="form-label">User Email</label>
+        <input id="grp-invite-email" class="form-input" type="email" placeholder="user@example.com"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Group</label>
+        <select id="grp-invite-group" class="form-select">
+          ${groups.map(g=>`<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('') || '<option>No groups yet</option>'}
+        </select>
+      </div>
+      <div id="grp-invite-status" style="font-size:12px;min-height:16px;margin-bottom:6px"></div>
+      <button class="btn btn-primary" onclick="_sendGroupRequest('${esc(adminEmail)}')">📨 Send Access Request</button>
+    </div>
+  </div>`;
+}
+
+async function _createGroup(adminEmail) {
+  const name = (document.getElementById('grp-name').value || '').trim();
+  const st   = document.getElementById('grp-status');
+  if (!name) { st.textContent='❌ Enter a group name.'; st.style.color='var(--red)'; return; }
+  st.textContent='⏳ Creating...'; st.style.color='var(--text3)';
+  try {
+    await _db.collection('groups').add({
+      name, ownerEmail: adminEmail, members: [], pendingRequests: [],
+      createdAt: new Date().toISOString()
+    });
+    toast('Group "' + name + '" created!', 'var(--green)');
+    showGroupManagementPanel();
+  } catch(e) { st.textContent='❌ ' + e.message; st.style.color='var(--red)'; }
+}
+
+async function _sendGroupRequest(adminEmail) {
+  const userEmail = (document.getElementById('grp-invite-email').value || '').trim().toLowerCase();
+  const groupId   = document.getElementById('grp-invite-group').value;
+  const st        = document.getElementById('grp-invite-status');
+  if (!userEmail) { st.textContent='❌ Enter a user email.'; st.style.color='var(--red)'; return; }
+  st.textContent='⏳ Sending request...'; st.style.color='var(--text3)';
+  try {
+    const userSnap = await _db.collection('appUsers').doc(userEmail).get();
+    if (!userSnap.exists) { st.textContent='❌ User not found.'; st.style.color='var(--red)'; return; }
+    const userData = userSnap.data();
+    // Add to group pendingRequests
+    const grpRef = _db.collection('groups').doc(groupId);
+    const grpSnap = await grpRef.get();
+    const existing = (grpSnap.data().pendingRequests || []);
+    if (existing.find(r => r.email === userEmail)) { st.textContent='⚠ Request already sent.'; st.style.color='var(--amber)'; return; }
+    await grpRef.set({
+      pendingRequests: [...existing, { email: userEmail, nickname: userData.nickname || '', requestedAt: new Date().toISOString() }]
+    }, { merge: true });
+    // Also notify the user via their pendingGroupInvites
+    await _db.collection('appUsers').doc(userEmail).set({
+      pendingGroupInvites: firebase.firestore.FieldValue.arrayUnion({ groupId, groupName: grpSnap.data().name, adminEmail, sentAt: new Date().toISOString() })
+    }, { merge: true });
+    st.textContent='✅ Access request sent to ' + userEmail; st.style.color='var(--green)';
+    toast('Access request sent!', 'var(--green)');
+  } catch(e) { st.textContent='❌ ' + e.message; st.style.color='var(--red)'; }
+}
+
+async function _approveGroupRequest(groupId, userEmail) {
+  try {
+    const grpRef  = _db.collection('groups').doc(groupId);
+    const grpSnap = await grpRef.get();
+    const g       = grpSnap.data();
+    const req     = (g.pendingRequests || []).find(r => r.email === userEmail);
+    if (!req) { toast('Request not found.','var(--amber)'); return; }
+    const newPending = (g.pendingRequests || []).filter(r => r.email !== userEmail);
+    const newMembers = [...(g.members || []), { email: userEmail, nickname: req.nickname, joinedAt: new Date().toISOString() }];
+    await grpRef.set({ pendingRequests: newPending, members: newMembers }, { merge: true });
+    // Update user's groupMemberships
+    await _db.collection('appUsers').doc(userEmail).set({
+      groupMemberships: firebase.firestore.FieldValue.arrayUnion(groupId),
+      pendingGroupInvites: (await _db.collection('appUsers').doc(userEmail).get()).data().pendingGroupInvites?.filter(i => i.groupId !== groupId) || []
+    }, { merge: true });
+    toast('✅ ' + userEmail + ' added to group!', 'var(--green)');
+    showGroupManagementPanel();
+  } catch(e) { toast('Error: ' + e.message, 'var(--red)'); }
+}
+
+async function _declineGroupRequest(groupId, userEmail) {
+  try {
+    const grpRef  = _db.collection('groups').doc(groupId);
+    const grpSnap = await grpRef.get();
+    const g       = grpSnap.data();
+    const newPending = (g.pendingRequests || []).filter(r => r.email !== userEmail);
+    await grpRef.set({ pendingRequests: newPending }, { merge: true });
+    toast('Request declined.', 'var(--amber)');
+    showGroupManagementPanel();
+  } catch(e) { toast('Error: ' + e.message, 'var(--red)'); }
+}
+
+async function _removeFromGroup(groupId, userEmail) {
+  if (!confirm('Remove ' + userEmail + ' from this group?')) return;
+  try {
+    const grpRef  = _db.collection('groups').doc(groupId);
+    const grpSnap = await grpRef.get();
+    const g       = grpSnap.data();
+    const newMembers = (g.members || []).filter(m => m.email !== userEmail);
+    await grpRef.set({ members: newMembers }, { merge: true });
+    await _db.collection('appUsers').doc(userEmail).set({
+      groupMemberships: firebase.firestore.FieldValue.arrayRemove(groupId)
+    }, { merge: true });
+    toast('Member removed.', 'var(--amber)');
+    showGroupManagementPanel();
+  } catch(e) { toast('Error: ' + e.message, 'var(--red)'); }
+}
+
+// ── User: view own pending group invites and accept ───────────────────
+async function showMyGroupInvites() {
+  if (!currentSession) return;
+  const email = currentSession.email;
+  const snap  = await _db.collection('appUsers').doc(email).get();
+  const invites = snap.data().pendingGroupInvites || [];
+  if (!invites.length) { toast('No pending group invitations.', 'var(--text3)'); return; }
+  const html = invites.map(inv => `
+    <div class="card" style="margin-bottom:10px;display:flex;align-items:center;gap:12px">
+      <div style="flex:1">
+        <div style="font-weight:700">${esc(inv.groupName || inv.groupId)}</div>
+        <div style="font-size:12px;color:var(--text3)">Invitation from ${esc(inv.adminEmail)}</div>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="_acceptGroupInvite('${esc(inv.groupId)}','${esc(email)}')">✅ Accept</button>
+      <button class="btn btn-ghost btn-sm" onclick="_declineGroupInviteUser('${esc(inv.groupId)}','${esc(email)}')">Decline</button>
+    </div>`).join('');
+  document.getElementById('content').innerHTML = `
+    <div class="panel-title fade-in">📬 Group Invitations</div>
+    <div class="panel-sub">Admins have sent you access requests to join their groups.</div>
+    <div style="max-width:520px" class="fade-in">${html}</div>`;
+}
+
+async function _acceptGroupInvite(groupId, userEmail) {
+  try {
+    const grpRef  = _db.collection('groups').doc(groupId);
+    const grpSnap = await grpRef.get();
+    const g       = grpSnap.data();
+    const req     = (g.pendingRequests || []).find(r => r.email === userEmail);
+    const newPending = (g.pendingRequests || []).filter(r => r.email !== userEmail);
+    const newMembers = [...(g.members || []), { email: userEmail, nickname: currentSession.nickname || '', joinedAt: new Date().toISOString() }];
+    await grpRef.set({ pendingRequests: newPending, members: newMembers }, { merge: true });
+    const userSnap = await _db.collection('appUsers').doc(userEmail).get();
+    const remaining = (userSnap.data().pendingGroupInvites || []).filter(i => i.groupId !== groupId);
+    await _db.collection('appUsers').doc(userEmail).set({
+      groupMemberships: firebase.firestore.FieldValue.arrayUnion(groupId),
+      pendingGroupInvites: remaining
+    }, { merge: true });
+    toast('✅ Joined group: ' + (g.name || groupId), 'var(--green)');
+    showMyGroupInvites();
+  } catch(e) { toast('Error: ' + e.message, 'var(--red)'); }
+}
+
+async function _declineGroupInviteUser(groupId, userEmail) {
+  try {
+    const grpRef  = _db.collection('groups').doc(groupId);
+    const newPending = ((await grpRef.get()).data().pendingRequests || []).filter(r => r.email !== userEmail);
+    await grpRef.set({ pendingRequests: newPending }, { merge: true });
+    const userSnap = await _db.collection('appUsers').doc(userEmail).get();
+    const remaining = (userSnap.data().pendingGroupInvites || []).filter(i => i.groupId !== groupId);
+    await _db.collection('appUsers').doc(userEmail).set({ pendingGroupInvites: remaining }, { merge: true });
+    toast('Invitation declined.', 'var(--amber)');
+    showMyGroupInvites();
+  } catch(e) { toast('Error: ' + e.message, 'var(--red)'); }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  CHANGE PASSWORD — for admin and user roles
+// ══════════════════════════════════════════════════════════════════════
+function showChangePasswordPanel() {
+  // Superadmin uses the existing admin password change flow in Settings
+  if (!currentSession && adminAuthenticated) {
+    showPanel('settings');
+    setTimeout(() => {
+      const el = document.querySelector('.card [id="pwd-current"]');
+      if (el) el.scrollIntoView({ behavior: 'smooth' });
+    }, 300);
+    return;
+  }
+  if (!currentSession) return;
+  const email = currentSession.email;
+  const name  = getSessionNick();
+  document.getElementById('content').innerHTML = `
+  <div class="panel-title fade-in">🔑 Change Password</div>
+  <div class="panel-sub">Update your password for account security.</div>
+  <div style="max-width:420px" class="fade-in">
+    <div class="card">
+      <div style="font-weight:700;font-size:15px;margin-bottom:16px">Account: ${esc(name)} <span style="color:var(--text3);font-size:12px">(${esc(email)})</span></div>
+      <div class="form-group"><label class="form-label">Current Password</label><input type="password" id="cp-current" class="form-input" placeholder="••••••••"/></div>
+      <div class="form-group"><label class="form-label">New Password</label><input type="password" id="cp-new" class="form-input" placeholder="Min. 6 characters"/></div>
+      <div class="form-group"><label class="form-label">Confirm New Password</label><input type="password" id="cp-confirm" class="form-input" placeholder="Repeat new password"/></div>
+      <div id="cp-status" style="font-size:12px;margin-bottom:10px;min-height:16px"></div>
+      <button class="btn btn-primary" onclick="_changeRolePassword('${esc(email)}')">Update Password</button>
+    </div>
+  </div>`;
+}
+
+async function _changeRolePassword(email) {
+  const cur = document.getElementById('cp-current').value;
+  const np  = document.getElementById('cp-new').value;
+  const cp  = document.getElementById('cp-confirm').value;
+  const st  = document.getElementById('cp-status');
+
+  if (!cur) { st.textContent='❌ Enter current password.'; st.style.color='var(--red)'; return; }
+  if (np.length < 6) { st.textContent='❌ New password must be at least 6 characters.'; st.style.color='var(--red)'; return; }
+  if (np !== cp) { st.textContent='❌ Passwords do not match.'; st.style.color='var(--red)'; return; }
+
+  st.textContent='⏳ Verifying...'; st.style.color='var(--text3)';
+  try {
+    const snap = await _db.collection('appUsers').doc(email).get();
+    const stored = snap.data().passwordHash;
+    const ok = await _verifyPw(stored, cur, email);
+    if (!ok) { st.textContent='❌ Current password is incorrect.'; st.style.color='var(--red)'; return; }
+    const hashed = await _hashPw(np, email);
+    await _db.collection('appUsers').doc(email).set({ passwordHash: hashed, mustChangePassword: false }, { merge: true });
+    st.textContent='✅ Password updated successfully!'; st.style.color='var(--green)';
+  } catch(e) { st.textContent='❌ Error: ' + e.message; st.style.color='var(--red)'; }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  USER MANAGEMENT PANEL — for superadmin (Settings) 
+// ══════════════════════════════════════════════════════════════════════
+async function renderUserManagementSection() {
+  if (!_fbReady || !_db) return '<div style="color:var(--text3)">Loading...</div>';
+  try {
+    const snap = await _db.collection('appUsers').get();
+    const users = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (!users.length) return '<div style="color:var(--text3);font-size:13px">No accounts yet. Send a registration link to create users.</div>';
+    return users.map(u => `
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">
+        <div style="width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--purple));display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff;flex-shrink:0;">${esc((u.nickname||u.email||'?')[0].toUpperCase())}</div>
+        <div style="flex:1;min-width:0;">
+          <div style="font-weight:600;font-size:13px">${esc(u.nickname||'—')} <span style="background:rgba(91,141,238,.15);color:var(--accent);border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">${esc(u.role||'user')}</span></div>
+          <div style="font-size:11px;color:var(--text3)">${esc(u.email)}</div>
+        </div>
+        <div style="font-size:11px;color:${u.status==='active'?'var(--green)':'var(--amber)'};">${esc(u.status||'active')}</div>
+        <button class="btn btn-danger btn-sm" style="font-size:11px" onclick="_disableAppUser('${esc(u.email)}')">Disable</button>
+      </div>`).join('');
+  } catch(e) { return '<div style="color:var(--red)">Error: ' + e.message + '</div>'; }
+}
+
+async function _disableAppUser(email) {
+  if (!confirm('Disable account for ' + email + '?')) return;
+  try {
+    await _db.collection('appUsers').doc(email).set({ status: 'disabled' }, { merge: true });
+    toast('Account disabled for ' + email, 'var(--amber)');
+    showPanel('settings');
+  } catch(e) { toast('Error: ' + e.message, 'var(--red)'); }
+}
+
+
 async function adminLogin(){
   const entered = document.getElementById('admin-pwd-input').value||'';
   const err = document.getElementById('admin-login-error');
@@ -5295,7 +5925,10 @@ async function adminLogin(){
     document.getElementById('btn-export').style.display = 'flex';
     const sidebarBottom = document.querySelector('.sidebar-bottom');
     if(sidebarBottom){ sidebarBottom.style.display = ''; sidebarBottom.style.visibility = ''; }
-    toast('Welcome back, Admin! 👋');
+    // Super admin sees settings + group/password management
+    _setSettingsNavVisible(true);
+    _injectRoleNavItems('superadmin');
+    toast('Welcome back, Super Admin! 👋');
     showPanel('dashboard');
   };
   const _DEFAULT_PWD = 'poly@123';
@@ -5316,12 +5949,17 @@ async function adminLogin(){
 
 // ── Logout ────────────────────────────────────────────────────────────
 function handleLogout(){
+  // Clear role session on any logout
+  currentSession = null;
+  const roleBadge = document.getElementById('role-user-badge');
+  if(roleBadge) roleBadge.remove();
+  const roleNav = document.getElementById('role-nav-items');
+  if(roleNav) roleNav.innerHTML = '';
   if(mode==='user'){
     if(!confirm('Log out?'))return;
     userEmail='';
     userTask=null;
     // Keep mode as 'user' — do NOT switch to admin after user logout
-    // This prevents any path to the admin login screen from the user session
     const uInfo=document.getElementById('topbar-user-info');
     const avatar=document.getElementById('topbar-avatar');
     if(uInfo) uInfo.style.display='none';
