@@ -1992,39 +1992,11 @@ function _renderDashCharts(_dashTasks){
 //  DASHBOARD
 // ═══════════════════════════════════════════════════════════════════════
 
-// ── Build single-click Plant filter tabs ──────────────────────────────
+// ── Plant filter tabs — hidden (replaced by team/role scoping) ─────────
 function _buildDashPlantTabs(){
   const row = document.getElementById('dash-plant-row');
-  if(!row) return;
-  // A plant admin already only ever sees their own plant (via getScopedTasks),
-  // so the extra filter row would be redundant — hide it for that session.
-  if(plantOwnerAuthenticated && currentPlantSession){
-    row.style.display='none';
-    return;
-  }
-  const groups = getPlantGroups();
-  if(!groups.length){
-    row.style.display='none';
-    return;
-  }
-  row.style.display='';
-  // clear except the label
-  while(row.children.length > 1) row.removeChild(row.lastChild);
-
-  const allTab = document.createElement('button');
-  allTab.className = 'dash-tab' + (dashPlantFilter==='All' ? ' active' : '');
-  allTab.textContent = 'All Plants';
-  allTab.onclick = () => { dashPlantFilter='All'; dashYearFilter='All'; dashMonthFilter='All'; _rebuildDashStats(); };
-  row.appendChild(allTab);
-
-  groups.forEach(p=>{
-    const btn = document.createElement('button');
-    btn.className = 'dash-tab' + (dashPlantFilter===p.id ? ' active' : '');
-    btn.textContent = '🏭 ' + p.name;
-    btn.title = p.name;
-    btn.onclick = () => { dashPlantFilter=p.id; dashYearFilter='All'; dashMonthFilter='All'; _rebuildDashStats(); };
-    row.appendChild(btn);
-  });
+  if(row){ row.style.display='none'; }
+  dashPlantFilter='All';
 }
 
 // ── Build year/month single-click filter tabs ────────────────────────
@@ -2399,6 +2371,20 @@ function renderDashboard(){
 // ═══════════════════════════════════════════════════════════════════════
 function getPlantGroups(){
   try{ return JSON.parse(localStorage.getItem('pg_plants')||'[]'); }catch(e){return [];}
+}
+
+// ── Ensure appUsers loaded for assignee dropdown ─────────────────────
+// _allAppUsers is normally loaded in renderUserManagementSection (Settings).
+// For admin/user roles that don't visit Settings, load it here on demand.
+async function _ensureAppUsersLoaded() {
+  if (_allAppUsers && _allAppUsers.length) return; // already loaded
+  if (!_fbReady || !_db) return;
+  try {
+    const snap = await _db.collection('appUsers').orderBy('email').limit(250).get();
+    _allAppUsers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Also fill nickname cache
+    _allAppUsers.forEach(u => { if(u.email && u.nickname) _nickCache[u.email.toLowerCase()] = u.nickname; });
+  } catch(e) { console.warn('[Role] Could not load appUsers:', e.message); }
 }
 
 // ── Nickname cache: email → nickname ──────────────────────────────────
@@ -5179,32 +5165,10 @@ function getDashScopedTasks(){
 function _buildFilterTabs(prefix, getBaseTasksFn, rerenderFn){
   const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
-  // ── Plant row ──
+  // ── Plant row — always hidden (plant tabs removed) ──
   const pRow = document.getElementById(prefix+'-plant-row');
-  if(pRow){
-    const groups = getPlantGroups();
-    if((plantOwnerAuthenticated && currentPlantSession) || !groups.length){
-      pRow.style.display='none';
-    } else {
-      pRow.style.display='';
-      while(pRow.children.length > 1) pRow.removeChild(pRow.lastChild);
-
-      const allTab = document.createElement('button');
-      allTab.className = 'dash-tab' + (dashPlantFilter==='All' ? ' active' : '');
-      allTab.textContent = 'All Plants';
-      allTab.onclick = () => { dashPlantFilter='All'; dashYearFilter='All'; dashMonthFilter='All'; rerenderFn(); };
-      pRow.appendChild(allTab);
-
-      groups.forEach(p=>{
-        const btn = document.createElement('button');
-        btn.className = 'dash-tab' + (dashPlantFilter===p.id ? ' active' : '');
-        btn.textContent = '🏭 ' + getPlantLabel(p);
-        btn.title = p.name + (p.owners&&p.owners.length ? ' — ' + p.owners[0] : '');
-        btn.onclick = () => { dashPlantFilter=p.id; dashYearFilter='All'; dashMonthFilter='All'; rerenderFn(); };
-        pRow.appendChild(btn);
-      });
-    }
-  }
+  if(pRow) pRow.style.display='none';
+  dashPlantFilter='All'; // always show all
 
   // ── Year row ──
   const yRow = document.getElementById(prefix+'-year-row');
@@ -5590,10 +5554,9 @@ function _activateRoleSession(role) {
     document.getElementById('btn-export').style.display = 'flex';
     _setSettingsNavVisible(false);
     _injectRoleNavItems('admin');
-    // Load group members so task scoping works
-    _loadGroupMemberEmails(currentSession.email).then(() => {
-      updateOverdueBadge();
-    });
+    // Load group members so task scoping works + load appUsers for assignee dropdown
+    _loadGroupMemberEmails(currentSession.email).then(() => { updateOverdueBadge(); });
+    _ensureAppUsersLoaded();
     toast('Welcome, ' + getSessionNick() + '! (Admin) 👋');
     showPanel('dashboard');
   } else if (role === 'user') {
@@ -5601,6 +5564,8 @@ function _activateRoleSession(role) {
     document.getElementById('btn-new-task').style.display = 'flex';
     _setSettingsNavVisible(false);
     _injectRoleNavItems('user');
+    // Load appUsers so assignee dropdown works
+    _ensureAppUsersLoaded();
     toast('Welcome, ' + getSessionNick() + '! 👋');
     showPanel('mytasks');
   }
@@ -7231,18 +7196,24 @@ function openTaskModal(){
     document.getElementById('task-modal-overlay')?.remove();
     const t=editTaskId?getTask(editTaskId):null;
     // If plant owner session: pre-fill assignee from their owners list
-    const plantOwners = plantOwnerAuthenticated && currentPlantSession
-      ? (currentPlantSession.owners||[])
-      : [];
-    const assigneeField = plantOwnerAuthenticated && currentPlantSession
-      ? `<div class="form-group"><label class="form-label">Assign To (Email) *</label>
-          <input id="tm-assignee" class="form-input" type="email" value="${esc(t?t.assignee:'')}" placeholder="anyone@company.com" list="tm-assignee-suggestions"/>
-          <datalist id="tm-assignee-suggestions">
-            ${plantOwners.map(o=>`<option value="${esc(o)}">`).join('')}
-          </datalist>
-          <div style="font-size:11px;color:var(--text3);margin-top:4px">Type any email — plant owner emails are suggested above</div>
-         </div>`
-      : `<div class="form-group"><label class="form-label">Assign To (Email) *</label><input id="tm-assignee" class="form-input" type="email" value="${esc(t?t.assignee:'')}" placeholder="user@company.com"/></div>`;
+    // Build assignee options from appUsers (nicknames shown, emails as values)
+    const _appUserOpts = _allAppUsers && _allAppUsers.length
+      ? _allAppUsers.filter(u => u.status !== 'disabled').map(u =>
+          `<option value="${esc(u.email)}">${esc(u.nickname ? u.nickname + ' (' + u.email + ')' : u.email)}</option>`
+        ).join('')
+      : '';
+    const assigneeField = `<div class="form-group">
+      <label class="form-label">Assign To *</label>
+      <select id="tm-assignee" class="form-select" onchange="(function(s){var c=document.getElementById('tm-assignee-custom');if(c){c.style.display=s.value==='__custom__'?'':'none';if(s.value!=='__custom__')c.value='';};})(this)">
+        <option value="">— Select team member —</option>
+        ${_appUserOpts}
+        <option value="__custom__">✏ Enter email manually…</option>
+      </select>
+      <input id="tm-assignee-custom" class="form-input" type="email" placeholder="manual@email.com"
+        style="margin-top:6px;display:${t && t.assignee && !_allAppUsers.find(u=>u.email===t.assignee) ? '' : 'none'}"
+        value="${esc(t && t.assignee && !_allAppUsers.find(u=>u.email===t.assignee) ? t.assignee : '')}"/>
+      <div style="font-size:11px;color:var(--text3);margin-top:4px">Team members are listed by nickname. Choose "Enter email manually" to assign to anyone.</div>
+    </div>`;
     const html=`
     <div class="modal-overlay" id="task-modal-overlay" onclick="if(event.target===this)closeTaskModal()">
     <div class="modal">
@@ -7282,7 +7253,19 @@ function openTaskModal(){
       </div>
     </div></div>`;
     document.body.insertAdjacentHTML('beforeend',html);
-    setTimeout(()=>document.getElementById('tm-title')?.focus(),50);
+    setTimeout(()=>{
+      document.getElementById('tm-title')?.focus();
+      // Pre-select current task's assignee in dropdown
+      if(t && t.assignee){
+        const sel=document.getElementById('tm-assignee');
+        const custom=document.getElementById('tm-assignee-custom');
+        if(sel){
+          const found=Array.from(sel.options).find(o=>o.value===t.assignee);
+          if(found){ sel.value=t.assignee; }
+          else if(custom){ sel.value='__custom__'; custom.style.display=''; custom.value=t.assignee; }
+        }
+      }
+    },50);
   }catch(err){
     console.error('openTaskModal error:',err);
     toast('Could not open task form: '+err.message,'var(--red)');
@@ -7293,9 +7276,11 @@ function closeTaskModal(){ document.getElementById('task-modal-overlay')?.remove
 
 function saveTask(){
   const title=document.getElementById('tm-title')?.value.trim();
-  const assignee=document.getElementById('tm-assignee')?.value.trim();
+  const assigneeSel=document.getElementById('tm-assignee')?.value.trim();
+  const assigneeCustom=document.getElementById('tm-assignee-custom')?.value.trim();
+  const assignee = assigneeSel==='__custom__' ? assigneeCustom : assigneeSel;
   const due=document.getElementById('tm-due')?.value;
-  if(!title||!assignee||!due){toast('Title, email & due date are required','var(--red)');return;}
+  if(!title||!assignee||!due){toast('Title, assignee & due date are required','var(--red)');return;}
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(assignee)){toast('Please enter a valid email address','var(--red)');return;}
 
   try{
