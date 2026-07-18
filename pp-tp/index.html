@@ -708,8 +708,7 @@
         <div class="nav-item" onclick="showPanel('team')"><span class="nav-icon">👥</span><span>Team</span></div>
       </div>
       <div id="role-nav-items"><!-- injected for admin/user roles --></div>
-      <div class="nav-section">🏭 Plants</div>
-      <div id="plant-nav-items"><!-- rendered by renderPlantNav() --></div>
+      <div id="plant-nav-items" style="display:none"><!-- plant nav hidden --></div>
       <div class="nav-section">Settings</div>
       <div class="nav-item" onclick="showPanel('settings')"><span class="nav-icon">⚙️</span><span>Settings</span></div>
     </div>
@@ -5104,11 +5103,13 @@ function exitImpersonation(){
 
 // ── Helper: get tasks scoped to current session ───────────────────────
 // ── Role-aware task scoping ───────────────────────────────────────────
-// Returns the task set the current session is allowed to see:
-//   superadmin (adminAuthenticated, no currentSession) → all tasks
-//   admin (currentSession.role==='admin')              → own tasks + group members' tasks
-//   user  (currentSession.role==='user')               → own tasks only (assigned to them)
-//   plantOwner                                          → plant-scoped tasks (unchanged)
+// getScopedTasks() → "All Tasks" tab: tasks assigned BY or TO current user
+// getMyTasks()     → "My Tasks" tab:  tasks assigned TO current user only
+function _getSessionEmail() {
+  if (currentSession) return currentSession.email.toLowerCase();
+  return '';
+}
+
 function getScopedTasks(){
   // Plant owner path — unchanged
   if(plantOwnerAuthenticated && currentPlantSession){
@@ -5122,22 +5123,29 @@ function getScopedTasks(){
   // Superadmin — sees everything
   if(adminAuthenticated && !currentSession) return tasks;
 
-  // Admin role — own tasks + tasks of group members
-  if(currentSession && currentSession.role === 'admin'){
-    const adminEmail = currentSession.email.toLowerCase();
-    // Get group member emails from cached _myGroupMemberEmails (populated on login)
-    const memberEmails = (_myGroupMemberEmails || []).map(e=>e.toLowerCase());
-    const allowed = new Set([adminEmail, ...memberEmails]);
-    return tasks.filter(t => allowed.has((t.assignee||'').toLowerCase()));
+  // Admin / User — All Tasks = assigned BY me OR assigned TO me
+  if(currentSession){
+    const me = currentSession.email.toLowerCase();
+    return tasks.filter(t =>
+      (t.assignee||'').toLowerCase() === me ||
+      (t.assignedBy||'').toLowerCase() === me
+    );
   }
 
-  // User role — own tasks only
-  if(currentSession && currentSession.role === 'user'){
-    const userEmail = currentSession.email.toLowerCase();
-    return tasks.filter(t => (t.assignee||'').toLowerCase() === userEmail);
-  }
+  return tasks;
+}
 
-  // Fallback — all tasks (dev mode / legacy)
+// "My Tasks" tab — only tasks assigned TO the current user
+function getMyOwnTasks(){
+  if(plantOwnerAuthenticated && currentPlantSession){
+    const owners = (currentPlantSession.owners||[]).map(o=>o.toLowerCase());
+    return tasks.filter(t => owners.includes((t.assignee||'').toLowerCase()));
+  }
+  if(adminAuthenticated && !currentSession) return tasks; // superadmin: My Tasks = all
+  if(currentSession){
+    const me = currentSession.email.toLowerCase();
+    return tasks.filter(t => (t.assignee||'').toLowerCase() === me);
+  }
   return tasks;
 }
 
@@ -7545,17 +7553,20 @@ function renderMyTasks(){
     return;
   }
 
-  const selfEmail=mode==='user'?(userEmail||''):(localStorage.getItem('self_email')||'');
-  const selfName=mode==='user'?(userEmail||'Me'):(localStorage.getItem('self_name')||'Admin');
+  // Use currentSession email for role-based logins; fall back to legacy modes
+  const selfEmail = currentSession ? currentSession.email
+    : mode==='user' ? (userEmail||'')
+    : (localStorage.getItem('self_email')||'');
+  const selfName = currentSession ? (currentSession.nickname || currentSession.email)
+    : mode==='user' ? (userEmail||'Me')
+    : (localStorage.getItem('self_name')||'Admin');
 
-  // If admin hasn't set identity yet, show ONLY the identity form — no confusing 0-task counts
-  if(mode==='admin'&&!selfEmail){
+  // If no identity (legacy superadmin without session) show identity form
+  if(!selfEmail && !currentSession && mode==='admin'){
     c.innerHTML=`
     <div style="font-family:var(--font-head);font-size:22px;font-weight:700;color:var(--text);margin-bottom:4px;">My Tasks</div>
-    <div style="font-size:13px;color:var(--text3);margin-bottom:22px;">Tasks assigned to you — create and track without needing an email address.</div>
     <div style="max-width:480px;background:var(--card);border:1px solid var(--accent);border-radius:12px;padding:24px;">
-      <div style="font-size:15px;font-weight:700;color:var(--text);margin-bottom:6px;">🔑 Set your identity to use My Tasks</div>
-      <div style="font-size:13px;color:var(--text3);margin-bottom:16px;">Your email is used to filter tasks assigned to you. This is stored locally — no account needed.</div>
+      <div style="font-size:15px;font-weight:700;color:var(--text);margin-bottom:6px;">🔑 Set your identity</div>
       <div class="form-row" style="margin-bottom:14px;">
         <div class="form-group"><label class="form-label">Your Name</label>
           <input id="self-name-inp" class="form-input" placeholder="e.g. Kapil Gupta"/></div>
@@ -7567,12 +7578,12 @@ function renderMyTasks(){
     return;
   }
 
-  const myT=_filterByDashPlant(tasks.filter(t=>t.assignee.toLowerCase()===(selfEmail||'').toLowerCase())).filter(t=>{
+  // My Tasks = ONLY tasks assigned TO me (not tasks I assigned to others)
+  const myT = getMyOwnTasks().filter(t=>{
     if(dashYearFilter!=='All' && (!t.due||t.due.slice(0,4)!==dashYearFilter)) return false;
     if(dashMonthFilter!=='All' && (!t.due||t.due.slice(5,7)!==dashMonthFilter)) return false;
     return true;
   });
-  const todo=myT.filter(t=>t.status==='To Do');
   const inprog=myT.filter(t=>t.status==='In Progress');
   const review=myT.filter(t=>t.status==='Review');
   const done=myT.filter(t=>t.status==='Done');
@@ -7591,7 +7602,7 @@ function renderMyTasks(){
     </div>
   </div>
 
-  ${mode==='admin'?`
+  ${(!currentSession && mode==='admin')?`
   <div style="background:rgba(91,141,238,.07);border:1px solid var(--border2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:var(--text2);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
     <span>Identity: <strong style="color:var(--text)">${selfName}</strong> &lt;${selfEmail}&gt;</span>
     <button class="btn btn-ghost btn-sm" onclick="localStorage.removeItem('self_email');localStorage.removeItem('self_name');renderMyTasks()">Change Identity</button>
@@ -7617,7 +7628,7 @@ function renderMyTasks(){
   <input id="mytasks-assignedby-search" class="form-input" type="text" placeholder="🗂 Search by who assigned it — email…" value="" oninput="handleMyTasksAssignedBySearch(this.value)" style="max-width:340px;margin-bottom:14px;"/>
   <div id="my-task-list"></div>`;
 
-  _buildFilterTabs('mytasks', ()=>tasks.filter(t=>t.assignee.toLowerCase()===(selfEmail||'').toLowerCase()), renderMyTasks);
+  _buildFilterTabs('mytasks', ()=>getMyOwnTasks(), renderMyTasks);
   renderMyTaskList(selfEmail, 'all');
 }
 
@@ -7628,7 +7639,9 @@ function filterMyTasks(filter){
   if(plantOwnerAuthenticated && currentPlantSession){
     selfEmail = (currentPlantSession.owners||[])[0] || '';
   } else {
-    selfEmail = mode==='user' ? (userEmail||'') : (localStorage.getItem('self_email')||'');
+    selfEmail = currentSession ? currentSession.email
+      : mode==='user' ? (userEmail||'')
+      : (localStorage.getItem('self_email')||'');
   }
   // Update the filter label pill
   const lbl = document.getElementById('mytasks-filter-label');
@@ -7656,7 +7669,9 @@ function handleMyTasksAssignedBySearch(val){
   if(plantOwnerAuthenticated && currentPlantSession){
     selfEmail = (currentPlantSession.owners||[])[0] || '';
   } else {
-    selfEmail = mode==='user' ? (userEmail||'') : (localStorage.getItem('self_email')||'');
+    selfEmail = currentSession ? currentSession.email
+      : mode==='user' ? (userEmail||'')
+      : (localStorage.getItem('self_email')||'');
   }
   renderMyTaskList(selfEmail, myTasksFilter);
 }
