@@ -5220,19 +5220,27 @@ function showAdminPasswordOverlay(){
       text-align:center;
     ">
       <div style="font-size:48px;margin-bottom:14px">🔐</div>
-      <div style="font-family:var(--font-head);font-weight:800;font-size:20px;color:var(--text);margin-bottom:6px">Admin Access</div>
-      <div style="color:var(--text3);font-size:13px;margin-bottom:24px">Enter your password to continue</div>
+      <div style="font-family:var(--font-head);font-weight:800;font-size:20px;color:var(--text);margin-bottom:6px">Welcome Back</div>
+      <div style="color:var(--text3);font-size:13px;margin-bottom:24px">Sign in to your Task Manager account</div>
+      <div style="text-align:left;margin-bottom:10px">
+        <label class="form-label">Email Address</label>
+        <input id="overlay-email-input" class="form-input" type="email"
+          placeholder="you@example.com"
+          onkeydown="if(event.key==='Enter')document.getElementById('overlay-pwd-input')?.focus()"
+          style="font-size:15px;padding:12px 14px;"
+        />
+      </div>
       <div style="text-align:left;margin-bottom:12px">
         <label class="form-label">Password</label>
         <input id="overlay-pwd-input" class="form-input" type="password"
-          placeholder="Enter admin password"
+          placeholder="Enter your password"
           onkeydown="if(event.key==='Enter')overlayAdminLogin()"
           style="font-size:15px;padding:12px 14px;"
         />
       </div>
-      <div id="overlay-login-error" style="color:var(--red);font-size:13px;margin-bottom:12px;display:none">❌ Incorrect password. Try again.</div>
+      <div id="overlay-login-error" style="color:var(--red);font-size:13px;margin-bottom:12px;display:none">❌ Incorrect credentials.</div>
       <button class="btn btn-primary" style="width:100%;justify-content:center;font-size:15px;padding:12px 20px;margin-bottom:10px" onclick="overlayAdminLogin()">
-        🔓 Login
+        🔓 Sign In
       </button>
       <div style="text-align:center;font-size:12px;color:var(--text3);margin:8px 0">— or —</div>
       <button class="btn btn-ghost" style="width:100%;justify-content:center" onclick="document.getElementById('admin-pwd-overlay').remove();showPlantOwnerLoginScreen()">
@@ -5241,66 +5249,123 @@ function showAdminPasswordOverlay(){
     </div>`;
 
   document.body.appendChild(overlay);
-  setTimeout(()=>document.getElementById('overlay-pwd-input')?.focus(), 80);
+  setTimeout(()=>document.getElementById('overlay-email-input')?.focus(), 80);
 }
 
 async function overlayAdminLogin(){
+  const email   = (document.getElementById('overlay-email-input')?.value || '').trim().toLowerCase();
   const entered = document.getElementById('overlay-pwd-input')?.value || '';
-  const err = document.getElementById('overlay-login-error');
+  const err     = document.getElementById('overlay-login-error');
 
-  const bf = await _bfCheck('admin');
-  if(bf.locked){
-    if(err){err.textContent='⏳ Locked for '+bf.remaining+' minute(s).';err.style.display='block';}
+  if (!email)   { if(err){err.textContent='❌ Enter your email address.';err.style.display='block';} return; }
+  if (!entered) { if(err){err.textContent='❌ Enter your password.';err.style.display='block';} return; }
+
+  // ── Check if superadmin email ──────────────────────────────────────
+  const adminDoc = _fbReady && _db ? await _db.collection('settings').doc('admin').get().catch(()=>null) : null;
+  const superAdminEmail = (adminDoc?.data()?.superAdminEmail || 'admin@polyplastics.com').toLowerCase();
+
+  if (email === superAdminEmail) {
+    // Superadmin path — check against settings/admin password
+    const bf = await _bfCheck('admin');
+    if(bf.locked){
+      if(err){err.textContent='⏳ Locked for '+bf.remaining+' minute(s).';err.style.display='block';}
+      return;
+    }
+    const _DEFAULT_PWD = 'poly@123';
+    const _doSuperLogin = async (stored) => {
+      if(stored && !/^[0-9a-f]{64}$/.test(stored)){
+        const hashed=await _hashPw(stored,'admin');
+        localStorage.setItem('admin_password',hashed);
+        if(_fbReady&&_db) _db.collection('settings').doc('admin').set({password:hashed},{merge:true}).catch(()=>{});
+        stored=hashed;
+      }
+      const ok = await _verifyPw(stored, entered, 'admin');
+      if(!ok){
+        await _bfRecord('admin',false);
+        const bfA=await _bfCheck('admin');
+        if(err){
+          if(bfA.locked) err.textContent='⏳ Too many failed attempts. Locked for '+bfA.remaining+' minute(s).';
+          else { const rem=_BF_MAX-(bfA.attempts||0); err.textContent='❌ Incorrect password.'+(rem>0&&rem<_BF_MAX?' '+rem+' attempt(s) left.':''); }
+          err.style.display='block';
+        }
+        const inp=document.getElementById('overlay-pwd-input'); if(inp) inp.value='';
+        return;
+      }
+      await _bfRecord('admin',true);
+      const licOK = await _requireSuperAdminLicense();
+      if (!licOK) {
+        if(err){err.textContent='❌ Super Admin access requires a valid license key.';err.style.display='block';}
+        const inp2=document.getElementById('overlay-pwd-input'); if(inp2) inp2.value='';
+        return;
+      }
+      currentSession = null;
+      adminAuthenticated = true;
+      localStorage.setItem('admin_password', stored);
+      const overlay = document.getElementById('admin-pwd-overlay');
+      if(overlay) overlay.remove();
+      _setSettingsNavVisible(true);
+      _injectRoleNavItems('superadmin');
+      toast('Welcome back, Super Admin! 👋');
+      showPanel('dashboard');
+    };
+    if(_fbReady && _db){
+      _db.collection('settings').doc('admin').get()
+        .then(async d=>{ let s=(d.exists&&d.data().password)?d.data().password:(localStorage.getItem('admin_password')||_DEFAULT_PWD); await _doSuperLogin(s); })
+        .catch(async ()=>_doSuperLogin(localStorage.getItem('admin_password')||_DEFAULT_PWD));
+    } else {
+      await _doSuperLogin(localStorage.getItem('admin_password')||_DEFAULT_PWD);
+    }
     return;
   }
 
-  const _doLogin = async (stored) => {
-    if(stored && !/^[0-9a-f]{64}$/.test(stored)){
-      const hashed=await _hashPw(stored,'admin');
-      localStorage.setItem('admin_password',hashed);
-      if(_fbReady&&_db) _db.collection('settings').doc('admin').set({password:hashed},{merge:true}).catch(()=>{});
-      stored=hashed;
+  // ── Admin / User path — check appUsers collection ──────────────────
+  const bfKey = 'user:' + email;
+  const bf = await _bfCheck(bfKey);
+  if(bf.locked){
+    if(err){err.textContent='⏳ Too many failed attempts. Locked for '+bf.remaining+' minute(s).';err.style.display='block';}
+    return;
+  }
+  if (!_fbReady || !_db) {
+    if(err){err.textContent='❌ Database not ready. Refresh and try again.';err.style.display='block';} return;
+  }
+  try {
+    const snap = await _db.collection('appUsers').doc(email).get();
+    if (!snap.exists) {
+      await _bfRecord(bfKey, false);
+      if(err){err.textContent='❌ Account not found. Contact your admin.';err.style.display='block';} return;
     }
-    const ok = await _verifyPw(stored, entered, 'admin');
-    if(!ok){
-      await _bfRecord('admin',false);
-      const bfA=await _bfCheck('admin');
-      if(err){
-        if(bfA.locked) err.textContent='⏳ Too many failed attempts. Locked for '+bfA.remaining+' minute(s).';
-        else { const rem=_BF_MAX-(bfA.attempts||0); err.textContent='❌ Incorrect password.'+(rem>0&&rem<_BF_MAX?' '+rem+' attempt(s) left.':''); }
-        err.style.display='block';
-      }
+    const u = snap.data();
+    if (u.status === 'pending') { if(err){err.textContent='❌ Account pending. Check your email.';err.style.display='block';} return; }
+    if (u.status === 'disabled') { if(err){err.textContent='❌ Account disabled. Contact Super Admin.';err.style.display='block';} return; }
+
+    const isFirstLogin = u.mustChangePassword === true;
+    const ok = isFirstLogin
+      ? (u.passwordHash === entered) || await _verifyPw(u.passwordHash, entered, email)
+      : await _verifyPw(u.passwordHash, entered, email);
+
+    if (!ok) {
+      await _bfRecord(bfKey, false);
+      const bfA = await _bfCheck(bfKey);
+      const rem = _BF_MAX - (bfA.attempts||0);
+      if(err){err.textContent='❌ Incorrect password.'+(rem>0&&rem<_BF_MAX?' '+rem+' attempt(s) left.':'');err.style.display='block';}
       const inp=document.getElementById('overlay-pwd-input'); if(inp) inp.value='';
       return;
     }
-    await _bfRecord('admin',true);
+
+    await _bfRecord(bfKey, true);
     if(err) err.style.display='none';
-    // ── SUPER ADMIN LICENSE GATE ──────────────────────────────────
-    // Password verified, but Super Admin also needs a valid license key.
-    const licOK = await _requireSuperAdminLicense();
-    if (!licOK) {
-      if (err) {
-        err.textContent = '❌ Super Admin access requires a valid license key.';
-        err.style.display = 'block';
-      }
-      const inp2=document.getElementById('overlay-pwd-input'); if(inp2) inp2.value='';
-      return;
-    }
-    adminAuthenticated = true;
-    localStorage.setItem('admin_password', stored);
+    currentSession = { email: u.email, nickname: u.nickname||'', role: u.role, uid: snap.id };
+
     const overlay = document.getElementById('admin-pwd-overlay');
     if(overlay) overlay.remove();
-    toast('Welcome back, Admin! 👋');
-    showPanel('dashboard');
-  };
-  const _DEFAULT_PWD = 'poly@123';
-  if(_fbReady && _db){
-    _db.collection('settings').doc('admin').get().then(async d=>{
-      let stored = (d.exists && d.data().password) ? d.data().password : (localStorage.getItem('admin_password') || _DEFAULT_PWD);
-      await _doLogin(stored);
-    }).catch(async ()=>await _doLogin(localStorage.getItem('admin_password') || _DEFAULT_PWD));
-  } else {
-    await _doLogin(localStorage.getItem('admin_password') || _DEFAULT_PWD);
+
+    if (isFirstLogin) {
+      showForcePasswordChange(u, email);
+      return;
+    }
+    _activateRoleSession(u.role);
+  } catch(e) {
+    if(err){err.textContent='❌ Login error: '+e.message;err.style.display='block';}
   }
 }
 
