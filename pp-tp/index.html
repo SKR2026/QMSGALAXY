@@ -1043,6 +1043,8 @@ function initFirebaseCore() {
     } else {
       console.warn('⚠ Firebase Storage SDK not loaded — uploads fall back to base64');
     }
+    // Preload nicknames for plant tab labels
+    _preloadNicknames().catch(()=>{});
     // Sign in anonymously so Firestore rules (request.auth != null) pass
     firebase.auth().signInAnonymously()
       .then(() => {
@@ -2397,6 +2399,40 @@ function renderDashboard(){
 // ═══════════════════════════════════════════════════════════════════════
 function getPlantGroups(){
   try{ return JSON.parse(localStorage.getItem('pg_plants')||'[]'); }catch(e){return [];}
+}
+
+// ── Nickname cache: email → nickname ──────────────────────────────────
+const _nickCache = {};
+function getNickForEmail(email) {
+  if (!email) return email;
+  const low = email.toLowerCase();
+  if (_nickCache[low]) return _nickCache[low];
+  // Return email domain part as fallback while loading
+  return email.split('@')[0];
+}
+// Preload nicknames from appUsers into cache
+async function _preloadNicknames() {
+  if (!_fbReady || !_db) return;
+  try {
+    const snap = await _db.collection('appUsers').get();
+    snap.docs.forEach(d => {
+      const data = d.data();
+      if (data.email && data.nickname) {
+        _nickCache[data.email.toLowerCase()] = data.nickname;
+      }
+    });
+  } catch(e) {}
+}
+// Get a display label for a plant group (nickname of first owner, else plant name)
+function getPlantLabel(plant) {
+  const owners = plant.owners || [];
+  if (owners.length > 0) {
+    const nick = _nickCache[owners[0].toLowerCase()];
+    if (nick) return nick;
+    // Fall back to email username part
+    return owners[0].split('@')[0];
+  }
+  return plant.name;
 }
 function savePlantGroups(arr){
   localStorage.setItem('pg_plants', JSON.stringify(arr));
@@ -5079,13 +5115,42 @@ function exitImpersonation(){
 }
 
 // ── Helper: get tasks scoped to current session ───────────────────────
+// ── Role-aware task scoping ───────────────────────────────────────────
+// Returns the task set the current session is allowed to see:
+//   superadmin (adminAuthenticated, no currentSession) → all tasks
+//   admin (currentSession.role==='admin')              → own tasks + group members' tasks
+//   user  (currentSession.role==='user')               → own tasks only (assigned to them)
+//   plantOwner                                          → plant-scoped tasks (unchanged)
 function getScopedTasks(){
-  if(!plantOwnerAuthenticated || !currentPlantSession) return tasks;
-  const owners = (currentPlantSession.owners||[]).map(o=>o.toLowerCase());
-  return tasks.filter(t =>
-    owners.includes((t.assignee||'').toLowerCase()) ||
-    (t.plant && t.plant === currentPlantSession.id)
-  );
+  // Plant owner path — unchanged
+  if(plantOwnerAuthenticated && currentPlantSession){
+    const owners = (currentPlantSession.owners||[]).map(o=>o.toLowerCase());
+    return tasks.filter(t =>
+      owners.includes((t.assignee||'').toLowerCase()) ||
+      (t.plant && t.plant === currentPlantSession.id)
+    );
+  }
+
+  // Superadmin — sees everything
+  if(adminAuthenticated && !currentSession) return tasks;
+
+  // Admin role — own tasks + tasks of group members
+  if(currentSession && currentSession.role === 'admin'){
+    const adminEmail = currentSession.email.toLowerCase();
+    // Get group member emails from cached _myGroupMemberEmails (populated on login)
+    const memberEmails = (_myGroupMemberEmails || []).map(e=>e.toLowerCase());
+    const allowed = new Set([adminEmail, ...memberEmails]);
+    return tasks.filter(t => allowed.has((t.assignee||'').toLowerCase()));
+  }
+
+  // User role — own tasks only
+  if(currentSession && currentSession.role === 'user'){
+    const userEmail = currentSession.email.toLowerCase();
+    return tasks.filter(t => (t.assignee||'').toLowerCase() === userEmail);
+  }
+
+  // Fallback — all tasks (dev mode / legacy)
+  return tasks;
 }
 
 // ── Helper: filter an arbitrary task array by the active dashboard Plant tab ──
@@ -5133,8 +5198,8 @@ function _buildFilterTabs(prefix, getBaseTasksFn, rerenderFn){
       groups.forEach(p=>{
         const btn = document.createElement('button');
         btn.className = 'dash-tab' + (dashPlantFilter===p.id ? ' active' : '');
-        btn.textContent = '🏭 ' + p.name;
-        btn.title = p.name;
+        btn.textContent = '🏭 ' + getPlantLabel(p);
+        btn.title = p.name + (p.owners&&p.owners.length ? ' — ' + p.owners[0] : '');
         btn.onclick = () => { dashPlantFilter=p.id; dashYearFilter='All'; dashMonthFilter='All'; rerenderFn(); };
         pRow.appendChild(btn);
       });
@@ -5495,6 +5560,23 @@ async function _getSettingDoc(docId) {
   } catch(e) { return {}; }
 }
 
+// ── Group member email cache (populated for admin on login) ──────────
+let _myGroupMemberEmails = [];
+
+async function _loadGroupMemberEmails(adminEmail) {
+  _myGroupMemberEmails = [];
+  if (!_fbReady || !_db) return;
+  try {
+    const snap = await _db.collection('groups').where('ownerEmail','==',adminEmail).get();
+    snap.docs.forEach(d => {
+      (d.data().members || []).forEach(m => {
+        if (m.email) _myGroupMemberEmails.push(m.email.toLowerCase());
+      });
+    });
+    console.log('[Role] Admin group members:', _myGroupMemberEmails);
+  } catch(e) { console.warn('[Role] Could not load group members:', e.message); }
+}
+
 // ── Activate role session (called after successful login) ─────────────
 function _activateRoleSession(role) {
   const sidebarBottom = document.querySelector('.sidebar-bottom');
@@ -5508,6 +5590,10 @@ function _activateRoleSession(role) {
     document.getElementById('btn-export').style.display = 'flex';
     _setSettingsNavVisible(false);
     _injectRoleNavItems('admin');
+    // Load group members so task scoping works
+    _loadGroupMemberEmails(currentSession.email).then(() => {
+      updateOverdueBadge();
+    });
     toast('Welcome, ' + getSessionNick() + '! (Admin) 👋');
     showPanel('dashboard');
   } else if (role === 'user') {
