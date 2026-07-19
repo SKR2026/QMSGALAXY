@@ -2732,8 +2732,10 @@ function renderPlantPanel(){
   const done=plantTasks.filter(t=>t.status==='Done').length;
   const inprog=plantTasks.filter(t=>t.status==='In Progress').length;
   const todo=plantTasks.filter(t=>t.status==='To Do').length;
+  const review=plantTasks.filter(t=>t.status==='Review').length;
   const overdue=plantTasks.filter(isOverdue).length;
   const rate=total?Math.round(done/total*100):0;
+  const myTasksCount=(()=>{const me=_getMyTasksScopeEmail();if(!me)return 0;if(plantOwnerAuthenticated&&currentPlantSession){const oe=(currentPlantSession.owners||[]).map(e=>e.toLowerCase());return plantTasks.filter(t=>oe.includes((t.assignee||'').toLowerCase())).length;}return plantTasks.filter(t=>(t.assignee||'').toLowerCase()===me).length;})();
   // reset this panel's search state on every fresh render
   plantTaskAssignedBySearch='';
 
@@ -2755,8 +2757,10 @@ function renderPlantPanel(){
 
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin-bottom:22px;" class="fade-in">
     <div class="stat-card" style="--c:var(--accent);cursor:pointer;" onclick="renderPlantTaskRows('All')" title="View all tasks"><div class="stat-icon">📋</div><div class="stat-value">${total}</div><div class="stat-label">Total Tasks</div></div>
+    <div class="stat-card" style="--c:var(--purple);cursor:pointer;" title="Tasks assigned to plant owner(s)"><div class="stat-icon">👤</div><div class="stat-value">${myTasksCount}</div><div class="stat-label">My Tasks</div></div>
     <div class="stat-card" style="--c:var(--text3);cursor:pointer;" onclick="renderPlantTaskRows('To Do')" title="View To Do tasks"><div class="stat-icon">📝</div><div class="stat-value">${todo}</div><div class="stat-label">To Do</div></div>
     <div class="stat-card" style="--c:var(--purple);cursor:pointer;" onclick="renderPlantTaskRows('In Progress')" title="View In Progress tasks"><div class="stat-icon">⚡</div><div class="stat-value">${inprog}</div><div class="stat-label">In Progress</div></div>
+    <div class="stat-card" style="--c:var(--amber);cursor:pointer;" onclick="renderPlantTaskRows('Review')" title="View In Review tasks"><div class="stat-icon">👁</div><div class="stat-value">${review}</div><div class="stat-label">In Review</div></div>
     <div class="stat-card" style="--c:var(--green);cursor:pointer;" onclick="renderPlantTaskRows('Done')" title="View completed tasks"><div class="stat-icon">✅</div><div class="stat-value">${done}</div><div class="stat-label">Completed</div></div>
     <div class="stat-card" style="--c:var(--red);cursor:pointer;" onclick="renderPlantTaskRows('overdue')" title="View overdue tasks"><div class="stat-icon">🚨</div><div class="stat-value">${overdue}</div><div class="stat-label">Overdue</div></div>
     <div class="stat-card" style="--c:var(--cyan);cursor:pointer;" onclick="renderPlantTaskRows('All')" title="View all tasks"><div class="stat-icon">📈</div><div class="stat-value">${rate}%</div><div class="stat-label">Completion Rate</div></div>
@@ -4285,6 +4289,7 @@ function renderPgList(){
           ${hasPwd
             ? `<span style="font-size:10px;color:var(--green);background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.2);border-radius:4px;padding:1px 7px">🔑 Password set</span>`
             : `<span style="font-size:10px;color:var(--red);background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);border-radius:4px;padding:1px 7px">⚠ No password</span>`}
+          <span id="bf-status-${p.id}" style="font-size:10px;display:none;color:var(--red);background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);border-radius:4px;padding:1px 7px">🔒 Login locked</span>
         </div>
         <div id="pg-owners-display-${p.id}" style="font-size:12px;color:var(--text3)">👤 ${esc((p.owners||[]).join(', ')||'No owner assigned')}</div>
         <!-- inline edit form (hidden by default) -->
@@ -4313,10 +4318,30 @@ function renderPgList(){
         <button class="btn btn-ghost btn-sm" onclick="showPlantPanel('${p.id}')" title="View plant dashboard">📊 View</button>
         <button class="btn btn-success btn-sm" onclick="impersonatePlantOwner('${p.id}')" title="Login as this plant owner">👁 Preview</button>
         <button class="btn btn-ghost btn-sm" onclick="startPlantEdit('${p.id}')" title="Edit plant">✏ Edit</button>
+        <button class="btn btn-ghost btn-sm" id="unlock-btn-${p.id}" onclick="unlockPlantLogin('${p.id}','${esc(p.name)}')" title="Clear login lockout for this plant">🔓 Unlock</button>
         <button class="btn btn-danger btn-sm" onclick="deletePlantGroup('${p.id}')" title="Delete plant">🗑</button>
       </div>
     </div>`;
   }).join('');
+
+  // Async: check brute-force lockout status for each plant and update badges
+  (async () => {
+    for(const p of groups){
+      const bfId = 'plant_' + p.id;
+      const bf = await _bfCheck(bfId);
+      const badge = document.getElementById('bf-status-' + p.id);
+      const unlockBtn = document.getElementById('unlock-btn-' + p.id);
+      if(badge){
+        if(bf.locked){
+          badge.style.display = 'inline';
+          badge.textContent = '🔒 Login locked — ' + bf.remaining + ' min remaining';
+          if(unlockBtn){ unlockBtn.style.color='var(--red)'; unlockBtn.style.borderColor='rgba(248,113,113,.4)'; }
+        } else {
+          badge.style.display = 'none';
+        }
+      }
+    }
+  })();
 }
 
 async function addPlantGroup(){
@@ -4390,6 +4415,27 @@ function deletePlantGroup(id){
   if(_activePlantId===id){ _activePlantId=null; }
   renderDashPlants();
   toast('🗑 Plant deleted','var(--red)');
+}
+
+/**
+ * unlockPlantLogin(id, name)
+ * Clears the brute-force lockout for a plant owner's login.
+ * Called by Super Admin from Settings → Plant Groups when a plant owner
+ * is locked out due to too many failed password attempts.
+ */
+async function unlockPlantLogin(id, name){
+  const bfId = 'plant_' + id;
+  const s = await _secGet(_BF_STORE) || {};
+  if(!s[bfId] || (!s[bfId].lockedUntil && !(s[bfId].attempts > 0))){
+    toast('🔓 ' + (name||id) + ' login is not currently locked.', 'var(--text3)');
+    return;
+  }
+  delete s[bfId];
+  await _secSet(_BF_STORE, s);
+  toast('✅ Login unlocked for ' + (name||id) + '. They can now sign in.', 'var(--green)');
+  // Update button to show it worked
+  const btn = document.getElementById('unlock-btn-' + id);
+  if(btn){ btn.textContent = '✅ Unlocked'; btn.disabled = true; setTimeout(()=>{ if(btn){ btn.textContent='🔓 Unlock'; btn.disabled=false; } },3000); }
 }
 
 
@@ -5445,6 +5491,11 @@ function plantOwnerLogin(){
     const avatar = document.getElementById('topbar-avatar');
     if(avatar){ avatar.textContent = plant.name[0].toUpperCase(); avatar.style.background='linear-gradient(135deg,var(--green),var(--cyan))'; }
     document.getElementById('topbar-title').textContent = '🏭 '+plant.name;
+
+    // Show sidebar account info card with plant owner's own email
+    const _poSai = document.getElementById('sidebar-account-info');
+    if(_poSai) _poSai.style.display = 'block';
+    _updateSidebarAccountInfo();
 
     toast('Welcome, '+plant.name+' Owner! 🏭');
     _renderTopbarUserBadge();
@@ -8271,9 +8322,13 @@ function handleLogout(){
     if(!confirm('Log out of plant session?'))return;
     plantOwnerAuthenticated = false;
     currentPlantSession = null;
+    _plantOwnerEmail = '';
     sessionStorage.removeItem('pg_impersonate_return');
     document.body.classList.remove('plant-owner-mode');
     userEmail=''; userTask=null;
+    // Clear sidebar account info so it doesn't show stale data
+    const _poSaiLogout = document.getElementById('sidebar-account-info');
+    if(_poSaiLogout){ _poSaiLogout.style.display = 'none'; _poSaiLogout.innerHTML = ''; }
     document.getElementById('admin-nav').style.display = 'none';
     document.getElementById('btn-new-task').style.display = 'none';
     document.getElementById('btn-bulk-upload').style.display = 'none';
