@@ -6612,49 +6612,81 @@ function _renderMvGantt(c, memberTasks) {
 }
 
 // ── Member Team ─────────────────────────────────────────────────────────
+// Mirrors renderTeam()'s exact algorithm — member-selection rule, self
+// inclusion, and per-member stats (assignedBy-fallback + deduped total) —
+// using _mvEmail in place of "me" so this ALWAYS matches what the member
+// sees in their own Team Overview panel. Do not diverge the two.
 function _renderMvTeam(c, memberTasks) {
   const scopedTasks = memberTasks || tasks.filter(t =>
     (t.assignee||'').toLowerCase()  === _mvEmail ||
     (t.assignedBy||'').toLowerCase() === _mvEmail
   );
-  // People this member assigned tasks to, or who assigned tasks to this member
-  const relatedEmails = new Set();
+
+  // Build member set — same rule as renderTeam(): direct relationships only,
+  // and ALWAYS include self (the viewed member), matching their own view.
+  const memberEmailSet = new Set();
   scopedTasks.forEach(t => {
     const assignee   = (t.assignee||'').toLowerCase();
     const assignedBy = (t.assignedBy||'').toLowerCase();
-    if(assignedBy === _mvEmail && assignee) relatedEmails.add(assignee);
-    if(assignee === _mvEmail && assignedBy) relatedEmails.add(assignedBy);
+    // mvEmail assigned this task → add the assignee (person they assigned to)
+    if(assignedBy === _mvEmail && assignee && assignee !== _mvEmail) {
+      memberEmailSet.add(assignee);
+    }
+    // Someone assigned a task TO mvEmail → add that person
+    if(assignee === _mvEmail && assignedBy && assignedBy !== _mvEmail && assignedBy !== 'superadmin') {
+      memberEmailSet.add(assignedBy);
+    }
   });
-  relatedEmails.delete(_mvEmail);
-  const saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-  if(saEmail) relatedEmails.delete(saEmail);
-  relatedEmails.delete('superadmin');
+  // Always include self — renderTeam() always shows the account holder's own card
+  memberEmailSet.add(_mvEmail);
+  // Note: unlike an earlier version, we do NOT exclude the superadmin here.
+  // renderTeam() never excludes anyone with a direct task relationship, so
+  // excluding them here would make this view diverge from what the member
+  // actually sees whenever the superadmin directly assigned/received a task.
+  memberEmailSet.delete('superadmin'); // legacy placeholder value, never a real email
 
-  const members = [...relatedEmails].map(email => {
+  const uniqueEmails = [...memberEmailSet].filter(Boolean);
+
+  const members = uniqueEmails.map(email => {
+    // Tasks assigned TO this person (their workload as assignee)
+    const assignedToThem = scopedTasks.filter(t => (t.assignee||'').toLowerCase() === email);
+    // Tasks this person assigned to others (their activity as assigner)
+    const assignedByThem = scopedTasks.filter(t => (t.assignedBy||'').toLowerCase() === email);
+    // Deduplicated union for the Total stat — same task never counted twice
+    const memberTaskIds  = new Set([...assignedToThem.map(t=>t.id), ...assignedByThem.map(t=>t.id)]);
+    const memberTaskPool = scopedTasks.filter(t => memberTaskIds.has(t.id));
     const nick = _nickCache[email] || email.split('@')[0];
-    const theirTasks = scopedTasks.filter(t=>(t.assignee||'').toLowerCase()===email);
-    const done    = theirTasks.filter(t=>t.status==='Done').length;
-    const inprog  = theirTasks.filter(t=>t.status==='In Progress').length;
-    const todo    = theirTasks.filter(t=>t.status==='To Do').length;
-    const overdue = theirTasks.filter(isOverdue).length;
-    const pct  = theirTasks.length ? Math.round(done/theirTasks.length*100) : 0;
-    const colors = ['var(--accent)','var(--purple)','var(--green)','var(--amber)','var(--cyan)'];
-    const color = colors[email.charCodeAt(0)%colors.length];
+    // Base workload stats on the assignee side; fall back to assigner side
+    // only when they have nothing assigned to them (matches renderTeam())
+    const workTasks = assignedToThem.length ? assignedToThem : assignedByThem;
+    const done    = workTasks.filter(t=>t.status==='Done').length;
+    const inprog  = workTasks.filter(t=>t.status==='In Progress').length;
+    const todo    = workTasks.filter(t=>t.status==='To Do').length;
+    const overdue = workTasks.filter(isOverdue).length;
+    const total   = memberTaskPool.length;
+    // pct gated by assignedToThem.length (not total) — exact same rule as
+    // renderTeam(): completion % is only meaningful for tasks assigned TO them.
+    const pct     = assignedToThem.length ? Math.round(done/total*100) : 0;
+    const colors  = ['var(--accent)','var(--purple)','var(--green)','var(--amber)','var(--cyan)'];
+    const color   = colors[email.charCodeAt(0)%colors.length];
     const iAssigned    = scopedTasks.some(t=>(t.assignedBy||'').toLowerCase()===_mvEmail&&(t.assignee||'').toLowerCase()===email);
-    const theyAssigned = scopedTasks.some(t=>(t.assignee||'').toLowerCase()===_mvEmail&&(t.assignedBy||'').toLowerCase()===email);
-    return {email,nick,total:theirTasks.length,done,inprog,todo,overdue,pct,color,iAssigned,theyAssigned};
+    const theyAssigned = email !== _mvEmail && scopedTasks.some(t=>(t.assignee||'').toLowerCase()===_mvEmail&&(t.assignedBy||'').toLowerCase()===email);
+    return {email,nick,total,done,inprog,todo,overdue,pct,color,iAssigned,theyAssigned};
   });
 
-  const cards = members.map(m=>`
-    <div style="background:var(--card);border:1px solid var(--border);border-top:3px solid ${m.color};border-radius:var(--radius);padding:16px;cursor:pointer;" onclick="openMemberViewer('${m.email}','${m.nick.replace(/'/g,"\'")}')">
+  const cards = members.map(m=>{
+    const isSelf = m.email === _mvEmail;
+    const relTags = [];
+    if(isSelf) relTags.push(`<span style="font-size:10px;font-weight:700;color:var(--accent);background:rgba(91,141,238,.12);border:1px solid rgba(91,141,238,.25);border-radius:4px;padding:1px 6px;">${esc(_mvNick)}</span>`);
+    if(!isSelf && m.iAssigned) relTags.push('<span style="font-size:10px;font-weight:700;color:var(--green);background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.25);border-radius:4px;padding:1px 6px;">Assigned by '+esc(_mvNick)+'</span>');
+    if(!isSelf && m.theyAssigned) relTags.push('<span style="font-size:10px;font-weight:700;color:var(--purple);background:rgba(179,102,255,.1);border:1px solid rgba(179,102,255,.25);border-radius:4px;padding:1px 6px;">Assigned '+esc(_mvNick)+'</span>');
+    return `
+    <div style="background:var(--card);border:1px solid var(--border);border-top:3px solid ${m.color};border-radius:var(--radius);padding:16px;${isSelf?'':'cursor:pointer;'}" ${isSelf?'':`onclick="openMemberViewer('${m.email}','${m.nick.replace(/'/g,"\\'")}')"`}>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
         <div style="width:40px;height:40px;border-radius:50%;background:${m.color}22;border:2px solid ${m.color}44;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;color:${m.color};flex-shrink:0">${m.nick.slice(0,2).toUpperCase()}</div>
         <div>
           <div style="font-weight:700;font-size:14px;color:var(--text)">${esc(m.nick)}</div>
-          <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:3px">
-            ${m.iAssigned?'<span style="font-size:10px;font-weight:700;color:var(--green);background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.25);border-radius:4px;padding:1px 6px;">Assigned by '+esc(_mvNick)+'</span>':''}
-            ${m.theyAssigned?'<span style="font-size:10px;font-weight:700;color:var(--purple);background:rgba(179,102,255,.1);border:1px solid rgba(179,102,255,.25);border-radius:4px;padding:1px 6px;">Assigned '+esc(_mvNick)+'</span>':''}
-          </div>
+          <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:3px">${relTags.join('')}</div>
         </div>
       </div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-bottom:5px;text-align:center">
@@ -6667,7 +6699,8 @@ function _renderMvTeam(c, memberTasks) {
         <div style="background:var(--bg);border-radius:6px;padding:6px"><div style="font-size:16px;font-weight:800;color:var(--cyan)">${m.pct}%</div><div style="font-size:9px;color:var(--text3);text-transform:uppercase">Rate</div></div>
       </div>
       <div style="background:var(--bg);border-radius:6px;height:6px;overflow:hidden"><div style="height:100%;width:${m.pct}%;background:${m.color};transition:width .4s"></div></div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   c.innerHTML = `
     <div style="font-size:18px;font-weight:800;color:var(--text);margin-bottom:16px">👥 ${esc(_mvNick)}'s Team (${members.length})</div>
