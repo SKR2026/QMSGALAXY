@@ -3603,8 +3603,11 @@ function renderReminders(){
 //  TEAM
 // ═══════════════════════════════════════════════════════════════════════
 function renderTeam(){
-  // Use ALL tasks (not scoped) so we see the full team picture
+  // Declare me FIRST before any filter that uses it
+  const me = currentSession ? currentSession.email.toLowerCase() : null;
+  const myE = me || (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
   const authorisedEmails = _getAuthorisedEmails();
+
   const allTasks = (plantOwnerAuthenticated && currentPlantSession)
     ? tasks.filter(t => {
         const owners = (currentPlantSession.owners||[]).map(o=>o.toLowerCase());
@@ -3613,16 +3616,15 @@ function renderTeam(){
     : tasks.filter(t => {
         const assignee   = (t.assignee||'').toLowerCase();
         const assignedBy = (t.assignedBy||'').toLowerCase();
-        const myE        = me || (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-        // Tasks I assigned to anyone — always visible (I created them)
-        if(myE && (assignedBy === myE || assignedBy === 'superadmin' && !currentSession)) return true;
+        // Tasks I assigned to anyone — always visible
+        if(myE && assignedBy === myE) return true;
+        // Superadmin legacy tasks (assignedBy = 'superadmin' or empty)
+        if(!currentSession && (assignedBy === 'superadmin' || !assignedBy)) return true;
         // Tasks assigned to me — always visible
         if(myE && assignee === myE) return true;
-        // Tasks where both parties are authorised (accepted group members)
+        // Tasks of authorised group members
         return authorisedEmails.has(assignee) && authorisedEmails.has(assignedBy);
       });
-
-  const me = currentSession ? currentSession.email.toLowerCase() : null;
 
   // Build the set of relevant member emails:
   // 1. Members I assigned tasks TO  (assignedBy === me)
@@ -3630,23 +3632,21 @@ function renderTeam(){
   // 3. Superadmin sees everyone
   let memberEmailSet;
   if(_memberViewActive && _memberViewEmail) {
-    // When viewing a specific member, show only them
     memberEmailSet = new Set([_memberViewEmail.toLowerCase()]);
-  } else if(me) {
+  } else {
     memberEmailSet = new Set();
     allTasks.forEach(t => {
       const assignee   = (t.assignee||'').toLowerCase();
       const assignedBy = (t.assignedBy||'').toLowerCase();
-      // Tasks I assigned to someone → that someone is in my team
-      if(assignedBy === me) memberEmailSet.add(assignee);
-      // Tasks someone assigned to me → that someone is in my team
-      if(assignee === me && assignedBy && assignedBy !== me) memberEmailSet.add(assignedBy);
+      // Add everyone who appears as assignee in tasks I can see
+      if(assignee) memberEmailSet.add(assignee);
+      // Add everyone who assigned tasks to me
+      if(myE && assignee === myE && assignedBy && assignedBy !== myE && assignedBy !== 'superadmin') {
+        memberEmailSet.add(assignedBy);
+      }
     });
-    // Always include myself
-    memberEmailSet.add(me);
-  } else {
-    // Superadmin — all unique assignees
-    memberEmailSet = new Set(allTasks.map(t=>(t.assignee||'').toLowerCase()).filter(Boolean));
+    // Always include self
+    if(myE) memberEmailSet.add(myE);
   }
 
   const uniqueEmails = [...memberEmailSet].filter(Boolean);
@@ -3667,8 +3667,8 @@ function renderTeam(){
       inprog:  assignedToThem.filter(t=>t.status==='In Progress').length,
       overdue: assignedToThem.filter(isOverdue).length,
       // Relationship label
-      iAssigned:    allTasks.some(t=>(t.assignedBy||'').toLowerCase()===me && (t.assignee||'').toLowerCase()===email),
-      theyAssigned: me && email !== me && allTasks.some(t=>(t.assignee||'').toLowerCase()===me && (t.assignedBy||'').toLowerCase()===email),
+      iAssigned:    allTasks.some(t=>{ const ab=(t.assignedBy||'').toLowerCase(); return (ab===myE||(!currentSession&&(ab==='superadmin'||!ab))) && (t.assignee||'').toLowerCase()===email; }),
+      theyAssigned: myE && email !== myE && allTasks.some(t=>(t.assignee||'').toLowerCase()===myE && (t.assignedBy||'').toLowerCase()===email),
     };
   });
 
@@ -6573,18 +6573,30 @@ function _updateSidebarAccountInfo() {
       </div>
       <button class="btn btn-ghost btn-sm" onclick="exitMemberImpersonation()" style="width:100%;justify-content:center;font-size:11px;color:var(--amber);border-color:rgba(251,191,36,.3);">↩ Back to My Account</button>`;
   } else {
-    const nick = getSessionNick();
-    const email = getSessionEmail();
-    const role = currentSession ? currentSession.role : 'Super Admin';
-    const roleLabel = role.charAt(0).toUpperCase() + role.slice(1);
-    const initial = nick ? nick[0].toUpperCase() : (email ? email[0].toUpperCase() : 'A');
+    // Resolve identity for all roles including superadmin
+    let nick, email, roleLabel;
+    if(currentSession) {
+      nick      = currentSession.nickname || currentSession.email.split('@')[0];
+      email     = currentSession.email;
+      roleLabel = currentSession.role.charAt(0).toUpperCase() + currentSession.role.slice(1);
+    } else if(plantOwnerAuthenticated && currentPlantSession) {
+      nick      = currentPlantSession.name + ' Owner';
+      email     = (currentPlantSession.owners||[])[0] || '';
+      roleLabel = 'Plant Owner';
+    } else {
+      // Superadmin — use admin_notify_email + self_name
+      email     = (localStorage.getItem('admin_notify_email')||'').trim();
+      nick      = localStorage.getItem('self_name') || 'Super Admin';
+      roleLabel = 'Super Admin';
+    }
+    const initial = nick ? nick[0].toUpperCase() : (email ? email[0].toUpperCase() : 'S');
     panel.innerHTML = `
       <div style="font-size:10px;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px;">My Account</div>
       <div style="display:flex;align-items:center;gap:8px;">
         <div style="width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--purple));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;color:#fff;flex-shrink:0;">${initial}</div>
         <div>
-          <div style="font-size:13px;font-weight:700;color:var(--text);">${esc(nick||'Admin')} <span style="font-size:10px;font-weight:600;color:var(--accent);">(${roleLabel})</span></div>
-          <div style="font-size:10px;color:var(--text3);word-break:break-all;">${esc(email||'')}</div>
+          <div style="font-size:13px;font-weight:700;color:var(--text);">${esc(nick)} <span style="font-size:10px;font-weight:600;color:var(--accent);">(${roleLabel})</span></div>
+          <div style="font-size:10px;color:var(--text3);word-break:break-all;">${esc(email||'Not set')}</div>
         </div>
       </div>`;
   }
