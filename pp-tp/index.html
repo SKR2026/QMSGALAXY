@@ -6046,14 +6046,28 @@ let _mvTab    = 'mv-dashboard'; // active sub-tab
 function openMemberViewer(email, nick) {
   if(!email) return;
   const targetEmail = email.toLowerCase();
-  // Check authorisation — only accepted group members can be viewed
-  const authorised = _getAuthorisedEmails();
-  if(!authorised.has(targetEmail)){
-    toast('⚠ You can only view members who have accepted your group invitation.', 'var(--amber)');
+
+  // Members (role=user) cannot view other people's dashboards — admin/superadmin only
+  if(currentSession && currentSession.role === 'user'){
+    toast('Only admins and super-admins can view member dashboards.', 'var(--amber)');
     return;
   }
+
+  // Check authorisation — superadmin always has access; admin needs accepted member
+  if(!isSuperAdmin()){
+    const authorised = _getAuthorisedEmails();
+    if(!authorised.has(targetEmail)){
+      toast('You can only view members who have accepted your group invitation.', 'var(--amber)');
+      return;
+    }
+  }
+
   _mvEmail = targetEmail;
   _mvNick  = nick || email.split('@')[0];
+  // Keep legacy vars in sync (used by team-overview and task-scoping panels)
+  _memberViewActive = true;
+  _memberViewEmail  = _mvEmail;
+  _memberViewNick   = _mvNick;
 
   // Update header
   const initial = _mvNick[0].toUpperCase();
@@ -6082,6 +6096,10 @@ function closeMemberViewer() {
   if(viewer) viewer.style.display = 'none';
   _mvEmail = null;
   _mvNick  = null;
+  // Clear legacy vars (used by team-overview and task-scoping panels)
+  _memberViewActive = false;
+  _memberViewEmail  = null;
+  _memberViewNick   = null;
   // Restore self chip as active
   const _closeChips = document.getElementById('global-member-chips');
   if(_closeChips){
@@ -6111,18 +6129,21 @@ function renderMemberViewerContent() {
   if(!c || !_mvEmail) return;
 
   // Re-check authorisation every render
-  const authorised = _getAuthorisedEmails();
-  if(!authorised.has(_mvEmail)){
-    c.innerHTML = `<div style="text-align:center;padding:60px 20px;">
-      <div style="font-size:48px;margin-bottom:16px">🔒</div>
-      <div style="font-size:18px;font-weight:700;color:var(--text);margin-bottom:8px">Access Restricted</div>
-      <div style="font-size:14px;color:var(--text3);max-width:360px;margin:0 auto;line-height:1.6">
-        <strong>${esc(_mvNick)}</strong> has not accepted your group invitation yet.<br/>
-        Once they accept, you will be able to view their tasks here.
-      </div>
-      <button class="btn btn-primary" style="margin-top:20px" onclick="closeMemberViewer()">← Back</button>
-    </div>`;
-    return;
+  // Superadmin always has full access to any group member's view
+  if(!isSuperAdmin()){
+    const authorised = _getAuthorisedEmails();
+    if(!authorised.has(_mvEmail)){
+      c.innerHTML = `<div style="text-align:center;padding:60px 20px;">
+        <div style="font-size:48px;margin-bottom:16px">🔒</div>
+        <div style="font-size:18px;font-weight:700;color:var(--text);margin-bottom:8px">Access Restricted</div>
+        <div style="font-size:14px;color:var(--text3);max-width:360px;margin:0 auto;line-height:1.6">
+          <strong>${esc(_mvNick)}</strong> has not accepted your group invitation yet.<br/>
+          Once they accept, you will be able to view their tasks here.
+        </div>
+        <button class="btn btn-primary" style="margin-top:20px" onclick="closeMemberViewer()">← Back</button>
+      </div>`;
+      return;
+    }
   }
 
   // Get all tasks for this member (assigned to OR assigned by)
@@ -6680,6 +6701,11 @@ function buildGlobalMemberBar() {
           closeMemberViewer();
           _setAllChips(chips, selfEmail);
         } else {
+          // Only admins / superadmin can open another member's viewer
+          if(currentSession && currentSession.role === 'user'){
+            toast('Only admins can view member dashboards.', 'var(--amber)');
+            return;
+          }
           openMemberViewer(m.email, m.nick);
           _setAllChips(chips, m.email);
         }
@@ -8715,8 +8741,9 @@ function openTaskModal(){
     const t=editTaskId?getTask(editTaskId):null;
     // If plant owner session: pre-fill assignee from their owners list
     // Build assignee options from appUsers (nicknames shown, emails as values)
+    // Only show registered & active users in the dropdown (exclude pending/disabled)
     const _appUserOpts = _allAppUsers && _allAppUsers.length
-      ? _allAppUsers.filter(u => u.status !== 'disabled').map(u =>
+      ? _allAppUsers.filter(u => (u.status || 'active') === 'active').map(u =>
           `<option value="${esc(u.email)}">${esc(u.nickname ? u.nickname + ' (' + u.email + ')' : u.email)}</option>`
         ).join('')
       : '';
@@ -8724,13 +8751,13 @@ function openTaskModal(){
       <label class="form-label">Assign To *</label>
       <select id="tm-assignee" class="form-select" onchange="(function(s){var c=document.getElementById('tm-assignee-custom');if(c){c.style.display=s.value==='__custom__'?'':'none';if(s.value!=='__custom__')c.value='';};})(this)">
         <option value="">— Select team member —</option>
-        ${_appUserOpts}
         <option value="__custom__">✏ Enter email manually…</option>
+        ${_appUserOpts}
       </select>
       <input id="tm-assignee-custom" class="form-input" type="email" placeholder="manual@email.com"
-        style="margin-top:6px;display:${t && t.assignee && !_allAppUsers.find(u=>u.email===t.assignee) ? '' : 'none'}"
-        value="${esc(t && t.assignee && !_allAppUsers.find(u=>u.email===t.assignee) ? t.assignee : '')}"/>
-      <div style="font-size:11px;color:var(--text3);margin-top:4px">Team members are listed by nickname. Choose "Enter email manually" to assign to anyone.</div>
+        style="margin-top:6px;display:${t && t.assignee && !(_allAppUsers||[]).find(u=>u.email===t.assignee&&(u.status||'active')==='active') ? '' : 'none'}"
+        value="${esc(t && t.assignee && !(_allAppUsers||[]).find(u=>u.email===t.assignee&&(u.status||'active')==='active') ? t.assignee : '')}"/>
+      <div style="font-size:11px;color:var(--text3);margin-top:4px">Only registered &amp; active members are listed. Use "Enter email manually" to assign to anyone else.</div>
     </div>`;
     const html=`
     <div class="modal-overlay" id="task-modal-overlay" onclick="if(event.target===this)closeTaskModal()">
