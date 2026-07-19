@@ -7654,13 +7654,132 @@ async function _toggleAdminStatus(email, action) {
 }
 
 async function _resetAdminPassword(email) {
-  const newPw = prompt('Enter new temporary password for '+email+':');
-  if(!newPw || newPw.length < 6){ toast('Password must be at least 6 characters.','var(--amber)'); return; }
+  if(!confirm('Send a password reset link to ' + email + '?\n\nThey will receive an email with a secure link to set a new password.')) return;
+  await _sendPasswordResetLink(email);
+}
+
+/* ── Password Reset Link — generates token, saves to Firestore, emails user ── */
+async function _sendPasswordResetLink(email) {
+  if (!_fbReady || !_db) { toast('Database not ready.', 'var(--red)'); return; }
   try {
-    const hashed = await _hashPw(newPw, email);
-    await _db.collection('appUsers').doc(email).set({passwordHash:hashed, mustChangePassword:true},{merge:true});
-    toast('✅ Password reset for '+email+'. Share new password: '+newPw,'var(--green)');
-  } catch(e){ toast('Error: '+e.message,'var(--red)'); }
+    // Generate a secure random token
+    const tokenBytes = new Uint8Array(24);
+    crypto.getRandomValues(tokenBytes);
+    const resetToken = Array.from(tokenBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    const expiresAt  = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+
+    // Store token in Firestore on the user doc
+    await _db.collection('appUsers').doc(email).set(
+      { passwordResetToken: resetToken, passwordResetExpires: expiresAt },
+      { merge: true }
+    );
+
+    // Build reset URL
+    const resetUrl = window.location.href.split('?')[0] + '?pwreset=' + resetToken + '&pwr_email=' + encodeURIComponent(email);
+
+    // Fetch user's nickname for personalised email
+    const snap = await _db.collection('appUsers').doc(email).get();
+    const nick = snap.exists ? (snap.data().nickname || email.split('@')[0]) : email.split('@')[0];
+
+    const sent = await _sendPasswordResetEmail(email, nick, resetUrl);
+    if (sent === true) {
+      toast('✅ Password reset link sent to ' + email, 'var(--green)');
+    } else {
+      // mailto fallback already opened
+      toast('✅ Reset token created. Email client opened — please send the email to ' + email, 'var(--amber)');
+    }
+  } catch(e) {
+    toast('❌ Error sending reset link: ' + e.message, 'var(--red)');
+  }
+}
+
+async function _sendPasswordResetEmail(toEmail, nickname, resetUrl) {
+  const transport   = emailTransport();
+  const companyName = localStorage.getItem('company_name') || 'POLYPLASTICS';
+  const logoUrl     = localStorage.getItem('company_logo_url') || '';
+  const displayName = nickname || toEmail.split('@')[0];
+
+  const logoBlock = logoUrl
+    ? `<img src="${logoUrl}" alt="${companyName}" style="max-height:40px;max-width:160px;display:block;margin-bottom:8px;"/>`
+    : `<div style="font-family:sans-serif;font-size:18px;font-weight:800;color:#5b8dee;letter-spacing:1px;">${companyName}</div>`;
+
+  const subject = `[${companyName}] Password Reset Request`;
+
+  const htmlBody = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#f0f2f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f2f7;padding:32px 16px;">
+<tr><td align="center">
+<table width="540" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+  <tr><td style="background:linear-gradient(135deg,#1a2340 0%,#0f172a 100%);padding:28px 36px;">
+    ${logoBlock}
+    <div style="font-size:12px;color:#9aa5c0;margin-top:4px;letter-spacing:0.8px;text-transform:uppercase;">Task Manager</div>
+  </td></tr>
+  <tr><td style="padding:36px;">
+    <div style="font-size:22px;font-weight:700;color:#1a1e2e;margin-bottom:8px;">Password Reset 🔐</div>
+    <div style="font-size:15px;color:#4a5068;line-height:1.6;margin-bottom:24px;">
+      Hi <strong>${displayName}</strong>,<br><br>
+      Your administrator has requested a password reset for your account.<br>
+      Click the button below to set a new password. This link is valid for <strong>24 hours</strong>.
+    </div>
+    <table cellpadding="0" cellspacing="0"><tr><td style="border-radius:10px;background:linear-gradient(135deg,#5b8dee,#3d6dd4);">
+      <a href="${resetUrl}" style="display:inline-block;padding:14px 32px;font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;letter-spacing:0.3px;">Set New Password →</a>
+    </td></tr></table>
+    <div style="margin-top:20px;padding:16px;background:#fff8e0;border:1px solid #fce8a0;border-radius:8px;">
+      <div style="font-size:12px;color:#805800;font-weight:600;">⚠ Security Notice</div>
+      <div style="font-size:12px;color:#805800;margin-top:4px;">If you did not request this reset, please contact your administrator immediately. This link expires in 24 hours.</div>
+    </div>
+    <div style="margin-top:20px;font-size:12px;color:#8890a8;line-height:1.6;">
+      If the button doesn't work, copy this link into your browser:<br/>
+      <a href="${resetUrl}" style="color:#5b8dee;word-break:break-all;">${resetUrl}</a>
+    </div>
+  </td></tr>
+  <tr><td style="background:#f5f7ff;padding:18px 36px;border-top:1px solid #d8dce8;">
+    <div style="font-size:11px;color:#8890a8;">This email was sent by ${companyName} Task Manager. Do not reply to this email.</div>
+  </td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>`;
+
+  if (transport === 'msgraph') {
+    try {
+      await sendViaMsGraph(toEmail, subject, htmlBody);
+      return true;
+    } catch(e) {
+      console.warn('[Password reset email] MS Graph failed:', e.message);
+    }
+  } else if (transport === 'emailjs') {
+    try {
+      const c = getEmailConfig();
+      if (typeof emailjs === 'undefined') throw new Error('EmailJS not loaded');
+      emailjs.init({ publicKey: c.ejsKey });
+      const params = {
+        to_email: toEmail, to_name: displayName,
+        subject, message_html: htmlBody,
+        task_title: 'Password Reset', task_due: '', task_priority: '', task_status: '',
+        task_desc: 'Click the link in this email to reset your password.',
+        task_assignee: toEmail, reply_to: 'noreply@polyplastics.com',
+        from_name: companyName + ' Task Manager',
+      };
+      const r = await withTimeout(emailjs.send(c.ejsService, c.ejsTemplate, params));
+      if (r.status !== 200) throw new Error('EmailJS: ' + r.text);
+      return true;
+    } catch(e) {
+      console.warn('[Password reset email] EmailJS failed:', e.message);
+    }
+  }
+
+  // Mailto fallback
+  const body = encodeURIComponent(
+    'Hi ' + displayName + ',\n\n' +
+    'Your administrator has initiated a password reset.\n\n' +
+    'Click the link below to set your new password (valid 24 hours):\n' +
+    resetUrl + '\n\n' +
+    'Regards,\n' + companyName
+  );
+  window.open('mailto:' + toEmail + '?subject=' + encodeURIComponent(subject) + '&body=' + body);
+  return 'mailto';
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -8159,7 +8278,8 @@ function _renderUserPage() {
           ${u.status==='removed'
             ? `<button class="btn btn-primary btn-sm" style="font-size:11px" title="Restore this account so it can log in and receive requests again" onclick="_restoreAppUser('${esc(u.email)}')">↩ Restore</button>
                <button class="btn btn-danger btn-sm" style="font-size:11px" title="Permanently delete this account — cannot be undone" onclick="_purgeAppUser('${esc(u.email)}','${esc(u.nickname||u.email)}')">🗑</button>`
-            : `<button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="_toggleAppUser('${esc(u.email)}','${esc(u.status||'active')}')">${(u.status||'active')==='active'?'Disable':'Enable'}</button>
+            : `<button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--cyan)" title="Send password reset link to user" onclick="_sendPasswordResetLink('${esc(u.email)}')">🔑 Reset Pwd</button>
+               <button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="_toggleAppUser('${esc(u.email)}','${esc(u.status||'active')}')">${(u.status||'active')==='active'?'Disable':'Enable'}</button>
                <button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--red)" title="Remove this account — keeps their record but blocks login until restored" onclick="_deleteAppUser('${esc(u.email)}','${esc(u.nickname||u.email)}')">Remove</button>`}
         </div>`).join('');
     }
@@ -10210,9 +10330,95 @@ function downloadJSONTemplate(){
   a.click();
 }
 
+// ── Password reset via ?pwreset=TOKEN&pwr_email=EMAIL ───────────────────────
+(function checkPasswordResetUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const token  = params.get('pwreset');
+  const email  = params.get('pwr_email');
+  if (!token || !email) return;
+
+  // Hide all standard UI — show only the reset form
+  document.getElementById('admin-nav').style.display  = 'none';
+  document.getElementById('btn-new-task').style.display = 'none';
+  document.getElementById('btn-bulk-upload').style.display = 'none';
+  document.getElementById('btn-admin-mode').style.display = 'none';
+  document.getElementById('btn-user-mode').style.display  = 'none';
+  document.getElementById('btn-export').style.display     = 'none';
+  const sb = document.querySelector('.sidebar-bottom');
+  if (sb) sb.style.display = 'none';
+  document.getElementById('topbar-title').textContent = '🔐 Reset Password';
+
+  const companyName = localStorage.getItem('company_name') || 'POLYPLASTICS';
+  document.getElementById('content').innerHTML = `
+    <div style="max-width:440px;margin:60px auto;" class="fade-in">
+      <div style="text-align:center;margin-bottom:28px">
+        <div style="font-size:48px;margin-bottom:10px">🔐</div>
+        <div class="panel-title" style="margin-bottom:4px">Set New Password</div>
+        <div style="color:var(--text3);font-size:13px">${esc(email)}</div>
+      </div>
+      <div class="card">
+        <div class="form-group">
+          <label class="form-label">New Password</label>
+          <input type="password" id="pwr-new" class="form-input" placeholder="Min. 6 characters"
+            onkeydown="if(event.key==='Enter')document.getElementById('pwr-confirm').focus()"/>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Confirm New Password</label>
+          <input type="password" id="pwr-confirm" class="form-input" placeholder="Repeat new password"
+            onkeydown="if(event.key==='Enter')_submitPasswordReset('${esc(email)}','${esc(token)}')"/>
+        </div>
+        <div id="pwr-status" style="font-size:12px;min-height:16px;margin-bottom:10px"></div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center"
+          onclick="_submitPasswordReset('${esc(email)}','${esc(token)}')">Set Password & Sign In →</button>
+      </div>
+      <div style="text-align:center;margin-top:14px;font-size:11px;color:var(--text3)">
+        This link expires 24 hours after it was sent by your administrator.
+      </div>
+    </div>`;
+  setTimeout(() => document.getElementById('pwr-new')?.focus(), 80);
+
+  // Mark page as handled so checkUrlToken() and showAdminPasswordOverlay() are skipped
+  window._pwResetHandled = true;
+})();
+
+async function _submitPasswordReset(email, token) {
+  const np = (document.getElementById('pwr-new')?.value || '');
+  const cp = (document.getElementById('pwr-confirm')?.value || '');
+  const st = document.getElementById('pwr-status');
+  if (np.length < 6) { st.textContent = '❌ Password must be at least 6 characters.'; st.style.color = 'var(--red)'; return; }
+  if (np !== cp)     { st.textContent = '❌ Passwords do not match.'; st.style.color = 'var(--red)'; return; }
+  st.textContent = '⏳ Verifying link...'; st.style.color = 'var(--text3)';
+  try {
+    if (!_fbReady || !_db) throw new Error('Database not ready. Please refresh and try again.');
+    const snap = await _db.collection('appUsers').doc(email).get();
+    if (!snap.exists) throw new Error('Account not found.');
+    const u = snap.data();
+    if (u.passwordResetToken !== token) throw new Error('This link is invalid or has already been used.');
+    if (u.passwordResetExpires && Date.now() > u.passwordResetExpires) throw new Error('This link has expired. Please ask your administrator to send a new one.');
+
+    st.textContent = '⏳ Saving new password...'; st.style.color = 'var(--text3)';
+    const hashed = await _hashPw(np, email);
+    await _db.collection('appUsers').doc(email).set({
+      passwordHash: hashed,
+      mustChangePassword: false,
+      passwordResetToken: firebase.firestore.FieldValue.delete(),
+      passwordResetExpires: firebase.firestore.FieldValue.delete()
+    }, { merge: true });
+
+    st.textContent = '✅ Password set! Redirecting to login...'; st.style.color = 'var(--green)';
+    setTimeout(() => {
+      // Clean URL and reload to normal login
+      window.location.href = window.location.href.split('?')[0];
+    }, 1800);
+  } catch(e) {
+    st.textContent = '❌ ' + e.message; st.style.color = 'var(--red)';
+  }
+}
+
 checkUrlToken();
 // Handle Microsoft MSAL redirect response on page load (runs silently if no redirect)
 handleMsalRedirect().catch(e => console.warn('[MSAL] Startup redirect check:', e.message));
+if(window._pwResetHandled){ /* password-reset page — skip normal startup flow */ } else
 if(mode !== 'user'){
   const params=new URLSearchParams(window.location.search);
   if(params.get('token') || params.get('email')){
