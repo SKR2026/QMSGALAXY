@@ -6608,8 +6608,11 @@ function buildGlobalMemberBar() {
   const chips = document.getElementById('global-member-chips');
   if(!bar || !chips) return;
 
-  const selfEmail = getSessionEmail().toLowerCase();
-  const selfNick  = getSessionNick() || selfEmail.split('@')[0];
+  // Resolve self identity for all roles including superadmin
+  const selfEmail = _getMyEmail(); // works for superadmin, admin, user, plant owner
+  const selfNick  = getSessionNick()
+    || localStorage.getItem('self_name')
+    || (selfEmail ? selfEmail.split('@')[0] : 'Me');
 
   // Gather: self + accepted group members + pending invitees
   const members = [];
@@ -6684,23 +6687,52 @@ async function _loadGroupMemberEmails(adminEmail) {
   if (!_fbReady || !_db) return;
   try {
     const groups = await _loadMyGroups(adminEmail);
+    const allEmails = new Set();
     groups.forEach(g => {
-      // Accepted members
+      // Accepted members — also cache nickname from group data
       (g.members || []).forEach(m => {
-        if (m.email) _myGroupMemberEmails.push(m.email.toLowerCase());
+        if (m.email) {
+          const e = m.email.toLowerCase();
+          _myGroupMemberEmails.push(e);
+          allEmails.add(e);
+          // Cache nickname from group record if available
+          if (m.nickname) _nickCache[e] = m.nickname;
+        }
       });
-      // Pending invitees (sent invite, not yet accepted)
+      // Pending invitees
       (g.pendingRequests || []).forEach(r => {
         if (r.email && !_myGroupMemberEmails.includes(r.email.toLowerCase())) {
-          _myGroupPendingEmails.push(r.email.toLowerCase());
+          const e = r.email.toLowerCase();
+          _myGroupPendingEmails.push(e);
+          allEmails.add(e);
+          if (r.nickname) _nickCache[e] = r.nickname;
         }
       });
     });
     console.log('[Role] Admin group members:', _myGroupMemberEmails);
-    // Also populate nickCache for member chips
+
+    // Fetch fresh nicknames from appUsers for all group members
+    // (group record may have stale nick; appUsers is the source of truth)
+    if(allEmails.size > 0) {
+      const emailArr = [...allEmails];
+      // Fetch in batches of 10 (Firestore 'in' limit)
+      for(let i = 0; i < emailArr.length; i += 10) {
+        const batch = emailArr.slice(i, i + 10);
+        try {
+          const snap = await _db.collection('appUsers').where('email','in', batch).get();
+          snap.docs.forEach(d => {
+            const u = d.data();
+            if(u.email && u.nickname) _nickCache[u.email.toLowerCase()] = u.nickname;
+          });
+        } catch(e) { /* ignore batch errors */ }
+      }
+    }
+
+    // Also populate from already-loaded appUsers cache
     if(_allAppUsers && _allAppUsers.length){
       _allAppUsers.forEach(u => { if(u.email && u.nickname) _nickCache[u.email.toLowerCase()] = u.nickname; });
     }
+
     // Rebuild global member bar with fresh nicknames
     buildGlobalMemberBar();
     // Update sidebar account info
@@ -6721,9 +6753,10 @@ function _activateRoleSession(role) {
     document.getElementById('btn-export').style.display = 'flex';
     _setSettingsNavVisible(false);
     _injectRoleNavItems('admin');
-    // Load group members so task scoping works + load appUsers for assignee dropdown
-    _loadGroupMemberEmails(currentSession.email).then(() => { refreshOverdueBadge(); });
-    _ensureAppUsersLoaded();
+    // Load appUsers first (populates nickCache), then load group members + build bar
+    _ensureAppUsersLoaded().then(() => {
+      _loadGroupMemberEmails(currentSession.email).then(() => { refreshOverdueBadge(); });
+    });
     toast('Welcome, ' + getSessionNick() + '! (Admin) 👋');
     showPanel('dashboard');
   } else if (role === 'user') {
@@ -6746,8 +6779,16 @@ function _activateRoleSession(role) {
   if(currentSession && currentSession.email){
     _startNotifListener(currentSession.email.toLowerCase());
   }
-  // Build global member bar (may be just self until group members load)
-  buildGlobalMemberBar();
+  // For superadmin: load appUsers for nickCache, then build member bar
+  // (superadmin groups use admin_notify_email as owner key)
+  const _saEmail = (localStorage.getItem('admin_notify_email')||'').trim();
+  if(_saEmail && _fbReady && _db) {
+    _ensureAppUsersLoaded().then(() => {
+      _loadGroupMemberEmails(_saEmail).then(() => { refreshOverdueBadge(); });
+    });
+  } else {
+    buildGlobalMemberBar();
+  }
 }
 
 function _injectRoleNavItems(role) {
