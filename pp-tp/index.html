@@ -4634,6 +4634,8 @@ async function getMSGraphToken(cfg, loginHint) {
  */
 function getPlantOwnerLoginHint() {
   if (!plantOwnerAuthenticated || !currentPlantSession) return null;
+  // Prefer the specific email the plant owner used to log in
+  if (_plantOwnerEmail) return _plantOwnerEmail.trim().toLowerCase();
   const owners = (currentPlantSession.owners || []).filter(e => e && e.includes('@'));
   return owners.length > 0 ? owners[0].trim().toLowerCase() : null;
 }
@@ -5175,6 +5177,7 @@ function previewEmailTemplate(taskId){
 let adminAuthenticated = false; // will be set true only after password check or confirmed admin session
 let plantOwnerAuthenticated = false; // true when a plant owner is logged in
 let currentPlantSession = null;      // the plant object the owner is logged into
+let _plantOwnerEmail = '';           // the specific email address the plant owner logged in with
 
 // ── Role-based access system ──────────────────────────────────────────
 // Roles: 'superadmin' | 'admin' | 'user'
@@ -5328,8 +5331,14 @@ function showPlantOwnerLoginScreen(){
   <div id="plant-login-screen" style="max-width:420px;margin:80px auto;text-align:center">
     <div style="font-size:52px;margin-bottom:16px">🏭</div>
     <div class="panel-title" style="margin-bottom:8px">Plant Owner Login</div>
-    <div style="color:var(--text3);font-size:14px;margin-bottom:0">Select your plant and enter your password.</div>
+    <div style="color:var(--text3);font-size:14px;margin-bottom:0">Sign in with your email and plant password.</div>
     <div class="token-box" style="margin-top:24px;text-align:left">
+      <div class="form-group">
+        <label class="form-label">Email Address</label>
+        <input id="plant-email-input" class="form-input" type="email" placeholder="your@email.com"
+          onkeydown="if(event.key==='Enter')document.getElementById('plant-pwd-input')?.focus()"
+          oninput="_autoSelectPlantByEmail(this.value)"/>
+      </div>
       <div class="form-group">
         <label class="form-label">Plant</label>
         <select id="plant-login-select" class="form-select">
@@ -5342,24 +5351,52 @@ function showPlantOwnerLoginScreen(){
         <input id="plant-pwd-input" class="form-input" type="password" placeholder="Enter plant password"
           onkeydown="if(event.key==='Enter')plantOwnerLogin()"/>
       </div>
-      <div id="plant-login-error" style="color:var(--red);font-size:13px;margin-bottom:10px;display:none">❌ Incorrect password or no plant selected.</div>
+      <div id="plant-login-error" style="color:var(--red);font-size:13px;margin-bottom:10px;display:none">❌ Incorrect credentials or email not registered for this plant.</div>
       <button class="btn btn-primary" style="width:100%;justify-content:center;margin-bottom:10px" onclick="plantOwnerLogin()">🔓 Login as Plant Owner</button>
       <button class="btn btn-ghost" style="width:100%;justify-content:center" onclick="showAdminLoginScreen()">← Back to Admin Login</button>
     </div>
   </div>`;
-  setTimeout(()=>document.getElementById('plant-login-select')?.focus(), 50);
+  setTimeout(()=>document.getElementById('plant-email-input')?.focus(), 50);
+}
+
+/**
+ * _autoSelectPlantByEmail(email)
+ * When the user types their email on the plant login screen, automatically
+ * select the matching plant in the dropdown (based on plant.owners).
+ */
+function _autoSelectPlantByEmail(email) {
+  const norm = (email || '').trim().toLowerCase();
+  if (!norm || !norm.includes('@')) return;
+  const groups = getPlantGroups();
+  const match = groups.find(p =>
+    (p.owners || []).map(e => e.trim().toLowerCase()).includes(norm)
+  );
+  const sel = document.getElementById('plant-login-select');
+  if (match && sel) {
+    sel.value = match.id;
+  }
 }
 
 function plantOwnerLogin(){
-  const plantId = document.getElementById('plant-login-select').value;
-  const entered = document.getElementById('plant-pwd-input').value;
-  const err = document.getElementById('plant-login-error');
+  const plantId     = document.getElementById('plant-login-select').value;
+  const enteredEmail= (document.getElementById('plant-email-input')?.value || '').trim().toLowerCase();
+  const entered     = document.getElementById('plant-pwd-input').value;
+  const err         = document.getElementById('plant-login-error');
 
-  if(!plantId || !entered){ err.style.display='block'; return; }
+  if(!enteredEmail){ err.textContent='❌ Enter your email address.'; err.style.display='block'; return; }
+  if(!plantId){ err.textContent='❌ Select your plant.'; err.style.display='block'; return; }
+  if(!entered){ err.textContent='❌ Enter your password.'; err.style.display='block'; return; }
 
   const groups = getPlantGroups();
-  const plant = groups.find(p=>p.id===plantId);
-  if(!plant){ err.style.display='block'; return; }
+  let plant = groups.find(p=>p.id===plantId);
+  if(!plant){ err.textContent='❌ Plant not found.'; err.style.display='block'; return; }
+
+  // Validate that the entered email is registered as an owner of the selected plant
+  const plantOwners = (plant.owners || []).map(e => e.trim().toLowerCase()).filter(Boolean);
+  if(plantOwners.length > 0 && !plantOwners.includes(enteredEmail)){
+    err.textContent='❌ This email is not registered as an owner of the selected plant.';
+    err.style.display='block'; return;
+  }
 
   const doLogin = async (storedPwd) => {
     const bfId='plant_'+plantId;
@@ -5391,6 +5428,7 @@ function plantOwnerLogin(){
     adminAuthenticated = false;
     currentPlantSession = plant;
     _activePlantId = plant.id;
+    _plantOwnerEmail = enteredEmail; // store the specific email used to log in
     document.body.classList.add('plant-owner-mode');
 
     // Show admin-nav so plant nav items are visible, but hide top-level admin items
@@ -5409,6 +5447,7 @@ function plantOwnerLogin(){
     document.getElementById('topbar-title').textContent = '🏭 '+plant.name;
 
     toast('Welcome, '+plant.name+' Owner! 🏭');
+    _renderTopbarUserBadge();
     renderPlantNav();
     showPlantPanel(plant.id);
   };
@@ -5547,6 +5586,7 @@ function exitImpersonation(){
   if(!confirm('Exit plant owner view and return to super admin?')) return;
   plantOwnerAuthenticated = false;
   currentPlantSession = null;
+  _plantOwnerEmail = '';
   sessionStorage.removeItem('pg_impersonate_return');
   adminAuthenticated = true;
   document.body.classList.remove('plant-owner-mode');
@@ -6069,7 +6109,26 @@ async function unifiedLogin() {
     return;
   }
 
-  // ── 2. Check admin / user accounts stored in Firestore ─────────────
+  // ── 2. Check if email matches a plant owner ─────────────────────────
+  const _plantGroups = getPlantGroups();
+  const _matchedPlant = _plantGroups.find(p =>
+    (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
+  );
+  if (_matchedPlant) {
+    // Redirect to plant owner login screen with email pre-filled
+    showPlantOwnerLoginScreen();
+    setTimeout(() => {
+      const emailInp = document.getElementById('plant-email-input');
+      const plantSel = document.getElementById('plant-login-select');
+      const pwdInp   = document.getElementById('plant-pwd-input');
+      if (emailInp) { emailInp.value = email; }
+      if (plantSel) { plantSel.value = _matchedPlant.id; }
+      if (pwdInp)   { pwdInp.value = pwd; plantOwnerLogin(); }
+    }, 80);
+    return;
+  }
+
+  // ── 3. Check admin / user accounts stored in Firestore ─────────────
   const bfKey = 'user:' + email;
   const bf = await _bfCheck(bfKey);
   if (bf.locked) {
@@ -7062,11 +7121,21 @@ function _setSettingsNavVisible(visible) {
 
 function _renderTopbarUserBadge() {
   if (!currentSession) {
-    // Superadmin: show "Super Admin" in topbar
     const nameEl  = document.getElementById('topbar-user-name');
     const emailEl = document.getElementById('topbar-user-email');
     const avatar  = document.getElementById('topbar-avatar');
     const info    = document.getElementById('topbar-user-info');
+    // Plant owner logged in — show their email
+    if (plantOwnerAuthenticated && currentPlantSession) {
+      const poEmail = _plantOwnerEmail || getPlantOwnerLoginHint() || '';
+      const poName  = currentPlantSession.name || 'Plant Owner';
+      if (nameEl)  nameEl.textContent  = poName + ' (Plant Owner)';
+      if (emailEl) emailEl.textContent = poEmail;
+      if (avatar)  { avatar.textContent = poName[0].toUpperCase(); avatar.title = poEmail; }
+      if (info)    info.style.display = 'flex';
+      return;
+    }
+    // Superadmin: show "Super Admin" in topbar
     if (nameEl)  nameEl.textContent  = 'Super Admin';
     if (emailEl) emailEl.textContent = localStorage.getItem('admin_notify_email') || '';
     if (avatar)  { avatar.textContent = 'S'; avatar.title = 'Super Admin'; }
