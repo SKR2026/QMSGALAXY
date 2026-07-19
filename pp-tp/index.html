@@ -1839,13 +1839,30 @@ function getTask(id) { return tasks.find(t=>t.id===id); }
 // An assignee logged into their own account (mode==='user') can only delete
 // tasks they personally added for themselves (t.assignedBy is unset) — they
 // can NEVER delete a task that was assigned to them by an admin/plant owner.
+// A "restricted assignee" is either the legacy email-only My-Tasks login
+// (mode==='user') or a real registered account with role 'user'
+// (currentSession-based). Both are ordinary team members who should only
+// ever be able to delete tasks they personally added for themselves.
+function _isRestrictedAssignee(){
+  return mode==='user' || (currentSession && currentSession.role==='user');
+}
+function _restrictedAssigneeEmail(){
+  if(currentSession) return (currentSession.email||'').toLowerCase();
+  return (userEmail||'').toLowerCase();
+}
 function canDeleteTask(t){
   if(!t) return false;
   if(plantOwnerAuthenticated && currentPlantSession){
     return !!(t.plant && t.plant === currentPlantSession.id);
   }
-  if(mode==='user'){
-    return !t.assignedBy;
+  if(_isRestrictedAssignee()){
+    // Deny by default — only allow when the task was provably self-added
+    // (assignedBy explicitly equals the assignee's own email). A missing
+    // assignedBy (legacy data, bulk uploads, etc.) must NOT be treated as
+    // "self-created" — that previously let assignees delete tasks that
+    // were actually assigned to them by someone else.
+    const me=_restrictedAssigneeEmail();
+    return !!(me && t.assignedBy && t.assignedBy.toLowerCase()===me);
   }
   return true;
 }
@@ -9086,7 +9103,7 @@ function editFromDrawer(id){
 
 function deleteTaskFromDrawer(id){
   const t0=getTask(id);
-  if(!canDeleteTask(t0)){ toast(mode==='user'?'This task was assigned to you — only the person who assigned it can delete it.':'You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
+  if(!canDeleteTask(t0)){ toast(_isRestrictedAssignee()?'This task was assigned to you — only the person who assigned it can delete it.':'You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task permanently? This cannot be undone.'))return;
   tasks=tasks.filter(t=>t.id!==id);
   localStorage.setItem('tf_tasks',JSON.stringify(tasks));
@@ -9766,7 +9783,7 @@ function quickStatusCycle(id){
   const LABEL_TO_FILTER = {'All':'all','To Do':'To Do','In Progress':'In Progress','Review':'Review','Done':'Done','Overdue':'overdue'};
   const currentFilter = lbl ? (LABEL_TO_FILTER[lbl.textContent] || 'all') : 'all';
   if(document.getElementById('my-task-list')){
-    const se = plantOwnerAuthenticated&&currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : (mode==='user'?(userEmail||''):(localStorage.getItem('self_email')||''));
+    const se = plantOwnerAuthenticated&&currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : (currentSession ? currentSession.email : mode==='user'?(userEmail||''):(localStorage.getItem('self_email')||''));
     renderMyTaskList(se, currentFilter);
     refreshOverdueBadge();
   } else {
@@ -9776,7 +9793,7 @@ function quickStatusCycle(id){
 
 function deleteMyTask(id){
   const t0=getTask(id);
-  if(!canDeleteTask(t0)){ toast(mode==='user'?'This task was assigned to you — only the person who assigned it can delete it.':'You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
+  if(!canDeleteTask(t0)){ toast(_isRestrictedAssignee()?'This task was assigned to you — only the person who assigned it can delete it.':'You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task?')) return;
   tasks=tasks.filter(t=>t.id!==id);
   localStorage.setItem('tf_tasks',JSON.stringify(tasks));
@@ -9784,14 +9801,16 @@ function deleteMyTask(id){
   const lbl = document.getElementById('mytasks-filter-label');
   const LABEL_TO_FILTER = {'All':'all','To Do':'To Do','In Progress':'In Progress','Review':'Review','Done':'Done','Overdue':'overdue'};
   const currentFilter = lbl ? (LABEL_TO_FILTER[lbl.textContent] || 'all') : 'all';
-  const se = mode==='user'?(userEmail||''):(plantOwnerAuthenticated?((currentPlantSession?.owners||[])[0]||''):(localStorage.getItem('self_email')||''));
+  const se = currentSession ? currentSession.email : mode==='user'?(userEmail||''):(plantOwnerAuthenticated?((currentPlantSession?.owners||[])[0]||''):(localStorage.getItem('self_email')||''));
   renderMyTaskList(se, currentFilter);
   refreshOverdueBadge();
   toast('Deleted');
 }
 
 function openSelfTaskModal(editId){
-  const selfEmail=mode==='user'?(userEmail||''):(localStorage.getItem('self_email')||'');
+  const selfEmail = currentSession ? currentSession.email
+    : mode==='user' ? (userEmail||'')
+    : (localStorage.getItem('self_email')||'');
   if(!selfEmail&&mode==='admin'){toast('Set your identity first in the My Tasks page','var(--amber)');return;}
   const t=editId?getTask(editId):null;
   const html=`
@@ -9853,7 +9872,7 @@ function saveSelfTask(editId,selfEmail){
     toast('Task updated ✅');
   } else {
     const nt={id:uid(),title,desc:document.getElementById('st-desc').value,
-      assignee:selfEmail,priority:document.getElementById('st-priority').value,
+      assignee:selfEmail,assignedBy:selfEmail,priority:document.getElementById('st-priority').value,
       status:document.getElementById('st-status').value,
       due,created:today(),token:uid(),replies:[],attachments:[],
       reminder:document.getElementById('st-reminder').value,tags,
@@ -10041,11 +10060,21 @@ function buildBulkTask(row){
   const tags = Array.isArray(rawTags)
     ? rawTags.map(t=>t.trim()).filter(Boolean)
     : rawTags.split(/[;|]|(?<![a-z]),/i).map(t=>t.trim()).filter(Boolean);
+  // Who is doing the bulk upload — same resolution used for single-task creation
+  // in saveTask(), so canDeleteTask() can correctly tell "assigned to me" apart
+  // from "I created this myself" for the assignee.
+  const _poHint = getPlantOwnerLoginHint();
+  const _poEmail = _poHint || (plantOwnerAuthenticated && currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : '');
+  const _assignedByEmail = _poEmail
+    || (currentSession ? currentSession.email : '')
+    || localStorage.getItem('admin_notify_email')
+    || 'superadmin';
   return {
     id: uid(),
     title: (row.title||row.task_title||'').trim(),
     desc: (row.description||row.desc||'').trim(),
     assignee: (row.assignee||row.email||row.assigned_to||'').trim(),
+    assignedBy: _assignedByEmail,
     priority: prio,
     status: status,
     due: (()=>{ const raw=(row.due||row.due_date||row.deadline||'').trim(); const dm=raw.match(/^(\d{2})-(\d{2})-(\d{4})$/); return dm?dm[3]+'-'+dm[2]+'-'+dm[1]:raw; })(),
@@ -10757,7 +10786,7 @@ function exportPDF(){
   const statRate    = exportList.length ? Math.round(statDone / exportList.length * 100) : 0;
   const statToDo    = exportList.filter(t => t.status === 'To Do').length;
   const statReview  = exportList.filter(t => t.status === 'Review').length;
-  const selfEmail   = mode === 'user' ? (userEmail || '') : (localStorage.getItem('self_email') || '');
+  const selfEmail   = currentSession ? currentSession.email : mode === 'user' ? (userEmail || '') : (localStorage.getItem('self_email') || '');
   const statMyTasks = exportList.filter(t => {
     if(plantOwnerAuthenticated && currentPlantSession){
       const oe = (currentPlantSession.owners || []).map(e => e.toLowerCase());
