@@ -1064,6 +1064,24 @@ let _db = null;
 let _fbReady = false;
 let _unsubscribeTasks = null;
 
+// ── Wait for Firebase anonymous-auth readiness (with a timeout) ────────
+// Login can complete before the async signInAnonymously() call resolves,
+// which previously caused _ensureAppUsersLoaded()/_loadGroupMemberEmails()
+// to bail out silently (see their `if (!_fbReady) return;` guards) and the
+// global member chip bar to be left showing only "self" — no group members.
+// This polls _fbReady for up to maxWaitMs instead of failing immediately.
+function _waitForFbReady(maxWaitMs) {
+  maxWaitMs = maxWaitMs || 8000;
+  return new Promise(resolve => {
+    if (_fbReady) { resolve(true); return; }
+    const start = Date.now();
+    const iv = setInterval(() => {
+      if (_fbReady) { clearInterval(iv); resolve(true); }
+      else if (Date.now() - start > maxWaitMs) { clearInterval(iv); resolve(false); }
+    }, 150);
+  });
+}
+
 (function initFirebase() {
   const s1 = document.createElement('script');
   s1.src = 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js';
@@ -1818,10 +1836,16 @@ function getTask(id) { return tasks.find(t=>t.id===id); }
 // by t.plant === currentPlantSession.id). Tasks assigned to a plant admin
 // BY the superadmin (no matching plant tag) cannot be deleted by that plant admin.
 // Superadmin (not logged in as a plant owner) can always delete.
+// An assignee logged into their own account (mode==='user') can only delete
+// tasks they personally added for themselves (t.assignedBy is unset) — they
+// can NEVER delete a task that was assigned to them by an admin/plant owner.
 function canDeleteTask(t){
   if(!t) return false;
   if(plantOwnerAuthenticated && currentPlantSession){
     return !!(t.plant && t.plant === currentPlantSession.id);
+  }
+  if(mode==='user'){
+    return !t.assignedBy;
   }
   return true;
 }
@@ -2621,6 +2645,7 @@ function getPlantGroups(){
 // For admin/user roles that don't visit Settings, load it here on demand.
 async function _ensureAppUsersLoaded() {
   if (_allAppUsers && _allAppUsers.length) return; // already loaded
+  await _waitForFbReady();
   if (!_fbReady || !_db) return;
   try {
     const snap = await _db.collection('appUsers').orderBy('email').limit(250).get();
@@ -2641,6 +2666,7 @@ function getNickForEmail(email) {
 }
 // Preload nicknames from appUsers into cache
 async function _preloadNicknames() {
+  await _waitForFbReady();
   if (!_fbReady || !_db) return;
   try {
     const snap = await _db.collection('appUsers').get();
@@ -6048,13 +6074,15 @@ async function overlayAdminLogin(){
       const _saNotifEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
       if(_saNotifEmail) _startNotifListener(_saNotifEmail);
       // ── Load group members + build member bar (same as admin path) ───
+      // Show self chip immediately, then upgrade once group members load —
+      // _ensureAppUsersLoaded/_loadGroupMemberEmails now wait internally for
+      // Firebase readiness instead of silently skipping when called too early.
+      buildGlobalMemberBar();
       const _saKey = (localStorage.getItem('admin_notify_email')||'').trim();
-      if(_saKey && _fbReady && _db) {
+      if(_saKey) {
         _ensureAppUsersLoaded().then(() => {
           _loadGroupMemberEmails(_saKey).then(() => { refreshOverdueBadge(); });
         });
-      } else {
-        buildGlobalMemberBar();
       }
       toast('Welcome back, Super Admin! 👋');
       showPanel('dashboard');
@@ -7019,6 +7047,7 @@ function _setAllChips(container, activeEmail) {
 async function _loadGroupMemberEmails(adminEmail) {
   _myGroupMemberEmails = [];
   _myGroupPendingEmails = [];
+  await _waitForFbReady();
   if (!_fbReady || !_db) return;
   try {
     const groups = await _loadMyGroups(adminEmail);
@@ -7129,13 +7158,12 @@ function _activateRoleSession(role) {
   // For admin/user role sessions (currentSession is set), groups are already
   // loaded inside their respective role branches above — skip this block.
   if(!currentSession) {
+    buildGlobalMemberBar();
     const _saEmail = (localStorage.getItem('admin_notify_email')||'').trim();
-    if(_saEmail && _fbReady && _db) {
+    if(_saEmail) {
       _ensureAppUsersLoaded().then(() => {
         _loadGroupMemberEmails(_saEmail).then(() => { refreshOverdueBadge(); });
       });
-    } else {
-      buildGlobalMemberBar();
     }
   }
 }
@@ -9058,7 +9086,7 @@ function editFromDrawer(id){
 
 function deleteTaskFromDrawer(id){
   const t0=getTask(id);
-  if(!canDeleteTask(t0)){ toast('You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
+  if(!canDeleteTask(t0)){ toast(mode==='user'?'This task was assigned to you — only the person who assigned it can delete it.':'You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task permanently? This cannot be undone.'))return;
   tasks=tasks.filter(t=>t.id!==id);
   localStorage.setItem('tf_tasks',JSON.stringify(tasks));
@@ -9710,7 +9738,7 @@ function renderMyTaskList(selfEmail, filter='all'){
         ${!isPlantOwner?`<button class="btn btn-ghost btn-sm" title="Edit" onclick="openSelfTaskModal('${t.id}')">✏</button>`:''}
         <button class="btn btn-ghost btn-sm" style="color:var(--cyan)" title="Next status" onclick="quickStatusCycle('${t.id}')">▶</button>
         <button class="btn btn-ghost btn-sm" onclick="openDrawer('${t.id}')">👁</button>
-        ${(!isPlantOwner||canDeleteTask(t))?`<button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteMyTask('${t.id}')" title="${isPlantOwner?'Delete task you assigned':'Delete'}">🗑</button>`:`<button class="btn btn-ghost btn-sm" disabled title="Assigned by superadmin — cannot be deleted" style="opacity:.3;cursor:not-allowed;color:var(--red)">🗑</button>`}
+        ${canDeleteTask(t)?`<button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteMyTask('${t.id}')" title="${isPlantOwner?'Delete task you assigned':'Delete'}">🗑</button>`:`<button class="btn btn-ghost btn-sm" disabled title="${isPlantOwner?'Assigned by superadmin — cannot be deleted':'This task was assigned to you — only the person who assigned it can delete it'}" style="opacity:.3;cursor:not-allowed;color:var(--red)">🗑</button>`}
       </div>
     </div>`;
   }).join('');
@@ -9748,7 +9776,7 @@ function quickStatusCycle(id){
 
 function deleteMyTask(id){
   const t0=getTask(id);
-  if(!canDeleteTask(t0)){ toast('You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
+  if(!canDeleteTask(t0)){ toast(mode==='user'?'This task was assigned to you — only the person who assigned it can delete it.':'You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task?')) return;
   tasks=tasks.filter(t=>t.id!==id);
   localStorage.setItem('tf_tasks',JSON.stringify(tasks));
