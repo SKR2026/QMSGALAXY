@@ -3780,6 +3780,7 @@ function renderSettings(){
           <option value="">All statuses</option>
           <option value="active">Active</option>
           <option value="disabled">Disabled</option>
+          <option value="removed">Removed</option>
         </select>
       </div>
       <div id="user-count-label" style="font-size:11px;color:var(--text3);margin-bottom:8px"></div>
@@ -5898,6 +5899,7 @@ async function overlayAdminLogin(){
     const u = snap.data();
     if (u.status === 'pending') { if(err){err.textContent='❌ Account pending. Check your email.';err.style.display='block';} return; }
     if (u.status === 'disabled') { if(err){err.textContent='❌ Account disabled. Contact Super Admin.';err.style.display='block';} return; }
+    if (u.status === 'removed') { if(err){err.textContent='❌ Account removed. Contact Super Admin to restore access.';err.style.display='block';} return; }
 
     const isFirstLogin = u.mustChangePassword === true;
     const ok = isFirstLogin
@@ -5995,6 +5997,9 @@ async function unifiedLogin() {
     }
     if (u.status === 'disabled') {
       err.textContent = '❌ Your account has been disabled. Contact Super Admin.'; err.style.display='block'; return;
+    }
+    if (u.status === 'removed') {
+      err.textContent = '❌ Your account was removed. Contact Super Admin to restore access.'; err.style.display='block'; return;
     }
 
     // Verify password
@@ -7468,8 +7473,10 @@ async function _sendGroupRequest(adminEmail) {
   try {
     // Load user info
     const userSnap = await _db.collection('appUsers').doc(userEmail).get();
-    if (!userSnap.exists) { st.textContent='❌ User not found in system.'; st.style.color='var(--red)'; return; }
+    if (!userSnap.exists) { st.textContent='❌ No registered account for this email. Send them a registration link first.'; st.style.color='var(--red)'; return; }
     const userData = userSnap.data();
+    if (userData.status === 'removed') { st.textContent='⚠ This account was removed. Ask Super Admin to restore it before sending a request.'; st.style.color='var(--amber)'; return; }
+    if (userData.status === 'disabled') { st.textContent='⚠ This account is disabled. Ask Super Admin to re-enable it before sending a request.'; st.style.color='var(--amber)'; return; }
 
     // Load admin's groups
     const groups = await _loadMyGroups(adminEmail);
@@ -7765,13 +7772,16 @@ function _renderUserPage() {
             <div style="font-weight:600;font-size:13px">${esc(u.nickname||'—')} <span style="background:rgba(91,141,238,.15);color:var(--accent);border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">${esc(u.role||'user')}</span></div>
             <div style="font-size:11px;color:var(--text3)">${esc(u.email)}</div>
           </div>
-          <div style="font-size:11px;color:${u.status==='active'?'var(--green)':'var(--amber)'};margin-right:2px;">${esc(u.status||'active')}</div>
+          <div style="font-size:11px;color:${u.status==='active'?'var(--green)':u.status==='removed'?'var(--red)':'var(--amber)'};margin-right:2px;">${esc(u.status||'active')}</div>
           ${isSuperAdmin() ? `<select class="form-select" style="font-size:11px;padding:3px 6px;width:auto;" onchange="_changeAppUserRole('${esc(u.email)}',this.value)">
             <option value="user"${(u.role||'user')==='user'?' selected':''}>User</option>
             <option value="admin"${u.role==='admin'?' selected':''}>Admin</option>
           </select>` : ''}
-          <button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="_toggleAppUser('${esc(u.email)}','${esc(u.status||'active')}')">${(u.status||'active')==='active'?'Disable':'Enable'}</button>
-          <button class="btn btn-danger btn-sm" style="font-size:11px" title="Permanently delete this account" onclick="_deleteAppUser('${esc(u.email)}','${esc(u.nickname||u.email)}')">🗑</button>
+          ${u.status==='removed'
+            ? `<button class="btn btn-primary btn-sm" style="font-size:11px" title="Restore this account so it can log in and receive requests again" onclick="_restoreAppUser('${esc(u.email)}')">↩ Restore</button>
+               <button class="btn btn-danger btn-sm" style="font-size:11px" title="Permanently delete this account — cannot be undone" onclick="_purgeAppUser('${esc(u.email)}','${esc(u.nickname||u.email)}')">🗑</button>`
+            : `<button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="_toggleAppUser('${esc(u.email)}','${esc(u.status||'active')}')">${(u.status||'active')==='active'?'Disable':'Enable'}</button>
+               <button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--red)" title="Remove this account — keeps their record but blocks login until restored" onclick="_deleteAppUser('${esc(u.email)}','${esc(u.nickname||u.email)}')">Remove</button>`}
         </div>`).join('');
     }
   }
@@ -7802,14 +7812,46 @@ function _goUserPage(page) {
   _renderUserPage();
 }
 
+// _deleteAppUser is a SOFT remove: the account is blocked from logging in, but
+// the appUsers doc is kept (status:'removed') instead of being deleted from
+// Firestore. This matters because emails, group-invite lookups ("resend
+// request"), and the superadmin's user list all key off that document existing —
+// hard-deleting it used to make later actions fail with "User not found in
+// system" even though the person was a real, still-registered user. Use
+// _purgeAppUser (available once a user is already 'removed') for a true,
+// irreversible delete.
 async function _deleteAppUser(email, displayName) {
-  if (!confirm('Permanently delete ' + displayName + ' (' + email + ')? This cannot be undone.')) return;
+  if (!confirm('Remove ' + displayName + ' (' + email + ')? They will be blocked from logging in and from receiving group requests until restored. Their record is kept so you can restore them later — use the 🗑 Delete option (after removing) if you want to erase them permanently instead.')) return;
+  try {
+    await _db.collection('appUsers').doc(email).set({ status: 'removed', removedAt: new Date().toISOString() }, { merge: true });
+    const u = _allAppUsers.find(u => u.email === email);
+    if (u) { u.status = 'removed'; u.removedAt = new Date().toISOString(); }
+    _renderUserPage();
+    toast('Account removed: ' + email + ' (restorable)', 'var(--amber)');
+  } catch(e) { toast('❌ Remove failed: ' + e.message, 'var(--red)'); }
+}
+
+async function _restoreAppUser(email) {
+  if (!confirm('Restore ' + email + '? They will be able to log in again and can receive group requests.')) return;
+  try {
+    await _db.collection('appUsers').doc(email).set({ status: 'active', removedAt: firebase.firestore.FieldValue.delete() }, { merge: true });
+    const u = _allAppUsers.find(u => u.email === email);
+    if (u) { u.status = 'active'; delete u.removedAt; }
+    _renderUserPage();
+    toast('✅ Account restored: ' + email, 'var(--green)');
+  } catch(e) { toast('❌ Restore failed: ' + e.message, 'var(--red)'); }
+}
+
+// True permanent delete — only reachable once an account is already 'removed',
+// so nobody can accidentally erase an active user's record by mistaking this
+// for the ordinary "remove from list" action.
+async function _purgeAppUser(email, displayName) {
+  if (!confirm('Permanently delete ' + displayName + ' (' + email + ')? This cannot be undone and cannot be restored.')) return;
   try {
     await _db.collection('appUsers').doc(email).delete();
-    // Remove from local cache
     _allAppUsers = _allAppUsers.filter(u => u.email !== email);
     _renderUserPage();
-    toast('🗑 Account deleted: ' + email, 'var(--red)');
+    toast('🗑 Account permanently deleted: ' + email, 'var(--red)');
   } catch(e) { toast('❌ Delete failed: ' + e.message, 'var(--red)'); }
 }
 
