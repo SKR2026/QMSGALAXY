@@ -1913,21 +1913,41 @@ function normalizeRole(raw) {
   return null; // not a recognized admin-ish role
 }
 
-/** Load the Firestore user doc and show the admin shell (or error). */
+/** Load the Firestore user doc and show the admin shell (or error).
+ *
+ *  MULTI-APP ISOLATION FIX (2025):
+ *  This app (ExamPro) and the KPI Dashboard share the same Firebase project
+ *  and the same /users/{uid} collection.  To prevent one app's role assignment
+ *  from overriding the other's, ExamPro now reads and writes the dedicated
+ *  field  examRole  instead of the shared  role  field.
+ *
+ *  Read priority:  examRole  (ExamPro-specific)  →  role  (legacy / fallback)
+ *  Writes always go to  examRole  only.  The shared  role  field is never
+ *  touched by ExamPro so KPI Dashboard roles are fully preserved.
+ */
 function resolveAdminUser(user) {
   if (!user) { hideAll(); show('vAdmLog'); return; }
   DB().collection('users').doc(user.uid).get()
     .then(function(doc) {
       if (doc.exists) {
         var d = doc.data();
-        var canonicalRole = normalizeRole(d.role);
+        // ── App-isolated role resolution ──────────────────────────────
+        // Prefer examRole (ExamPro-specific field). Fall back to the
+        // shared role field ONLY if examRole is absent — this handles
+        // users created before the multi-app isolation fix.
+        var rawRole = d.examRole || d.role;
+        var canonicalRole = normalizeRole(rawRole);
         if (canonicalRole) {
-          // If the stored value wasn't already the canonical form, fix it in
-          // Firestore so future reads (and any reporting/queries) are clean.
-          var fixPromise = (d.role !== canonicalRole)
-            ? DB().collection('users').doc(user.uid).update({ role: canonicalRole })
+          // Migrate: if examRole is missing, write it now so future logins
+          // use the app-specific field and no longer touch the shared role.
+          var migrations = {};
+          if (!d.examRole) migrations.examRole = canonicalRole;
+          // Correct examRole if it wasn't already in canonical form.
+          else if (d.examRole !== canonicalRole) migrations.examRole = canonicalRole;
+          var fixPromise = Object.keys(migrations).length
+            ? DB().collection('users').doc(user.uid).update(migrations)
             : Promise.resolve();
-          fixPromise.catch(function(e){ console.warn('Role auto-correct failed:', e.message); })
+          fixPromise.catch(function(e){ console.warn('examRole migration failed:', e.message); })
             .then(function(){
               // Populate CURRENT_USER global
               CURRENT_USER.role        = canonicalRole;
@@ -1942,21 +1962,23 @@ function resolveAdminUser(user) {
               } else {
                 CURRENT_USER.plants  = d.plant ? [d.plant] : [];
               }
-              CURRENT_USER.displayName = d.displayName || (d.email||'').split('@')[0];
+              CURRENT_USER.displayName = d.displayName || d.name || (d.email||'').split('@')[0];
               CURRENT_USER.email       = d.email || user.email || '';
               CURRENT_USER.uid         = user.uid;
-              d.role = canonicalRole;
+              d.role = canonicalRole; // ensure showAdmin() gets canonical value
               showAdmin(d);
             });
         } else {
-          showE('aErr', 'Account role is "' + (d.role||'not set') + '". Must be "admin" or "super_admin".');
+          showE('aErr', 'No ExamPro role assigned. examRole/role is "' + (rawRole||'not set') + '". An admin must assign you a role in ExamPro.');
           hideAll(); show('vAdmLog');
         }
       } else {
-        // Auto-create user doc with super_admin role on first login
+        // Auto-create user doc with super_admin examRole on first login.
+        // NOTE: we set examRole (not role) so KPI Dashboard is unaffected.
         showE('aErr', 'No profile found — creating one now...');
         DB().collection('users').doc(user.uid).set({
-          role: 'super_admin',
+          examRole: 'super_admin',
+          role: 'super_admin', // kept for any legacy tooling
           displayName: user.displayName || user.email.split('@')[0],
           email: user.email,
           createdAt: firebase.firestore.FieldValue.serverTimestamp()
@@ -5627,7 +5649,9 @@ function renderUserMgmt() {
     var users = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
     users.sort(function(a,b){ return (a.email||'').localeCompare(b.email||''); });
     var rows = users.map(function(u) {
-      var isSA = u.role === 'super_admin';
+      // Use examRole (app-specific); fall back to shared role for legacy docs
+      var resolvedRole = u.examRole || u.role || '';
+      var isSA = resolvedRole === 'super_admin';
       var isMultiPlant = Array.isArray(u.plants) && u.plants.length > 1;
       var roleTag = isSA
         ? '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd)">⭐ Super Admin</span>'
@@ -5742,10 +5766,11 @@ function createPlantAdmin() {
     if (data.error) { showAdmErr(data.error.message||'Firebase error'); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} return; }
     var uid = data.localId;
     var userDoc = {
-      role: 'admin',
+      examRole: 'admin',  // ExamPro-specific field — never conflicts with kpiRole
       plant: pl,
       plants: plants,
       displayName: nm,
+      name: nm,           // KPI Dashboard reads 'name'; ExamPro reads 'displayName'
       email: em,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       createdBy: CURRENT_USER.uid || ''
@@ -5827,7 +5852,9 @@ function openEditAdminUser(uid) {
   DB().collection('users').doc(uid).get().then(function(doc) {
     if (!doc.exists) { toast('User not found.', 'er'); return; }
     var u = doc.data();
-    var isSA = u.role === 'super_admin';
+    // Read examRole (app-specific) first; fall back to shared role for legacy docs
+    var resolvedRole = u.examRole || u.role || '';
+    var isSA = resolvedRole === 'super_admin';
     var isMulti = Array.isArray(u.plants) && u.plants.length > 1;
     var currentRole = isSA ? 'super_admin' : (isMulti ? 'multi' : 'plant');
     var currentPlant = u.plant || '';
@@ -5906,15 +5933,15 @@ function saveEditAdminUser() {
       pl = (G('editAdmPlant')||{}).value || '';
       if (!pl) { showErr('Select a plant.'); return; }
       plants = [pl];
-      update.role   = 'admin';
-      update.plant  = pl;
-      update.plants = plants;
+      update.examRole = 'admin'; // ExamPro-specific — does not touch kpiRole
+      update.plant    = pl;
+      update.plants   = plants;
     } else {
       document.querySelectorAll('.editAdmPChk:checked').forEach(function(cb){ plants.push(cb.value); });
       if (!plants.length) { showErr('Select at least one plant.'); return; }
-      update.role   = 'admin';
-      update.plant  = '';
-      update.plants = plants;
+      update.examRole = 'admin'; // ExamPro-specific — does not touch kpiRole
+      update.plant    = '';
+      update.plants   = plants;
     }
   }
 
