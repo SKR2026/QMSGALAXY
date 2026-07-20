@@ -1306,22 +1306,12 @@ function plantQuery(colRef) {
 function normPlant(x){ return (x||'').toString().trim().toLowerCase(); }
 function samePlant(a, b){ return normPlant(a) === normPlant(b); }
 
-/** Client-side attempt filter — supports single-plant and multi-plant admins.
- *  An attempt is included if EITHER:
- *    (a) the candidate's plantLocation matches this admin's plant, OR
- *    (b) the attempt belongs to an exam that is assigned to this admin's plant
- *        (covers cases where plantLocation on the attempt/candidate is blank). */
-function filterAttemptsByPlant(attempts, candsMapAll, examsMap) {
+/** Client-side attempt filter — supports single-plant and multi-plant admins. */
+function filterAttemptsByPlant(attempts, candsMapAll) {
   if (isSuperAdmin()) return attempts;
   return attempts.filter(function(a){
-    // (a) candidate plant match
     var p = a.plantLocation || (candsMapAll && candsMapAll[a.candidateId] && candsMapAll[a.candidateId].plantLocation) || '';
-    if (p && userCanSeePlant(p)) return true;
-    // (b) exam-assignment fallback: if the exam for this attempt is assigned to our plant
-    if (examsMap && a.examId && examsMap[a.examId]) {
-      return examAppliesToPlant(examsMap[a.examId], CURRENT_USER.plant);
-    }
-    return false;
+    return userCanSeePlant(p);
   });
 }
 
@@ -2078,10 +2068,7 @@ function pgDash(plantFilter) {
     if (!isSuperAdmin()) {
       var candsMapAll = {};
       candsAllSnap.docs.forEach(function(d){ candsMapAll[d.id]=d.data(); });
-      // Build exams map for fallback exam-assignment filter
-      var examsMapDash = {};
-      eSraw.docs.forEach(function(d){ examsMapDash[d.id]=d.data(); });
-      allAtts = filterAttemptsByPlant(allAttsRaw, candsMapAll, examsMapDash);
+      allAtts = filterAttemptsByPlant(allAttsRaw, candsMapAll);
     }
 
     // ── Plant tab strip (super admin only) ──────────────────
@@ -4094,10 +4081,9 @@ function pgResults() {
     DB().collection('candidates').get(),
     DB().collection('questions').where('isActive','==',true).get()
   ]).then(function(res){
-    var exams={}, allExamsMap={}, cands={}, questions={};
+    var exams={}, cands={}, questions={};
     res[0].docs.forEach(function(d){
       var ex = d.data();
-      allExamsMap[d.id] = ex; // full map used as fallback in filterAttemptsByPlant
       if (isSuperAdmin() || examAppliesToPlant(ex, CURRENT_USER.plant)) exams[d.id]=ex;
     });
     res[2].docs.forEach(function(d){cands[d.id]=d.data();});
@@ -4105,9 +4091,7 @@ function pgResults() {
 
     var attsRaw = res[1].docs.map(function(d){return Object.assign({id:d.id},d.data());})
                           .filter(function(a){return a.status==='completed';});
-    // Pass allExamsMap so attempts whose candidate has a blank plant but whose exam
-    // is assigned to this plant admin's plant are still included in results.
-    var atts = isSuperAdmin() ? attsRaw : filterAttemptsByPlant(attsRaw, cands, allExamsMap);
+    var atts = isSuperAdmin() ? attsRaw : filterAttemptsByPlant(attsRaw, cands);
     atts.sort(function(a,b){return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0);});
     window._ra=atts; window._re=exams; window._rc=cands; window._rq=questions;
 
@@ -4166,9 +4150,9 @@ function pgResults() {
     if (!isSuperAdmin() && atts.length === 0 && attsRaw.length > 0) {
       diagBanner =
         '<div style="background:var(--ambg);border:1px solid var(--ambd);border-radius:9px;padding:12px 14px;margin-bottom:14px;font-size:13px;color:var(--am);line-height:1.6">'+
-          '⚠️ There are <strong>'+attsRaw.length+'</strong> completed exam result(s) in the system, but none are visible to your plant (<strong>'+esc(CURRENT_USER.plant||'—')+'</strong>). '+
-          'This can happen for two reasons: (1) The employees\' candidate records have a different or blank plant name — ask your Super Admin to open <strong>Candidates → ⚠️ Fix Missing Plants</strong>; '+
-          'or (2) The exam was not assigned to your plant — ask your Super Admin to edit the exam and check your plant in the <strong>Applicable Plant(s)</strong> list.'+
+          '⚠️ There are <strong>'+attsRaw.length+'</strong> completed exam result(s) in the system, but none are matched to your plant (<strong>'+esc(CURRENT_USER.plant||'—')+'</strong>). '+
+          'This usually means the employees\' candidate records have a different (or blank) plant name than your account. '+
+          'Ask your Super Admin to open <strong>Candidates → ⚠️ Fix Missing Plants</strong> and assign these employees to "'+esc(CURRENT_USER.plant||'—')+'". Their results will then appear here automatically.'+
         '</div>';
     }
 
@@ -4683,10 +4667,9 @@ function pgCerts() {
     isSuperAdmin() ? Promise.resolve(null) : DB().collection('candidates').get()
   ])
     .then(function(res){
-      var exams={}, allExamsMapCerts={};
+      var exams={};
       res[1].docs.forEach(function(d){
         var ex=d.data();
-        allExamsMapCerts[d.id]=ex; // full map for fallback filtering
         if (isSuperAdmin() || examAppliesToPlant(ex, CURRENT_USER.plant)) exams[d.id]=ex;
       });
       var attsRaw=res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());});
@@ -4694,7 +4677,7 @@ function pgCerts() {
       if (!isSuperAdmin()) {
         var candsMapAll = {};
         (res[2] ? res[2].docs : []).forEach(function(d){ candsMapAll[d.id]=d.data(); });
-        atts = filterAttemptsByPlant(attsRaw, candsMapAll, allExamsMapCerts);
+        atts = filterAttemptsByPlant(attsRaw, candsMapAll);
       }
       atts.sort(function(a,b){ return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0); });
       var pass=atts.filter(function(a){return a.result==='pass';}).length;
@@ -5621,14 +5604,14 @@ function renderUserMgmt() {
       var plantTag = isMultiPlant
         ? u.plants.map(function(p){ return '<span class="bk bb" style="margin-left:3px">'+esc(p)+'</span>'; }).join('')
         : (u.plant ? '<span class="bk bb" style="margin-left:4px">'+esc(u.plant)+'</span>' : '<span style="color:var(--tx3);font-size:11px">—</span>');
-      var editBtn = '<button class="b bg bxs" onclick="openEditAdminUser(\''+u.id+'\')">✏️ Edit</button>';
-      var delBtn  = !isSA ? '<button class="b bd_ bxs" onclick="deleteAdminUser(\''+u.id+'\',\''+esc(u.email||'')+'\')">🗑 Delete</button>' : '';
       return '<tr>'+
         '<td class="tn">'+esc(u.displayName||u.email||'—')+'</td>'+
         '<td style="color:var(--tx2);font-size:12px">'+esc(u.email||'—')+'</td>'+
         '<td>'+roleTag+'</td>'+
         '<td>'+plantTag+'</td>'+
-        '<td style="display:flex;gap:4px">'+editBtn+delBtn+'</td>'+
+        '<td style="display:flex;gap:4px">'+
+          (!isSA ? '<button class="b bd_ bxs" onclick="deleteAdminUser(\''+u.id+'\',\''+esc(u.email||'')+'\')">🗑 Delete</button>' : '<span style="color:var(--tx3);font-size:11px">—</span>')+
+        '</td>'+
       '</tr>';
     }).join('');
     setHtml('vUserMgmtSection',
@@ -5751,122 +5734,6 @@ function deleteAdminUser(uid, email) {
     toast('Admin profile deleted for '+email,'wn');
     renderUserMgmt();
   }).catch(function(e){ toast('Error: '+e.message,'er'); });
-}
-
-
-// ── EDIT ADMIN USER ──────────────────────────────────────────
-var _editAdmUid = '';
-
-function openEditAdminUser(uid) {
-  _editAdmUid = uid;
-  DB().collection('users').doc(uid).get().then(function(doc) {
-    if (!doc.exists) { toast('User not found.', 'er'); return; }
-    var u = doc.data();
-    var isSA = u.role === 'super_admin';
-    var isMulti = Array.isArray(u.plants) && u.plants.length > 1;
-    var currentRole = isSA ? 'super_admin' : (isMulti ? 'multi' : 'plant');
-    var currentPlant = u.plant || '';
-    var currentPlants = Array.isArray(u.plants) ? u.plants : (currentPlant ? [currentPlant] : []);
-
-    var plantSingleOpts = PLANTS.map(function(p){
-      return '<option value="'+esc(p)+'"'+(p===currentPlant?' selected':'')+'>'+esc(p)+'</option>';
-    }).join('');
-
-    var plantMultiChks = PLANTS.map(function(p){
-      var chk = currentPlants.indexOf(p) > -1 ? 'checked' : '';
-      return '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:5px 9px;border:1px solid var(--bd2);border-radius:6px;background:var(--bg2)">'+
-        '<input type="checkbox" class="editAdmPChk" value="'+esc(p)+'" '+chk+' style="accent-color:var(--bl);width:13px;height:13px">'+esc(p)+'</label>';
-    }).join('');
-
-    var roleOpts = isSA
-      ? '<option value="super_admin" selected>⭐ Super Admin</option><option value="plant">🏭 Plant Admin (single plant)</option><option value="multi">🏢 Multi-Plant Admin</option>'
-      : '<option value="plant"'+(currentRole==='plant'?' selected':'')+'>🏭 Plant Admin (single plant)</option>'+
-        '<option value="multi"'+(currentRole==='multi'?' selected':'')+'>🏢 Multi-Plant Admin</option>';
-
-    var singleDisplay = (!isSA && currentRole !== 'multi') ? '' : 'display:none';
-    var multiDisplay  = (!isSA && currentRole === 'multi') ? '' : 'display:none';
-
-    openMo('✏️ Edit Admin User',
-      '<div class="fg"><label class="fl">Display Name *</label>'+
-        '<input class="fi" id="editAdmName" value="'+esc(u.displayName||'')+'" placeholder="Display name"></div>'+
-      '<div class="fg"><label class="fl">Email <span style="color:var(--tx3);font-weight:400">(read-only — change via Firebase Console)</span></label>'+
-        '<div class="fi" style="opacity:.6;cursor:not-allowed;background:var(--bg3)">'+esc(u.email||'—')+'</div></div>'+
-      (!isSA
-        ? '<div class="fg"><label class="fl">Role *</label>'+
-            '<select class="fi fsel" id="editAdmRole" onchange="onEditAdmRoleChange()">'+roleOpts+'</select></div>'
-        : '<div class="fg"><label class="fl">Role</label><div class="fi" style="opacity:.6;cursor:not-allowed;background:var(--bg3)">⭐ Super Admin (cannot be changed)</div></div>')+
-      '<div id="vEditAdmPlantWrap">'+
-        '<div id="vEditAdmSingleRow" style="'+singleDisplay+'">'+
-          '<div class="fg"><label class="fl">Assigned Plant</label>'+
-            '<select class="fi fsel" id="editAdmPlant"><option value="">— Select Plant —</option>'+plantSingleOpts+'</select></div>'+
-        '</div>'+
-        '<div id="vEditAdmMultiRow" style="'+multiDisplay+'">'+
-          '<div class="fg"><label class="fl">Assigned Plants *</label>'+
-            '<div style="display:flex;flex-wrap:wrap;gap:7px;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg3)" id="vEditAdmPlantChks">'+
-              plantMultiChks+
-            '</div></div>'+
-        '</div>'+
-      '</div>'+
-      '<div id="vEditAdmErr" class="h" style="padding:8px 11px;background:var(--rdbg);border:1px solid var(--rdbd);border-radius:7px;font-size:12px;color:var(--rd)"></div>',
-      [{lbl:'Cancel',cls:'b bg',fn:'closeMo()'},{lbl:'💾 Save Changes',cls:'b bp',fn:'saveEditAdminUser()'}]
-    );
-  }).catch(function(e){ toast('Error loading user: '+e.message,'er'); });
-}
-
-function onEditAdmRoleChange() {
-  var role = val('editAdmRole');
-  var sr = G('vEditAdmSingleRow');
-  var mr = G('vEditAdmMultiRow');
-  if (sr) sr.style.display = (role === 'plant' || !role) ? '' : 'none';
-  if (mr) mr.style.display = role === 'multi' ? '' : 'none';
-}
-
-function saveEditAdminUser() {
-  var uid = _editAdmUid;
-  if (!uid) return;
-  var nm   = (G('editAdmName')||{}).value.trim();
-  var errEl = G('vEditAdmErr');
-  function showErr(m){ if(errEl){errEl.textContent=m; errEl.classList.remove('h');} }
-  if (!nm) { showErr('Display name is required.'); return; }
-
-  var roleEl = G('editAdmRole');
-  var isSA = !roleEl; // super admin: role select is hidden
-  var update = { displayName: nm };
-
-  if (!isSA) {
-    var role = roleEl.value;
-    if (!role) { showErr('Select a role.'); return; }
-    var pl = '', plants = [];
-    if (role === 'plant') {
-      pl = (G('editAdmPlant')||{}).value || '';
-      if (!pl) { showErr('Select a plant.'); return; }
-      plants = [pl];
-      update.role   = 'admin';
-      update.plant  = pl;
-      update.plants = plants;
-    } else {
-      document.querySelectorAll('.editAdmPChk:checked').forEach(function(cb){ plants.push(cb.value); });
-      if (!plants.length) { showErr('Select at least one plant.'); return; }
-      update.role   = 'admin';
-      update.plant  = '';
-      update.plants = plants;
-    }
-  }
-
-  var btn = document.querySelector('#vMo .bp');
-  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
-  if (errEl) errEl.classList.add('h');
-
-  DB().collection('users').doc(uid).update(update)
-    .then(function(){
-      closeMo();
-      toast('Admin user updated!', 'ok');
-      renderUserMgmt();
-    })
-    .catch(function(e){
-      showErr('Error: '+e.message);
-      if (btn) { btn.disabled = false; btn.textContent = '💾 Save Changes'; }
-    });
 }
 
 // ── MAINTENANCE ──────────────────────────────────────────────
@@ -7362,22 +7229,9 @@ function loadNotifications() {
     DB().collection('exams').get(),
     DB().collection('questions').where('isActive','==',true).get()
   ]).then(function(res) {
-    var allAttsN  = res[0].docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
-    var allExamsN = res[1].docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
-    var qCount    = res[2].size;
-
-    // For plant admins: restrict notifications to their plant's exams and attempts
-    var allExamsMapN = {};
-    allExamsN.forEach(function(e){ allExamsMapN[e.id] = e; });
-    var exams = isSuperAdmin() ? allExamsN : allExamsN.filter(function(e){ return examAppliesToPlant(e, CURRENT_USER.plant); });
-    var assignedExamIds = {};
-    exams.forEach(function(e){ assignedExamIds[e.id] = true; });
-    var atts = isSuperAdmin() ? allAttsN : allAttsN.filter(function(a){
-      // Include if candidate's plant matches OR exam is assigned to this plant
-      var p = a.plantLocation || '';
-      if (p && userCanSeePlant(p)) return true;
-      return a.examId && assignedExamIds[a.examId];
-    });
+    var atts   = res[0].docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
+    var exams  = res[1].docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
+    var qCount = res[2].size;
 
     // ── 1. Recent new submissions (last 24 h) ──
     var cutoff24 = new Date(now.getTime() - 86400000);
@@ -7483,27 +7337,6 @@ function loadNotifications() {
         timeAgo: '',
         action: 'questions'
       });
-    }
-
-    // ── 7a. New exams assigned to this plant admin (last 48h) ──
-    if (!isSuperAdmin()) {
-      var cutoff48n = new Date(now.getTime() - 172800000);
-      var newAssigned = exams.filter(function(e) {
-        if (!e.createdAt) return false;
-        var ct = e.createdAt.toDate ? e.createdAt.toDate() : new Date(e.createdAt);
-        return ct > cutoff48n;
-      });
-      if (newAssigned.length > 0) {
-        notifs.unshift({
-          id: 'new_exam_assigned_' + newAssigned[0].id,
-          type: 'exam_live',
-          icon: '📋',
-          title: newAssigned.length + ' exam' + (newAssigned.length > 1 ? 's' : '') + ' assigned to your plant',
-          body: newAssigned.map(function(e){ return e.name || '—'; }).join(', '),
-          timeAgo: timeAgo(newAssigned[0].createdAt),
-          action: 'exams'
-        });
-      }
     }
 
     // ── 7. Completed exams summary (last 7 days) ──
