@@ -6037,10 +6037,26 @@ async function overlayAdminLogin(){
   if (!email)   { if(err){err.textContent='❌ Enter your email address.';err.style.display='block';} return; }
   if (!entered) { if(err){err.textContent='❌ Enter your password.';err.style.display='block';} return; }
 
-  // ── Try superadmin password first (no email config required) ────────
-  // If the password matches admin stored password → superadmin login.
+  // ── Wait for Firebase to be ready before any auth check ─────────────
+  if (!_fbReady) {
+    if(err){err.textContent='⏳ Connecting to database… please try again.';err.style.display='block';}
+    const ready = await _waitForFbReady(8000);
+    if (!ready) {
+      if(err){err.textContent='❌ Database not ready. Please refresh the page.';err.style.display='block';}
+      return;
+    }
+    if(err) err.style.display='none';
+  }
+
+  // ── Try superadmin password first — but ONLY for the superadmin email ─
+  // Gate: check stored superadmin email (admin_notify_email) or fall back
+  // to password-only match. This prevents regular users who happen to know
+  // the superadmin password from logging in as superadmin.
   const _DEFAULT_PWD = 'poly@123';
-  const _tryAsSuperAdmin = await (async () => {
+  const _superAdminEmail = (localStorage.getItem('admin_notify_email') || '').trim().toLowerCase();
+  const _emailIsSuperAdmin = !_superAdminEmail || email === _superAdminEmail;
+
+  const _tryAsSuperAdmin = _emailIsSuperAdmin && await (async () => {
     try {
       let stored = _DEFAULT_PWD;
       if (_fbReady && _db) {
@@ -6127,6 +6143,36 @@ async function overlayAdminLogin(){
     return;
   }
 
+  // ── Check if email matches a plant owner (only if not a regular appUser) ─
+  const _overlayPlantGroups = getPlantGroups();
+  const _overlayMatchedPlant = _overlayPlantGroups.find(p =>
+    (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
+  );
+  if (_overlayMatchedPlant) {
+    // Only redirect to plant owner login if NOT also a regular appUser
+    let _isRegularUser = false;
+    try {
+      const _userSnap = await _db.collection('appUsers').doc(email).get();
+      if (_userSnap.exists) _isRegularUser = true;
+    } catch(e) { /* fall through to plant owner */ }
+    if (!_isRegularUser) {
+      // Remove overlay first, then show plant owner login screen
+      const _ov = document.getElementById('admin-pwd-overlay');
+      if(_ov) _ov.remove();
+      showPlantOwnerLoginScreen();
+      setTimeout(() => {
+        const emailInp = document.getElementById('plant-email-input');
+        const plantSel = document.getElementById('plant-login-select');
+        const pwdInp   = document.getElementById('plant-pwd-input');
+        if (emailInp) { emailInp.value = email; }
+        if (plantSel) { plantSel.value = _overlayMatchedPlant.id; }
+        if (pwdInp)   { pwdInp.value = entered; plantOwnerLogin(); }
+      }, 80);
+      return;
+    }
+    // else: email exists in appUsers — fall through to normal login below
+  }
+
   // ── Admin / User path — check appUsers collection ──────────────────
   const bfKey = 'user:' + email;
   const bf = await _bfCheck(bfKey);
@@ -6191,11 +6237,15 @@ async function unifiedLogin() {
   if (!email) { err.textContent='❌ Enter your email address.'; err.style.display='block'; return; }
   if (!pwd)   { err.textContent='❌ Enter your password.'; err.style.display='block'; return; }
 
-  // ── 1. Try superadmin password first ────────────────────────────────
-  // If the entered password matches the stored admin password → superadmin login.
-  // This requires no email config in Firestore.
+  // ── 1. Try superadmin password first — gated by email ───────────────
+  // Only attempt superadmin login if the email matches the stored superadmin
+  // email (admin_notify_email). This prevents regular users from accidentally
+  // logging in as superadmin if they share the same password.
   const _DEFAULT_PWD = 'poly@123';
-  const isSuperAdminPw = await (async () => {
+  const _uniSuperAdminEmail = (localStorage.getItem('admin_notify_email') || '').trim().toLowerCase();
+  const _uniEmailIsSuperAdmin = !_uniSuperAdminEmail || email === _uniSuperAdminEmail;
+
+  const isSuperAdminPw = _uniEmailIsSuperAdmin && await (async () => {
     try {
       let stored = _DEFAULT_PWD;
       if (_fbReady && _db) {
