@@ -8081,7 +8081,10 @@ function _renderGroupPanel(groups, adminEmail, adminNick) {
       </div>`
     ).join('');
     return `<div class="card" style="margin-bottom:12px">
-      <div style="font-weight:700;font-size:15px;margin-bottom:12px">👥 ${esc(g.name)}</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+        <div style="font-weight:700;font-size:15px">👥 ${esc(g.name)}</div>
+        <button class="btn btn-danger btn-sm" style="font-size:11px;padding:5px 11px;" title="Delete this group and remove all members" onclick="_deleteGroup('${esc(adminEmail)}','${esc(g.id)}','${esc(g.name)}')">🗑 Delete Group</button>
+      </div>
       ${pending ? '<div style="font-size:12px;font-weight:600;color:var(--amber);margin-bottom:6px">⏳ Pending Requests</div>' + pending : ''}
       <div style="font-size:12px;font-weight:600;color:var(--text2);margin:10px 0 6px">Members</div>
       ${members || '<div style="font-size:12px;color:var(--text3)">No members yet.</div>'}
@@ -8279,6 +8282,38 @@ async function _removeFromGroup(adminEmail, groupId, userEmail) {
     toast('Member removed.', 'var(--amber)');
     showGroupManagementPanel();
   } catch(e) { toast('Error: ' + e.message, 'var(--red)'); }
+}
+
+// ── Admin / Super Admin: delete an entire group and clean up memberships ─────
+async function _deleteGroup(adminEmail, groupId, groupName) {
+  if (!confirm('Delete group "' + groupName + '"?\n\nAll members will be removed from the group. This cannot be undone.')) return;
+  try {
+    const groups = await _loadMyGroups(adminEmail);
+    const grp = groups.find(g => g.id === groupId);
+    if (!grp) { toast('Group not found.', 'var(--amber)'); return; }
+
+    // Remove groupMembership entry from every member's appUsers doc
+    const allAffected = [
+      ...(grp.members || []).map(m => m.email),
+      ...(grp.pendingRequests || []).map(r => r.email)
+    ];
+    const membershipKey = adminEmail + '::' + groupId;
+    const cleanupPromises = allAffected.map(email =>
+      _db.collection('appUsers').doc(email).set(
+        { groupMemberships: firebase.firestore.FieldValue.arrayRemove(membershipKey),
+          pendingGroupInvites: firebase.firestore.FieldValue.arrayRemove({ groupId, groupOwner: adminEmail }) },
+        { merge: true }
+      ).catch(e => console.warn('Could not clean membership for', email, e.message))
+    );
+    await Promise.all(cleanupPromises);
+
+    // Remove the group itself
+    const updatedGroups = groups.filter(g => g.id !== groupId);
+    await _saveMyGroups(adminEmail, updatedGroups);
+
+    toast('🗑 Group "' + groupName + '" deleted.', 'var(--red)');
+    showGroupManagementPanel();
+  } catch(e) { toast('Error deleting group: ' + e.message, 'var(--red)'); }
 }
 
 // ── Admin / Super Admin: rename a group member's display nickname ─────
