@@ -7382,8 +7382,6 @@ function _activateRoleSession(role) {
   // Start per-user Firestore notification listener
   if(currentSession && currentSession.email){
     _startNotifListener(currentSession.email.toLowerCase());
-    // Watch this user's groupMemberships so removals by an admin reflect instantly
-    _startMembershipListener(currentSession.email.toLowerCase());
   }
   // For superadmin ONLY: load superadmin's own groups using admin_notify_email.
   // For admin/user role sessions (currentSession is set), groups are already
@@ -8702,73 +8700,25 @@ async function adminLogin(){
 
 // ── Logout ────────────────────────────────────────────────────────────
 function handleLogout(){
+  // Determine the right confirmation message based on current session type
+  let confirmMsg = 'Log out?';
+  if(mode === 'user')               confirmMsg = 'Log out?';
+  else if(plantOwnerAuthenticated)  confirmMsg = 'Log out of plant session?';
+  else                              confirmMsg = 'Log out of admin session?';
+
+  if(!confirm(confirmMsg)) return;
+
+  // Stop all Firestore listeners so they don't fire during teardown
   _stopNotifListener();
-  // Clear role session on any logout
-  currentSession = null;
-  const roleBadge = document.getElementById('role-user-badge');
-  if(roleBadge) roleBadge.remove();
-  const roleNav = document.getElementById('role-nav-items');
-  if(roleNav) roleNav.innerHTML = '';
-  // Clear topbar name/email
-  const _tnEl = document.getElementById('topbar-user-name');
-  const _teEl = document.getElementById('topbar-user-email');
-  const _tiEl = document.getElementById('topbar-user-info');
-  if(_tnEl) _tnEl.textContent = '';
-  if(_teEl) _teEl.textContent = '';
-  if(_tiEl) _tiEl.style.display = 'none';
-  const _avEl = document.getElementById('topbar-avatar');
-  if(_avEl){ _avEl.textContent='A'; _avEl.title=''; }
-  if(mode==='user'){
-    if(!confirm('Log out?'))return;
-    userEmail='';
-    userTask=null;
-    // Keep mode as 'user' — do NOT switch to admin after user logout
-    const uInfo=document.getElementById('topbar-user-info');
-    const avatar=document.getElementById('topbar-avatar');
-    if(uInfo) uInfo.style.display='none';
-    if(avatar){ avatar.textContent='U'; avatar.style.background='linear-gradient(135deg,var(--accent),var(--purple))'; }
-    document.getElementById('admin-nav').style.display='none';
-    document.getElementById('btn-new-task').style.display='none';
-    document.getElementById('btn-bulk-upload').style.display='none';
-    document.getElementById('btn-admin-mode').style.display='none';
-    document.getElementById('btn-user-mode').style.display='none';
-    document.getElementById('topbar-title').textContent='Logged Out';
-    document.getElementById('content').innerHTML=`
-      <div style="max-width:420px;margin:80px auto;text-align:center">
-        <div style="font-size:52px;margin-bottom:16px">👋</div>
-        <div class="panel-title" style="margin-bottom:8px">You've been logged out</div>
-        <div style="color:var(--text3);font-size:14px;margin-bottom:24px">Your session has ended. Please close this tab or use your personal task link to log in again.</div>
-      </div>`;
-    return;
-  } else if(plantOwnerAuthenticated){
-    if(!confirm('Log out of plant session?'))return;
-    plantOwnerAuthenticated = false;
-    currentPlantSession = null;
-    _plantOwnerEmail = '';
-    sessionStorage.removeItem('pg_impersonate_return');
-    document.body.classList.remove('plant-owner-mode');
-    userEmail=''; userTask=null;
-    // Clear sidebar account info so it doesn't show stale data
-    const _poSaiLogout = document.getElementById('sidebar-account-info');
-    if(_poSaiLogout){ _poSaiLogout.style.display = 'none'; _poSaiLogout.innerHTML = ''; }
-    document.getElementById('admin-nav').style.display = 'none';
-    document.getElementById('btn-new-task').style.display = 'none';
-    document.getElementById('btn-bulk-upload').style.display = 'none';
-    document.getElementById('btn-export').style.display = 'none';
-    showAdminLoginScreen();
-    toast('Plant owner logged out');
-  } else {
-    // Admin logout — lock the dashboard and show login screen
-    if(!confirm('Log out of admin session?'))return;
-    userEmail='';
-    userTask=null;
-    // Clear developer session if active
-    _devAuthenticated = false;
-    const devBadge = document.getElementById('dev-badge');
-    if(devBadge) devBadge.remove();
-    showAdminLoginScreen();
-    toast('Admin logged out successfully');
-  }
+
+  // ── Full page reload after logout ────────────────────────────────────────
+  // Instead of manually resetting dozens of global variables (tasks, mode,
+  // adminAuthenticated, currentSession, plantOwnerAuthenticated, group member
+  // caches, nav state, topbar badges, sidebar info, Firestore listeners …),
+  // we reload the page. This guarantees a perfectly clean slate for the next
+  // user — identical to pressing F5 — so no stale state from the previous
+  // session leaks through to the new login.
+  window.location.reload();
 }
 
 // ── mailto email (zero-config fallback) ──────────────────────────────
@@ -10774,7 +10724,6 @@ function setColorTheme(color){
 let _notifications = [];
 let _notifUserEmail = null;      // email of user whose notifs are loaded
 let _notifUnsubscribe = null;    // Firestore listener unsubscribe
-let _membershipUnsubscribe = null; // Firestore listener for own groupMemberships changes
 
 // Notification type icons
 const NOTIF_ICONS = { assigned:'📋', status:'🔄', due:'📅', reply:'💬', info:'ℹ️' };
@@ -10810,40 +10759,9 @@ function _stopNotifListener() {
   _notifUserEmail = null;
   _notifications = [];
   refreshNotifBadge();
-  // Stop membership listener too
-  if(_membershipUnsubscribe) { _membershipUnsubscribe(); _membershipUnsubscribe = null; }
   // Hide global member bar on logout
   const bar = document.getElementById('global-member-bar');
   if(bar) bar.style.display = 'none';
-}
-
-// ── Real-time listener: watch the logged-in user's groupMemberships ───
-// When an admin removes them from a group, Firestore updates their appUsers
-// doc and this listener fires — refreshing the member bar and the
-// Group Invitations panel if it is currently open.
-function _startMembershipListener(email) {
-  if(!email || !_fbReady || !_db) return;
-  if(_membershipUnsubscribe) { _membershipUnsubscribe(); _membershipUnsubscribe = null; }
-  let _prevMemberships = null; // track previous value to avoid firing on first load
-  _membershipUnsubscribe = _db.collection('appUsers').doc(email)
-    .onSnapshot(snap => {
-      if(!snap.exists) return;
-      const data = snap.data();
-      const memberships = (data.groupMemberships || []).slice().sort().join(',');
-      // Skip the very first emission (initial load — no change yet)
-      if(_prevMemberships === null) { _prevMemberships = memberships; return; }
-      if(memberships === _prevMemberships) return; // no change
-      _prevMemberships = memberships;
-      // Reload the group member email cache (updates global member bar)
-      _loadGroupMemberEmails(email);
-      // If the Group Invitations panel is currently open, refresh it live
-      const titleEl = document.querySelector('#content .panel-title');
-      if(titleEl && titleEl.textContent.includes('Group Invitations')) {
-        showMyGroupInvites();
-      }
-    }, err => {
-      console.warn('[Membership] Firestore listener error:', err.message);
-    });
 }
 
 // ── Push a notification to a user's Firestore notif doc ──────────────
