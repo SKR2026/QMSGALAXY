@@ -1931,78 +1931,74 @@ function resolveAdminUser(user) {
     .then(function(doc) {
       if (doc.exists) {
         var d = doc.data();
-        // ── App-isolated role resolution ──────────────────────────────
-        // Prefer examRole (ExamPro-specific field). Fall back to the
-        // shared role field ONLY if examRole is absent — this handles
-        // users created before the multi-app isolation fix.
+        // Prefer examRole (ExamPro-specific field). Fall back to the shared
+        // role field only for users created before the multi-app isolation fix.
         var rawRole = d.examRole || d.role;
         var canonicalRole = normalizeRole(rawRole);
         if (canonicalRole) {
-          // Migrate: if examRole is missing, write it now so future logins
-          // use the app-specific field and no longer touch the shared role.
-          var migrations = {};
-          if (!d.examRole) migrations.examRole = canonicalRole;
-          // Correct examRole if it wasn't already in canonical form.
-          else if (d.examRole !== canonicalRole) migrations.examRole = canonicalRole;
-          var fixPromise = Object.keys(migrations).length
-            ? DB().collection('users').doc(user.uid).update(migrations)
-            : Promise.resolve();
-          fixPromise.catch(function(e){ console.warn('examRole migration failed:', e.message); })
-            .then(function(){
-              // Populate CURRENT_USER global
-              CURRENT_USER.role        = canonicalRole;
-              CURRENT_USER.plant       = d.plant || '';
-              // Multi-plant support: 'plants' array overrides single 'plant' field.
-              // If 'plants' has entries, CURRENT_USER.plants is that array and
-              // CURRENT_USER.plant is left as '' so all plant filters switch to
-              // the array-aware helpers automatically.
-              if (Array.isArray(d.plants) && d.plants.length) {
-                CURRENT_USER.plants  = d.plants;
-                CURRENT_USER.plant   = ''; // signal: use .plants array instead
-              } else {
-                CURRENT_USER.plants  = d.plant ? [d.plant] : [];
-              }
-              CURRENT_USER.displayName = d.displayName || d.name || (d.email||'').split('@')[0];
-              CURRENT_USER.email       = d.email || user.email || '';
-              CURRENT_USER.uid         = user.uid;
-              d.role = canonicalRole; // ensure showAdmin() gets canonical value
-              showAdmin(d);
-            });
+          // Silently migrate: write examRole if it's missing or not canonical,
+          // so future logins use the app-specific field. Failure is non-fatal.
+          if (d.examRole !== canonicalRole) {
+            DB().collection('users').doc(user.uid).update({ examRole: canonicalRole })
+              .catch(function(e){ console.warn('examRole migration failed:', e.message); });
+          }
+          CURRENT_USER.role        = canonicalRole;
+          CURRENT_USER.plant       = d.plant || '';
+          if (Array.isArray(d.plants) && d.plants.length) {
+            CURRENT_USER.plants  = d.plants;
+            CURRENT_USER.plant   = '';
+          } else {
+            CURRENT_USER.plants  = d.plant ? [d.plant] : [];
+          }
+          CURRENT_USER.displayName = d.displayName || d.name || (d.email||'').split('@')[0];
+          CURRENT_USER.email       = d.email || user.email || '';
+          CURRENT_USER.uid         = user.uid;
+          d.role = canonicalRole;
+          showAdmin(d);
         } else {
-          showE('aErr', 'No ExamPro role assigned. examRole/role is "' + (rawRole||'not set') + '". An admin must assign you a role in ExamPro.');
+          // Doc exists but has no ExamPro role (e.g. a KPI-only user).
+          showE('aErr', 'Your account does not have ExamPro access. Contact your Super Admin to assign you an ExamPro role.');
           hideAll(); show('vAdmLog');
         }
       } else {
-        // Auto-create user doc with super_admin examRole on first login.
-        // NOTE: we set examRole (not role) so KPI Dashboard is unaffected.
-        showE('aErr', 'No profile found — creating one now...');
-        DB().collection('users').doc(user.uid).set({
-          examRole: 'super_admin',
-          role: 'super_admin', // kept for any legacy tooling
-          displayName: user.displayName || user.email.split('@')[0],
-          email: user.email,
-          createdAt: firebase.firestore.FieldValue.serverTimestamp()
-        }).then(function() {
-          DB().collection('users').doc(user.uid).get().then(function(doc2) {
-            if (doc2.exists) {
-              var d2 = doc2.data();
-              CURRENT_USER.role        = 'super_admin';
-              CURRENT_USER.plant       = '';
-              CURRENT_USER.plants      = [];
-              CURRENT_USER.displayName = d2.displayName || user.email.split('@')[0];
-              CURRENT_USER.email       = d2.email || user.email;
-              CURRENT_USER.uid         = user.uid;
-              showAdmin(d2);
-            }
+        // No user doc at all — this is a brand-new Firebase Auth account.
+        // We no longer auto-create here because:
+        //   1. In a multi-app project the first admin must be created
+        //      deliberately (not silently on first login).
+        //   2. Firestore token propagation race conditions caused intermittent
+        //      "Missing or insufficient permissions" errors on auto-create.
+        //
+        // Instead: try once to create the first Super Admin doc. If this is
+        // genuinely the very first login (empty /users collection), this will
+        // succeed via the "own uid" create rule. If permissions deny it (i.e.
+        // a KPI-only account trying ExamPro), we show a clear message.
+        var newDoc = {
+          examRole:    'super_admin',
+          role:        'super_admin',
+          displayName: user.displayName || (user.email||'').split('@')[0],
+          email:       user.email || '',
+          createdAt:   firebase.firestore.FieldValue.serverTimestamp()
+        };
+        DB().collection('users').doc(user.uid).set(newDoc)
+          .then(function() {
+            CURRENT_USER.role        = 'super_admin';
+            CURRENT_USER.plant       = '';
+            CURRENT_USER.plants      = [];
+            CURRENT_USER.displayName = newDoc.displayName;
+            CURRENT_USER.email       = newDoc.email;
+            CURRENT_USER.uid         = user.uid;
+            showAdmin(newDoc);
+          })
+          .catch(function(err2) {
+            // Permission denied almost always means this Firebase Auth account
+            // was not created by ExamPro and has no /users doc here.
+            showE('aErr', 'No ExamPro profile found for this account. Ask your Super Admin to create one, or use your ExamPro credentials.');
+            hideAll(); show('vAdmLog');
           });
-        }).catch(function(err2) {
-          showE('aErr', 'Could not create profile: ' + err2.message);
-          hideAll(); show('vAdmLog');
-        });
       }
     })
     .catch(function(err) {
-      showE('aErr', 'Firestore error: ' + err.message);
+      showE('aErr', 'Sign-in error: ' + err.message);
       hideAll(); show('vAdmLog');
     });
 }
@@ -5766,16 +5762,18 @@ function createPlantAdmin() {
     if (data.error) { showAdmErr(data.error.message||'Firebase error'); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} return; }
     var uid = data.localId;
     var userDoc = {
-      examRole: 'admin',  // ExamPro-specific field — never conflicts with kpiRole
-      plant: pl,
-      plants: plants,
+      examRole:    'admin',  // ExamPro-specific field — never conflicts with KPI's role field
+      plant:       pl,
+      plants:      plants,
       displayName: nm,
-      name: nm,           // KPI Dashboard reads 'name'; ExamPro reads 'displayName'
-      email: em,
-      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-      createdBy: CURRENT_USER.uid || ''
+      name:        nm,
+      email:       em,
+      createdAt:   firebase.firestore.FieldValue.serverTimestamp(),
+      createdBy:   CURRENT_USER.uid || ''
     };
-    DB().collection('users').doc(uid).set(userDoc).then(function(){
+    // Use merge:true so that if this user already has a KPI profile (role, kpiRole, etc.)
+    // those fields are preserved — we only set/update ExamPro-specific fields.
+    DB().collection('users').doc(uid).set(userDoc, { merge: true }).then(function(){
       var scopeLabel = plants.length > 1 ? plants.join(', ') : pl;
       toast('Admin created for '+scopeLabel+'!','ok');
       ['newAdmName','newAdmEmail','newAdmPwd','newAdmRole','newAdmPlant'].forEach(function(id){var e=G(id);if(e)e.value='';});
