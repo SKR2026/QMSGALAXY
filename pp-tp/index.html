@@ -7382,6 +7382,8 @@ function _activateRoleSession(role) {
   // Start per-user Firestore notification listener
   if(currentSession && currentSession.email){
     _startNotifListener(currentSession.email.toLowerCase());
+    // Watch this user's groupMemberships so removals by an admin reflect instantly
+    _startMembershipListener(currentSession.email.toLowerCase());
   }
   // For superadmin ONLY: load superadmin's own groups using admin_notify_email.
   // For admin/user role sessions (currentSession is set), groups are already
@@ -10772,6 +10774,7 @@ function setColorTheme(color){
 let _notifications = [];
 let _notifUserEmail = null;      // email of user whose notifs are loaded
 let _notifUnsubscribe = null;    // Firestore listener unsubscribe
+let _membershipUnsubscribe = null; // Firestore listener for own groupMemberships changes
 
 // Notification type icons
 const NOTIF_ICONS = { assigned:'📋', status:'🔄', due:'📅', reply:'💬', info:'ℹ️' };
@@ -10807,9 +10810,40 @@ function _stopNotifListener() {
   _notifUserEmail = null;
   _notifications = [];
   refreshNotifBadge();
+  // Stop membership listener too
+  if(_membershipUnsubscribe) { _membershipUnsubscribe(); _membershipUnsubscribe = null; }
   // Hide global member bar on logout
   const bar = document.getElementById('global-member-bar');
   if(bar) bar.style.display = 'none';
+}
+
+// ── Real-time listener: watch the logged-in user's groupMemberships ───
+// When an admin removes them from a group, Firestore updates their appUsers
+// doc and this listener fires — refreshing the member bar and the
+// Group Invitations panel if it is currently open.
+function _startMembershipListener(email) {
+  if(!email || !_fbReady || !_db) return;
+  if(_membershipUnsubscribe) { _membershipUnsubscribe(); _membershipUnsubscribe = null; }
+  let _prevMemberships = null; // track previous value to avoid firing on first load
+  _membershipUnsubscribe = _db.collection('appUsers').doc(email)
+    .onSnapshot(snap => {
+      if(!snap.exists) return;
+      const data = snap.data();
+      const memberships = (data.groupMemberships || []).slice().sort().join(',');
+      // Skip the very first emission (initial load — no change yet)
+      if(_prevMemberships === null) { _prevMemberships = memberships; return; }
+      if(memberships === _prevMemberships) return; // no change
+      _prevMemberships = memberships;
+      // Reload the group member email cache (updates global member bar)
+      _loadGroupMemberEmails(email);
+      // If the Group Invitations panel is currently open, refresh it live
+      const titleEl = document.querySelector('#content .panel-title');
+      if(titleEl && titleEl.textContent.includes('Group Invitations')) {
+        showMyGroupInvites();
+      }
+    }, err => {
+      console.warn('[Membership] Firestore listener error:', err.message);
+    });
 }
 
 // ── Push a notification to a user's Firestore notif doc ──────────────
