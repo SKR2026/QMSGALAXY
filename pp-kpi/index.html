@@ -4927,24 +4927,7 @@ function bulkDeleteKPIs(){
 // ══ ROLE-BASED ACCESS CONTROL ══
 window._roleInfo = { role: null, plant: null, isSuperAdmin: true, isPlantAdmin: false, isTopMgmt: false };
 function applyRoleRestrictions(profile){
-  // MULTI-APP ISOLATION FIX (2025):
-  // KPI Dashboard and ExamPro share the same /users/{uid} Firestore collection.
-  // To prevent ExamPro's role assignments from affecting KPI Dashboard access
-  // (and vice-versa), KPI Dashboard reads the dedicated  kpiRole  field.
-  // Fall back to the shared  role  field only for legacy docs created before
-  // this fix so existing users are not locked out on first upgrade.
-  const kpiRoleRaw = (profile && profile.kpiRole) ? String(profile.kpiRole).trim() : '';
-  const legacyRoleRaw = (profile && profile.role)  ? String(profile.role).trim()    : '';
-  const effectiveRole = kpiRoleRaw || legacyRoleRaw;
-
-  // If we are using the legacy field, schedule a silent migration so future
-  // logins use kpiRole and the shared field is no longer touched by this app.
-  if (!kpiRoleRaw && legacyRoleRaw && window.FB && window.FB.updateUser && profile && profile.id) {
-    window.FB.updateUser(profile.id, { kpiRole: legacyRoleRaw })
-      .catch(e => console.warn('[KPI] kpiRole migration failed:', e.message));
-  }
-
-  const roleRaw = effectiveRole.toLowerCase();
+  const roleRaw = (profile && profile.role) ? String(profile.role).trim().toLowerCase() : '';
 
   const isTopMgmt   = roleRaw === 'top management';
   const isPlantAdmin = roleRaw === 'plant admin';
@@ -7687,42 +7670,25 @@ export function onAuthChange(callback) {
  */
 
 export async function getUserProfile(uid) {
-  const snap = await getDoc(doc(db, "users", uid));
+  const snap = await getDoc(doc(db, "kpiUsers", uid));
   if (!snap.exists()) return null;
-  const data = snap.data();
-  // Resolve the effective KPI role: prefer kpiRole (app-isolated field),
-  // fall back to the shared role field for legacy docs.
-  const effectiveKpiRole = data.kpiRole || data.role || null;
-  return { id: snap.id, ...data, role: effectiveKpiRole };
+  return { id: snap.id, ...snap.data() };
 }
 
 export async function getAllUsers() {
-  const snap = await getDocs(collection(db, "users"));
-  return snap.docs.map(d => {
-    const data = d.data();
-    // Resolve effective KPI role so the Users page always shows the right role
-    const effectiveKpiRole = data.kpiRole || data.role || null;
-    return { id: d.id, ...data, role: effectiveKpiRole };
-  });
+  const snap = await getDocs(collection(db, "kpiUsers"));
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
 export async function createUser(uid, userData) {
-  // Store the KPI-specific role in kpiRole so ExamPro roles are never overwritten.
-  const { role, ...rest } = userData;
-  await setDoc(doc(db, "users", uid), {
-    ...rest,
-    kpiRole: role,   // KPI Dashboard app-specific field
+  await setDoc(doc(db, "kpiUsers", uid), {
+    ...userData,
     createdAt: serverTimestamp()
   });
 }
 
 export async function updateUser(uid, updates) {
-  // If the caller is changing the role, write to kpiRole (app-isolated field)
-  // instead of the shared role field, so ExamPro roles are never overwritten.
-  const { role, ...otherUpdates } = updates;
-  const safeUpdates = { ...otherUpdates };
-  if (role !== undefined) safeUpdates.kpiRole = role;
-  await updateDoc(doc(db, "users", uid), safeUpdates);
+  await updateDoc(doc(db, "kpiUsers", uid), updates);
 }
 
 /**
@@ -7733,11 +7699,8 @@ export async function updateUser(uid, updates) {
  */
 export async function registerUser(email, password, profile) {
   const cred = await createUserWithEmailAndPassword(secondaryAuth, email, password);
-  // Store KPI role in kpiRole so ExamPro's examRole field is never overwritten.
-  const { role, ...profileRest } = profile;
-  await setDoc(doc(db, "users", cred.user.uid), {
-    ...profileRest,
-    kpiRole: role,   // KPI Dashboard app-specific field
+  await setDoc(doc(db, "kpiUsers", cred.user.uid), {
+    ...profile,
     email,
     active: true,
     createdAt: serverTimestamp()
@@ -7760,18 +7723,15 @@ export async function repairOrphanProfile(email, password, profile) {
   const uid  = cred.user.uid;
 
   // Check if a Firestore doc already exists — if so, just update it
-  const snap = await getDoc(doc(db, "users", uid));
+  const snap = await getDoc(doc(db, "kpiUsers", uid));
   const { role, ...profileRest } = profile;
   if(snap.exists()){
-    // Doc exists — patch it with the supplied profile details.
-    // Write kpiRole (app-isolated) instead of shared role field.
-    await updateDoc(doc(db, "users", uid), {
-      ...profileRest, kpiRole: role, email, active: true
+    await updateDoc(doc(db, "kpiUsers", uid), {
+      ...profileRest, role, email, active: true
     });
   } else {
-    // Doc is missing — create it fresh.
-    await setDoc(doc(db, "users", uid), {
-      ...profileRest, kpiRole: role, email, active: true,
+    await setDoc(doc(db, "kpiUsers", uid), {
+      ...profileRest, role, email, active: true,
       repairedAt: serverTimestamp()
     });
   }
@@ -7813,7 +7773,7 @@ export async function deletePlant(plantId) {
 export async function deleteUserDoc(uid) {
   // Removes the Firestore profile only. The Firebase Auth account itself
   // can only be deleted via the Admin SDK / a Cloud Function.
-  await deleteDoc(doc(db, "users", uid));
+  await deleteDoc(doc(db, "kpiUsers", uid));
 }
 
 // ════════════════════════════════════════════════════════════════
