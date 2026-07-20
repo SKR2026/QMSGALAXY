@@ -1306,12 +1306,22 @@ function plantQuery(colRef) {
 function normPlant(x){ return (x||'').toString().trim().toLowerCase(); }
 function samePlant(a, b){ return normPlant(a) === normPlant(b); }
 
-/** Client-side attempt filter — supports single-plant and multi-plant admins. */
-function filterAttemptsByPlant(attempts, candsMapAll) {
+/** Client-side attempt filter — supports single-plant and multi-plant admins.
+ *  An attempt is included if EITHER:
+ *    (a) the candidate's plantLocation matches this admin's plant, OR
+ *    (b) the attempt belongs to an exam that is assigned to this admin's plant
+ *        (covers cases where plantLocation on the attempt/candidate is blank). */
+function filterAttemptsByPlant(attempts, candsMapAll, examsMap) {
   if (isSuperAdmin()) return attempts;
   return attempts.filter(function(a){
+    // (a) candidate plant match
     var p = a.plantLocation || (candsMapAll && candsMapAll[a.candidateId] && candsMapAll[a.candidateId].plantLocation) || '';
-    return userCanSeePlant(p);
+    if (p && userCanSeePlant(p)) return true;
+    // (b) exam-assignment fallback: if the exam for this attempt is assigned to our plant
+    if (examsMap && a.examId && examsMap[a.examId]) {
+      return examAppliesToPlant(examsMap[a.examId], CURRENT_USER.plant);
+    }
+    return false;
   });
 }
 
@@ -2068,7 +2078,10 @@ function pgDash(plantFilter) {
     if (!isSuperAdmin()) {
       var candsMapAll = {};
       candsAllSnap.docs.forEach(function(d){ candsMapAll[d.id]=d.data(); });
-      allAtts = filterAttemptsByPlant(allAttsRaw, candsMapAll);
+      // Build exams map for fallback exam-assignment filter
+      var examsMapDash = {};
+      eSraw.docs.forEach(function(d){ examsMapDash[d.id]=d.data(); });
+      allAtts = filterAttemptsByPlant(allAttsRaw, candsMapAll, examsMapDash);
     }
 
     // ── Plant tab strip (super admin only) ──────────────────
@@ -4081,9 +4094,10 @@ function pgResults() {
     DB().collection('candidates').get(),
     DB().collection('questions').where('isActive','==',true).get()
   ]).then(function(res){
-    var exams={}, cands={}, questions={};
+    var exams={}, allExamsMap={}, cands={}, questions={};
     res[0].docs.forEach(function(d){
       var ex = d.data();
+      allExamsMap[d.id] = ex; // full map used as fallback in filterAttemptsByPlant
       if (isSuperAdmin() || examAppliesToPlant(ex, CURRENT_USER.plant)) exams[d.id]=ex;
     });
     res[2].docs.forEach(function(d){cands[d.id]=d.data();});
@@ -4091,7 +4105,9 @@ function pgResults() {
 
     var attsRaw = res[1].docs.map(function(d){return Object.assign({id:d.id},d.data());})
                           .filter(function(a){return a.status==='completed';});
-    var atts = isSuperAdmin() ? attsRaw : filterAttemptsByPlant(attsRaw, cands);
+    // Pass allExamsMap so attempts whose candidate has a blank plant but whose exam
+    // is assigned to this plant admin's plant are still included in results.
+    var atts = isSuperAdmin() ? attsRaw : filterAttemptsByPlant(attsRaw, cands, allExamsMap);
     atts.sort(function(a,b){return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0);});
     window._ra=atts; window._re=exams; window._rc=cands; window._rq=questions;
 
@@ -4150,9 +4166,9 @@ function pgResults() {
     if (!isSuperAdmin() && atts.length === 0 && attsRaw.length > 0) {
       diagBanner =
         '<div style="background:var(--ambg);border:1px solid var(--ambd);border-radius:9px;padding:12px 14px;margin-bottom:14px;font-size:13px;color:var(--am);line-height:1.6">'+
-          '⚠️ There are <strong>'+attsRaw.length+'</strong> completed exam result(s) in the system, but none are matched to your plant (<strong>'+esc(CURRENT_USER.plant||'—')+'</strong>). '+
-          'This usually means the employees\' candidate records have a different (or blank) plant name than your account. '+
-          'Ask your Super Admin to open <strong>Candidates → ⚠️ Fix Missing Plants</strong> and assign these employees to "'+esc(CURRENT_USER.plant||'—')+'". Their results will then appear here automatically.'+
+          '⚠️ There are <strong>'+attsRaw.length+'</strong> completed exam result(s) in the system, but none are visible to your plant (<strong>'+esc(CURRENT_USER.plant||'—')+'</strong>). '+
+          'This can happen for two reasons: (1) The employees\' candidate records have a different or blank plant name — ask your Super Admin to open <strong>Candidates → ⚠️ Fix Missing Plants</strong>; '+
+          'or (2) The exam was not assigned to your plant — ask your Super Admin to edit the exam and check your plant in the <strong>Applicable Plant(s)</strong> list.'+
         '</div>';
     }
 
@@ -4667,9 +4683,10 @@ function pgCerts() {
     isSuperAdmin() ? Promise.resolve(null) : DB().collection('candidates').get()
   ])
     .then(function(res){
-      var exams={};
+      var exams={}, allExamsMapCerts={};
       res[1].docs.forEach(function(d){
         var ex=d.data();
+        allExamsMapCerts[d.id]=ex; // full map for fallback filtering
         if (isSuperAdmin() || examAppliesToPlant(ex, CURRENT_USER.plant)) exams[d.id]=ex;
       });
       var attsRaw=res[0].docs.map(function(d){return Object.assign({id:d.id},d.data());});
@@ -4677,7 +4694,7 @@ function pgCerts() {
       if (!isSuperAdmin()) {
         var candsMapAll = {};
         (res[2] ? res[2].docs : []).forEach(function(d){ candsMapAll[d.id]=d.data(); });
-        atts = filterAttemptsByPlant(attsRaw, candsMapAll);
+        atts = filterAttemptsByPlant(attsRaw, candsMapAll, allExamsMapCerts);
       }
       atts.sort(function(a,b){ return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0); });
       var pass=atts.filter(function(a){return a.result==='pass';}).length;
@@ -7229,9 +7246,22 @@ function loadNotifications() {
     DB().collection('exams').get(),
     DB().collection('questions').where('isActive','==',true).get()
   ]).then(function(res) {
-    var atts   = res[0].docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
-    var exams  = res[1].docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
-    var qCount = res[2].size;
+    var allAttsN  = res[0].docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
+    var allExamsN = res[1].docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
+    var qCount    = res[2].size;
+
+    // For plant admins: restrict notifications to their plant's exams and attempts
+    var allExamsMapN = {};
+    allExamsN.forEach(function(e){ allExamsMapN[e.id] = e; });
+    var exams = isSuperAdmin() ? allExamsN : allExamsN.filter(function(e){ return examAppliesToPlant(e, CURRENT_USER.plant); });
+    var assignedExamIds = {};
+    exams.forEach(function(e){ assignedExamIds[e.id] = true; });
+    var atts = isSuperAdmin() ? allAttsN : allAttsN.filter(function(a){
+      // Include if candidate's plant matches OR exam is assigned to this plant
+      var p = a.plantLocation || '';
+      if (p && userCanSeePlant(p)) return true;
+      return a.examId && assignedExamIds[a.examId];
+    });
 
     // ── 1. Recent new submissions (last 24 h) ──
     var cutoff24 = new Date(now.getTime() - 86400000);
@@ -7337,6 +7367,27 @@ function loadNotifications() {
         timeAgo: '',
         action: 'questions'
       });
+    }
+
+    // ── 7a. New exams assigned to this plant admin (last 48h) ──
+    if (!isSuperAdmin()) {
+      var cutoff48n = new Date(now.getTime() - 172800000);
+      var newAssigned = exams.filter(function(e) {
+        if (!e.createdAt) return false;
+        var ct = e.createdAt.toDate ? e.createdAt.toDate() : new Date(e.createdAt);
+        return ct > cutoff48n;
+      });
+      if (newAssigned.length > 0) {
+        notifs.unshift({
+          id: 'new_exam_assigned_' + newAssigned[0].id,
+          type: 'exam_live',
+          icon: '📋',
+          title: newAssigned.length + ' exam' + (newAssigned.length > 1 ? 's' : '') + ' assigned to your plant',
+          body: newAssigned.map(function(e){ return e.name || '—'; }).join(', '),
+          timeAgo: timeAgo(newAssigned[0].createdAt),
+          action: 'exams'
+        });
+      }
     }
 
     // ── 7. Completed exams summary (last 7 days) ──
