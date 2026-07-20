@@ -5621,14 +5621,14 @@ function renderUserMgmt() {
       var plantTag = isMultiPlant
         ? u.plants.map(function(p){ return '<span class="bk bb" style="margin-left:3px">'+esc(p)+'</span>'; }).join('')
         : (u.plant ? '<span class="bk bb" style="margin-left:4px">'+esc(u.plant)+'</span>' : '<span style="color:var(--tx3);font-size:11px">—</span>');
+      var editBtn = '<button class="b bg bxs" onclick="openEditAdminUser(\''+u.id+'\')">✏️ Edit</button>';
+      var delBtn  = !isSA ? '<button class="b bd_ bxs" onclick="deleteAdminUser(\''+u.id+'\',\''+esc(u.email||'')+'\')">🗑 Delete</button>' : '';
       return '<tr>'+
         '<td class="tn">'+esc(u.displayName||u.email||'—')+'</td>'+
         '<td style="color:var(--tx2);font-size:12px">'+esc(u.email||'—')+'</td>'+
         '<td>'+roleTag+'</td>'+
         '<td>'+plantTag+'</td>'+
-        '<td style="display:flex;gap:4px">'+
-          (!isSA ? '<button class="b bd_ bxs" onclick="deleteAdminUser(\''+u.id+'\',\''+esc(u.email||'')+'\')">🗑 Delete</button>' : '<span style="color:var(--tx3);font-size:11px">—</span>')+
-        '</td>'+
+        '<td style="display:flex;gap:4px">'+editBtn+delBtn+'</td>'+
       '</tr>';
     }).join('');
     setHtml('vUserMgmtSection',
@@ -5746,11 +5746,176 @@ function createPlantAdmin() {
 }
 
 function deleteAdminUser(uid, email) {
-  if (!confirm('Delete admin account for '+email+'? This removes their Firestore profile.\n\nNote: You will need to delete their Firebase Auth account from the Firebase console separately.')) return;
-  DB().collection('users').doc(uid).delete().then(function(){
-    toast('Admin profile deleted for '+email,'wn');
+  if (!confirm('Delete admin account for "'+email+'"?\n\nThis will permanently remove their login access AND profile. This cannot be undone.')) return;
+
+  var apiKey = FCFG.apiKey;
+
+  // Step 1: Set a random temporary password on the target account so we can sign them in
+  var tmpPwd = 'TMP_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+
+  // Use accounts:update (requires the user's idToken normally, but we use the admin approach:
+  // create a secondary app, sign in with the temp password, get idToken, call accounts:delete)
+  // First: reset the target user's password via admin endpoint
+  fetch('https://identitytoolkit.googleapis.com/v1/accounts:update?key=' + apiKey, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ localId: uid, password: tmpPwd, returnSecureToken: false })
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(upd) {
+    if (upd.error) throw new Error(upd.error.message || 'Password reset failed');
+    // Step 2: Sign in as that user to get their idToken
+    return fetch('https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' + apiKey, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, password: tmpPwd, returnSecureToken: true })
+    }).then(function(r){ return r.json(); });
+  })
+  .then(function(signIn) {
+    if (signIn.error) throw new Error(signIn.error.message || 'Sign-in for deletion failed');
+    var targetIdToken = signIn.idToken;
+    // Step 3: Delete the Firebase Auth account using the user's own idToken
+    return fetch('https://identitytoolkit.googleapis.com/v1/accounts:delete?key=' + apiKey, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken: targetIdToken })
+    }).then(function(r){ return r.json(); });
+  })
+  .then(function(del) {
+    if (del.error) throw new Error(del.error.message || 'Auth deletion failed');
+    // Step 4: Delete the Firestore profile doc
+    return DB().collection('users').doc(uid).delete();
+  })
+  .then(function() {
+    toast('Admin "' + email + '" deleted from login and system.', 'ok');
     renderUserMgmt();
-  }).catch(function(e){ toast('Error: '+e.message,'er'); });
+  })
+  .catch(function(e) {
+    // If auth deletion fails, still offer to remove just the Firestore profile
+    var msg = e.message || 'Unknown error';
+    if (confirm('Auth deletion error: ' + msg + '\n\nRemove their profile from the system anyway? (They may still be able to log in until removed from Firebase Console.)')) {
+      DB().collection('users').doc(uid).delete().then(function(){
+        toast('Profile removed. Please delete "' + email + '" from Firebase Console > Authentication manually.', 'wn');
+        renderUserMgmt();
+      }).catch(function(e2){ toast('Error: ' + e2.message, 'er'); });
+    }
+  });
+}
+
+
+// ── EDIT ADMIN USER ──────────────────────────────────────────
+var _editAdmUid = '';
+
+function openEditAdminUser(uid) {
+  _editAdmUid = uid;
+  DB().collection('users').doc(uid).get().then(function(doc) {
+    if (!doc.exists) { toast('User not found.', 'er'); return; }
+    var u = doc.data();
+    var isSA = u.role === 'super_admin';
+    var isMulti = Array.isArray(u.plants) && u.plants.length > 1;
+    var currentRole = isSA ? 'super_admin' : (isMulti ? 'multi' : 'plant');
+    var currentPlant = u.plant || '';
+    var currentPlants = Array.isArray(u.plants) ? u.plants : (currentPlant ? [currentPlant] : []);
+
+    var plantSingleOpts = PLANTS.map(function(p){
+      return '<option value="'+esc(p)+'"'+(p===currentPlant?' selected':'')+'>'+esc(p)+'</option>';
+    }).join('');
+
+    var plantMultiChks = PLANTS.map(function(p){
+      var chk = currentPlants.indexOf(p) > -1 ? 'checked' : '';
+      return '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:5px 9px;border:1px solid var(--bd2);border-radius:6px;background:var(--bg2)">'+
+        '<input type="checkbox" class="editAdmPChk" value="'+esc(p)+'" '+chk+' style="accent-color:var(--bl);width:13px;height:13px">'+esc(p)+'</label>';
+    }).join('');
+
+    var roleOpts = isSA
+      ? '<option value="super_admin" selected>⭐ Super Admin</option><option value="plant">🏭 Plant Admin (single plant)</option><option value="multi">🏢 Multi-Plant Admin</option>'
+      : '<option value="plant"'+(currentRole==='plant'?' selected':'')+'>🏭 Plant Admin (single plant)</option>'+
+        '<option value="multi"'+(currentRole==='multi'?' selected':'')+'>🏢 Multi-Plant Admin</option>';
+
+    var singleDisplay = (!isSA && currentRole !== 'multi') ? '' : 'display:none';
+    var multiDisplay  = (!isSA && currentRole === 'multi') ? '' : 'display:none';
+
+    openMo('✏️ Edit Admin User',
+      '<div class="fg"><label class="fl">Display Name *</label>'+
+        '<input class="fi" id="editAdmName" value="'+esc(u.displayName||'')+'" placeholder="Display name"></div>'+
+      '<div class="fg"><label class="fl">Email <span style="color:var(--tx3);font-weight:400">(read-only — change via Firebase Console)</span></label>'+
+        '<div class="fi" style="opacity:.6;cursor:not-allowed;background:var(--bg3)">'+esc(u.email||'—')+'</div></div>'+
+      (!isSA
+        ? '<div class="fg"><label class="fl">Role *</label>'+
+            '<select class="fi fsel" id="editAdmRole" onchange="onEditAdmRoleChange()">'+roleOpts+'</select></div>'
+        : '<div class="fg"><label class="fl">Role</label><div class="fi" style="opacity:.6;cursor:not-allowed;background:var(--bg3)">⭐ Super Admin (cannot be changed)</div></div>')+
+      '<div id="vEditAdmPlantWrap">'+
+        '<div id="vEditAdmSingleRow" style="'+singleDisplay+'">'+
+          '<div class="fg"><label class="fl">Assigned Plant</label>'+
+            '<select class="fi fsel" id="editAdmPlant"><option value="">— Select Plant —</option>'+plantSingleOpts+'</select></div>'+
+        '</div>'+
+        '<div id="vEditAdmMultiRow" style="'+multiDisplay+'">'+
+          '<div class="fg"><label class="fl">Assigned Plants *</label>'+
+            '<div style="display:flex;flex-wrap:wrap;gap:7px;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg3)" id="vEditAdmPlantChks">'+
+              plantMultiChks+
+            '</div></div>'+
+        '</div>'+
+      '</div>'+
+      '<div id="vEditAdmErr" class="h" style="padding:8px 11px;background:var(--rdbg);border:1px solid var(--rdbd);border-radius:7px;font-size:12px;color:var(--rd)"></div>',
+      [{lbl:'Cancel',cls:'b bg',fn:'closeMo()'},{lbl:'💾 Save Changes',cls:'b bp',fn:'saveEditAdminUser()'}]
+    );
+  }).catch(function(e){ toast('Error loading user: '+e.message,'er'); });
+}
+
+function onEditAdmRoleChange() {
+  var role = val('editAdmRole');
+  var sr = G('vEditAdmSingleRow');
+  var mr = G('vEditAdmMultiRow');
+  if (sr) sr.style.display = (role === 'plant' || !role) ? '' : 'none';
+  if (mr) mr.style.display = role === 'multi' ? '' : 'none';
+}
+
+function saveEditAdminUser() {
+  var uid = _editAdmUid;
+  if (!uid) return;
+  var nm   = (G('editAdmName')||{}).value.trim();
+  var errEl = G('vEditAdmErr');
+  function showErr(m){ if(errEl){errEl.textContent=m; errEl.classList.remove('h');} }
+  if (!nm) { showErr('Display name is required.'); return; }
+
+  var roleEl = G('editAdmRole');
+  var isSA = !roleEl; // super admin: role select is hidden
+  var update = { displayName: nm };
+
+  if (!isSA) {
+    var role = roleEl.value;
+    if (!role) { showErr('Select a role.'); return; }
+    var pl = '', plants = [];
+    if (role === 'plant') {
+      pl = (G('editAdmPlant')||{}).value || '';
+      if (!pl) { showErr('Select a plant.'); return; }
+      plants = [pl];
+      update.role   = 'admin';
+      update.plant  = pl;
+      update.plants = plants;
+    } else {
+      document.querySelectorAll('.editAdmPChk:checked').forEach(function(cb){ plants.push(cb.value); });
+      if (!plants.length) { showErr('Select at least one plant.'); return; }
+      update.role   = 'admin';
+      update.plant  = '';
+      update.plants = plants;
+    }
+  }
+
+  var btn = document.querySelector('#vMo .bp');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  if (errEl) errEl.classList.add('h');
+
+  DB().collection('users').doc(uid).update(update)
+    .then(function(){
+      closeMo();
+      toast('Admin user updated!', 'ok');
+      renderUserMgmt();
+    })
+    .catch(function(e){
+      showErr('Error: '+e.message);
+      if (btn) { btn.disabled = false; btn.textContent = '💾 Save Changes'; }
+    });
 }
 
 // ── MAINTENANCE ──────────────────────────────────────────────
