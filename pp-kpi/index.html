@@ -4946,25 +4946,13 @@ function applyRoleRestrictions(profile){
 
   const roleRaw = effectiveRole.toLowerCase();
 
-  const isTopMgmt    = roleRaw === 'top management';
+  const isTopMgmt   = roleRaw === 'top management';
   const isPlantAdmin = roleRaw === 'plant admin';
   const isDeptUser   = roleRaw === 'dept user';
-  // isSuperAdmin is ONLY true when an explicit KPI role IS recognised.
-  // An empty/unrecognised role (e.g. examRole='admin' with no kpiRole) must NOT
-  // default to Super Admin — that was the root cause of "admin rights for all plants".
-  const isKnownKpiRole = isTopMgmt || isPlantAdmin || isDeptUser || roleRaw === 'super admin';
-  const isSuperAdmin   = isKnownKpiRole && !isPlantAdmin && !isDeptUser && !isTopMgmt;
+  const isSuperAdmin = !isPlantAdmin && !isDeptUser && !isTopMgmt;
 
-  // ISOLATION: KPI plant comes from kpiPlant (app-specific) if present,
-  // falling back to the shared plant field for legacy docs.
-  // This prevents ExamPro's plant/plants writes from altering KPI plant scope.
-  const kpiPlant = (profile && profile.kpiPlant) ? profile.kpiPlant
-                 : (profile && profile.plant)     ? profile.plant
-                 : '';
-
-  // Store effectiveRole (resolved KPI role) — never the raw Firestore role field
-  // which may contain an ExamPro value like 'admin' or 'super_admin'.
-  window._roleInfo = { role: effectiveRole, plant: kpiPlant, isSuperAdmin, isPlantAdmin, isDeptUser, isTopMgmt, isKnownKpiRole };
+  const role = profile && profile.role;
+  window._roleInfo = { role, plant: profile && profile.plant, isSuperAdmin, isPlantAdmin, isDeptUser, isTopMgmt };
 
   // ── Nav visibility ────────────────────────────────────────────────
   // KPI Matrix — visible to all except Dept User
@@ -8379,15 +8367,6 @@ function resetAppState() {
   if (unsubLive)    { try{ unsubLive();    }catch(e){} unsubLive    = null; }
 }
 
-// Returns true when the string is one of the four recognised KPI role values.
-// Used to distinguish a KPI user doc from an ExamPro-only doc (which has
-// examRole = 'admin'/'super_admin' but no kpiRole and no KPI role in role).
-function _isKpiRoleString(r) {
-  if (!r) return false;
-  const s = String(r).trim().toLowerCase();
-  return s === 'super admin' || s === 'top management' || s === 'plant admin' || s === 'dept user';
-}
-
 // Robust profile fetch — retries with exponential backoff so users on fresh
 // devices / slower networks load correctly without needing Super Admin to open
 // the app first. Returns the profile object, or null if every attempt failed.
@@ -8396,10 +8375,7 @@ async function fetchProfileWithRetry(uid, maxAttempts = 6) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const p = await getUserProfile(uid);
-      // Success only if the profile has a recognised KPI role (kpiRole or legacy role
-      // that maps to a KPI role string). An examRole-only doc ('admin'/'super_admin')
-      // must not be treated as a valid KPI profile — that is an ExamPro-only account.
-      if (p && (p.kpiRole || _isKpiRoleString(p.role))) return p;
+      if (p && p.role) return p;          // success — got a real profile
       // Doc may not be readable yet (token not propagated) — wait and retry
       console.warn(`Profile attempt ${attempt}/${maxAttempts}: no role yet`);
     } catch (err) {
@@ -8443,7 +8419,7 @@ function showProfileErrorScreen(user) {
     const btn = document.getElementById('profileRetryBtn');
     btn.textContent = 'Retrying…'; btn.disabled = true;
     const profile = await fetchProfileWithRetry(user.uid, 6);
-    if (profile && (profile.kpiRole || _isKpiRoleString(profile.role))) {
+    if (profile && profile.role) {
       el.remove();
       currentProfile = profile;
       if (!currentProfile.email) currentProfile.email = user.email;
@@ -8453,8 +8429,7 @@ function showProfileErrorScreen(user) {
       const initials = safeName.split(' ').filter(Boolean).map(n=>n[0]).join('').slice(0,2).toUpperCase() || '?';
       const av = document.querySelector('.avatar'); if (av) av.textContent = initials;
       const nm = document.querySelector('.user-name'); if (nm) nm.textContent = safeName;
-      // Show resolved KPI role label (from kpiRole), not raw role field
-      const rl = document.querySelector('.user-role'); if (rl) rl.textContent = (currentProfile.kpiRole || currentProfile.role) || '—';
+      const rl = document.querySelector('.user-role'); if (rl) rl.textContent = currentProfile.role || '—';
       try { await loadFirebaseData(); startLiveListeners(); showToast('Signed in ✓'); }
       catch(e){ console.error(e); showToast('Signed in — some data failed to load'); }
     } else {
@@ -8492,8 +8467,8 @@ onAuthChange(async user => {
     // If after all retries we STILL have no profile/role, do NOT default to
     // Super Admin (security) and do NOT silently bounce the user. Show a clear
     // retry screen so they can try again without needing anyone else to log in.
-    if (!currentProfile || (!currentProfile.kpiRole && !_isKpiRoleString(currentProfile.role))) {
-      console.warn('No KPI role found for user after retries — showing retry screen');
+    if (!currentProfile || !currentProfile.role) {
+      console.warn('No role found for user after retries — showing retry screen');
       showProfileErrorScreen(user);
       return;
     }
@@ -8510,7 +8485,7 @@ onAuthChange(async user => {
       const nameEl = document.querySelector('.user-name');
       if (nameEl) nameEl.textContent = safeName;
       const roleEl = document.querySelector('.user-role');
-      if (roleEl) roleEl.textContent = (currentProfile.kpiRole || currentProfile.role) || '—';
+      if (roleEl) roleEl.textContent = currentProfile.role || '—';
     }
 
     // Load Firebase data into app — wrapped so a failure here never blocks the UI
