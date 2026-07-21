@@ -1955,12 +1955,17 @@ function resolveAdminUser(user) {
               .catch(function(e){ console.warn('examRole migration failed:', e.message); });
           }
           CURRENT_USER.role        = canonicalRole;
-          CURRENT_USER.plant       = d.plant || '';
-          if (Array.isArray(d.plants) && d.plants.length) {
-            CURRENT_USER.plants  = d.plants;
-            CURRENT_USER.plant   = '';
+          // Read ExamPro-specific plant fields (examPlant / examPlants).
+          // Fall back to shared plant/plants only for legacy docs created before
+          // this isolation fix, so existing admins are not locked out.
+          var ep  = d.examPlant  !== undefined ? (d.examPlant  || '') : (d.plant  || '');
+          var eps = d.examPlants !== undefined ? d.examPlants         : (Array.isArray(d.plants) ? d.plants : null);
+          CURRENT_USER.plant  = ep;
+          if (Array.isArray(eps) && eps.length) {
+            CURRENT_USER.plants = eps;
+            CURRENT_USER.plant  = '';
           } else {
-            CURRENT_USER.plants  = d.plant ? [d.plant] : [];
+            CURRENT_USER.plants = ep ? [ep] : [];
           }
           CURRENT_USER.displayName = d.displayName || d.name || (d.email||'').split('@')[0];
           CURRENT_USER.email       = d.email || user.email || '';
@@ -5663,15 +5668,20 @@ function renderUserMgmt() {
       // Use examRole (app-specific); fall back to shared role for legacy docs
       var resolvedRole = u.examRole || u.role || '';
       var isSA = resolvedRole === 'super_admin';
-      var isMultiPlant = Array.isArray(u.plants) && u.plants.length > 1;
+      // Read ExamPro-specific plant fields for display; fall back for legacy docs
+      var uExamPlant  = u.examPlant  !== undefined ? (u.examPlant  || '') : (u.plant  || '');
+      var uExamPlants = u.examPlants !== undefined
+        ? (Array.isArray(u.examPlants) ? u.examPlants : [])
+        : (Array.isArray(u.plants)     ? u.plants     : []);
+      var isMultiPlant = uExamPlants.length > 1;
       var roleTag = isSA
         ? '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd)">⭐ Super Admin</span>'
         : (isMultiPlant
           ? '<span class="bk" style="background:var(--blbg);color:var(--bl);border:1px solid rgba(79,142,247,.3)">🏢 Multi-Plant Admin</span>'
           : '<span class="bk bt">🏭 Plant Admin</span>');
       var plantTag = isMultiPlant
-        ? u.plants.map(function(p){ return '<span class="bk bb" style="margin-left:3px">'+esc(p)+'</span>'; }).join('')
-        : (u.plant ? '<span class="bk bb" style="margin-left:4px">'+esc(u.plant)+'</span>' : '<span style="color:var(--tx3);font-size:11px">—</span>');
+        ? uExamPlants.map(function(p){ return '<span class="bk bb" style="margin-left:3px">'+esc(p)+'</span>'; }).join('')
+        : (uExamPlant ? '<span class="bk bb" style="margin-left:4px">'+esc(uExamPlant)+'</span>' : '<span style="color:var(--tx3);font-size:11px">—</span>');
       var editBtn = '<button class="b bg bxs" onclick="openEditAdminUser(\''+u.id+'\')">✏️ Edit</button>';
       var delBtn  = !isSA ? '<button class="b bd_ bxs" onclick="deleteAdminUser(\''+u.id+'\',\''+esc(u.email||'')+'\')">🗑 Delete</button>' : '';
       return '<tr>'+
@@ -5777,16 +5787,16 @@ function createPlantAdmin() {
     if (data.error) { showAdmErr(data.error.message||'Firebase error'); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} return; }
     var uid = data.localId;
     var userDoc = {
-      examRole:    'admin',  // ExamPro-specific field — never conflicts with KPI's role field
-      plant:       pl,
-      plants:      plants,
+      examRole:    'admin',  // ExamPro-specific — never overwrites KPI's kpiRole field
+      examPlant:   pl,       // ExamPro-specific — never overwrites KPI's plant field
+      examPlants:  plants,   // ExamPro-specific — never overwrites KPI's plants field
       displayName: nm,
       name:        nm,
       email:       em,
       createdAt:   firebase.firestore.FieldValue.serverTimestamp(),
       createdBy:   CURRENT_USER.uid || ''
     };
-    // Use merge:true so that if this user already has a KPI profile (role, kpiRole, etc.)
+    // Use merge:true so that if this user already has a KPI profile (kpiRole, plant, etc.)
     // those fields are preserved — we only set/update ExamPro-specific fields.
     DB().collection('users').doc(uid).set(userDoc, { merge: true }).then(function(){
       var scopeLabel = plants.length > 1 ? plants.join(', ') : pl;
@@ -5868,10 +5878,13 @@ function openEditAdminUser(uid) {
     // Read examRole (app-specific) first; fall back to shared role for legacy docs
     var resolvedRole = u.examRole || u.role || '';
     var isSA = resolvedRole === 'super_admin';
-    var isMulti = Array.isArray(u.plants) && u.plants.length > 1;
+    // Read ExamPro-specific plant fields; fall back to shared fields for legacy docs
+    var currentPlant  = u.examPlant  !== undefined ? (u.examPlant  || '') : (u.plant  || '');
+    var currentPlants = u.examPlants !== undefined
+      ? (Array.isArray(u.examPlants) ? u.examPlants : (currentPlant ? [currentPlant] : []))
+      : (Array.isArray(u.plants)     ? u.plants     : (currentPlant ? [currentPlant] : []));
+    var isMulti = currentPlants.length > 1;
     var currentRole = isSA ? 'super_admin' : (isMulti ? 'multi' : 'plant');
-    var currentPlant = u.plant || '';
-    var currentPlants = Array.isArray(u.plants) ? u.plants : (currentPlant ? [currentPlant] : []);
 
     var plantSingleOpts = PLANTS.map(function(p){
       return '<option value="'+esc(p)+'"'+(p===currentPlant?' selected':'')+'>'+esc(p)+'</option>';
@@ -5946,15 +5959,15 @@ function saveEditAdminUser() {
       pl = (G('editAdmPlant')||{}).value || '';
       if (!pl) { showErr('Select a plant.'); return; }
       plants = [pl];
-      update.examRole = 'admin'; // ExamPro-specific — does not touch kpiRole
-      update.plant    = pl;
-      update.plants   = plants;
+      update.examRole   = 'admin'; // ExamPro-specific — does not touch kpiRole
+      update.examPlant  = pl;      // ExamPro-specific — does not touch KPI's plant field
+      update.examPlants = plants;  // ExamPro-specific — does not touch KPI's plants field
     } else {
       document.querySelectorAll('.editAdmPChk:checked').forEach(function(cb){ plants.push(cb.value); });
       if (!plants.length) { showErr('Select at least one plant.'); return; }
-      update.examRole = 'admin'; // ExamPro-specific — does not touch kpiRole
-      update.plant    = '';
-      update.plants   = plants;
+      update.examRole   = 'admin'; // ExamPro-specific — does not touch kpiRole
+      update.examPlant  = '';      // ExamPro-specific — does not touch KPI's plant field
+      update.examPlants = plants;  // ExamPro-specific — does not touch KPI's plants field
     }
   }
 
