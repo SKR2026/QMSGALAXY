@@ -4964,8 +4964,9 @@ function applyRoleRestrictions(profile){
   const isDeptUser   = roleRaw === 'dept user';
   const isSuperAdmin = !isPlantAdmin && !isDeptUser && !isTopMgmt;
 
-  const role = profile && profile.role;
-  window._roleInfo = { role, plant: profile && profile.plant, isSuperAdmin, isPlantAdmin, isDeptUser, isTopMgmt };
+  // FIX: use effectiveRole (kpiRole ?? role) so downstream checks are consistent
+  // with the isSuperAdmin/isPlantAdmin/isDeptUser/isTopMgmt flags above.
+  window._roleInfo = { role: effectiveRole, plant: profile && profile.plant, isSuperAdmin, isPlantAdmin, isDeptUser, isTopMgmt };
 
   // ── Nav visibility ────────────────────────────────────────────────
   // KPI Matrix — visible to all except Dept User
@@ -7486,15 +7487,28 @@ function refreshPlantSelectors(){
 
   // Rebuild the top "Plant" filter tabs from plantsList so newly added
   // plants appear immediately, preserving the currently active selection.
+  // FIX: Plant Admin / Dept User must only see their own plant tab — not all plants.
   const plantTabs = document.getElementById('plantTabs');
   if(plantTabs){
     const activeBtn = plantTabs.querySelector('.ftab.active');
     const activeVal = activeBtn ? activeBtn.getAttribute('onclick').match(/'plant','([^']*)'/)[1] : (filterState.plant || 'All');
-    plantTabs.innerHTML = '<button class="ftab" onclick="setFilter(\'plant\',\'All\',this)">All Plants</button>' +
-      plantsList.map(p=>`<button class="ftab" draggable="true" ondragstart="tabDragStart(event)" ondragend="tabDragEnd(event)" onclick="setFilter('plant','${p.name}',this)">${p.name}</button>`).join('');
-    let toActivate = plantTabs.querySelector(`.ftab[onclick*="'${activeVal}'"]`) || plantTabs.querySelector('.ftab');
-    plantTabs.querySelectorAll('.ftab').forEach(b=>b.classList.remove('active'));
-    if(toActivate) toActivate.classList.add('active');
+    const isRestricted = restrictedPlants.length === 1;
+    if (isRestricted) {
+      // Plant Admin / Dept User: show only their plant tab (no "All Plants" option)
+      const p = restrictedPlants[0];
+      plantTabs.innerHTML = `<button class="ftab active" onclick="setFilter('plant','${p.name}',this)">${p.name}</button>`;
+      // Force the filter to their plant so they cannot view other plants' data
+      if (filterState.plant !== p.name) {
+        filterState.plant = p.name;
+      }
+    } else {
+      // Super Admin / Top Management: show all plants
+      plantTabs.innerHTML = '<button class="ftab" onclick="setFilter(\'plant\',\'All\',this)">All Plants</button>' +
+        plantsList.map(p=>`<button class="ftab" draggable="true" ondragstart="tabDragStart(event)" ondragend="tabDragEnd(event)" onclick="setFilter('plant','${p.name}',this)">${p.name}</button>`).join('');
+      let toActivate = plantTabs.querySelector(`.ftab[onclick*="'${activeVal}'"]`) || plantTabs.querySelector('.ftab');
+      plantTabs.querySelectorAll('.ftab').forEach(b=>b.classList.remove('active'));
+      if(toActivate) toActivate.classList.add('active');
+    }
   }
 
   // Keep the Add/Edit User "Plant" dropdowns in sync with plantsList
@@ -8546,9 +8560,13 @@ onAuthChange(async user => {
     currentUser    = null;
     currentProfile = null;
     window._fbProfile = null;
+    window._roleInfo   = null;
     resetAppState();
-    // Show login overlay
-    showLoginOverlay();
+    // FIX: Reload the page on logout so all in-memory state, role restrictions,
+    // UI elements, and cached data are completely wiped before the next user logs
+    // in. Without this, the previous user's plant tabs, nav visibility, and
+    // data arrays remain visible to whoever signs in next on the same machine.
+    location.reload();
   }
 });
 
@@ -8717,10 +8735,16 @@ async function loadFirebaseData() {
   // 2. KPI Entries — initial load
   // Firestore is the authoritative source. Clear BOTH local arrays so nothing
   // persists from before login and all data comes fresh from Firestore.
+  // FIX: Plant Admin / Dept User must only fetch entries for their own plant —
+  //      do NOT load other plants' data into the browser at all.
   try {
     kpiData.length = 0;
     recentEntries.length = 0; // ← critical: prevents stale local entries surviving across sessions
-    let fsEntries = await getKPIEntries({}); // no filters — need full dataset
+    const _r = window._roleInfo;
+    const _entryFilter = (_r && (_r.isPlantAdmin || _r.isDeptUser) && _r.plant)
+      ? { plant: _r.plant }
+      : {};
+    let fsEntries = await getKPIEntries(_entryFilter); // restrict by plant for non-admins
 
     // Deduplicate Firestore entries by business key (kpiId+plant+month+year).
     // ALWAYS prefer the submitted/locked doc. If two docs exist for the same
