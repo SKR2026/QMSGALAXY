@@ -7371,7 +7371,13 @@ function _activateRoleSession(role) {
       _loadGroupMemberEmails(currentSession.email).then(() => { refreshOverdueBadge(); });
     });
     toast('Welcome, ' + getSessionNick() + '! 👋');
-    showPanel('dashboard');
+    // If user arrived via a group invite deep-link, open their Group Invites panel directly
+    if (window._grpInviteDeepLink && window._grpInviteDeepLink.giEmail &&
+        currentSession && currentSession.email.toLowerCase() === window._grpInviteDeepLink.giEmail.toLowerCase()) {
+      setTimeout(() => { showMyGroupInvites(); delete window._grpInviteDeepLink; }, 200);
+    } else {
+      showPanel('dashboard');
+    }
   }
 
   _renderTopbarUserBadge();
@@ -7532,10 +7538,6 @@ function showSendRegistrationPanel() {
             : '<option value="user">User</option>'}
         </select>
       </div>
-      <div class="form-group">
-        <label class="form-label">Temporary Password <span style="color:var(--text3);font-size:12px">(user will change on first login)</span></label>
-        <input id="reg-tempwd" class="form-input" type="text" placeholder="e.g. Welcome@123"/>
-      </div>
       <div id="reg-status" style="font-size:12px;min-height:16px;margin-bottom:8px"></div>
       <button class="btn btn-primary" onclick="_sendRegistration()">📨 Create Account & Send Link</button>
     </div>
@@ -7546,11 +7548,9 @@ async function _sendRegistration() {
   const email  = _normEmail(document.getElementById('reg-email').value);
   const nick   = (document.getElementById('reg-nick').value || '').trim();
   const role   = document.getElementById('reg-role').value;
-  const tempPw = (document.getElementById('reg-tempwd').value || '').trim();
   const st     = document.getElementById('reg-status');
 
   if (!email) { st.textContent='❌ Enter an email address.'; st.style.color='var(--red)'; return; }
-  if (!tempPw){ st.textContent='❌ Set a temporary password.'; st.style.color='var(--red)'; return; }
 
   st.textContent='⏳ Creating account...'; st.style.color='var(--text3)';
   try {
@@ -7563,35 +7563,43 @@ async function _sendRegistration() {
         : '❌ An account for "' + email + '" already exists (' + exStatus + ').';
       st.style.color='var(--red)'; return;
     }
-    const hashed = await _hashPw(tempPw, email);
+
+    // Generate a secure set-password token (user will set their own password via link)
+    const tokenBytes = new Uint8Array(24);
+    crypto.getRandomValues(tokenBytes);
+    const setPasswordToken = Array.from(tokenBytes).map(b => b.toString(16).padStart(2,'0')).join('');
+    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
+
     await _db.collection('appUsers').doc(email).set({
       email, nickname: nick, role,
-      passwordHash: hashed,
+      passwordHash: '',
       mustChangePassword: true,
+      passwordResetToken: setPasswordToken,
+      passwordResetExpires: expiresAt,
       status: 'active',
       createdBy: adminAuthenticated && !currentSession ? 'superadmin' : (currentSession?.email || ''),
       createdAt: new Date().toISOString(),
       groupMemberships: []
     });
 
+    const setPasswordUrl = window.location.href.split('?')[0] + '?pwreset=' + setPasswordToken + '&pwr_email=' + encodeURIComponent(email);
+
     // ── Now actually send the registration email ──────────────────────
     st.textContent='⏳ Account created! Sending registration email...'; st.style.color='var(--text3)';
-    const emailSent = await _sendRegistrationEmail(email, nick, role, tempPw);
+    const emailSent = await _sendRegistrationEmail(email, nick, role, setPasswordUrl);
 
     if (emailSent === true) {
       st.innerHTML='✅ Account created & registration email sent to <strong>' + esc(email) + '</strong>!';
       st.style.color='var(--green)';
       toast('✅ Account created & email sent to ' + (nick || email) + '!', 'var(--green)');
     } else if (emailSent === 'mailto') {
-      // Opened mail client fallback
-      st.innerHTML='✅ Account created! A draft email has been opened in your mail client.<br><span style="color:var(--text3)">Temp password: <strong>' + esc(tempPw) + '</strong></span>';
+      st.innerHTML='✅ Account created! A draft email has been opened in your mail client.';
       st.style.color='var(--green)';
       toast('✅ Account created! Mail client opened — send the draft.', 'var(--amber)');
     } else {
-      // Email failed but account exists — show manual fallback
-      st.innerHTML='✅ Account created, but email failed to send.<br><span style="color:var(--text3)">Share manually — Temp password: <strong>' + esc(tempPw) + '</strong></span>';
+      st.innerHTML='✅ Account created, but email failed to send.<br><span style="color:var(--text3)">Share this link manually: <a href="' + esc(setPasswordUrl) + '" style="color:var(--accent)">' + esc(setPasswordUrl) + '</a></span>';
       st.style.color='var(--amber)';
-      toast('⚠ Account created but email failed — share login details manually.', 'var(--amber)');
+      toast('⚠ Account created but email failed — share the set-password link manually.', 'var(--amber)');
     }
   } catch(e) {
     st.textContent='❌ Error: ' + e.message; st.style.color='var(--red)';
@@ -7599,9 +7607,9 @@ async function _sendRegistration() {
 }
 
 // ── Build and send the registration email ─────────────────────────────
-async function _sendRegistrationEmail(toEmail, nickname, role, tempPassword) {
+// setPasswordUrl: a ?pwreset=TOKEN&pwr_email=EMAIL link; user clicks to set their own password.
+async function _sendRegistrationEmail(toEmail, nickname, role, setPasswordUrl) {
   const transport   = emailTransport();
-  const loginUrl    = window.location.href.split('?')[0];
   const displayName = nickname || toEmail.split('@')[0];
   const companyName = localStorage.getItem('company_name') || 'POLYPLASTICS';
   const senderName  = adminAuthenticated && !currentSession ? 'Super Admin' : (getSessionNick() || 'Admin');
@@ -7612,7 +7620,7 @@ async function _sendRegistrationEmail(toEmail, nickname, role, tempPassword) {
     ? `<img src="${logoUrl}" alt="${companyName}" style="max-height:40px;max-width:160px;display:block;margin-bottom:8px;"/>`
     : `<div style="font-family:sans-serif;font-size:18px;font-weight:800;color:#5b8dee;letter-spacing:1px;">${companyName}</div>`;
 
-  const subject = `[${companyName}] Your Task Manager account is ready`;
+  const subject = `[${companyName}] Your Task Manager account is ready — set your password`;
 
   const htmlBody = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/></head>
@@ -7632,17 +7640,13 @@ async function _sendRegistrationEmail(toEmail, nickname, role, tempPassword) {
       <strong>${senderName}</strong> has created a <strong>${roleLabel}</strong> account for you on the ${companyName} Task Manager.
     </div>
 
-    <!-- Credentials box -->
+    <!-- Account info box -->
     <div style="background:#f5f7ff;border:1px solid #d8dce8;border-radius:10px;padding:20px 24px;margin-bottom:24px;">
-      <div style="font-size:12px;font-weight:700;color:#8890a8;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:14px;">Your Login Details</div>
+      <div style="font-size:12px;font-weight:700;color:#8890a8;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:14px;">Your Account Details</div>
       <table cellpadding="0" cellspacing="0" width="100%">
         <tr>
           <td style="font-size:13px;color:#4a5068;padding:5px 0;width:120px;font-weight:600;">Email</td>
           <td style="font-size:13px;color:#1a1e2e;font-weight:700;">${toEmail}</td>
-        </tr>
-        <tr>
-          <td style="font-size:13px;color:#4a5068;padding:5px 0;font-weight:600;">Temp Password</td>
-          <td style="font-size:13px;color:#1a1e2e;font-weight:700;font-family:monospace;background:#e8ebf4;padding:3px 8px;border-radius:5px;">${tempPassword}</td>
         </tr>
         <tr>
           <td style="font-size:13px;color:#4a5068;padding:5px 0;font-weight:600;">Role</td>
@@ -7651,16 +7655,18 @@ async function _sendRegistrationEmail(toEmail, nickname, role, tempPassword) {
       </table>
     </div>
 
-    <div style="font-size:13px;color:#e6112a;font-weight:600;margin-bottom:20px;">⚠ You will be prompted to set a new password on your first login.</div>
+    <div style="font-size:13px;color:#4a5068;line-height:1.6;margin-bottom:20px;">
+      Click the button below to set your password and activate your account. This link is valid for <strong>7 days</strong>.
+    </div>
 
-    <!-- CTA Button -->
+    <!-- CTA Button — "Click here to set the password" -->
     <table cellpadding="0" cellspacing="0"><tr><td style="border-radius:10px;background:linear-gradient(135deg,#5b8dee,#3d6dd4);">
-      <a href="${loginUrl}" style="display:inline-block;padding:14px 32px;font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;letter-spacing:0.3px;">Open Task Manager →</a>
+      <a href="${setPasswordUrl}" style="display:inline-block;padding:14px 32px;font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;letter-spacing:0.3px;">Click here to set the password</a>
     </td></tr></table>
 
     <div style="margin-top:24px;font-size:12px;color:#8890a8;line-height:1.6;">
-      If the button doesn't work, copy this link:<br/>
-      <a href="${loginUrl}" style="color:#5b8dee;">${loginUrl}</a>
+      If the button doesn't work, copy and paste this link into your browser:<br/>
+      <a href="${setPasswordUrl}" style="color:#5b8dee;word-break:break-all;">${setPasswordUrl}</a>
     </div>
   </td></tr>
   <!-- Footer -->
@@ -7694,7 +7700,7 @@ async function _sendRegistrationEmail(toEmail, nickname, role, tempPassword) {
         task_due:     '',
         task_priority:'',
         task_status:  '',
-        task_desc:    'Your login details are inside.',
+        task_desc:    'Click the link inside to set your password.',
         task_assignee: toEmail,
         reply_to:     'noreply@polyplastics.com',
         from_name:    companyName + ' Task Manager',
@@ -7712,10 +7718,9 @@ async function _sendRegistrationEmail(toEmail, nickname, role, tempPassword) {
   const body = encodeURIComponent(
     'Hello ' + displayName + ',\n\n' +
     'Your Task Manager account has been created.\n\n' +
-    'Login URL: ' + loginUrl + '\n' +
-    'Email: ' + toEmail + '\n' +
-    'Temporary Password: ' + tempPassword + '\n\n' +
-    'You will be asked to set a new password on first login.\n\n' +
+    'Email: ' + toEmail + '\n\n' +
+    'Click the link below to set your password:\n' + setPasswordUrl + '\n\n' +
+    'This link is valid for 7 days.\n\n' +
     'Regards,\n' + companyName
   );
   const mailtoSubject = encodeURIComponent(subject);
@@ -7767,10 +7772,6 @@ async function showManageAdminsPanel() {
             <input id="ma-nick" class="form-input" placeholder="e.g. Rahul"/>
           </div>
         </div>
-        <div class="form-group">
-          <label class="form-label">Temporary Password <span style="color:var(--text3);font-size:11px">(user must change on first login)</span></label>
-          <input id="ma-pwd" class="form-input" type="text" placeholder="e.g. Admin@2025"/>
-        </div>
         <div id="ma-status" style="font-size:12px;min-height:16px;margin-bottom:10px"></div>
         <button class="btn btn-primary" onclick="_createAdminAccount()">🛡️ Create Admin & Send Registration Email</button>
       </div>
@@ -7787,10 +7788,8 @@ async function showManageAdminsPanel() {
 async function _createAdminAccount() {
   const email  = _normEmail(document.getElementById('ma-email')?.value);
   const nick   = (document.getElementById('ma-nick')?.value||'').trim();
-  const tempPw = (document.getElementById('ma-pwd')?.value||'').trim();
   const st     = document.getElementById('ma-status');
   if(!email){ st.textContent='❌ Enter email.'; st.style.color='var(--red)'; return; }
-  if(!tempPw){ st.textContent='❌ Set a temporary password.'; st.style.color='var(--red)'; return; }
   st.textContent='⏳ Creating admin account...'; st.style.color='var(--text3)';
   try {
     const existing = await _db.collection('appUsers').doc(email).get();
@@ -7801,27 +7800,35 @@ async function _createAdminAccount() {
         : '❌ An account for "' + email + '" already exists (' + exStatus + ').';
       st.style.color='var(--red)'; return;
     }
-    const hashed = await _hashPw(tempPw, email);
+    // Generate set-password token — admin sets their own password via link
+    const tokenBytes = new Uint8Array(24);
+    crypto.getRandomValues(tokenBytes);
+    const setPasswordToken = Array.from(tokenBytes).map(b => b.toString(16).padStart(2,'0')).join('');
+    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
+
     await _db.collection('appUsers').doc(email).set({
       email, nickname: nick, role: 'admin',
-      passwordHash: hashed, mustChangePassword: true,
+      passwordHash: '', mustChangePassword: true,
+      passwordResetToken: setPasswordToken,
+      passwordResetExpires: expiresAt,
       status: 'active', createdBy: 'superadmin',
       createdAt: new Date().toISOString(), groupMemberships: []
     });
+    const setPasswordUrl = window.location.href.split('?')[0] + '?pwreset=' + setPasswordToken + '&pwr_email=' + encodeURIComponent(email);
+
     st.textContent='⏳ Account created! Sending registration email...'; st.style.color='var(--text3)';
-    const sent = await _sendRegistrationEmail(email, nick, 'admin', tempPw);
+    const sent = await _sendRegistrationEmail(email, nick, 'admin', setPasswordUrl);
     if(sent === true){
       st.innerHTML='✅ Admin account created & email sent to <strong>'+esc(email)+'</strong>!';
       st.style.color='var(--green)';
       toast('✅ Admin account created for '+(nick||email)+'!','var(--green)');
     } else {
-      st.innerHTML='✅ Admin account created. Share login manually — Temp pwd: <strong>'+esc(tempPw)+'</strong>';
+      st.innerHTML='✅ Admin account created. Share link manually: <a href="'+esc(setPasswordUrl)+'" style="color:var(--accent)">Set Password Link</a>';
       st.style.color='var(--amber)';
     }
     _loadAdminList();
     if(document.getElementById('ma-email')) document.getElementById('ma-email').value='';
     if(document.getElementById('ma-nick'))  document.getElementById('ma-nick').value='';
-    if(document.getElementById('ma-pwd'))   document.getElementById('ma-pwd').value='';
   } catch(e){ st.textContent='❌ '+e.message; st.style.color='var(--red)'; }
 }
 
@@ -8183,16 +8190,18 @@ async function _sendGroupRequest(adminEmail) {
     await _db.collection('appUsers').doc(userEmail).set({ pendingGroupInvites: [...existingInvites, inviteObj] }, { merge: true });
 
     // ── Send invite email from account holder's email ──────────────
-    await _sendGroupInviteEmail(userEmail, inviteNick||userEmail.split('@')[0], adminEmail, adminNick, grp.name);
+    await _sendGroupInviteEmail(userEmail, inviteNick||userEmail.split('@')[0], adminEmail, adminNick, grp.name, groupId);
 
     st.textContent='✅ Invite sent to ' + userEmail; st.style.color='var(--green)';
     toast('Group invitation sent to ' + (inviteNick||userEmail) + '!', 'var(--green)');
   } catch(e) { st.textContent='❌ ' + e.message; st.style.color='var(--red)'; }
 }
 
-async function _sendGroupInviteEmail(toEmail, toName, fromEmail, fromName, groupName) {
+async function _sendGroupInviteEmail(toEmail, toName, fromEmail, fromName, groupName, groupId) {
   const transport = emailTransport();
-  const appUrl    = window.location.href.split('?')[0];
+  const baseUrl   = window.location.href.split('?')[0];
+  // Deep-link URL: clicking it opens the accept/reject panel directly after login
+  const deepLinkUrl = baseUrl + '?grpinvite=' + encodeURIComponent(fromEmail + '::' + (groupId||'')) + '&gi_email=' + encodeURIComponent(toEmail);
   const company   = localStorage.getItem('company_name') || 'POLYPLASTICS';
   const subject   = '[' + company + '] ' + fromName + ' wants to add you to their group';
   const html = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f0f2f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
@@ -8210,11 +8219,11 @@ async function _sendGroupInviteEmail(toEmail, toName, fromEmail, fromName, group
       <strong>⚠ What this means:</strong> If you accept, ${fromName} will be able to see and manage tasks in your account.
     </div>
     <table cellpadding="0" cellspacing="0"><tr>
-      <td style="padding-right:10px;"><div style="background:linear-gradient(135deg,#5b8dee,#3d6dd4);border-radius:8px;">
-        <a href="${appUrl}" style="display:inline-block;padding:12px 24px;color:#fff;font-weight:700;font-size:14px;text-decoration:none;">✅ Open App to Accept / Decline</a>
+      <td><div style="background:linear-gradient(135deg,#5b8dee,#3d6dd4);border-radius:8px;">
+        <a href="${deepLinkUrl}" style="display:inline-block;padding:14px 28px;color:#fff;font-weight:700;font-size:14px;text-decoration:none;">Click here to accept or reject the request</a>
       </div></td>
     </tr></table>
-    <p style="font-size:12px;color:#8890a8;margin-top:20px;">Log in and go to <strong>Account → Group Invites</strong> to accept or decline this request.</p>
+    <p style="font-size:12px;color:#8890a8;margin-top:20px;">If the button doesn't work, copy and paste this link into your browser:<br/><a href="${deepLinkUrl}" style="color:#5b8dee;word-break:break-all;">${deepLinkUrl}</a></p>
   </td></tr>
   <tr><td style="background:#f5f7ff;padding:14px 32px;border-top:1px solid #d8dce8;">
     <div style="font-size:11px;color:#8890a8;">Sent by ${company} Task Manager on behalf of ${fromName} (${fromEmail})</div>
@@ -8239,7 +8248,7 @@ async function _sendGroupInviteEmail(toEmail, toName, fromEmail, fromName, group
     } catch(e) { console.warn('Group invite emailjs failed:', e.message); }
   }
   // Mailto fallback
-  const _mailBody = 'Hi ' + toName + ', ' + fromName + ' (' + fromEmail + ') wants to add you to "' + groupName + '" on ' + company + ' Task Manager. Open: ' + appUrl;
+  const _mailBody = 'Hi ' + toName + ',\n\n' + fromName + ' (' + fromEmail + ') wants to add you to "' + groupName + '" on ' + company + ' Task Manager.\n\nClick the link below to accept or reject the request:\n' + deepLinkUrl;
   const body = encodeURIComponent(_mailBody);
   window.open('mailto:' + toEmail + '?subject=' + encodeURIComponent(subject) + '&body=' + body);
 }
@@ -10609,7 +10618,7 @@ function downloadJSONTemplate(){
           onclick="_submitPasswordReset('${esc(email)}','${esc(token)}')">Set Password & Sign In →</button>
       </div>
       <div style="text-align:center;margin-top:14px;font-size:11px;color:var(--text3)">
-        This link expires 24 hours after it was sent by your administrator.
+        This link expires after it was sent by your administrator (registration links: 7 days; reset links: 24 hours).
       </div>
     </div>`;
   setTimeout(() => document.getElementById('pwr-new')?.focus(), 80);
@@ -10648,6 +10657,28 @@ async function _submitPasswordReset(email, token) {
     st.textContent = '❌ ' + e.message; st.style.color = 'var(--red)';
   }
 }
+
+// ── Group invite deep-link handler: ?grpinvite=OWNER::GROUPID&gi_email=USER ──
+(function checkGroupInviteUrl() {
+  const params    = new URLSearchParams(window.location.search);
+  const grpParam  = params.get('grpinvite');
+  const giEmail   = params.get('gi_email');
+  if (!grpParam || !giEmail) return;
+
+  // Parse owner and groupId from param
+  const sepIdx     = grpParam.indexOf('::');
+  const ownerEmail = sepIdx >= 0 ? grpParam.slice(0, sepIdx) : grpParam;
+  const groupId    = sepIdx >= 0 ? grpParam.slice(sepIdx + 2) : '';
+
+  // Flag so init block knows to open group invites panel after user logs in
+  window._grpInviteDeepLink = { ownerEmail, groupId, giEmail };
+
+  // Clean URL so the params don't persist after login or reload
+  const cleanUrl = new URL(window.location.href);
+  cleanUrl.searchParams.delete('grpinvite');
+  cleanUrl.searchParams.delete('gi_email');
+  history.replaceState(null, '', cleanUrl.toString());
+})();
 
 checkUrlToken();
 // Handle Microsoft MSAL redirect response on page load (runs silently if no redirect)
