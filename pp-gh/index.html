@@ -3064,6 +3064,19 @@ const App = () => {
     let nextExpenseId = getNextId(expenses);
     const importedExpenses = [];
     const skippedRows = [];
+    // ── Build O(1) lookup structures ONCE before the loop ──────────────────
+    // Key: "dateISO|empId_lower" and "dateISO|guestName_lower"
+    const existingEmpIdKeys  = new Set();
+    const existingNameKeys   = new Set();
+    expenses.forEach(e => {
+      const d = (e.date || '').trim();
+      if ((e.employeeId || '').trim()) existingEmpIdKeys.add(`${d}|${e.employeeId.toLowerCase().trim()}`);
+      if ((e.guestName  || '').trim()) existingNameKeys .add(`${d}|${e.guestName.toLowerCase().trim()}`);
+    });
+    // Batch-level sets (grow as rows are accepted)
+    const batchEmpIdKeys = new Set();
+    const batchNameKeys  = new Set();
+
     rows.slice(1).forEach((row, index) => {
       const lineNumber = index + 2;
       const getValue = column => column >= 0 ? `${row[column] ?? ''}`.trim() : '';
@@ -3109,18 +3122,12 @@ const App = () => {
         skippedRows.push(`Line ${lineNumber}: check-in date must be in DD-MM-YYYY format.`);
         return;
       }
-      const checkInDateISO = checkInDate ? (() => {
-        const [d, m, y] = checkInDate.split('-');
-        return `${y}-${m}-${d}`;
-      })() : '';
+      const checkInDateISO = checkInDate ? (() => { const [d, m, y] = checkInDate.split('-'); return `${y}-${m}-${d}`; })() : '';
       if (checkOutDate && !/^\d{2}-\d{2}-\d{4}$/.test(checkOutDate)) {
         skippedRows.push(`Line ${lineNumber}: check-out date must be in DD-MM-YYYY format.`);
         return;
       }
-      const checkOutDateISO = checkOutDate ? (() => {
-        const [d, m, y] = checkOutDate.split('-');
-        return `${y}-${m}-${d}`;
-      })() : '';
+      const checkOutDateISO = checkOutDate ? (() => { const [d, m, y] = checkOutDate.split('-'); return `${y}-${m}-${d}`; })() : '';
       if (checkInTime && !/^\d{2}:\d{2}(:\d{2})?$/.test(checkInTime)) {
         skippedRows.push(`Line ${lineNumber}: check-in time must be in HH:MM format.`);
         return;
@@ -3149,20 +3156,21 @@ const App = () => {
       }
       const guestHouse = matchingGuestHouses[0];
 
-      // Duplicate guard — check against existing Firestore records AND already-queued rows
-      const hasIdentifier = (employeeId || '').trim() || (guestName || '').trim();
+      // ── O(1) duplicate check using pre-built Sets ──
+      const hasIdentifier = employeeId.trim() || guestName.trim();
       if (hasIdentifier) {
-        const alreadyInDb = isDuplicateExpense(dateISO, employeeId, guestName);
-        const alreadyInBatch = importedExpenses.some(e => {
-          const sameDate = e.date === dateISO;
-          const sameEmpId = (employeeId || '').trim() && (e.employeeId || '').trim() && (e.employeeId || '').toLowerCase().trim() === (employeeId || '').toLowerCase().trim();
-          const sameName = (guestName || '').trim() && (e.guestName || '').trim() && (e.guestName || '').toLowerCase().trim() === (guestName || '').toLowerCase().trim();
-          return sameDate && (sameEmpId || sameName);
-        });
-        if (alreadyInDb || alreadyInBatch) {
-          skippedRows.push(`Line ${lineNumber}: duplicate entry \u2014 an expense for the same Date, Guest House and Employee (ID / Name) already exists.`);
+        const empKey  = employeeId.trim() ? `${dateISO}|${employeeId.toLowerCase().trim()}` : null;
+        const nameKey = guestName.trim()  ? `${dateISO}|${guestName.toLowerCase().trim()}`  : null;
+        const isDup =
+          (empKey  && (existingEmpIdKeys.has(empKey)  || batchEmpIdKeys.has(empKey)))  ||
+          (nameKey && (existingNameKeys .has(nameKey)  || batchNameKeys .has(nameKey)));
+        if (isDup) {
+          skippedRows.push(`Line ${lineNumber}: duplicate entry — an expense for the same Date and Employee (ID / Name) already exists.`);
           return;
         }
+        // Register in batch sets so subsequent rows in this file are also checked
+        if (empKey)  batchEmpIdKeys.add(empKey);
+        if (nameKey) batchNameKeys .add(nameKey);
       }
       importedExpenses.push(normalizeExpenseRecord({
         id: nextExpenseId,
