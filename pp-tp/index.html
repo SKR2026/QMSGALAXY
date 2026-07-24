@@ -5854,18 +5854,34 @@ function getMyPersonalTasks(){
   });
 }
 
-// Tasks belonging to team members only — excludes tasks involving me
+// Tasks belonging to team members — includes plant owners + group members.
+// Shows ALL tasks involving any team member (assigned to them or by them),
+// excluding tasks that involve ONLY me (assigned to me AND by me).
 function getTeamOnlyTasks(){
   const myEmail = _getMyEmail();
   const allScoped = getScopedTasks();
   if(!myEmail) return allScoped;
+
+  // Collect all team member emails: group members + plant owners
+  const teamEmails = new Set();
+  (_myGroupMemberEmails || []).forEach(e => { if(e !== myEmail) teamEmails.add(e.toLowerCase()); });
+  // Add plant owner emails
+  getPlantGroups().forEach(p => {
+    (p.owners || []).forEach(o => {
+      const e = o.toLowerCase();
+      if(e !== myEmail) teamEmails.add(e);
+    });
+  });
+
   return allScoped.filter(t => {
     const assignee   = (t.assignee||'').toLowerCase();
     const assignedBy = (t.assignedBy||'').toLowerCase();
-    // Exclude anything involving me
-    if(assignee === myEmail || assignedBy === myEmail) return false;
-    if(assignedBy === 'superadmin') return false; // my own legacy tasks
-    return !!(assignee && assignedBy); // must have both parties
+    // Include if assignee OR assigner is a known team member
+    if(teamEmails.has(assignee) || teamEmails.has(assignedBy)) return true;
+    // Also include tasks where assignee is not me and is any non-empty email
+    // (covers team members not yet loaded into teamEmails)
+    if(assignee && assignee !== myEmail && assignedBy && assignedBy !== myEmail && assignedBy !== 'superadmin') return true;
+    return false;
   });
 }
 
@@ -6982,9 +6998,17 @@ function _renderMvAllTasks(c, memberTasks) {
   function taskRow(t) {
     const od = isOverdue(t);
     const isAssignee = (t.assignee||'').toLowerCase() === _mvEmail;
-    return `<div style="display:grid;grid-template-columns:1fr 130px 100px 90px 80px;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);cursor:pointer;" onclick="closeMemberViewer();openDrawer('${t.id}')">
+    const assignerRaw = (t.assignedBy||'').trim();
+    const assignerNick = assignerRaw
+      ? (_nickCache[assignerRaw.toLowerCase()] || assignerRaw.split('@')[0])
+      : '—';
+    const assignerDisplay = isAssignee
+      ? `<span style="font-size:11px;color:var(--text2);" title="${esc(assignerRaw)}">${esc(assignerNick)}</span>`
+      : `<span style="font-size:11px;color:var(--text3);font-style:italic;">—</span>`;
+    return `<div style="display:grid;grid-template-columns:1fr 110px 140px 100px 90px 80px;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);cursor:pointer;" onclick="closeMemberViewer();openDrawer('${t.id}')">
       <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:600;color:var(--text)">${esc(t.title)}</div>
-      <div style="font-size:11px;color:var(--text3)">${isAssignee?'<span style="color:var(--accent);font-weight:600;">Assignee</span>':'<span style="color:var(--purple);font-weight:600;">Assigned by</span>'}</div>
+      <div>${isAssignee?'<span style="color:var(--accent);font-weight:600;font-size:11px;">Assignee</span>':'<span style="color:var(--purple);font-weight:600;font-size:11px;">Assigned by</span>'}</div>
+      <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${assignerDisplay}</div>
       <div style="font-size:12px;color:${od?'var(--red)':'var(--text3)'}">${t.due?fmt(t.due):'—'}</div>
       <span class="badge ${prioBadgeClass(t.priority)}">${t.priority||'—'}</span>
       <span class="badge ${t.status==='Done'?'badge-done':t.status==='In Progress'?'badge-inprog':t.status==='Review'?'badge-review':'badge-todo'}">${t.status}</span>
@@ -6994,9 +7018,10 @@ function _renderMvAllTasks(c, memberTasks) {
   c.innerHTML = `
     <div style="font-size:18px;font-weight:800;color:var(--text);margin-bottom:16px">📋 All Tasks for ${esc(_mvNick)} (${memberTasks.length})</div>
     <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
-      <div style="display:grid;grid-template-columns:1fr 130px 100px 90px 80px;gap:10px;padding:8px 14px;background:var(--card2);border-bottom:1px solid var(--border)">
+      <div style="display:grid;grid-template-columns:1fr 110px 140px 100px 90px 80px;gap:10px;padding:8px 14px;background:var(--card2);border-bottom:1px solid var(--border)">
         <span style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase">Title</span>
         <span style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase">Role</span>
+        <span style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase">Assigner</span>
         <span style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase">Due</span>
         <span style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase">Priority</span>
         <span style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase">Status</span>
@@ -7263,49 +7288,34 @@ function buildGlobalMemberBar() {
   const acceptedSet = _getAuthorisedEmails();
 
   chips.innerHTML = '';
-  members.forEach((m, idx) => {
-    const col       = CHIP_COLORS[idx % CHIP_COLORS.length];
-    const isAccepted = m.isSelf || (!m.isPending && acceptedSet.has(m.email.toLowerCase()));
+
+  // Separate self from other members
+  const selfMember  = members.find(m => m.isSelf);
+  const otherMembers = members.filter(m => !m.isSelf);
+
+  // ── 1. Render self chip first ──
+  if(selfMember){
+    const col = CHIP_COLORS[0];
     const btn = document.createElement('button');
     btn.className = 'member-chip';
-    btn.dataset.email = m.email;
-    btn.dataset.color = isAccepted ? col : '#9ca3af';
-    btn.title = m.email + (isAccepted ? '' : ' — invitation pending');
-    // Set CSS custom property
-    btn.style.setProperty('--pc', isAccepted ? col : '#9ca3af');
-    if(!isAccepted){
-      // Pending: greyed out, lock icon, not clickable as viewer
-      btn.textContent = '🔒 ' + m.nick;
-      btn.style.opacity = '0.5';
-      btn.style.cursor  = 'not-allowed';
-      btn.onclick = () => toast('⏳ ' + m.nick + ' has not accepted your group invitation yet.', 'var(--amber)');
-    } else {
-      btn.textContent = m.nick;
-      btn.onclick = () => {
-        if(m.isSelf){
-          closeMemberViewer();
-          _setAllChips(chips, selfEmail);
-          // Switch back to "mine" mode
-          dashViewMode = 'mine';
-          if(currentPanel === 'dashboard') { dashYearFilter='All'; dashMonthFilter='All'; renderDashboard(); }
-        } else {
-          // Only admins / superadmin can open another member's viewer
-          if(currentSession && currentSession.role === 'user'){
-            toast('Only admins can view member dashboards.', 'var(--amber)');
-            return;
-          }
-          openMemberViewer(m.email, m.nick);
-          _setAllChips(chips, m.email);
-        }
-      };
-    }
-    if(m.isSelf && dashViewMode !== 'team') btn.classList.add('pill-active');
+    btn.dataset.email = selfMember.email;
+    btn.dataset.color = col;
+    btn.title = selfMember.email;
+    btn.style.setProperty('--pc', col);
+    btn.textContent = selfMember.nick;
+    btn.onclick = () => {
+      closeMemberViewer();
+      _setAllChips(chips, selfMember.email);
+      dashViewMode = 'mine';
+      if(currentPanel === 'dashboard') { dashYearFilter='All'; dashMonthFilter='All'; renderDashboard(); }
+    };
+    if(dashViewMode !== 'team') btn.classList.add('pill-active');
     chips.appendChild(btn);
-  });
+  }
 
-  // ── Add "Team" pill — shows team-only dashboard ──
-  if(members.length > 1){ // only show Team pill when there are actual team members
-    // Divider
+  // ── 2. Team pill — immediately after self chip ──
+  if(members.length > 1){
+    // Small divider before Team pill
     const div = document.createElement('span');
     div.style.cssText = 'width:1px;height:18px;background:var(--border2);flex-shrink:0;margin:0 4px;align-self:center;';
     chips.appendChild(div);
@@ -7313,22 +7323,54 @@ function buildGlobalMemberBar() {
     const teamBtn = document.createElement('button');
     teamBtn.id = 'dash-team-pill';
     teamBtn.className = 'member-chip' + (dashViewMode === 'team' ? ' pill-active' : '');
-    teamBtn.dataset.color = '#06b6d4';
-    teamBtn.style.setProperty('--pc', '#06b6d4');
-    teamBtn.title = 'Show Team Dashboard — tasks assigned between team members';
+    teamBtn.dataset.color = '#10b981';
+    teamBtn.style.setProperty('--pc', '#10b981');
+    teamBtn.title = 'Team Dashboard — all tasks of your team members (plant owners + group members)';
     teamBtn.innerHTML = '👥 Team';
     teamBtn.onclick = () => {
       closeMemberViewer();
       dashViewMode = 'team';
-      // Deactivate all member chips, activate team pill
       chips.querySelectorAll('.member-chip').forEach(c => c.classList.remove('pill-active'));
       teamBtn.classList.add('pill-active');
-      // Navigate to dashboard (or refresh if already there)
       if(currentPanel === 'dashboard'){ dashYearFilter='All'; dashMonthFilter='All'; renderDashboard(); }
       else showPanel('dashboard');
     };
     chips.appendChild(teamBtn);
+
+    // Divider before individual member chips
+    const div2 = document.createElement('span');
+    div2.style.cssText = 'width:1px;height:18px;background:var(--border2);flex-shrink:0;margin:0 4px;align-self:center;';
+    chips.appendChild(div2);
   }
+
+  // ── 3. Other member chips ──
+  otherMembers.forEach((m, idx) => {
+    const col        = CHIP_COLORS[(idx + 1) % CHIP_COLORS.length];
+    const isAccepted = !m.isPending && acceptedSet.has(m.email.toLowerCase());
+    const btn = document.createElement('button');
+    btn.className = 'member-chip';
+    btn.dataset.email = m.email;
+    btn.dataset.color = isAccepted ? col : '#9ca3af';
+    btn.title = m.email + (isAccepted ? '' : ' — invitation pending');
+    btn.style.setProperty('--pc', isAccepted ? col : '#9ca3af');
+    if(!isAccepted){
+      btn.textContent = '🔒 ' + m.nick;
+      btn.style.opacity = '0.5';
+      btn.style.cursor  = 'not-allowed';
+      btn.onclick = () => toast('⏳ ' + m.nick + ' has not accepted your group invitation yet.', 'var(--amber)');
+    } else {
+      btn.textContent = m.nick;
+      btn.onclick = () => {
+        if(currentSession && currentSession.role === 'user'){
+          toast('Only admins can view member dashboards.', 'var(--amber)');
+          return;
+        }
+        openMemberViewer(m.email, m.nick);
+        _setAllChips(chips, m.email);
+      };
+    }
+    chips.appendChild(btn);
+  });
 
   bar.style.display = 'flex';
 }
