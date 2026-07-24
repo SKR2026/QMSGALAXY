@@ -373,6 +373,17 @@ var GHM_FB_CONFIG = {
 };
 var GHM_LICENSE_COLLECTION = 'ghm_licenses';
 
+/* Timeout wrapper — prevents the license gate from hanging forever if the
+   network is slow, blocked, or the Firebase/Firestore endpoints don't respond. */
+function ghmTimeout(ms) {
+  return new Promise(function(_, reject) {
+    setTimeout(function() { reject(new Error('GHM_TIMEOUT')); }, ms);
+  });
+}
+function ghmWithTimeout(promise, ms) {
+  return Promise.race([promise, ghmTimeout(ms)]);
+}
+
 async function ghmValidateLicense(key) {
   if (!key || !key.trim()) return { valid: false, reason: 'NO_KEY' };
   var cleanKey = key.trim().toUpperCase();
@@ -384,8 +395,8 @@ async function ghmValidateLicense(key) {
       var docRef = fb.doc(fb.db, GHM_LICENSE_COLLECTION, cleanKey);
       /* getDoc with cache bypass — getDocs on single doc isn't direct, use REST fallback */
       /* Try SDK getDocs workaround via query on specific doc */
-      var { getDoc } = await import('https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js');
-      var snap = await getDoc(docRef);
+      var { getDoc } = await ghmWithTimeout(import('https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js'), 12000);
+      var snap = await ghmWithTimeout(getDoc(docRef), 12000);
       if (!snap.exists()) return { valid: false, reason: 'INVALID_KEY' };
       var d = snap.data();
       if (d._deleted) return { valid: false, reason: 'INVALID_KEY' };
@@ -412,10 +423,10 @@ async function ghmValidateLicense(key) {
     /* Get anonymous ID token */
     var idToken = '';
     try {
-      var tokenResp = await fetch(
+      var tokenResp = await ghmWithTimeout(fetch(
         'https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=' + GHM_FB_CONFIG.apiKey,
         { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({returnSecureToken:true}) }
-      );
+      ), 12000);
       if (tokenResp.ok) { var tj = await tokenResp.json(); idToken = tj.idToken || ''; }
     } catch(te) {}
 
@@ -423,7 +434,7 @@ async function ghmValidateLicense(key) {
               '/databases/(default)/documents/' + GHM_LICENSE_COLLECTION + '/' + encodeURIComponent(cleanKey);
     var hdrs = { 'Content-Type': 'application/json' };
     if (idToken) hdrs['Authorization'] = 'Bearer ' + idToken;
-    var resp = await fetch(url, { headers: hdrs });
+    var resp = await ghmWithTimeout(fetch(url, { headers: hdrs }), 12000);
     if (resp.status === 404) return { valid: false, reason: 'INVALID_KEY' };
     if (!resp.ok) return { valid: false, reason: 'ERROR', message: 'HTTP ' + resp.status };
     var docData = await resp.json();
@@ -4253,7 +4264,8 @@ const ExpensesView = ({
   const [empSearch, setEmpSearch] = React.useState('');
   const [selectedIds, setSelectedIds] = React.useState(new Set());
   const [page, setPage] = React.useState(1);
-  const PAGE_SIZE = 50;
+  // Show every matching record on one page — no 50-row cap.
+  const PAGE_SIZE = Number.MAX_SAFE_INTEGER;
   const isSuperAdmin = currentUser.role === 'Super Admin';
 
   // ── Year / Month quick-filter tabs ─────────────────────────────────────────
