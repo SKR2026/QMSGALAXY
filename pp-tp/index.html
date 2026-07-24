@@ -1994,12 +1994,17 @@ function showPanel(name){
       _spChips.querySelectorAll('.member-chip').forEach(c => {
         if(c.dataset.color) c.style.setProperty('--pc', c.dataset.color);
       });
-      // If viewer is closed, keep self chip active
+      // If viewer is closed, keep self chip active (unless team mode is on)
       const viewer = document.getElementById('member-viewer');
       const viewerOpen = viewer && viewer.style.display === 'flex';
-      if(!viewerOpen){
+      if(!viewerOpen && dashViewMode !== 'team'){
         const firstChip = _spChips.querySelector('.member-chip');
         if(firstChip) _setAllChips(_spChips, firstChip.dataset.email);
+      } else if(!viewerOpen && dashViewMode === 'team'){
+        // Keep team pill highlighted
+        _spChips.querySelectorAll('.member-chip').forEach(c => c.classList.remove('pill-active'));
+        const teamPill = document.getElementById('dash-team-pill');
+        if(teamPill) teamPill.classList.add('pill-active');
       }
     }
   }
@@ -2528,8 +2533,8 @@ function renderDashboard(){
   c.innerHTML=`
   <div class="dash-header-row fade-in">
     <div class="dash-header-left">
-      <div class="panel-title">Command Centre${plantOwnerAuthenticated&&currentPlantSession?' — 🏭 '+esc(currentPlantSession.name):''}</div>
-      <div class="panel-sub">Live overview of ${plantOwnerAuthenticated&&currentPlantSession?'your plant tasks':'all tasks'}, team performance, and deadlines</div>
+      <div class="panel-title">Command Centre${plantOwnerAuthenticated&&currentPlantSession?' — 🏭 '+esc(currentPlantSession.name):dashViewMode==='team'?' — 👥 Team':''}</div>
+      <div class="panel-sub">${dashViewMode==='team'?'Team members\' tasks — tasks assigned between your team (not involving you)':'Live overview of your tasks (assigned to you or by you), performance, and deadlines'}</div>
     </div>
     <div class="dash-ym-inline" id="dash-ym-bar">
       <div class="dash-tab-row" id="dash-plant-row"><span class="dash-tab-label">Plant</span></div>
@@ -3052,6 +3057,7 @@ let taskFilters={status:'All',priority:'All',search:'',overdue:false,assignedBy:
 let dashPlantFilter='All';  // 'All' | plant.id
 let dashYearFilter='All';   // 'All' | '2024' | '2025' | '2026' …
 let dashMonthFilter='All';  // 'All' | '01'..'12'
+let dashViewMode='mine';    // 'mine' | 'team'  — controls dashboard + all-tasks scope
 
 let _selectedTasks = new Set();
 
@@ -3065,7 +3071,7 @@ function renderTasks(){
   <div class="dash-header-row fade-in" style="margin-bottom:14px;">
     <div class="dash-header-left">
       <div class="panel-title" style="margin-bottom:0;">All Tasks${_ymLabel}</div>
-      <div class="panel-sub">${getDashScopedTasks().filter(t=>(dashYearFilter==='All'||(t.due&&t.due.slice(0,4)===dashYearFilter))&&(dashMonthFilter==='All'||(t.due&&t.due.slice(5,7)===dashMonthFilter))).length} total tasks${plantOwnerAuthenticated&&currentPlantSession?' for 🏭 '+esc(currentPlantSession.name):' across all team members'}</div>
+      <div class="panel-sub">${getDashScopedTasks().filter(t=>(dashYearFilter==='All'||(t.due&&t.due.slice(0,4)===dashYearFilter))&&(dashMonthFilter==='All'||(t.due&&t.due.slice(5,7)===dashMonthFilter))).length} total tasks${plantOwnerAuthenticated&&currentPlantSession?' for 🏭 '+esc(currentPlantSession.name):' assigned to you or by you'}</div>
     </div>
     <div class="dash-ym-inline" id="tasks-ym-bar">
       <div class="dash-tab-row" id="tasks-plant-row"><span class="dash-tab-label">Plant</span></div>
@@ -5837,6 +5843,32 @@ function _getMyEmail(){
   return (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
 }
 
+// Tasks where I am assignee OR assigner — for "My Dashboard" and "All Tasks"
+function getMyPersonalTasks(){
+  const myEmail = _getMyEmail();
+  if(!myEmail) return getScopedTasks(); // fallback: show everything if no identity
+  return tasks.filter(t => {
+    const assignee   = (t.assignee||'').toLowerCase();
+    const assignedBy = (t.assignedBy||'').toLowerCase();
+    return assignee === myEmail || assignedBy === myEmail || assignedBy === 'superadmin';
+  });
+}
+
+// Tasks belonging to team members only — excludes tasks involving me
+function getTeamOnlyTasks(){
+  const myEmail = _getMyEmail();
+  const allScoped = getScopedTasks();
+  if(!myEmail) return allScoped;
+  return allScoped.filter(t => {
+    const assignee   = (t.assignee||'').toLowerCase();
+    const assignedBy = (t.assignedBy||'').toLowerCase();
+    // Exclude anything involving me
+    if(assignee === myEmail || assignedBy === myEmail) return false;
+    if(assignedBy === 'superadmin') return false; // my own legacy tasks
+    return !!(assignee && assignedBy); // must have both parties
+  });
+}
+
 // "My Tasks" on the Command Centre should track whichever member is currently
 // filtered/being viewed (member chip / member viewer), not always the logged-in
 // account — otherwise it silently shows the viewer's own task count instead of
@@ -5861,6 +5893,18 @@ function _filterByDashPlant(arr){
 // ── Helper: session-scoped tasks, further narrowed by the dashboard's
 //    single-click Plant filter tab (if one is active) ──────────────────
 function getDashScopedTasks(){
+  // When in "team" view mode, show only team members' tasks (not mine)
+  if(dashViewMode === 'team') return _filterByDashPlant(getTeamOnlyTasks());
+  // Default "mine" view: show only tasks where I am assignee or assigner
+  const myEmail = _getMyEmail();
+  if(myEmail){
+    const myTasks = tasks.filter(t => {
+      const assignee   = (t.assignee||'').toLowerCase();
+      const assignedBy = (t.assignedBy||'').toLowerCase();
+      return assignee === myEmail || assignedBy === myEmail || assignedBy === 'superadmin';
+    });
+    return _filterByDashPlant(myTasks);
+  }
   return _filterByDashPlant(getScopedTasks());
 }
 
@@ -6542,11 +6586,15 @@ function closeMemberViewer() {
   _memberViewActive = false;
   _memberViewEmail  = null;
   _memberViewNick   = null;
-  // Restore self chip as active
+  // Ensure we're in "mine" mode (not team)
+  if(dashViewMode === 'team') { /* keep team mode if it was explicitly set */ }
+  // Restore self chip as active (unless team mode is on)
   const _closeChips = document.getElementById('global-member-chips');
   if(_closeChips){
-    const selfC = _closeChips.querySelector('.member-chip');
-    if(selfC) _setAllChips(_closeChips, selfC.dataset.email);
+    if(dashViewMode !== 'team'){
+      const selfC = _closeChips.querySelector('.member-chip');
+      if(selfC) _setAllChips(_closeChips, selfC.dataset.email);
+    }
   }
 }
 
@@ -7237,6 +7285,9 @@ function buildGlobalMemberBar() {
         if(m.isSelf){
           closeMemberViewer();
           _setAllChips(chips, selfEmail);
+          // Switch back to "mine" mode
+          dashViewMode = 'mine';
+          if(currentPanel === 'dashboard') { dashYearFilter='All'; dashMonthFilter='All'; renderDashboard(); }
         } else {
           // Only admins / superadmin can open another member's viewer
           if(currentSession && currentSession.role === 'user'){
@@ -7248,9 +7299,36 @@ function buildGlobalMemberBar() {
         }
       };
     }
-    if(m.isSelf) btn.classList.add('pill-active');
+    if(m.isSelf && dashViewMode !== 'team') btn.classList.add('pill-active');
     chips.appendChild(btn);
   });
+
+  // ── Add "Team" pill — shows team-only dashboard ──
+  if(members.length > 1){ // only show Team pill when there are actual team members
+    // Divider
+    const div = document.createElement('span');
+    div.style.cssText = 'width:1px;height:18px;background:var(--border2);flex-shrink:0;margin:0 4px;align-self:center;';
+    chips.appendChild(div);
+
+    const teamBtn = document.createElement('button');
+    teamBtn.id = 'dash-team-pill';
+    teamBtn.className = 'member-chip' + (dashViewMode === 'team' ? ' pill-active' : '');
+    teamBtn.dataset.color = '#06b6d4';
+    teamBtn.style.setProperty('--pc', '#06b6d4');
+    teamBtn.title = 'Show Team Dashboard — tasks assigned between team members';
+    teamBtn.innerHTML = '👥 Team';
+    teamBtn.onclick = () => {
+      closeMemberViewer();
+      dashViewMode = 'team';
+      // Deactivate all member chips, activate team pill
+      chips.querySelectorAll('.member-chip').forEach(c => c.classList.remove('pill-active'));
+      teamBtn.classList.add('pill-active');
+      // Navigate to dashboard (or refresh if already there)
+      if(currentPanel === 'dashboard'){ dashYearFilter='All'; dashMonthFilter='All'; renderDashboard(); }
+      else showPanel('dashboard');
+    };
+    chips.appendChild(teamBtn);
+  }
 
   bar.style.display = 'flex';
 }
