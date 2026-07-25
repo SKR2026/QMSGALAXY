@@ -2595,16 +2595,28 @@ const App = () => {
   };
 
   // ── Duplicate detection ────────────────────────────────────────────────────
-  // Two expense records are considered duplicates when they share the same
-  // date AND category.  An optional excludeId lets us skip the record being
-  // edited so edit-saves are never blocked.
-  const isDuplicateExpense = (date, category, excludeId = null) => {
-    if (!(category || '').trim()) return false;
+  // Rule 1 (Collection)        : same Date + Guest House + Employee ID + Guest Name
+  //                           OR same Date + Guest House + non-zero Payment Collected
+  // Rule 2 (Category/Commodity): same Date + Guest House + Category
+  // excludeId skips the record being edited so edit-saves are never blocked.
+  const isDuplicateExpense = (payload, excludeId = null) => {
+    const norm = v => (v || '').toString().toLowerCase().trim();
+    const { date, guestHouseId, employeeId, guestName, paymentCollected, category } = payload;
     return expenses.some(e => {
       if (excludeId !== null && e.id === excludeId) return false;
-      const sameDate     = e.date === date;
-      const sameCategory = (e.category || '').toLowerCase().trim() === (category || '').toLowerCase().trim();
-      return sameDate && sameCategory;
+      if (e.date !== date) return false;
+      if (String(e.guestHouseId) !== String(guestHouseId)) return false;
+
+      // Rule 1: same guest (Employee ID OR Guest Name)
+      const empMatch  = norm(employeeId) && norm(e.employeeId) && norm(e.employeeId) === norm(employeeId);
+      const nameMatch = norm(guestName)  && norm(e.guestName)  && norm(e.guestName)  === norm(guestName);
+      if (empMatch || nameMatch) return true;
+
+      // Rule 2: same category/commodity
+      if (norm(category) && norm(e.category) &&
+          norm(e.category) === norm(category)) return true;
+
+      return false;
     });
   };
   const buildExpensePayload = (data, existingExpense = {}) => {
@@ -2636,8 +2648,24 @@ const App = () => {
     const expensePayload = buildExpensePayload(data);
     if (!expensePayload) return;
     // Duplicate guard
-    if (isDuplicateExpense(expensePayload.date, expensePayload.category)) {
-      window.alert('Duplicate entry detected!\n\nAn expense for the same Date and Category already exists.\nPlease verify the details before saving.');
+    // Rule 1 (Collection): Date+GH+EmpID+Name  OR  Date+GH+PaymentCollected(non-zero)
+    // Rule 2 (Category)  : Date+GH+Category
+    const dupRule = (() => {
+      const norm = v => (v || '').toString().toLowerCase().trim();
+      const { date, guestHouseId, employeeId, guestName, paymentCollected, category } = expensePayload;
+      for (const e of expenses) {
+        if (e.date !== date || String(e.guestHouseId) !== String(guestHouseId)) continue;
+        const empMatch  = norm(employeeId) && norm(e.employeeId) && norm(e.employeeId) === norm(employeeId);
+        const nameMatch = norm(guestName)  && norm(e.guestName)  && norm(e.guestName)  === norm(guestName);
+        if (empMatch || nameMatch)
+          return 'Collection — same Date, Guest House & ' + (empMatch && nameMatch ? 'Employee ID and Guest Name' : empMatch ? 'Employee ID' : 'Guest Name');
+        if (norm(category) && norm(e.category) && norm(e.category) === norm(category))
+          return 'Category/Commodity — same Date, Guest House & Category';
+      }
+      return null;
+    })();
+    if (dupRule) {
+      window.alert('Duplicate entry detected!\n\nMatched rule: ' + dupRule + '.\n\nPlease verify the details before saving.');
       return;
     }
     const newId = getNextId(expenses);
@@ -2885,13 +2913,25 @@ const App = () => {
     const importedExpenses = [];
     const skippedRows = [];
     // ── Build O(1) lookup structures ONCE before the loop ──────────────────
-    // Key: "dateISO|category_lower"
+    // Rule 1 keys: "dateISO|ghId|empId"  OR  "dateISO|ghId|guestName"
+    // Rule 2 key : "dateISO|ghId|category"
+    const normBulk = v => (v || '').toString().toLowerCase().trim();
+    const existingEmpKeys      = new Set();
+    const existingNameKeys     = new Set();
     const existingCategoryKeys = new Set();
     expenses.forEach(e => {
-      const d = (e.date || '').trim();
-      if ((e.category || '').trim()) existingCategoryKeys.add(`${d}|${e.category.toLowerCase().trim()}`);
+      const d    = (e.date || '').trim();
+      const ghId = String(e.guestHouseId || '');
+      const empId = normBulk(e.employeeId);
+      const gName = normBulk(e.guestName);
+      const cat   = normBulk(e.category);
+      if (empId) existingEmpKeys.add(`${d}|${ghId}|${empId}`);
+      if (gName) existingNameKeys.add(`${d}|${ghId}|${gName}`);
+      if (cat)   existingCategoryKeys.add(`${d}|${ghId}|${cat}`);
     });
-    // Batch-level set (grows as rows are accepted)
+    // Batch-level sets (grow as rows are accepted in this upload)
+    const batchEmpKeys      = new Set();
+    const batchNameKeys     = new Set();
     const batchCategoryKeys = new Set();
 
     rows.slice(1).forEach((row, index) => {
@@ -2973,17 +3013,40 @@ const App = () => {
       }
       const guestHouse = matchingGuestHouses[0];
 
-      // ── O(1) duplicate check using pre-built Sets ──
-      if (category.trim()) {
-        const catKey = `${dateISO}|${category.toLowerCase().trim()}`;
-        const isDup = existingCategoryKeys.has(catKey) || batchCategoryKeys.has(catKey);
-        if (isDup) {
-          skippedRows.push(`Line ${lineNumber}: duplicate entry — an expense for the same Date and Category already exists.`);
+      // ── O(1) duplicate check (Rule 1 Collection + Rule 2 Category) ──
+      const ghIdStr = String(guestHouse.id);
+      const empIdNorm  = normBulk(employeeId);
+      const gNameNorm  = normBulk(guestName);
+      const catNorm    = normBulk(category);
+      const pcNum      = Number(paymentCollected);
+
+      // Rule 1: same Date + Guest House + Employee ID OR Guest Name
+      if (empIdNorm) {
+        const empKey = `${dateISO}|${ghIdStr}|${empIdNorm}`;
+        if (existingEmpKeys.has(empKey) || batchEmpKeys.has(empKey)) {
+          skippedRows.push(`Line ${lineNumber}: duplicate — same Date, Guest House & Employee ID (Collection).`);
           return;
         }
-        // Register in batch set so subsequent rows in this file are also checked
-        batchCategoryKeys.add(catKey);
       }
+      if (gNameNorm) {
+        const nameKey = `${dateISO}|${ghIdStr}|${gNameNorm}`;
+        if (existingNameKeys.has(nameKey) || batchNameKeys.has(nameKey)) {
+          skippedRows.push(`Line ${lineNumber}: duplicate — same Date, Guest House & Guest Name (Collection).`);
+          return;
+        }
+      }
+      // Rule 2: same Date + Guest House + Category
+      if (catNorm) {
+        const catKey = `${dateISO}|${ghIdStr}|${catNorm}`;
+        if (existingCategoryKeys.has(catKey) || batchCategoryKeys.has(catKey)) {
+          skippedRows.push(`Line ${lineNumber}: duplicate — same Date, Guest House & Category (Category/Commodity).`);
+          return;
+        }
+      }
+      // Register accepted row into batch sets
+      if (empIdNorm) batchEmpKeys.add(`${dateISO}|${ghIdStr}|${empIdNorm}`);
+      if (gNameNorm) batchNameKeys.add(`${dateISO}|${ghIdStr}|${gNameNorm}`);
+      if (catNorm)   batchCategoryKeys.add(`${dateISO}|${ghIdStr}|${catNorm}`);
       importedExpenses.push(normalizeExpenseRecord({
         id: nextExpenseId,
         guestHouseId: guestHouse.id,
