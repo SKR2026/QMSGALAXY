@@ -50,64 +50,86 @@ const COLLECTIONS = {
   LOGS:     'reminderLogs',
 };
 
-async function getEmailConfig() {
-  // Try Firestore (set via Admin → Settings → Cloud Reminders in the SPA)
+/**
+ * Build nodemailer SMTP config for the chosen provider.
+ *   provider = 'gmail'     → smtp.gmail.com:465  SSL
+ *   provider = 'office365' → smtp.office365.com:587 STARTTLS
+ */
+function smtpSettings(provider, user, pass) {
+  if (provider === 'office365') {
+    return { host:'smtp.office365.com', port:587, secure:false, auth:{user,pass}, tls:{ciphers:'SSLv3'} };
+  }
+  // Default: Gmail
+  return { host:'smtp.gmail.com', port:465, secure:true, auth:{user,pass} };
+}
+
+async function getEmailConfig(overrideProvider) {
+  // ── Try Firestore first (set via Admin → Settings → Cloud Reminders) ──
   try {
     const snap = await db.collection(COLLECTIONS.SETTINGS).doc('data').get();
     if (snap.exists) {
       const items = snap.data().items || [];
       const s = items[0];
-      if (s && s.o365User && s.o365Pass) {
-        return {
-          host:             'smtp.office365.com',
-          port:             587,
-          secure:           false,           // STARTTLS
-          user:             s.o365User,
-          pass:             s.o365Pass,
-          fromName:         s.o365FromName  || 'Polyplastics Legal Compliance',
-          digestRecipients: (s.digestRecipients  || '').split(',').map(e=>e.trim()).filter(Boolean),
-          overdueRecipients:(s.overdueRecipients || '').split(',').map(e=>e.trim()).filter(Boolean),
-          reminderLeadDays: (s.reminderLeadDays  || '1,3,7,14').split(',').map(n=>parseInt(n,10)).filter(n=>!isNaN(n)),
-          weeklyEnabled:    !!s.weeklyEnabled,
-          monthlyEnabled:   !!s.monthlyEnabled,
-          dailyDigestEnabled: s.dailyDigestEnabled !== false,
-          overdueAlertEnabled:s.overdueAlert !== false,
-          _source:          'firestore',
-        };
+      if (s) {
+        const provider = overrideProvider || s.smtpProvider || 'gmail';
+        const isGmail  = provider === 'gmail';
+        const user     = isGmail ? s.gmailUser  : s.o365User;
+        const pass     = isGmail ? s.gmailPass  : s.o365Pass;
+        const fromName = isGmail ? (s.gmailFromName || s.o365FromName || 'Polyplastics Legal Compliance')
+                                 : (s.o365FromName  || s.gmailFromName || 'Polyplastics Legal Compliance');
+        if (user && pass) {
+          return {
+            ...smtpSettings(provider, user, pass),
+            fromName,
+            provider,
+            digestRecipients:  (s.digestRecipients  || '').split(',').map(e=>e.trim()).filter(Boolean),
+            overdueRecipients: (s.overdueRecipients || '').split(',').map(e=>e.trim()).filter(Boolean),
+            reminderLeadDays:  (s.reminderLeadDays  || '1,3,7,14').split(',').map(n=>parseInt(n,10)).filter(n=>!isNaN(n)),
+            weeklyEnabled:     !!s.weeklyEnabled,
+            monthlyEnabled:    !!s.monthlyEnabled,
+            dailyDigestEnabled:  s.dailyDigestEnabled !== false,
+            overdueAlertEnabled: s.overdueAlert !== false,
+            _source: 'firestore',
+          };
+        }
       }
     }
   } catch(e) {
     functions.logger.warn('getEmailConfig: Firestore read failed', e.message);
   }
 
-  // Fallback to functions:config
+  // ── Fallback to functions:config (set via firebase functions:config:set) ──
   const fc = functions.config();
   const em = fc.email || {};
+  // Support both gmail_ and o365_ prefixes in functions:config
+  const provider  = overrideProvider || em.smtp_provider || 'gmail';
+  const isGmail   = provider === 'gmail';
+  const user      = isGmail ? (em.gmail_user || em.o365_user || '') : (em.o365_user || em.gmail_user || '');
+  const pass      = isGmail ? (em.gmail_pass || em.o365_pass || '') : (em.o365_pass || em.gmail_pass || '');
+  const fromName  = em.from_name || 'Polyplastics Legal Compliance';
   return {
-    host:             'smtp.office365.com',
-    port:             587,
-    secure:           false,
-    user:             em.o365_user             || '',
-    pass:             em.o365_pass             || '',
-    fromName:         em.o365_from_name        || 'Polyplastics Legal Compliance',
-    digestRecipients: (em.digest_recipients    || '').split(',').map(e=>e.trim()).filter(Boolean),
-    overdueRecipients:(em.overdue_recipients   || '').split(',').map(e=>e.trim()).filter(Boolean),
-    reminderLeadDays: [1,3,7,14],
+    ...smtpSettings(provider, user, pass),
+    fromName,
+    provider,
+    digestRecipients:  (em.digest_recipients  || '').split(',').map(e=>e.trim()).filter(Boolean),
+    overdueRecipients: (em.overdue_recipients || '').split(',').map(e=>e.trim()).filter(Boolean),
+    reminderLeadDays:  [1,3,7,14],
     weeklyEnabled:    true,
     monthlyEnabled:   false,
-    dailyDigestEnabled: true,
-    overdueAlertEnabled:true,
-    _source:          'functions-config',
+    dailyDigestEnabled:  true,
+    overdueAlertEnabled: true,
+    _source: 'functions-config',
   };
 }
 
 function buildTransport(cfg) {
+  // cfg already has host/port/secure/auth/tls from smtpSettings()
   return nodemailer.createTransport({
     host:   cfg.host,
     port:   cfg.port,
     secure: cfg.secure,
-    auth:   { user: cfg.user, pass: cfg.pass },
-    tls:    { ciphers: 'SSLv3' },   // Office 365 compatibility
+    auth:   cfg.auth,
+    ...(cfg.tls ? { tls: cfg.tls } : {}),
   });
 }
 
@@ -194,7 +216,7 @@ function buildEmailHTML({ heading, subheading, bodyHTML, footer }) {
 ───────────────────────────────────────── */
 async function sendMail(cfg, { to, subject, html }) {
   const transport = buildTransport(cfg);
-  const from = `"${cfg.fromName}" <${cfg.user}>`;
+  const from = `"${cfg.fromName}" <${cfg.auth.user}>`;
   const info = await transport.sendMail({
     from,
     to: Array.isArray(to) ? to.join(', ') : to,
@@ -213,9 +235,9 @@ exports.sendDailyDigest = functions
   .pubsub.schedule('30 1 * * *').timeZone('Asia/Kolkata')
   .onRun(async () => {
     functions.logger.info('▶ sendDailyDigest');
-    const cfg = await getEmailConfig();
-    functions.logger.info('Email config source:', cfg._source, 'user:', cfg.user);
-    if (!cfg.dailyDigestEnabled || !cfg.user || !cfg.pass) { functions.logger.info('Digest disabled or unconfigured'); return null; }
+    const cfg = await getEmailConfig(global._smtpProviderOverride || null);
+    functions.logger.info('Email config source:', cfg._source, 'provider:', cfg.provider, 'user:', cfg.auth.user);
+    if (!cfg.dailyDigestEnabled || !cfg.auth.user || !cfg.auth.pass) { functions.logger.info('Digest disabled or unconfigured'); return null; }
     if (!cfg.digestRecipients.length) { functions.logger.warn('No digest recipients'); return null; }
 
     const { requirements, plants, users } = await fetchAllData();
@@ -261,8 +283,8 @@ exports.sendLeadDayReminders = functions
   .pubsub.schedule('30 2 * * *').timeZone('Asia/Kolkata')
   .onRun(async () => {
     functions.logger.info('▶ sendLeadDayReminders');
-    const cfg = await getEmailConfig();
-    if (!cfg.user || !cfg.pass) { functions.logger.info('Reminders unconfigured'); return null; }
+    const cfg = await getEmailConfig(global._smtpProviderOverride || null);
+    if (!cfg.auth.user || !cfg.auth.pass) { functions.logger.info('Reminders unconfigured'); return null; }
     const { requirements, plants, users } = await fetchAllData();
     let sent = 0;
 
@@ -316,8 +338,8 @@ exports.sendOverdueAlerts = functions
   .pubsub.schedule('30 3 * * *').timeZone('Asia/Kolkata')
   .onRun(async () => {
     functions.logger.info('▶ sendOverdueAlerts');
-    const cfg = await getEmailConfig();
-    if (!cfg.overdueAlertEnabled || !cfg.user || !cfg.pass) return null;
+    const cfg = await getEmailConfig(global._smtpProviderOverride || null);
+    if (!cfg.overdueAlertEnabled || !cfg.auth.user || !cfg.auth.pass) return null;
     if (!cfg.overdueRecipients.length) { functions.logger.warn('No overdue recipients'); return null; }
 
     const { requirements, plants, users } = await fetchAllData();
@@ -350,8 +372,8 @@ exports.sendWeeklySummary = functions
   .pubsub.schedule('0 2 * * 1').timeZone('Asia/Kolkata')
   .onRun(async () => {
     functions.logger.info('▶ sendWeeklySummary');
-    const cfg = await getEmailConfig();
-    if (!cfg.weeklyEnabled || !cfg.user || !cfg.pass) return null;
+    const cfg = await getEmailConfig(global._smtpProviderOverride || null);
+    if (!cfg.weeklyEnabled || !cfg.auth.user || !cfg.auth.pass) return null;
     if (!cfg.digestRecipients.length) return null;
 
     const { requirements, plants, users } = await fetchAllData();
@@ -392,8 +414,8 @@ exports.sendMonthlyReport = functions
   .pubsub.schedule('30 2 1 * *').timeZone('Asia/Kolkata')
   .onRun(async () => {
     functions.logger.info('▶ sendMonthlyReport');
-    const cfg = await getEmailConfig();
-    if (!cfg.monthlyEnabled || !cfg.user || !cfg.pass) return null;
+    const cfg = await getEmailConfig(global._smtpProviderOverride || null);
+    if (!cfg.monthlyEnabled || !cfg.auth.user || !cfg.auth.pass) return null;
     if (!cfg.digestRecipients.length) return null;
 
     const { requirements } = await fetchAllData();
@@ -449,22 +471,30 @@ exports.triggerEmailNow = functions
       return;
     }
 
-    const { type } = req.body || {};
-    functions.logger.info(`triggerEmailNow called: type=${type}`);
+    const { type, smtpProvider } = req.body || {};
+    functions.logger.info(`triggerEmailNow called: type=${type}, provider=${smtpProvider||'from-firestore'}`);
+
+    // Store override provider in a module-level variable so scheduled functions
+    // can pick it up when called manually via this HTTP endpoint.
+    // (Scheduled .run() calls share the same process, so this works for manual triggers.)
+    global._smtpProviderOverride = smtpProvider || null;
 
     try {
       switch (type) {
-        case 'digest':    await exports.sendDailyDigest.run({});    break;
+        case 'digest':    await exports.sendDailyDigest.run({});      break;
         case 'reminders': await exports.sendLeadDayReminders.run({}); break;
-        case 'overdue':   await exports.sendOverdueAlerts.run({});  break;
-        case 'weekly':    await exports.sendWeeklySummary.run({});  break;
-        case 'monthly':   await exports.sendMonthlyReport.run({});  break;
+        case 'overdue':   await exports.sendOverdueAlerts.run({});    break;
+        case 'weekly':    await exports.sendWeeklySummary.run({});    break;
+        case 'monthly':   await exports.sendMonthlyReport.run({});    break;
         default:
           res.status(400).json({ error: 'Unknown type. Use: digest | reminders | overdue | weekly | monthly' });
+          global._smtpProviderOverride = null;
           return;
       }
-      res.json({ success: true, type, triggeredAt: new Date().toISOString() });
+      global._smtpProviderOverride = null;
+      res.json({ success: true, type, smtpProvider: smtpProvider || 'from-firestore', triggeredAt: new Date().toISOString() });
     } catch(e) {
+      global._smtpProviderOverride = null;
       functions.logger.error('triggerEmailNow error:', e);
       res.status(500).json({ error: e.message });
     }
