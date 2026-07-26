@@ -6,7 +6,7 @@
   <meta http-equiv="X-Content-Type-Options" content="nosniff" />
   <meta name="referrer" content="no-referrer" />
   <meta name="robots" content="noindex, nofollow" />
-  <title>Polyplastics — Legal Compliance (Secured)</title>
+  <title>Polyplastics — Legal Compliance v35 (Cloud Reminders)</title>
 
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -2354,10 +2354,51 @@ async function sendDailyDigestMail(requirements, plants, users) {
 }
 
 /**
- * useDailyDigestScheduler – React hook.
- * Checks every minute if the configured digest time has arrived and fires.
- * Must be called with live requirements/plants/users from App state.
+ * useDailyDigestScheduler – React hook (v35: Cloud-aware).
+ *
+ * PRIMARY path  → Firebase Cloud Function (Office 365 SMTP via Nodemailer).
+ *   Reminders fire 24/7 from Firebase's servers regardless of whether the
+ *   browser tab is open.  The SPA simply saves settings to Firestore; the
+ *   Cloud Function scheduler reads them and sends at the configured times.
+ *
+ * FALLBACK path → browser-side MS Graph send (original v34 behaviour).
+ *   Only fires when the app IS open, as a safety net in case the Cloud
+ *   Function webhook URL is not yet configured.
+ *
+ * Cloud Function webhook endpoint (set in Admin → Settings → Cloud Reminders):
+ *   POST  <cloudFnUrl>
+ *   Header: x-internal-secret: <cloudFnSecret>
+ *   Body:   { "type": "digest" | "reminders" | "overdue" | "weekly" | "monthly" }
  */
+
+/* ── Cloud Function trigger helper ── */
+async function triggerCloudReminder(type) {
+  try {
+    const raw = localStorage.getItem('adminSettings');
+    if (!raw) return { ok: false, reason: 'no settings' };
+    const cfg = JSON.parse(raw);
+    const url    = (cfg.cloudFnUrl    || '').trim();
+    const secret = (cfg.cloudFnSecret || '').trim();
+    if (!url) return { ok: false, reason: 'cloudFnUrl not configured' };
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-secret': secret,
+      },
+      body: JSON.stringify({ type }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    console.log(`✅ Cloud reminder triggered [${type}]:`, data);
+    return { ok: true, data };
+  } catch(e) {
+    console.warn(`⚠️ Cloud reminder trigger failed [${type}]:`, e?.message || e);
+    return { ok: false, reason: e?.message || String(e) };
+  }
+}
+
 function useDailyDigestScheduler(requirements, plants, users) {
   // Store latest data in refs so the interval closure always sees fresh values
   // without needing to be recreated on every state change (which would reset
@@ -2377,20 +2418,27 @@ function useDailyDigestScheduler(requirements, plants, users) {
         const cfg = JSON.parse(raw);
         if (!cfg.dailyDigestEnabled) return;
 
-        const digestTime = cfg.dailyDigestTime || '08:00'; // HH:mm
+        const digestTime = cfg.dailyDigestTime || '08:00'; // HH:mm IST
         const [hh, mm]   = digestTime.split(':').map(Number);
         const now        = new Date();
         const todayKey   = now.toISOString().slice(0,10); // YYYY-MM-DD
         const lastSent   = localStorage.getItem('lastDailyDigestSent') || '';
         const lastSentDay= lastSent.slice(0,10);
 
-        // Fire if current time is at or past the configured time and we haven't sent today yet.
-        // >= catches the case where the app is opened/refreshed after the configured time
-        // (e.g. page load at 08:05 with digest set for 08:00 — it still fires on mount).
         const nowMins = now.getHours() * 60 + now.getMinutes();
         const cfgMins = hh * 60 + mm;
+
         if (nowMins >= cfgMins && lastSentDay !== todayKey) {
-          await sendDailyDigestMail(reqRef.current, plantRef.current, userRef.current);
+          localStorage.setItem('lastDailyDigestSent', now.toISOString());
+
+          // ── PRIMARY: call Cloud Function (Office 365 SMTP, server-side) ──
+          const cloudResult = await triggerCloudReminder('digest');
+
+          // ── FALLBACK: browser-side MS Graph (only if Cloud Fn not configured) ──
+          if (!cloudResult.ok && (cfg.msClientId && cfg.msTenantId)) {
+            console.log('↩ Cloud Fn not configured — falling back to browser MS Graph send');
+            await sendDailyDigestMail(reqRef.current, plantRef.current, userRef.current);
+          }
         }
       } catch(e) {
         console.warn('⚠️ Digest scheduler tick error:', e?.message||e);
@@ -3967,6 +4015,23 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove }) {
       // Daily Digest
       dailyDigestEnabled: false,
       dailyDigestTime: '08:00',
+      // ── Cloud Function / Office 365 auto-reminders (v35) ──────────────────
+      // Set cloudFnUrl to your Firebase Cloud Function's triggerEmailNow URL.
+      // The Cloud Function runs 24/7 on Firebase servers and sends emails via
+      // Office 365 SMTP (Nodemailer) — no browser tab needs to be open.
+      cloudFnUrl:             '',   // e.g. https://asia-south1-skr-task.cloudfunctions.net/triggerEmailNow
+      cloudFnSecret:          '',   // x-internal-secret header value (set in functions:config:set app.internal_secret)
+      // Office 365 SMTP credentials (stored in Firestore, used by Cloud Function)
+      o365User:               '',   // e.g. compliance@polyplastics.in
+      o365Pass:               '',   // App password or Exchange SMTP auth password
+      o365FromName:           'Polyplastics Legal Compliance',
+      // Recipient lists for Cloud Function emails
+      digestRecipients:       '',   // comma-separated, e.g. admin@co.com, ceo@co.com
+      overdueRecipients:      '',   // comma-separated
+      // Reminder lead days — Cloud Function fires on these days-before-due
+      reminderLeadDays:       '1,3,7,14',  // comma-separated integers
+      weeklyEnabled:          true,
+      monthlyEnabled:         false,
     };
     try {
       const raw = localStorage.getItem('adminSettings');
@@ -4791,6 +4856,199 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove }) {
           <span>Find these values in your <strong>Firebase Console → Project Settings → Your apps → Firebase SDK snippet</strong>.</span>
         </div>
       </div>
+
+      {/* ══════════════════════════════════════════════════════
+          CLOUD REMINDERS — Office 365 via Firebase Cloud Function
+          Emails fire 24/7 from Firebase servers even when
+          the browser tab is closed.
+      ══════════════════════════════════════════════════════ */}
+      {(() => {
+        const [cloudTestStatus, setCloudTestStatus] = React.useState(null);
+        const [cloudTestMsg, setCloudTestMsg] = React.useState('');
+        const cloudReady = !!(settings.cloudFnUrl && settings.cloudFnSecret && settings.o365User && settings.o365Pass);
+
+        const testCloudFn = async (type='digest') => {
+          if (!settings.cloudFnUrl) { setCloudTestMsg('Enter the Cloud Function URL first.'); setCloudTestStatus('error'); setTimeout(()=>setCloudTestStatus(null),4000); return; }
+          if (!settings.cloudFnSecret) { setCloudTestMsg('Enter the internal secret first.'); setCloudTestStatus('error'); setTimeout(()=>setCloudTestStatus(null),4000); return; }
+          setCloudTestStatus('sending'); setCloudTestMsg('');
+          try {
+            const res = await fetch(settings.cloudFnUrl, {
+              method:'POST',
+              headers:{ 'Content-Type':'application/json', 'x-internal-secret': settings.cloudFnSecret },
+              body: JSON.stringify({ type }),
+            });
+            const data = await res.json().catch(()=>({}));
+            if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+            setCloudTestStatus('success');
+            setCloudTestMsg(`✅ ${type} triggered — messageId: ${data.messageId || data.triggered || 'sent'}`);
+          } catch(e) {
+            setCloudTestStatus('error');
+            setCloudTestMsg(`❌ ${e?.message || String(e)}`);
+          }
+          setTimeout(()=>setCloudTestStatus(null), 8000);
+        };
+
+        return (
+          <div className={`rounded-2xl border shadow-sm overflow-hidden ${dk?'border-indigo-800/50 bg-gray-800':'border-indigo-200 bg-white'}`}>
+            {/* Header */}
+            <div className={`px-6 py-4 flex items-center gap-4 border-b ${dk?'border-indigo-800/40 bg-indigo-900/20':'border-indigo-100 bg-indigo-50'}`}>
+              <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-xl flex-shrink-0 ${dk?'bg-indigo-900/40':'bg-indigo-100'}`}>☁️</div>
+              <div className="flex-1">
+                <p className="font-semibold text-sm">Cloud Reminders — Office 365 via Firebase</p>
+                <p className={`text-xs ${sub}`}>Emails sent 24/7 from Firebase Cloud Functions even when the app is closed — no browser needed</p>
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <span className={`text-xs font-bold px-2.5 py-1 rounded-full ${cloudReady ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
+                  {cloudReady ? '🟢 Ready' : '🟡 Not configured'}
+                </span>
+              </div>
+            </div>
+
+            <div className="p-6 space-y-5">
+              {/* Info banner */}
+              <div className={`p-4 rounded-xl border text-xs space-y-2 ${dk?'bg-indigo-900/20 border-indigo-800/40 text-indigo-300':'bg-indigo-50 border-indigo-100 text-indigo-700'}`}>
+                <p className="font-semibold text-sm mb-1">🔁 How it works</p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-center">
+                  {[
+                    ['⚙️ Cloud Function','Runs on Firebase 24/7 on a schedule'],
+                    ['📧 Office 365 SMTP','Sends via smtp.office365.com — your mailbox'],
+                    ['🗓️ Set & Forget','Configure once; emails fire automatically'],
+                  ].map(([icon, label]) => (
+                    <div key={label} className={`rounded-lg p-2 ${dk?'bg-indigo-900/30':'bg-indigo-100/60'}`}>
+                      <p className="text-base mb-0.5">{icon}</p>
+                      <p className="font-medium text-[11px]">{label}</p>
+                    </div>
+                  ))}
+                </div>
+                <p className="pt-1">The Cloud Function reads reminder settings from Firestore and sends via Office 365. Save settings here → they sync to Firestore → Cloud Function picks them up on next run.</p>
+              </div>
+
+              {/* Office 365 SMTP */}
+              <div className={`p-4 rounded-xl border space-y-4 ${dk?'bg-gray-700/50 border-gray-600':'bg-gray-50 border-gray-200'}`}>
+                <p className="text-xs font-bold uppercase tracking-wider text-indigo-500">📮 Office 365 SMTP Credentials</p>
+                <p className={`text-xs ${sub}`}>These are stored in Firestore and read by the Cloud Function at runtime. The Cloud Function uses <code>smtp.office365.com:587</code> with STARTTLS.</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <FormField label="Office 365 Email (From)" required>
+                    <input type="email" value={settings.o365User||''} onChange={e=>set('o365User',e.target.value)}
+                      placeholder="compliance@polyplasticsindia.com" className={inputCls} />
+                  </FormField>
+                  <FormField label="App Password / SMTP Password" required>
+                    <input type="password" value={settings.o365Pass||''} onChange={e=>set('o365Pass',e.target.value)}
+                      placeholder="••••••••••••" className={inputCls} autoComplete="new-password" />
+                  </FormField>
+                  <FormField label="From Name (display)">
+                    <input value={settings.o365FromName||''} onChange={e=>set('o365FromName',e.target.value)}
+                      placeholder="Polyplastics Legal Compliance" className={inputCls} />
+                  </FormField>
+                </div>
+                <div className={`rounded-lg p-3 text-xs ${dk?'bg-amber-900/20 border border-amber-800/30 text-amber-300':'bg-amber-50 border border-amber-200 text-amber-700'}`}>
+                  ⚠️ For Office 365: go to <strong>Microsoft 365 Admin Center → Users → Active users → your account → Mail → Manage email apps</strong> and enable <strong>Authenticated SMTP</strong>. Then use your account password or an App Password if MFA is on.
+                </div>
+              </div>
+
+              {/* Recipient config */}
+              <div className={`p-4 rounded-xl border space-y-4 ${dk?'bg-gray-700/50 border-gray-600':'bg-gray-50 border-gray-200'}`}>
+                <p className="text-xs font-bold uppercase tracking-wider text-indigo-500">📬 Recipients & Schedule</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <FormField label="Digest & Summary Recipients" required>
+                    <input value={settings.digestRecipients||''} onChange={e=>set('digestRecipients',e.target.value)}
+                      placeholder="admin@co.com, ceo@co.com" className={inputCls} />
+                    <p className={`text-xs mt-1 ${sub}`}>Comma-separated. Receives daily digest, weekly, monthly.</p>
+                  </FormField>
+                  <FormField label="Overdue Alert Recipients" required>
+                    <input value={settings.overdueRecipients||''} onChange={e=>set('overdueRecipients',e.target.value)}
+                      placeholder="admin@co.com, md@co.com" className={inputCls} />
+                    <p className={`text-xs mt-1 ${sub}`}>Comma-separated. Receives urgent overdue alerts.</p>
+                  </FormField>
+                  <FormField label="Lead-day reminder thresholds">
+                    <input value={settings.reminderLeadDays||'1,3,7,14'} onChange={e=>set('reminderLeadDays',e.target.value)}
+                      placeholder="1,3,7,14" className={inputCls} />
+                    <p className={`text-xs mt-1 ${sub}`}>Days before due date. Comma-separated integers.</p>
+                  </FormField>
+                </div>
+                <div className="flex flex-wrap gap-3">
+                  <label className="flex items-center gap-2 cursor-pointer text-sm">
+                    <button onClick={()=>set('weeklyEnabled',!settings.weeklyEnabled)}
+                      className={`w-10 h-5 rounded-full relative transition-colors ${settings.weeklyEnabled?'':'bg-gray-300 dark:bg-gray-600'}`} style={settings.weeklyEnabled?{background:'var(--p600)'}:{}}>
+                      <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${settings.weeklyEnabled?'left-5':'left-0.5'}`} />
+                    </button>
+                    <span>Weekly summary (Mondays 07:30 IST)</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer text-sm">
+                    <button onClick={()=>set('monthlyEnabled',!settings.monthlyEnabled)}
+                      className={`w-10 h-5 rounded-full relative transition-colors ${settings.monthlyEnabled?'':'bg-gray-300 dark:bg-gray-600'}`} style={settings.monthlyEnabled?{background:'var(--p600)'}:{}}>
+                      <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${settings.monthlyEnabled?'left-5':'left-0.5'}`} />
+                    </button>
+                    <span>Monthly report (1st of month)</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* Cloud Function URL + secret */}
+              <div className={`p-4 rounded-xl border space-y-4 ${dk?'bg-gray-700/50 border-gray-600':'bg-gray-50 border-gray-200'}`}>
+                <p className="text-xs font-bold uppercase tracking-wider text-indigo-500">🔗 Cloud Function Connection</p>
+                <p className={`text-xs ${sub}`}>Deploy <code>backend/functions/index.js</code> to Firebase, then paste the <code>triggerEmailNow</code> HTTPS URL below.</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <FormField label="Cloud Function URL" required>
+                    <input type="url" value={settings.cloudFnUrl||''} onChange={e=>set('cloudFnUrl',e.target.value)}
+                      placeholder="https://asia-south1-skr-task.cloudfunctions.net/triggerEmailNow" className={inputCls} />
+                  </FormField>
+                  <FormField label="Internal Secret (x-internal-secret)" required>
+                    <input type="password" value={settings.cloudFnSecret||''} onChange={e=>set('cloudFnSecret',e.target.value)}
+                      placeholder="your random secret" className={inputCls} autoComplete="new-password" />
+                    <p className={`text-xs mt-1 ${sub}`}>Must match <code>app.internal_secret</code> in Firebase functions config.</p>
+                  </FormField>
+                </div>
+
+                {/* Auto-schedule info */}
+                <div className={`rounded-xl p-3 text-xs ${dk?'bg-gray-700 text-gray-300':'bg-gray-100 text-gray-700'}`}>
+                  <p className="font-semibold mb-2">🕐 Automatic Cloud Schedule (IST)</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                    {[
+                      ['07:00 daily','📋 Daily digest → digest recipients'],
+                      ['08:00 daily','⏰ Lead-day reminders → assignees + plant heads'],
+                      ['09:00 daily','🚨 Overdue alert → overdue recipients'],
+                      ['07:30 Monday','📊 Weekly summary → digest recipients'],
+                      ['08:00 on 1st','📅 Monthly report → digest recipients'],
+                    ].map(([time, desc]) => (
+                      <div key={time} className="flex items-start gap-2">
+                        <span className={`font-mono text-[11px] px-1.5 py-0.5 rounded flex-shrink-0 ${dk?'bg-gray-600 text-indigo-300':'bg-white text-indigo-700 border border-indigo-100'}`}>{time}</span>
+                        <span>{desc}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <p className={`mt-2 ${sub}`}>These fire automatically on Firebase's servers. No browser tab needs to be open. Toggle weekly/monthly above.</p>
+                </div>
+              </div>
+
+              {/* Test buttons */}
+              <div className="space-y-3">
+                <p className="text-xs font-semibold uppercase tracking-wider text-indigo-500">🧪 Test Cloud Function</p>
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { type:'digest',    label:'📋 Send Digest Now' },
+                    { type:'reminders', label:'⏰ Send Lead-Day Reminders' },
+                    { type:'overdue',   label:'🚨 Send Overdue Alert' },
+                    { type:'weekly',    label:'📊 Send Weekly Summary' },
+                  ].map(({ type, label }) => (
+                    <button key={type} onClick={() => testCloudFn(type)}
+                      disabled={cloudTestStatus==='sending' || !settings.cloudFnUrl || !settings.cloudFnSecret}
+                      className={`px-4 py-2 rounded-xl text-xs font-semibold text-white transition-colors disabled:opacity-50`}
+                      style={{background:'var(--p600)'}}>
+                      {cloudTestStatus==='sending' ? '⏳ Sending…' : label}
+                    </button>
+                  ))}
+                </div>
+                {cloudTestStatus === 'success' && <p className="text-sm text-green-600 dark:text-green-400 font-medium">{cloudTestMsg}</p>}
+                {cloudTestStatus === 'error'   && <p className="text-sm text-red-500 font-medium">{cloudTestMsg}</p>}
+                {(!settings.cloudFnUrl || !settings.cloudFnSecret) && (
+                  <p className={`text-xs ${sub}`}>Enter the Cloud Function URL and secret above to enable test buttons.</p>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       <button onClick={save} disabled={logoSaving || logoDeleting} className="w-full py-3 text-white rounded-xl font-semibold transition-colors shadow-lg disabled:opacity-60" style={{background:"var(--p600)"}}>
         💾 Save All Settings
