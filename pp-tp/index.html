@@ -1601,6 +1601,12 @@ function startFirestoreListeners() {
       renderPlantNav();
     }
   }).catch(()=>{});
+  // Load departments from Firestore
+  _db.collection('settings').doc('departments').get().then(d=>{
+    if(d.exists&&Array.isArray(d.data().list)){
+      localStorage.setItem('tf_departments',JSON.stringify(d.data().list));
+    }
+  }).catch(()=>{});
   // Load company branding (logo/name) so it's shared across all devices/admins
   _db.collection('settings').doc('branding').get().then(d=>{
     if(d.exists){
@@ -2303,6 +2309,90 @@ function _renderDashCharts(_dashTasks){
     });
   })();
 
+  // ── Dept-wise & Name-wise Analytics ──────────────────────────────
+  (()=>{
+    const row=document.getElementById('dept-analytics-row');
+    if(row) row.style.display='grid';
+    const depts = [...new Set(_dashTasks.filter(t=>t.department).map(t=>t.department))];
+    // Hide dept cards if no tasks have a department assigned
+    const deptCard1=document.getElementById('ch-dept-compliance')?.closest('.card');
+    const deptCard2=document.getElementById('ch-dept-avgclose')?.closest('.card');
+    if(deptCard1) deptCard1.style.display=depts.length?'':'none';
+    if(deptCard2) deptCard2.style.display=depts.length?'':'none';
+    if(depts.length){
+    const deptCompliance = depts.map(dept=>{
+      const done=_dashTasks.filter(t=>t.department===dept&&t.status==='Done');
+      if(!done.length) return 0;
+      const onTime=done.filter(t=>{ const cd=t.closedAt||t.doneAt||null; if(cd) return cd<=t.due; return t.due&&t.created&&t.due>=t.created; }).length;
+      return Math.round(onTime/done.length*100);
+    });
+    const dcColors=deptCompliance.map(v=>v>=80?'#22c55e':v>=50?'#f59e0b':'#ef4444');
+    destroyChart('ch-dept-compliance');
+    if(document.getElementById('ch-dept-compliance')){
+      chartInstances['ch-dept-compliance']=new Chart(document.getElementById('ch-dept-compliance'),{
+        type:'bar',data:{labels:depts,datasets:[{label:'On-Time %',data:deptCompliance,backgroundColor:dcColors,borderRadius:6,borderWidth:0}]},
+        options:{indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>' '+ctx.raw+'% on-time'}}},scales:{x:{min:0,max:100,ticks:{color:tickCol,font:{size:10},callback:v=>v+'%'},grid:{color:gridCol}},y:{ticks:{color:tickCol,font:{size:10}},grid:{display:false}}},maintainAspectRatio:false}
+      });
+    }
+
+    // ── Dept-wise: Avg Days to Close ──────────────────────────────────
+    const deptAvg = depts.map(dept=>{
+      const done=_dashTasks.filter(t=>t.department===dept&&t.status==='Done'&&t.created);
+      if(!done.length) return null;
+      const total=done.reduce((sum,t)=>{const end=t.closedAt||t.doneAt?new Date(t.closedAt||t.doneAt):new Date();const diff=Math.max(0,Math.round((end-new Date(t.created))/(86400000)));return sum+diff;},0);
+      return Math.round(total/done.length);
+    });
+    const daColors=['#3b82f6','#a855f7','#22d3ee','#f97316','#10b981','#f59e0b','#ef4444','#22c55e'];
+    destroyChart('ch-dept-avgclose');
+    if(document.getElementById('ch-dept-avgclose')){
+      chartInstances['ch-dept-avgclose']=new Chart(document.getElementById('ch-dept-avgclose'),{
+        type:'bar',data:{labels:depts,datasets:[{label:'Avg Days',data:deptAvg,backgroundColor:depts.map((_,i)=>daColors[i%daColors.length]),borderRadius:6,borderWidth:0}]},
+        options:{indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>ctx.raw===null?' No data':' '+ctx.raw+' days avg'}}},scales:{x:{ticks:{color:tickCol,font:{size:10},callback:v=>v+'d'},grid:{color:gridCol}},y:{ticks:{color:tickCol,font:{size:10}},grid:{display:false}}},maintainAspectRatio:false}
+      });
+    }
+
+    } // end if(depts.length)
+
+    // ── Name-wise: On-Time Compliance (by assigneeName, fallback to email prefix) ──
+    const nameMap={};
+    _dashTasks.forEach(t=>{
+      const name=(t.assigneeName&&t.assigneeName.trim())||(t.assignee?t.assignee.split('@')[0]:'Unknown');
+      if(!nameMap[name]) nameMap[name]={done:0,onTime:0,hasDue:[]};
+      if(t.status==='Done'){
+        nameMap[name].done++;
+        const cd=t.closedAt||t.doneAt||null;
+        const inTime=cd?cd<=t.due:(t.due&&t.created&&t.due>=t.created);
+        if(inTime) nameMap[name].onTime++;
+      }
+    });
+    const nameLabels=Object.keys(nameMap).filter(n=>nameMap[n].done>0);
+    const nameCompliance=nameLabels.map(n=>Math.round(nameMap[n].onTime/nameMap[n].done*100));
+    const ncColors=nameCompliance.map(v=>v>=80?'#22c55e':v>=50?'#f59e0b':'#ef4444');
+    destroyChart('ch-name-compliance');
+    if(document.getElementById('ch-name-compliance')){
+      chartInstances['ch-name-compliance']=new Chart(document.getElementById('ch-name-compliance'),{
+        type:'bar',data:{labels:nameLabels,datasets:[{label:'On-Time %',data:nameCompliance,backgroundColor:ncColors,borderRadius:6,borderWidth:0}]},
+        options:{indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>' '+ctx.raw+'% on-time'}}},scales:{x:{min:0,max:100,ticks:{color:tickCol,font:{size:10},callback:v=>v+'%'},grid:{color:gridCol}},y:{ticks:{color:tickCol,font:{size:10}},grid:{display:false}}},maintainAspectRatio:false}
+      });
+    }
+
+    // ── Name-wise: Avg Days to Close ──
+    const nameAvg=nameLabels.map(n=>{
+      const pts=_dashTasks.filter(t=>t.status==='Done'&&t.created&&((t.assigneeName&&t.assigneeName.trim())||(t.assignee?t.assignee.split('@')[0]:'Unknown'))===n);
+      if(!pts.length) return null;
+      const tot=pts.reduce((sum,t)=>{const end=t.closedAt||t.doneAt?new Date(t.closedAt||t.doneAt):new Date();return sum+Math.max(0,Math.round((end-new Date(t.created))/86400000));},0);
+      return Math.round(tot/pts.length);
+    });
+    const naColors=['#3b82f6','#a855f7','#22d3ee','#f97316','#10b981','#f59e0b','#ef4444','#22c55e'];
+    destroyChart('ch-name-avgclose');
+    if(document.getElementById('ch-name-avgclose')){
+      chartInstances['ch-name-avgclose']=new Chart(document.getElementById('ch-name-avgclose'),{
+        type:'bar',data:{labels:nameLabels,datasets:[{label:'Avg Days',data:nameAvg,backgroundColor:nameLabels.map((_,i)=>naColors[i%naColors.length]),borderRadius:6,borderWidth:0}]},
+        options:{indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>ctx.raw===null?' No data':' '+ctx.raw+' days avg'}}},scales:{x:{ticks:{color:tickCol,font:{size:10},callback:v=>v+'d'},grid:{color:gridCol}},y:{ticks:{color:tickCol,font:{size:10}},grid:{display:false}}},maintainAspectRatio:false}
+      });
+    }
+  })();
+
   // team table
   const byPerson=[...new Set(_dashTasks.map(t=>t.assignee))].map(e=>({email:e,total:_dashTasks.filter(t=>t.assignee===e).length,done:_dashTasks.filter(t=>t.assignee===e&&t.status==='Done').length}));
   document.getElementById('team-tbl').innerHTML=`<thead><tr><th>Member</th><th>Total</th><th>Done</th><th style="width:120px">Progress</th></tr></thead><tbody>`+
@@ -2663,6 +2753,30 @@ function renderDashboard(){
       <div class="section-head" style="margin-bottom:4px">Avg. Days to Close (vs Assigned Date)</div>
       <div style="font-size:11px;color:var(--text3);margin-bottom:12px">Average days from task creation to completion, per assignee</div>
       <div class="chart-wrap" style="height:220px"><canvas id="ch-avgclose"></canvas></div>
+    </div>
+  </div>
+
+  <!-- ══ Dept-wise & Name-wise Analytics Row ══ -->
+  <div class="charts-grid fade-in" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));margin-bottom:22px;display:none" id="dept-analytics-row">
+    <div class="card">
+      <div class="section-head" style="margin-bottom:4px">🏢 On-Time Compliance by Department</div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:12px">% of completed tasks closed on or before due date, per department</div>
+      <div class="chart-wrap" style="height:220px"><canvas id="ch-dept-compliance"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="section-head" style="margin-bottom:4px">🏢 Avg. Days to Close by Department</div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:12px">Average days from task creation to completion, per department</div>
+      <div class="chart-wrap" style="height:220px"><canvas id="ch-dept-avgclose"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="section-head" style="margin-bottom:4px">👤 On-Time Compliance by Name</div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:12px">% of completed tasks closed on or before due date, per assignee name</div>
+      <div class="chart-wrap" style="height:220px"><canvas id="ch-name-compliance"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="section-head" style="margin-bottom:4px">👤 Avg. Days to Close by Name</div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:12px">Average days from task creation to completion, per assignee name</div>
+      <div class="chart-wrap" style="height:220px"><canvas id="ch-name-avgclose"></canvas></div>
     </div>
   </div>
 
@@ -3937,6 +4051,68 @@ function renderTeam(){
 // ═══════════════════════════════════════════════════════════════════════
 //  SETTINGS
 // ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  DEPARTMENT MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════
+function getDepartments(){
+  try{
+    const local = JSON.parse(localStorage.getItem('tf_departments')||'[]');
+    return Array.isArray(local) ? local : [];
+  }catch(e){ return []; }
+}
+
+function saveDepartments(arr){
+  localStorage.setItem('tf_departments', JSON.stringify(arr));
+  if(_fbReady && _db){
+    _db.collection('settings').doc('departments').set({list: arr}).catch(e=>console.warn('dept sync error',e));
+  }
+}
+
+function renderDeptList(){
+  const el = document.getElementById('dept-list');
+  if(!el) return;
+  const depts = getDepartments();
+  if(!depts.length){
+    el.innerHTML = '<div style="text-align:center;padding:16px;color:var(--text3);font-size:13px">No departments added yet. Use the form above to add departments.</div>';
+    return;
+  }
+  const colors = ['#5b8dee','#a78bfa','#34d399','#fbbf24','#f87171','#22d3ee','#f97316','#10b981'];
+  el.innerHTML = depts.map((d,i) => {
+    const col = colors[i % colors.length];
+    const taskCount = tasks.filter(t=>t.department===d).length;
+    return `<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-left:4px solid ${col};border-radius:var(--radius);margin-bottom:6px;">
+      <div style="flex:1;min-width:0">
+        <span style="font-weight:700;font-size:14px;color:var(--text)">${esc(d)}</span>
+        <span style="font-size:11px;color:var(--text3);margin-left:10px;background:var(--card);border:1px solid var(--border);border-radius:4px;padding:1px 6px">${taskCount} task${taskCount!==1?'s':''}</span>
+      </div>
+      <button class="btn btn-danger btn-sm" onclick="deleteDepartment(${i})">🗑</button>
+    </div>`;
+  }).join('');
+}
+
+function addDepartment(){
+  const inp = document.getElementById('dept-name-inp');
+  const name = (inp?.value||'').trim();
+  if(!name){ toast('Department name is required','var(--red)'); return; }
+  const depts = getDepartments();
+  if(depts.map(d=>d.toLowerCase()).includes(name.toLowerCase())){ toast('Department already exists','var(--amber)'); return; }
+  depts.push(name);
+  saveDepartments(depts);
+  if(inp) inp.value='';
+  renderDeptList();
+  toast('✅ Department "'+name+'" added!');
+}
+
+function deleteDepartment(idx){
+  const depts = getDepartments();
+  const name = depts[idx];
+  if(!confirm('Delete department "'+name+'"?')) return;
+  depts.splice(idx,1);
+  saveDepartments(depts);
+  renderDeptList();
+  toast('Department removed.','var(--amber)');
+}
+
 function renderSettings(){
   const c=document.getElementById('content');
   // Plant owners only get a password change screen
@@ -4294,6 +4470,23 @@ function renderSettings(){
       }).join('')}
     </div>
 
+    <div class="card" id="dept-settings-section">
+      <div style="font-weight:700;font-size:15px;color:var(--text);margin-bottom:4px">🏢 Departments</div>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:18px">Create departments to categorize tasks by team or function. Departments appear as a dropdown when assigning tasks.</div>
+      <div style="background:var(--card2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;margin-bottom:16px">
+        <div style="font-weight:600;font-size:13px;color:var(--text);margin-bottom:10px">➕ Add Department</div>
+        <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <div class="form-group" style="margin-bottom:0;flex:1;min-width:200px">
+            <label class="form-label">Department Name</label>
+            <input class="form-input" id="dept-name-inp" placeholder="e.g. Engineering, Finance, HR"
+              onkeydown="if(event.key==='Enter')addDepartment()"/>
+          </div>
+          <button class="btn btn-primary btn-sm" style="flex-shrink:0" onclick="addDepartment()">➕ Add</button>
+        </div>
+      </div>
+      <div id="dept-list"></div>
+    </div>
+
     <div class="card" id="plant-settings-section">
       <div style="font-weight:700;font-size:15px;color:var(--text);margin-bottom:4px">🏭 Plant Groups</div>
       <div style="font-size:12px;color:var(--text3);margin-bottom:18px">Create plant groups and assign owners. Each owner will only see their plant's tasks when they log in.</div>
@@ -4355,6 +4548,7 @@ function renderSettings(){
   </div>`;
   // render plant list and update MSAL sign-in status after innerHTML is set
   setTimeout(()=>{
+    renderDeptList();
     renderPgList();
     // Update Microsoft sign-in status badge using singleton instance
     const inst = getMsalInstance();
@@ -9790,7 +9984,27 @@ function openTaskModal(){
            <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--amber);flex-shrink:0;"></span>
            Microsoft 365 not configured — go to Settings → Email Integration to enable auto-email.
          </div>`;
-    const assigneeField = `<div class="form-group">
+    // Build department options from saved departments
+    const _depts = getDepartments();
+    const _deptOptions = _depts.length
+      ? _depts.map(d=>`<option value="${esc(d)}"${t&&t.department===d?' selected':''}>${esc(d)}</option>`).join('')
+      : '';
+    const assigneeField = `<div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Department <span style="font-size:11px;font-weight:400;color:var(--text3)">(optional)</span></label>
+        <select id="tm-department" class="form-select">
+          <option value="">— Select Department —</option>
+          ${_deptOptions}
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Assignee Name <span style="font-size:11px;font-weight:400;color:var(--text3)">(optional)</span></label>
+        <input id="tm-assignee-name" class="form-input" type="text"
+          placeholder="Full name of assignee"
+          value="${esc(t ? t.assigneeName||'' : '')}"/>
+      </div>
+    </div>
+    <div class="form-group">
       <label class="form-label">Assign To * <span style="font-size:11px;font-weight:400;color:var(--text3)">(email address)</span></label>
       <input id="tm-assignee" class="form-input" type="email"
         placeholder="assignee@example.com"
@@ -9866,7 +10080,7 @@ function saveTask(){
       const _resolvedAssignedBy = t.assignedBy || _poEmail
         || (currentSession ? currentSession.email : '')
         || localStorage.getItem('admin_notify_email') || '';
-      const updated={...t,title,desc:document.getElementById('tm-desc').value,assignee,cc:ccEmail||t.cc||'',assignedBy:_resolvedAssignedBy,priority:newPriority,status:newStatus,due,completedDate:document.getElementById('tm-completedDate')?.value||t.completedDate||'',reminder:document.getElementById('tm-reminder').value,tags};
+      const updated={...t,title,desc:document.getElementById('tm-desc').value,assignee,assigneeName:(document.getElementById('tm-assignee-name')?.value||'').trim()||t.assigneeName||'',department:(document.getElementById('tm-department')?.value||'').trim()||t.department||'',cc:ccEmail||t.cc||'',assignedBy:_resolvedAssignedBy,priority:newPriority,status:newStatus,due,completedDate:document.getElementById('tm-completedDate')?.value||t.completedDate||'',reminder:document.getElementById('tm-reminder').value,tags};
       updateTask(updated);
       // close modal & refresh UI immediately
       closeTaskModal(); refreshOverdueBadge(); showPanel(currentPanel);
@@ -9932,6 +10146,8 @@ function saveTask(){
         id:uid(), title,
         desc:document.getElementById('tm-desc').value,
         assignee,
+        assigneeName:(document.getElementById('tm-assignee-name')?.value||'').trim(),
+        department:(document.getElementById('tm-department')?.value||'').trim(),
         cc: ccEmail,
         assignedBy: assignedByEmail,
         priority:document.getElementById('tm-priority').value,
