@@ -5703,6 +5703,12 @@ function buildEmailSubject(reason, taskTitle, task){
 
 // ── Microsoft Graph send ───────────────────────────────────────────────
 async function sendViaMsGraph(toEmail, subject, htmlBody, ccEmails=[]){
+  // ── FIX v114: Hard guard — Microsoft Graph returns ErrorInvalidRecipients
+  // when toEmail is empty, undefined, or not a valid RFC 5322 address.
+  if(!toEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(toEmail.trim())){
+    throw new Error('INVALID_RECIPIENT: toEmail is empty or not a valid email address: "' + toEmail + '"');
+  }
+  toEmail = toEmail.trim();
   const cfg = getEmailConfig();
   // When a plant owner is logged in, use their account.
   // Otherwise, use the logged-in account holder's email so email is sent FROM their mailbox.
@@ -5766,17 +5772,25 @@ async function sendViaEmailJS(toEmail, subject, htmlBody, task={}){
 async function sendTaskEmail(task, reason='assigned', extra={}){
   const transport = emailTransport();
   if(transport === 'mailto') return false; // handled separately
-  const taskLink = window.location.href.split('?')[0]+'?email='+encodeURIComponent(task.assignee);
+  // ── FIX v114: Guard against empty / invalid assignee email ──
+  // Microsoft Graph returns ErrorInvalidRecipients when toEmail is blank or malformed.
+  const _emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if(!task.assignee || !_emailRegex.test((task.assignee||'').trim())){
+    console.warn('[sendTaskEmail] Skipped — assignee email is empty or invalid:', task.assignee);
+    return false; // task saved successfully; just no email to send
+  }
+  const toEmail  = task.assignee.trim();
+  const taskLink = window.location.href.split('?')[0]+'?email='+encodeURIComponent(toEmail);
   const subject  = buildEmailSubject(reason, task.title, task);
   const htmlBody = buildEmailHtml(task, reason, taskLink, extra.changeDetail||'');
   // Let errors propagate so callers can distinguish the failure type
   if(transport === 'msgraph'){
     // Parse task.cc (may be comma-separated string) into a validated array
     const ccArr = (task.cc||'').split(',').map(e=>e.trim()).filter(e=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
-    await sendViaMsGraph(task.assignee, subject, htmlBody, ccArr);
+    await sendViaMsGraph(toEmail, subject, htmlBody, ccArr);
   } else if(transport === 'emailjs'){
     try {
-      await sendViaEmailJS(task.assignee, subject, htmlBody, task);
+      await sendViaEmailJS(toEmail, subject, htmlBody, task);
     } catch(ejsErr) {
       console.error('[EmailJS send error]', ejsErr);
       throw ejsErr; // re-throw so notifyAssignee can show the toast
@@ -10539,7 +10553,7 @@ function saveTask(){
           // Send to assignee (fire and forget — no await)
           sendTaskEmail(nt,'assigned').then(ok=>{
             if(ok) toast('\u2705 Task created & email sent to '+assignee+'!');
-            else   toast('Task created! Email failed — check Microsoft Graph settings.','var(--amber)');
+            else   toast('\u2705 Task created! (No assignee email — notification skipped)','var(--amber)');
           }).catch(e=>{
             const msg = e.message || '';
             if(msg.includes('MS_NOT_SIGNED_IN')){
