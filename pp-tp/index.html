@@ -1814,7 +1814,7 @@ function startFirestoreListeners() {
 }
 
 // ── state ─────────────────────────────────────────────────────────────
-let tasks = JSON.parse(localStorage.getItem('tf_tasks') || 'null') || SEED;
+let tasks = (()=>{ try{ return JSON.parse(localStorage.getItem('tf_tasks')||'null')||SEED; }catch(e){ console.warn('[TaskPlanner] Corrupt tf_tasks cache — resetting.',e); try{localStorage.removeItem('tf_tasks');}catch(_){} return SEED; } })();
 // plant nav rendered after DOM is ready
 document.addEventListener('DOMContentLoaded',()=>{ setTimeout(renderPlantNav,100); });
 let mode = 'admin'; // 'admin' | 'user'
@@ -1824,8 +1824,58 @@ let editTaskId = null;
 let pendingFiles = []; // file objects waiting to attach
 let chartInstances = {};
 
+/**
+ * _safeSetTasks — write tasks array to localStorage with quota-safe fallback.
+ *
+ * Strategy (in order):
+ *  1. Strip base64 attachments (replace with a placeholder stub) to shrink payload.
+ *  2. Try to write the stripped payload.
+ *  3. If still too large, keep only the 200 most-recent tasks and try again.
+ *  4. If still failing, silently skip localStorage (Firestore is the source of truth).
+ *
+ * Attachment data is never lost — the full objects always remain in the in-memory
+ * `tasks` array and are synced to Firestore by saveTasks(); only the localStorage
+ * cache is stripped for size.
+ */
+function _safeSetTasks(arr) {
+  // Strip large base64 blobs from attachments before caching locally
+  function _stripAttachments(taskList) {
+    return taskList.map(t => {
+      if (!t.attachments || !t.attachments.length) return t;
+      return {
+        ...t,
+        attachments: t.attachments.map(a => {
+          if (a && a.data && a.data.length > 2000) {
+            return { ...a, data: '__LOCAL_STRIPPED__', size: a.size || 0 };
+          }
+          return a;
+        })
+      };
+    });
+  }
+
+  const stripped = _stripAttachments(arr);
+  const payload  = JSON.stringify(stripped);
+
+  try {
+    localStorage.setItem('tf_tasks', payload);
+    return; // success
+  } catch (e1) {
+    // Quota exceeded after stripping attachments — try with fewer tasks
+    try {
+      const trimmed = JSON.stringify(_stripAttachments(arr.slice(0, 200)));
+      localStorage.setItem('tf_tasks', trimmed);
+      console.warn('[TaskPlanner] localStorage quota: saved only 200 most-recent tasks as cache. Firestore holds all data.');
+    } catch (e2) {
+      // Still failing — clear only the tasks key and give up gracefully
+      try { localStorage.removeItem('tf_tasks'); } catch(_) {}
+      console.warn('[TaskPlanner] localStorage quota exceeded — skipping local cache. Firestore is the source of truth.', e2);
+    }
+  }
+}
+
 function saveTasks() {
-  localStorage.setItem('tf_tasks', JSON.stringify(tasks));
+  _safeSetTasks(tasks);
   if (_fbReady && _db) {
     const batch = _db.batch();
     tasks.forEach(t => { const tc=Object.fromEntries(Object.entries(t).filter(([,v])=>v!==undefined)); batch.set(_db.collection('tasks').doc(tc.id), tc); });
@@ -1876,7 +1926,7 @@ function canDeleteTask(t){
 }
 function updateTask(t) {
   tasks = tasks.map(x=>x.id===t.id?t:x);
-  localStorage.setItem('tf_tasks', JSON.stringify(tasks));
+  _safeSetTasks(tasks);
   if (_fbReady && _db) {
     const tClean = Object.fromEntries(Object.entries(t).filter(([,v])=>v!==undefined));
     _db.collection('tasks').doc(tClean.id).set(tClean).catch(e => console.warn('updateTask error:', e));
@@ -3673,7 +3723,7 @@ function bulkDeleteTasks(){
     : `Permanently delete ${count} task${count>1?'s':''}? This cannot be undone.`;
   if(!confirm(msg)) return;
   tasks = tasks.filter(t=>!ids.includes(t.id));
-  localStorage.setItem('tf_tasks', JSON.stringify(tasks));
+  _safeSetTasks(tasks);
   if(_fbReady&&_db){
     const batch=_db.batch();
     ids.forEach(id=>batch.delete(_db.collection('tasks').doc(id)));
@@ -3767,7 +3817,7 @@ function deleteTask(id){
   if(!canDeleteTask(t0)){ toast('You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task permanently?'))return;
   tasks=tasks.filter(t=>t.id!==id);
-  localStorage.setItem('tf_tasks',JSON.stringify(tasks));
+  _safeSetTasks(tasks);
   if(_fbReady&&_db) _db.collection('tasks').doc(id).delete().catch(e=>console.warn('delete error',e));
   renderTaskRows(); refreshOverdueBadge();
   toast('Task deleted','var(--red)');
@@ -9664,7 +9714,7 @@ function importData(){
         const imported=JSON.parse(ev.target.result);
         if(!Array.isArray(imported)){toast('Invalid format: expected an array of tasks','var(--red)');return;}
         tasks=imported;
-        localStorage.setItem('tf_tasks',JSON.stringify(tasks));
+        _safeSetTasks(tasks);
         if(_fbReady&&_db){
           const batch=_db.batch();
           tasks.forEach(t=>batch.set(_db.collection('tasks').doc(t.id),t));
@@ -9679,7 +9729,7 @@ function importData(){
 function resetData(){
   if(!confirm('Reset all tasks to demo data? This cannot be undone.'))return;
   tasks=JSON.parse(JSON.stringify(SEED)).map(t=>({...t,id:uid(),token:uid()}));
-  localStorage.setItem('tf_tasks',JSON.stringify(tasks));
+  _safeSetTasks(tasks);
   if(_fbReady&&_db){
     // Clear existing docs then write fresh
     _db.collection('tasks').get().then(snap=>{
@@ -10267,7 +10317,7 @@ function deleteTaskFromDrawer(id){
   if(!canDeleteTask(t0)){ toast(_isRestrictedAssignee()?'This task was assigned to you — only the person who assigned it can delete it.':'You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task permanently? This cannot be undone.'))return;
   tasks=tasks.filter(t=>t.id!==id);
-  localStorage.setItem('tf_tasks',JSON.stringify(tasks));
+  _safeSetTasks(tasks);
   if(_fbReady&&_db) _db.collection('tasks').doc(id).delete().catch(e=>console.warn('delete error',e));
   refreshOverdueBadge();
   closeDrawer();
@@ -10549,7 +10599,7 @@ function saveTask(){
         ...(plantOwnerAuthenticated&&currentPlantSession ? {plant: currentPlantSession.id} : {})
       };
       tasks=[nt,...tasks];
-      localStorage.setItem('tf_tasks',JSON.stringify(tasks));
+      _safeSetTasks(tasks);
       // Strip undefined fields before sending to Firestore (Firestore rejects undefined)
       const ntClean = Object.fromEntries(Object.entries(nt).filter(([,v])=>v!==undefined));
       if(_fbReady&&_db) _db.collection('tasks').doc(ntClean.id).set(ntClean).catch(e=>console.warn('addTask error',e));
@@ -11288,7 +11338,7 @@ function deleteMyTask(id){
   if(!canDeleteTask(t0)){ toast(_isRestrictedAssignee()?'This task was assigned to you — only the person who assigned it can delete it.':'You can only delete tasks you assigned yourself. This task was assigned by the superadmin.','var(--red)'); return; }
   if(!confirm('Delete this task?')) return;
   tasks=tasks.filter(t=>t.id!==id);
-  localStorage.setItem('tf_tasks',JSON.stringify(tasks));
+  _safeSetTasks(tasks);
   if(_fbReady&&_db) _db.collection('tasks').doc(id).delete().catch(e=>console.warn('deleteMyTask error',e));
   const lbl = document.getElementById('mytasks-filter-label');
   const LABEL_TO_FILTER = {'All':'all','To Do':'To Do','In Progress':'In Progress','Review':'Review','Done':'Done','Overdue':'overdue'};
@@ -11371,7 +11421,7 @@ function saveSelfTask(editId,selfEmail){
       reminder:document.getElementById('st-reminder').value,tags,
       ...(plantOwnerAuthenticated&&currentPlantSession ? {plant: currentPlantSession.id} : {})};
     tasks=[nt,...tasks];
-    localStorage.setItem('tf_tasks',JSON.stringify(tasks));
+    _safeSetTasks(tasks);
     const ntClean = Object.fromEntries(Object.entries(nt).filter(([,v])=>v!==undefined));
     if(_fbReady&&_db) _db.collection('tasks').doc(ntClean.id).set(ntClean).catch(e=>console.warn('saveSelfTask error',e));
     toast('Task added ✅ — no email sent');
@@ -11739,7 +11789,7 @@ function importBulk(){
   }
 
   // Persist to localStorage without blocking UI
-  try { localStorage.setItem('tf_tasks', JSON.stringify(tasks)); } catch(e){ console.warn('localStorage quota exceeded', e); }
+  _safeSetTasks(tasks);
 }
 
 // ── template downloads ─────────────────────────────────────────────────
