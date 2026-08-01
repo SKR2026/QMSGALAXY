@@ -653,17 +653,23 @@ function plantsHTML(){
 function employeesHTML(){
   const fp=S.filterPlant;
   const filtered=fp?S.employees.filter(e=>e.plantId===fp):S.employees;
+  const isSA=S.profile?.role==='super-admin';
   return `<div class="fl ac jb mb16">
   <div><h2 style="font-size:17px;font-weight:800;color:var(--navy)">All Employees</h2><p style="font-size:13px;color:var(--g400)">${S.employees.length} across all plants</p></div>
   <div class="fl g2h">
     <select class="inp" id="fp-sel" style="width:170px"><option value="">All Plants</option>${S.plants.map(p=>`<option value="${p.id}" ${fp===p.id?'selected':''}>${p.name}</option>`).join('')}</select>
     <button class="btn bo" id="bulk-emp-btn" style="gap:6px">⬆ Bulk Upload</button>
+    ${isSA?`<button class="btn bd" id="bulk-del-btn" style="display:none;gap:6px">🗑 Delete Selected (<span id="bulk-del-count">0</span>)</button>`:''}
     <button class="btn bp" id="add-emp-btn">+ Add Employee</button>
   </div>
 </div>
 <div class="card"><div class="tw"><table>
-  <thead><tr><th>Employee</th><th>Emp Code</th><th>Department</th><th>Designation</th><th>Email</th><th>Contact</th><th>Plant</th><th>Actions</th></tr></thead>
+  <thead><tr>
+    ${isSA?`<th style="width:36px"><input type="checkbox" id="sel-all" title="Select all" style="cursor:pointer;width:15px;height:15px"/></th>`:''}
+    <th>Employee</th><th>Emp Code</th><th>Department</th><th>Designation</th><th>Email</th><th>Contact</th><th>Plant</th><th>Actions</th>
+  </tr></thead>
   <tbody>${filtered.map(e=>`<tr>
+    ${isSA?`<td style="text-align:center"><input type="checkbox" class="emp-chk" data-id="${e.id}" style="cursor:pointer;width:15px;height:15px"/></td>`:''}
     <td><div class="fl ac g2h">${avatarThumb(e)}<strong>${e.name}</strong></div></td>
     <td style="color:var(--g400);font-size:12px;font-weight:600">${e.empCode||'—'}</td>
     <td style="color:var(--g400);font-size:12px">${e.dept||'—'}</td>
@@ -675,7 +681,7 @@ function employeesHTML(){
       <button class="btn bo bsm bic ee-btn" data-id="${e.id}">✎</button>
       <button class="btn bd bsm bic de-btn" data-id="${e.id}" data-name="${e.name}">✕</button>
     </div></td>
-  </tr>`).join('')||noData(6,'👤','No employees found','')}
+  </tr>`).join('')||noData(isSA?9:8,'👤','No employees found','')}
   </tbody>
 </table></div></div>`;
 }
@@ -1193,6 +1199,42 @@ function bindAll(){
   $('det-overlay')?.addEventListener('click',e=>{ if(e.target.id==='det-overlay'){ S.detailPerson=null; render(); }});
   $('det-close')?.addEventListener('click',()=>{ S.detailPerson=null; render(); });
 
+  // ── Bulk delete (super admin only) ───────────────────────────────
+  const bulkDelBtn=$('bulk-del-btn');
+  const selAllChk=$('sel-all');
+  const empChks=()=>document.querySelectorAll('.emp-chk');
+  const updateBulkBar=()=>{
+    const checked=[...empChks()].filter(c=>c.checked);
+    const count=checked.length;
+    if(bulkDelBtn){
+      bulkDelBtn.style.display=count>0?'inline-flex':'none';
+      const span=$('bulk-del-count'); if(span) span.textContent=count;
+    }
+    if(selAllChk) selAllChk.indeterminate=count>0&&count<empChks().length;
+  };
+  selAllChk?.addEventListener('change',()=>{
+    empChks().forEach(c=>c.checked=selAllChk.checked);
+    updateBulkBar();
+  });
+  empChks().forEach(c=>c.addEventListener('change',()=>{
+    if(selAllChk) selAllChk.checked=[...empChks()].every(x=>x.checked);
+    updateBulkBar();
+  }));
+  bulkDelBtn?.addEventListener('click',async()=>{
+    const ids=[...empChks()].filter(c=>c.checked).map(c=>c.dataset.id);
+    if(!ids.length) return;
+    const names=ids.map(id=>S.employees.find(e=>e.id===id)?.name||id);
+    if(!confirm(`Delete ${ids.length} employee${ids.length!==1?'s':''}?\n\n${names.slice(0,10).join(', ')}${names.length>10?`\n…and ${names.length-10} more`:''}\n\nThis cannot be undone.`)) return;
+    bulkDelBtn.disabled=true; bulkDelBtn.textContent='Deleting…';
+    let done=0,failed=0;
+    for(const id of ids){
+      try{ await db.collection('employees').doc(id).delete(); done++; }
+      catch(e){ failed++; console.error('Bulk delete error:',e); }
+    }
+    toast(`🗑 Deleted ${done} employee${done!==1?'s':''}${failed?', '+failed+' failed':''}`, done>0?'ok':'er');
+    // render will reset the button state
+  });
+
   // ── Public View Toggle ────────────────────────────────────────────
   const pvTrack=$('pv-track');
   const pvThumb=$('pv-thumb');
@@ -1475,13 +1517,20 @@ function parseBulkXLSX(file){
 
       if(rows.length<2){ showBulkErr('Excel file is empty or has no data rows.'); return; }
 
-      // Normalise headers from first row
-      const headers=rows[0].map(h=>String(h).trim().toLowerCase().replace(/\s+/g,'_').replace(/[^a-z_]/g,''));
+      // Normalise headers — strip parenthetical notes like "(name or emp_code)" before normalising
+      const headers=rows[0].map(h=>String(h).trim().replace(/\s*\(.*?\)/g,'').trim().toLowerCase().replace(/\s+/g,'_').replace(/[^a-z_]/g,''));
       const required=['name','designation'];
       const missing=required.filter(r=>!headers.includes(r));
       if(missing.length){ showBulkErr('Missing required columns: '+missing.join(', ')+'. Check your Excel header row.'); return; }
 
       const col=k=>headers.indexOf(k);
+      // reports_to_name column accepts multiple aliases
+      const reportsToCol=()=>{
+        for(const alias of ['reports_to_name','reports_to','reportsto','reportstoname','parent','reports_to_emp_code']){
+          const i=col(alias); if(i>=0) return i;
+        }
+        return -1;
+      };
 
       _bulkRows=[];
       for(let i=1;i<rows.length;i++){
@@ -1493,7 +1542,8 @@ function parseBulkXLSX(file){
         const email=String(cells[col('email')]||'').trim();
         const contact=String(cells[col('contact')]||'').trim();
         const plantName=String(cells[col('plant_name')]||'').trim();
-        const reportsTo=String(cells[col('reports_to_name')]||'').trim();
+        const rtCol=reportsToCol();
+        const reportsTo=rtCol>=0?String(cells[rtCol]||'').trim():'';
 
         // Skip completely empty rows
         if(!name&&!designation&&!email) continue;
