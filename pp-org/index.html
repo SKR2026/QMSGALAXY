@@ -230,6 +230,7 @@ const stor   = firebase.storage();
 const S = {
   user:null, profile:null,
   plants:[], employees:[], users:[],
+  departments:[], // list of {id, name, description} stored in Firestore settings/departments
   tab:'dashboard',
   modal:null, detailPerson:null,
   filterPlant:'', chartScale:1, plantChartId:'', deptChartId:'', deptChartPlant:'',
@@ -291,6 +292,11 @@ function startListeners(){
   }));
   _unsubs.push(db.collection('employees').onSnapshot(s=>{
     S.employees=s.docs.map(d=>({id:d.id,...d.data()})); render();
+  }));
+  _unsubs.push(db.collection('settings').doc('departments').onSnapshot(snap=>{
+    const d=snap.exists?snap.data():{};
+    S.departments=(d.list||[]).sort((a,b)=>a.name.localeCompare(b.name));
+    render();
   }));
   if(S.profile?.role==='super-admin'){
     _unsubs.push(db.collection('mompro_users').onSnapshot(s=>{
@@ -634,6 +640,59 @@ function plantsHTML(){
   </div>
 </div>
 
+<!-- ── Department Management ── -->
+<div class="card" style="margin-bottom:20px">
+  <div class="card-h">
+    <h3>🏢 Department Management</h3>
+    <button class="btn bp bsm" id="add-dept-btn">+ Add Department</button>
+  </div>
+
+  <!-- Inline add/edit form (hidden by default) -->
+  <div id="dept-form-wrap" style="display:none;padding:16px 20px;border-bottom:1px solid var(--g100);background:var(--g50)">
+    <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end">
+      <div>
+        <label class="lbl">Department Name *</label>
+        <input class="inp" id="dept-name-inp" placeholder="e.g. Quality, Production…"/>
+      </div>
+      <div>
+        <label class="lbl">Description</label>
+        <input class="inp" id="dept-desc-inp" placeholder="Optional description"/>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn bp bsm" id="dept-save-btn">Save</button>
+        <button class="btn bo bsm" id="dept-cancel-btn">Cancel</button>
+      </div>
+    </div>
+    <div id="dept-form-err" style="display:none;color:var(--err);font-size:12px;margin-top:8px"></div>
+    <input type="hidden" id="dept-edit-id"/>
+  </div>
+
+  <!-- Department list -->
+  <div class="tw">
+    <table>
+      <thead><tr><th>#</th><th>Department Name</th><th>Description</th><th>Employees</th><th>Actions</th></tr></thead>
+      <tbody>
+        ${S.departments.length===0
+          ?`<tr><td colspan="5"><div class="empty" style="padding:30px 20px"><div class="ei" style="font-size:28px">🏢</div><h3 style="font-size:14px">No departments yet</h3><p style="font-size:12px">Click "+ Add Department" to create your first department.</p></div></td></tr>`
+          :S.departments.map((d,i)=>{
+            const empCount=S.employees.filter(e=>(e.dept||'').toLowerCase()===d.name.toLowerCase()).length;
+            return `<tr>
+              <td style="color:var(--g400);font-size:12px">${i+1}</td>
+              <td><strong>${d.name}</strong></td>
+              <td style="color:var(--g400);font-size:12px">${d.description||'—'}</td>
+              <td><span class="badge bb">${empCount}</span></td>
+              <td><div class="fl g2h">
+                <button class="btn bo bsm bic ed-btn" data-dept-id="${d.id}" title="Edit">✎</button>
+                <button class="btn bd bsm bic dd-btn" data-dept-id="${d.id}" data-dept-name="${d.name}" title="Delete">✕</button>
+              </div></td>
+            </tr>`;
+          }).join('')}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── Plants Table ── -->
 <div class="card"><div class="tw"><table>
   <thead><tr><th>Plant Name</th><th>Location</th><th>Description</th><th>Staff</th><th>Actions</th></tr></thead>
   <tbody>${S.plants.map(p=>`<tr>
@@ -1194,7 +1253,15 @@ function employeeModalHTML(emp){
       </div>
       <div class="g2">
         <div class="fg"><label class="lbl">Employee Code</label><input class="inp" id="m-empcode" value="${e.empCode||''}" placeholder="EMP-001"/></div>
-        <div class="fg"><label class="lbl">Department</label><input class="inp" id="m-dept" value="${e.dept||''}" placeholder="Quality, Production…"/></div>
+        <div class="fg"><label class="lbl">Department</label>
+          ${S.departments.length>0
+            ?`<select class="inp" id="m-dept">
+                <option value="">— Select Department —</option>
+                ${S.departments.map(d=>`<option value="${d.name}" ${(e.dept||'')===(d.name)?'selected':''}>${d.name}</option>`).join('')}
+              </select>`
+            :`<input class="inp" id="m-dept" value="${e.dept||''}" placeholder="Quality, Production…"/>`
+          }
+        </div>
       </div>
       <div class="g2">
         <div class="fg"><label class="lbl">Email</label><input class="inp" id="m-email" type="email" value="${e.email||''}" placeholder="john@company.com"/></div>
@@ -1492,6 +1559,86 @@ function bindAll(){
       await db.collection('settings').doc('company').set({logoURL:null,updatedAt:new Date().toISOString()},{merge:true});
       toast('Logo removed','ok');
     } catch(e){ toast('Error: '+e.message,'er'); }
+  });
+
+  // ── department CRUD ───────────────────────────────────────────────
+  const deptForm=$('dept-form-wrap');
+  const deptNameInp=$('dept-name-inp');
+  const deptDescInp=$('dept-desc-inp');
+  const deptEditId=$('dept-edit-id');
+  const deptErr=$('dept-form-err');
+
+  function openDeptForm(dept){
+    if(!deptForm) return;
+    deptForm.style.display='block';
+    if(deptNameInp) deptNameInp.value=dept?dept.name:'';
+    if(deptDescInp) deptDescInp.value=dept?dept.description||'':'';
+    if(deptEditId) deptEditId.value=dept?dept.id:'';
+    if(deptErr){ deptErr.style.display='none'; deptErr.textContent=''; }
+    deptNameInp?.focus();
+  }
+  function closeDeptForm(){
+    if(deptForm) deptForm.style.display='none';
+  }
+
+  $('add-dept-btn')?.addEventListener('click',()=>openDeptForm(null));
+  $('dept-cancel-btn')?.addEventListener('click',()=>closeDeptForm());
+
+  // Edit buttons
+  document.querySelectorAll('.ed-btn').forEach(b=>{
+    b.addEventListener('click',()=>{
+      const dept=S.departments.find(d=>d.id===b.dataset.deptId);
+      if(dept) openDeptForm(dept);
+    });
+  });
+
+  // Delete buttons
+  document.querySelectorAll('.dd-btn').forEach(b=>{
+    b.addEventListener('click',async()=>{
+      const name=b.dataset.deptName;
+      const id=b.dataset.deptId;
+      const inUse=S.employees.filter(e=>(e.dept||'').toLowerCase()===name.toLowerCase()).length;
+      const warn=inUse>0?`\n\n⚠ ${inUse} employee(s) currently belong to this department.`:'';
+      if(!confirm(`Delete department "${name}"?${warn}\n\nThis cannot be undone.`)) return;
+      try{
+        const newList=S.departments.filter(d=>d.id!==id);
+        await db.collection('settings').doc('departments').set({list:newList,updatedAt:new Date().toISOString()});
+        toast(`Department "${name}" deleted`,'ok');
+      } catch(e){ toast('Error: '+e.message,'er'); }
+    });
+  });
+
+  // Save department
+  $('dept-save-btn')?.addEventListener('click',async()=>{
+    const name=deptNameInp?.value.trim();
+    const desc=deptDescInp?.value.trim();
+    const editId=deptEditId?.value;
+    if(!name){
+      if(deptErr){ deptErr.style.display='block'; deptErr.textContent='Department name is required.'; }
+      deptNameInp?.focus(); return;
+    }
+    // Duplicate check
+    const duplicate=S.departments.find(d=>d.name.toLowerCase()===name.toLowerCase()&&d.id!==editId);
+    if(duplicate){
+      if(deptErr){ deptErr.style.display='block'; deptErr.textContent=`A department named "${name}" already exists.`; }
+      deptNameInp?.focus(); return;
+    }
+    const saveBtn=$('dept-save-btn');
+    saveBtn.disabled=true; saveBtn.textContent='Saving…';
+    try{
+      let newList;
+      if(editId){
+        newList=S.departments.map(d=>d.id===editId?{...d,name,description:desc||''}:d);
+        toast(`Department "${name}" updated`,'ok');
+      } else {
+        const newDept={id:uid(),name,description:desc||'',createdAt:new Date().toISOString()};
+        newList=[...S.departments,newDept];
+        toast(`Department "${name}" added`,'ok');
+      }
+      await db.collection('settings').doc('departments').set({list:newList,updatedAt:new Date().toISOString()});
+      closeDeptForm();
+    } catch(e){ toast('Error: '+e.message,'er'); }
+    saveBtn.disabled=false; saveBtn.textContent='Save';
   });
 
   // ── plant CRUD ────────────────────────────────────────────────────
