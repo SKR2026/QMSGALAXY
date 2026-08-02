@@ -1796,21 +1796,28 @@ function bindAll(){
 
   $('logo-save-btn')?.addEventListener('click',async()=>{
     if(!_logoFile) return;
-    const btn=$('logo-save-btn'); btn.disabled=true; btn.textContent='Uploading…';
-    const status=$('logo-status'); if(status){ status.style.color='var(--g400)'; status.textContent='Uploading…'; }
+    const btn=$('logo-save-btn'); btn.disabled=true; btn.textContent='Saving…';
+    const status=$('logo-status'); if(status){ status.style.color='var(--g400)'; status.textContent='Compressing & saving…'; }
     try{
-      const ext=_logoFile.name.split('.').pop();
-      const ref=stor.ref('settings/company-logo.'+ext);
-      await ref.put(_logoFile,{contentType:_logoFile.type});
-      const url=await ref.getDownloadURL();
-      await db.collection('settings').doc('company').set({logoURL:url,updatedAt:new Date().toISOString()},{merge:true});
+      // Compress and convert to base64 data URL — stored directly in Firestore.
+      // This permanently avoids CORS/canvas-taint issues for PDF/Excel export,
+      // since the logo data lives in memory as base64 with no network fetch needed.
+      const compressedBlob=await compressImage(_logoFile, 300, 150, 0.85);
+      const dataURL=await new Promise((resolve,reject)=>{
+        const r=new FileReader();
+        r.onload=()=>resolve(r.result);
+        r.onerror=reject;
+        r.readAsDataURL(compressedBlob);
+      });
+      if(dataURL.length>900000) throw new Error('Logo is too large even after compression. Please use a smaller image.');
+      await db.collection('settings').doc('company').set({logoURL:dataURL,updatedAt:new Date().toISOString()},{merge:true});
       _logoFile=null;
       if(status){ status.style.color='var(--ok)'; status.textContent='✓ Logo saved successfully! All users will see this logo.'; }
       toast('Company logo updated','ok');
       btn.textContent='⬆ Save Logo';
     } catch(e){
-      if(status){ status.style.color='var(--err)'; status.textContent='Upload failed: '+e.message; }
-      toast('Upload failed: '+e.message,'er');
+      if(status){ status.style.color='var(--err)'; status.textContent='Save failed: '+e.message; }
+      toast('Save failed: '+e.message,'er');
       btn.disabled=false; btn.textContent='⬆ Save Logo';
     }
   });
@@ -2412,27 +2419,17 @@ async function doBulkImport(){
 
 // ── Export Utilities ──────────────────────────────────────────────
 
-// Fetch the logo as a blob URL to bypass CORS taint issues,
-// then draw it with white rounded-rect background.
+// The company logo is stored as a base64 data URL directly in Firestore
+// (see logo-save-btn handler), so no network fetch or CORS handling is
+// ever needed here — it's already in memory as a data: URI.
 async function captureLogoPNG(targetH=52){
   if(!S.companyLogo) return null;
-  return new Promise(async resolve=>{
-    try{
-      // Fetch via XHR as blob — bypasses CORS canvas taint
-      const resp=await fetch(S.companyLogo);
-      const blob=await resp.blob();
-      const blobURL=URL.createObjectURL(blob);
-      const img=new Image();
-      img.onload=()=>{
-        drawLogoWithBg(img, targetH, png=>{ URL.revokeObjectURL(blobURL); resolve(png); });
-      };
-      img.onerror=()=>{ URL.revokeObjectURL(blobURL); resolve(null); };
-      img.src=blobURL;
-    }catch(e){
-      // fetch failed (CORS/network) — return null, header will show text only
-      resolve(null);
-    }
-    setTimeout(()=>resolve(null),8000);
+  return new Promise(resolve=>{
+    const img=new Image();
+    img.onload=()=>drawLogoWithBg(img, targetH, resolve);
+    img.onerror=()=>resolve(null);
+    img.src=S.companyLogo;
+    setTimeout(()=>resolve(null),4000);
   });
 }
 
@@ -2561,98 +2558,121 @@ async function exportPDF(key){
   btn.textContent='⬇ PDF'; btn.disabled=false;
 }
 
-// ── Excel Export — embeds the org chart screenshot as an image ────
-// SheetJS 0.18.5 community does not support !images natively.
-// Solution: compose a final PNG (header + chart) and download it as PNG,
-// PLUS download an XLSX with the employee data list as a second file.
+// ── Excel Export — hierarchical structure matching the on-screen tree ──
+// Produces exactly ONE .xlsx file that mirrors the visible org chart via
+// indentation (depth-based prefixes). If any step fails, nothing is
+// downloaded — no broken or partial files are left behind.
+function flattenTreeForExport(node, depth, rows){
+  if(!node) return;
+  if(node._isVirtualRoot){
+    (node.children||[]).forEach(c=>flattenTreeForExport(c, depth, rows));
+    return;
+  }
+  const indent='    '.repeat(depth) + (depth>0?'└─ ':'');
+  const contextTag=node._isContext?' (context)':'';
+  const isDeptHeader=!!node._isDeptHeader;
+  rows.push([
+    indent+node.name+contextTag,
+    isDeptHeader?'':node.designation,
+    isDeptHeader?'':(node.empCode||''),
+    isDeptHeader?'':(node.dept||''),
+    isDeptHeader?'':(node.plant||''),
+    isDeptHeader?'':(node.email||''),
+    isDeptHeader?'':(node.contact||'')
+  ]);
+  (node.children||[]).forEach(c=>flattenTreeForExport(c, depth+1, rows));
+}
+
 async function exportXLSX(key){
-  // Find button
   const isPublic=key==='pub';
   const btn=isPublic?$('pub-xlsx'):$(`xlsx-${key}`);
   if(btn){ btn.textContent='Exporting…'; btn.disabled=true; }
 
   try{
-    const canvasEl=isPublic?$('pub-canvas'):$(`oc-${key}`);
-    if(!canvasEl){ toast('No chart to export','er'); return; }
-
     const companyName=S.companyName||'Organisation';
-    let sheetTitle='Group';
-    if(key==='plt'&&S.plantChartId){ const p=S.plants.find(x=>x.id===S.plantChartId); sheetTitle=p?.name||'Plant'; }
-    else if(key==='dpt'&&S.deptChartId){ sheetTitle=S.deptChartId; }
-    else if(key==='pa'&&S.profile?.plantId){ const p=S.plants.find(x=>x.id===S.profile.plantId); sheetTitle=p?.name||'Plant'; }
-
     const dateStr=new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
-    const fileSuffix=`${sheetTitle.replace(/\s+/g,'_')}_${new Date().toLocaleDateString('en-IN').replace(/\//g,'-')}`;
 
-    // 1. Screenshot chart
-    const prev=canvasEl.style.transform;
-    canvasEl.style.transform='scale(1)';
-    const chartCv=await html2canvas(canvasEl,{
-      scale:2,
-      backgroundColor:'#F7F9FC',
-      useCORS:true,
-      allowTaint:false,
-      logging:false,
-      ignoreElements:el=>el.tagName==='IMG'&&el.src&&!el.src.startsWith('data:')
-    });
-    canvasEl.style.transform=prev;
+    // Build the same tree structure shown on screen for this chart key
+    let tree=null, sheetTitle='Group Organisation Chart';
+    if(key==='plt'||isPublic&&S.plantChartId){
+      const pid=S.plantChartId;
+      if(!pid) throw new Error('Select a plant first');
+      const plant=S.plants.find(p=>p.id===pid);
+      const emps=S.employees.filter(e=>e.plantId===pid);
+      if(!emps.length) throw new Error('No employees in this plant to export');
+      tree=buildTreeWithAncestors(emps, S.employees);
+      sheetTitle=(plant?.name||'Plant')+' Organisation Chart';
+    } else if(key==='dpt'){
+      if(!S.deptChartId) throw new Error('Select a department first');
+      const scope=S.deptChartPlant?S.employees.filter(e=>e.plantId===S.deptChartPlant):S.employees;
+      const emps=scope.filter(e=>(e.dept||'').toLowerCase()===S.deptChartId.toLowerCase());
+      if(!emps.length) throw new Error('No employees in this department to export');
+      tree=buildTreeWithAncestors(emps, S.employees);
+      sheetTitle=S.deptChartId+' Department Chart';
+    } else if(key==='pa'){
+      if(!S.profile?.plantId) throw new Error('No plant assigned');
+      const plant=S.plants.find(p=>p.id===S.profile.plantId);
+      const emps=S.employees.filter(e=>e.plantId===S.profile.plantId);
+      if(!emps.length) throw new Error('No employees to export');
+      tree=buildTree(emps);
+      sheetTitle=(plant?.name||'My Plant')+' Organisation Chart';
+    } else if(isPublic){
+      // Public view: group or plant depending on current filter
+      if(S.plantChartId){
+        const pid=S.plantChartId;
+        const plant=S.plants.find(p=>p.id===pid);
+        const emps=S.employees.filter(e=>e.plantId===pid);
+        if(!emps.length) throw new Error('No employees in this plant to export');
+        tree=buildTreeWithAncestors(emps, S.employees);
+        sheetTitle=(plant?.name||'Plant')+' Organisation Chart';
+      } else {
+        if(!S.employees.length) throw new Error('No employees to export');
+        tree=buildTree(S.employees);
+        sheetTitle='Group Organisation Chart';
+      }
+    } else {
+      // 'grp' — full group chart
+      if(!S.employees.length) throw new Error('No employees to export');
+      tree=buildTree(S.employees);
+      sheetTitle='Group Organisation Chart';
+    }
 
-    // 2. Build header canvas
-    const hdrCv=await buildHeaderCanvas(Math.max(chartCv.width,1200), sheetTitle);
+    if(!tree) throw new Error('No chart data available to export');
 
-    // 3. Compose final image: header on top, chart below
-    const FULL_W=Math.max(chartCv.width, hdrCv.width);
-    const FULL_H=hdrCv.height+chartCv.height;
-    const finalCv=document.createElement('canvas');
-    finalCv.width=FULL_W; finalCv.height=FULL_H;
-    const fctx=finalCv.getContext('2d');
-    fctx.fillStyle='#F7F9FC';
-    fctx.fillRect(0,0,FULL_W,FULL_H);
-    fctx.drawImage(hdrCv,0,0);
-    fctx.drawImage(chartCv,Math.round((FULL_W-chartCv.width)/2),hdrCv.height);
+    // Flatten tree into indented rows (mirrors on-screen hierarchy)
+    const treeRows=[];
+    flattenTreeForExport(tree, 0, treeRows);
+    if(!treeRows.length) throw new Error('Chart is empty — nothing to export');
 
-    // 4. Download chart as PNG (the actual visual structure)
-    const pngLink=document.createElement('a');
-    pngLink.download=`${companyName.replace(/\s+/g,'_')}_OrgChart_${fileSuffix}.png`;
-    pngLink.href=finalCv.toDataURL('image/png');
-    pngLink.click();
-
-    // 5. Short delay then download XLSX with employee data list
-    await new Promise(r=>setTimeout(r,500));
-
-    // Determine employees for this chart
-    let emps=S.employees;
-    if(key==='plt'&&S.plantChartId) emps=S.employees.filter(e=>e.plantId===S.plantChartId);
-    else if(key==='dpt'&&S.deptChartId) emps=S.employees.filter(e=>(e.dept||'').toLowerCase()===S.deptChartId.toLowerCase());
-    else if(key==='pa'&&S.profile?.plantId) emps=S.employees.filter(e=>e.plantId===S.profile.plantId);
-
-    const rows=[
+    const headerRows=[
       [companyName],
-      ['Organisation Structure — '+sheetTitle],
+      [sheetTitle],
       ['Exported: '+dateStr],
       [],
-      ['#','Name','Designation','Emp Code','Department','Plant','Reports To','Email','Contact'],
-      ...emps.map((e,i)=>{
-        const parent=S.employees.find(p=>p.id===e.parentId);
-        return [i+1,e.name,e.designation,e.empCode||'',e.dept||'',e.plant||'',parent?parent.name+' ('+parent.designation+')':'Top Level',e.email||'',e.contact||''];
-      })
+      ['Name (indented by level)','Designation','Emp Code','Department','Plant','Email','Contact'],
     ];
 
-    const ws=XLSX.utils.aoa_to_sheet(rows);
-    ws['!cols']=[{wch:4},{wch:22},{wch:20},{wch:12},{wch:16},{wch:14},{wch:28},{wch:28},{wch:16}];
-    if(!ws['!merges']) ws['!merges']=[];
-    ws['!merges'].push({s:{r:0,c:0},e:{r:0,c:8}});
-    ws['!merges'].push({s:{r:1,c:0},e:{r:1,c:8}});
-    ws['!merges'].push({s:{r:2,c:0},e:{r:2,c:8}});
+    const allRows=[...headerRows, ...treeRows];
+    const ws=XLSX.utils.aoa_to_sheet(allRows);
+    ws['!cols']=[{wch:38},{wch:20},{wch:12},{wch:16},{wch:16},{wch:28},{wch:16}];
+    ws['!merges']=[
+      {s:{r:0,c:0},e:{r:0,c:6}},
+      {s:{r:1,c:0},e:{r:1,c:6}},
+      {s:{r:2,c:0},e:{r:2,c:6}},
+    ];
 
     const wb=XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb,ws,sheetTitle.substring(0,31));
-    XLSX.writeFile(wb,`${companyName.replace(/\s+/g,'_')}_EmployeeList_${fileSuffix}.xlsx`);
+    XLSX.utils.book_append_sheet(wb, ws, sheetTitle.substring(0,31).replace(/[\\/?*[\]:]/g,''));
 
-    toast('Exported: chart PNG + employee list Excel','ok');
+    // Only write the file if everything above succeeded — no partial output.
+    const fileSuffix=`${sheetTitle.replace(/\s+/g,'_')}_${new Date().toLocaleDateString('en-IN').replace(/\//g,'-')}`;
+    XLSX.writeFile(wb, `${companyName.replace(/\s+/g,'_')}_${fileSuffix}.xlsx`);
+
+    toast('Excel exported successfully','ok');
   } catch(e){
-    console.error('Export error:',e);
-    toast('Export failed: '+e.message,'er');
+    console.error('Excel export error:',e);
+    toast('Excel export failed: '+e.message,'er');
+    // No file is written on failure — nothing to clean up.
   }
 
   if(btn){ btn.textContent='⬇ Excel'; btn.disabled=false; }
