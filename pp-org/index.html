@@ -2498,18 +2498,50 @@ function bindModal(){
     XLSX.writeFile(wb,'employees_template.xlsx');
   });
 
-  // XLSX file input
+  // XLSX file input — fetch target structure's employees before parsing
+  let _lastFile=null; // remember last file so we can re-parse when structure changes
   const csvInput=$('csv-file-input');
   const csvDrop=$('csv-drop-area');
   csvDrop?.addEventListener('click',()=>csvInput?.click());
   csvDrop?.addEventListener('dragover',e=>{e.preventDefault();csvDrop.style.borderColor='var(--steel)';});
   csvDrop?.addEventListener('dragleave',()=>{csvDrop.style.borderColor='var(--g200)';});
-  csvDrop?.addEventListener('drop',e=>{e.preventDefault();csvDrop.style.borderColor='var(--g200)';const f=e.dataTransfer.files[0];if(f) parseBulkXLSX(f);});
-  csvInput?.addEventListener('change',e=>{const f=e.target.files[0];if(f) parseBulkXLSX(f);});
+  csvDrop?.addEventListener('drop',async e=>{
+    e.preventDefault();csvDrop.style.borderColor='var(--g200)';
+    const f=e.dataTransfer.files[0];
+    if(f){ _lastFile=f; await refreshBulkTargetAndParse(f); }
+  });
+  csvInput?.addEventListener('change',async e=>{
+    const f=e.target.files[0];
+    if(f){ _lastFile=f; await refreshBulkTargetAndParse(f); }
+  });
 
-  // Structure choice radio buttons — enable/disable fields
+  async function refreshBulkTargetAndParse(file){
+    const targetId=getSelectedBulkStructId();
+    csvDrop.style.borderColor='var(--steel)';
+    csvDrop.querySelector('div')?.style&&(csvDrop.querySelector('.photo-area')?.style);
+    $('bulk-err')&&($('bulk-err').style.display='none');
+    // show loading indicator in drop area
+    const dropLabel=csvDrop.querySelector('div[style*="font-size:13px"]');
+    if(dropLabel) dropLabel.textContent='Checking target structure…';
+    _bulkTargetEmployees = await fetchTargetEmployees(targetId);
+    if(dropLabel) dropLabel.textContent='Click to choose Excel file (.xlsx)';
+    csvDrop.style.borderColor='var(--g200)';
+    if(file) parseBulkXLSX(file);
+  }
+
+  function getSelectedBulkStructId(){
+    const choice=(document.querySelector('input[name="bulk-struct-choice"]:checked')?.value)||'current';
+    if(choice==='current') return S.activeStructId;
+    if(choice==='existing'){
+      const sel=$('bulk-struct-existing-sel')?.value||'';
+      return sel==='__default__'?'':sel;
+    }
+    return '__new__'; // new structure has no existing employees
+  }
+
+  // Structure choice radio buttons — enable/disable fields + re-parse if file already loaded
   document.querySelectorAll('input[name="bulk-struct-choice"]').forEach(radio=>{
-    radio.addEventListener('change',()=>{
+    radio.addEventListener('change',async()=>{
       const v=radio.value;
       // highlight active option
       document.querySelectorAll('[id^="bulk-struct-opt-"]').forEach(el=>{
@@ -2526,8 +2558,20 @@ function bindModal(){
       if(newDesc)  newDesc.disabled=(v!=='new');
       if(v==='existing'&&existSel) existSel.focus();
       if(v==='new'&&newName) newName.focus();
+      // Re-run parse with new target's employees if a file was already chosen
+      if(_lastFile && v!=='new') await refreshBulkTargetAndParse(_lastFile);
+      else if(_lastFile && v==='new'){ _bulkTargetEmployees=[]; parseBulkXLSX(_lastFile); }
     });
   });
+
+  // Also re-parse when existing structure dropdown changes
+  $('bulk-struct-existing-sel')?.addEventListener('change',async()=>{
+    if(_lastFile) await refreshBulkTargetAndParse(_lastFile);
+  });
+
+  // Initialise _bulkTargetEmployees for current structure on modal open
+  (async()=>{ _bulkTargetEmployees=await fetchTargetEmployees(S.activeStructId); })();
+
   // Highlight default selected on open
   const defOpt=document.getElementById('bulk-struct-opt-current');
   if(defOpt){defOpt.style.borderColor='var(--steel)';defOpt.style.background='rgba(30,64,128,.04)';}
@@ -2801,6 +2845,17 @@ function hideProgress(){
 
 // ── Bulk XLSX Upload ─────────────────────────────────────────────
 let _bulkRows=[];
+let _bulkTargetEmployees=[]; // employees of the target structure (may differ from S.employees)
+
+// Fetch employees from any structure for duplicate checking
+async function fetchTargetEmployees(targetStructId){
+  try{
+    const snap = targetStructId
+      ? await db.collection('structures').doc(targetStructId).collection('employees').get()
+      : await db.collection('employees').get();
+    return snap.docs.map(d=>({id:d.id,...d.data()}));
+  } catch(e){ console.warn('Could not fetch target employees:',e); return []; }
+}
 
 function parseBulkXLSX(file){
   const reader=new FileReader();
@@ -2862,16 +2917,16 @@ function parseBulkXLSX(file){
         // Resolve reportsTo: try name match, then emp code match against existing employees
         let resolvedReportsTo=reportsTo; // display value (keep original input)
         if(reportsTo){
-          const byName=S.employees.find(e=>e.name.toLowerCase()===reportsTo.toLowerCase());
-          const byCode=S.employees.find(e=>e.empCode&&e.empCode.toLowerCase()===reportsTo.toLowerCase());
+          const byName=_bulkTargetEmployees.find(e=>e.name.toLowerCase()===reportsTo.toLowerCase());
+          const byCode=_bulkTargetEmployees.find(e=>e.empCode&&e.empCode.toLowerCase()===reportsTo.toLowerCase());
           const match=byName||byCode;
           if(match) resolvedReportsTo=match.name; // normalize to name for display
         }
 
-        // Duplicate check — employee code only
+        // Duplicate check — employee code only (against target structure, not current)
         if(empCode){
-          const dbDup=S.employees.find(e=>e.empCode&&e.empCode.trim().toLowerCase()===empCode.toLowerCase());
-          if(dbDup) rowErrs.push(`Employee code "${empCode}" already exists (${dbDup.name})`);
+          const dbDup=_bulkTargetEmployees.find(e=>e.empCode&&e.empCode.trim().toLowerCase()===empCode.toLowerCase());
+          if(dbDup) rowErrs.push(`Employee code "${empCode}" already exists in target structure (${dbDup.name})`);
           const fileDup=_bulkRows.find(r=>r.empCode&&r.empCode.toLowerCase()===empCode.toLowerCase());
           if(fileDup) rowErrs.push(`Employee code "${empCode}" duplicated in this file (row: ${fileDup.name})`);
         }
@@ -2964,10 +3019,10 @@ async function doBulkImport(){
   const total=validRows.length;
   showProgress('Uploading Employees', `Inserting 0 of ${total}…`);
 
-  // Build name→id AND empCode→id maps from EXISTING employees
+  // Build name→id AND empCode→id maps from TARGET structure's employees
   const nameMap={};
   const codeMap={};
-  S.employees.forEach(e=>{
+  _bulkTargetEmployees.forEach(e=>{
     nameMap[e.name.toLowerCase()]=e.id;
     if(e.empCode) codeMap[e.empCode.toLowerCase()]=e.id;
   });
@@ -2984,7 +3039,7 @@ async function doBulkImport(){
   for(const row of validRows){
     try{
       if(row.empCode){
-        const alreadyInDB=S.employees.find(e=>e.empCode&&e.empCode.trim().toLowerCase()===row.empCode.toLowerCase());
+        const alreadyInDB=_bulkTargetEmployees.find(e=>e.empCode&&e.empCode.trim().toLowerCase()===row.empCode.toLowerCase());
         const alreadyInserted=codeMap[row.empCode.toLowerCase()];
         if(alreadyInDB||alreadyInserted){ failed++; console.warn('Skipped duplicate emp code:',row.empCode); continue; }
       }
