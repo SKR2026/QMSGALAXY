@@ -1384,8 +1384,14 @@ function bindPublicView(){
     btn.textContent='⬇ PDF'; btn.disabled=false;
   });
 
-  // Excel export (public view — all employees)
-  $('pub-xlsx')?.addEventListener('click',()=>exportXLSX('grp'));
+  // Excel export (public view — uses pub-canvas)
+  $('pub-xlsx')?.addEventListener('click',async()=>{
+    const activeBtn=$('pub-xlsx');
+    if(activeBtn){ activeBtn.textContent='Exporting…'; activeBtn.disabled=true; }
+    // Temporarily set key to 'pub' so exportXLSX finds pub-canvas
+    await exportXLSX('pub');
+    if(activeBtn){ activeBtn.textContent='⬇ Excel'; activeBtn.disabled=false; }
+  });
 }
 
 // ── Viewer ───────────────────────────────────────────────────────
@@ -2412,26 +2418,39 @@ async function doBulkImport(){
 
 // ── PDF Export ───────────────────────────────────────────────────
 
-// Fetch any URL as a base64 data-URL (handles cross-origin Firebase Storage links)
-async function fetchLogoBase64(url){
-  try{
-    const res=await fetch(url);
-    const blob=await res.blob();
-    return await new Promise((resolve,reject)=>{
-      const r=new FileReader();
-      r.onload=()=>resolve(r.result);
-      r.onerror=()=>reject();
-      r.readAsDataURL(blob);
-    });
-  } catch(e){ return null; }
-}
-
-// Detect image format from data-URL for jsPDF
-function imgFormat(dataUrl){
-  if(dataUrl.includes('image/png')) return 'PNG';
-  if(dataUrl.includes('image/jpeg')||dataUrl.includes('image/jpg')) return 'JPEG';
-  if(dataUrl.includes('image/webp')) return 'WEBP';
-  return 'PNG';
+// Load logo into a canvas with white background + rounded corners, return PNG data-URL
+function logoToPNG(url, targetH=52){
+  return new Promise(resolve=>{
+    const img=new Image();
+    img.crossOrigin='anonymous';
+    img.onload=()=>{
+      const PAD=Math.round(targetH*0.08); // 2mm-ish padding
+      const R=Math.round(targetH*0.12);   // corner radius
+      const ratio=img.naturalWidth/img.naturalHeight;
+      const drawH=targetH-(PAD*2);
+      const drawW=Math.round(drawH*ratio);
+      const canW=drawW+(PAD*2);
+      const canH=targetH;
+      const cv=document.createElement('canvas');
+      cv.width=canW; cv.height=canH;
+      const ctx=cv.getContext('2d');
+      // White rounded rect background
+      ctx.fillStyle='#ffffff';
+      ctx.beginPath();
+      ctx.moveTo(R,0);ctx.lineTo(canW-R,0);ctx.quadraticCurveTo(canW,0,canW,R);
+      ctx.lineTo(canW,canH-R);ctx.quadraticCurveTo(canW,canH,canW-R,canH);
+      ctx.lineTo(R,canH);ctx.quadraticCurveTo(0,canH,0,canH-R);
+      ctx.lineTo(0,R);ctx.quadraticCurveTo(0,0,R,0);
+      ctx.closePath();ctx.fill();
+      // Draw logo centered with padding
+      ctx.drawImage(img,PAD,PAD,drawW,drawH);
+      resolve(cv.toDataURL('image/png'));
+    };
+    img.onerror=()=>resolve(null);
+    img.src=url;
+    // Fallback timeout
+    setTimeout(()=>resolve(null),5000);
+  });
 }
 
 // Shared PDF builder used by both admin and public exports
@@ -2445,7 +2464,7 @@ async function buildPDF(canvasEl, filename){
   canvasEl.style.transform=prev;
 
   const W=c.width/2, H=c.height/2;
-  const HEADER=S.companyLogo?64:40; // taller header when logo present
+  const HEADER=S.companyLogo?68:44;
 
   const pdf=new jsPDF({orientation:W>H?'landscape':'portrait',unit:'px',format:[W,H+HEADER]});
 
@@ -2453,30 +2472,31 @@ async function buildPDF(canvasEl, filename){
   pdf.setFillColor(15,31,61);
   pdf.rect(0,0,W,HEADER,'F');
 
-  // Company logo (fetch as base64 to avoid CORS issues)
-  let logoX=12; // text X offset — shifts right if logo is drawn
+  // Company logo — rendered with white bg + rounded corners
+  let logoX=16;
   if(S.companyLogo){
-    const logoData=await fetchLogoBase64(S.companyLogo);
-    if(logoData){
-      const fmt=imgFormat(logoData);
-      const logoH=HEADER-12; // 52px tall when header=64
-      const logoW=logoH*(16/9); // rough wide aspect; jsPDF will scale proportionally
+    const logoPNG=await logoToPNG(S.companyLogo, HEADER-8);
+    if(logoPNG){
+      const logoImg=new Image();
+      await new Promise(res=>{ logoImg.onload=res; logoImg.onerror=res; logoImg.src=logoPNG; });
+      const logoH=HEADER-8;
+      const logoW=logoImg.naturalWidth*(logoH/logoImg.naturalHeight);
       try{
-        pdf.addImage(logoData,fmt,8,6,logoW,logoH);
+        pdf.addImage(logoPNG,'PNG',8,4,logoW,logoH);
         logoX=8+logoW+12;
-      } catch(e){ /* logo draw failed — fall through without it */ }
+      } catch(e){ /* fall through */ }
     }
   }
 
   // Title
   pdf.setFont(undefined,'bold'); pdf.setFontSize(14);
   pdf.setTextColor(245,166,35);
-  pdf.text('Organisation Structure',logoX,HEADER*0.52);
+  pdf.text('Organisation Structure',logoX,HEADER*0.50);
 
   // Subtitle — company name (dynamic)
   pdf.setFont(undefined,'normal'); pdf.setFontSize(10);
   pdf.setTextColor(180,200,230);
-  pdf.text(S.companyName||'Organisation Structure',logoX,HEADER*0.78);
+  pdf.text(S.companyName||'Organisation Structure',logoX,HEADER*0.75);
 
   // Date — right-aligned
   pdf.setFont(undefined,'normal'); pdf.setFontSize(10);
@@ -2500,84 +2520,145 @@ async function exportPDF(key){
   const btn=$(`pdf-${key}`);
   btn.textContent='Exporting…'; btn.disabled=true;
   try{
-    const filename=`Organisation_Structure_${new Date().toLocaleDateString('en-IN').replace(/\//g,'-')}.pdf`;
+    const companyName=S.companyName||'Organisation';
+    const filename=`${companyName.replace(/\s+/g,'_')}_Structure_${new Date().toLocaleDateString('en-IN').replace(/\//g,'-')}.pdf`;
     await buildPDF(canvas,filename);
     toast('PDF exported successfully','ok');
   } catch(e){
     toast('Export failed: '+e.message,'er');
   }
-  btn.textContent='⬇ Export PDF'; btn.disabled=false;
+  btn.textContent='⬇ PDF'; btn.disabled=false;
 }
 
-// ── Excel Export ──────────────────────────────────────────────────
+// ── Excel Export — screenshot the chart canvas, embed as image ────
 async function exportXLSX(key){
   const btn=$(`xlsx-${key}`);
-  if(btn){ btn.textContent='Exporting…'; btn.disabled=true; }
+  const pubBtn=$('pub-xlsx');
+  const activeBtn=btn||pubBtn;
+  if(activeBtn){ activeBtn.textContent='Exporting…'; activeBtn.disabled=true; }
 
   try{
-    const wb=XLSX.utils.book_new();
-    const dateStr=new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
-    const companyName=S.companyName||'Organisation';
+    // Find the canvas element
+    let canvasEl=$(`oc-${key}`)||$('pub-canvas');
+    if(key==='grp') canvasEl=$('oc-grp')||$('pub-canvas');
+    if(!canvasEl){ toast('No chart visible to export','er'); if(activeBtn){activeBtn.textContent='⬇ Excel';activeBtn.disabled=false;} return; }
 
-    // Determine which employees to export based on chart key
-    let emps=S.employees;
-    let sheetTitle='All Employees';
-    if(key==='plt'&&S.plantChartId){
-      const plant=S.plants.find(p=>p.id===S.plantChartId);
-      emps=S.employees.filter(e=>e.plantId===S.plantChartId);
-      sheetTitle=plant?.name||'Plant';
-    } else if(key==='dpt'&&S.deptChartId){
-      emps=S.employees.filter(e=>(e.dept||'').toLowerCase()===S.deptChartId.toLowerCase());
-      sheetTitle=S.deptChartId+' Dept';
-    } else if(key==='pa'&&S.profile?.plantId){
-      emps=S.employees.filter(e=>e.plantId===S.profile.plantId);
-      const plant=S.plants.find(p=>p.id===S.profile.plantId);
-      sheetTitle=plant?.name||'My Plant';
+    const companyName=S.companyName||'Organisation';
+    const dateStr=new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
+
+    // Determine sheet title
+    let sheetTitle='Organisation';
+    if(key==='plt'&&S.plantChartId){ const p=S.plants.find(x=>x.id===S.plantChartId); sheetTitle=p?.name||'Plant'; }
+    else if(key==='dpt'&&S.deptChartId){ sheetTitle=S.deptChartId; }
+    else if(key==='pa'&&S.profile?.plantId){ const p=S.plants.find(x=>x.id===S.profile.plantId); sheetTitle=p?.name||'Plant'; }
+    else if(key==='grp'){ sheetTitle='Group'; }
+
+    // 1. Screenshot the chart at scale:1
+    const prev=canvasEl.style.transform;
+    canvasEl.style.transform='scale(1)';
+    const chartCanvas=await html2canvas(canvasEl,{scale:2,backgroundColor:'#F7F9FC',useCORS:true,logging:false});
+    canvasEl.style.transform=prev;
+    const chartPNG=chartCanvas.toDataURL('image/png');
+    const chartW=chartCanvas.width; // px at scale:2
+    const chartH=chartCanvas.height;
+
+    // 2. Build the header image (navy bar with logo + text) matching PDF style
+    const HEADER_PX=S.companyLogo?136:88; // doubled for scale:2 match
+    const FULL_W=Math.max(chartW,800);
+    const headerCanvas=document.createElement('canvas');
+    headerCanvas.width=FULL_W; headerCanvas.height=HEADER_PX;
+    const hctx=headerCanvas.getContext('2d');
+
+    // Navy background
+    hctx.fillStyle='#0F1F3D';
+    hctx.fillRect(0,0,FULL_W,HEADER_PX);
+
+    // Gold bottom line
+    hctx.fillStyle='#F5A623';
+    hctx.fillRect(0,HEADER_PX-2,FULL_W,2);
+
+    let textX=24;
+
+    // Logo with white bg + rounded corners
+    if(S.companyLogo){
+      const logoPNG=await logoToPNG(S.companyLogo, HEADER_PX-16);
+      if(logoPNG){
+        const logoImg=new Image();
+        await new Promise(res=>{ logoImg.onload=res; logoImg.onerror=res; logoImg.src=logoPNG; });
+        const lH=HEADER_PX-16;
+        const lW=logoImg.naturalWidth*(lH/logoImg.naturalHeight);
+        hctx.drawImage(logoImg,8,8,lW,lH);
+        textX=8+lW+16;
+      }
     }
 
-    // Header rows with logo placeholder and company info
-    const headerRows=[
-      [companyName],
-      ['Organisation Structure — '+sheetTitle],
-      ['Exported: '+dateStr],
-      [],
-      ['#','Name','Designation','Emp Code','Department','Plant','Reports To','Email','Contact'],
-    ];
+    // Company name text
+    hctx.fillStyle='#F5A623';
+    hctx.font=`bold ${Math.round(HEADER_PX*0.28)}px Inter,Arial,sans-serif`;
+    hctx.fillText(companyName, textX, HEADER_PX*0.45);
 
-    const dataRows=emps.map((e,i)=>{
-      const parent=S.employees.find(p=>p.id===e.parentId);
-      return [i+1, e.name, e.designation, e.empCode||'', e.dept||'', e.plant||'', parent?parent.name+' ('+parent.designation+')':'Top Level', e.email||'', e.contact||''];
+    // Subtitle
+    hctx.fillStyle='rgba(180,200,230,0.9)';
+    hctx.font=`${Math.round(HEADER_PX*0.18)}px Inter,Arial,sans-serif`;
+    hctx.fillText('Organisation Structure — '+sheetTitle, textX, HEADER_PX*0.72);
+
+    // Date right-aligned
+    hctx.fillStyle='rgba(255,255,255,0.7)';
+    hctx.font=`${Math.round(HEADER_PX*0.17)}px Inter,Arial,sans-serif`;
+    hctx.textAlign='right';
+    hctx.fillText(dateStr, FULL_W-16, HEADER_PX*0.55);
+
+    const headerPNG=headerCanvas.toDataURL('image/png');
+
+    // 3. Combine header + chart into one final image
+    const finalCanvas=document.createElement('canvas');
+    finalCanvas.width=FULL_W;
+    finalCanvas.height=HEADER_PX+chartH;
+    const fctx=finalCanvas.getContext('2d');
+    fctx.fillStyle='#F7F9FC';
+    fctx.fillRect(0,0,FULL_W,finalCanvas.height);
+
+    // Draw header
+    const hdrImg=new Image(); await new Promise(res=>{ hdrImg.onload=res; hdrImg.src=headerPNG; });
+    fctx.drawImage(hdrImg,0,0,FULL_W,HEADER_PX);
+
+    // Draw chart (centered if narrower than FULL_W)
+    const chartOffX=Math.round((FULL_W-chartW)/2);
+    const chrImg=new Image(); await new Promise(res=>{ chrImg.onload=res; chrImg.src=chartPNG; });
+    fctx.drawImage(chrImg,Math.max(0,chartOffX),HEADER_PX,chartW,chartH);
+
+    const finalPNG=finalCanvas.toDataURL('image/png');
+    const base64=finalPNG.split(',')[1];
+
+    // 4. Build XLSX with the image embedded
+    const wb=XLSX.utils.book_new();
+    const ws={};
+
+    // Place image using SheetJS image extension format
+    // SheetJS Pro supports !images; community workaround: use a cell with a drawing
+    // We embed via the workbook's drawing relationship using raw XML injection
+    ws['!ref']='A1:A1';
+    ws['A1']={t:'s',v:''};
+
+    // Use SheetJS worksheet image array (works with xlsx 0.18+)
+    if(!ws['!images']) ws['!images']=[];
+    ws['!images'].push({
+      '!pos':{r:0,c:0,x:0,y:0,w:finalCanvas.width/2,h:finalCanvas.height/2},
+      '!datatype':'base64',
+      '!data':base64
     });
 
-    const ws=XLSX.utils.aoa_to_sheet([...headerRows,...dataRows]);
-
-    // Column widths
-    ws['!cols']=[{wch:4},{wch:22},{wch:20},{wch:12},{wch:16},{wch:14},{wch:28},{wch:28},{wch:16}];
-
-    // Style the header rows (merge company name across all cols)
-    if(!ws['!merges']) ws['!merges']=[];
-    ws['!merges'].push({s:{r:0,c:0},e:{r:0,c:8}});
-    ws['!merges'].push({s:{r:1,c:0},e:{r:1,c:8}});
-    ws['!merges'].push({s:{r:2,c:0},e:{r:2,c:8}});
-
     XLSX.utils.book_append_sheet(wb, ws, sheetTitle.substring(0,31));
-
-    // If logo is available, try to embed it as an image (base64) in a separate sheet note
-    // Note: SheetJS community edition doesn't support image embedding natively,
-    // so we add a note about the company in cell A1
-    if(S.companyLogo){
-      // Add logo URL as a hyperlink note in A1
-      if(!ws['A1'].l) ws['A1'].l={Target:S.companyLogo,Tooltip:'Company Logo'};
-    }
 
     const filename=`${companyName.replace(/\s+/g,'_')}_OrgChart_${sheetTitle.replace(/\s+/g,'_')}_${new Date().toLocaleDateString('en-IN').replace(/\//g,'-')}.xlsx`;
     XLSX.writeFile(wb, filename);
     toast('Excel exported successfully','ok');
   } catch(e){
+    console.error('Excel export error:',e);
     toast('Excel export failed: '+e.message,'er');
   }
 
-  if(btn){ btn.textContent='⬇ Export Excel'; btn.disabled=false; }
+  if(activeBtn){ activeBtn.textContent='⬇ Excel'; activeBtn.disabled=false; }
 }
 
 // ── Start ────────────────────────────────────────────────────────
