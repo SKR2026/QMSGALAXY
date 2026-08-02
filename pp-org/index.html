@@ -1798,22 +1798,16 @@ function bindAll(){
   $('logo-save-btn')?.addEventListener('click',async()=>{
     if(!_logoFile) return;
     const btn=$('logo-save-btn'); btn.disabled=true; btn.textContent='Saving…';
-    const status=$('logo-status'); if(status){ status.style.color='var(--g400)'; status.textContent='Compressing & saving…'; }
+    const status=$('logo-status'); if(status){ status.style.color='var(--g400)'; status.textContent='Saving…'; }
     try{
-      // Compress and convert to base64 data URL — stored directly in Firestore.
-      // This permanently avoids CORS/canvas-taint issues for PDF/Excel export,
-      // since the logo data lives in memory as base64 with no network fetch needed.
-      const compressedBlob=await compressImage(_logoFile, 300, 150, 0.85);
-      const dataURL=await new Promise((resolve,reject)=>{
-        const r=new FileReader();
-        r.onload=()=>resolve(r.result);
-        r.onerror=reject;
-        r.readAsDataURL(compressedBlob);
-      });
-      if(dataURL.length>900000) throw new Error('Logo is too large even after compression. Please use a smaller image.');
+      // Convert logo to a base64 data URL preserving transparency.
+      // We NEVER use JPEG for logos — JPEG kills transparency (turns it black).
+      // We resize to fit 400×160 max, then export as PNG to keep alpha channel.
+      const dataURL=await compressLogoPNG(_logoFile, 400, 160);
+      if(dataURL.length>900000) throw new Error('Logo file is too large. Please use a smaller or simpler image (under ~200KB original).');
       await db.collection('settings').doc('company').set({logoURL:dataURL,updatedAt:new Date().toISOString()},{merge:true});
       _logoFile=null;
-      if(status){ status.style.color='var(--ok)'; status.textContent='✓ Logo saved successfully! All users will see this logo.'; }
+      if(status){ status.style.color='var(--ok)'; status.textContent='✓ Logo saved successfully!'; }
       toast('Company logo updated','ok');
       btn.textContent='⬆ Save Logo';
     } catch(e){
@@ -2048,6 +2042,31 @@ function bindModal(){
 function closeModal(){ S.modal=null; render(); }
 
 // ── CRUD ops ─────────────────────────────────────────────────────
+
+// Resize logo and export as PNG — preserves transparency (alpha channel).
+// Never use JPEG for logos: JPEG has no alpha channel and turns transparent
+// pixels black. PNG is lossless for transparency.
+function compressLogoPNG(file, maxW=400, maxH=160){
+  return new Promise((resolve,reject)=>{
+    const img=new Image();
+    const url=URL.createObjectURL(file);
+    img.onload=()=>{
+      URL.revokeObjectURL(url);
+      let {width:w,height:h}=img;
+      const scale=Math.min(1,maxW/w,maxH/h);
+      w=Math.round(w*scale); h=Math.round(h*scale);
+      const canvas=document.createElement('canvas');
+      canvas.width=w; canvas.height=h;
+      // Do NOT fill with any background colour — keep canvas fully transparent
+      // so the logo's own alpha channel is preserved exactly.
+      canvas.getContext('2d').drawImage(img,0,0,w,h);
+      const dataURL=canvas.toDataURL('image/png'); // PNG supports alpha
+      resolve(dataURL);
+    };
+    img.onerror=()=>reject(new Error('Failed to load logo image'));
+    img.src=url;
+  });
+}
 
 // Compress an image File to a Blob (JPEG) at max dimensions & quality
 function compressImage(file, maxW=400, maxH=400, quality=0.75){
