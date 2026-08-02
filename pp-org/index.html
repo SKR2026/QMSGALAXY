@@ -1918,6 +1918,9 @@ function bulkModalHTML(){
           <button class="btn bo bsm" id="dl-template-btn">⬇ Download Excel Template (.xlsx)</button>
           <span style="font-size:12px;color:var(--g400)">Fill the Excel sheet then upload below. Columns: <code style="background:rgba(0,0,0,.07);padding:1px 5px;border-radius:4px;font-size:11px">name, designation, emp_code, dept, email, contact, plant_name, reports_to_name</code> — <em>reports_to_name accepts employee name <strong>or</strong> employee code</em></span>
         </div>
+        <div id="bulk-plants-hint" style="margin-top:10px;font-size:12px;color:var(--g400)">
+          <span style="font-weight:600;color:var(--navy)">Plants in target structure:</span> <span id="bulk-plants-list" style="color:var(--steel)">loading…</span>
+        </div>
       </div>
 
       <!-- Step 2: Upload -->
@@ -2517,15 +2520,23 @@ function bindModal(){
 
   async function refreshBulkTargetAndParse(file){
     const targetId=getSelectedBulkStructId();
-    csvDrop.style.borderColor='var(--steel)';
-    csvDrop.querySelector('div')?.style&&(csvDrop.querySelector('.photo-area')?.style);
     $('bulk-err')&&($('bulk-err').style.display='none');
-    // show loading indicator in drop area
-    const dropLabel=csvDrop.querySelector('div[style*="font-size:13px"]');
-    if(dropLabel) dropLabel.textContent='Checking target structure…';
-    _bulkTargetEmployees = await fetchTargetEmployees(targetId);
+    const dropLabel=csvDrop?.querySelector('div[style*="font-size:13px"]');
+    const plantsList=$('bulk-plants-list');
+    if(dropLabel) dropLabel.textContent='Loading target structure…';
+    if(plantsList) plantsList.textContent='loading…';
+    // fetch both plants and employees for the target structure
+    [_bulkTargetPlants, _bulkTargetEmployees] = await Promise.all([
+      fetchTargetPlants(targetId==='__new__'?'__none__':targetId),
+      fetchTargetEmployees(targetId==='__new__'?'__none__':targetId)
+    ]);
     if(dropLabel) dropLabel.textContent='Click to choose Excel file (.xlsx)';
-    csvDrop.style.borderColor='var(--g200)';
+    if(plantsList){
+      plantsList.textContent = _bulkTargetPlants.length
+        ? _bulkTargetPlants.map(p=>p.name).join(', ')
+        : '(none — add plants to this structure first)';
+      plantsList.style.color = _bulkTargetPlants.length ? 'var(--steel)' : 'var(--err)';
+    }
     if(file) parseBulkXLSX(file);
   }
 
@@ -2560,7 +2571,7 @@ function bindModal(){
       if(v==='new'&&newName) newName.focus();
       // Re-run parse with new target's employees if a file was already chosen
       if(_lastFile && v!=='new') await refreshBulkTargetAndParse(_lastFile);
-      else if(_lastFile && v==='new'){ _bulkTargetEmployees=[]; parseBulkXLSX(_lastFile); }
+      else if(_lastFile && v==='new'){ _bulkTargetEmployees=[]; _bulkTargetPlants=[]; parseBulkXLSX(_lastFile); }
     });
   });
 
@@ -2569,8 +2580,20 @@ function bindModal(){
     if(_lastFile) await refreshBulkTargetAndParse(_lastFile);
   });
 
-  // Initialise _bulkTargetEmployees for current structure on modal open
-  (async()=>{ _bulkTargetEmployees=await fetchTargetEmployees(S.activeStructId); })();
+  // Initialise _bulkTargetPlants and _bulkTargetEmployees for current structure on modal open
+  (async()=>{
+    [_bulkTargetPlants, _bulkTargetEmployees] = await Promise.all([
+      fetchTargetPlants(S.activeStructId),
+      fetchTargetEmployees(S.activeStructId)
+    ]);
+    const plantsList=$('bulk-plants-list');
+    if(plantsList){
+      plantsList.textContent = _bulkTargetPlants.length
+        ? _bulkTargetPlants.map(p=>p.name).join(', ')
+        : '(none — add plants to this structure first)';
+      plantsList.style.color = _bulkTargetPlants.length ? 'var(--steel)' : 'var(--err)';
+    }
+  })();
 
   // Highlight default selected on open
   const defOpt=document.getElementById('bulk-struct-opt-current');
@@ -2846,15 +2869,28 @@ function hideProgress(){
 // ── Bulk XLSX Upload ─────────────────────────────────────────────
 let _bulkRows=[];
 let _bulkTargetEmployees=[]; // employees of the target structure (may differ from S.employees)
+let _bulkTargetPlants=[];    // plants of the target structure (may differ from S.plants)
 
 // Fetch employees from any structure for duplicate checking
 async function fetchTargetEmployees(targetStructId){
+  if(targetStructId==='__none__') return [];
   try{
     const snap = targetStructId
       ? await db.collection('structures').doc(targetStructId).collection('employees').get()
       : await db.collection('employees').get();
     return snap.docs.map(d=>({id:d.id,...d.data()}));
   } catch(e){ console.warn('Could not fetch target employees:',e); return []; }
+}
+
+// Fetch plants from any structure for plant name resolution
+async function fetchTargetPlants(targetStructId){
+  if(targetStructId==='__none__') return [];
+  try{
+    const snap = targetStructId
+      ? await db.collection('structures').doc(targetStructId).collection('plants').get()
+      : await db.collection('plants').get();
+    return snap.docs.map(d=>({id:d.id,...d.data()}));
+  } catch(e){ console.warn('Could not fetch target plants:',e); return []; }
 }
 
 function parseBulkXLSX(file){
@@ -2903,15 +2939,15 @@ function parseBulkXLSX(file){
         if(!name) rowErrs.push('Name required');
         if(!designation) rowErrs.push('Designation required');
 
-        // Resolve plant
+        // Resolve plant — against target structure's plants, not current
         let plantId='', resolvedPlant='';
         if(plantName){
-          const found=S.plants.find(p=>p.name.toLowerCase()===plantName.toLowerCase());
+          const found=_bulkTargetPlants.find(p=>p.name.toLowerCase()===plantName.toLowerCase());
           if(found){ plantId=found.id; resolvedPlant=found.name; }
-          else rowErrs.push('Plant "'+plantName+'" not found');
+          else rowErrs.push('Plant "'+plantName+'" not found in target structure');
         } else if(S.profile?.role==='plant-admin'){
           plantId=S.profile.plantId;
-          resolvedPlant=S.plants.find(p=>p.id===plantId)?.name||'';
+          resolvedPlant=_bulkTargetPlants.find(p=>p.id===plantId)?.name||'';
         }
 
         // Resolve reportsTo: try name match, then emp code match against existing employees
