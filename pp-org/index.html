@@ -311,6 +311,8 @@ const S = {
   _paDept:'',     // selected dept in plant-admin dept tab
   _paPltId:'',    // selected plant in plant-admin plt tab
   _paSearch:'',   // search string in plant-admin chart view
+  activeStructId:'',  // '' = default root collections; else = structures/{id}/...
+  structures:[],      // list of {id, name, description, createdAt}
 };
 // Detect public view: ?view=public OR #public OR path ends with /public
 if(
@@ -326,6 +328,22 @@ const $ = id => document.getElementById(id);
 const ini = n => (n||'?').split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
 const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2);
 const isConfigured = () => true;
+
+// ── Structure-scoped collection helpers ─────────────────────────
+// If a structure is active, scope plants/employees/departments inside it.
+// Global settings (company logo, name, public view) and users stay at root.
+function col(name){
+  if(S.activeStructId){
+    return db.collection('structures').doc(S.activeStructId).collection(name);
+  }
+  return db.collection(name);
+}
+function structSettingsDoc(docName){
+  if(S.activeStructId){
+    return db.collection('structures').doc(S.activeStructId).collection('settings').doc(docName);
+  }
+  return db.collection('settings').doc(docName);
+}
 
 function toast(msg, type='in'){
   const t=document.createElement('div');
@@ -354,7 +372,7 @@ function buildTree(emps){
 // ── Listeners ───────────────────────────────────────────────────
 function startListeners(){
   _unsubs.forEach(u=>u()); _unsubs=[];
-  // Load shared company settings (logo, etc.)
+  // Load shared company settings (logo, etc.) — always from root
   _unsubs.push(db.collection('settings').doc('company').onSnapshot(snap=>{
     const d=snap.exists?snap.data():{};
     S.companyLogo=d.logoURL||null;
@@ -362,15 +380,21 @@ function startListeners(){
     S.publicViewEnabled=d.publicViewEnabled!==false;
     if(!_importing) render();
   }));
-  _unsubs.push(db.collection('plants').onSnapshot(s=>{
+  // Load structures list (super-admin)
+  _unsubs.push(db.collection('structures').onSnapshot(s=>{
+    S.structures=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(a.createdAt||'').localeCompare(b.createdAt||''));
+    if(!_importing) render();
+  }));
+  // Structure-scoped data
+  _unsubs.push(col('plants').onSnapshot(s=>{
     S.plants=s.docs.map(d=>({id:d.id,...d.data()}));
     if(!_importing) render();
   }));
-  _unsubs.push(db.collection('employees').onSnapshot(s=>{
+  _unsubs.push(col('employees').onSnapshot(s=>{
     S.employees=s.docs.map(d=>({id:d.id,...d.data()}));
     if(!_importing) render();
   }));
-  _unsubs.push(db.collection('settings').doc('departments').onSnapshot(snap=>{
+  _unsubs.push(structSettingsDoc('departments').onSnapshot(snap=>{
     const d=snap.exists?snap.data():{};
     S.departments=(d.list||[]).sort((a,b)=>a.name.localeCompare(b.name));
     if(!_importing) render();
@@ -392,11 +416,11 @@ function startPublicListeners(){
     S.publicViewEnabled=d.publicViewEnabled!==false;
     if(!_importing) render();
   }));
-  _unsubs.push(db.collection('plants').onSnapshot(s=>{
+  _unsubs.push(col('plants').onSnapshot(s=>{
     S.plants=s.docs.map(d=>({id:d.id,...d.data()}));
     if(!_importing) render();
   }));
-  _unsubs.push(db.collection('employees').onSnapshot(s=>{
+  _unsubs.push(col('employees').onSnapshot(s=>{
     S.employees=s.docs.map(d=>({id:d.id,...d.data()}));
     if(!_importing) render();
   }));
@@ -575,11 +599,6 @@ function loginHTML(){
       <p style="margin-top:14px;font-size:11px;color:var(--g400);text-align:center">Contact your Super Admin for account access.</p>
     </div>
 
-  </div>
-  <!-- Tool utility bar at bottom of login screen -->
-  <div style="position:fixed;bottom:18px;right:20px;display:flex;gap:8px;z-index:50">
-    <button onclick="openStructuresManager()" style="background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.75);padding:7px 13px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s" onmouseover="this.style.background='rgba(255,255,255,.25)'" onmouseout="this.style.background='rgba(255,255,255,.15)'">🏗 Structures</button>
-    <button onclick="downloadTool()" style="background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.75);padding:7px 13px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s" onmouseover="this.style.background='rgba(255,255,255,.25)'" onmouseout="this.style.background='rgba(255,255,255,.15)'">⬇ Download Tool</button>
   </div>`;
 }
 function bindLogin(){
@@ -641,8 +660,6 @@ function sidebarHTML(sections){
       <div style="flex:1;min-width:0"><div class="u-nm">${p?.name||p?.email||'User'}</div><div class="u-rl">${rl}</div></div>
     </div>
     <button class="lo-btn" id="chpw-btn" style="color:rgba(255,255,255,.4)">🔑 Change Password</button>
-    <button class="lo-btn" id="switch-struct-btn" style="color:rgba(255,255,255,.5)">🏗 Switch Structure</button>
-    <button class="lo-btn" id="download-tool-btn" style="color:rgba(255,255,255,.5)">⬇ Download Tool</button>
     <button class="lo-btn" id="lo-btn">⇤ Sign Out</button>
   </div>
 </div>`;
@@ -650,9 +667,13 @@ function sidebarHTML(sections){
 
 // ── Topbar ───────────────────────────────────────────────────────
 function topbarHTML(title,sub,badge){
+  const activeStruct = S.activeStructId ? S.structures.find(s=>s.id===S.activeStructId) : null;
+  const structBadge = activeStruct
+    ? `<span class="badge" style="background:rgba(30,64,128,.1);color:var(--steel);font-size:11px;margin-right:8px">🏗 ${activeStruct.name}</span>`
+    : `<span class="badge" style="background:rgba(245,166,35,.08);color:#B7791F;font-size:11px;margin-right:8px">🏗 Default</span>`;
   return `<div class="topbar">
   <div><div style="font-size:15px;font-weight:700;color:var(--navy)">${title}</div><div style="font-size:12px;color:var(--g400)">${sub}</div></div>
-  <span class="badge bg">${badge}</span>
+  <div style="display:flex;align-items:center;gap:6px">${structBadge}<span class="badge bg">${badge}</span></div>
 </div>`;
 }
 
@@ -662,12 +683,12 @@ function superAdminHTML(){
     {label:null,items:[{id:'dashboard',icon:'◈',label:'Dashboard'}]},
     {label:'Organization',items:[{id:'group-chart',icon:'⬡',label:'Group Chart'},{id:'plant-charts',icon:'🏭',label:'Plant Charts'},{id:'dept-chart',icon:'🏢',label:'Dept Chart'}]},
     {label:'Management',items:[{id:'employees',icon:'👥',label:'Employees'},{id:'admins',icon:'🛡',label:'Admins'}]},
-    {label:'Settings',items:[{id:'plants',icon:'⚙',label:'Plants & Settings'}]},
+    {label:'Settings',items:[{id:'plants',icon:'⚙',label:'Plants & Settings'},{id:'structures',icon:'🏗',label:'Structures'}]},
   ];
-  const titles={dashboard:'Dashboard','group-chart':'Group Chart','plant-charts':'Plant Charts','dept-chart':'Department Chart',employees:'All Employees',admins:'Admin Management',plants:'Plants & Settings'};
+  const titles={dashboard:'Dashboard','group-chart':'Group Chart','plant-charts':'Plant Charts','dept-chart':'Department Chart',employees:'All Employees',admins:'Admin Management',plants:'Plants & Settings',structures:'Organisation Structures'};
   const contentMap={
     'dashboard':dashboardHTML,'group-chart':groupChartHTML,'plant-charts':plantChartsHTML,'dept-chart':deptChartHTML,
-    'employees':employeesHTML,'admins':adminsHTML,'plants':plantsHTML
+    'employees':employeesHTML,'admins':adminsHTML,'plants':plantsHTML,'structures':structuresHTML
   };
   const content=(contentMap[S.tab]||dashboardHTML)();
   return `<div class="layout">
@@ -2011,10 +2032,6 @@ function bindAll(){
   $('lo-btn')?.addEventListener('click',()=>auth.signOut());
   // change password
   $('chpw-btn')?.addEventListener('click',()=>{ S.modal={type:'changePassword'}; render(); bindChangePassword(); });
-  // download tool
-  $('download-tool-btn')?.addEventListener('click', downloadTool);
-  // switch structure
-  $('switch-struct-btn')?.addEventListener('click', openStructuresManager);
 
   // org card click → detail
   document.querySelectorAll('[data-pid]').forEach(card=>{
@@ -2139,7 +2156,7 @@ function bindAll(){
       const id=ids[i];
       const empName=names[i]||id;
       try{
-        await db.collection('employees').doc(id).delete();
+        await col('employees').doc(id).delete();
         done++;
         updateProgress(done, ids.length, `Deleted: ${empName}`);
       }
@@ -2276,7 +2293,7 @@ function bindAll(){
       if(!confirm(`Delete department "${name}"?${warn}\n\nThis cannot be undone.`)) return;
       try{
         const newList=S.departments.filter(d=>d.id!==id);
-        await db.collection('settings').doc('departments').set({list:newList,updatedAt:new Date().toISOString()});
+        await structSettingsDoc('departments').set({list:newList,updatedAt:new Date().toISOString()});
         toast(`Department "${name}" deleted`,'ok');
       } catch(e){ toast('Error: '+e.message,'er'); }
     });
@@ -2309,7 +2326,7 @@ function bindAll(){
         newList=[...S.departments,newDept];
         toast(`Department "${name}" added`,'ok');
       }
-      await db.collection('settings').doc('departments').set({list:newList,updatedAt:new Date().toISOString()});
+      await structSettingsDoc('departments').set({list:newList,updatedAt:new Date().toISOString()});
       closeDeptForm();
     } catch(e){ toast('Error: '+e.message,'er'); }
     saveBtn.disabled=false; saveBtn.textContent='Save';
@@ -2335,6 +2352,9 @@ function bindAll(){
   $('pcs-sel')?.addEventListener('change',e=>{ S.plantChartId=e.target.value; render(); });
   $('dcs-plant')?.addEventListener('change',e=>{ S.deptChartPlant=e.target.value; S.deptChartId=''; render(); });
   $('dcs-dept')?.addEventListener('change',e=>{ S.deptChartId=e.target.value; render(); });
+
+  // structures tab
+  if(S.tab==='structures') bindStructures();
 
   // zoom & PDF & Excel for all chart keys
   ['grp','plt','pa','dpt'].forEach(key=>{
@@ -2554,8 +2574,8 @@ async function savePlant(){
   if(!name) throw new Error('Plant name is required');
   const data={name,location:location||'',description:description||''};
   const existing=S.modal?.data;
-  if(existing?.id){ await db.collection('plants').doc(existing.id).update(data); toast('Plant updated','ok'); }
-  else{ await db.collection('plants').add({...data,createdAt:new Date().toISOString()}); toast('Plant added','ok'); }
+  if(existing?.id){ await col('plants').doc(existing.id).update(data); toast('Plant updated','ok'); }
+  else{ await col('plants').add({...data,createdAt:new Date().toISOString()}); toast('Plant added','ok'); }
 }
 
 async function saveEmployee(){
@@ -2608,8 +2628,8 @@ async function saveEmployee(){
   }
   const data={name,designation,empCode:empCode||'',dept:dept||'',email:email||'',contact:contact||'',plantId,plant,parentId,photoURL};
   const existing=S.modal?.data;
-  if(existing?.id){ await db.collection('employees').doc(existing.id).update(data); toast('Employee updated','ok'); }
-  else{ await db.collection('employees').doc(uid()).set({...data,createdAt:new Date().toISOString()}); toast('Employee added','ok'); }
+  if(existing?.id){ await col('employees').doc(existing.id).update(data); toast('Employee updated','ok'); }
+  else{ await col('employees').doc(uid()).set({...data,createdAt:new Date().toISOString()}); toast('Employee added','ok'); }
 }
 
 async function saveAdmin(){
@@ -2637,7 +2657,7 @@ async function saveAdmin(){
 
 async function deletePlant(id,name){
   if(!confirm(`Delete plant "${name}"? Employees in this plant will NOT be deleted.`)) return;
-  try{ await db.collection('plants').doc(id).delete(); toast('Plant deleted','ok'); }
+  try{ await col('plants').doc(id).delete(); toast('Plant deleted','ok'); }
   catch(e){ toast('Error: '+e.message,'er'); }
 }
 async function deleteEmployee(id,name){
@@ -2645,13 +2665,13 @@ async function deleteEmployee(id,name){
   showProgress('Deleting Employee', name);
   updateProgress(0,1,'Removing from database…');
   try{
-    await db.collection('employees').doc(id).delete();
+    await col('employees').doc(id).delete();
     // Unlink any children that reported to this employee
     const children=S.employees.filter(e=>e.parentId===id);
     if(children.length){
       updateProgress(0, children.length+1, 'Unlinking subordinates…');
       for(let i=0;i<children.length;i++){
-        await db.collection('employees').doc(children[i].id).update({parentId:null});
+        await col('employees').doc(children[i].id).update({parentId:null});
         updateProgress(i+1, children.length+1, `Unlinked: ${children[i].name}`);
       }
     }
@@ -2868,7 +2888,7 @@ async function doBulkImport(){
         parentId:null, photoURL:null,
         createdAt:new Date().toISOString()
       };
-      await db.collection('employees').doc(id).set(data);
+      await col('employees').doc(id).set(data);
       nameMap[row.name.toLowerCase()]=id;
       if(row.empCode) codeMap[row.empCode.toLowerCase()]=id;
       row._newId=id;
@@ -2883,7 +2903,7 @@ async function doBulkImport(){
     if(row._newId){
       const parentId=resolveParent(row.reportsToName);
       if(parentId){
-        try{ await db.collection('employees').doc(row._newId).update({parentId}); }
+        try{ await col('employees').doc(row._newId).update({parentId}); }
         catch(e){ console.warn('Could not set parentId for',row.name,e); }
       }
     }
@@ -3180,276 +3200,296 @@ async function exportXLSX(key){
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  💾  DOWNLOAD TOOL — saves this very HTML file to the user's disk
+//  🏗  ORGANISATION STRUCTURES — UI & CRUD
+//  Each structure lives at structures/{id}/{plants,employees,settings}
+//  Default data (no structure selected) lives at root collections.
 // ══════════════════════════════════════════════════════════════════
-function downloadTool(){
-  try {
-    const html = document.documentElement.outerHTML;
-    const blob = new Blob(['<!DOCTYPE html>\n' + html], {type:'text/html;charset=utf-8'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'OrgChart_Tool_' + (S.companyName||'Organisation').replace(/\s+/g,'_') + '.html';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-    toast('Tool downloaded — open the file to use it anytime!','ok');
-  } catch(e){ toast('Download failed: '+e.message,'er'); }
+
+function structuresHTML(){
+  const structs = S.structures;
+  const activeId = S.activeStructId;
+  const activeStruct = activeId ? structs.find(s=>s.id===activeId) : null;
+
+  return `<div class="fl ac jb mb16">
+  <div>
+    <h2 style="font-size:17px;font-weight:800;color:var(--navy)">Organisation Structures</h2>
+    <p style="font-size:13px;color:var(--g400)">Create and switch between multiple org chart structures within this Firebase project</p>
+  </div>
+  <div class="fl g2h">
+    <button class="btn bo bsm" id="struct-import-btn">⬆ Import Structure</button>
+    <input type="file" id="struct-import-file" accept=".json" style="display:none"/>
+    <button class="btn bp bsm" id="struct-add-btn">+ New Structure</button>
+  </div>
+</div>
+
+<!-- Active structure banner -->
+<div style="background:${activeId?'rgba(30,64,128,.07)':'rgba(245,166,35,.08)'};border:1.5px solid ${activeId?'var(--steel)':'var(--gold)'};border-radius:12px;padding:14px 18px;margin-bottom:20px;display:flex;align-items:center;gap:14px">
+  <div style="font-size:28px">${activeId?'🏗':'🏠'}</div>
+  <div style="flex:1">
+    <div style="font-size:14px;font-weight:800;color:var(--navy)">
+      Currently Viewing: <span style="color:${activeId?'var(--steel)':'var(--gold)'}">${activeStruct?activeStruct.name:'Default (Root)'}</span>
+    </div>
+    <div style="font-size:12px;color:var(--g400);margin-top:2px">
+      ${activeId
+        ? `${S.employees.length} employees · ${S.plants.length} plants — scoped to this structure only`
+        : 'Showing root-level data (plants, employees at top-level Firebase collections)'}
+    </div>
+  </div>
+  ${activeId?`<button class="btn bo bsm" id="struct-go-default-btn">↩ Back to Default</button>`:''}
+</div>
+
+<!-- Default structure card -->
+<div style="margin-bottom:16px">
+  <div style="font-size:11px;font-weight:700;color:var(--g400);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Default</div>
+  <div style="border:1.5px solid ${!activeId?'var(--gold)':'var(--g100)'};border-radius:12px;padding:16px 18px;background:${!activeId?'rgba(245,166,35,.04)':'#fff'};display:flex;align-items:center;gap:12px">
+    <div style="font-size:24px">🏠</div>
+    <div style="flex:1">
+      <div style="font-size:14px;font-weight:700;color:var(--navy)">Root / Default</div>
+      <div style="font-size:12px;color:var(--g400)">Original data in root Firestore collections</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      ${!activeId
+        ? `<span style="font-size:11px;color:var(--gold);font-weight:700;padding:0 4px">● Active</span>`
+        : `<button class="btn bp bsm struct-switch-btn" data-id="">Switch to Default</button>`}
+      <button class="btn bs bsm" id="struct-export-default-btn">⬇ Export</button>
+    </div>
+  </div>
+</div>
+
+<!-- Named structures -->
+${structs.length>0?`
+<div style="font-size:11px;font-weight:700;color:var(--g400);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Saved Structures (${structs.length})</div>
+<div style="display:flex;flex-direction:column;gap:10px">
+  ${structs.map(s=>`
+  <div style="border:1.5px solid ${s.id===activeId?'var(--steel)':'var(--g100)'};border-radius:12px;padding:16px 18px;background:${s.id===activeId?'rgba(30,64,128,.05)':'#fff'};display:flex;align-items:center;gap:12px">
+    <div style="font-size:24px">🏗</div>
+    <div style="flex:1;min-width:0">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
+        <span style="font-size:14px;font-weight:700;color:var(--navy)">${s.name}</span>
+        ${s.id===activeId?`<span class="badge bk" style="font-size:10px">● Active</span>`:''}
+      </div>
+      ${s.description?`<div style="font-size:12px;color:var(--g400)">${s.description}</div>`:''}
+      <div style="font-size:11px;color:var(--g200);margin-top:3px">${s.createdAt?new Date(s.createdAt).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}):''}</div>
+    </div>
+    <div style="display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">
+      ${s.id!==activeId
+        ? `<button class="btn bp bsm struct-switch-btn" data-id="${s.id}">Switch</button>`
+        : `<span style="font-size:11px;color:var(--steel);font-weight:700;padding:0 4px">● Viewing</span>`}
+      <button class="btn bo bsm struct-rename-btn" data-id="${s.id}" data-name="${s.name.replace(/"/g,'&quot;')}" data-desc="${(s.description||'').replace(/"/g,'&quot;')}">✎ Rename</button>
+      <button class="btn bs bsm struct-export-btn" data-id="${s.id}" data-name="${s.name.replace(/"/g,'&quot;')}">⬇ Export</button>
+      <button class="btn bd bsm struct-delete-btn" data-id="${s.id}" data-name="${s.name.replace(/"/g,'&quot;')}">✕</button>
+    </div>
+  </div>`).join('')}
+</div>`
+:`<div class="empty" style="margin-top:24px"><div class="ei">🏗</div><h3>No structures yet</h3><p style="font-size:13px;color:var(--g400);margin-top:4px">Create a new structure to keep separate org charts — e.g. by company, region, or year.</p></div>`}
+
+<!-- Add/rename form -->
+<div id="struct-form-wrap" style="display:none;margin-top:20px;border:1.5px dashed var(--g200);border-radius:12px;padding:20px;background:var(--g50)">
+  <div style="font-size:14px;font-weight:700;color:var(--navy);margin-bottom:14px" id="struct-form-title">New Structure</div>
+  <input type="hidden" id="struct-edit-id"/>
+  <div class="g2">
+    <div class="fg"><label class="lbl">Structure Name *</label><input class="inp" id="struct-name-inp" placeholder="e.g. North Region, 2025 Structure…"/></div>
+    <div class="fg"><label class="lbl">Description</label><input class="inp" id="struct-desc-inp" placeholder="Optional note"/></div>
+  </div>
+  <div id="struct-form-err" style="display:none;color:var(--err);font-size:12px;margin-bottom:8px"></div>
+  <div style="display:flex;gap:8px">
+    <button class="btn bp bsm" id="struct-form-save-btn">💾 Save</button>
+    <button class="btn bo bsm" id="struct-form-cancel-btn">Cancel</button>
+  </div>
+</div>`;
 }
 
-// ══════════════════════════════════════════════════════════════════
-//  🏗  MULTIPLE STRUCTURES MANAGER
-//  Stores named Firebase configs in localStorage.
-//  Each entry: { id, name, description, config:{apiKey,...} }
-//  Switching reinjects FIREBASE_CONFIG and reloads the page.
-// ══════════════════════════════════════════════════════════════════
-const STRUCTS_KEY = 'orgchart_structures';
-const ACTIVE_KEY  = 'orgchart_active_struct';
-
-function getStructures(){ try{ return JSON.parse(localStorage.getItem(STRUCTS_KEY)||'[]'); }catch(e){ return []; } }
-function saveStructures(arr){ localStorage.setItem(STRUCTS_KEY, JSON.stringify(arr)); }
-function getActiveStructId(){ return localStorage.getItem(ACTIVE_KEY)||''; }
-
-// On first load — store the bundled config as the default entry if no structures yet
-(function seedDefaultStructure(){
-  const existing = getStructures();
-  if(existing.length === 0){
-    const def = {
-      id: 'default',
-      name: S.companyName || 'Default Structure',
-      description: 'Built-in Firebase configuration',
-      config: FIREBASE_CONFIG,
-      isDefault: true
-    };
-    saveStructures([def]);
-    localStorage.setItem(ACTIVE_KEY, 'default');
-  }
-})();
-
-function openStructuresManager(){
-  // Remove old overlay if any
-  document.getElementById('struct-overlay')?.remove();
-
-  const structs = getStructures();
-  const activeId = getActiveStructId();
-
-  const overlay = document.createElement('div');
-  overlay.id = 'struct-overlay';
-  overlay.className = 'overlay';
-  overlay.innerHTML = `
-  <div class="modal" style="max-width:640px">
-    <div class="mh">
-      <h3>🏗 Organisation Structures</h3>
-      <button class="btn bo bic" id="struct-close-btn">✕</button>
-    </div>
-    <div class="mb" style="padding-bottom:8px">
-      <p style="font-size:12px;color:var(--g400);margin-bottom:16px">
-        Save and switch between multiple organisation setups. Each structure has its own Firebase project and data.
-      </p>
-
-      <div id="struct-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px">
-        ${structs.map(s=>`
-          <div style="border:1.5px solid ${s.id===activeId?'var(--gold)':'var(--g100)'};border-radius:12px;padding:14px 16px;background:${s.id===activeId?'rgba(245,166,35,.05)':'#fff'};display:flex;align-items:center;gap:12px">
-            <div style="flex:1;min-width:0">
-              <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
-                <span style="font-size:14px;font-weight:700;color:var(--navy)">${s.name}</span>
-                ${s.id===activeId?`<span class="badge bk" style="font-size:10px">● Active</span>`:''}
-              </div>
-              ${s.description?`<div style="font-size:11px;color:var(--g400)">${s.description}</div>`:''}
-              <div style="font-size:10px;color:var(--g200);margin-top:3px;font-family:monospace">${(s.config?.projectId||'')}</div>
-            </div>
-            <div style="display:flex;gap:6px;flex-shrink:0">
-              ${s.id!==activeId?`<button class="btn bp bsm struct-switch-btn" data-id="${s.id}">Switch</button>`:'<span style="font-size:11px;color:var(--gold);font-weight:700;padding:0 6px">Current</span>'}
-              <button class="btn bo bsm struct-edit-btn" data-id="${s.id}">✎ Edit</button>
-              ${!s.isDefault?`<button class="btn bd bsm struct-del-btn" data-id="${s.id}">✕</button>`:''}
-            </div>
-          </div>`).join('')}
-      </div>
-
-      <!-- Add new structure form -->
-      <div style="border:1.5px dashed var(--g200);border-radius:12px;padding:16px 18px;background:var(--g50)" id="struct-add-area">
-        <div style="font-size:13px;font-weight:700;color:var(--navy);margin-bottom:12px">➕ Add New Structure</div>
-        <div class="g2">
-          <div class="fg"><label class="lbl">Structure Name *</label><input class="inp" id="sn-name" placeholder="e.g. North Plant Group"/></div>
-          <div class="fg"><label class="lbl">Description</label><input class="inp" id="sn-desc" placeholder="Optional note"/></div>
-        </div>
-        <div style="font-size:11px;font-weight:700;color:var(--g600);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Firebase Config (paste JSON or fill fields)</div>
-        <div class="g2">
-          <div class="fg"><label class="lbl">API Key *</label><input class="inp" id="sn-apiKey" placeholder="AIza…"/></div>
-          <div class="fg"><label class="lbl">Auth Domain *</label><input class="inp" id="sn-authDomain" placeholder="project.firebaseapp.com"/></div>
-          <div class="fg"><label class="lbl">Project ID *</label><input class="inp" id="sn-projectId" placeholder="my-project"/></div>
-          <div class="fg"><label class="lbl">Storage Bucket</label><input class="inp" id="sn-storageBucket" placeholder="my-project.appspot.com"/></div>
-          <div class="fg"><label class="lbl">Messaging Sender ID</label><input class="inp" id="sn-msgSenderId" placeholder="1234567890"/></div>
-          <div class="fg"><label class="lbl">App ID</label><input class="inp" id="sn-appId" placeholder="1:123…web:abc"/></div>
-        </div>
-        <div class="fg" style="margin-bottom:6px">
-          <label class="lbl">— or — Paste full Firebase config JSON</label>
-          <textarea class="inp" id="sn-json" placeholder='{"apiKey":"…","authDomain":"…","projectId":"…"}' style="min-height:54px;font-family:monospace;font-size:12px"></textarea>
-        </div>
-        <div id="sn-err" style="display:none;color:var(--err);font-size:12px;margin-bottom:8px"></div>
-        <button class="btn bp bsm" id="sn-save-btn">💾 Save Structure</button>
-      </div>
-    </div>
-    <div class="mf">
-      <button class="btn bp bsm" id="dl-all-structs-btn">⬇ Export All Structures</button>
-      <button class="btn bo bsm" id="import-structs-btn">⬆ Import Structures</button>
-      <input type="file" id="import-structs-file" accept=".json" style="display:none"/>
-      <div style="flex:1"></div>
-      <button class="btn bs" id="struct-close-btn2">Done</button>
-    </div>
-  </div>`;
-
-  document.body.appendChild(overlay);
-
-  // Close
-  const closeOverlay = ()=>overlay.remove();
-  document.getElementById('struct-close-btn').onclick = closeOverlay;
-  document.getElementById('struct-close-btn2').onclick = closeOverlay;
-  overlay.addEventListener('click', e=>{ if(e.target===overlay) closeOverlay(); });
-
-  // Switch
-  overlay.querySelectorAll('.struct-switch-btn').forEach(btn=>{
-    btn.onclick = ()=>{
-      const id = btn.dataset.id;
-      const s = getStructures().find(x=>x.id===id);
-      if(!s){ toast('Structure not found','er'); return; }
-      localStorage.setItem(ACTIVE_KEY, id);
-      // Embed the new config into the HTML and trigger a download + reload
-      activateStructure(s);
-      closeOverlay();
-    };
+function bindStructures(){
+  // Add new
+  $('struct-add-btn')?.addEventListener('click',()=>{
+    $('struct-edit-id').value='';
+    $('struct-name-inp').value='';
+    $('struct-desc-inp').value='';
+    $('struct-form-title').textContent='New Structure';
+    $('struct-form-err').style.display='none';
+    const w=$('struct-form-wrap'); w.style.display='block'; w.scrollIntoView({behavior:'smooth'});
+    $('struct-name-inp').focus();
   });
 
-  // Edit
-  overlay.querySelectorAll('.struct-edit-btn').forEach(btn=>{
-    btn.onclick = ()=>{
-      const id = btn.dataset.id;
-      const s = getStructures().find(x=>x.id===id);
-      if(!s) return;
-      document.getElementById('sn-name').value = s.name||'';
-      document.getElementById('sn-desc').value = s.description||'';
-      document.getElementById('sn-apiKey').value = s.config?.apiKey||'';
-      document.getElementById('sn-authDomain').value = s.config?.authDomain||'';
-      document.getElementById('sn-projectId').value = s.config?.projectId||'';
-      document.getElementById('sn-storageBucket').value = s.config?.storageBucket||'';
-      document.getElementById('sn-msgSenderId').value = s.config?.messagingSenderId||'';
-      document.getElementById('sn-appId').value = s.config?.appId||'';
-      document.getElementById('sn-save-btn').textContent = '💾 Update Structure';
-      document.getElementById('sn-save-btn').dataset.editId = id;
-      document.getElementById('sn-add-area').scrollIntoView({behavior:'smooth'});
-    };
+  // Cancel
+  $('struct-form-cancel-btn')?.addEventListener('click',()=>{ $('struct-form-wrap').style.display='none'; });
+
+  // Save (create or rename)
+  $('struct-form-save-btn')?.addEventListener('click',async()=>{
+    const name=$('struct-name-inp').value.trim();
+    const desc=$('struct-desc-inp').value.trim();
+    const editId=$('struct-edit-id').value;
+    const errEl=$('struct-form-err');
+    errEl.style.display='none';
+    if(!name){ errEl.textContent='Structure name is required.'; errEl.style.display='block'; return; }
+    const btn=$('struct-form-save-btn'); btn.disabled=true; btn.textContent='Saving…';
+    try{
+      if(editId){
+        await db.collection('structures').doc(editId).update({name, description:desc, updatedAt:new Date().toISOString()});
+        toast(`"${name}" renamed`,'ok');
+      } else {
+        const docRef=await db.collection('structures').add({name, description:desc||'', createdAt:new Date().toISOString()});
+        toast(`Structure "${name}" created`,'ok');
+        // Optionally switch to the new structure
+        if(confirm(`Switch to "${name}" now?`)){ await switchStructure(docRef.id); return; }
+      }
+      $('struct-form-wrap').style.display='none';
+    } catch(e){ errEl.textContent='Error: '+e.message; errEl.style.display='block'; }
+    btn.disabled=false; btn.textContent='💾 Save';
   });
+
+  // Rename buttons
+  document.querySelectorAll('.struct-rename-btn').forEach(b=>{
+    b.addEventListener('click',()=>{
+      $('struct-edit-id').value=b.dataset.id;
+      $('struct-name-inp').value=b.dataset.name||'';
+      $('struct-desc-inp').value=b.dataset.desc||'';
+      $('struct-form-title').textContent='Rename Structure';
+      $('struct-form-err').style.display='none';
+      const w=$('struct-form-wrap'); w.style.display='block'; w.scrollIntoView({behavior:'smooth'});
+      $('struct-name-inp').focus();
+    });
+  });
+
+  // Switch buttons
+  document.querySelectorAll('.struct-switch-btn').forEach(b=>{
+    b.addEventListener('click',()=>switchStructure(b.dataset.id));
+  });
+
+  // Back to default
+  $('struct-go-default-btn')?.addEventListener('click',()=>switchStructure(''));
 
   // Delete
-  overlay.querySelectorAll('.struct-del-btn').forEach(btn=>{
-    btn.onclick = ()=>{
-      if(!confirm('Delete this structure? This only removes the saved config, not any Firebase data.')) return;
-      const id = btn.dataset.id;
-      const structs = getStructures().filter(x=>x.id!==id);
-      saveStructures(structs);
-      toast('Structure removed','ok');
-      openStructuresManager(); // refresh
-    };
+  document.querySelectorAll('.struct-delete-btn').forEach(b=>{
+    b.addEventListener('click',async()=>{
+      const name=b.dataset.name;
+      if(!confirm(`Delete structure "${name}"?\n\nThis will permanently delete ALL plants and employees stored in this structure. This cannot be undone.`)) return;
+      const id=b.dataset.id;
+      try{
+        // Delete sub-collections first
+        await deleteStructureData(id);
+        await db.collection('structures').doc(id).delete();
+        if(S.activeStructId===id){ await switchStructure(''); return; }
+        toast(`Structure "${name}" deleted`,'ok');
+      } catch(e){ toast('Delete failed: '+e.message,'er'); }
+    });
   });
 
-  // Save / update
-  document.getElementById('sn-save-btn').onclick = ()=>{
-    const btn = document.getElementById('sn-save-btn');
-    const editId = btn.dataset.editId;
-    const name = document.getElementById('sn-name').value.trim();
-    const desc = document.getElementById('sn-desc').value.trim();
-    const jsonRaw = document.getElementById('sn-json').value.trim();
-    const errEl = document.getElementById('sn-err');
-    errEl.style.display='none';
+  // Export named structures
+  document.querySelectorAll('.struct-export-btn').forEach(b=>{
+    b.addEventListener('click',()=>exportStructure(b.dataset.id, b.dataset.name));
+  });
 
-    let cfg = {};
-    if(jsonRaw){
-      try{ cfg = JSON.parse(jsonRaw); }
-      catch(e){ errEl.textContent='Invalid JSON — check your Firebase config.'; errEl.style.display='block'; return; }
-    } else {
-      cfg = {
-        apiKey: document.getElementById('sn-apiKey').value.trim(),
-        authDomain: document.getElementById('sn-authDomain').value.trim(),
-        projectId: document.getElementById('sn-projectId').value.trim(),
-        storageBucket: document.getElementById('sn-storageBucket').value.trim(),
-        messagingSenderId: document.getElementById('sn-msgSenderId').value.trim(),
-        appId: document.getElementById('sn-appId').value.trim(),
-      };
-    }
-
-    if(!name){ errEl.textContent='Name is required.'; errEl.style.display='block'; return; }
-    if(!cfg.apiKey||!cfg.projectId){ errEl.textContent='API Key and Project ID are required.'; errEl.style.display='block'; return; }
-
-    const structs = getStructures();
-    if(editId){
-      const idx = structs.findIndex(x=>x.id===editId);
-      if(idx>=0){ structs[idx]={...structs[idx], name, description:desc, config:cfg}; }
-    } else {
-      structs.push({id:'struct_'+Date.now(), name, description:desc, config:cfg, isDefault:false});
-    }
-    saveStructures(structs);
-    toast(editId?'Structure updated':'Structure saved','ok');
-    openStructuresManager(); // refresh
-  };
-
-  // Export all
-  document.getElementById('dl-all-structs-btn').onclick = ()=>{
-    const data = {structures: getStructures(), exported: new Date().toISOString()};
-    const blob = new Blob([JSON.stringify(data,null,2)], {type:'application/json'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'OrgChart_Structures.json';
-    a.click();
-    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
-    toast('Structures exported','ok');
-  };
+  // Export default
+  $('struct-export-default-btn')?.addEventListener('click',()=>exportStructure('','Default'));
 
   // Import
-  document.getElementById('import-structs-btn').onclick = ()=> document.getElementById('import-structs-file').click();
-  document.getElementById('import-structs-file').onchange = e=>{
-    const f = e.target.files[0]; if(!f) return;
-    const reader = new FileReader();
-    reader.onload = ev=>{
-      try{
-        const data = JSON.parse(ev.target.result);
-        const imported = data.structures || (Array.isArray(data)?data:[]);
-        if(!imported.length){ toast('No structures found in file','er'); return; }
-        const existing = getStructures();
-        let added=0;
-        imported.forEach(s=>{
-          if(!existing.find(x=>x.id===s.id)){ existing.push(s); added++; }
-        });
-        saveStructures(existing);
-        toast(`Imported ${added} structure(s)`,'ok');
-        openStructuresManager();
-      } catch(err){ toast('Invalid file: '+err.message,'er'); }
-    };
-    reader.readAsText(f);
-  };
+  $('struct-import-btn')?.addEventListener('click',()=>$('struct-import-file')?.click());
+  $('struct-import-file')?.addEventListener('change',e=>{
+    const f=e.target.files[0]; if(!f) return;
+    importStructure(f);
+    e.target.value=''; // reset so same file can be re-picked
+  });
 }
 
-// Activate a saved structure by downloading a modified copy of the tool
-// with the new Firebase config embedded, and saving the preference.
-function activateStructure(struct){
-  // Update the embedded config in this page's source and download it
-  const currentHtml = document.documentElement.outerHTML;
-  const cfgStr = JSON.stringify(struct.config, null, 2);
-  const newHtml = currentHtml.replace(
-    /const FIREBASE_CONFIG\s*=\s*\{[\s\S]*?\};/,
-    `const FIREBASE_CONFIG = ${cfgStr};`
-  );
-  if(newHtml === currentHtml){
-    toast('Could not inject config — please edit FIREBASE_CONFIG manually.','er');
-    return;
-  }
-  const blob = new Blob(['<!DOCTYPE html>\n'+newHtml],{type:'text/html;charset=utf-8'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  const safeName = struct.name.replace(/[^a-zA-Z0-9_\-]/g,'_');
-  a.download = `OrgChart_${safeName}.html`;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); },1000);
-  toast(`"${struct.name}" downloaded — open that file to switch structures.`,'ok');
+async function switchStructure(id){
+  S.activeStructId=id;
+  S.plants=[]; S.employees=[]; S.departments=[];
+  S.tab='dashboard';
+  S.filterPlant=''; S.plantChartId=''; S.deptChartId=''; S.deptChartPlant='';
+  S.collapsed=new Set();
+  // Restart listeners with new scope
+  startListeners();
+  render();
+  const name=id?(S.structures.find(s=>s.id===id)?.name||id):'Default';
+  toast(`Switched to "${name}"`,'ok');
+}
+
+async function deleteStructureData(structId){
+  // Delete all plants and employees in this structure
+  const plantsSnap=await db.collection('structures').doc(structId).collection('plants').get();
+  const empsSnap=await db.collection('structures').doc(structId).collection('employees').get();
+  const batch=db.batch();
+  plantsSnap.docs.forEach(d=>batch.delete(d.ref));
+  empsSnap.docs.forEach(d=>batch.delete(d.ref));
+  await batch.commit();
+}
+
+async function exportStructure(structId, structName){
+  try{
+    let plants, employees;
+    if(structId){
+      const ps=await db.collection('structures').doc(structId).collection('plants').get();
+      const es=await db.collection('structures').doc(structId).collection('employees').get();
+      plants=ps.docs.map(d=>({id:d.id,...d.data()}));
+      employees=es.docs.map(d=>({id:d.id,...d.data()}));
+    } else {
+      // Export root/default
+      plants=S.plants;
+      employees=S.employees;
+    }
+    const data={
+      exportVersion:1,
+      structureName:structName||'Default',
+      exportedAt:new Date().toISOString(),
+      plants,
+      employees
+    };
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download=`OrgStructure_${(structName||'Default').replace(/\s+/g,'_')}_${new Date().toLocaleDateString('en-IN').replace(/\//g,'-')}.json`;
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    toast(`"${structName}" exported (${plants.length} plants, ${employees.length} employees)`,'ok');
+  } catch(e){ toast('Export failed: '+e.message,'er'); }
+}
+
+async function importStructure(file){
+  const reader=new FileReader();
+  reader.onload=async ev=>{
+    try{
+      const data=JSON.parse(ev.target.result);
+      if(!data.exportVersion||!Array.isArray(data.plants)||!Array.isArray(data.employees)){
+        toast('Invalid structure file — must be exported from this tool.','er'); return;
+      }
+      const suggestedName=data.structureName||file.name.replace(/\.json$/,'').replace(/_/g,' ');
+      const name=prompt(`Import as structure:\n\nPlants: ${data.plants.length}, Employees: ${data.employees.length}\n\nEnter a name for this structure:`, suggestedName);
+      if(!name) return;
+
+      // Create the structure document
+      const docRef=await db.collection('structures').add({
+        name, description:`Imported from ${file.name}`, createdAt:new Date().toISOString()
+      });
+      const sid=docRef.id;
+
+      // Build plant ID mapping (old id → new id)
+      const plantIdMap={};
+      showProgress('Importing Structure', 'Creating plants…');
+      for(let i=0;i<data.plants.length;i++){
+        const p=data.plants[i];
+        const {id:oldId,...pData}=p;
+        const newRef=await db.collection('structures').doc(sid).collection('plants').add(pData);
+        if(oldId) plantIdMap[oldId]=newRef.id;
+        updateProgress(i+1, data.plants.length+data.employees.length, `Plant: ${p.name}`);
+      }
+
+      // Import employees, remapping plantId
+      const empIdMap={};
+      for(let i=0;i<data.employees.length;i++){
+        const e=data.employees[i];
+        const {id:oldId,...eData}=e;
+        if(eData.plantId&&plantIdMap[eData.plantId]) eData.plantId=plantIdMap[eData.plantId];
+        const newRef=await db.collection('structures').doc(sid).collection('employees').doc(uid()).set(eData);
+        updateProgress(data.plants.length+i+1, data.plants.length+data.employees.length, `Employee: ${e.name}`);
+      }
+
+      hideProgress();
+      toast(`"${name}" imported: ${data.plants.length} plants, ${data.employees.length} employees`,'ok');
+      if(confirm(`Import complete!\n\nSwitch to "${name}" now?`)){ await switchStructure(sid); }
+    } catch(e){ hideProgress(); toast('Import failed: '+e.message,'er'); console.error(e); }
+  };
+  reader.readAsText(file);
 }
 
 // ── Start ────────────────────────────────────────────────────────
