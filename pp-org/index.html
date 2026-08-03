@@ -3371,51 +3371,61 @@ async function doBulkImport(){
 
 // ── Export Utilities ──────────────────────────────────────────────
 
-// The company logo is stored as a base64 data URL directly in Firestore
-// (see logo-save-btn handler), so no network fetch or CORS handling is
-// ever needed here — it's already in memory as a data: URI.
-async function captureLogoPNG(targetH=52){
+// The company logo is normally stored as a base64 data: URL directly in
+// Firestore (see logo-save-btn handler). Occasionally it may be an http(s)
+// URL instead — handle both without ever distorting the image's aspect ratio.
+async function captureLogoPNG(){
   if(!S.companyLogo) return null;
-  // Try with crossOrigin first (works if Firebase CORS is configured)
+  const isDataUrl=S.companyLogo.startsWith('data:');
+
   const tryLoad=(src, cors)=>new Promise(resolve=>{
     const img=new Image();
     if(cors) img.crossOrigin='anonymous';
-    img.onload=()=>drawLogoWithBg(img, targetH, resolve);
+    img.onload=()=>resolve(img.naturalWidth>0?img:null);
     img.onerror=()=>resolve(null);
     img.src=src;
     setTimeout(()=>resolve(null),5000);
   });
-  // Cache-bust forces a fresh request with CORS headers
+
+  if(isDataUrl){
+    // data: URLs are already local — load directly, no CORS/cache-bust needed
+    // (appending a query string would corrupt the base64 payload)
+    return tryLoad(S.companyLogo, false);
+  }
+
+  // http(s) URL — cache-bust to force a fresh CORS-enabled response
   const bustUrl=S.companyLogo+(S.companyLogo.includes('?')?'&':'?')+'_cb='+Date.now();
   const result=await tryLoad(bustUrl, true);
   if(result) return result;
-  // Fallback: load without crossOrigin — will taint but we catch the error
   return tryLoad(S.companyLogo, false);
 }
 
-function drawLogoWithBg(img, targetH, cb){
+// Draws the logo with a white rounded background, preserving its exact
+// aspect ratio — used directly inside buildHeaderCanvas (single pass, no
+// intermediate resize that could compound rounding/distortion).
+function drawLogoOnCtx(ctx, img, targetH, x, yCenter){
   const PAD=Math.round(targetH*0.10);
   const R=Math.round(targetH*0.14);
   const ratio=(img.naturalWidth||img.width)/(img.naturalHeight||img.height)||1;
   const drawH=targetH-(PAD*2);
-  const drawW=Math.round(drawH*ratio);
+  const drawW=Math.round(drawH*ratio); // width derived from height × original ratio — never stretched
   const canW=drawW+(PAD*2);
   const canH=targetH;
-  const cv=document.createElement('canvas');
-  cv.width=canW; cv.height=canH;
-  const ctx=cv.getContext('2d');
-  // White rounded background
+  const y=Math.round(yCenter-canH/2);
+
+  // White rounded background box sized exactly to the logo + padding
   ctx.fillStyle='#ffffff';
   ctx.beginPath();
-  ctx.moveTo(R,0);ctx.lineTo(canW-R,0);ctx.quadraticCurveTo(canW,0,canW,R);
-  ctx.lineTo(canW,canH-R);ctx.quadraticCurveTo(canW,canH,canW-R,canH);
-  ctx.lineTo(R,canH);ctx.quadraticCurveTo(0,canH,0,canH-R);
-  ctx.lineTo(0,R);ctx.quadraticCurveTo(0,0,R,0);
+  ctx.moveTo(x+R,y);ctx.lineTo(x+canW-R,y);ctx.quadraticCurveTo(x+canW,y,x+canW,y+R);
+  ctx.lineTo(x+canW,y+canH-R);ctx.quadraticCurveTo(x+canW,y+canH,x+canW-R,y+canH);
+  ctx.lineTo(x+R,y+canH);ctx.quadraticCurveTo(x,y+canH,x,y+canH-R);
+  ctx.lineTo(x,y+R);ctx.quadraticCurveTo(x,y,x+R,y);
   ctx.closePath();ctx.fill();
-  try{
-    ctx.drawImage(img,PAD,PAD,drawW,drawH);
-    cb(cv.toDataURL('image/png'));
-  }catch(e){ cb(null); }
+
+  // Draw the logo at its true aspect ratio — never stretched to fill a fixed box
+  ctx.drawImage(img, x+PAD, y+PAD, drawW, drawH);
+
+  return canW; // total width consumed, for positioning text after it
 }
 
 // Build header canvas (navy bar with logo + company name + date)
@@ -3437,18 +3447,12 @@ async function buildHeaderCanvas(width, title){
 
   let textX=20*SCALE;
 
-  // Logo — rendered at 75% of header height for better proportion
-  const logoPNG=await captureLogoPNG(Math.round((H-16*SCALE)*0.75));
-  if(logoPNG){
-    const logoImg=new Image();
-    await new Promise(res=>{ logoImg.onload=res; logoImg.onerror=res; logoImg.src=logoPNG; });
-    if(logoImg.naturalWidth>0){
-      const lH=Math.round((H-10*SCALE)*0.75);
-      const lW=logoImg.naturalWidth*(lH/logoImg.naturalHeight);
-      const lY=Math.round((H-lH)/2); // vertically centered
-      ctx.drawImage(logoImg,6*SCALE,lY,lW,lH);
-      textX=6*SCALE+lW+14*SCALE;
-    }
+  // Logo — single-pass draw at true aspect ratio, never stretched
+  const logoImg=await captureLogoPNG();
+  if(logoImg){
+    const targetH=Math.round((H-16*SCALE)*0.75);
+    const consumedW=drawLogoOnCtx(ctx, logoImg, targetH, 6*SCALE, H/2);
+    textX=6*SCALE+consumedW+14*SCALE;
   }
 
   // Title text — company name only if defined, otherwise blank
