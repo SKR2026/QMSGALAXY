@@ -935,6 +935,7 @@ window.FB = {
   async getEntries(){ const s=await getDocs(query(collection(db,'copqEntries'),orderBy('createdAt','desc'))); return s.docs.map(d=>({id:d.id,...d.data()})); },
   async addEntry(data){ return addDoc(collection(db,'copqEntries'),{...data,createdAt:serverTimestamp()}); },
   async updateEntry(id,data){ await updateDoc(doc(db,'copqEntries',id),{...data,updatedAt:serverTimestamp()}); },
+  async setEntryLock(id,locked){ await updateDoc(doc(db,'copqEntries',id),{locked,lockedAt:serverTimestamp()}); },
   async deleteEntry(id){ await deleteDoc(doc(db,'copqEntries',id)); },
 
   // Settings (company branding)
@@ -1057,16 +1058,26 @@ window.saveEntry = async function(){
   if(!plant||!category||!subcat||isNaN(amount)||amount<=0){
     showToast('Please fill Plant, Category, Sub-category and Amount'); return;
   }
+  // Check if editing a locked entry — only super_admin may edit locked entries
+  if(editingEntryId){
+    const existing=entriesList.find(x=>x.id===editingEntryId);
+    if(existing && existing.locked && currentProfile.role!=='super_admin'){
+      showToast('This entry is locked. Only Super Admin can edit it.'); return;
+    }
+  }
+  const isSA=currentProfile.role==='super_admin';
   const data={year,month,plant,category,subcat,amount,qty:qty?parseFloat(qty):null,unit,description:desc,
     enteredBy:currentProfile.name||currentProfile.email,
-    enteredByUid:currentUser.uid,locked:false};
+    enteredByUid:currentUser.uid,
+    // Entries are locked immediately on save; only super_admin can unlock
+    locked:true};
   try{
     if(editingEntryId){
       await window.FB.updateEntry(editingEntryId,data);
       showToast('Entry updated ✓');
     } else {
       await window.FB.addEntry(data);
-      showToast('Entry saved ✓');
+      showToast('Entry saved & locked ✓');
     }
     entriesList = await window.FB.getEntries();
     clearEntryForm();
@@ -1076,6 +1087,7 @@ window.saveEntry = async function(){
 };
 
 window.deleteEntry = async function(id){
+  if(currentProfile.role!=='super_admin'){showToast('Only Super Admin can delete entries.');return;}
   if(!confirm('Delete this COPQ entry?')) return;
   await window.FB.deleteEntry(id);
   entriesList=entriesList.filter(e=>e.id!==id);
@@ -1083,6 +1095,9 @@ window.deleteEntry = async function(id){
 };
 window.editEntry = function(id){
   const e=entriesList.find(x=>x.id===id); if(!e) return;
+  if(e.locked && currentProfile.role!=='super_admin'){
+    showToast('This entry is locked. Only Super Admin can edit it.',4000); return;
+  }
   editingEntryId=id;
   document.getElementById('entryYear').value=e.year;
   document.getElementById('entryMonth').value=e.month;
@@ -1222,8 +1237,14 @@ function updateSidebarProfile(){
 function getFilteredEntries(){
   const p=currentProfile;
   if(!p) return [];
+  // Super Admin: sees everything
   if(p.role==='super_admin') return entriesList;
-  if(p.role==='admin') return entriesList.filter(e=>e.plant===p.plant||p.plant==='All');
+  // Admin: sees ONLY their assigned plant — never other plants
+  if(p.role==='admin'){
+    if(!p.plant||p.plant==='All') return entriesList; // admin with All plants
+    return entriesList.filter(e=>e.plant===p.plant);
+  }
+  // User: sees only their own entries within their plant
   return entriesList.filter(e=>e.enteredByUid===currentUser.uid);
 }
 
@@ -1406,7 +1427,11 @@ function renderMyEntries(){
   const total=list.reduce((s,e)=>s+e.amount,0);
   body.innerHTML=list.map(e=>{
     const col=catColor(e.category);
-    const canEdit=isSA||(isAdmin&&e.plant===currentProfile?.plant)||(e.enteredByUid===currentUser?.uid);
+    // Locked entries: only super_admin can edit or delete
+    // Unlocked entries: owner or plant admin can edit; only super_admin can delete
+    const isOwner=e.enteredByUid===currentUser?.uid;
+    const isPlantAdmin=isAdmin&&(currentProfile?.plant===e.plant||currentProfile?.plant==='All');
+    const canEdit=e.locked ? isSA : (isSA||isPlantAdmin||isOwner);
     return`<tr>
       <td>${e.year}</td><td>${e.month}</td><td>${e.plant}</td>
       <td><span style="background:${col.bg};color:${col.text};border-radius:20px;padding:2px 8px;font-size:11px;font-weight:600">${e.category}</span></td>
@@ -1416,12 +1441,13 @@ function renderMyEntries(){
       <td class="mono" style="color:var(--navy);font-weight:700">${fmtINRFull(e.amount)}</td>
       <td style="font-size:12px;color:var(--text2);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${e.description||''}">${e.description||'—'}</td>
       <td style="font-size:11px;color:var(--text3)">${e.enteredBy||'—'}</td>
-      <td><span class="badge ${e.locked?'badge-blue':'badge-green'}">${e.locked?'🔒 Locked':'✓ Active'}</span></td>
+      <td><span class="badge ${e.locked?'badge-red':'badge-green'}">${e.locked?'🔒 Locked':'✓ Active'}</span></td>
       <td>
-        ${canEdit?`<div style="display:flex;gap:4px">
-          <button class="btn btn-sm btn-icon" title="Edit" onclick="editEntry('${e.id}')"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
-          ${isSA?`<button class="btn btn-sm btn-icon" title="Delete" style="color:var(--red)" onclick="deleteEntry('${e.id}')"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg></button>`:''}
-        </div>`:'—'}
+        <div style="display:flex;gap:4px;align-items:center">
+          ${canEdit?`<button class="btn btn-sm btn-icon" title="Edit" onclick="editEntry('${e.id}')"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>`:''}
+          ${isSA?`<button class="btn btn-sm btn-icon" title="${e.locked?'Unlock':'Lock'}" style="color:${e.locked?'var(--amber)':'var(--navy)'}" onclick="toggleLock('${e.id}',${e.locked})"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="${e.locked?'M7 11V7a5 5 0 0110 0v4':'M7 11V7a5 5 0 0110 0'}"/></svg></button><button class="btn btn-sm btn-icon" title="Delete" style="color:var(--red)" onclick="deleteEntry('${e.id}')"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg></button>`:''}
+          ${!isSA&&!canEdit?'<span style="font-size:11px;color:var(--text3)">🔒</span>':''}
+        </div>
       </td>
     </tr>`;
   }).join('');
@@ -1682,6 +1708,22 @@ function clearEntryForm(){
 }
 
 // ══════════════════════════════════════════════
+// LOCK / UNLOCK ENTRIES (Super Admin only)
+// ══════════════════════════════════════════════
+window.toggleLock = async function(id, currentlyLocked){
+  if(currentProfile.role!=='super_admin'){ showToast('Only Super Admin can lock/unlock entries.'); return; }
+  const action = currentlyLocked ? 'unlock' : 'lock';
+  if(!confirm(`${action.charAt(0).toUpperCase()+action.slice(1)} this entry?`)) return;
+  try{
+    await window.FB.setEntryLock(id, !currentlyLocked);
+    const idx=entriesList.findIndex(e=>e.id===id);
+    if(idx>-1) entriesList[idx].locked=!currentlyLocked;
+    renderMyEntries();
+    showToast(`Entry ${action}ed ✓`);
+  } catch(err){ showToast('Error: '+err.message,5000); }
+};
+
+// ══════════════════════════════════════════════
 // EDIT PLANT
 // ══════════════════════════════════════════════
 function openEditPlantModal(id){
@@ -1829,7 +1871,7 @@ window.importBulkData = async function(){
         subcat:r.subcat, amount:r.amount, qty:r.qty, unit:r.unit,
         description:r.description,
         enteredBy:currentProfile.name||currentProfile.email,
-        enteredByUid:currentUser.uid, locked:false
+        enteredByUid:currentUser.uid, locked:true
       });
       count++;
     }
@@ -2071,6 +2113,7 @@ async function removeLogoAction(){
 // INIT
 // ══════════════════════════════════════════════
 // Expose all functions needed by inline onclick handlers
+window.toggleLock=toggleLock;
 window.openEditPlantModal=openEditPlantModal;
 window.openBulkUploadModal=openBulkUploadModal;
 window.downloadBulkTemplate=downloadBulkTemplate;
