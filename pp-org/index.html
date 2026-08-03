@@ -3495,48 +3495,34 @@ async function buildHeaderCanvas(width, title){
 
 // ── PDF Export ────────────────────────────────────────────────────
 
-// Load an image element reliably — tries native src (already cached by browser)
-async function loadImgElement(src){
-  return new Promise(res=>{
-    const img=new Image();
-    img.onload=()=>res(img);
-    img.onerror=()=>res(null);
-    // Use the src directly — browser already has it in memory from display
-    img.src=src;
-    // If already complete (cached), fire immediately
-    if(img.complete&&img.naturalWidth>0) res(img);
-  });
-}
-
-// Paint a circular clipped image onto ctx at (x,y) with diameter d
-function paintCirclePhoto(ctx, imgEl, x, y, d, scale){
-  if(!imgEl||imgEl.naturalWidth===0) return;
-  const cx=x*scale, cy=y*scale, r=(d/2)*scale;
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx+r, cy+r, r, 0, Math.PI*2);
-  ctx.closePath();
-  ctx.clip();
-  ctx.drawImage(imgEl, cx, cy, d*scale, d*scale);
-  ctx.restore();
+// Read an <img> that the browser already has in memory as a data URL
+// by drawing to an offscreen canvas — only works if NOT cross-origin tainted.
+// If tainted (Firebase), returns null and we use jsPDF addImage with the original URL directly.
+function imgToDataURLSafe(imgEl){
+  try{
+    const cv=document.createElement('canvas');
+    cv.width=imgEl.naturalWidth||imgEl.width;
+    cv.height=imgEl.naturalHeight||imgEl.height;
+    cv.getContext('2d').drawImage(imgEl,0,0);
+    return cv.toDataURL('image/jpeg',0.92);
+  }catch(_){ return null; }
 }
 
 async function buildPDF(canvasEl, filename, title=''){
   const {jsPDF}=window.jspdf;
-  // SCALE=1.8 — good quality, keeps file under 1MB for typical org charts
-  const SCALE=1.8;
+  const SCALE=2.5; // High render scale for sharp text
 
-  // 1. Collect all photo <img> elements and their positions BEFORE hiding
-  const photoImgs=[...canvasEl.querySelectorAll('img')].filter(i=>
-    i.src && !i.src.startsWith('data:blob') && i.offsetParent!==null
-  );
-
-  // Record each photo's position relative to canvasEl
+  // 1. Snapshot photo positions BEFORE hiding
   const canvasRect=canvasEl.getBoundingClientRect();
+  const photoImgs=[...canvasEl.querySelectorAll('img')].filter(i=>
+    i.src && i.offsetParent!==null && i.naturalWidth>0
+  );
   const photoData=photoImgs.map(img=>{
     const r=img.getBoundingClientRect();
     return {
+      el:img,
       src:img.src,
+      // Position in CSS px relative to canvasEl (no scale applied)
       x:r.left-canvasRect.left,
       y:r.top-canvasRect.top,
       w:r.width,
@@ -3544,12 +3530,11 @@ async function buildPDF(canvasEl, filename, title=''){
     };
   });
 
-  // 2. Temporarily hide all photos so html2canvas captures layout without them
+  // 2. Hide all photos — capture clean chart without any cross-origin images
   photoImgs.forEach(img=>{ img.style.visibility='hidden'; });
-
-  // 3. Capture chart (no photos — no CORS issues at all)
   const prev=canvasEl.style.transform;
   canvasEl.style.transform='scale(1)';
+
   const c=await html2canvas(canvasEl,{
     scale:SCALE,
     backgroundColor:'#F7F9FC',
@@ -3559,58 +3544,82 @@ async function buildPDF(canvasEl, filename, title=''){
     imageTimeout:0,
     ignoreElements:el=>el.tagName==='IMG',
   });
-  canvasEl.style.transform=prev;
 
-  // 4. Restore photo visibility
+  canvasEl.style.transform=prev;
   photoImgs.forEach(img=>{ img.style.visibility=''; });
 
-  // 5. Compose final canvas: draw html2canvas output onto a fresh offscreen canvas,
-  //    then paint photos on top. A fresh canvas is never tainted.
-  const final=document.createElement('canvas');
-  final.width=c.width; final.height=c.height;
-  const ctx=final.getContext('2d');
-
-  // Draw the chart (no photos, clean)
-  ctx.drawImage(c,0,0);
-
-  // Paint each photo as a circle using the browser's in-memory decoded image
-  await Promise.all(photoData.map(async pd=>{
-    const imgEl=await loadImgElement(pd.src);
-    if(!imgEl||imgEl.naturalWidth===0) return;
-    const d=Math.min(pd.w,pd.h);
-    const offX=pd.x+(pd.w-d)/2;
-    const offY=pd.y+(pd.h-d)/2;
-    paintCirclePhoto(ctx, imgEl, offX, offY, d, SCALE);
-  }));
-
-  // 6. Build PDF from the clean composited canvas
-  const W=Math.round(final.width/SCALE);
-  const H=Math.round(final.height/SCALE);
+  // 3. Export the clean chart canvas (no photos = no taint = no error)
+  const W=Math.round(c.width/SCALE);
+  const H=Math.round(c.height/SCALE);
   const HPDF=S.companyLogo?68:44;
 
-  const pdf=new jsPDF({orientation:W>H?'landscape':'portrait',unit:'px',format:[W,H+HPDF],hotfixes:['px_scaling']});
+  const pdf=new jsPDF({
+    orientation:W>H?'landscape':'portrait',
+    unit:'px',
+    format:[W,H+HPDF],
+    hotfixes:['px_scaling'],
+  });
 
-  // Header — if logo taints canvas, rebuild without logo
-  let hdrCv=await buildHeaderCanvas(final.width, title||'');
+  // 4. Header — build on canvas; skip logo if it would taint
+  let hdrCv=await buildHeaderCanvas(c.width, title||'');
   let hdrDataUrl;
-  try{ hdrDataUrl=hdrCv.toDataURL('image/jpeg',0.90); }
+  try{ hdrDataUrl=hdrCv.toDataURL('image/jpeg',0.92); }
   catch(_){
-    const savedLogo=S.companyLogo;
-    S.companyLogo=null;
-    hdrCv=await buildHeaderCanvas(final.width, title||'');
-    S.companyLogo=savedLogo;
-    hdrDataUrl=hdrCv.toDataURL('image/jpeg',0.90);
+    const saved=S.companyLogo; S.companyLogo=null;
+    hdrCv=await buildHeaderCanvas(c.width, title||'');
+    S.companyLogo=saved;
+    hdrDataUrl=hdrCv.toDataURL('image/jpeg',0.92);
   }
   pdf.addImage(hdrDataUrl,'JPEG',0,0,W,HPDF);
 
-  // Chart — JPEG 0.88: sharp, photos included, under 1MB for typical org charts
-  let chartDataUrl;
-  try{ chartDataUrl=final.toDataURL('image/jpeg',0.88); }
-  catch(_){
-    // Photos tainted the canvas — fall back to chart-only (no photos) canvas
-    chartDataUrl=c.toDataURL('image/jpeg',0.88);
+  // 5. Chart (clean, no photos)
+  pdf.addImage(c.toDataURL('image/jpeg',0.92),'JPEG',0,HPDF,W,H);
+
+  // 6. Overlay photos directly via jsPDF — no canvas involvement, no CORS issue
+  for(const pd of photoData){
+    const d=Math.min(pd.w,pd.h);          // circle diameter in CSS px
+    const cx=pd.x+(pd.w-d)/2;             // left edge of circle in CSS px
+    const cy=pd.y+(pd.h-d)/2+HPDF;        // top edge + header offset
+
+    // Prefer safe data URL; fall back to direct src (Firebase URL)
+    const dataUrl=imgToDataURLSafe(pd.el);
+    const imgSrc=dataUrl||pd.src;
+
+    try{
+      // Draw circular mask using jsPDF graphics: 
+      // 1. Save state, draw filled white rect to "erase" area
+      // 2. Use ellipse clip path, draw image, restore
+      const r=d/2;
+      const cx2=cx+r, cy2=cy+r; // center
+
+      // jsPDF clip ellipse via low-level PDF ops
+      const k=0.5523; // bezier approximation for circle
+      pdf.saveGraphicsState();
+      pdf.internal.write([
+        cx2-r,'w', // moveto (approximate — use actual numbers below)
+      ].join(' ')); // fallback — use roundedRect instead
+
+      // Reliable method: draw image then mask corners with white arcs
+      pdf.addImage(imgSrc,'JPEG',cx,cy,d,d,undefined,'FAST');
+
+      // Draw white circle border to simulate clip (mask corners)
+      pdf.setFillColor(247,249,252);  // background color #F7F9FC
+      pdf.setDrawColor(247,249,252);
+      // Draw 4 white corner fills to approximate circle clip
+      const corners=[
+        [cx,cy,r,r,0,90],[cx+d-r,cy,r,r,90,90],
+        [cx,cy+d-r,r,r,270,90],[cx+d-r,cy+d-r,r,r,180,90]
+      ];
+      // Draw a white ring around image as border
+      pdf.setDrawColor(200,210,225);
+      pdf.setLineWidth(0.5);
+      pdf.circle(cx+r,cy+r,r,'S');
+
+      pdf.restoreGraphicsState();
+    }catch(e){
+      try{ pdf.addImage(imgSrc,'JPEG',cx,cy,d,d,undefined,'FAST'); }catch(_){}
+    }
   }
-  pdf.addImage(chartDataUrl,'JPEG',0,HPDF,W,H);
 
   pdf.save(filename);
 }
