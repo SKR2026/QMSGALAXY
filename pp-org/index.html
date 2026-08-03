@@ -3390,13 +3390,21 @@ async function doBulkImport(){
 // ever needed here — it's already in memory as a data: URI.
 async function captureLogoPNG(targetH=52){
   if(!S.companyLogo) return null;
-  return new Promise(resolve=>{
+  // Try with crossOrigin first (works if Firebase CORS is configured)
+  const tryLoad=(src, cors)=>new Promise(resolve=>{
     const img=new Image();
+    if(cors) img.crossOrigin='anonymous';
     img.onload=()=>drawLogoWithBg(img, targetH, resolve);
     img.onerror=()=>resolve(null);
-    img.src=S.companyLogo;
-    setTimeout(()=>resolve(null),4000);
+    img.src=src;
+    setTimeout(()=>resolve(null),5000);
   });
+  // Cache-bust forces a fresh request with CORS headers
+  const bustUrl=S.companyLogo+(S.companyLogo.includes('?')?'&':'?')+'_cb='+Date.now();
+  const result=await tryLoad(bustUrl, true);
+  if(result) return result;
+  // Fallback: load without crossOrigin — will taint but we catch the error
+  return tryLoad(S.companyLogo, false);
 }
 
 function drawLogoWithBg(img, targetH, cb){
@@ -3582,12 +3590,27 @@ async function buildPDF(canvasEl, filename, title=''){
 
   const pdf=new jsPDF({orientation:W>H?'landscape':'portrait',unit:'px',format:[W,H+HPDF],hotfixes:['px_scaling']});
 
-  // Header
-  const hdrCv=await buildHeaderCanvas(final.width, title||'');
-  pdf.addImage(hdrCv.toDataURL('image/jpeg',0.90),'JPEG',0,0,W,HPDF);
+  // Header — if logo taints canvas, rebuild without logo
+  let hdrCv=await buildHeaderCanvas(final.width, title||'');
+  let hdrDataUrl;
+  try{ hdrDataUrl=hdrCv.toDataURL('image/jpeg',0.90); }
+  catch(_){
+    const savedLogo=S.companyLogo;
+    S.companyLogo=null;
+    hdrCv=await buildHeaderCanvas(final.width, title||'');
+    S.companyLogo=savedLogo;
+    hdrDataUrl=hdrCv.toDataURL('image/jpeg',0.90);
+  }
+  pdf.addImage(hdrDataUrl,'JPEG',0,0,W,HPDF);
 
   // Chart — JPEG 0.88: sharp, photos included, under 1MB for typical org charts
-  pdf.addImage(final.toDataURL('image/jpeg',0.88),'JPEG',0,HPDF,W,H);
+  let chartDataUrl;
+  try{ chartDataUrl=final.toDataURL('image/jpeg',0.88); }
+  catch(_){
+    // Photos tainted the canvas — fall back to chart-only (no photos) canvas
+    chartDataUrl=c.toDataURL('image/jpeg',0.88);
+  }
+  pdf.addImage(chartDataUrl,'JPEG',0,HPDF,W,H);
 
   pdf.save(filename);
 }
