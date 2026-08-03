@@ -3520,9 +3520,26 @@ async function buildPDF(canvasEl, filename, title=''){
   const {jsPDF}=window.jspdf;
   const SCALE=2.2; // Higher render resolution for sharper text
 
-  // ── Step 1: Snapshot photo positions & srcs BEFORE touching anything
+  // ── Step 1: Wait for ALL visible photos to finish loading first —
+  //    critical for deep/large charts where many photos may still be
+  //    downloading when export is triggered (otherwise they'd be silently
+  //    skipped because naturalWidth would still be 0).
+  const allImgsInChart=[...canvasEl.querySelectorAll('img[src]')].filter(i=>i.offsetParent!==null);
+  await Promise.all(allImgsInChart.map(img=>{
+    if(img.complete && img.naturalWidth>0) return Promise.resolve();
+    return new Promise(res=>{
+      const done=()=>res();
+      img.addEventListener('load',done,{once:true});
+      img.addEventListener('error',done,{once:true});
+      // Safety timeout so one slow/broken image never blocks the whole export
+      setTimeout(done,6000);
+    });
+  }));
+
+  // ── Step 2: Snapshot photo positions & srcs — now that loading has settled,
+  //    re-check naturalWidth to skip any that genuinely failed
   const canvasRect=canvasEl.getBoundingClientRect();
-  const photoImgs=[...canvasEl.querySelectorAll('img[src]')].filter(i=>i.offsetParent!==null && i.naturalWidth>0);
+  const photoImgs=allImgsInChart.filter(i=>i.naturalWidth>0);
   const photoData=photoImgs.map(img=>{
     const r=img.getBoundingClientRect();
     return {
@@ -3534,10 +3551,10 @@ async function buildPDF(canvasEl, filename, title=''){
     };
   });
 
-  // ── Step 2: Pre-fetch all photos as blob URLs (bypasses CORS cache)
+  // ── Step 3: Pre-fetch all photos as blob URLs (bypasses CORS cache)
   const blobUrls=await Promise.all(photoData.map(pd=>loadAsBlob(pd.src)));
 
-  // ── Step 3: Hide <img> tags so html2canvas captures clean layout
+  // ── Step 4: Hide <img> tags so html2canvas captures clean layout
   photoImgs.forEach(img=>{ img.style.visibility='hidden'; });
   const prevTransform=canvasEl.style.transform;
   canvasEl.style.transform='scale(1)';
@@ -3555,7 +3572,7 @@ async function buildPDF(canvasEl, filename, title=''){
   canvasEl.style.transform=prevTransform;
   photoImgs.forEach(img=>{ img.style.visibility=''; });
 
-  // ── Step 4: Compose on fresh canvas — draw chart then overlay photos
+  // ── Step 5: Compose on fresh canvas — draw chart then overlay photos
   const out=document.createElement('canvas');
   out.width=chartCanvas.width;
   out.height=chartCanvas.height;
@@ -3575,7 +3592,7 @@ async function buildPDF(canvasEl, filename, title=''){
   // Revoke blob URLs
   blobUrls.forEach(u=>{ if(u) URL.revokeObjectURL(u); });
 
-  // ── Step 5: Export to PDF
+  // ── Step 6: Export to PDF
   const W=Math.round(out.width/SCALE);
   const H=Math.round(out.height/SCALE);
   const HPDF=S.companyLogo?68:44;
