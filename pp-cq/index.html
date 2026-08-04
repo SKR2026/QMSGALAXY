@@ -314,7 +314,7 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
         <button type="button" class="fycy-btn active" data-mode="CY" onclick="setDashPeriodMode('CY')">CY</button>
         <button type="button" class="fycy-btn" data-mode="FY" onclick="setDashPeriodMode('FY')">FY</button>
       </div>
-      <select id="dashYearSel" onchange="refreshDashboard()" style="font-size:11px;padding:4px 8px;border:1px solid var(--border2);border-radius:6px;background:var(--surface);color:var(--text);display:none">
+      <select id="dashYearSel" onchange="refreshDashboard();syncYearToAllPages();" style="font-size:11px;padding:4px 8px;border:1px solid var(--border2);border-radius:6px;background:var(--surface);color:var(--text);display:none">
         <option>2026</option><option>2025</option><option>2024</option>
       </select>
       <div class="plant-pills" id="topbarPlantPills"></div>
@@ -1069,6 +1069,10 @@ function navigate(page, el){
   // static object literal like {dashboard: refreshDashboard} captures undefined
   // for all block-3 functions. Using string names + window lookup defers resolution
   // to runtime, by which point all script blocks have been parsed.
+  // Sync year selection before rendering target page
+  if(['reports','my-entries','sales'].includes(page)){
+    if(typeof syncYearToAllPages==='function') syncYearToAllPages();
+  }
   const renderFnNames={
     dashboard: 'refreshDashboard',
     'my-entries': 'renderMyEntries',
@@ -1770,8 +1774,6 @@ function setDashPeriodMode(mode){
   dashPeriodMode=mode;
   document.querySelectorAll('.fycy-btn').forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));
   // Update monthly trend card title
-  const trendTitle=document.querySelector('#fycyToggle')?.closest('.card')?.querySelector('.card-title');
-  // Update card title to reflect mode
   const trendTitleAll=document.querySelectorAll('.card-title');
   trendTitleAll.forEach(el=>{
     if(el.textContent.includes('Monthly COPQ Trend')){
@@ -1780,6 +1782,61 @@ function setDashPeriodMode(mode){
   });
   populateDashYears();
   refreshDashboard();
+  syncYearToAllPages();
+}
+
+// Push the current dashboard year+period to all other pages and re-render active page
+function syncYearToAllPages(){
+  const dashYearEl=document.getElementById('dashYearSel');
+  const dashYear=dashYearEl?.value||(new Date().getFullYear()+'');
+
+  // Build year options for other selectors (same years as dashboard)
+  const cy=new Date().getFullYear();
+  const baseYrs=[...new Set([cy,cy-1,cy-2,...entriesList.map(e=>parseInt(e.year)).filter(y=>!isNaN(y)),...salesList.map(s=>parseInt(s.year)).filter(y=>!isNaN(y))])].sort((a,b)=>b-a);
+
+  // For FY mode, convert dashYear (FY start) to CY equivalent options
+  // rptYear and salesFilterYear still use calendar year values; 
+  // we sync by finding the closest CY year that overlaps with selected FY
+  const targetCY = dashPeriodMode==='FY' ? parseInt(dashYear)+1 : parseInt(dashYear);
+
+  // ── rptYear ──────────────────────────────────────────────────
+  const rptYr=document.getElementById('rptYear');
+  if(rptYr){
+    // Rebuild options to include all known years
+    const prev=rptYr.value;
+    rptYr.innerHTML=baseYrs.map(y=>`<option value="${y}">${dashPeriodMode==='FY'?'FY '+(y-1)+'-'+String(y).slice(-2):y}</option>`).join('');
+    // Select the year that best matches dashboard selection
+    const match=baseYrs.find(y=>y===targetCY)||baseYrs[0];
+    rptYr.value=String(match);
+  }
+
+  // ── meYear ────────────────────────────────────────────────────
+  const meYr=document.getElementById('meYear');
+  if(meYr){
+    const prev=meYr.value;
+    const opts='<option value="All">All Years</option>'+baseYrs.map(y=>`<option value="${y}">${dashPeriodMode==='FY'?'FY '+(y-1)+'-'+String(y).slice(-2):y}</option>`).join('');
+    meYr.innerHTML=opts;
+    const match=baseYrs.find(y=>y===targetCY);
+    meYr.value=match?String(match):'All';
+  }
+
+  // ── salesFilterYear ───────────────────────────────────────────
+  const sfYr=document.getElementById('salesFilterYear');
+  if(sfYr){
+    const prev=sfYr.value;
+    const opts='<option value="All">All Years</option>'+baseYrs.map(y=>`<option value="${y}">${dashPeriodMode==='FY'?'FY '+(y-1)+'-'+String(y).slice(-2):y}</option>`).join('');
+    sfYr.innerHTML=opts;
+    const match=baseYrs.find(y=>y===targetCY);
+    sfYr.value=match?String(match):'All';
+  }
+
+  // Re-render whichever page is currently active (not dashboard)
+  const activePage=document.querySelector('.page.active');
+  if(!activePage||activePage.id==='page-dashboard') return;
+  const page=activePage.id.replace('page-','');
+  const fnMap={reports:'renderReports','my-entries':'renderMyEntries',sales:'renderSalesPage'};
+  const fn=fnMap[page]?window[fnMap[page]]:null;
+  if(typeof fn==='function') fn();
 }
 function populateDashYears(){
   const sel=document.getElementById('dashYearSel'); if(!sel) return;
@@ -1990,7 +2047,10 @@ function renderMyEntries(){
   const cat=document.getElementById('meCat')?.value||'All';
   const plant=document.getElementById('mePlant')?.value||'All';
   let list=getFilteredEntries();
-  if(year!=='All') list=list.filter(e=>String(e.year)===String(year));
+  if(year!=='All'){
+    const periodVal=dashPeriodMode==='FY'?String(parseInt(year)-1):year;
+    list=filterByPeriod(list, periodVal);
+  }
   if(month!=='All') list=list.filter(e=>e.month===month);
   if(cat!=='All') list=list.filter(e=>e.category===cat);
   if(plant!=='All') list=list.filter(e=>e.plant===plant);
@@ -2058,7 +2118,9 @@ function renderReports(){
   const body=document.getElementById('rptBody'); if(!body) return;
   const year=document.getElementById('rptYear')?.value||(new Date().getFullYear()+'');
   const plant=document.getElementById('rptPlant')?.value||'All';
-  let entries=getFilteredEntries().filter(e=>String(e.year)===String(year));
+  // Use filterByPeriod to respect CY/FY mode (convert CY year to FY start year for FY mode)
+  const periodVal=dashPeriodMode==='FY'?String(parseInt(year)-1):year;
+  let entries=filterByPeriod(getFilteredEntries(), periodVal);
   if(plant!=='All') entries=entries.filter(e=>e.plant===plant);
   const total=entries.reduce((s,e)=>s+e.amount,0);
   const groups={};
@@ -2084,13 +2146,14 @@ function renderReports(){
   else rows+=`<tr style="border-top:2px solid var(--border)"><td colspan="4" style="font-weight:800;color:var(--navy)">GRAND TOTAL</td><td class="mono" style="font-weight:800;color:var(--red)">${fmtINRFull(total)}</td><td style="font-weight:700">100%</td></tr>`;
   body.innerHTML=rows;
 
+  const orderedMths=getOrderedMonths();
   const monthlyByCat={};
-  ['Internal Failures','External Failures','Appraisal','Prevention'].forEach(c=>{monthlyByCat[c]=MONTHS.map(()=>0);});
-  entries.forEach(e=>{const mIdx=MONTHS.indexOf(e.month);if(mIdx===-1)return;if(monthlyByCat[e.category])monthlyByCat[e.category][mIdx]+=e.amount;});
+  ['Internal Failures','External Failures','Appraisal','Prevention'].forEach(c=>{monthlyByCat[c]=orderedMths.map(()=>0);});
+  entries.forEach(e=>{const mIdx=orderedMths.indexOf(e.month);if(mIdx===-1)return;if(monthlyByCat[e.category])monthlyByCat[e.category][mIdx]+=e.amount;});
   const rmCtx=document.getElementById('rptMonthChart');
   if(rmCtx){
     if(reportCharts.month)reportCharts.month.destroy();
-    reportCharts.month=new Chart(rmCtx,{type:'bar',data:{labels:MONTHS.map(m=>m.slice(0,3)),datasets:['Internal Failures','External Failures','Appraisal','Prevention'].map(c=>({label:c,data:monthlyByCat[c],backgroundColor:catColor(c).chart,borderRadius:2,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,clip:false,plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:8,font:{size:9},padding:8}},tooltip:{callbacks:{label:ctx=>' '+ctx.dataset.label+': '+fmtINR(ctx.raw)}}},scales:{x:{stacked:true,ticks:{font:{size:9}},grid:{display:false}},y:{stacked:true,ticks:{font:{size:9},callback:v=>fmtINR(v)},grid:{color:'rgba(0,0,0,0.05)'}}}}});
+    reportCharts.month=new Chart(rmCtx,{type:'bar',data:{labels:orderedMths.map(m=>m.slice(0,3)),datasets:['Internal Failures','External Failures','Appraisal','Prevention'].map(c=>({label:c,data:monthlyByCat[c],backgroundColor:catColor(c).chart,borderRadius:2,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,clip:false,plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:8,font:{size:9},padding:8}},tooltip:{callbacks:{label:ctx=>' '+ctx.dataset.label+': '+fmtINR(ctx.raw)}}},scales:{x:{stacked:true,ticks:{font:{size:9}},grid:{display:false}},y:{stacked:true,ticks:{font:{size:9},callback:v=>fmtINR(v)},grid:{color:'rgba(0,0,0,0.05)'}}}}});
   }
   const catSums={};entries.forEach(e=>{catSums[e.category]=(catSums[e.category]||0)+e.amount;});
   const rcCtx=document.getElementById('rptCatChart');
@@ -2378,7 +2441,11 @@ function renderSalesTable(){
   const yearF=document.getElementById('salesFilterYear')?.value||'All';
   const plantF=document.getElementById('salesFilterPlant')?.value||'All';
   let list=getSalesForRole();
-  if(yearF!=='All') list=list.filter(s=>String(s.year)===String(yearF));
+  if(yearF!=='All'){
+    // Use filterByPeriod to respect CY/FY mode
+    const periodVal=dashPeriodMode==='FY'?String(parseInt(yearF)-1):yearF;
+    list=filterByPeriod(list, periodVal);
+  }
   if(plantF!=='All') list=list.filter(s=>s.plant===plantF);
   list=[...list].sort((a,b)=>{if(String(b.year)!==String(a.year))return parseInt(b.year)-parseInt(a.year);return MONTHS.indexOf(b.month)-MONTHS.indexOf(a.month);});
   const isAdmin=currentProfile?.role==='super_admin'||currentProfile?.role==='admin';
@@ -2674,6 +2741,7 @@ window.applyCompanySettings  = applyCompanySettings;
 window.refreshPlantSelectors = refreshPlantSelectors;
 window.populateDashYears     = populateDashYears;
 window.populateReportYears   = populateReportYears;
+window.syncYearToAllPages    = syncYearToAllPages;
 window.updateSidebarProfile  = updateSidebarProfile;
 window.getFilteredEntries    = getFilteredEntries;
 window.getSalesForRole       = getSalesForRole;
