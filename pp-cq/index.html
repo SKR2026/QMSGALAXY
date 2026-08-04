@@ -663,12 +663,12 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
 
       <!-- Factor-wise Access Rights (Plant Admin / Super Admin) -->
       <div class="card mb-16" id="factorAccessCard" style="display:none">
-        <div class="card-title" style="margin-bottom:2px">Factor-wise Access Rights</div>
-        <div style="font-size:11px;color:var(--text3);margin-bottom:16px">Control which COPQ cost factors each user can enter and view. Unchecked factors are hidden for that user across Entry, Dashboard, My Entries and Reports.</div>
+        <div class="card-title" style="margin-bottom:2px">Factor &amp; Sub-category Access Rights</div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:16px">Control which COPQ cost factors — and which specific sub-categories within them — each user can enter and view. Restricted items are hidden for that user across Entry, Dashboard, My Entries and Reports.</div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>User</th><th>Plant</th><th style="text-align:center">Internal Failures</th><th style="text-align:center">External Failures</th><th style="text-align:center">Appraisal</th><th style="text-align:center">Prevention</th><th></th></tr></thead>
-            <tbody id="factorAccessBody"><tr><td colspan="7" style="text-align:center;color:var(--text3);padding:20px">Loading…</td></tr></tbody>
+            <thead><tr><th>User</th><th>Plant</th><th>Factor Access</th><th></th></tr></thead>
+            <tbody id="factorAccessBody"><tr><td colspan="4" style="text-align:center;color:var(--text3);padding:20px">Loading…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -836,6 +836,23 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
   </div>
 </div>
 
+<!-- Manage Factor & Sub-category Access -->
+<div class="modal-overlay" id="factorAccessModal">
+  <div class="modal" style="max-width:640px">
+    <div class="modal-header">
+      <div class="modal-title" id="faModalTitle">Manage Access</div>
+      <button class="modal-close" onclick="closeModal('factorAccessModal')">×</button>
+    </div>
+    <input type="hidden" id="faUserId">
+    <div style="font-size:11px;color:var(--text3);margin-bottom:14px">Uncheck a factor to hide it entirely, or leave it checked and uncheck specific sub-categories to narrow access within it.</div>
+    <div id="faCategoryList" style="display:flex;flex-direction:column;gap:12px;max-height:56vh;overflow-y:auto"></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:18px">
+      <button class="btn" onclick="closeModal('factorAccessModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveFactorAccessModal()">Save Access Rights</button>
+    </div>
+  </div>
+</div>
+
 <!-- Add Plant -->
 <div class="modal-overlay" id="plantModal">
   <div class="modal">
@@ -981,6 +998,13 @@ const COPQ_FACTORS = ['Internal Failures','External Failures','Appraisal','Preve
 // Users without a `factors` array (or with an empty one) get full access — keeps existing users working unchanged.
 function getUserFactors(u){
   return (u && Array.isArray(u.factors) && u.factors.length) ? u.factors : COPQ_FACTORS.slice();
+}
+// Sub-category access is stored per-category as u.subcats[category] = [allowed subcat names].
+// A missing key for a category means "no restriction" — full access to every sub-category in that category.
+function getUserSubcats(u, category){
+  const allSubs=mastersList.filter(m=>m.category===category).map(m=>m.subcat);
+  if(u && u.subcats && Array.isArray(u.subcats[category])) return u.subcats[category];
+  return allSubs;
 }
 
 const DEFAULT_MASTERS = [
@@ -1299,6 +1323,9 @@ window.saveEntry=async function(){
   }
   if(currentProfile.role!=='super_admin'&&!getUserFactors(currentProfile).includes(category)){
     showToast('You do not have access to this COPQ factor'); return;
+  }
+  if(currentProfile.role!=='super_admin'&&!getUserSubcats(currentProfile,category).includes(subcat)){
+    showToast('You do not have access to this sub-category'); return;
   }
   if(editingEntryId){
     const existing=entriesList.find(x=>x.id===editingEntryId);
@@ -1696,7 +1723,11 @@ function getFilteredEntries(){
   }
   if(p.role!=='super_admin'){
     const allowed=getUserFactors(p);
-    list=list.filter(e=>allowed.includes(e.category));
+    list=list.filter(e=>{
+      if(!allowed.includes(e.category)) return false;
+      const allowedSubs=getUserSubcats(p,e.category);
+      return allowedSubs.includes(e.subcat);
+    });
   }
   return list;
 }
@@ -2189,7 +2220,7 @@ function renderSettings(){
   renderFactorAccessPanel();
 }
 
-// ── Factor-wise Access Rights (Plant Admin / Super Admin) ──────
+// ── Factor & Sub-category Access Rights (Plant Admin / Super Admin) ──
 function renderFactorAccessPanel(){
   const card=document.getElementById('factorAccessCard');
   const body=document.getElementById('factorAccessBody');
@@ -2205,28 +2236,74 @@ function renderFactorAccessPanel(){
     list=list.filter(u=>u.plant===currentProfile.plant);
   }
   if(!list.length){
-    body.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:20px">No users to manage</td></tr>';
+    body.innerHTML='<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:20px">No users to manage</td></tr>';
     return;
   }
   body.innerHTML=list.map(u=>{
-    const allowed=getUserFactors(u);
-    const cbs=COPQ_FACTORS.map(f=>`<td style="text-align:center"><input type="checkbox" class="factor-chk" data-uid="${u.id}" data-factor="${f.replace(/"/g,'&quot;')}" ${allowed.includes(f)?'checked':''}></td>`).join('');
+    const allowedFactors=getUserFactors(u);
+    const chips=COPQ_FACTORS.map(f=>{
+      const on=allowedFactors.includes(f);
+      const allSubs=mastersList.filter(m=>m.category===f).map(m=>m.subcat);
+      const allowedSubs=getUserSubcats(u,f);
+      const subRestricted=on&&allSubs.length&&allowedSubs.length<allSubs.length;
+      const label=f.split(' ')[0]+(subRestricted?` (${allowedSubs.length}/${allSubs.length})`:'');
+      return `<span class="badge ${on?(subRestricted?'badge-amber':'badge-green'):'badge-red'}" style="margin:2px" title="${f}">${label}</span>`;
+    }).join('');
     return `<tr>
       <td style="font-weight:600">${u.name||'—'}<div style="font-size:11px;color:var(--text3);font-weight:400">${u.email||''}</div></td>
       <td>${u.plant||'All'}</td>
-      ${cbs}
-      <td><button class="btn btn-sm" onclick="saveFactorAccess('${u.id}')">Save</button></td>
+      <td>${chips}</td>
+      <td><button class="btn btn-sm" onclick="openFactorAccessModal('${u.id}')">Manage Access</button></td>
     </tr>`;
   }).join('');
 }
-async function saveFactorAccess(uid){
-  const boxes=document.querySelectorAll('.factor-chk[data-uid="'+uid+'"]');
-  const selected=[...boxes].filter(b=>b.checked).map(b=>b.dataset.factor);
-  if(!selected.length){ showToast('Select at least one factor'); return; }
+function openFactorAccessModal(uid){
+  const u=usersList.find(x=>x.id===uid); if(!u) return;
+  document.getElementById('faUserId').value=uid;
+  document.getElementById('faModalTitle').textContent='Manage Access — '+(u.name||u.email||'User');
+  const allowedFactors=getUserFactors(u);
+  const listEl=document.getElementById('faCategoryList');
+  listEl.innerHTML=COPQ_FACTORS.map(cat=>{
+    const subs=mastersList.filter(m=>m.category===cat).map(m=>m.subcat);
+    const allowedSubs=getUserSubcats(u,cat);
+    const subHtml=subs.length
+      ?subs.map(s=>`<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);font-weight:400"><input type="checkbox" class="fa-sub-chk" data-category="${cat.replace(/"/g,'&quot;')}" data-subcat="${s.replace(/"/g,'&quot;')}" ${allowedSubs.includes(s)?'checked':''}>${s}</label>`).join('')
+      :'<div style="font-size:11px;color:var(--text3)">No sub-categories defined for this factor</div>';
+    return `<div class="card" style="padding:12px 14px;background:var(--surface2);border-radius:var(--r-md)">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:13px;cursor:pointer">
+          <input type="checkbox" class="fa-cat-chk" data-category="${cat.replace(/"/g,'&quot;')}" ${allowedFactors.includes(cat)?'checked':''}>${cat}
+        </label>
+        ${subs.length?`<span style="font-size:11px;display:flex;gap:10px">
+          <a href="#" onclick="toggleFaSubs('${cat.replace(/'/g,"\\'")}',true);return false" style="color:var(--blue)">All</a>
+          <a href="#" onclick="toggleFaSubs('${cat.replace(/'/g,"\\'")}',false);return false" style="color:var(--text3)">None</a>
+        </span>`:''}
+      </div>
+      <div style="margin-top:10px;padding-left:24px;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:6px">${subHtml}</div>
+    </div>`;
+  }).join('');
+  document.getElementById('factorAccessModal').classList.add('open');
+}
+function toggleFaSubs(category, checked){
+  document.querySelectorAll('.fa-sub-chk[data-category="'+category+'"]').forEach(c=>c.checked=checked);
+}
+async function saveFactorAccessModal(){
+  const uid=document.getElementById('faUserId').value; if(!uid) return;
+  const factors=[...document.querySelectorAll('.fa-cat-chk:checked')].map(c=>c.dataset.category);
+  if(!factors.length){ showToast('Select at least one factor'); return; }
+  const subcats={};
+  COPQ_FACTORS.forEach(cat=>{
+    const subChks=[...document.querySelectorAll('.fa-sub-chk[data-category="'+cat+'"]')];
+    if(!subChks.length) return; // no masters defined for this category
+    const checked=subChks.filter(c=>c.checked).map(c=>c.dataset.subcat);
+    if(checked.length<subChks.length) subcats[cat]=checked; // only store when restricted below "all"
+  });
   try{
-    await window.FB.updateUser(uid,{factors:selected});
-    const u=usersList.find(x=>x.id===uid); if(u) u.factors=selected;
+    await window.FB.updateUser(uid,{factors,subcats});
+    const u=usersList.find(x=>x.id===uid); if(u){u.factors=factors;u.subcats=subcats;}
     showToast('Access rights updated ✓');
+    closeModal('factorAccessModal');
+    renderFactorAccessPanel();
   } catch(err){ showToast('Error: '+err.message,6000); }
 }
 
@@ -2330,7 +2407,11 @@ function updateSalesAmountDisplay(){
 function updateEntrySubcats(){
   const cat=document.getElementById('entryCategory').value;
   const sel=document.getElementById('entrySubcat');
-  const masters=mastersList.filter(m=>m.category===cat);
+  let masters=mastersList.filter(m=>m.category===cat);
+  if(cat && currentProfile && currentProfile.role!=='super_admin'){
+    const allowedSubs=getUserSubcats(currentProfile,cat);
+    masters=masters.filter(m=>allowedSubs.includes(m.subcat));
+  }
   sel.innerHTML=cat
     ?(masters.length
       ?'<option value="">— Select sub-category —</option>'+masters.map(m=>`<option value="${m.subcat}" data-unit="${m.unit||''}">${m.subcat}</option>`).join('')
@@ -2411,6 +2492,7 @@ function processBulkRows(raw){
     if(!plant||!plantsList.find(p=>p.name===plant)) errors.push('Plant not found');
     if(!VALID_CATS.includes(category)) errors.push('Invalid category');
     else if(currentProfile&&currentProfile.role!=='super_admin'&&!getUserFactors(currentProfile).includes(category)) errors.push('Category not permitted for your access rights');
+    else if(currentProfile&&currentProfile.role!=='super_admin'&&subcat&&!getUserSubcats(currentProfile,category).includes(subcat)) errors.push('Sub-category not permitted for your access rights');
     if(!subcat) errors.push('Sub-category required');
     if(isNaN(amount)||amount<=0) errors.push('Amount must be > 0');
     return{year,month,plant,category,subcat,amount,qty,unit,description,errors,rowNum:i+2};
@@ -2546,8 +2628,11 @@ window.setDashPeriodMode     = setDashPeriodMode;
 window.renderDashPlantPills  = renderDashPlantPills;
 window.selectDashPlant       = selectDashPlant;
 window.renderFactorAccessPanel = renderFactorAccessPanel;
-window.saveFactorAccess      = saveFactorAccess;
+window.openFactorAccessModal = openFactorAccessModal;
+window.toggleFaSubs          = toggleFaSubs;
+window.saveFactorAccessModal = saveFactorAccessModal;
 window.getUserFactors        = getUserFactors;
+window.getUserSubcats        = getUserSubcats;
 // Page render functions (called by navigate())
 window.refreshDashboard      = refreshDashboard;
 window.renderMyEntries       = renderMyEntries;
