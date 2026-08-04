@@ -993,12 +993,12 @@ function showToast(msg,dur=2800){
 }
 function closeModal(id){ document.getElementById(id).classList.remove('open'); }
 
-// ── Navigate — identical to v3 pattern, no try/catch swallowing ──
+// ── Navigate — errors are now surfaced ON SCREEN, not just console ──
 function navigate(page, el){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   const pageEl=document.getElementById('page-'+page);
-  if(!pageEl){ console.error('Page not found: page-'+page); return; }
+  if(!pageEl){ showDiag('Page not found: page-'+page); return; }
   pageEl.classList.add('active');
   if(el) el.classList.add('active');
   const titles={
@@ -1008,15 +1008,42 @@ function navigate(page, el){
   };
   const titleEl=document.getElementById('pageTitle');
   if(titleEl) titleEl.textContent=titles[page]||page;
-  if(page==='dashboard')  refreshDashboard();
-  if(page==='my-entries') renderMyEntries();
-  if(page==='reports')    renderReports();
-  if(page==='users')      renderUsers();
-  if(page==='plants')     renderPlants();
-  if(page==='masters')    renderMasters();
-  if(page==='settings')   renderSettings();
-  if(page==='sales')      renderSalesPage();
+  const renderFns={
+    dashboard: refreshDashboard,
+    'my-entries': renderMyEntries,
+    reports: renderReports,
+    users: renderUsers,
+    plants: renderPlants,
+    masters: renderMasters,
+    settings: renderSettings,
+    sales: renderSalesPage
+  };
+  const fn=renderFns[page];
+  if(fn){
+    try{ fn(); }
+    catch(err){
+      showDiag('Error rendering "'+page+'": '+err.message);
+      console.error('navigate/'+page+' error:',err);
+    }
+  }
 }
+
+// Shows a persistent, visible on-page error banner (not just console)
+// so failures are diagnosable without opening devtools.
+function showDiag(msg){
+  console.error('[COPQ DIAG]',msg);
+  let bar=document.getElementById('diagBar');
+  if(!bar){
+    bar=document.createElement('div');
+    bar.id='diagBar';
+    bar.style.cssText='position:fixed;top:0;left:0;right:0;background:#C0392B;color:#fff;padding:10px 16px;font-size:13px;font-family:monospace;z-index:99999;box-shadow:0 2px 8px rgba(0,0,0,0.3);white-space:pre-wrap';
+    document.body.prepend(bar);
+  }
+  bar.textContent='⚠ '+msg+'  (click to dismiss)';
+  bar.onclick=()=>bar.remove();
+  showToast('Error: '+msg,7000);
+}
+window.showDiag=showDiag;
 </script>
 
 <!-- ════════════════════════════════════════════════════════
@@ -1101,19 +1128,24 @@ window.FB = {
 
 // ── Auth State ──────────────────────────────────────────────
 window.FB.onAuth(async user=>{
-  if(user){
-    currentUser=user;
-    const profile=await window.FB.getProfile(user.uid);
-    if(!profile){ showToast('Profile not found — contact admin',6000); await window.FB.logout(); return; }
-    currentProfile=profile;
-    applyRole(profile);
-    document.getElementById('authGate').style.display='none';
-    await loadAllData();
-    refreshDashboard();
-    showToast('Signed in ✓');
-  } else {
-    currentUser=null; currentProfile=null;
-    document.getElementById('authGate').style.display='flex';
+  try{
+    if(user){
+      currentUser=user;
+      const profile=await window.FB.getProfile(user.uid);
+      if(!profile){ showToast('Profile not found — contact admin',6000); await window.FB.logout(); return; }
+      currentProfile=profile;
+      applyRole(profile);
+      document.getElementById('authGate').style.display='none';
+      await loadAllData();
+      refreshDashboard();
+      showToast('Signed in ✓');
+    } else {
+      currentUser=null; currentProfile=null;
+      document.getElementById('authGate').style.display='flex';
+    }
+  } catch(err){
+    if(window.showDiag) window.showDiag('Auth/profile load failed: '+err.message+' (code: '+(err.code||'n/a')+')');
+    else console.error('Auth error:',err);
   }
 });
 
@@ -1464,19 +1496,53 @@ window.removeLogoAction=async function(){
 <script>
 
 // ── Load Data ─────────────────────────────────────────────────
+// IMPORTANT: each collection is loaded independently (allSettled, not all).
+// If Firestore rules block ONE collection (e.g. copqUsers readable only by
+// admins), that must NOT prevent plants/masters/entries from loading too —
+// which is exactly what Promise.all() would do (reject everything on one
+// failure). This was the most likely cause of "all tabs blank".
 async function loadAllData(){
+  const results = await Promise.allSettled([
+    window.FB.getEntries(),
+    window.FB.getPlants(),
+    window.FB.getUsers(),
+    window.FB.getMasters()
+  ]);
+  const [entriesR, plantsR, usersR, mastersR] = results;
+  const failures = [];
+
+  if(entriesR.status==='fulfilled') entriesList = entriesR.value;
+  else { entriesList=[]; failures.push('Entries: '+entriesR.reason.message+' (code: '+(entriesR.reason.code||'n/a')+')'); }
+
+  if(plantsR.status==='fulfilled') plantsList = plantsR.value;
+  else { plantsList=[]; failures.push('Plants: '+plantsR.reason.message+' (code: '+(plantsR.reason.code||'n/a')+')'); }
+
+  if(usersR.status==='fulfilled') usersList = usersR.value;
+  else { usersList=[]; failures.push('Users: '+usersR.reason.message+' (code: '+(usersR.reason.code||'n/a')+')'); }
+
+  if(mastersR.status==='fulfilled') mastersList = mastersR.value;
+  else { mastersList=[]; failures.push('Masters: '+mastersR.reason.message+' (code: '+(mastersR.reason.code||'n/a')+')'); }
+
+  if(failures.length){
+    showDiag('Firestore read failed for: '+failures.join(' | ')+'  → Check Firestore Security Rules for these collections.');
+  }
+
+  if(mastersList.length===0 && mastersR.status==='fulfilled'){
+    try{ await window.FB.seedMasters(); mastersList=await window.FB.getMasters(); }
+    catch(e){ showDiag('Could not seed default masters: '+e.message+' (code: '+(e.code||'n/a')+')'); }
+  }
+
   try{
-    [entriesList,plantsList,usersList,mastersList]=await Promise.all([
-      window.FB.getEntries(),window.FB.getPlants(),window.FB.getUsers(),window.FB.getMasters()
-    ]);
-    if(mastersList.length===0) await window.FB.seedMasters().then(async()=>{mastersList=await window.FB.getMasters();});
-    try{
-      salesList=await window.FB.getSales();
-      salesList.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
-    } catch(e){console.warn('Sales load skipped:',e.message);salesList=[];}
-    refreshPlantSelectors(); populateDashYears(); populateReportYears(); updateSidebarProfile();
-    try{const s=await window.FB.getSettings();if(s) applyCompanySettings(s);}catch(e){}
-  } catch(err){console.error('Load error:',err);showToast('Error loading data: '+err.message,6000);}
+    salesList=await window.FB.getSales();
+    salesList.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
+  } catch(e){
+    salesList=[];
+    showDiag('Sales load failed: '+e.message+' (code: '+(e.code||'n/a')+') — Sales tab will be empty until Firestore rules allow reading copqSales.');
+  }
+
+  refreshPlantSelectors(); populateDashYears(); populateReportYears(); updateSidebarProfile();
+  try{ const s=await window.FB.getSettings(); if(s) applyCompanySettings(s); }
+  catch(e){ console.warn('Settings load failed (non-critical):',e.message); }
 }
 
 function applyCompanySettings(settings){
