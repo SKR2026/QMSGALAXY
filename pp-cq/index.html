@@ -1131,13 +1131,35 @@ window.FB = {
 window.FB.onAuth(async user=>{
   try{
     if(user){
+      console.log('[COPQ] Step 1: Auth fired, uid='+user.uid+', email='+user.email);
       currentUser=user;
-      const profile=await window.FB.getProfile(user.uid);
-      if(!profile){ showToast('Profile not found — contact admin',6000); await window.FB.logout(); return; }
+
+      console.log('[COPQ] Step 2: Loading profile from copqUsers/'+user.uid);
+      let profile=null;
+      try{
+        profile=await window.FB.getProfile(user.uid);
+      }catch(profileErr){
+        showDiag('STEP 2 FAILED — Could not read copqUsers/'+user.uid+': '+profileErr.message+' | code: '+(profileErr.code||'n/a'));
+        return;
+      }
+
+      if(!profile){
+        showDiag('STEP 2 FAILED — No document found at copqUsers/'+user.uid+'. Create a Firestore document at collection=copqUsers, doc='+user.uid+' with fields: name, email, role="super_admin", plant="All"');
+        await window.FB.logout(); return;
+      }
+
+      console.log('[COPQ] Step 3: Profile loaded. role="'+profile.role+'" plant="'+profile.plant+'" name="'+profile.name+'"');
+      // Show profile details in a toast so it's visible without devtools
+      showToast('Profile: role='+profile.role+' | plant='+(profile.plant||'(none)'), 5000);
+
       currentProfile=profile;
       applyRole(profile);
       document.getElementById('authGate').style.display='none';
+
+      console.log('[COPQ] Step 4: Loading all Firestore collections…');
       await loadAllData();
+
+      console.log('[COPQ] Step 5: Refreshing dashboard…');
       refreshDashboard();
       showToast('Signed in ✓');
     } else {
@@ -1145,8 +1167,7 @@ window.FB.onAuth(async user=>{
       document.getElementById('authGate').style.display='flex';
     }
   } catch(err){
-    if(window.showDiag) window.showDiag('Auth/profile load failed: '+err.message+' (code: '+(err.code||'n/a')+')');
-    else console.error('Auth error:',err);
+    showDiag('Auth/load failed at unexpected point: '+err.message+' | code: '+(err.code||'n/a')+' | stack: '+err.stack);
   }
 });
 
@@ -1502,6 +1523,8 @@ window.removeLogoAction=async function(){
 // which is exactly what Promise.all() would do (reject everything on one
 // failure). This was the most likely cause of "all tabs blank".
 async function loadAllData(){
+  console.log('[COPQ] loadAllData: starting…');
+
   const results = await Promise.allSettled([
     window.FB.getEntries(),
     window.FB.getPlants(),
@@ -1510,39 +1533,49 @@ async function loadAllData(){
   ]);
   const [entriesR, plantsR, usersR, mastersR] = results;
   const failures = [];
+  const successes = [];
 
-  if(entriesR.status==='fulfilled') entriesList = entriesR.value;
-  else { entriesList=[]; failures.push('Entries: '+entriesR.reason.message+' (code: '+(entriesR.reason.code||'n/a')+')'); }
+  if(entriesR.status==='fulfilled'){ entriesList=entriesR.value; successes.push('entries('+entriesList.length+')'); }
+  else { entriesList=[]; failures.push('copqEntries: '+entriesR.reason.message+' ['+( entriesR.reason.code||'n/a')+']'); }
 
-  if(plantsR.status==='fulfilled') plantsList = plantsR.value;
-  else { plantsList=[]; failures.push('Plants: '+plantsR.reason.message+' (code: '+(plantsR.reason.code||'n/a')+')'); }
+  if(plantsR.status==='fulfilled'){ plantsList=plantsR.value; successes.push('plants('+plantsList.length+')'); }
+  else { plantsList=[]; failures.push('copqPlants: '+plantsR.reason.message+' ['+(plantsR.reason.code||'n/a')+']'); }
 
-  if(usersR.status==='fulfilled') usersList = usersR.value;
-  else { usersList=[]; failures.push('Users: '+usersR.reason.message+' (code: '+(usersR.reason.code||'n/a')+')'); }
+  if(usersR.status==='fulfilled'){ usersList=usersR.value; successes.push('users('+usersList.length+')'); }
+  else { usersList=[]; failures.push('copqUsers: '+usersR.reason.message+' ['+(usersR.reason.code||'n/a')+']'); }
 
-  if(mastersR.status==='fulfilled') mastersList = mastersR.value;
-  else { mastersList=[]; failures.push('Masters: '+mastersR.reason.message+' (code: '+(mastersR.reason.code||'n/a')+')'); }
+  if(mastersR.status==='fulfilled'){ mastersList=mastersR.value; successes.push('masters('+mastersList.length+')'); }
+  else { mastersList=[]; failures.push('copqMasters: '+mastersR.reason.message+' ['+(mastersR.reason.code||'n/a')+']'); }
+
+  console.log('[COPQ] loadAllData: OK='+successes.join(', ')+(failures.length?' | FAIL='+failures.join(', '):''));
+
+  // Show data summary on screen so visible without devtools
+  showToast('Loaded: '+successes.join(', ')+(failures.length?' | FAILED: '+failures.join('; '):''), 6000);
 
   if(failures.length){
-    showDiag('Firestore read failed for: '+failures.join(' | ')+'  → Check Firestore Security Rules for these collections.');
+    showDiag('Firestore FAILED → '+failures.join(' | '));
   }
 
   if(mastersList.length===0 && mastersR.status==='fulfilled'){
-    try{ await window.FB.seedMasters(); mastersList=await window.FB.getMasters(); }
-    catch(e){ showDiag('Could not seed default masters: '+e.message+' (code: '+(e.code||'n/a')+')'); }
+    try{ await window.FB.seedMasters(); mastersList=await window.FB.getMasters();
+      console.log('[COPQ] loadAllData: seeded masters, now '+mastersList.length);
+    }catch(e){ showDiag('Could not seed masters: '+e.message+' ['+( e.code||'n/a')+']'); }
   }
 
   try{
     salesList=await window.FB.getSales();
     salesList.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
+    console.log('[COPQ] loadAllData: sales('+salesList.length+')');
   } catch(e){
     salesList=[];
-    showDiag('Sales load failed: '+e.message+' (code: '+(e.code||'n/a')+') — Sales tab will be empty until Firestore rules allow reading copqSales.');
+    showDiag('copqSales FAILED: '+e.message+' ['+(e.code||'n/a')+']');
   }
 
   refreshPlantSelectors(); populateDashYears(); populateReportYears(); updateSidebarProfile();
   try{ const s=await window.FB.getSettings(); if(s) applyCompanySettings(s); }
-  catch(e){ console.warn('Settings load failed (non-critical):',e.message); }
+  catch(e){ console.warn('[COPQ] Settings load skipped:',e.message); }
+
+  console.log('[COPQ] loadAllData: complete.');
 }
 
 function applyCompanySettings(settings){
@@ -1565,7 +1598,15 @@ function applyCompanySettings(settings){
 }
 
 function applyRole(profile){
-  const isSA=profile.role==='super_admin';
+  const isSA   = profile.role==='super_admin';
+  const isAdmin= profile.role==='admin'||isSA;
+  console.log('[COPQ] applyRole: role="'+profile.role+'" isSA='+isSA);
+  // Show role in sidebar footer immediately so it is visible on screen
+  const sidebarRole=document.getElementById('sidebarRole');
+  if(sidebarRole) sidebarRole.textContent='role: '+profile.role+' | isSA:'+isSA;
+  if(!isSA){
+    console.warn('[COPQ] role is "'+profile.role+'" not "super_admin" — admin tabs hidden. Fix the role field in Firestore: copqUsers/'+profile.id);
+  }
   document.getElementById('navAdminGroup').style.display=isSA?'':'none';
   document.getElementById('nav-users').style.display=isSA?'':'none';
   document.getElementById('nav-plants').style.display=isSA?'':'none';
