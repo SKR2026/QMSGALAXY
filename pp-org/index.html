@@ -229,7 +229,9 @@ tr:hover td{background:var(--g50)}
 
 /* Org chart */
 .org-wrap{overflow:auto;background:#fff;border-radius:var(--rl);border:1px solid var(--g100);min-height:380px}
-.org-canvas{display:inline-flex;min-width:100%;justify-content:center;padding:44px 36px;transform-origin:top center;transition:transform .2s}
+.org-canvas{display:inline-flex;min-width:100%;justify-content:center;padding:44px 36px;transform-origin:top center;transition:transform .2s;will-change:transform}
+/* GPU-promote individual nodes for large trees so CSS transforms are cheap */
+.ocard{contain:layout style;}
 .org-tb{display:flex;align-items:center;gap:8px;padding:11px 14px;background:#fff;border-radius:var(--rl);border:1px solid var(--g100);margin-bottom:14px;flex-wrap:wrap}
 .org-t{font-size:13px;font-weight:700;color:var(--navy);flex:1}
 .onode{display:flex;flex-direction:column;align-items:center;position:relative}
@@ -384,6 +386,7 @@ const S = {
   companyName:'',     // Company name set by superadmin in settings
   _photoFile:null, _photoPreview:null,
   _empSearch:'',  // employee table search string
+  _empPage:0,     // current page index for employee table (50 rows per page)
   _pubTab:'grp',  // public view active tab: 'grp' | 'plt' | 'dpt'
   _pubDept:'',    // selected dept in dept-wise public tab
   _pubSearch:'',  // current search string in public view
@@ -426,6 +429,16 @@ function structSettingsDoc(docName){
   return db.collection('settings').doc(docName);
 }
 
+// ── Debounced render for chart interactions ──────────────────────
+// Collapses/search on 250-node charts can fire render() many times per second.
+// This batches rapid calls into one rAF so the browser never drops frames.
+let _renderPending = false;
+function renderDeferred(){
+  if(_renderPending) return;
+  _renderPending = true;
+  requestAnimationFrame(()=>{ _renderPending=false; render(); });
+}
+
 function toast(msg, type='in'){
   const t=document.createElement('div');
   t.className=`toast t${type}`;
@@ -433,6 +446,15 @@ function toast(msg, type='in'){
   t.innerHTML=`<span>${icons['t'+type]||'ℹ'}</span><span style="flex:1">${msg}</span>`;
   $('toasts').appendChild(t);
   setTimeout(()=>t.remove(),3500);
+}
+
+// Count total nodes in a tree (iterative, safe for 250+)
+function countNodes(node){
+  if(!node) return 0;
+  let count=0;
+  const stack=[node];
+  while(stack.length){ const n=stack.pop(); count++; (n.children||[]).forEach(c=>stack.push(c)); }
+  return count;
 }
 
 function buildTree(emps){
@@ -573,7 +595,7 @@ async function fetchUserProfile(user, attempt=1){
 
     // Strategy 4: case-insensitive email scan (handles email casing mismatch)
     const emailLower=user.email.toLowerCase();
-    const allDocs=await db.collection('mompro_users').limit(200).get();
+    const allDocs=await db.collection('mompro_users').limit(500).get();
     const match=allDocs.docs.find(d=>(d.data().email||'').toLowerCase()===emailLower);
     if(match){
       console.log('[OrgChart] Found by case-insensitive email scan');
@@ -1023,14 +1045,41 @@ function plantsHTML(){
 </table></div></div>`;
 }
 
+const EMP_PAGE_SIZE = 50; // rows rendered per page — keep browser fast for 250+ employees
+
 function employeesHTML(){
   const fp=S.filterPlant;
   const sq=(S._empSearch||'').toLowerCase().trim();
   let filtered=fp?S.employees.filter(e=>e.plantId===fp):S.employees;
-  if(sq) filtered=filtered.filter(e=>(e.name||'').toLowerCase().includes(sq)||(e.empCode||'').toLowerCase().includes(sq)||(e.designation||'').toLowerCase().includes(sq)||(e.dept||'').toLowerCase().includes(sq)||(e.email||'').toLowerCase().includes(sq));
+  if(sq) filtered=filtered.filter(e=>
+    (e.name||'').toLowerCase().includes(sq)||
+    (e.empCode||'').toLowerCase().includes(sq)||
+    (e.designation||'').toLowerCase().includes(sq)||
+    (e.dept||'').toLowerCase().includes(sq)||
+    (e.email||'').toLowerCase().includes(sq)
+  );
+
+  // Clamp page index
+  const totalPages=Math.max(1,Math.ceil(filtered.length/EMP_PAGE_SIZE));
+  if(S._empPage>=totalPages) S._empPage=totalPages-1;
+  if(S._empPage<0) S._empPage=0;
+  const page=S._empPage;
+  const pageEmps=filtered.slice(page*EMP_PAGE_SIZE,(page+1)*EMP_PAGE_SIZE);
+
   const isSA=S.profile?.role==='super-admin';
+
+  // Pagination controls
+  const pgCtrl=totalPages>1?`<div style="display:flex;align-items:center;gap:6px;margin-top:10px;justify-content:flex-end;flex-wrap:wrap">
+    <span style="font-size:12px;color:var(--g400)">Page ${page+1} of ${totalPages} &nbsp;·&nbsp; ${filtered.length} employees</span>
+    <button id="emp-pg-first" class="btn bo bsm" ${page===0?'disabled':''}>«</button>
+    <button id="emp-pg-prev"  class="btn bo bsm" ${page===0?'disabled':''}>‹ Prev</button>
+    ${Array.from({length:totalPages},(_, i)=>`<button class="btn ${i===page?'bs':'bo'} bsm emp-pg-num" data-pg="${i}" style="min-width:30px">${i+1}</button>`).join('')}
+    <button id="emp-pg-next" class="btn bo bsm" ${page>=totalPages-1?'disabled':''}>Next ›</button>
+    <button id="emp-pg-last" class="btn bo bsm" ${page>=totalPages-1?'disabled':''}>»</button>
+  </div>`:'';
+
   return `<div class="fl ac jb mb16">
-  <div><h2 style="font-size:17px;font-weight:800;color:var(--navy)">All Employees</h2><p style="font-size:13px;color:var(--g400)">${filtered.length} of ${S.employees.length} shown</p></div>
+  <div><h2 style="font-size:17px;font-weight:800;color:var(--navy)">All Employees</h2><p style="font-size:13px;color:var(--g400)">${filtered.length} of ${S.employees.length} shown · showing ${pageEmps.length} on this page</p></div>
   <div class="fl g2h" style="flex-wrap:wrap">
     <input class="inp" id="emp-search-inp" value="${S._empSearch||''}" placeholder="🔍 Search name, code, dept…" style="width:200px;padding:6px 10px;font-size:12px"/>
     <select class="inp" id="fp-sel" style="width:130px;padding:6px 10px;font-size:12px"><option value="">All Plants</option>${S.plants.map(p=>`<option value="${p.id}" ${fp===p.id?'selected':''}>${p.name}</option>`).join('')}</select>
@@ -1041,7 +1090,7 @@ function employeesHTML(){
 </div>
 <div class="card"><div class="tw"><table style="font-size:12px">
   <thead><tr style="font-size:11px">
-    ${isSA?`<th style="width:28px;padding:7px 8px"><input type="checkbox" id="sel-all" title="Select all" style="cursor:pointer;width:13px;height:13px"/></th>`:''}
+    ${isSA?`<th style="width:28px;padding:7px 8px"><input type="checkbox" id="sel-all" title="Select all on this page" style="cursor:pointer;width:13px;height:13px"/></th>`:''}
     <th style="padding:7px 10px">Employee</th>
     <th style="padding:7px 8px">Code</th>
     <th style="padding:7px 8px">Dept</th>
@@ -1051,7 +1100,7 @@ function employeesHTML(){
     <th style="padding:7px 8px">Plant</th>
     <th style="padding:7px 8px">Actions</th>
   </tr></thead>
-  <tbody>${filtered.map(e=>`<tr style="line-height:1">
+  <tbody>${pageEmps.map(e=>`<tr style="line-height:1">
     ${isSA?`<td style="padding:5px 8px;text-align:center"><input type="checkbox" class="emp-chk" data-id="${e.id}" style="cursor:pointer;width:13px;height:13px"/></td>`:''}
     <td style="padding:5px 10px"><div class="fl ac" style="gap:7px">${avatarThumbSm(e)}<span style="font-weight:600;font-size:12px">${e.name}</span></div></td>
     <td style="padding:5px 8px;color:var(--steel);font-weight:600">${e.empCode||'—'}</td>
@@ -1066,7 +1115,8 @@ function employeesHTML(){
     </div></td>
   </tr>`).join('')||noData(isSA?9:8,'👤','No employees found','')}
   </tbody>
-</table></div></div>`;
+</table></div></div>
+${pgCtrl}`;
 }
 
 function adminsHTML(){
@@ -1125,19 +1175,34 @@ function groupChartHTML(){
   return orgPanelHTML(tree,'Group','grp',inlineStats);
 }
 
+// ── Cached allMap ────────────────────────────────────────────────
+// Rebuilt only when S.employees reference changes (avoids O(n) rebuild per render).
+let _cachedAllMap = null;
+let _cachedEmpsRef = null;
+function getAllMap(){
+  if(_cachedEmpsRef !== S.employees){
+    _cachedAllMap = {};
+    S.employees.forEach(e=>{ _cachedAllMap[e.id]=e; });
+    _cachedEmpsRef = S.employees;
+  }
+  return _cachedAllMap;
+}
+
 // Build a tree for a subset of employees (plantEmps or deptEmps)
 // but include their full ancestor chain up to the root (from allEmps).
 // Ancestors outside the subset are flagged _isContext=true (greyed in card).
 function buildTreeWithAncestors(subEmps, allEmps){
   if(!subEmps||!subEmps.length) return null;
-  const allMap={};
-  allEmps.forEach(e=>{ allMap[e.id]=e; });
+  // Use cached map when allEmps is the global S.employees array (common case)
+  const allMap = (allEmps === S.employees) ? getAllMap() : (() => {
+    const m={}; allEmps.forEach(e=>{ m[e.id]=e; }); return m;
+  })();
 
-  // Collect all ancestors of each sub-employee
+  // Collect all ancestors of each sub-employee (iterative, not recursive)
   const needed=new Set(subEmps.map(e=>e.id));
   subEmps.forEach(e=>{
     let cur=e;
-    while(cur&&cur.parentId&&allMap[cur.parentId]){
+    while(cur&&cur.parentId&&allMap[cur.parentId]&&!needed.has(cur.parentId)){
       needed.add(cur.parentId);
       cur=allMap[cur.parentId];
     }
@@ -1344,7 +1409,11 @@ function orgPanelHTML(tree,title,key,inlineStats=[]){
   <span style="display:flex;align-items:center;gap:5px"><span style="width:13px;height:13px;border-radius:50%;background:linear-gradient(135deg,#BE185D,#9D174D);display:inline-block"></span>Female</span>
   <span style="display:flex;align-items:center;gap:5px"><span style="width:13px;height:13px;border-radius:50%;background:linear-gradient(135deg,#6D28D9,#4C1D95);display:inline-block"></span>Other</span>
   <span style="display:flex;align-items:center;gap:5px"><span style="width:13px;height:13px;border-radius:50%;background:linear-gradient(135deg,#475569,#1E293B);display:inline-block"></span>Not specified</span>
+  ${tree?`<span style="margin-left:auto;background:var(--g50);border:1px solid var(--g100);border-radius:6px;padding:2px 8px;font-size:10px;font-weight:700;color:var(--g600)">${countNodes(tree)} node${countNodes(tree)!==1?'s':''}</span>`:''}
 </div>
+${tree&&countNodes(tree)>100?`<div style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.25);border-top:none;padding:7px 14px;font-size:11px;color:#92610a;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+  <span>⚡</span><span><strong>${countNodes(tree)} nodes</strong> detected — use <strong>⊟ Collapse All</strong> then expand only the branches you need for best performance. Zoom out to see the full tree.</span>
+</div>`:''}
 <div class="org-wrap">
   <div class="org-canvas" id="oc-${key}" style="transform:scale(${sc})">
     ${tree?orgNodeHTML(tree,true):'<div class="empty"><div class="ei">🌳</div><h3>No employees yet</h3></div>'}
@@ -1352,30 +1421,76 @@ function orgPanelHTML(tree,title,key,inlineStats=[]){
 </div>`;
 }
 
-function orgNodeHTML(node,isRoot=false){
-  const children=node.children||[];
-  const has=children.length>0;
-  const col=S.collapsed.has(node.id);
-  const showPh=S.showPhoto;
+// ── Optimised org-node renderer ──────────────────────────────────
+// Uses an iterative stack instead of deep recursion so 250-node trees
+// don't blow the call stack or produce one giant synchronous frame.
+// Collapsed subtrees generate ZERO inner HTML — only the card itself.
+function orgNodeHTML(node, isRoot=false){
+  return _renderNode(node, isRoot);
+}
 
-  // Virtual root — just render children side by side without a node box
+function _renderNode(node, isRoot){
+  const showPh = S.showPhoto;
+
+  // ── Virtual root wrapper ──────────────────────────────────────
   if(node._isVirtualRoot){
+    const parts = (node.children||[]).map(c=>
+      `<div style="display:flex;flex-direction:column;align-items:center">${_renderNode(c,true)}</div>`
+    );
     return `<div style="display:flex;flex-direction:column;align-items:center">
-  <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
-    ${children.map(c=>`<div style="display:flex;flex-direction:column;align-items:center">${orgNodeHTML(c,true)}</div>`).join('')}
-  </div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">${parts.join('')}</div>
 </div>`;
   }
 
-  // Dept header node
+  // Iterative DFS to build HTML bottom-up.
+  // Stack entries: { node, isRoot, phase }
+  //   phase=0  → push children first, then come back with phase=1 to build HTML
+  //   phase=1  → children already resolved; build this node's HTML
+  const stack = [{ node, isRoot, phase: 0 }];
+  const results = new Map(); // nodeId → rendered HTML string
+
+  while(stack.length){
+    const top = stack[stack.length-1];
+    const n = top.node;
+    const col = S.collapsed.has(n.id);
+    const children = n.children||[];
+    const has = children.length > 0;
+
+    if(top.phase === 0){
+      top.phase = 1;
+      // If not collapsed, push children so they resolve before we come back
+      if(has && !col){
+        for(let i = children.length-1; i >= 0; i--){
+          stack.push({ node: children[i], isRoot: false, phase: 0 });
+        }
+      }
+      continue;
+    }
+
+    // phase === 1: all children (if any) are now in results
+    stack.pop();
+    const html = _buildNodeHTML(n, top.isRoot, showPh, results, col);
+    results.set(n.id, html);
+  }
+
+  return results.get(node.id) || '';
+}
+
+function _buildNodeHTML(node, isRoot, showPh, results, col){
+  const children = node.children||[];
+  const has = children.length > 0;
+
+  // ── Dept header ───────────────────────────────────────────────
   if(node._isDeptHeader){
-    const childrenHTML=has&&!col?`
-    <div class="conn-v" style="height:12px"></div>
-    <div class="ochildren">
-      ${children.map((c,ci)=>`<div class="ochild-wrap" data-first="${ci===0}" data-last="${ci===children.length-1}" data-only="${children.length===1}">
-        <div style="height:16px"></div>${orgNodeHTML(c)}
-      </div>`).join('')}
-    </div>`:'';
+    let childrenHTML = '';
+    if(has && !col){
+      const inner = children.map((c,ci)=>
+        `<div class="ochild-wrap" data-first="${ci===0}" data-last="${ci===children.length-1}" data-only="${children.length===1}">
+          <div style="height:16px"></div>${results.get(c.id)||''}
+        </div>`
+      ).join('');
+      childrenHTML = `<div class="conn-v" style="height:12px"></div><div class="ochildren">${inner}</div>`;
+    }
     return `<div class="onode">
   <div style="background:linear-gradient(135deg,var(--steel),var(--navy));border-radius:10px;padding:8px 12px;min-width:100px;text-align:center;box-shadow:var(--shadow);border:2px solid var(--gold);position:relative">
     <div style="font-size:16px;margin-bottom:3px">🏢</div>
@@ -1388,18 +1503,17 @@ function orgNodeHTML(node,isRoot=false){
 </div>`;
   }
 
-  const avSize=isRoot?(showPh?'36px':'0'):(showPh?'26px':'0');
-  const avFontSize=isRoot?'13px':'10px';
-
-  // Context nodes = ancestors outside the current plant/dept — shown greyed, no photo
+  // ── Context (greyed ancestor) node ────────────────────────────
   if(node._isContext){
-    const childrenHTML=has&&!col?`
-    <div class="conn-v" style="height:12px"></div>
-    <div class="ochildren">
-      ${children.map((c,ci)=>`<div class="ochild-wrap" data-first="${ci===0}" data-last="${ci===children.length-1}" data-only="${children.length===1}">
-        <div style="height:16px"></div>${orgNodeHTML(c)}
-      </div>`).join('')}
-    </div>`:'';
+    let childrenHTML = '';
+    if(has && !col){
+      const inner = children.map((c,ci)=>
+        `<div class="ochild-wrap" data-first="${ci===0}" data-last="${ci===children.length-1}" data-only="${children.length===1}">
+          <div style="height:16px"></div>${results.get(c.id)||''}
+        </div>`
+      ).join('');
+      childrenHTML = `<div class="conn-v" style="height:12px"></div><div class="ochildren">${inner}</div>`;
+    }
     return `<div class="onode">
   <div class="ocard" data-pid="${node.id}" style="width:86px;padding:5px 6px 7px;border-style:dashed;opacity:0.6;cursor:default">
     <div style="font-size:8.5px;font-weight:700;color:var(--navy);line-height:1.3;text-align:center;word-break:break-word">${node.name}</div>
@@ -1410,19 +1524,25 @@ function orgNodeHTML(node,isRoot=false){
 </div>`;
   }
 
-  const av=showPh
+  // ── Regular employee node ─────────────────────────────────────
+  const avSize = isRoot?(showPh?'36px':'0'):(showPh?'26px':'0');
+  const avFontSize = isRoot?'13px':'10px';
+  const av = showPh
     ?(node.photoURL
-      ?`<img src="${node.photoURL}" style="width:${avSize};height:${avSize};border-radius:50%;object-fit:cover;margin:0 auto 4px;display:block;border:1.5px solid ${genderBorderColor(node.gender)}" onerror="this.style.display='none'">`
+      // loading="lazy" defers off-screen image decoding — critical for 250-node charts
+      ?`<img src="${node.photoURL}" loading="lazy" style="width:${avSize};height:${avSize};border-radius:50%;object-fit:cover;margin:0 auto 4px;display:block;border:1.5px solid ${genderBorderColor(node.gender)}" onerror="this.style.display='none'">`
       :`<div style="width:${avSize};height:${avSize};border-radius:50%;background:${genderAvBg(node.gender)};margin:0 auto 4px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:${avFontSize};font-weight:700">${ini(node.name)}</div>`)
     :'';
 
-  const childrenHTML=has&&!col?`
-    <div class="conn-v" style="height:12px"></div>
-    <div class="ochildren">
-      ${children.map((c,ci)=>`<div class="ochild-wrap" data-first="${ci===0}" data-last="${ci===children.length-1}" data-only="${children.length===1}">
-        <div style="height:16px"></div>${orgNodeHTML(c)}
-      </div>`).join('')}
-    </div>`:'';
+  let childrenHTML = '';
+  if(has && !col){
+    const inner = children.map((c,ci)=>
+      `<div class="ochild-wrap" data-first="${ci===0}" data-last="${ci===children.length-1}" data-only="${children.length===1}">
+        <div style="height:16px"></div>${results.get(c.id)||''}
+      </div>`
+    ).join('');
+    childrenHTML = `<div class="conn-v" style="height:12px"></div><div class="ochildren">${inner}</div>`;
+  }
 
   return `<div class="onode">
   <div class="ocard ${isRoot?'root-card':node._highlight?'highlight-card':''}" data-pid="${node.id}" style="width:${isRoot?'100px':'86px'};padding:${showPh?'7px 6px 9px':'5px 6px 7px'}">
@@ -1854,8 +1974,11 @@ function publicViewHTML(){
                     }).join('')}
               </div>`
             : tree
-              ?`<div style="background:#fff;border-radius:var(--rl);border:1px solid var(--g100);overflow:auto;min-height:400px;box-shadow:0 1px 3px rgba(15,31,61,.07)">
-                  <div id="pub-canvas" style="display:inline-flex;min-width:100%;justify-content:center;padding:44px 36px;transform:scale(${sc});transform-origin:top center;transition:transform .2s">
+              ?`${countNodes(tree)>100?`<div style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.25);border-radius:8px;padding:8px 14px;font-size:11px;color:#92610a;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+  <span>⚡</span><span><strong>${countNodes(tree)} nodes</strong> — use <strong>⊟ Collapse</strong> and zoom out for best performance with large charts.</span>
+</div>`:''}
+<div style="background:#fff;border-radius:var(--rl);border:1px solid var(--g100);overflow:auto;min-height:400px;box-shadow:0 1px 3px rgba(15,31,61,.07)">
+                  <div id="pub-canvas" style="display:inline-flex;min-width:100%;justify-content:center;padding:44px 36px;transform:scale(${sc});transform-origin:top center;transition:transform .2s;will-change:transform">
                     ${orgNodeHTML(tree,true)}
                   </div>
                 </div>`
@@ -1918,7 +2041,7 @@ function bindPublicView(){
       e.stopPropagation();
       const id=btn.dataset.colid;
       S.collapsed.has(id)?S.collapsed.delete(id):S.collapsed.add(id);
-      render();
+      renderDeferred();
     });
   });
 
@@ -2565,7 +2688,7 @@ function bindAll(){
       e.stopPropagation();
       const id=btn.dataset.colid;
       S.collapsed.has(id)?S.collapsed.delete(id):S.collapsed.add(id);
-      render();
+      renderDeferred();
     });
   });
   // expand/collapse/toggle-photo bound below in the main chart-keys loop
@@ -2871,7 +2994,19 @@ function bindAll(){
   document.querySelectorAll('.da-btn').forEach(b=>b.addEventListener('click',()=>deleteAdmin(b.dataset.id,b.dataset.name)));
 
   // filters (pcs-sel, dcs-plant, dcs-dept removed — now pill buttons render inline)
-  $('fp-sel')?.addEventListener('change',e=>{ S.filterPlant=e.target.value; S._empSearch=''; render(); });
+  $('fp-sel')?.addEventListener('change',e=>{ S.filterPlant=e.target.value; S._empSearch=''; S._empPage=0; render(); });
+
+  // ── Employee table pagination ─────────────────────────────────────
+  $('emp-pg-first')?.addEventListener('click',()=>{ S._empPage=0; render(); });
+  $('emp-pg-prev')?.addEventListener('click',()=>{ S._empPage=Math.max(0,S._empPage-1); render(); });
+  $('emp-pg-next')?.addEventListener('click',()=>{ S._empPage=S._empPage+1; render(); });
+  $('emp-pg-last')?.addEventListener('click',()=>{
+    const fp=S.filterPlant; const sq=(S._empSearch||'').toLowerCase().trim();
+    let f=fp?S.employees.filter(e=>e.plantId===fp):S.employees;
+    if(sq) f=f.filter(e=>(e.name||'').toLowerCase().includes(sq)||(e.empCode||'').toLowerCase().includes(sq)||(e.designation||'').toLowerCase().includes(sq)||(e.dept||'').toLowerCase().includes(sq)||(e.email||'').toLowerCase().includes(sq));
+    S._empPage=Math.max(0,Math.ceil(f.length/EMP_PAGE_SIZE)-1); render();
+  });
+  document.querySelectorAll('.emp-pg-num').forEach(b=>b.addEventListener('click',()=>{ S._empPage=parseInt(b.dataset.pg)||0; render(); }));
 
   // Employee table search
   const empSInp=$('emp-search-inp');
@@ -2879,7 +3014,7 @@ function bindAll(){
     let _empTimer;
     empSInp.addEventListener('input',e=>{
       const val=e.target.value, pos=e.target.selectionStart;
-      S._empSearch=val;
+      S._empSearch=val; S._empPage=0; // reset to first page on new search
       clearTimeout(_empTimer);
       _empTimer=setTimeout(()=>{
         render();
@@ -2896,15 +3031,15 @@ function bindAll(){
 
   // zoom & PDF & Excel for all chart keys
   ['grp','plt','pa','dpt'].forEach(key=>{
-    $(`zi-${key}`)?.addEventListener('click',()=>{ S.chartScale=Math.min(S.chartScale+0.1,2.5); render(); });
-    $(`zo-${key}`)?.addEventListener('click',()=>{ S.chartScale=Math.max(S.chartScale-0.1,0.3); render(); });
-    $(`zr-${key}`)?.addEventListener('click',()=>{ S.chartScale=1; render(); });
+    $(`zi-${key}`)?.addEventListener('click',()=>{ S.chartScale=Math.min(S.chartScale+0.1,2.5); renderDeferred(); });
+    $(`zo-${key}`)?.addEventListener('click',()=>{ S.chartScale=Math.max(S.chartScale-0.1,0.3); renderDeferred(); });
+    $(`zr-${key}`)?.addEventListener('click',()=>{ S.chartScale=1; renderDeferred(); });
     $(`pdf-${key}`)?.addEventListener('click',()=>exportPDF(key));
     $(`xlsx-${key}`)?.addEventListener('click',()=>exportXLSX(key));
     // expand/collapse per chart key
-    $(`expand-all-${key}`)?.addEventListener('click',()=>{ S.collapsed.clear(); render(); });
-    $(`collapse-all-${key}`)?.addEventListener('click',()=>{ document.querySelectorAll('[data-colid]').forEach(b=>S.collapsed.add(b.dataset.colid)); render(); });
-    $(`toggle-photo-${key}`)?.addEventListener('click',()=>{ S.showPhoto=!S.showPhoto; render(); });
+    $(`expand-all-${key}`)?.addEventListener('click',()=>{ S.collapsed.clear(); renderDeferred(); });
+    $(`collapse-all-${key}`)?.addEventListener('click',()=>{ document.querySelectorAll('[data-colid]').forEach(b=>S.collapsed.add(b.dataset.colid)); renderDeferred(); });
+    $(`toggle-photo-${key}`)?.addEventListener('click',()=>{ S.showPhoto=!S.showPhoto; renderDeferred(); });
     // SA search field (grp/plt/dpt keys only — pa handled separately)
     const sInp=$(`search-${key}`);
     if(sInp && key!=='pa'){
