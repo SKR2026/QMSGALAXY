@@ -661,6 +661,18 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
         </div>
       </div>
 
+      <!-- Factor-wise Access Rights (Plant Admin / Super Admin) -->
+      <div class="card mb-16" id="factorAccessCard" style="display:none">
+        <div class="card-title" style="margin-bottom:2px">Factor-wise Access Rights</div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:16px">Control which COPQ cost factors each user can enter and view. Unchecked factors are hidden for that user across Entry, Dashboard, My Entries and Reports.</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>User</th><th>Plant</th><th style="text-align:center">Internal Failures</th><th style="text-align:center">External Failures</th><th style="text-align:center">Appraisal</th><th style="text-align:center">Prevention</th><th></th></tr></thead>
+            <tbody id="factorAccessBody"><tr><td colspan="7" style="text-align:center;color:var(--text3);padding:20px">Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- Company Logo (Super Admin only) -->
       <div class="card" id="logoSettingsCard" style="display:none">
         <div class="card-title">Company Logo &amp; Branding <span style="font-size:10px;color:var(--text3);font-weight:400;text-transform:none;letter-spacing:0">&nbsp;— appears on login screen and sidebar</span></div>
@@ -965,6 +977,11 @@ let charts         = {};
 let reportCharts   = {};
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const COPQ_FACTORS = ['Internal Failures','External Failures','Appraisal','Prevention'];
+// Users without a `factors` array (or with an empty one) get full access — keeps existing users working unchanged.
+function getUserFactors(u){
+  return (u && Array.isArray(u.factors) && u.factors.length) ? u.factors : COPQ_FACTORS.slice();
+}
 
 const DEFAULT_MASTERS = [
   {category:'Internal Failures', subcat:'Scrap Material',            unit:'Kg'},
@@ -1051,7 +1068,8 @@ function navigate(page, el){
     plants: 'renderPlants',
     masters: 'renderMasters',
     settings: 'renderSettings',
-    sales: 'renderSalesPage'
+    sales: 'renderSalesPage',
+    entry: 'updateEntryCategories'
   };
   const fnName=renderFnNames[page];
   const fn=fnName ? (typeof window[fnName]==='function' ? window[fnName] : null) : null;
@@ -1278,6 +1296,9 @@ window.saveEntry=async function(){
   const desc=document.getElementById('entryDesc').value.trim();
   if(!plant||!category||!subcat||isNaN(amount)||amount<=0){
     showToast('Please fill Plant, Category, Sub-category and Amount'); return;
+  }
+  if(currentProfile.role!=='super_admin'&&!getUserFactors(currentProfile).includes(category)){
+    showToast('You do not have access to this COPQ factor'); return;
   }
   if(editingEntryId){
     const existing=entriesList.find(x=>x.id===editingEntryId);
@@ -1651,6 +1672,7 @@ function applyRole(profile){
   document.getElementById('navEntryGroup').style.display='';
   document.getElementById('nav-entry').style.display='';
   document.getElementById('nav-sales').style.display='';
+  updateEntryCategories();
 }
 
 function updateSidebarProfile(){
@@ -1665,12 +1687,18 @@ function updateSidebarProfile(){
 
 function getFilteredEntries(){
   const p=currentProfile; if(!p) return [];
-  if(p.role==='super_admin') return entriesList;
-  if(p.role==='admin'){
-    if(!p.plant||p.plant==='All') return entriesList;
-    return entriesList.filter(e=>e.plant===p.plant);
+  let list;
+  if(p.role==='super_admin') list=entriesList;
+  else if(p.role==='admin'){
+    list=(!p.plant||p.plant==='All') ? entriesList : entriesList.filter(e=>e.plant===p.plant);
+  } else {
+    list=entriesList.filter(e=>e.enteredByUid===currentUser.uid);
   }
-  return entriesList.filter(e=>e.enteredByUid===currentUser.uid);
+  if(p.role!=='super_admin'){
+    const allowed=getUserFactors(p);
+    list=list.filter(e=>allowed.includes(e.category));
+  }
+  return list;
 }
 
 function getSalesForRole(){
@@ -2158,6 +2186,48 @@ function renderSettings(){
     if(pe) pe.style.display='none';
     const rb=document.getElementById('removeLogoBtn');if(rb)rb.style.display='';
   }
+  renderFactorAccessPanel();
+}
+
+// ── Factor-wise Access Rights (Plant Admin / Super Admin) ──────
+function renderFactorAccessPanel(){
+  const card=document.getElementById('factorAccessCard');
+  const body=document.getElementById('factorAccessBody');
+  if(!card||!body||!currentProfile) return;
+  const isSA=currentProfile.role==='super_admin';
+  const isAdmin=isSA||currentProfile.role==='admin';
+  if(!isAdmin){ card.style.display='none'; return; }
+  card.style.display='';
+  // Super admins are always full-access and aren't restrictable here.
+  let list=(usersList||[]).filter(u=>u.role!=='super_admin');
+  if(!isSA){
+    // A plant admin can only assign rights to users of their own plant.
+    list=list.filter(u=>u.plant===currentProfile.plant);
+  }
+  if(!list.length){
+    body.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:20px">No users to manage</td></tr>';
+    return;
+  }
+  body.innerHTML=list.map(u=>{
+    const allowed=getUserFactors(u);
+    const cbs=COPQ_FACTORS.map(f=>`<td style="text-align:center"><input type="checkbox" class="factor-chk" data-uid="${u.id}" data-factor="${f.replace(/"/g,'&quot;')}" ${allowed.includes(f)?'checked':''}></td>`).join('');
+    return `<tr>
+      <td style="font-weight:600">${u.name||'—'}<div style="font-size:11px;color:var(--text3);font-weight:400">${u.email||''}</div></td>
+      <td>${u.plant||'All'}</td>
+      ${cbs}
+      <td><button class="btn btn-sm" onclick="saveFactorAccess('${u.id}')">Save</button></td>
+    </tr>`;
+  }).join('');
+}
+async function saveFactorAccess(uid){
+  const boxes=document.querySelectorAll('.factor-chk[data-uid="'+uid+'"]');
+  const selected=[...boxes].filter(b=>b.checked).map(b=>b.dataset.factor);
+  if(!selected.length){ showToast('Select at least one factor'); return; }
+  try{
+    await window.FB.updateUser(uid,{factors:selected});
+    const u=usersList.find(x=>x.id===uid); if(u) u.factors=selected;
+    showToast('Access rights updated ✓');
+  } catch(err){ showToast('Error: '+err.message,6000); }
 }
 
 // ── Sales ────────────────────────────────────────────────────
@@ -2268,7 +2338,14 @@ function updateEntrySubcats(){
     :'<option value="">— Select category first —</option>';
   sel.onchange=()=>{const opt=sel.selectedOptions[0];const unit=opt?.dataset?.unit||'';if(unit)document.getElementById('entryUnit').value=unit;};
 }
-function updateEntryCategories(){ /* placeholder for plant-based restrictions */ }
+function updateEntryCategories(){
+  const sel=document.getElementById('entryCategory'); if(!sel) return;
+  const allowed = (currentProfile && currentProfile.role!=='super_admin') ? getUserFactors(currentProfile) : COPQ_FACTORS;
+  const prev=sel.value;
+  sel.innerHTML='<option value="">— Select category —</option>'+COPQ_FACTORS.filter(c=>allowed.includes(c)).map(c=>`<option value="${c}">${c}</option>`).join('');
+  sel.value=allowed.includes(prev)?prev:'';
+  updateEntrySubcats();
+}
 function updateAmountDisplay(){
   const v=parseFloat(document.getElementById('entryAmount').value);
   const el=document.getElementById('amountDisplay');
@@ -2333,6 +2410,7 @@ function processBulkRows(raw){
     if(!MONTHS.includes(month)) errors.push('Invalid month');
     if(!plant||!plantsList.find(p=>p.name===plant)) errors.push('Plant not found');
     if(!VALID_CATS.includes(category)) errors.push('Invalid category');
+    else if(currentProfile&&currentProfile.role!=='super_admin'&&!getUserFactors(currentProfile).includes(category)) errors.push('Category not permitted for your access rights');
     if(!subcat) errors.push('Sub-category required');
     if(isNaN(amount)||amount<=0) errors.push('Amount must be > 0');
     return{year,month,plant,category,subcat,amount,qty,unit,description,errors,rowNum:i+2};
@@ -2467,6 +2545,9 @@ window.getSalesForRole       = getSalesForRole;
 window.setDashPeriodMode     = setDashPeriodMode;
 window.renderDashPlantPills  = renderDashPlantPills;
 window.selectDashPlant       = selectDashPlant;
+window.renderFactorAccessPanel = renderFactorAccessPanel;
+window.saveFactorAccess      = saveFactorAccess;
+window.getUserFactors        = getUserFactors;
 // Page render functions (called by navigate())
 window.refreshDashboard      = refreshDashboard;
 window.renderMyEntries       = renderMyEntries;
