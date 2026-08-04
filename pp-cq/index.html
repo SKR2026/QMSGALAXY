@@ -1059,6 +1059,10 @@ function closeModal(id){ document.getElementById(id).classList.remove('open'); }
 
 // ── Navigate — errors are now surfaced ON SCREEN, not just console ──
 function navigate(page, el){
+  const restrictedForUser={sales:1,settings:1,users:1,plants:1,masters:1};
+  if(currentProfile&&currentProfile.role==='user'&&restrictedForUser[page]){
+    showToast('You do not have access to this page'); return;
+  }
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   const pageEl=document.getElementById('page-'+page);
@@ -1293,12 +1297,20 @@ window.saveUser=async function(){
   const id=document.getElementById('editUserId').value;
   const name=document.getElementById('uName').value.trim();
   const email=document.getElementById('uEmail').value.trim();
-  const role=document.getElementById('uRole').value;
-  const plant=document.getElementById('uPlant').value;
+  const isSA=currentProfile?.role==='super_admin';
+  const isAdmin=isSA||currentProfile?.role==='admin';
+  if(!isAdmin){showToast('Permission denied');return;}
+  let role=document.getElementById('uRole').value;
+  let plant=document.getElementById('uPlant').value;
   const pw=document.getElementById('uPassword').value;
   if(!name||!email){showToast('Name and email required');return;}
   if(!id&&!pw){showToast('Password required for new user');return;}
   if(!id&&pw.length<6){showToast('Password must be at least 6 characters');return;}
+  // Enforce admin restrictions: can only create/edit users in their own plant with role='user'
+  if(!isSA){
+    role='user';
+    if(currentProfile.plant&&currentProfile.plant!=='All') plant=currentProfile.plant;
+  }
   try{
     if(id){ await window.FB.updateUser(id,{name,role,plant}); showToast('User updated ✓'); }
     else  { await window.FB.createUser(email,pw,{name,role,plant}); showToast('User created ✓'); }
@@ -1692,13 +1704,14 @@ function applyRole(profile){
   if(!isSA){
     console.warn('[COPQ] role is "'+profile.role+'" not "super_admin" — admin tabs hidden. Fix the role field in Firestore: copqUsers/'+profile.id);
   }
-  document.getElementById('navAdminGroup').style.display=isSA?'':'none';
-  document.getElementById('nav-users').style.display=isSA?'':'none';
+  document.getElementById('navAdminGroup').style.display=isAdmin?'':'none';
+  document.getElementById('nav-users').style.display=isAdmin?'':'none';
   document.getElementById('nav-plants').style.display=isSA?'':'none';
   document.getElementById('nav-masters').style.display=isSA?'':'none';
   document.getElementById('navEntryGroup').style.display='';
   document.getElementById('nav-entry').style.display='';
-  document.getElementById('nav-sales').style.display='';
+  document.getElementById('nav-sales').style.display=isAdmin?'':'none';
+  document.getElementById('nav-settings').style.display=isAdmin?'':'none';
   updateEntryCategories();
 }
 
@@ -2088,10 +2101,20 @@ function renderReports(){
 // ── Users ─────────────────────────────────────────────────────
 function renderUsers(){
   const body=document.getElementById('usersBody'); if(!body) return;
-  if(!usersList||!usersList.length){body.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:24px">No users yet</td></tr>';return;}
+  const isSA=currentProfile?.role==='super_admin';
+  const isAdmin=isSA||currentProfile?.role==='admin';
+  // Admin sees only users in their own plant; super_admin sees all
+  let list=usersList||[];
+  if(!isSA&&currentProfile?.plant&&currentProfile.plant!=='All'){
+    list=list.filter(u=>u.plant===currentProfile.plant);
+  }
+  // Update the page header Add User button visibility
+  const addBtn=document.querySelector('#page-users .btn-primary');
+  if(addBtn) addBtn.style.display=isAdmin?'':'none';
+  if(!list.length){body.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:24px">No users in your plant yet</td></tr>';return;}
   const roleLabels={super_admin:'⭐ Super Admin',admin:'🏭 Admin',user:'👤 User'};
   const roleColors={super_admin:'badge-amber',admin:'badge-blue',user:'badge-green'};
-  body.innerHTML=usersList.map(u=>`<tr>
+  body.innerHTML=list.map(u=>`<tr>
     <td style="font-weight:600">${u.name||'—'}</td>
     <td style="color:var(--text2);font-size:12px">${u.email||'—'}</td>
     <td><span class="badge ${roleColors[u.role]||'badge-blue'}">${roleLabels[u.role]||u.role}</span></td>
@@ -2099,33 +2122,61 @@ function renderUsers(){
     <td><span class="badge badge-green">Active</span></td>
     <td><div style="display:flex;gap:4px">
       <button class="btn btn-sm" onclick="openEditUserModal('${u.id}')">Edit</button>
-      ${currentProfile?.role==='super_admin'&&u.id!==currentUser?.uid?`<button class="btn btn-sm" style="color:var(--red)" onclick="deleteUser('${u.id}')">Delete</button>`:''}
+      ${isSA&&u.id!==currentUser?.uid?`<button class="btn btn-sm" style="color:var(--red)" onclick="deleteUser('${u.id}')">Delete</button>`:''}
     </div></td>
   </tr>`).join('');
 }
 function openUserModal(){
+  const isSA=currentProfile?.role==='super_admin';
   document.getElementById('editUserId').value='';
   document.getElementById('uName').value='';
   document.getElementById('uEmail').value='';
   document.getElementById('uEmail').disabled=false;
-  document.getElementById('uRole').value='user';
-  document.getElementById('uPlant').value='All';
   document.getElementById('uPassword').value='';
   document.getElementById('uPasswordRow').style.display='';
   document.getElementById('userModalTitle').textContent='Add User';
+  // Role: admin can only create Users (not admin/super_admin)
+  const roleEl=document.getElementById('uRole');
+  roleEl.innerHTML=isSA
+    ?'<option value="user">User</option><option value="admin">Admin</option><option value="super_admin">Super Admin</option>'
+    :'<option value="user">User</option>';
+  roleEl.value='user';
+  // Plant: admin is locked to their own plant
+  const plantEl=document.getElementById('uPlant');
+  if(!isSA&&currentProfile?.plant&&currentProfile.plant!=='All'){
+    plantEl.value=currentProfile.plant;
+    plantEl.disabled=true;
+  } else {
+    plantEl.disabled=false;
+    plantEl.value='All';
+  }
   document.getElementById('userModal').classList.add('open');
 }
 function openEditUserModal(id){
   const u=usersList.find(x=>x.id===id); if(!u) return;
+  const isSA=currentProfile?.role==='super_admin';
   document.getElementById('editUserId').value=id;
   document.getElementById('uName').value=u.name||'';
   document.getElementById('uEmail').value=u.email||'';
   document.getElementById('uEmail').disabled=true;
-  document.getElementById('uRole').value=u.role||'user';
-  document.getElementById('uPlant').value=u.plant||'All';
   document.getElementById('uPassword').value='';
   document.getElementById('uPasswordRow').style.display='none';
   document.getElementById('userModalTitle').textContent='Edit User';
+  // Role: admin can only set/keep role as 'user'
+  const roleEl=document.getElementById('uRole');
+  roleEl.innerHTML=isSA
+    ?'<option value="user">User</option><option value="admin">Admin</option><option value="super_admin">Super Admin</option>'
+    :'<option value="user">User</option>';
+  roleEl.value=u.role||'user';
+  // Plant: admin locked to their plant
+  const plantEl=document.getElementById('uPlant');
+  if(!isSA&&currentProfile?.plant&&currentProfile.plant!=='All'){
+    plantEl.value=currentProfile.plant;
+    plantEl.disabled=true;
+  } else {
+    plantEl.disabled=false;
+    plantEl.value=u.plant||'All';
+  }
   document.getElementById('userModal').classList.add('open');
 }
 async function deleteUser(id){
