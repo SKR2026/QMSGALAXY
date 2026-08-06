@@ -1997,15 +1997,14 @@ function resolveTarget(k, year, month, plant){
   const p  = (plant && plant !== 'All') ? plant : null;
 
   // Helper: look up a map that may have string OR numeric keys (Firestore quirk)
+  // (mget below is the one actually used throughout — mapGet kept for legacy safety)
   function mapGet(obj, key){
     if(!obj) return undefined;
     if(obj[key] != null) return obj[key];
-    // try numeric key
     const numKey = parseInt(key);
-    if(!isNaN(numKey) && obj[n] != null) return obj[numKey];
+    if(!isNaN(numKey) && obj[numKey] != null) return obj[numKey]; // fixed: was obj[n] (typo)
     return undefined;
   }
-  // Safe version (avoids reference error on 'n' typo in original)
   function mget(obj, key){
     if(!obj) return undefined;
     if(obj[key] != null) return obj[key];
@@ -5581,11 +5580,19 @@ function getMatrixData(){
     // Otherwise fall back to the year-level annual target.
     const allMonthsHaveTarget = MONTHS.every(m => {
       const dataYear = (monthStartIdx===3 && MONTHS.indexOf(m)<3) ? year+1 : year;
-      const t = resolveTarget(k, dataYear, m, plant==='All' ? null : plant);
-      // Check whether the value came from a *monthly* target entry specifically,
-      // not just falling through to the annual / base target.
+      // Check whether the value came from a *monthly* target specifically (not just
+      // falling through to the annual / base). Must check BOTH plant-specific monthly
+      // targets AND global monthly targets, since resolveTarget now prefers plant-specific.
       const y = String(dataYear);
-      function mapGetL(obj,key){ if(!obj)return undefined; if(obj[key]!=null)return obj[key]; const n=parseInt(key); if(!isNaN(n)&&obj[n]!=null)return obj[n]; return undefined; }
+      // Fixed mapGetL: use numKey (not obj[n] which was a typo referencing an undeclared variable)
+      function mapGetL(obj,key){ if(!obj)return undefined; if(obj[key]!=null)return obj[key]; const numKey=parseInt(key); if(!isNaN(numKey)&&obj[numKey]!=null)return obj[numKey]; return undefined; }
+      const resolvedPlant = plant === 'All' ? null : plant;
+      // Priority mirrors resolveTarget: plant-specific monthly → global monthly
+      const plantOvrL = resolvedPlant ? (k.plantOverrides && k.plantOverrides[resolvedPlant]) : null;
+      if(plantOvrL && plantOvrL.monthTargets){
+        const pYearMap = mapGetL(plantOvrL.monthTargets, y);
+        if(pYearMap && pYearMap[m] != null) return true;
+      }
       const yearMap = k.monthTargets ? mapGetL(k.monthTargets, y) : null;
       return yearMap && yearMap[m] != null;
     });
@@ -6023,10 +6030,16 @@ function initMonthReportPage(){
 // Builds one cell's actual/target for a given KPI + plant + month, reusing
 // the same resolveTarget/cellDisplay logic the KPI Matrix uses.
 function monthReportCellData(k, plantName, year, month){
+  // year is the FY START year (e.g. 2025 for FY2025-26).
+  // In Apr-Mar FY mode, Jan/Feb/Mar data is stored under calendar year+1.
+  // Use getFYDataYear so the data lookup uses the correct calendar year.
+  const dataYear = getFYDataYear(year, month);
   const baseData = [...kpiData, ...recentEntries];
+  // resolveTarget handles its own FY adjustment internally (Jan/Feb/Mar → fyStart-1),
+  // but we pass year (the FY start year) for consistency with how targets are keyed.
   const target = resolveTarget(k, year, month, plantName);
   const entries = baseData.filter(d =>
-    String(d.year) === String(year) && d.month === month &&
+    String(d.year) === String(dataYear) && d.month === month &&
     String(d.kpiId) === String(k.id) && d.plant === plantName
   );
   let actual = null;
@@ -6182,6 +6195,9 @@ function exportMonthReportExcel(){
   const month  = monthReportState.month || MONTHS[new Date().getMonth()];
   const showTargetsEl2 = document.getElementById('monthReportShowTargets');
   const showTargets = !!(showTargetsEl2 && showTargetsEl2.checked);
+  // dataYear: the calendar year that entries for this month are stored under
+  // (e.g. FY2025, month=January → dataYear=2026; month=April → dataYear=2025)
+  // monthReportCellData now calls getFYDataYear internally so year (FY start) is enough.
 
   const r = window._roleInfo;
   const plants = (r && (r.isPlantAdmin||r.isDeptUser) && r.plant)
