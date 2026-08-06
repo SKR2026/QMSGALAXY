@@ -5322,12 +5322,18 @@ function App() {
   const saveMailSubject  = async v => firebase.database().ref(DB.mailSubject).set(v.trim());
   const saveAckMailEnabled = async v => firebase.database().ref(DB.ackMailEnabled).set(!!v);
 
-  /* ── Microsoft Graph: get OAuth2 token then send mail silently ── */
-  /* ── MSAL singleton (same pattern as Task Planner) ── */
+  /* ── Microsoft Graph: get OAuth2 token then send mail silently ──
+     Strategy: MSAL stores tokens in localStorage keyed by clientId+tenantId.
+     On every call we first try acquireTokenSilent (uses the cached refresh token
+     — no popup, no user interaction). Only if that fails AND we have no accounts
+     at all do we fall through to loginPopup. After one successful popup the
+     refresh token is persisted in localStorage indefinitely, so subsequent page
+     loads / survey submissions never show a popup again.
+     ssoSilent is attempted before the popup as an extra no-interaction pass. ── */
   const _msalInstances = {};
   let   _msalSignedIn  = false;
 
-  const getMSGraphToken = async (clientId, tenantId) => {
+  const _getMsalInst = async (clientId, tenantId) => {
     if (typeof msal === "undefined") throw new Error("MSAL library failed to load. Check internet connection and refresh.");
     if (!clientId || !tenantId) throw new Error("Microsoft credentials not configured. Go to Settings > Mail Configuration.");
     const redirectUri = window.location.href.split("?")[0].split("#")[0];
@@ -5335,32 +5341,80 @@ function App() {
     if (!_msalInstances[cacheKey]) {
       const inst = new msal.PublicClientApplication({
         auth: { clientId, authority: "https://login.microsoftonline.com/" + tenantId, redirectUri },
-        cache: { cacheLocation: "localStorage", storeAuthStateInCookie: false },
+        // localStorage persists across tabs and page reloads — the refresh token
+        // survives until it expires (typically 90 days of inactivity).
+        cache: { cacheLocation: "localStorage", storeAuthStateInCookie: true },
       });
       await inst.initialize();
       _msalInstances[cacheKey] = inst;
     }
-    const inst     = _msalInstances[cacheKey];
-    const request  = { scopes: ["Mail.Send", "User.Read"] };
+    return _msalInstances[cacheKey];
+  };
+
+  const getMSGraphToken = async (clientId, tenantId) => {
+    const inst    = await _getMsalInst(clientId, tenantId);
+    const request = { scopes: ["Mail.Send", "User.Read"] };
     const accounts = inst.getAllAccounts();
+
+    // 1️⃣ Silent refresh — works as long as the refresh token in localStorage is valid
     if (accounts.length > 0) {
       try {
         const silent = await inst.acquireTokenSilent({ ...request, account: accounts[0] });
         _msalSignedIn = true;
         setMsSignedIn(true);
         return silent.accessToken;
-      } catch(_) { /* fall through to popup */ }
+      } catch(silentErr) {
+        console.warn("acquireTokenSilent failed, trying ssoSilent:", silentErr.message || silentErr);
+      }
     }
-    // Interactive popup — user signs in once, tokens cached for future submissions
+
+    // 2️⃣ SSO silent — uses existing browser session cookie, still no popup
+    try {
+      const sso = await inst.ssoSilent(request);
+      _msalSignedIn = true;
+      setMsSignedIn(true);
+      return sso.accessToken;
+    } catch(ssoErr) {
+      console.warn("ssoSilent failed, popup required:", ssoErr.message || ssoErr);
+    }
+
+    // 3️⃣ Interactive popup — only reached on the very first sign-in ever.
+    //    After this the refresh token is cached and steps 1/2 will succeed forever.
     const popup = await inst.loginPopup(request);
     _msalSignedIn = true;
     setMsSignedIn(true);
     return popup.accessToken;
   };
 
+  // Called from Settings "Sign in with Microsoft" button.
+  // Also auto-called on app load (below) to restore session without popup.
   const msalSignIn = async () => {
     try { await getMSGraphToken(msClientId, msTenantId); } catch(e) { console.error("MSAL sign-in:", e); }
   };
+
+  // ── Auto-restore MS session on every page load ──
+  // If the admin has signed in before, localStorage already has the refresh
+  // token. We attempt a fully silent restore here so that when a survey is
+  // submitted the token is already warm and getMSGraphToken returns instantly
+  // without any popup or delay.
+  useEffect(() => {
+    if (!msTenantId || !msClientId) return; // creds not configured yet
+    (async () => {
+      try {
+        const inst    = await _getMsalInst(msClientId, msTenantId);
+        const request = { scopes: ["Mail.Send", "User.Read"] };
+        const accounts = inst.getAllAccounts();
+        if (accounts.length > 0) {
+          const silent = await inst.acquireTokenSilent({ ...request, account: accounts[0] });
+          if (silent) { _msalSignedIn = true; setMsSignedIn(true); }
+        } else {
+          // Try cookie-based SSO (no popup)
+          const sso = await inst.ssoSilent(request).catch(()=>null);
+          if (sso) { _msalSignedIn = true; setMsSignedIn(true); }
+        }
+      } catch(_) { /* silent — don't bother user */ }
+    })();
+  }, [msTenantId, msClientId]);
 
   const buildAckHtml = (toEmail, compName, bodyText, logo, info) => {
     const yr   = new Date().getFullYear();
