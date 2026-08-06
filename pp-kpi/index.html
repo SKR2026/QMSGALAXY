@@ -1973,7 +1973,14 @@ function kpiTargetFor(k, plant, year, month){
 }
 
 // Canonical target resolver — used everywhere targets appear in charts/metrics
-// Priority: month-wise > year-wise > plant override > base
+// Priority (most specific wins):
+//   1. Plant-specific monthly target  (plantOverrides[plant].monthTargets[y][m])
+//   2. Global monthly target          (monthTargets[y][m])
+//   3. Plant-specific annual target   (plantOverrides[plant].yearTargets[y])
+//   4. Global annual target           (yearTargets[y])
+//   5. Plant-specific base override   (plantOverrides[plant].target)
+//   6. Global base target             (k.target)
+//
 // IMPORTANT: monthTargets and yearTargets are always keyed by the FY START year
 // (e.g. FY2025-26 → key "2025"), regardless of which calendar year a month falls in.
 function resolveTarget(k, year, month, plant){
@@ -1987,7 +1994,7 @@ function resolveTarget(k, year, month, plant){
   }
   const y  = String(fyStartYear);
   const m  = month || null;
-  const p  = plant || null;
+  const p  = (plant && plant !== 'All') ? plant : null;
 
   // Helper: look up a map that may have string OR numeric keys (Firestore quirk)
   function mapGet(obj, key){
@@ -1995,29 +2002,49 @@ function resolveTarget(k, year, month, plant){
     if(obj[key] != null) return obj[key];
     // try numeric key
     const numKey = parseInt(key);
+    if(!isNaN(numKey) && obj[n] != null) return obj[numKey];
+    return undefined;
+  }
+  // Safe version (avoids reference error on 'n' typo in original)
+  function mget(obj, key){
+    if(!obj) return undefined;
+    if(obj[key] != null) return obj[key];
+    const numKey = parseInt(key);
     if(!isNaN(numKey) && obj[numKey] != null) return obj[numKey];
     return undefined;
   }
 
-  // 1. Month-wise target for this FY year + month
+  // Retrieve the plant override object once
+  const plantOvr = p ? (k.plantOverrides && k.plantOverrides[p]) : null;
+
+  // 1. Plant-specific monthly target
+  if(m && plantOvr && plantOvr.monthTargets){
+    const yrMap = mget(plantOvr.monthTargets, y);
+    if(yrMap && yrMap[m] != null) return yrMap[m];
+  }
+
+  // 2. Global monthly target
   if(m && k.monthTargets){
-    const yearMap = mapGet(k.monthTargets, y);
+    const yearMap = mget(k.monthTargets, y);
     if(yearMap && yearMap[m] != null) return yearMap[m];
   }
 
-  // 2. Year-wise target (keyed by FY start year)
-  if(k.yearTargets){
-    const yt = mapGet(k.yearTargets, y);
+  // 3. Plant-specific annual target
+  if(plantOvr && plantOvr.yearTargets){
+    const yt = mget(plantOvr.yearTargets, y);
     if(yt != null) return yt;
   }
 
-  // 3. Plant-specific override
-  if(p && p !== 'All'){
-    const o = k.plantOverrides && k.plantOverrides[p];
-    if(o && o.target != null) return o.target;
+  // 4. Global annual target (keyed by FY start year)
+  if(k.yearTargets){
+    const yt = mget(k.yearTargets, y);
+    if(yt != null) return yt;
   }
 
-  // 4. Base target
+  // 5. Plant-specific base target override
+  if(plantOvr && plantOvr.target != null) return plantOvr.target;
+
+  // 6. Global base target
   return k.target;
 }
 
@@ -3737,19 +3764,24 @@ function loadKPITarget(){
   if(k){
     document.getElementById('entryTarget').value = kpiTargetFor(k, plant, year, month);
     document.getElementById('entryUnit').value = k.unit;
-    // Show which target level is being used
+    // Show which target level is being used (mirrors resolveTarget priority)
     let srcLabel = '';
-    // Determine FY start year for lookup
     let fyStartYear = parseInt(year || new Date().getFullYear());
     if(appSettings.fyMode === 'apr' && month && ['January','February','March'].includes(month)) fyStartYear -= 1;
     const y = String(fyStartYear);
     function mapGet2(obj, key){ if(!obj) return undefined; if(obj[key] != null) return obj[key]; const n=parseInt(key); if(!isNaN(n)&&obj[n]!=null) return obj[n]; return undefined; }
-    const yearMap = k.monthTargets ? mapGet2(k.monthTargets, y) : null;
-    if(month && yearMap && yearMap[month] != null){
+    const plantOvr2 = (plant && plant !== 'All') ? (k.plantOverrides && k.plantOverrides[plant]) : null;
+    const plantMonthMap = plantOvr2 && plantOvr2.monthTargets ? mapGet2(plantOvr2.monthTargets, y) : null;
+    const globalMonthMap = k.monthTargets ? mapGet2(k.monthTargets, y) : null;
+    if(month && plantMonthMap && plantMonthMap[month] != null){
+      srcLabel = '🏭📅 Plant-specific monthly target';
+    } else if(month && globalMonthMap && globalMonthMap[month] != null){
       srcLabel = '📅 Monthly target';
+    } else if(plantOvr2 && plantOvr2.yearTargets && mapGet2(plantOvr2.yearTargets, y) != null){
+      srcLabel = '🏭📆 Plant-specific annual target';
     } else if(k.yearTargets && mapGet2(k.yearTargets, y) != null){
-      srcLabel = '📆 Annual target (no monthly target defined)';
-    } else if(plant && plant!=='All' && k.plantOverrides && k.plantOverrides[plant] && k.plantOverrides[plant].target != null){
+      srcLabel = '📆 Annual target';
+    } else if(plantOvr2 && plantOvr2.target != null){
       srcLabel = '🏭 Plant-specific target';
     } else {
       srcLabel = '📋 Base target';
@@ -4050,10 +4082,17 @@ function saveEntry(mode){
   if(appSettings.fyMode==='apr' && month_ && ['January','February','March'].includes(month_)) _fyStart -= 1;
   const _yKey = String(_fyStart);
   const _mapGet = (o,key)=>{ if(!o) return undefined; if(o[key]!=null) return o[key]; const n=parseInt(key); if(!isNaN(n)&&o[n]!=null) return o[n]; return undefined; };
-  const _monthMap = k.monthTargets ? _mapGet(k.monthTargets,_yKey) : null;
-  const _hasMonthly = !!(_monthMap && _monthMap[month_] != null);
+  const _plantOvr = (plant && plant!=='All') ? (k.plantOverrides && k.plantOverrides[plant]) : null;
+  const _plantMonthMap = _plantOvr && _plantOvr.monthTargets ? _mapGet(_plantOvr.monthTargets,_yKey) : null;
+  const _globalMonthMap = k.monthTargets ? _mapGet(k.monthTargets,_yKey) : null;
+  const _hasPlantMonthly = !!(_plantMonthMap && _plantMonthMap[month_] != null);
+  const _hasMonthly = !!(_globalMonthMap && _globalMonthMap[month_] != null);
+  const _hasPlantAnnual = !!(_plantOvr && _plantOvr.yearTargets && _mapGet(_plantOvr.yearTargets,_yKey) != null);
   const _hasAnnual  = !!(k.yearTargets && _mapGet(k.yearTargets,_yKey) != null);
-  const _tgtSource = _hasMonthly ? 'MONTHLY' : (_hasAnnual ? 'ANNUAL (no monthly set for this month!)' : 'BASE target');
+  const _hasPlantBase = !!(_plantOvr && _plantOvr.target != null);
+  const _tgtSource = _hasPlantMonthly ? 'PLANT MONTHLY' : _hasMonthly ? 'GLOBAL MONTHLY' :
+    _hasPlantAnnual ? 'PLANT ANNUAL' : _hasAnnual ? 'GLOBAL ANNUAL' :
+    _hasPlantBase ? 'PLANT BASE OVERRIDE' : 'BASE target';
   console.log('[saveEntry decision]', {
     kpiId, kpiName: k.name, month: month_, year: year_,
     directionUsed: kDir, masterDir: k.dir, optionDataDir: optDir,
@@ -5945,7 +5984,8 @@ function buildMonthReportPills(){
   const wrap = document.getElementById('monthReportPills');
   if(!wrap) return;
   const active = monthReportState.month;
-  wrap.innerHTML = MONTHS.map(m=>
+  // Use getFYMonths() so pills run Apr→Mar in FY mode and Jan→Dec in CY mode
+  wrap.innerHTML = getFYMonths().map(m=>
     `<button class="month-pill${m===active?' active':''}" onclick="selectMonthReportMonth('${m}')">${m.slice(0,3)}</button>`
   ).join('');
 }
@@ -5968,6 +6008,7 @@ function initMonthReportPage(){
   if(!monthReportState.month){
     let saved = null;
     try{ saved = localStorage.getItem('kpiMonthReportMonth'); }catch(e){}
+    // Default to current calendar month, but expressed in FY-aware ordering
     monthReportState.month = saved || MONTHS[new Date().getMonth()];
   }
   try{
