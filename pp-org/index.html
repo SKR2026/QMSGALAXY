@@ -3261,9 +3261,8 @@ function noData(cols,icon='',h='',p=''){
 function drawAdminLines(chartKey){
   const svg = document.getElementById('admin-lines-svg-'+chartKey);
   if(!svg) return;
-  svg.innerHTML = ''; // clear previous lines
+  svg.innerHTML = '';
 
-  // Only draw if there are employees with adminParentId
   const dualReporters = S.employees.filter(e=>e.adminParentId);
   if(!dualReporters.length) return;
 
@@ -3271,89 +3270,123 @@ function drawAdminLines(chartKey){
   if(!canvas) return;
   const canvasRect = canvas.getBoundingClientRect();
   const scale = parseFloat(((canvas.style.transform||'scale(1)').replace('scale(','').replace(')','')))||1;
+  const PAD = 6; // padding around nodes when checking collisions
 
-  // Arrow marker definitions — one per type so each has the correct colour
+  // ── Collect ALL node bounding boxes in canvas coords ──────────────
+  const allCards = Array.from(canvas.querySelectorAll('.ocard'));
+  const nodeBoxes = allCards.map(el=>{
+    const r = el.getBoundingClientRect();
+    return {
+      left:   (r.left   - canvasRect.left) / scale - PAD,
+      right:  (r.right  - canvasRect.left) / scale + PAD,
+      top:    (r.top    - canvasRect.top)  / scale - PAD,
+      bottom: (r.bottom - canvasRect.top)  / scale + PAD,
+    };
+  });
+
+  // ── Helper: does a vertical segment at x between y_a and y_b hit any node? ──
+  function verticalClear(x, ya, yb){
+    const minY = Math.min(ya,yb), maxY = Math.max(ya,yb);
+    return !nodeBoxes.some(b=> x > b.left && x < b.right && maxY > b.top && minY < b.bottom);
+  }
+
+  // ── Helper: does a horizontal segment at y between x_a and x_b hit any node? ──
+  function horizontalClear(y, xa, xb){
+    const minX = Math.min(xa,xb), maxX = Math.max(xa,xb);
+    return !nodeBoxes.some(b=> y > b.top && y < b.bottom && maxX > b.left && minX < b.right);
+  }
+
+  // ── Find a clear vertical corridor X between xMin and xMax ──
+  // Scans outward from the midpoint in STEP increments.
+  function findClearVerticalX(xMin, xMax, ya, yb, laneOffset){
+    const STEP = 8;
+    const minY = Math.min(ya,yb), maxY = Math.max(ya,yb);
+    // Prefer outside the node band — try left of xMin first, then right of xMax
+    // Also try the gap between nodes in increasing offsets
+    const candidates = [];
+    // Outside left: xMin - gap
+    for(let g = 20 + laneOffset; g <= 180; g += STEP) candidates.push(xMin - g);
+    // Outside right: xMax + gap
+    for(let g = 20 + laneOffset; g <= 180; g += STEP) candidates.push(xMax + g);
+    // Between nodes (fallback): scan from xMin to xMax
+    for(let x = xMin - laneOffset; x >= xMin - 180; x -= STEP) candidates.push(x);
+    for(let x = xMax + laneOffset; x <= xMax + 180; x += STEP) candidates.push(x);
+
+    for(const x of candidates){
+      if(verticalClear(x, minY, maxY)) return x;
+    }
+    return xMin - 30 - laneOffset; // fallback
+  }
+
+  // ── Arrow marker defs ──────────────────────────────────────────────
   const typeColors = {administrative:'#F5A623',functional:'#1E4080','dotted-line':'#F5A623',matrix:'#EF4444'};
   const typeDashes = {administrative:'8 5',functional:'12 4','dotted-line':'4 6',matrix:'6 3 2 3'};
 
   const defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
   Object.entries(typeColors).forEach(([type, color])=>{
-    const safeType = type.replace(/[^a-z]/g,'-');
-    defs.innerHTML += `<marker id="admin-arrow-${chartKey}-${safeType}" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto">
+    const st = type.replace(/[^a-z]/g,'-');
+    defs.innerHTML += `<marker id="admin-arrow-${chartKey}-${st}" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
       <path d="M0,0 L0,7 L7,3.5 z" fill="${color}" opacity="0.9"/>
     </marker>`;
   });
   svg.appendChild(defs);
 
-  // Track used horizontal rail Y-levels to avoid overlap between lines
-  // We assign each connection a unique "lane" offset so parallel lines don't stack
-  const usedRails = {}; // key: rounded-midY → count
+  // Track used vertical X rails so parallel connections don't land on same column
+  const usedX = [];
 
   dualReporters.forEach((emp, idx)=>{
-    // Find the employee's card element (data-pid attribute)
     const fromCard = canvas.querySelector(`[data-pid="${emp.id}"]`);
     const toCard   = emp.adminParentId ? canvas.querySelector(`[data-pid="${emp.adminParentId}"]`) : null;
     if(!fromCard || !toCard) return;
 
-    const fromRect = fromCard.getBoundingClientRect();
-    const toRect   = toCard.getBoundingClientRect();
+    const fR = fromCard.getBoundingClientRect();
+    const tR = toCard.getBoundingClientRect();
 
-    // Convert page coords → canvas coords (account for CSS scale)
-    // Use LEFT/RIGHT edges of nodes instead of centres, to avoid crossing nodes
-    const fLeft   = (fromRect.left   - canvasRect.left) / scale;
-    const fRight  = (fromRect.right  - canvasRect.left) / scale;
-    const fMidY   = (fromRect.top + fromRect.height/2 - canvasRect.top) / scale;
-    const tLeft   = (toRect.left     - canvasRect.left) / scale;
-    const tRight  = (toRect.right    - canvasRect.left) / scale;
-    const tMidY   = (toRect.top + toRect.height/2 - canvasRect.top) / scale;
+    // Canvas-space coords
+    const fL  = (fR.left   - canvasRect.left) / scale;
+    const fRx = (fR.right  - canvasRect.left) / scale;
+    const fMY = (fR.top + fR.height/2 - canvasRect.top) / scale;
+    const tL  = (tR.left   - canvasRect.left) / scale;
+    const tRx = (tR.right  - canvasRect.left) / scale;
+    const tMY = (tR.top + tR.height/2 - canvasRect.top) / scale;
 
-    // Decide which sides to exit/enter: prefer the side that avoids the gap between nodes
-    // If "from" node is to the RIGHT of "to" node → exit left of "from", enter right of "to"
-    // If "from" node is to the LEFT of "to" node  → exit right of "from", enter left of "to"
-    const fromIsRight = fLeft > tRight;   // from-node is entirely right of to-node
-    const fromIsLeft  = fRight < tLeft;   // from-node is entirely left of to-node
+    // Y-range the vertical segment must traverse
+    const minY = Math.min(fMY, tMY);
+    const maxY = Math.max(fMY, tMY);
 
-    let x1, x2, side1, side2;
-    if(fromIsRight){
-      // exit left side of from, enter right side of to
-      x1 = fLeft;  side1 = -1; // going left
-      x2 = tRight; side2 = +1; // arriving from right
-    } else {
-      // default: exit right side of from, enter left side of to
-      x1 = fRight; side1 = +1; // going right
-      x2 = tLeft;  side2 = -1; // arriving from left
+    // Overall X extent of the two nodes
+    const xMin = Math.min(fL, tL);
+    const xMax = Math.max(fRx, tRx);
+
+    // Lane offset — spread parallel connections apart by ~10px each
+    const laneOffset = idx * 10;
+
+    // Find a clear vertical X corridor
+    let vx = findClearVerticalX(xMin, xMax, minY, maxY, laneOffset);
+
+    // Avoid reusing exact same X as a previous connection (nudge by 8px)
+    let attempts = 0;
+    while(usedX.some(ux => Math.abs(ux - vx) < 8) && attempts < 10){
+      vx += (vx < xMin) ? -8 : 8;
+      attempts++;
     }
+    usedX.push(vx);
 
-    const y1 = fMidY;
-    const y2 = tMidY;
+    // Determine which side of each node the horizontal stub exits from
+    // — exit from the side closest to vx
+    const fromExitLeft  = Math.abs(fL  - vx) < Math.abs(fRx - vx);
+    const toEnterLeft   = Math.abs(tL  - vx) < Math.abs(tRx - vx);
 
-    // Horizontal clearance: how far the line extends before turning
-    // Use a small per-connection offset (idx * 8) so parallel lines use different rails
-    const BASE_CLEARANCE = 22;
-    const LANE_STEP      = 9;
-    const clearance = BASE_CLEARANCE + (idx % 6) * LANE_STEP;
+    const x1 = fromExitLeft ? fL  : fRx;  // edge of from-node
+    const x2 = toEnterLeft  ? tL  : tRx;  // edge of to-node
+    const y1 = fMY;
+    const y2 = tMY;
 
-    // Exit point from "from" node edge
-    const ex1 = x1 + side1 * clearance;
-    // Entry point into "to" node edge
-    const ex2 = x2 + side2 * clearance;
+    // Path: (x1,y1) → (vx,y1) → (vx,y2) → (x2,y2)  — 3 segments, 2 turns
+    const d = `M${x1},${y1} L${vx},${y1} L${vx},${y2} L${x2},${y2}`;
 
-    // Orthogonal path: exit horizontal → vertical → enter horizontal
-    // Shape:  (x1,y1) → (ex1,y1) → (ex1,y2) → (x2,y2)
-    // But if ex1 and ex2 are on different sides we need a mid-column merge:
-    // (x1,y1) → (ex1,y1) → (ex1, midY) → (ex2, midY) → (ex2,y2) → (x2,y2)
-    let d;
-    if(Math.abs(ex1 - ex2) < 2){
-      // Same column — simple 3-segment L
-      d = `M${x1},${y1} L${ex1},${y1} L${ex1},${y2} L${x2},${y2}`;
-    } else {
-      // Different column — 5-segment Z with a horizontal bridge at the midpoint
-      const midY = (y1 + y2) / 2;
-      d = `M${x1},${y1} L${ex1},${y1} L${ex1},${midY} L${ex2},${midY} L${ex2},${y2} L${x2},${y2}`;
-    }
-
-    const lineColor = typeColors[emp.adminReportingType]||'#F5A623';
-    const dashArray = typeDashes[emp.adminReportingType]||'8 5';
+    const lineColor = typeColors[emp.adminReportingType] || '#F5A623';
+    const dashArray = typeDashes[emp.adminReportingType] || '8 5';
     const safeType  = (emp.adminReportingType||'administrative').replace(/[^a-z]/g,'-');
 
     const path = document.createElementNS('http://www.w3.org/2000/svg','path');
@@ -3362,13 +3395,13 @@ function drawAdminLines(chartKey){
     path.setAttribute('stroke-width', '1.8');
     path.setAttribute('stroke-dasharray', dashArray);
     path.setAttribute('fill', 'none');
-    path.setAttribute('opacity', '0.80');
+    path.setAttribute('opacity', '0.85');
     path.setAttribute('stroke-linejoin', 'miter');
     path.setAttribute('stroke-linecap', 'square');
     path.setAttribute('marker-end', `url(#admin-arrow-${chartKey}-${safeType})`);
     svg.appendChild(path);
 
-    // Small dot at the origin (employee card edge)
+    // Dot at origin edge
     const dot = document.createElementNS('http://www.w3.org/2000/svg','circle');
     dot.setAttribute('cx', x1);
     dot.setAttribute('cy', y1);
