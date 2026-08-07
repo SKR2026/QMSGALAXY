@@ -12,12 +12,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-analytics-compat.js"></script>
 
-<!-- Microsoft MSAL – Azure AD / Microsoft Graph token acquisition -->
-<script src="https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"
-  onerror="console.error('❌ MSAL failed to load from unpkg. Trying jsDelivr fallback…');
-           var s=document.createElement('script');
-           s.src='https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js';
-           document.head.appendChild(s);"></script>
+<!-- Gmail backend used for email — no MSAL needed -->
 <style>
 :root {
   --navy:    #0f0f1a;
@@ -1016,7 +1011,7 @@ html.guest-direct-link #mainContent { display: block !important; }
     "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://www.gstatic.com https://unpkg.com https://cdn.jsdelivr.net",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src https://fonts.gstatic.com",
-    "connect-src https://*.firebaseio.com https://*.googleapis.com https://*.microsoft.com https://graph.microsoft.com https://login.microsoftonline.com",
+    "connect-src https://*.firebaseio.com https://*.googleapis.com https://*.run.app",
     "img-src 'self' data: https:",
     "frame-ancestors 'none'",
   ].join('; ');
@@ -1643,10 +1638,9 @@ let _visitsData = [];
 let _mailData   = [];
 let _usersData  = { ...DEFAULT_USERS };
 let _settingsData = {
-  azure: {
-    msClientId: '',
-    msTenantId: '',
-    msToEmail: '',
+  gmail: {
+    backendUrl: '',
+    toEmail: '',
     senderName: 'PlantVisit System'
   },
   notification: {
@@ -3366,111 +3360,73 @@ function closeModal() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   MICROSOFT GRAPH API HELPER (MSAL delegated flow)
-   – Uses Azure AD MSAL popup/silent for token acquisition
-     + Microsoft Graph /me/sendMail endpoint
+   GMAIL BACKEND API HELPER
+   – Calls the Cloud Run email backend (Nodemailer + Gmail App Password)
+     No OAuth popup, no Azure credentials required.
 ══════════════════════════════════════════════════════════ */
 
-// ── MSAL singleton cache (one instance per clientId+tenantId) ──────────
-// Prevents "interaction_in_progress" errors caused by multiple MSAL instances
-// writing conflicting auth state to localStorage.
-const _msalInstances = {};
-
 /**
- * getMSGraphToken()
- * Acquires a delegated access token from Azure AD using MSAL popup/silent flow.
- * Requires: { msClientId, msTenantId }
+ * getGmailBackendUrl()
+ * Returns the Cloud Run backend URL from settings.
  */
-async function getMSGraphToken(cfg) {
-  if (typeof msal === 'undefined') {
-    throw new Error(
-      'MSAL library failed to load. Please check your internet connection and try refreshing the page. ' +
-      'If the problem persists, ensure your network allows access to unpkg.com or cdn.jsdelivr.net.'
-    );
-  }
-  if (!cfg.msClientId || !cfg.msTenantId) {
-    throw new Error('Azure App (Client) ID and Tenant ID are required.');
-  }
-
-  // Use the full page URL as redirectUri — register THIS exact URL in Azure AD under:
-  //   App registrations → Authentication → Redirect URIs (type: Single-page application)
-  const redirectUri = window.location.href.split('?')[0].split('#')[0];
-  console.info(`ℹ️  Azure AD Redirect URI to register: ${redirectUri}`);
-
-  const cacheKey = `${cfg.msClientId}::${cfg.msTenantId}`;
-  if (!_msalInstances[cacheKey]) {
-    const msalConfig = {
-      auth: {
-        clientId:  cfg.msClientId,
-        authority: `https://login.microsoftonline.com/${cfg.msTenantId}`,
-        redirectUri,
-      },
-      cache: { cacheLocation: 'localStorage', storeAuthStateInCookie: false },
-    };
-    const inst = new msal.PublicClientApplication(msalConfig);
-    await inst.initialize();
-    _msalInstances[cacheKey] = inst;
-    console.log(`🔑 MSAL instance created — redirectUri: ${redirectUri}`);
-  }
-  const msalInstance = _msalInstances[cacheKey];
-
-  const request = { scopes: ['Mail.Send', 'User.Read'] };
-
-  // Try silent first (uses cached token)
-  const accounts = msalInstance.getAllAccounts();
-  if (accounts.length > 0) {
-    try {
-      const silentResult = await msalInstance.acquireTokenSilent({ ...request, account: accounts[0] });
-      return silentResult.accessToken;
-    } catch (_) { /* fall through to popup */ }
-  }
-  // Interactive popup login
-  const popupResult = await msalInstance.loginPopup(request);
-  return popupResult.accessToken;
+function getGmailBackendUrl() {
+  return (_settingsData.gmail || {}).backendUrl || '';
 }
 
 /**
- * sendGraphMail(accessToken, { toEmail, subject, htmlBody })
- * POST to Microsoft Graph /me/sendMail
+ * sendGmailEmail(toEmail, subject, bodyHtml)
+ * Calls POST /api/send-email on the Cloud Run backend.
  */
-async function sendGraphMail(accessToken, { toEmail, subject, htmlBody }) {
-  const body = {
-    message: {
-      subject,
-      body: { contentType: 'HTML', content: htmlBody },
-      toRecipients: [{ emailAddress: { address: toEmail } }],
-    },
-    saveToSentItems: true,
-  };
-  const res = await fetch('https://graph.microsoft.com/v1.0/me/sendMail', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => res.statusText);
-    throw new Error(`Graph API error ${res.status}: ${errText}`);
-  }
-}
-
-/**
- * sendGraphEmail(toEmail, subject, bodyHtml)
- * High-level wrapper used by logMail() — acquires token then sends.
- */
-async function sendGraphEmail(toEmail, subject, bodyHtml) {
-  const az = _settingsData.azure || {};
-  if (!az.msClientId || !az.msTenantId) return false;
+async function sendGmailEmail(toEmail, subject, bodyHtml) {
+  const backendUrl = getGmailBackendUrl();
+  if (!backendUrl) return false;
+  const gm = _settingsData.gmail || {};
   try {
-    const accessToken = await getMSGraphToken({ msClientId: az.msClientId, msTenantId: az.msTenantId });
-    await sendGraphMail(accessToken, { toEmail, subject, htmlBody: bodyHtml });
+    const res = await fetch(`${backendUrl}/api/send-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        to: toEmail,
+        subject,
+        htmlBody: bodyHtml,
+        senderName: gm.senderName || 'PlantVisit Notifications',
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || res.statusText);
+    }
     return true;
   } catch(e) {
-    console.error('Graph API email error:', e);
+    console.error('Gmail backend email error:', e);
     return false;
   }
+}
+
+/**
+ * sendGmailDigest(recipients, subject, bodyHtml)
+ * Calls POST /api/send-digest on the Cloud Run backend.
+ */
+async function sendGmailDigest(recipients, subject, bodyHtml) {
+  const backendUrl = getGmailBackendUrl();
+  if (!backendUrl) return false;
+  const gm = _settingsData.gmail || {};
+  const res = await fetch(`${backendUrl}/api/send-digest`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      recipients,
+      subject,
+      htmlBody: bodyHtml,
+      senderName: gm.senderName || 'PlantVisit Digest',
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
+  }
+  const data = await res.json();
+  return data.results || [];
 }
 
 function logMail(record, isUpdate) {
@@ -3479,8 +3435,8 @@ function logMail(record, isUpdate) {
   const directLink = `${appUrl}?visit=${record.id}&guest=1`;
   const company = _settingsData?.app?.companyName || 'PlantVisit';
   const subject = `[${isUpdate?'UPDATED':'NEW'}] Customer Visit — ${record.company} @ ${record.plant} on ${fmtDateRange(record.visitDate, record.visitDateEnd)}`;
-  const az      = _settingsData.azure || {};
-  const toAddr  = az.msToEmail || _settingsData.notification?.managementEmail || 'management@company.com';
+  const gm      = _settingsData.gmail || {};
+  const toAddr  = gm.toEmail || _settingsData.notification?.managementEmail || 'management@company.com';
 
   // ── Criticality colour map ────────────────────────────────────────────
   const CRIT_COLOR = { Critical:'#e05555', High:'#e08540', Medium:'#e8c547', Low:'#5abf7a' };
@@ -3663,10 +3619,11 @@ function logMail(record, isUpdate) {
 </td></tr></table><!-- /outer -->
 </body></html>`;
 
-  // Attempt real send via Microsoft Graph API (fires-and-forgets)
-  if (az.msClientId && az.msTenantId && az.msToEmail) {
-    sendGraphEmail(az.msToEmail, subject, bodyHtml).then(ok => {
-      if (ok) toast('📧 Email Sent', `Notification sent via Microsoft Graph to ${az.msToEmail}`);
+  // Attempt real send via Gmail backend (fires-and-forgets)
+  const gm = _settingsData.gmail || {};
+  if (gm.backendUrl && gm.toEmail) {
+    sendGmailEmail(gm.toEmail, subject, bodyHtml).then(ok => {
+      if (ok) toast('📧 Email Sent', `Notification sent via Gmail to ${gm.toEmail}`);
     });
   }
 
@@ -3692,10 +3649,10 @@ function renderMail(el) {
     <div class="section-title">Mail Notification Log</div>
     <div class="section-sub">Microsoft Graph API · auto-sent on every create/update</div>
   </div>
-  ${(()=>{const az=_settingsData.azure||{};
-    return az.msClientId&&az.msTenantId&&az.msToEmail
-      ? `<div class="alert alert-info" style="margin-bottom:18px">✅ Microsoft Graph API is configured — emails are sent live via MSAL delegated sign-in to <strong>${xe(az.msToEmail)}</strong>. Each notification includes a <strong>direct-access link</strong> so plant users can open records instantly.</div>`
-      : `<div class="alert alert-warn" style="margin-bottom:18px">⚙ Microsoft Graph API is not configured yet. Go to <strong>Settings → Microsoft Graph API</strong> and enter your Azure App Client ID, Tenant ID and recipient email to enable live email notifications.</div>`;
+  ${(()=>{const gm=_settingsData.gmail||{};
+    return gm.backendUrl&&gm.toEmail
+      ? `<div class="alert alert-info" style="margin-bottom:18px">✅ Gmail backend is configured — emails are sent to <strong>${xe(gm.toEmail)}</strong> via your Cloud Run service. Each notification includes a <strong>direct-access link</strong> so plant users can open records instantly.</div>`
+      : `<div class="alert alert-warn" style="margin-bottom:18px">⚙ Gmail backend is not configured yet. Go to <strong>Settings → Gmail Email</strong> and enter your Cloud Run backend URL and recipient email to enable live email notifications.</div>`;
   })()}
   <div class="card">
     <div class="card-header">
@@ -3737,7 +3694,7 @@ function renderSettings(el) {
     <div class="section-sub">Configure system, Azure, and user management</div>
   </div>
   <div class="settings-tabs">
-    <button class="settings-tab${_settingsActiveTab==='azure'?' active':''}" onclick="switchSettingsTab('azure')">🔗 Microsoft Graph API</button>
+    <button class="settings-tab${_settingsActiveTab==='azure'?' active':''}" onclick="switchSettingsTab('azure')">📧 Gmail Email</button>
     <button class="settings-tab${_settingsActiveTab==='notifications'?' active':''}" onclick="switchSettingsTab('notifications')">🔔 Notifications</button>
     <button class="settings-tab${_settingsActiveTab==='plants'?' active':''}" onclick="switchSettingsTab('plants')">🏭 Plants</button>
     <button class="settings-tab${_settingsActiveTab==='categories'?' active':''}" onclick="switchSettingsTab('categories')">📋 Categories</button>
@@ -3767,35 +3724,31 @@ function renderSettingsTab() {
 }
 
 function renderAzureSettings(el) {
-  const az = _settingsData.azure || {};
+  // Renamed internally but kept for compatibility — now shows Gmail settings
+  const gm = _settingsData.gmail || {};
   el.innerHTML = `
   <div class="card">
-    <div class="card-header"><div class="card-title">Microsoft Graph API</div><span class="badge badge-medium">Email Channel</span></div>
+    <div class="card-header"><div class="card-title">Gmail Email Settings</div><span class="badge badge-medium">Email Channel</span></div>
     <div class="alert alert-info" style="margin-bottom:20px">
-      🔗 Configure Microsoft Graph API via Azure App Registration to enable email notifications.
-      This uses <strong>MSAL delegated sign-in</strong> (popup) — no client secret required.
-      Find these values in <strong>Azure Portal → App Registrations → Your App</strong>.
+      📧 Email is sent via <strong>Gmail SMTP</strong> through a Cloud Run backend service (Nodemailer).<br>
+      No OAuth popup or Azure credentials needed — just a Gmail App Password and your backend URL.
     </div>
     <div class="alert alert-warn" style="margin-bottom:20px;font-size:12px">
-      ⚙ <strong>Azure AD Setup:</strong>
-      <ol style="margin:8px 0 0 16px;line-height:1.7">
-        <li>App registrations → New registration → Single-page application</li>
-        <li>Set Redirect URI to: <code style="font-size:11px;background:var(--navy4);padding:1px 6px;border-radius:4px">${window.location.href.split('?')[0].split('#')[0]}</code></li>
-        <li>API permissions → Microsoft Graph → Delegated → <code style="font-size:11px;background:var(--navy4);padding:1px 6px;border-radius:4px">Mail.Send</code> + <code style="font-size:11px;background:var(--navy4);padding:1px 6px;border-radius:4px">User.Read</code> → Grant admin consent</li>
+      ⚙ <strong>One-time Gmail Setup:</strong>
+      <ol style="margin:8px 0 0 16px;line-height:1.8">
+        <li>Enable 2-Step Verification on your Gmail account</li>
+        <li>Go to <strong>Google Account → Security → App Passwords</strong></li>
+        <li>Create a new app password (select "Mail" + "Other") → copy the 16-char code</li>
+        <li>Deploy the Cloud Run backend with <code style="font-size:11px;background:var(--navy4);padding:1px 6px;border-radius:4px">GMAIL_USER</code> and <code style="font-size:11px;background:var(--navy4);padding:1px 6px;border-radius:4px">GMAIL_APP_PASS</code> env vars</li>
+        <li>Paste the Cloud Run service URL below</li>
       </ol>
     </div>
     <div class="settings-section">
-      <div class="settings-section-title">Azure AD — App Registration</div>
+      <div class="settings-section-title">Cloud Run Backend</div>
       <div class="settings-row">
-        <div><div class="settings-row-label">Application (Client) ID</div><div class="settings-row-sub">Azure Portal → App Registrations → Your App → Overview</div></div>
+        <div><div class="settings-row-label">Backend URL</div><div class="settings-row-sub">Your Cloud Run service URL — e.g. https://plantvisit-email-xxxx-uc.a.run.app</div></div>
         <div class="settings-row-right">
-          <input type="text" class="settings-input mono" id="az_client_id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" value="${xe(az.msClientId||'')}">
-        </div>
-      </div>
-      <div class="settings-row">
-        <div><div class="settings-row-label">Directory (Tenant) ID</div><div class="settings-row-sub">Azure Portal → App Registrations → Your App → Overview</div></div>
-        <div class="settings-row-right">
-          <input type="text" class="settings-input mono" id="az_tenant_id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" value="${xe(az.msTenantId||'')}">
+          <input type="text" class="settings-input mono" id="gm_backend_url" placeholder="https://plantvisit-email-xxxx-uc.a.run.app" value="${xe(gm.backendUrl||'')}">
         </div>
       </div>
     </div>
@@ -3803,39 +3756,37 @@ function renderAzureSettings(el) {
       <div class="settings-section-title">Notification Recipient</div>
       <div class="settings-row">
         <div><div class="settings-row-label">Recipient Email (To)</div><div class="settings-row-sub">Email address that receives visit notifications</div></div>
-        <div class="settings-row-right"><input type="email" class="settings-input" id="az_to_email" placeholder="management@yourdomain.com" value="${xe(az.msToEmail||'')}"></div>
+        <div class="settings-row-right"><input type="email" class="settings-input" id="gm_to_email" placeholder="management@yourdomain.com" value="${xe(gm.toEmail||'')}"></div>
       </div>
       <div class="settings-row">
-        <div><div class="settings-row-label">Sender Display Name</div><div class="settings-row-sub">Name shown in notification emails (sent from the signed-in Microsoft account)</div></div>
-        <div class="settings-row-right"><input type="text" class="settings-input" id="az_sender_name" placeholder="PlantVisit System" value="${xe(az.senderName||'')}"></div>
+        <div><div class="settings-row-label">Sender Display Name</div><div class="settings-row-sub">Name shown in the From field of notification emails</div></div>
+        <div class="settings-row-right"><input type="text" class="settings-input" id="gm_sender_name" placeholder="PlantVisit Notifications" value="${xe(gm.senderName||'')}"></div>
       </div>
     </div>
     <div id="az_test_status" style="display:none;margin-bottom:12px"></div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
       <button class="btn btn-ghost" onclick="testGraphConnection()">⚡ Send Test Email</button>
-      <button class="btn btn-gold" onclick="saveAzureSettings()">✓ Save Graph API Config</button>
+      <button class="btn btn-gold" onclick="saveAzureSettings()">✓ Save Gmail Config</button>
     </div>
   </div>`;
 }
 function saveAzureSettings() {
-  _settingsData.azure = {
-    msClientId:  document.getElementById('az_client_id').value.trim(),
-    msTenantId:  document.getElementById('az_tenant_id').value.trim(),
-    msToEmail:   document.getElementById('az_to_email').value.trim(),
-    senderName:  document.getElementById('az_sender_name').value.trim(),
+  _settingsData.gmail = {
+    backendUrl:  document.getElementById('gm_backend_url').value.trim().replace(/\/$/, ''),
+    toEmail:     document.getElementById('gm_to_email').value.trim(),
+    senderName:  document.getElementById('gm_sender_name').value.trim(),
   };
   saveSettings();
-  toast('✓ Graph API Config Saved', 'Microsoft Graph API configuration updated successfully.');
+  toast('✓ Gmail Config Saved', 'Gmail backend configuration updated successfully.');
 }
 
 async function testGraphConnection() {
-  const clientId = document.getElementById('az_client_id').value.trim();
-  const tenantId = document.getElementById('az_tenant_id').value.trim();
-  const toEmail  = document.getElementById('az_to_email').value.trim();
-  const statusEl = document.getElementById('az_test_status');
+  const backendUrl = document.getElementById('gm_backend_url').value.trim().replace(/\/$/, '');
+  const toEmail    = document.getElementById('gm_to_email').value.trim();
+  const statusEl   = document.getElementById('az_test_status');
 
-  if (!clientId || !tenantId) {
-    toast('Config Missing', 'Please enter Application (Client) ID and Tenant ID first.', true);
+  if (!backendUrl) {
+    toast('Config Missing', 'Please enter the Cloud Run Backend URL first.', true);
     return;
   }
   if (!toEmail) {
@@ -3844,17 +3795,20 @@ async function testGraphConnection() {
   }
 
   statusEl.style.display = 'block';
-  statusEl.innerHTML = `<div class="alert alert-info">⏳ Acquiring token — a Microsoft sign-in popup may appear…</div>`;
+  statusEl.innerHTML = `<div class="alert alert-info">⏳ Sending test email via Gmail backend…</div>`;
 
   try {
-    const accessToken = await getMSGraphToken({ msClientId: clientId, msTenantId: tenantId });
-    const htmlBody = `<p>Hello,</p><p>This is a test email sent from <strong>PlantVisit</strong> via Microsoft Graph API on ${new Date().toLocaleString('en-IN')}.</p><p>Your Microsoft Graph email integration is working correctly.</p><p>— PlantVisit System</p>`;
-    await sendGraphMail(accessToken, {
-      toEmail,
-      subject: 'PlantVisit – Microsoft Graph Email Test',
-      htmlBody,
+    const res = await fetch(`${backendUrl}/api/test-connection`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: toEmail }),
     });
-    statusEl.innerHTML = `<div class="alert alert-good" style="color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">✅ Test email delivered to ${toEmail}</div>`;
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || res.statusText);
+    }
+    const data = await res.json();
+    statusEl.innerHTML = `<div class="alert alert-good" style="color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">✅ Test email delivered to ${toEmail} (from: ${data.from})</div>`;
     toast('📧 Test Sent', `Test email successfully delivered to ${toEmail}`);
   } catch (err) {
     statusEl.innerHTML = `<div class="alert alert-warn">❌ Failed: ${err?.message || String(err)}</div>`;
@@ -4297,7 +4251,7 @@ function buildDailyDigestHtml(visits, since, company, allVisits, upcomingVisits)
         <tr>
           <td style="font-size:12px;color:#8888aa;line-height:1.6">
             This <strong style="color:#aaaac8">Daily Digest</strong> was auto-generated by
-            <strong style="color:#aaaac8">PlantVisit · ${xe(company)}</strong> via Microsoft Graph API.<br>
+            <strong style="color:#aaaac8">PlantVisit · ${xe(company)}</strong> via Gmail.<br>
             You are receiving this because you are subscribed to daily visit summaries.
           </td>
           <td align="right" style="font-size:11px;color:#8888aa;white-space:nowrap;vertical-align:top">
@@ -4320,12 +4274,12 @@ function buildDailyDigestHtml(visits, since, company, allVisits, upcomingVisits)
  * When force=true (e.g. "Send Now" button), the daily dedup check is skipped.
  */
 async function sendDailyDigestEmail(force = false) {
-  const az  = _settingsData.azure || {};
+  const gm  = _settingsData.gmail || {};
   const dd  = _settingsData.dailyDigest || {};
   const company = _settingsData?.app?.companyName || 'PlantVisit';
 
-  if (!az.msClientId || !az.msTenantId) {
-    toast('Graph API Not Configured', 'Please set up Microsoft Graph API credentials in Settings → Graph API.', true);
+  if (!gm.backendUrl) {
+    toast('Gmail Backend Not Configured', 'Please set up Gmail backend URL in Settings → Gmail Email.', true);
     return;
   }
 
@@ -4360,7 +4314,7 @@ async function sendDailyDigestEmail(force = false) {
 
   // Determine recipients
   const digestRecipients = (dd.recipients || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (!digestRecipients.length && az.msToEmail) digestRecipients.push(az.msToEmail);
+  if (!digestRecipients.length && gm.toEmail) digestRecipients.push(gm.toEmail);
   if (!digestRecipients.length) {
     toast('No Recipients', 'Please set digest recipient emails in Notification Settings.', true);
     return;
@@ -4370,16 +4324,12 @@ async function sendDailyDigestEmail(force = false) {
   const statusEl = document.getElementById('dd_send_status');
   if (statusEl) {
     statusEl.style.display = 'block';
-    statusEl.innerHTML = `<div class="alert alert-info">⏳ Acquiring token — Microsoft sign-in popup may appear…</div>`;
+    statusEl.innerHTML = `<div class="alert alert-info">⏳ Sending digest via Gmail backend…</div>`;
   }
 
   try {
-    const bodyHtml    = buildDailyDigestHtml(relevant, since, company, _visitsData, upcoming48);
-    const accessToken = await getMSGraphToken({ msClientId: az.msClientId, msTenantId: az.msTenantId });
-
-    for (const email of digestRecipients) {
-      await sendGraphMail(accessToken, { toEmail: email, subject, htmlBody: bodyHtml });
-    }
+    const bodyHtml = buildDailyDigestHtml(relevant, since, company, _visitsData, upcoming48);
+    await sendGmailDigest(digestRecipients, subject, bodyHtml);
 
     // Record last sent date (both in memory and Firestore)
     const sentLabel = new Date().toLocaleString('en-IN');
