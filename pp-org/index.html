@@ -3270,11 +3270,10 @@ function drawAdminLines(chartKey){
   if(!canvas) return;
   const canvasRect = canvas.getBoundingClientRect();
   const scale = parseFloat(((canvas.style.transform||'scale(1)').replace('scale(','').replace(')','')))||1;
-  const PAD = 6; // padding around nodes when checking collisions
+  const PAD = 5;
 
-  // ── Collect ALL node bounding boxes in canvas coords ──────────────
-  const allCards = Array.from(canvas.querySelectorAll('.ocard'));
-  const nodeBoxes = allCards.map(el=>{
+  // ── Collect ALL node bounding boxes in canvas-space ───────────────
+  const nodeBoxes = Array.from(canvas.querySelectorAll('.ocard')).map(el=>{
     const r = el.getBoundingClientRect();
     return {
       left:   (r.left   - canvasRect.left) / scale - PAD,
@@ -3284,41 +3283,85 @@ function drawAdminLines(chartKey){
     };
   });
 
-  // ── Helper: does a vertical segment at x between y_a and y_b hit any node? ──
-  function verticalClear(x, ya, yb){
-    const minY = Math.min(ya,yb), maxY = Math.max(ya,yb);
-    return !nodeBoxes.some(b=> x > b.left && x < b.right && maxY > b.top && minY < b.bottom);
+  // ── Segment collision helpers ─────────────────────────────────────
+  // Does a HORIZONTAL line at `y` from `xa` to `xb` pass through any node?
+  function hClear(y, xa, xb, excludeBoxes){
+    const x0=Math.min(xa,xb), x1=Math.max(xa,xb);
+    return !nodeBoxes.some((b,i)=>
+      !excludeBoxes.has(i) &&
+      y > b.top && y < b.bottom &&
+      x1 > b.left && x0 < b.right
+    );
+  }
+  // Does a VERTICAL line at `x` from `ya` to `yb` pass through any node?
+  function vClear(x, ya, yb, excludeBoxes){
+    const y0=Math.min(ya,yb), y1=Math.max(ya,yb);
+    return !nodeBoxes.some((b,i)=>
+      !excludeBoxes.has(i) &&
+      x > b.left && x < b.right &&
+      y1 > b.top && y0 < b.bottom
+    );
   }
 
-  // ── Helper: does a horizontal segment at y between x_a and x_b hit any node? ──
-  function horizontalClear(y, xa, xb){
-    const minX = Math.min(xa,xb), maxX = Math.max(xa,xb);
-    return !nodeBoxes.some(b=> y > b.top && y < b.bottom && maxX > b.left && minX < b.right);
-  }
+  // ── Route a single connection ─────────────────────────────────────
+  // Strategy: try all 4 side-pairs (from/to exit sides), pick one where
+  // all 3 segments are clear. Fall back to outermost clear corridor.
+  function route(fL, fR, fY, tL, tR, tY, fromIdx, toIdx, laneOffset){
+    const excl = new Set([fromIdx, toIdx]);
+    const STEP = 10;
+    const MARGIN = 18 + laneOffset; // min horizontal stub length
 
-  // ── Find a clear vertical corridor X between xMin and xMax ──
-  // Scans outward from the midpoint in STEP increments.
-  function findClearVerticalX(xMin, xMax, ya, yb, laneOffset){
-    const STEP = 8;
-    const minY = Math.min(ya,yb), maxY = Math.max(ya,yb);
-    // Prefer outside the node band — try left of xMin first, then right of xMax
-    // Also try the gap between nodes in increasing offsets
-    const candidates = [];
-    // Outside left: xMin - gap
-    for(let g = 20 + laneOffset; g <= 180; g += STEP) candidates.push(xMin - g);
-    // Outside right: xMax + gap
-    for(let g = 20 + laneOffset; g <= 180; g += STEP) candidates.push(xMax + g);
-    // Between nodes (fallback): scan from xMin to xMax
-    for(let x = xMin - laneOffset; x >= xMin - 180; x -= STEP) candidates.push(x);
-    for(let x = xMax + laneOffset; x <= xMax + 180; x += STEP) candidates.push(x);
+    // All exit/entry side combos: [fromSide, toSide]
+    // fromSide: 'L'=exit left edge, 'R'=exit right edge
+    // toSide:   'L'=enter left edge, 'R'=enter right edge
+    const combos = [['L','R'],['R','L'],['L','L'],['R','R']];
 
-    for(const x of candidates){
-      if(verticalClear(x, minY, maxY)) return x;
+    for(const [fs, ts] of combos){
+      const x1 = fs==='L' ? fL : fR;
+      const x2 = ts==='L' ? tL : tR;
+      const y1 = fY, y2 = tY;
+
+      // Compute direction of stubs
+      const dir1 = fs==='L' ? -1 : 1;
+      const dir2 = ts==='L' ? -1 : 1;
+
+      // Find the shared vertical corridor X that is clear for the whole Y span
+      // Scan from outside both nodes outward
+      const xMin = Math.min(x1, x2);
+      const xMax = Math.max(x1, x2);
+
+      // Try positions: outside-left, outside-right, between (rare)
+      const tryCols = [];
+      for(let g=MARGIN; g<=300; g+=STEP) tryCols.push(xMin - g);
+      for(let g=MARGIN; g<=300; g+=STEP) tryCols.push(xMax + g);
+
+      for(const vx of tryCols){
+        // Stub 1: horizontal from (x1,y1) to (vx,y1)
+        if(!hClear(y1, x1, vx, excl)) continue;
+        // Vertical: from (vx,y1) to (vx,y2)
+        if(!vClear(vx, y1, y2, excl)) continue;
+        // Stub 2: horizontal from (vx,y2) to (x2,y2)
+        if(!hClear(y2, vx, x2, excl)) continue;
+
+        // All clear — return this path
+        return {d:`M${x1},${y1} L${vx},${y1} L${vx},${y2} L${x2},${y2}`, x1, y1};
+      }
     }
-    return xMin - 30 - laneOffset; // fallback
+
+    // ── Fallback: find best vx even if stubs partially overlap ───────
+    // Pick the outermost left column (well outside all nodes)
+    const allLeft  = Math.min(...nodeBoxes.map(b=>b.left));
+    const allRight = Math.max(...nodeBoxes.map(b=>b.right));
+    const vxL = allLeft  - 30 - laneOffset;
+    const vxR = allRight + 30 + laneOffset;
+    const x1 = fL, x2 = tL, y1 = fY, y2 = tY;
+    // Pick side with shorter total horizontal travel
+    const vx = Math.abs(vxL - x1) + Math.abs(vxL - x2) < Math.abs(vxR - x1) + Math.abs(vxR - x2)
+      ? vxL : vxR;
+    return {d:`M${x1},${y1} L${vx},${y1} L${vx},${y2} L${x2},${y2}`, x1, y1};
   }
 
-  // ── Arrow marker defs ──────────────────────────────────────────────
+  // ── Arrow marker defs ─────────────────────────────────────────────
   const typeColors = {administrative:'#F5A623',functional:'#1E4080','dotted-line':'#F5A623',matrix:'#EF4444'};
   const typeDashes = {administrative:'8 5',functional:'12 4','dotted-line':'4 6',matrix:'6 3 2 3'};
 
@@ -3331,59 +3374,34 @@ function drawAdminLines(chartKey){
   });
   svg.appendChild(defs);
 
-  // Track used vertical X rails so parallel connections don't land on same column
-  const usedX = [];
+  // Build index map: nodeBox index per card element
+  const allCards = Array.from(canvas.querySelectorAll('.ocard'));
+
+  // Track used vx columns to spread parallel lines
+  const usedVX = [];
 
   dualReporters.forEach((emp, idx)=>{
     const fromCard = canvas.querySelector(`[data-pid="${emp.id}"]`);
     const toCard   = emp.adminParentId ? canvas.querySelector(`[data-pid="${emp.adminParentId}"]`) : null;
     if(!fromCard || !toCard) return;
 
+    const fromIdx = allCards.indexOf(fromCard);
+    const toIdx   = allCards.indexOf(toCard);
+
     const fR = fromCard.getBoundingClientRect();
     const tR = toCard.getBoundingClientRect();
 
-    // Canvas-space coords
     const fL  = (fR.left   - canvasRect.left) / scale;
     const fRx = (fR.right  - canvasRect.left) / scale;
-    const fMY = (fR.top + fR.height/2 - canvasRect.top) / scale;
+    const fY  = (fR.top + fR.height/2 - canvasRect.top) / scale;
     const tL  = (tR.left   - canvasRect.left) / scale;
     const tRx = (tR.right  - canvasRect.left) / scale;
-    const tMY = (tR.top + tR.height/2 - canvasRect.top) / scale;
+    const tY  = (tR.top + tR.height/2 - canvasRect.top) / scale;
 
-    // Y-range the vertical segment must traverse
-    const minY = Math.min(fMY, tMY);
-    const maxY = Math.max(fMY, tMY);
+    // Stagger lane offset so parallel connections use different columns
+    const laneOffset = idx * 12;
 
-    // Overall X extent of the two nodes
-    const xMin = Math.min(fL, tL);
-    const xMax = Math.max(fRx, tRx);
-
-    // Lane offset — spread parallel connections apart by ~10px each
-    const laneOffset = idx * 10;
-
-    // Find a clear vertical X corridor
-    let vx = findClearVerticalX(xMin, xMax, minY, maxY, laneOffset);
-
-    // Avoid reusing exact same X as a previous connection (nudge by 8px)
-    let attempts = 0;
-    while(usedX.some(ux => Math.abs(ux - vx) < 8) && attempts < 10){
-      vx += (vx < xMin) ? -8 : 8;
-      attempts++;
-    }
-    usedX.push(vx);
-
-    // Determine which side of each node the horizontal stub exits from
-    // — exit from the side closest to vx
-    const fromExitLeft  = Math.abs(fL  - vx) < Math.abs(fRx - vx);
-    const toEnterLeft   = Math.abs(tL  - vx) < Math.abs(tRx - vx);
-
-    const x1 = fromExitLeft ? fL  : fRx;  // edge of from-node
-    const x2 = toEnterLeft  ? tL  : tRx;  // edge of to-node
-    const y1 = fMY;
-    const y2 = tMY;
-
-    // Path: (x1,y1) → (vx,y1) → (vx,y2) → (x2,y2)  — 3 segments, 2 turns
-    const d = `M${x1},${y1} L${vx},${y1} L${vx},${y2} L${x2},${y2}`;
+    const {d, x1, y1} = route(fL, fRx, fY, tL, tRx, tY, fromIdx, toIdx, laneOffset);
 
     const lineColor = typeColors[emp.adminReportingType] || '#F5A623';
     const dashArray = typeDashes[emp.adminReportingType] || '8 5';
@@ -3401,7 +3419,7 @@ function drawAdminLines(chartKey){
     path.setAttribute('marker-end', `url(#admin-arrow-${chartKey}-${safeType})`);
     svg.appendChild(path);
 
-    // Dot at origin edge
+    // Origin dot
     const dot = document.createElementNS('http://www.w3.org/2000/svg','circle');
     dot.setAttribute('cx', x1);
     dot.setAttribute('cy', y1);
