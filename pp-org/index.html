@@ -3272,7 +3272,24 @@ function drawAdminLines(chartKey){
   const canvasRect = canvas.getBoundingClientRect();
   const scale = parseFloat(((canvas.style.transform||'scale(1)').replace('scale(','').replace(')','')))||1;
 
-  dualReporters.forEach(emp=>{
+  // Arrow marker definitions — one per type so each has the correct colour
+  const typeColors = {administrative:'#F5A623',functional:'#1E4080','dotted-line':'#F5A623',matrix:'#EF4444'};
+  const typeDashes = {administrative:'8 5',functional:'12 4','dotted-line':'4 6',matrix:'6 3 2 3'};
+
+  const defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
+  Object.entries(typeColors).forEach(([type, color])=>{
+    const safeType = type.replace(/[^a-z]/g,'-');
+    defs.innerHTML += `<marker id="admin-arrow-${chartKey}-${safeType}" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L7,3.5 z" fill="${color}" opacity="0.9"/>
+    </marker>`;
+  });
+  svg.appendChild(defs);
+
+  // Track used horizontal rail Y-levels to avoid overlap between lines
+  // We assign each connection a unique "lane" offset so parallel lines don't stack
+  const usedRails = {}; // key: rounded-midY → count
+
+  dualReporters.forEach((emp, idx)=>{
     // Find the employee's card element (data-pid attribute)
     const fromCard = canvas.querySelector(`[data-pid="${emp.id}"]`);
     const toCard   = emp.adminParentId ? canvas.querySelector(`[data-pid="${emp.adminParentId}"]`) : null;
@@ -3281,49 +3298,85 @@ function drawAdminLines(chartKey){
     const fromRect = fromCard.getBoundingClientRect();
     const toRect   = toCard.getBoundingClientRect();
 
-    // Convert page coordinates to canvas coordinates (account for CSS scale)
-    const cx1 = (fromRect.left + fromRect.width/2  - canvasRect.left) / scale;
-    const cy1 = (fromRect.top  + fromRect.height/2 - canvasRect.top)  / scale;
-    const cx2 = (toRect.left   + toRect.width/2    - canvasRect.left) / scale;
-    const cy2 = (toRect.top    + toRect.height/2   - canvasRect.top)  / scale;
+    // Convert page coords → canvas coords (account for CSS scale)
+    // Use LEFT/RIGHT edges of nodes instead of centres, to avoid crossing nodes
+    const fLeft   = (fromRect.left   - canvasRect.left) / scale;
+    const fRight  = (fromRect.right  - canvasRect.left) / scale;
+    const fMidY   = (fromRect.top + fromRect.height/2 - canvasRect.top) / scale;
+    const tLeft   = (toRect.left     - canvasRect.left) / scale;
+    const tRight  = (toRect.right    - canvasRect.left) / scale;
+    const tMidY   = (toRect.top + toRect.height/2 - canvasRect.top) / scale;
 
-    // Draw a curved dashed line (cubic bezier, control points offset vertically)
-    const midY = (cy1 + cy2) / 2;
-    const cpY  = Math.abs(cy2 - cy1) > 40 ? midY : cy1 - 60; // arc up if nodes are close
-    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
-    const d    = `M${cx1},${cy1} C${cx1},${cpY} ${cx2},${cpY} ${cx2},${cy2}`;
+    // Decide which sides to exit/enter: prefer the side that avoids the gap between nodes
+    // If "from" node is to the RIGHT of "to" node → exit left of "from", enter right of "to"
+    // If "from" node is to the LEFT of "to" node  → exit right of "from", enter left of "to"
+    const fromIsRight = fLeft > tRight;   // from-node is entirely right of to-node
+    const fromIsLeft  = fRight < tLeft;   // from-node is entirely left of to-node
 
-    // Determine line style based on reporting type
-    const typeColors = {administrative:'#F5A623',functional:'#E07B00','dotted-line':'#F5A623',matrix:'#EF4444'};
-    const typeDashes = {administrative:'8 5',functional:'12 4','dotted-line':'4 6',matrix:'6 3 2 3'};
+    let x1, x2, side1, side2;
+    if(fromIsRight){
+      // exit left side of from, enter right side of to
+      x1 = fLeft;  side1 = -1; // going left
+      x2 = tRight; side2 = +1; // arriving from right
+    } else {
+      // default: exit right side of from, enter left side of to
+      x1 = fRight; side1 = +1; // going right
+      x2 = tLeft;  side2 = -1; // arriving from left
+    }
+
+    const y1 = fMidY;
+    const y2 = tMidY;
+
+    // Horizontal clearance: how far the line extends before turning
+    // Use a small per-connection offset (idx * 8) so parallel lines use different rails
+    const BASE_CLEARANCE = 22;
+    const LANE_STEP      = 9;
+    const clearance = BASE_CLEARANCE + (idx % 6) * LANE_STEP;
+
+    // Exit point from "from" node edge
+    const ex1 = x1 + side1 * clearance;
+    // Entry point into "to" node edge
+    const ex2 = x2 + side2 * clearance;
+
+    // Orthogonal path: exit horizontal → vertical → enter horizontal
+    // Shape:  (x1,y1) → (ex1,y1) → (ex1,y2) → (x2,y2)
+    // But if ex1 and ex2 are on different sides we need a mid-column merge:
+    // (x1,y1) → (ex1,y1) → (ex1, midY) → (ex2, midY) → (ex2,y2) → (x2,y2)
+    let d;
+    if(Math.abs(ex1 - ex2) < 2){
+      // Same column — simple 3-segment L
+      d = `M${x1},${y1} L${ex1},${y1} L${ex1},${y2} L${x2},${y2}`;
+    } else {
+      // Different column — 5-segment Z with a horizontal bridge at the midpoint
+      const midY = (y1 + y2) / 2;
+      d = `M${x1},${y1} L${ex1},${y1} L${ex1},${midY} L${ex2},${midY} L${ex2},${y2} L${x2},${y2}`;
+    }
+
     const lineColor = typeColors[emp.adminReportingType]||'#F5A623';
     const dashArray = typeDashes[emp.adminReportingType]||'8 5';
+    const safeType  = (emp.adminReportingType||'administrative').replace(/[^a-z]/g,'-');
 
+    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
     path.setAttribute('d', d);
     path.setAttribute('stroke', lineColor);
     path.setAttribute('stroke-width', '1.8');
     path.setAttribute('stroke-dasharray', dashArray);
     path.setAttribute('fill', 'none');
-    path.setAttribute('opacity', '0.75');
-    path.setAttribute('marker-end', 'url(#admin-arrow-'+chartKey+')');
+    path.setAttribute('opacity', '0.80');
+    path.setAttribute('stroke-linejoin', 'miter');
+    path.setAttribute('stroke-linecap', 'square');
+    path.setAttribute('marker-end', `url(#admin-arrow-${chartKey}-${safeType})`);
     svg.appendChild(path);
 
-    // Endpoint dot on the employee's card
+    // Small dot at the origin (employee card edge)
     const dot = document.createElementNS('http://www.w3.org/2000/svg','circle');
-    dot.setAttribute('cx', cx1);
-    dot.setAttribute('cy', cy1);
-    dot.setAttribute('r', '4');
+    dot.setAttribute('cx', x1);
+    dot.setAttribute('cy', y1);
+    dot.setAttribute('r', '3.5');
     dot.setAttribute('fill', lineColor);
     dot.setAttribute('opacity', '0.9');
     svg.appendChild(dot);
   });
-
-  // Arrow marker definition (once per svg)
-  const defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
-  defs.innerHTML = `<marker id="admin-arrow-${chartKey}" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="userSpaceOnUse">
-    <path d="M0,0 L0,6 L8,3 z" fill="#F5A623" opacity="0.9"/>
-  </marker>`;
-  svg.insertBefore(defs, svg.firstChild);
 }
 
 // Draw admin lines for all active chart panels after DOM settles
