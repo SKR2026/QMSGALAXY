@@ -3270,166 +3270,199 @@ function drawAdminLines(chartKey){
   if(!canvas) return;
   const canvasRect = canvas.getBoundingClientRect();
   const scale = parseFloat(((canvas.style.transform||'scale(1)').replace('scale(','').replace(')','')))||1;
-  const PAD = 5;
+  const PAD = 4;
 
-  // ── Collect ALL node bounding boxes in canvas-space ───────────────
-  const nodeBoxes = Array.from(canvas.querySelectorAll('.ocard')).map(el=>{
+  // ── All node boxes in canvas-space ───────────────────────────────
+  const allCards = Array.from(canvas.querySelectorAll('.ocard'));
+  const boxes = allCards.map(el=>{
     const r = el.getBoundingClientRect();
     return {
-      left:   (r.left   - canvasRect.left) / scale - PAD,
-      right:  (r.right  - canvasRect.left) / scale + PAD,
-      top:    (r.top    - canvasRect.top)  / scale - PAD,
-      bottom: (r.bottom - canvasRect.top)  / scale + PAD,
+      l:(r.left  -canvasRect.left)/scale - PAD,
+      r:(r.right -canvasRect.left)/scale + PAD,
+      t:(r.top   -canvasRect.top) /scale - PAD,
+      b:(r.bottom-canvasRect.top) /scale + PAD,
     };
   });
 
-  // ── Segment collision helpers ─────────────────────────────────────
-  // Does a HORIZONTAL line at `y` from `xa` to `xb` pass through any node?
-  function hClear(y, xa, xb, excludeBoxes){
+  // ── Segment collision checks (exclude source & target) ────────────
+  function hBlocked(y, xa, xb, excl){
     const x0=Math.min(xa,xb), x1=Math.max(xa,xb);
-    return !nodeBoxes.some((b,i)=>
-      !excludeBoxes.has(i) &&
-      y > b.top && y < b.bottom &&
-      x1 > b.left && x0 < b.right
-    );
+    return boxes.some((b,i)=> !excl.has(i) && y>b.t && y<b.b && x1>b.l && x0<b.r);
   }
-  // Does a VERTICAL line at `x` from `ya` to `yb` pass through any node?
-  function vClear(x, ya, yb, excludeBoxes){
+  function vBlocked(x, ya, yb, excl){
     const y0=Math.min(ya,yb), y1=Math.max(ya,yb);
-    return !nodeBoxes.some((b,i)=>
-      !excludeBoxes.has(i) &&
-      x > b.left && x < b.right &&
-      y1 > b.top && y0 < b.bottom
-    );
+    return boxes.some((b,i)=> !excl.has(i) && x>b.l && x<b.r && y1>b.t && y0<b.b);
   }
 
-  // ── Route a single connection ─────────────────────────────────────
-  // Strategy: try all 4 side-pairs (from/to exit sides), pick one where
-  // all 3 segments are clear. Fall back to outermost clear corridor.
-  function route(fL, fR, fY, tL, tR, tY, fromIdx, toIdx, laneOffset){
-    const excl = new Set([fromIdx, toIdx]);
-    const STEP = 10;
-    const MARGIN = 18 + laneOffset; // min horizontal stub length
+  // ── Find first clear horizontal Y scanning from nearY outward ────
+  function findHLane(nearY, xa, xb, excl, preferDir){
+    // preferDir: -1 = try above first, +1 = try below first
+    const STEP=5, MAX=300;
+    for(let d=0; d<=MAX; d+=STEP){
+      const ya=nearY + preferDir*d;
+      const yb=nearY - preferDir*d;
+      if(!hBlocked(ya, xa, xb, excl)) return ya;
+      if(d>0 && !hBlocked(yb, xa, xb, excl)) return yb;
+    }
+    return nearY;
+  }
 
-    // All exit/entry side combos: [fromSide, toSide]
-    // fromSide: 'L'=exit left edge, 'R'=exit right edge
-    // toSide:   'L'=enter left edge, 'R'=enter right edge
-    const combos = [['L','R'],['R','L'],['L','L'],['R','R']];
+  // ── Find first clear vertical X scanning from startX in dir ──────
+  function findVCol(startX, ya, yb, excl, dir){
+    const STEP=8, MAX=500;
+    for(let d=0; d<=MAX; d+=STEP){
+      const x=startX + dir*d;
+      if(!vBlocked(x, ya, yb, excl)) return x;
+    }
+    return startX + dir*MAX;
+  }
 
-    for(const [fs, ts] of combos){
-      const x1 = fs==='L' ? fL : fR;
-      const x2 = ts==='L' ? tL : tR;
-      const y1 = fY, y2 = tY;
+  // ── Build a fully obstacle-free 5-or-7-segment orthogonal path ───
+  // Approach:
+  //  1. Exit from node edge vertically (short stub) to a clear H-lane hy1
+  //  2. Run horizontally on hy1 to a clear vertical corridor vx
+  //  3. Run vertically on vx from hy1 to hy2
+  //  4. Run horizontally on hy2 to a short vertical stub into the target
+  //  5. Enter target via that vertical stub
+  //
+  // This guarantees no horizontal segment ever crosses a node row
+  // because hy1/hy2 are chosen to be in a gap between rows.
+  function route(fL, fR, fTop, fBot, fY, tL, tR, tTop, tBot, tY, excl, laneIdx){
+    const nudge = laneIdx * 14;
 
-      // Compute direction of stubs
-      const dir1 = fs==='L' ? -1 : 1;
-      const dir2 = ts==='L' ? -1 : 1;
+    // Decide which horizontal side to place the vertical corridor
+    // Prefer the side where the two nodes are farther apart (more room)
+    const gapLeft  = Math.min(fL, tL);           // space to the left
+    const gapRight = -(Math.max(fR, tR));         // space to the right (negative = more nodes)
+    const useLeft  = gapLeft > -gapRight;         // true = put vx on the left
 
-      // Find the shared vertical corridor X that is clear for the whole Y span
-      // Scan from outside both nodes outward
-      const xMin = Math.min(x1, x2);
-      const xMax = Math.max(x1, x2);
+    // Starting search position for vx — just outside the leftmost/rightmost node
+    const vxStart = useLeft
+      ? Math.min(fL, tL) - 20 - nudge
+      : Math.max(fR, tR) + 20 + nudge;
+    const vxDir = useLeft ? -1 : 1;
 
-      // Try positions: outside-left, outside-right, between (rare)
-      const tryCols = [];
-      for(let g=MARGIN; g<=300; g+=STEP) tryCols.push(xMin - g);
-      for(let g=MARGIN; g<=300; g+=STEP) tryCols.push(xMax + g);
+    // Horizontal lane hy1 (near from-node): should be OUTSIDE from-node vertically
+    // Try above from-node first (cleaner in org charts where nodes are below)
+    const hy1_prefDir = (fTop < tTop) ? -1 : 1; // from-node higher → go above it
+    // hy1 needs to be outside the from-node top/bottom, so seed from just outside
+    const hy1_seed = hy1_prefDir < 0 ? fTop - 2 : fBot + 2;
 
-      for(const vx of tryCols){
-        // Stub 1: horizontal from (x1,y1) to (vx,y1)
-        if(!hClear(y1, x1, vx, excl)) continue;
-        // Vertical: from (vx,y1) to (vx,y2)
-        if(!vClear(vx, y1, y2, excl)) continue;
-        // Stub 2: horizontal from (vx,y2) to (x2,y2)
-        if(!hClear(y2, vx, x2, excl)) continue;
+    // Horizontal lane hy2 (near to-node): outside to-node
+    const hy2_prefDir = (tTop < fTop) ? -1 : 1;
+    const hy2_seed = hy2_prefDir < 0 ? tTop - 2 : tBot + 2;
 
-        // All clear — return this path
-        return {d:`M${x1},${y1} L${vx},${y1} L${vx},${y2} L${x2},${y2}`, x1, y1};
-      }
+    // hy1 must clear from x1 to vx — but we don't know vx yet.
+    // Solution: iterate. Start with a candidate vx, find hy1/hy2, verify, nudge if needed.
+    // We scan vx positions and for each check all three segments.
+    const VSTEP=8, VMAX=500;
+    for(let vd=0; vd<=VMAX; vd+=VSTEP){
+      const vx = vxStart + vxDir*vd;
+
+      // From-node: exit left or right edge toward vx
+      const x1 = vx < fL ? fL : fR;   // exit the side closest to vx
+      // To-node: enter left or right edge from vx
+      const x2 = vx < tL ? tL : tR;
+
+      // Find hy1: a clear H-lane from x1 to vx, seeded near from-node boundary
+      const hy1 = findHLane(hy1_seed, Math.min(x1,vx), Math.max(x1,vx), excl, hy1_prefDir);
+      // Find hy2: a clear H-lane from vx to x2, seeded near to-node boundary
+      const hy2 = findHLane(hy2_seed, Math.min(x2,vx), Math.max(x2,vx), excl, hy2_prefDir);
+
+      // Check vertical stub from node edge to hy1 (x1 is on the node edge, stays in node col — always clear)
+      // Check vx corridor from hy1 to hy2
+      if(vBlocked(vx, hy1, hy2, excl)) continue;
+      // Check hy1 horizontal (already found clear above)
+      // Check hy2 horizontal (already found clear above)
+      // Check vertical stub x1 side: from fY to hy1 (this is a short vertical at x=x1)
+      if(vBlocked(x1, fY, hy1, excl)) continue;
+      // Check vertical stub x2 side: from hy2 to tY
+      if(vBlocked(x2, hy2, tY, excl)) continue;
+
+      // Build 7-segment path (or collapse segments that are zero-length)
+      const pts = [
+        [x1, fY],
+        [x1, hy1],
+        [vx, hy1],
+        [vx, hy2],
+        [x2, hy2],
+        [x2, tY],
+      ];
+      // Remove consecutive duplicate points
+      const clean = pts.filter((p,i)=> i===0 || p[0]!==pts[i-1][0] || p[1]!==pts[i-1][1]);
+      const d = 'M'+clean.map(p=>p[0]+','+p[1]).join(' L');
+      return {d, ox:x1, oy:fY};
     }
 
-    // ── Fallback: find best vx even if stubs partially overlap ───────
-    // Pick the outermost left column (well outside all nodes)
-    const allLeft  = Math.min(...nodeBoxes.map(b=>b.left));
-    const allRight = Math.max(...nodeBoxes.map(b=>b.right));
-    const vxL = allLeft  - 30 - laneOffset;
-    const vxR = allRight + 30 + laneOffset;
-    const x1 = fL, x2 = tL, y1 = fY, y2 = tY;
-    // Pick side with shorter total horizontal travel
-    const vx = Math.abs(vxL - x1) + Math.abs(vxL - x2) < Math.abs(vxR - x1) + Math.abs(vxR - x2)
-      ? vxL : vxR;
-    return {d:`M${x1},${y1} L${vx},${y1} L${vx},${y2} L${x2},${y2}`, x1, y1};
+    // Ultimate fallback: straight elbow outside all nodes
+    const allL = Math.min(...boxes.map(b=>b.l));
+    const allR = Math.max(...boxes.map(b=>b.r));
+    const vx   = useLeft ? allL-30-nudge : allR+30+nudge;
+    const x1   = useLeft ? fL : fR;
+    const x2   = useLeft ? tL : tR;
+    const d    = `M${x1},${fY} L${vx},${fY} L${vx},${tY} L${x2},${tY}`;
+    return {d, ox:x1, oy:fY};
   }
 
-  // ── Arrow marker defs ─────────────────────────────────────────────
+  // ── Arrow markers ─────────────────────────────────────────────────
   const typeColors = {administrative:'#F5A623',functional:'#1E4080','dotted-line':'#F5A623',matrix:'#EF4444'};
   const typeDashes = {administrative:'8 5',functional:'12 4','dotted-line':'4 6',matrix:'6 3 2 3'};
-
   const defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
-  Object.entries(typeColors).forEach(([type, color])=>{
-    const st = type.replace(/[^a-z]/g,'-');
-    defs.innerHTML += `<marker id="admin-arrow-${chartKey}-${st}" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+  Object.entries(typeColors).forEach(([type,color])=>{
+    const st=type.replace(/[^a-z]/g,'-');
+    defs.innerHTML+=`<marker id="admin-arrow-${chartKey}-${st}" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
       <path d="M0,0 L0,7 L7,3.5 z" fill="${color}" opacity="0.9"/>
     </marker>`;
   });
   svg.appendChild(defs);
 
-  // Build index map: nodeBox index per card element
-  const allCards = Array.from(canvas.querySelectorAll('.ocard'));
-
-  // Track used vx columns to spread parallel lines
-  const usedVX = [];
-
   dualReporters.forEach((emp, idx)=>{
     const fromCard = canvas.querySelector(`[data-pid="${emp.id}"]`);
     const toCard   = emp.adminParentId ? canvas.querySelector(`[data-pid="${emp.adminParentId}"]`) : null;
-    if(!fromCard || !toCard) return;
+    if(!fromCard||!toCard) return;
 
-    const fromIdx = allCards.indexOf(fromCard);
-    const toIdx   = allCards.indexOf(toCard);
+    const fi = allCards.indexOf(fromCard);
+    const ti = allCards.indexOf(toCard);
+    const excl = new Set([fi, ti]);
 
-    const fR = fromCard.getBoundingClientRect();
-    const tR = toCard.getBoundingClientRect();
+    const fRect = fromCard.getBoundingClientRect();
+    const tRect = toCard.getBoundingClientRect();
+    const fL  =(fRect.left  -canvasRect.left)/scale;
+    const fR  =(fRect.right -canvasRect.left)/scale;
+    const fTop=(fRect.top   -canvasRect.top) /scale;
+    const fBot=(fRect.bottom-canvasRect.top) /scale;
+    const fY  =(fRect.top+fRect.height/2-canvasRect.top)/scale;
+    const tL  =(tRect.left  -canvasRect.left)/scale;
+    const tR  =(tRect.right -canvasRect.left)/scale;
+    const tTop=(tRect.top   -canvasRect.top) /scale;
+    const tBot=(tRect.bottom-canvasRect.top) /scale;
+    const tY  =(tRect.top+tRect.height/2-canvasRect.top)/scale;
 
-    const fL  = (fR.left   - canvasRect.left) / scale;
-    const fRx = (fR.right  - canvasRect.left) / scale;
-    const fY  = (fR.top + fR.height/2 - canvasRect.top) / scale;
-    const tL  = (tR.left   - canvasRect.left) / scale;
-    const tRx = (tR.right  - canvasRect.left) / scale;
-    const tY  = (tR.top + tR.height/2 - canvasRect.top) / scale;
+    const {d, ox, oy} = route(fL, fR, fTop, fBot, fY, tL, tR, tTop, tBot, tY, excl, idx);
 
-    // Stagger lane offset so parallel connections use different columns
-    const laneOffset = idx * 12;
+    const color=(typeColors[emp.adminReportingType]||'#F5A623');
+    const dash =(typeDashes[emp.adminReportingType]||'8 5');
+    const st   =(emp.adminReportingType||'administrative').replace(/[^a-z]/g,'-');
 
-    const {d, x1, y1} = route(fL, fRx, fY, tL, tRx, tY, fromIdx, toIdx, laneOffset);
-
-    const lineColor = typeColors[emp.adminReportingType] || '#F5A623';
-    const dashArray = typeDashes[emp.adminReportingType] || '8 5';
-    const safeType  = (emp.adminReportingType||'administrative').replace(/[^a-z]/g,'-');
-
-    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
-    path.setAttribute('d', d);
-    path.setAttribute('stroke', lineColor);
-    path.setAttribute('stroke-width', '1.8');
-    path.setAttribute('stroke-dasharray', dashArray);
-    path.setAttribute('fill', 'none');
-    path.setAttribute('opacity', '0.85');
-    path.setAttribute('stroke-linejoin', 'miter');
-    path.setAttribute('stroke-linecap', 'square');
-    path.setAttribute('marker-end', `url(#admin-arrow-${chartKey}-${safeType})`);
+    const path=document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d',d);
+    path.setAttribute('stroke',color);
+    path.setAttribute('stroke-width','1.8');
+    path.setAttribute('stroke-dasharray',dash);
+    path.setAttribute('fill','none');
+    path.setAttribute('opacity','0.85');
+    path.setAttribute('stroke-linejoin','miter');
+    path.setAttribute('stroke-linecap','square');
+    path.setAttribute('marker-end',`url(#admin-arrow-${chartKey}-${st})`);
     svg.appendChild(path);
 
-    // Origin dot
-    const dot = document.createElementNS('http://www.w3.org/2000/svg','circle');
-    dot.setAttribute('cx', x1);
-    dot.setAttribute('cy', y1);
-    dot.setAttribute('r', '3.5');
-    dot.setAttribute('fill', lineColor);
-    dot.setAttribute('opacity', '0.9');
+    const dot=document.createElementNS('http://www.w3.org/2000/svg','circle');
+    dot.setAttribute('cx',ox); dot.setAttribute('cy',oy);
+    dot.setAttribute('r','3.5'); dot.setAttribute('fill',color);
+    dot.setAttribute('opacity','0.9');
     svg.appendChild(dot);
   });
 }
-
 // Draw admin lines for all active chart panels after DOM settles
 function drawAllAdminLines(){
   requestAnimationFrame(()=>{
