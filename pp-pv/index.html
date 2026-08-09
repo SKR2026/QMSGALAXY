@@ -1091,6 +1091,15 @@ html.guest-direct-link #mainContent { display: block !important; }
 <!-- MAIN CONTENT -->
 <main class="content" id="mainContent" style="display:none"></main>
 
+<!-- LICENSE EXPIRED LOCK SCREEN -->
+<div id="licExpiredOverlay" style="display:none;position:fixed;inset:0;z-index:1500;background:var(--navy);flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;padding:32px">
+  <div style="font-size:48px">&#x1F512;</div>
+  <div style="font-family:var(--font-display);font-size:26px;color:var(--red);letter-spacing:-0.3px">License Expired</div>
+  <div style="font-size:14px;color:var(--slate);max-width:360px;line-height:1.7">Your PlantVisit license has expired. Access to the application is suspended.<br>Please contact your administrator or developer to renew.</div>
+  <div id="licExpiredDate" style="font-size:12px;color:var(--slate);margin-top:4px"></div>
+  <button class="btn btn-danger" onclick="doLogout()" style="margin-top:8px">Sign Out</button>
+</div>
+
 <!-- MODAL (view / edit / user forms) -->
 <div class="overlay" id="overlay">
   <div class="modal" id="modalBox">
@@ -2199,6 +2208,39 @@ function initFirestoreListeners() {
   }, e => console.error(e));
 }
 
+/* ══ LICENSE ENFORCEMENT ══════════════════════════════════════════════════
+   lockApp()   — covers the UI with the expired overlay; admin can still
+                 access Settings to renew the key.
+   unlockApp() — removes the overlay (called when a valid key is detected).
+   ══════════════════════════════════════════════════════════════════════ */
+function lockApp(expiryDate) {
+  const overlay = document.getElementById('licExpiredOverlay');
+  if (!overlay) return;
+  overlay.style.display = 'flex';
+  // Show expiry date if known
+  const dateEl = document.getElementById('licExpiredDate');
+  if (dateEl && expiryDate) {
+    const d = new Date(expiryDate);
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    dateEl.textContent = 'Expired on ' + d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear();
+  }
+  // Allow admin to still reach Settings tab to fix the license
+  if (typeof currentUser !== 'undefined' && currentUser && currentUser.access === 'admin') {
+    document.getElementById('tab-settings').style.display = '';
+  }
+}
+
+function unlockApp() {
+  const overlay = document.getElementById('licExpiredOverlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function isLicenseExpired() {
+  if (!_LIC || _LIC.key === 'OPEN') return false;   // no key = open mode
+  if (!_LIC.expiry) return false;                    // no expiry = unlimited
+  return new Date(_LIC.expiry) < new Date();
+}
+
 /* -- License helper: apply a Firestore license doc to the in-memory _LIC --
    Pure memory update — no localStorage. Firestore onSnapshot is the only
    writer so all devices always reflect the same state.                    */
@@ -2212,7 +2254,9 @@ function _applyLicData(lic) {
   // Expiry warning (shown once after data arrives)
   if (!_LIC.valid) {
     console.warn('[PlantVisit] ⚠ License expired:', _LIC.expiry);
+    lockApp(_LIC.expiry);
   } else if (_LIC.expiry) {
+    unlockApp();
     const days = Math.ceil((new Date(_LIC.expiry) - new Date()) / 86400000);
     if (days <= 30) {
       setTimeout(() => toast('License Expiring Soon',
@@ -2302,6 +2346,14 @@ function activateSession(user, id, visitId) {
   document.getElementById('appHeader').style.display = 'flex';
   document.getElementById('appNav').style.display = 'flex';
   document.getElementById('mainContent').style.display = 'block';
+
+  // ── License expiry gate ─────────────────────────────────────────────────
+  // Lock immediately if expiry is already known at login time.
+  // _applyLicData / Firestore onSnapshot will call lockApp() again if the
+  // expiry snapshot arrives after login (covers the live-revocation case).
+  if (isLicenseExpired()) {
+    lockApp(_LIC.expiry);
+  }
 
   // ── Start secure session + audit ────────────────────────────────────────
   _SESSION.start();
