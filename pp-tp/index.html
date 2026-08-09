@@ -1368,6 +1368,125 @@ async function checkLicense() {
   }
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   LICENSE SETTINGS PANEL — SuperAdmin Settings → License Key card
+   Reads & writes dev_panel_config/superadmin.activeKey in skr-legal
+   ══════════════════════════════════════════════════════════════════ */
+async function licSettingsLoad() {
+  const keyEl    = document.getElementById('lic-settings-current-key');
+  const expEl    = document.getElementById('lic-settings-expiry');
+  const badgeEl  = document.getElementById('lic-settings-status-badge');
+  const inpEl    = document.getElementById('lic-settings-key-inp');
+
+  // Fetch current active key from Firestore
+  let activeKey = '';
+  try {
+    const licDb = await _getLicDb();
+    if (licDb) {
+      const cfgDoc = await licDb.collection('dev_panel_config').doc('superadmin').get();
+      if (cfgDoc.exists) activeKey = cfgDoc.data().activeKey || '';
+    }
+  } catch(e) {
+    console.warn('[LicSettings] Could not fetch activeKey:', e.message);
+  }
+  if (!activeKey) activeKey = localStorage.getItem(_LIC_STORE) || '';
+
+  if (keyEl) keyEl.textContent = activeKey || '— Not configured —';
+  if (inpEl && activeKey) inpEl.value = activeKey;
+
+  // Show expiry
+  const expStr = localStorage.getItem(_LIC_EXPIRY);
+  if (expEl) {
+    if (expStr) {
+      const d = new Date(expStr);
+      const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const days = Math.ceil((d - new Date()) / 86400000);
+      expEl.textContent = d.getDate() + ' ' + M[d.getMonth()] + ' ' + d.getFullYear()
+        + (days < 0 ? ' (expired)' : ' (' + days + ' days left)');
+      expEl.style.color = days < 0 ? 'var(--red)' : days <= 30 ? 'var(--amber)' : 'var(--text)';
+    } else {
+      expEl.textContent = activeKey ? 'No expiry (perpetual)' : '—';
+    }
+  }
+
+  // Badge
+  if (badgeEl) {
+    if (!activeKey) {
+      badgeEl.textContent = '⚪ No Key Set';
+      badgeEl.style.background = 'rgba(92,102,128,.1)';
+      badgeEl.style.border = '1px solid rgba(92,102,128,.2)';
+      badgeEl.style.color = '#94a3b8';
+    } else {
+      const expiry = expStr ? new Date(expStr) : null;
+      const days = expiry ? Math.ceil((expiry - new Date()) / 86400000) : null;
+      if (days !== null && days < 0) {
+        badgeEl.textContent = '🔴 Expired';
+        badgeEl.style.background = 'rgba(248,113,113,.1)'; badgeEl.style.border = '1px solid rgba(248,113,113,.25)'; badgeEl.style.color = '#f87171';
+      } else if (days !== null && days <= 30) {
+        badgeEl.textContent = '⚠ Expiring Soon';
+        badgeEl.style.background = 'rgba(251,191,36,.1)'; badgeEl.style.border = '1px solid rgba(251,191,36,.25)'; badgeEl.style.color = '#fbbf24';
+      } else {
+        badgeEl.textContent = '✓ Active';
+        badgeEl.style.background = 'rgba(52,211,153,.12)'; badgeEl.style.border = '1px solid rgba(52,211,153,.25)'; badgeEl.style.color = '#34d399';
+      }
+    }
+  }
+}
+
+async function licSettingsPublish() {
+  const inpEl    = document.getElementById('lic-settings-key-inp');
+  const statusEl = document.getElementById('lic-settings-save-status');
+  const key = inpEl ? inpEl.value.trim().toUpperCase() : '';
+
+  if (!key) { if (statusEl) { statusEl.textContent = '⚠ Please enter a license key.'; statusEl.style.color = 'var(--amber)'; } return; }
+  if (key.length < 6) { if (statusEl) { statusEl.textContent = '⚠ Key too short. Format: TP-XXXX-XXXX-XXXX'; statusEl.style.color = 'var(--amber)'; } return; }
+
+  if (statusEl) { statusEl.textContent = 'Validating…'; statusEl.style.color = 'var(--text3)'; }
+
+  // Validate the key first
+  const ok = await _licValidate(key, false);
+  if (!ok) {
+    if (statusEl) { statusEl.textContent = '✕ Invalid, expired, or revoked key. Check the Developer Licensing Panel.'; statusEl.style.color = 'var(--red)'; }
+    return;
+  }
+
+  // Publish to Firestore so all users auto-fetch it
+  try {
+    const licDb = await _getLicDb();
+    if (licDb) {
+      await licDb.collection('dev_panel_config').doc('superadmin').set(
+        { activeKey: key, activeKeyUpdated: new Date().toISOString() },
+        { merge: true }
+      );
+    }
+    localStorage.setItem(_LIC_STORE, key);
+    if (statusEl) { statusEl.textContent = '✓ Published! All users will use this key automatically.'; statusEl.style.color = 'var(--green)'; }
+    setTimeout(() => { licSettingsLoad(); renderLicenseExpiryBadge(); }, 500);
+  } catch(e) {
+    if (statusEl) { statusEl.textContent = '✕ Publish failed: ' + e.message; statusEl.style.color = 'var(--red)'; }
+  }
+}
+
+async function licSettingsClear() {
+  if (!confirm('Clear the active license key? All users will be locked out until a new key is published.')) return;
+  const statusEl = document.getElementById('lic-settings-save-status');
+  try {
+    const licDb = await _getLicDb();
+    if (licDb) {
+      await licDb.collection('dev_panel_config').doc('superadmin').set(
+        { activeKey: '', activeKeyUpdated: new Date().toISOString() },
+        { merge: true }
+      );
+    }
+    localStorage.removeItem(_LIC_STORE);
+    localStorage.removeItem(_LIC_EXPIRY);
+    if (statusEl) { statusEl.textContent = '✓ Key cleared.'; statusEl.style.color = 'var(--amber)'; }
+    licSettingsLoad();
+  } catch(e) {
+    if (statusEl) { statusEl.textContent = '✕ Failed: ' + e.message; statusEl.style.color = 'var(--red)'; }
+  }
+}
+
 function _licShowLockScreen(title, msg, expStr) {
   const gate = document.getElementById('lic-gate');
   if (!gate) return;
@@ -4598,6 +4717,45 @@ function renderSettings(){
       <button class="btn btn-primary" onclick="changeAdminPassword()">Update Password</button>
     </div>
 
+    <div class="card" id="license-settings-card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
+        <div>
+          <div style="font-weight:700;font-size:15px;color:var(--text)">🔑 License Key</div>
+          <div style="font-size:11px;color:var(--text3);margin-top:2px">Controlled by SuperAdmin only. Applied automatically to all accounts — users never enter a key.</div>
+        </div>
+        <span id="lic-settings-status-badge" style="font-size:11px;font-weight:700;padding:4px 12px;border-radius:20px;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.25);color:#34d399">Checking…</span>
+      </div>
+
+      <!-- Current active key display -->
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--surface);border:1px solid var(--border2);border-radius:10px;margin-bottom:16px;flex-wrap:wrap">
+        <div style="flex:1;min-width:140px">
+          <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.7px;margin-bottom:3px">Active Key</div>
+          <div style="font-family:var(--font-mono,monospace);font-size:13px;font-weight:700;color:var(--accent);letter-spacing:.08em" id="lic-settings-current-key">Loading…</div>
+        </div>
+        <div>
+          <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.7px;margin-bottom:3px">Expiry</div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)" id="lic-settings-expiry">—</div>
+        </div>
+      </div>
+
+      <!-- Publish a new / updated key -->
+      <div style="margin-bottom:10px">
+        <label class="form-label" style="margin-bottom:6px">Update License Key</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input class="form-input" id="lic-settings-key-inp"
+            placeholder="TP-XXXX-XXXX-XXXX"
+            maxlength="20"
+            style="flex:1;min-width:180px;font-family:var(--font-mono,monospace);letter-spacing:.08em;font-size:13px;"
+            oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9\-]/g,'')"
+          />
+          <button class="btn btn-primary btn-sm" onclick="licSettingsPublish()">✓ Publish to All</button>
+          <button class="btn btn-ghost btn-sm" onclick="licSettingsClear()" style="color:var(--red);border-color:rgba(248,113,113,.3)">✕ Clear</button>
+        </div>
+        <div style="font-size:11px;color:var(--text3);margin-top:6px">Paste the key from the Developer Licensing Panel. Once published, all users will use this key automatically.</div>
+        <div id="lic-settings-save-status" style="font-size:12px;margin-top:6px;min-height:16px"></div>
+      </div>
+    </div>
+
     <div class="card">
       <div style="font-weight:700;font-size:15px;color:var(--text);margin-bottom:16px">🖼️ Company Branding</div>
       <div style="font-size:12px;color:var(--text3);margin-bottom:14px">Logo and/or company name shown in all outgoing emails. If a logo is uploaded, the text name is hidden automatically.</div>
@@ -4995,6 +5153,8 @@ function renderSettings(){
       }
     }
   }, 0);
+  // Load license settings card data (async, non-blocking)
+  setTimeout(() => { if (typeof licSettingsLoad === 'function') licSettingsLoad(); }, 200);
   // Async-populate user accounts list (super admin only)
   // _renderUserPage is called inside renderUserManagementSection automatically
   renderUserManagementSection().catch(e => {
