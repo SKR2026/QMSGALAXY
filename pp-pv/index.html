@@ -2012,8 +2012,8 @@ function initFirestoreListeners() {
         const _ls = document.getElementById('loaderStatus'); if (_ls) _ls.textContent = 'Seeding sample data…';
         const batch = db.batch();
         SEED_DATA.forEach(v => batch.set(db.collection(VISITS_COL).doc(v.id), v));
-        batch.commit().then(() => { _visitsData = [...SEED_DATA]; bootApp(); refreshActiveTab(); }).catch(() => { _visitsData = [...SEED_DATA]; bootApp(); refreshActiveTab(); });
-      } else { bootApp(); refreshActiveTab(); }
+        batch.commit().then(() => { _visitsData = [...SEED_DATA]; bootApp(); if(!isLicenseExpired()) refreshActiveTab(); }).catch(() => { _visitsData = [...SEED_DATA]; bootApp(); if(!isLicenseExpired()) refreshActiveTab(); });
+      } else { bootApp(); if(!isLicenseExpired()) refreshActiveTab(); }
     } else {
       updateBadges();
       // ★ FIX: Always honour _guestDashboardPending regardless of data length.
@@ -2022,6 +2022,7 @@ function initFirestoreListeners() {
       // re-rendered and showed all-zero metrics.
       if (_guestDashboardPending && currentUser) {
         _guestDashboardPending = false;
+        if (isLicenseExpired()) { lockApp(_LIC.expiry); return; }
         const el = document.getElementById('mainContent');
         if (el) { destroyCharts(); el.innerHTML = ''; renderDashboard(el); }
         return;
@@ -2266,8 +2267,10 @@ function unlockApp() {
 }
 
 function isLicenseExpired() {
-  if (!_LIC || !_LIC.expiry) return false;           // no expiry = unlimited
-  return new Date(_LIC.expiry) < new Date();
+  if (!_LIC || !_LIC.expiry) return false;  // no expiry = unlimited/open
+  const expired = new Date(_LIC.expiry) < new Date();
+  if (expired) console.warn('[PlantVisit] 🔒 isLicenseExpired=true, expiry:', _LIC.expiry);
+  return expired;
 }
 
 /* -- License helper: apply a Firestore license doc to the in-memory _LIC --
@@ -2329,8 +2332,10 @@ function bootApp() {
   });
   setTimeout(() => {
     document.getElementById('pageLoader').classList.add('hidden');
-    // ★ FIX: refreshActiveTab checks _guestDashboardPending and re-renders
-    // the dashboard if the guest direct-link has already activated a session.
+    if (isLicenseExpired()) {
+      lockApp(_LIC.expiry);
+      return;
+    }
     refreshActiveTab();
   }, 400);
 }
@@ -2350,6 +2355,7 @@ function refreshActiveTab() {
   // full dashboard render now that Firestore data has arrived.
   if (_guestDashboardPending) {
     _guestDashboardPending = false;
+    if (isLicenseExpired()) { lockApp(_LIC.expiry); return; }
     const el = document.getElementById('mainContent');
     if (el) { destroyCharts(); el.innerHTML = ''; renderDashboard(el); }
     updateBadges();
@@ -2507,37 +2513,74 @@ function doLogin() {
   }
 
   localStorage.setItem('pv_session', JSON.stringify({ id: username, name: user.name }));
-  activateSession(user, username, null);
   _pendingVisitId = null;
 
-  // ★ FIX: Re-authenticate with Firebase using email/password so the auth
-  // token becomes non-anonymous. This is required for Firestore write rules
-  // (isRealUser) to pass. The app uses its own username/password check above;
-  // Firebase Auth here is only needed to satisfy Firestore security rules.
-  // We use the stored email if available, otherwise derive one from username.
-  const email = user.email || (username + '@plantvisit.internal');
-  const fbPass = 'pv_' + username + '_realuser_2025';
-  try {
-    firebase.auth().signInWithEmailAndPassword(email, fbPass)
-      .then(cred => {
-        console.log('[PlantVisit] ✅ Firebase email auth OK for', username, '| UID:', cred?.user?.uid);
-      })
-      .catch(err => {
-        if (err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
-          // User doesn't exist yet in Firebase Auth — create them
-          firebase.auth().createUserWithEmailAndPassword(email, fbPass)
-            .then(cred => {
-              console.log('[PlantVisit] ✅ Firebase email auth created for', username, '| UID:', cred?.user?.uid);
-            })
-            .catch(err2 => {
-              console.warn('[PlantVisit] Firebase email auth create failed:', err2.code, '— writes may fail if rules block anonymous.');
-            });
-        } else {
-          console.warn('[PlantVisit] Firebase email auth failed:', err.code, '— writes may fail if rules block anonymous.');
-        }
-      });
-  } catch(e) {
-    console.warn('[PlantVisit] Firebase auth upgrade error:', e);
+  // ── LICENCE CHECK BEFORE LETTING USER IN ────────────────────────────────
+  // Read the license doc directly from Firestore before showing the app.
+  // This runs synchronously from the user's perspective — they see a brief
+  // "Checking license…" state while we await the single Firestore .get().
+  const errEl2 = document.getElementById('loginErr');
+  const _proceedWithLogin = (licExpired, licExpiry) => {
+    if (licExpired) {
+      // Reject login — show error on login screen itself
+      errEl2.textContent = '🔒 License Expired' + (licExpiry ? ' (' + licExpiry + ')' : '') + ' — Please contact your administrator to renew.';
+      errEl2.classList.add('show');
+      localStorage.removeItem('pv_session');
+      return;
+    }
+    // License OK — proceed
+    activateSession(user, username, null);
+
+    // ★ FIX: Re-authenticate with Firebase using email/password so the auth
+    // token becomes non-anonymous. This is required for Firestore write rules.
+    const email = user.email || (username + '@plantvisit.internal');
+    const fbPass = 'pv_' + username + '_realuser_2025';
+    try {
+      firebase.auth().signInWithEmailAndPassword(email, fbPass)
+        .then(cred => {
+          console.log('[PlantVisit] ✅ Firebase email auth OK for', username, '| UID:', cred?.user?.uid);
+        })
+        .catch(err => {
+          if (err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
+            firebase.auth().createUserWithEmailAndPassword(email, fbPass)
+              .then(cred => console.log('[PlantVisit] ✅ Firebase email auth created for', username))
+              .catch(err2 => console.warn('[PlantVisit] Firebase email auth create failed:', err2.code));
+          } else {
+            console.warn('[PlantVisit] Firebase email auth failed:', err.code);
+          }
+        });
+    } catch(e) {
+      console.warn('[PlantVisit] Firebase auth upgrade error:', e);
+    }
+  };
+
+  // If _LIC already has a real expiry from a prior snapshot, use it immediately.
+  if (_LIC.expiry) {
+    const expired = new Date(_LIC.expiry) < new Date();
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const d = new Date(_LIC.expiry);
+    const dateStr = d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear();
+    _proceedWithLogin(expired, expired ? dateStr : null);
+  } else {
+    // _LIC not yet populated — fetch directly from Firestore
+    LICENSE_DOC.get().then(doc => {
+      if (doc.exists && doc.data()) {
+        const data = doc.data();
+        _applyLicData(data); // keep _LIC in sync
+        const expiry = data.expiry || '';
+        const expired = expiry ? new Date(expiry) < new Date() : false;
+        const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        const d = new Date(expiry);
+        const dateStr = expiry ? d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear() : '';
+        _proceedWithLogin(expired, expired ? dateStr : null);
+      } else {
+        // No license doc — treat as open/unlimited
+        _proceedWithLogin(false, null);
+      }
+    }).catch(e => {
+      console.warn('[PlantVisit] License pre-check failed, proceeding:', e);
+      _proceedWithLogin(false, null); // fail open so auth issues don't lock out
+    });
   }
 }
 
@@ -2848,11 +2891,13 @@ function getVisible() {
    TAB ROUTING
 ══════════════════════════════════════════════════════════ */
 function showTab(tab) {
-  // ── LICENSE GATE: block all tabs (except Settings for admin) on expiry ──
-  if (isLicenseExpired() || _licLockPending) {
-    lockApp(_LIC.expiry || _licLockExpiry);
+  // ── ABSOLUTE LICENSE GATE ──────────────────────────────────────────────
+  // Always re-evaluate expiry live — never trust cached flags alone.
+  const _licExp = isLicenseExpired();
+  if (_licExp) {
+    lockApp(_LIC.expiry);
     const isAdmin = typeof currentUser !== 'undefined' && currentUser && currentUser.access === 'admin';
-    if (tab !== 'settings' || !isAdmin) return;  // only admin can reach settings
+    if (tab !== 'settings' || !isAdmin) return;
   }
   // Guests may not access the New Visit form — redirect to dashboard
   if (tab === 'new' && currentUser && currentUser.id === '__guest__') {
@@ -2884,21 +2929,23 @@ function setDashPlant(plant) {
   _dashFilter.plant = plant;
   _dashFilter.month = ''; // reset month when plant changes
   const el = document.getElementById('mainContent');
-  if (el) { destroyCharts(); el.innerHTML = ''; renderDashboard(el); }
+  if (el && !isLicenseExpired()) { destroyCharts(); el.innerHTML = ''; renderDashboard(el); }
 }
 function setDashYear(year) {
   _dashFilter.year  = year;
   _dashFilter.month = ''; // reset month when year changes
   const el = document.getElementById('mainContent');
-  if (el) { destroyCharts(); el.innerHTML = ''; renderDashboard(el); }
+  if (el && !isLicenseExpired()) { destroyCharts(); el.innerHTML = ''; renderDashboard(el); }
 }
 function setDashMonth(month) {
   _dashFilter.month = month;
   const el = document.getElementById('mainContent');
-  if (el) { destroyCharts(); el.innerHTML = ''; renderDashboard(el); }
+  if (el && !isLicenseExpired()) { destroyCharts(); el.innerHTML = ''; renderDashboard(el); }
 }
 
 function renderDashboard(el) {
+  // Last-resort license guard — never render content if expired
+  if (isLicenseExpired()) { lockApp(_LIC.expiry); return; }
   const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const allVisits = getVisible();
 
@@ -5930,6 +5977,7 @@ function navToRecords(crit='', status='', plant='', month='') {
 
 // Override renderRecords to apply pending filter
 function renderRecords(el) {
+  if (isLicenseExpired()) { lockApp(_LIC.expiry); return; }
   _visitsCache = getVisible();
   const pf = _pendingFilter || {};
   _pendingFilter = null;
