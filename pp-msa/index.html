@@ -165,6 +165,26 @@
     } catch(e) { return { success: false, error: e.message }; }
   };
 
+  // ── LOG: Record a user session ────────────────────────
+  window.__msaLogSession = async function(sessionData) {
+    try {
+      const logId = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+      await setDoc(doc(db, 'msa_session_logs', logId), {
+        ...sessionData,
+        loggedAt: serverTimestamp()
+      });
+      return { success: true };
+    } catch(e) { return { success: false, error: e.message }; }
+  };
+
+  // ── LOG: List all session logs ─────────────────────────
+  window.__msaListSessionLogs = async function() {
+    try {
+      const snap = await getDocs(collection(db, 'msa_session_logs'));
+      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    } catch(e) { return []; }
+  };
+
   // ── Expose validate and mark ready ────────────────────
   // Set validate FIRST, then set ready flag, then dispatch event.
   // This order guarantees activateLicense() can call __msaValidate
@@ -1252,6 +1272,7 @@ canvas{max-width:100%}
     <div class="admin-tabs">
       <button class="admin-tab active" onclick="switchAdminTab('users',this)">👥 Users</button>
       <button class="admin-tab" onclick="switchAdminTab('licenses',this)">📋 View Licenses</button>
+      <button class="admin-tab" onclick="switchAdminTab('usagelog',this);loadMsaSessionLogs()">📊 Usage Log</button>
     </div>
     <div class="admin-body">
 
@@ -1318,6 +1339,20 @@ canvas{max-width:100%}
         </div>
         <div id="licenses-list">
           <div style="text-align:center;color:var(--text3);padding:30px;font-size:12px">Click Refresh to load license information.</div>
+        </div>
+      </div>
+
+      <!-- USAGE LOG TAB -->
+      <div id="admin-usagelog" class="admin-section">
+        <div class="admin-divider">Sign-In Usage Log</div>
+        <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap;">
+          <input class="admin-input" id="msa-log-search" placeholder="🔍  Search by name, email or company…" oninput="filterMsaSessionLogs()" style="flex:1;min-width:160px;">
+          <button class="btn btn-sm" onclick="loadMsaSessionLogs()">↻ Refresh</button>
+          <button class="btn btn-sm" onclick="exportMsaSessionLogsCSV()">⬇ Export CSV</button>
+          <span id="msa-log-count" style="font-size:11px;color:var(--text3);white-space:nowrap;"></span>
+        </div>
+        <div id="msa-session-logs-list">
+          <div style="text-align:center;color:var(--text3);padding:30px;font-size:12px">Click Refresh to load the sign-in log.</div>
         </div>
       </div>
 
@@ -1464,6 +1499,19 @@ async function activateLicense(){
         readOnly:     result.readOnly,
         ts:           Date.now()
       }));
+      // ── Log this sign-in session ──
+      if (window.__msaLogSession) {
+        window.__msaLogSession({
+          userName:   name,
+          userEmail:  email.toLowerCase().trim(),
+          role:       userRole,
+          licenseKey: licenseKey,
+          company:    result.data.company || result.data.customerName || '—',
+          readOnly:   result.readOnly || false,
+          userAgent:  navigator.userAgent,
+          app:        'MSA'
+        });
+      }
       unlockApp(result.readOnly, { ...result.data, userName: name, userEmail: email, userRole });
     } else {
       const msgs = {
@@ -1513,7 +1561,10 @@ function unlockApp(readOnly,data){
     chipExpiry.textContent = expiryText;
     chipExpiry.style.color = expiryColor;
     // Show admin button if superadmin role
-    if(data.userRole==='admin' || data.role==='admin' || data.isAdmin===true){
+    if(data.userRole==='admin' || data.userRole==='super_admin'
+      || data.role==='admin' || data.role==='super_admin'
+      || data.isAdmin===true || data.examRole==='admin' || data.examRole==='super_admin'
+      || data.kpiRole==='super_admin'){
       document.getElementById('btn-admin').style.display='inline-flex';
     }
   }
@@ -3619,6 +3670,120 @@ window.runAttributeWithConfig = function(parts, nParts, nOps, nReps) {
     drawWithPanelsVisible(function() { renderCrossTabAnalyses(attrData); });
   }
 };
+
+// ═══════════════════════════════════════════════════════
+//  MSA USAGE LOG
+// ═══════════════════════════════════════════════════════
+let _allMsaSessionLogs = [];
+
+async function loadMsaSessionLogs() {
+  const el = document.getElementById('msa-session-logs-list');
+  el.innerHTML = '<div style="text-align:center;color:var(--text3);padding:20px;font-size:12px">Loading…</div>';
+  if (!window.__msaListSessionLogs) {
+    el.innerHTML = '<div style="text-align:center;color:var(--red);padding:20px;font-size:12px">Firebase not ready.</div>';
+    return;
+  }
+  _allMsaSessionLogs = await window.__msaListSessionLogs();
+  // Sort newest first
+  _allMsaSessionLogs.sort((a, b) => {
+    const ta = a.loggedAt?.seconds || 0, tb = b.loggedAt?.seconds || 0;
+    return tb - ta;
+  });
+  const count = _allMsaSessionLogs.length;
+  document.getElementById('msa-log-count').textContent = `${count} sign-in${count !== 1 ? 's' : ''} total`;
+  renderMsaSessionLogs(_allMsaSessionLogs);
+}
+
+function renderMsaSessionLogs(logs) {
+  const el = document.getElementById('msa-session-logs-list');
+  if (!logs.length) {
+    el.innerHTML = '<div style="text-align:center;color:var(--text3);padding:20px;font-size:12px">No sign-in records found yet.</div>';
+    return;
+  }
+
+  // ── Summary stats ──
+  const uniqueUsers = [...new Set(logs.map(l => (l.userEmail||'').toLowerCase()).filter(Boolean))];
+  const today = new Date(); today.setHours(0,0,0,0);
+  const todayCount = logs.filter(l => {
+    const d = l.loggedAt?.seconds ? new Date(l.loggedAt.seconds * 1000) : null;
+    return d && d >= today;
+  }).length;
+
+  const statsHtml = `
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px;">
+      <div style="background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Total Sign-ins</div>
+        <div style="font-size:24px;font-weight:800;color:var(--a1);font-family:'JetBrains Mono',monospace">${logs.length}</div>
+      </div>
+      <div style="background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Unique Users</div>
+        <div style="font-size:24px;font-weight:800;color:var(--a2);font-family:'JetBrains Mono',monospace">${uniqueUsers.length}</div>
+      </div>
+      <div style="background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Today's Sign-ins</div>
+        <div style="font-size:24px;font-weight:800;color:var(--a3);font-family:'JetBrains Mono',monospace">${todayCount}</div>
+      </div>
+    </div>`;
+
+  const rowsHtml = logs.map(l => {
+    const ts = l.loggedAt?.seconds ? new Date(l.loggedAt.seconds * 1000) : null;
+    const dateStr = ts ? ts.toLocaleDateString('en-IN') : '—';
+    const timeStr = ts ? ts.toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit' }) : '';
+    const isAdmin = l.role === 'admin' || l.role === 'super_admin';
+    const roleBadge = isAdmin
+      ? `<span class="user-badge badge-admin">${l.role||'admin'}</span>`
+      : `<span class="user-badge badge-active">${l.role||'user'}</span>`;
+    const roBadge = l.readOnly
+      ? `<span class="user-badge badge-inactive">read-only</span>`
+      : '';
+    const licShort = (l.licenseKey||'—').substring(0, 16);
+    return `
+      <div style="background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:9px 14px;margin-bottom:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div style="font-size:11px;color:var(--text3);font-family:'JetBrains Mono',monospace;min-width:88px;flex-shrink:0;line-height:1.6">${dateStr}<br>${timeStr}</div>
+        <div style="flex:1;min-width:160px;">
+          <div style="font-size:13px;font-weight:600;color:var(--text)">${l.userName||'—'} ${roleBadge} ${roBadge}</div>
+          <div style="font-size:11px;color:var(--text3);margin-top:2px;">📧 ${l.userEmail||'—'} · 🏢 ${l.company||'—'}</div>
+        </div>
+        <div style="font-size:10px;color:var(--text3);font-family:'JetBrains Mono',monospace;text-align:right;flex-shrink:0;">${licShort}</div>
+      </div>`;
+  }).join('');
+
+  el.innerHTML = statsHtml + rowsHtml;
+}
+
+function filterMsaSessionLogs() {
+  const q = (document.getElementById('msa-log-search').value || '').toLowerCase();
+  if (!q) { renderMsaSessionLogs(_allMsaSessionLogs); return; }
+  renderMsaSessionLogs(_allMsaSessionLogs.filter(l =>
+    (l.userName||'').toLowerCase().includes(q) ||
+    (l.userEmail||'').toLowerCase().includes(q) ||
+    (l.company||'').toLowerCase().includes(q) ||
+    (l.role||'').toLowerCase().includes(q)
+  ));
+}
+
+function exportMsaSessionLogsCSV() {
+  if (!_allMsaSessionLogs.length) { notify('No logs to export.', 'err'); return; }
+  const header = ['Date', 'Time', 'Name', 'Email', 'Role', 'Company', 'License Key', 'Read-Only', 'App'];
+  const rows = _allMsaSessionLogs.map(l => {
+    const ts = l.loggedAt?.seconds ? new Date(l.loggedAt.seconds * 1000) : null;
+    return [
+      ts ? ts.toLocaleDateString('en-IN') : '',
+      ts ? ts.toLocaleTimeString('en-IN') : '',
+      l.userName||'', l.userEmail||'', l.role||'user',
+      l.company||'', l.licenseKey||'',
+      l.readOnly ? 'Yes' : 'No',
+      l.app||'MSA'
+    ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(',');
+  });
+  const csv = [header.join(','), ...rows].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `MSA_UsageLog_${new Date().toISOString().split('T')[0]}.csv`;
+  a.click();
+  notify('Usage log exported as CSV.', 'ok');
+}
 
 </script>
 </body>
