@@ -762,7 +762,8 @@
      Validates key against Firestore developer_licenses collection
      (same Firebase project: skr-task)
 ═══════════════════════════════════════════════════════════ -->
-<div id="lic-gate">
+<!-- LICENSE EXPIRED LOCK SCREEN — shown automatically, no key entry needed -->
+<div id="lic-gate" style="display:none;">
   <div class="lg-wrap">
     <div class="lg-logo">
       <div class="lg-logo-icon">🗂️</div>
@@ -772,28 +773,14 @@
       </div>
     </div>
     <div class="lg-card">
-      <div class="lg-icon">🔑</div>
-      <div class="lg-title">Software License</div>
-      <div class="lg-sub">Enter your license key to continue</div>
-      <div style="width:100%;margin-bottom:4px;">
-        <div class="lg-lbl">License Key</div>
-        <input class="lg-inp" id="lic-key-inp" type="text" maxlength="20"
-          placeholder="TP-XXXX-XXXX-XXXX"
-          style="display:block;width:100%;box-sizing:border-box;"
-          onkeydown="if(event.key==='Enter')licSubmit()"
-          oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9\-]/g,'')">
-      </div>
-      <div class="lg-err" id="lic-err">Invalid or expired license key. Please contact your administrator.</div>
-      <button class="lg-btn" id="lic-btn" onclick="licSubmit()">
-        <div class="lg-spin"></div>
-        <span class="lg-lbl">Activate &amp; Continue</span>
-      </button>
-      <div id="lic-ok-wrap" style="display:none">
-        <div class="lg-ok-badge">✓ License valid — launching app…</div>
-      </div>
+      <div class="lg-icon">🔒</div>
+      <div class="lg-title" id="lic-gate-title">License Expired</div>
+      <div class="lg-sub" id="lic-gate-sub">Access Suspended</div>
+      <div id="lic-gate-date" style="display:none;margin:8px 0 16px;padding:8px 16px;border-radius:8px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);font-size:13px;font-weight:600;color:#f87171;text-align:center;"></div>
+      <div class="lg-err show" id="lic-err">Your Task Planner license has expired. Please contact your developer to renew.</div>
       <div class="lg-hint">
-        <strong>Licensed software.</strong><br>
-        Contact your administrator if you need a license key.
+        <strong>License controlled by SuperAdmin.</strong><br>
+        Contact your administrator or developer to renew the license key.
       </div>
     </div>
   </div>
@@ -1336,18 +1323,68 @@ async function _getLicDb() {
   return _licDb;
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   AUTO LICENSE CHECK — key is set by SuperAdmin in Licensing Panel
+   and stored in Firestore dev_panel_config/superadmin.activeKey.
+   Users and admins NEVER enter a key. The app fetches it silently.
+   ══════════════════════════════════════════════════════════════════ */
 async function checkLicense() {
-  const savedKey = localStorage.getItem(_LIC_STORE);
-  if (savedKey) {
-    const ok = await _licValidate(savedKey, true);
-    if (ok) { _licLaunch(); return; }
-    // Key was revoked / expired — clear and ask again
+  // Step 1: Try to fetch the active key from Firestore (set by SuperAdmin)
+  let activeKey = '';
+  try {
+    const licDb = await _getLicDb();
+    if (licDb) {
+      const cfgDoc = await licDb.collection('dev_panel_config').doc('superadmin').get();
+      if (cfgDoc.exists) {
+        activeKey = cfgDoc.data().activeKey || '';
+      }
+    }
+  } catch(e) {
+    console.warn('[License] Could not fetch activeKey from Firestore:', e.message);
+  }
+
+  // Step 2: Fall back to locally cached key if Firestore unreachable
+  if (!activeKey) {
+    activeKey = localStorage.getItem(_LIC_STORE) || '';
+  }
+
+  if (!activeKey) {
+    // No key configured at all — show lock screen
+    _licShowLockScreen('No License Configured', 'Contact your developer to set up a license key.');
+    return;
+  }
+
+  // Step 3: Validate the key
+  const ok = await _licValidate(activeKey, true);
+  if (ok) {
+    localStorage.setItem(_LIC_STORE, activeKey); // cache for offline resilience
+    _licLaunch();
+  } else {
+    // Expired or revoked
     localStorage.removeItem(_LIC_STORE);
     localStorage.removeItem(_LIC_EXPIRY);
+    const expStr = localStorage.getItem(_LIC_EXPIRY);
+    _licShowLockScreen('License Expired', 'Your Task Planner license has expired or been revoked.', expStr);
   }
-  // Gate is already visible by default — just focus the input
-  const inp = document.getElementById('lic-key-inp');
-  if (inp) inp.focus();
+}
+
+function _licShowLockScreen(title, msg, expStr) {
+  const gate = document.getElementById('lic-gate');
+  if (!gate) return;
+  gate.style.display = 'flex';
+  gate.style.opacity = '1';
+  const titleEl = document.getElementById('lic-gate-title');
+  const subEl   = document.getElementById('lic-gate-sub');
+  const errEl   = document.getElementById('lic-err');
+  const dateEl  = document.getElementById('lic-gate-date');
+  if (titleEl) titleEl.textContent = title;
+  if (errEl)   errEl.textContent   = msg;
+  if (dateEl && expStr) {
+    const d = new Date(expStr);
+    const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    dateEl.textContent = 'Expired on ' + d.getDate() + ' ' + M[d.getMonth()] + ' ' + d.getFullYear();
+    dateEl.style.display = 'block';
+  }
 }
 
 async function _licValidate(key, silent) {
@@ -1503,32 +1540,7 @@ function _licShowErr(msg) {
   if (el) { el.textContent = msg; el.classList.add('show'); }
 }
 
-async function licSubmit() {
-  const inp = document.getElementById('lic-key-inp');
-  const btn = document.getElementById('lic-btn');
-  const key = inp ? inp.value.trim().toUpperCase() : '';
-
-  document.getElementById('lic-err').classList.remove('show');
-
-  if (!key) { _licShowErr('Please enter your license key.'); return; }
-  if (key.length < 6) { _licShowErr('License key is too short. Format: TP-XXXX-XXXX-XXXX'); return; }
-
-  btn.classList.add('loading');
-  btn.disabled = true;
-
-  const ok = await _licValidate(key, false);
-
-  if (ok) {
-    localStorage.setItem(_LIC_STORE, key);
-    document.getElementById('lic-ok-wrap').style.display = 'block';
-    btn.style.display = 'none';
-    setTimeout(() => _licLaunch(), 900);
-  } else {
-    btn.classList.remove('loading');
-    btn.disabled = false;
-    _licShowErr('Invalid, expired, or revoked license key. Please contact your administrator.');
-  }
-}
+function licSubmit() { /* disabled — key managed by SuperAdmin via Licensing Panel */ }
 
 /* ══════════════════════════════════════════════════════════════════
    SUPER-ADMIN LICENSE GATE
@@ -1537,88 +1549,21 @@ async function licSubmit() {
    key is present (or successfully entered just now); false otherwise.
    ══════════════════════════════════════════════════════════════════ */
 async function _requireSuperAdminLicense() {
-  // If a key is already saved AND still valid, allow silently.
+  // Key is fetched automatically — SuperAdmin does NOT enter it manually.
+  // Just validate whatever key is cached (set by checkLicense() on boot).
   const saved = localStorage.getItem(_LIC_STORE);
   if (saved) {
     const ok = await _licValidate(saved, true);
     if (ok) {
-      // Show the license expiry badge once we know it's valid
       try { renderLicenseExpiryBadge(); } catch(e) {}
       return true;
     }
-    // Key was revoked / expired — clear and ask again
     localStorage.removeItem(_LIC_STORE);
     localStorage.removeItem(_LIC_EXPIRY);
   }
-  // No valid key — show license gate (it was hidden at startup).
-  // Wrap into a Promise that resolves true/false based on user action.
-  return new Promise((resolve) => {
-    const gate = document.getElementById('lic-gate');
-    if (!gate) { resolve(false); return; }
-    gate.style.display = 'flex';
-    gate.style.opacity = '1';
-    gate.style.transition = 'opacity .3s ease';
-    // Reset UI
-    const errEl = document.getElementById('lic-err'); if (errEl) errEl.classList.remove('show');
-    const okWrap = document.getElementById('lic-ok-wrap'); if (okWrap) okWrap.style.display = 'none';
-    const btn = document.getElementById('lic-btn');
-    if (btn) { btn.style.display = ''; btn.classList.remove('loading'); btn.disabled = false; }
-    const inp = document.getElementById('lic-key-inp');
-    if (inp) { inp.value = ''; setTimeout(() => inp.focus(), 100); }
-
-    // Override licSubmit behaviour so it resolves this Promise on success.
-    // We do it by intercepting button click + Enter key without breaking original code.
-    const origBtn = btn;
-    const handler = async () => {
-      const key = inp ? inp.value.trim().toUpperCase() : '';
-      if (errEl) errEl.classList.remove('show');
-      if (!key) { _licShowErr('Please enter your license key.'); return; }
-      if (key.length < 6) { _licShowErr('License key is too short. Format: TP-XXXX-XXXX-XXXX'); return; }
-      if (origBtn) { origBtn.classList.add('loading'); origBtn.disabled = true; }
-      const valid = await _licValidate(key, false);
-      if (valid) {
-        localStorage.setItem(_LIC_STORE, key);
-        if (okWrap) okWrap.style.display = 'block';
-        if (origBtn) origBtn.style.display = 'none';
-        try { renderLicenseExpiryBadge(); } catch(e) {}
-        setTimeout(() => {
-          gate.style.opacity = '0';
-          setTimeout(() => { gate.style.display = 'none'; cleanup(); resolve(true); }, 420);
-        }, 700);
-      } else {
-        if (origBtn) { origBtn.classList.remove('loading'); origBtn.disabled = false; }
-        _licShowErr('Invalid, expired, or revoked license key. Please contact your administrator.');
-      }
-    };
-    const keyHandler = (e) => { if (e.key === 'Enter') handler(); };
-    const cancelBtn = document.createElement('button');
-    cancelBtn.className = 'btn btn-ghost';
-    cancelBtn.style.cssText = 'width:100%;justify-content:center;margin-top:10px;';
-    cancelBtn.textContent = '← Cancel & go back';
-    cancelBtn.onclick = () => { gate.style.display = 'none'; cleanup(); resolve(false); };
-    const card = gate.querySelector('.lg-card');
-    if (card && !card.querySelector('.lg-cancel-btn')) {
-      cancelBtn.classList.add('lg-cancel-btn');
-      card.appendChild(cancelBtn);
-    }
-
-    function cleanup() {
-      if (origBtn) origBtn.removeEventListener('click', handler);
-      if (inp) inp.removeEventListener('keydown', keyHandler);
-      const cb = card && card.querySelector('.lg-cancel-btn');
-      if (cb) cb.remove();
-    }
-
-    // Replace the inline onclick so it doesn't double-fire
-    if (origBtn) {
-      origBtn.onclick = null;
-      origBtn.addEventListener('click', handler);
-    }
-    if (inp) {
-      inp.onkeydown = null;
-      inp.addEventListener('keydown', keyHandler);
-    }
-  });
+  // No valid key — show the lock screen (same as for all users)
+  _licShowLockScreen('License Expired', 'Your Task Planner license has expired. Contact your developer to renew.');
+  return false;
 }
 
 function startFirestoreListeners() {
