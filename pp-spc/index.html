@@ -2112,38 +2112,53 @@ async function doActivate() {
   errEl.classList.remove('show');
 
   try {
-    // Look up user record by email
+    // Look up user record by email (optional — not required to sign in)
     const users = await window.__spcListUsers();
     const userId = email.replace(/[^a-z0-9]/g, '_');
     const user = users.find(u => (u.email||'').toLowerCase() === email || u.id === userId);
 
-    if (!user) {
-      showGateErr('User not found. Contact your administrator to create an account.');
-      return;
-    }
-    if (user.isActive === false) {
+    // If user record exists but is deactivated, block them
+    if (user && user.isActive === false) {
       showGateErr('Your account has been deactivated. Contact your administrator.');
       return;
     }
 
-    // Validate the license key assigned to this user
-    const licKey = user.licenseKey || user.license_key;
+    // Find license key:
+    // a) from user's assigned licenseKey if they have a record
+    // b) fall back to any active SPC license (shared license model)
+    let licKey = (user && (user.licenseKey || user.license_key)) || null;
+
     if (!licKey) {
-      showGateErr('No license assigned to this account. Contact your administrator.');
+      const licenses = await window.__spcListLicenses();
+      const active = licenses.filter(l => l.isActive && (l.product === 'SPC' || !l.product));
+      if (active.length > 0) licKey = active[0].id || active[0].key;
+    }
+
+    // Broaden: accept any active license if SPC-specific not found
+    if (!licKey) {
+      const licenses = await window.__spcListLicenses();
+      const anyActive = licenses.filter(l => l.isActive);
+      if (anyActive.length > 0) licKey = anyActive[0].id || anyActive[0].key;
+    }
+
+    if (!licKey) {
+      showGateErr('No active license found. Contact your administrator to set up a license.');
       return;
     }
 
     const r = await window.__spcValidate(licKey);
     if (r.valid) {
-      _licData = { key: licKey, userName: user.name||name, userEmail: email, ...r.data };
+      const userRole = user ? user.role : 'user';
+      const isAdmin  = userRole === 'admin' || r.data.isAdmin === true;
+      _licData = { key: licKey, userName: user?.name||name, userEmail: email, ...r.data };
       localStorage.setItem(_SESS, JSON.stringify({
-        key: licKey, userName: user.name||name, userEmail: email,
+        key: licKey, userName: user?.name||name, userEmail: email,
         company: r.data.company, customerName: r.data.customerName,
         expiryDate: r.data.expiryDate?.toString(), readOnly: r.readOnly,
-        role: user.role || r.data.role, isAdmin: user.role==='admin' || r.data.isAdmin,
+        role: userRole, isAdmin,
         ts: Date.now()
       }));
-      unlockApp(r.readOnly, { ...r.data, role: user.role, isAdmin: user.role==='admin'||r.data.isAdmin });
+      unlockApp(r.readOnly, { ...r.data, role: userRole, isAdmin });
     } else {
       const msgs = {
         INVALID_KEY:   'License assigned to your account is invalid. Contact your administrator.',
@@ -2252,11 +2267,12 @@ document.addEventListener("DOMContentLoaded", () => {
     // ── Step 2: Re-validate in background — picks up admin changes ──
     const doRefresh = async () => {
       try {
-        // Re-check user is still active
+        // Re-check user active status only if they have a DB record
         if (s.userEmail) {
           const users = await window.__spcListUsers();
           const user = users.find(u => (u.email||'').toLowerCase() === s.userEmail);
-          if (!user || user.isActive === false) {
+          // Only block if they explicitly exist AND are deactivated
+          if (user && user.isActive === false) {
             localStorage.removeItem(_SESS);
             location.reload();
             return;
