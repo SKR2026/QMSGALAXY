@@ -2176,6 +2176,9 @@ function initFirestoreListeners() {
   LICENSE_DOC.onSnapshot(doc => {
     if (doc.exists && doc.data()) {
       _applyLicData(doc.data());
+      // Also populate _licInfo from the licenses/{key} collection
+      // so isLicenseExpired() has correct data for ALL user roles.
+      _syncBadgeFromLIC();
     }
   }, e => console.error('[PlantVisit] License listener error:', e));
 
@@ -2226,30 +2229,35 @@ let _licLockExpiry  = null;
 
 function lockApp(expiryDate) {
   _licLockPending = true;
-  _licLockExpiry  = expiryDate || _licLockExpiry;
+
+  // Resolve best available expiry date for display
+  // Priority: _licInfo.expiresAt (ms) > passed expiryDate > _licLockExpiry
+  const resolvedExpiry = (_licInfo && _licInfo.expiresAt)
+    ? new Date(_licInfo.expiresAt)
+    : (expiryDate ? new Date(expiryDate) : (_licLockExpiry ? new Date(_licLockExpiry) : null));
+  _licLockExpiry = resolvedExpiry ? resolvedExpiry.toISOString() : _licLockExpiry;
 
   const overlay = document.getElementById('licExpiredOverlay');
-  if (!overlay) {
-    // DOM not ready yet — activateSession will call lockApp again
-    return;
-  }
+  if (!overlay) return; // DOM not ready — pending flag set, activateSession will retry
 
   overlay.style.display = 'flex';
 
-  // Show expiry date
+  // Show expiry date pill
   const dateEl = document.getElementById('licExpiredDate');
   if (dateEl) {
-    if (_licLockExpiry) {
-      const d = new Date(_licLockExpiry);
+    if (resolvedExpiry && !isNaN(resolvedExpiry)) {
       const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-      dateEl.textContent = 'Expired on ' + d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear();
+      const isRevoked = _licInfo && _licInfo.status === 'revoked';
+      dateEl.textContent = isRevoked
+        ? 'License Revoked'
+        : 'Expired on ' + resolvedExpiry.getDate() + ' ' + MONTHS[resolvedExpiry.getMonth()] + ' ' + resolvedExpiry.getFullYear();
       dateEl.style.display = 'inline-block';
     } else {
       dateEl.style.display = 'none';
     }
   }
 
-  // Hide all nav tabs except Settings for admin
+  // Hide all nav tabs — admin keeps Settings to renew
   document.querySelectorAll('.nav-btn').forEach(btn => {
     if (btn.id === 'tab-settings') {
       btn.style.display = (typeof currentUser !== 'undefined' && currentUser && currentUser.access === 'admin') ? '' : 'none';
@@ -2267,10 +2275,24 @@ function unlockApp() {
 }
 
 function isLicenseExpired() {
-  if (!_LIC || !_LIC.expiry) return false;  // no expiry = unlimited/open
-  const expired = new Date(_LIC.expiry) < new Date();
-  if (expired) console.warn('[PlantVisit] 🔒 isLicenseExpired=true, expiry:', _LIC.expiry);
-  return expired;
+  // PRIMARY: use _licInfo.expiresAt from licenses/{key} collection
+  // (this is what the license panel writes via expiresAt in ms)
+  if (_licInfo && _licInfo.status === 'revoked') {
+    console.warn('[PlantVisit] 🔒 License REVOKED');
+    return true;
+  }
+  if (_licInfo && _licInfo.expiresAt) {
+    const expired = _licInfo.expiresAt < Date.now();
+    if (expired) console.warn('[PlantVisit] 🔒 isLicenseExpired=true (expiresAt):', new Date(_licInfo.expiresAt).toISOString());
+    return expired;
+  }
+  // SECONDARY: fall back to _LIC.expiry from config/license (date string)
+  if (_LIC && _LIC.expiry) {
+    const expired = new Date(_LIC.expiry) < new Date();
+    if (expired) console.warn('[PlantVisit] 🔒 isLicenseExpired=true (expiry):', _LIC.expiry);
+    return expired;
+  }
+  return false; // no expiry data yet = allow (will lock once snapshot arrives)
 }
 
 /* -- License helper: apply a Firestore license doc to the in-memory _LIC --
@@ -2554,33 +2576,67 @@ function doLogin() {
     }
   };
 
-  // If _LIC already has a real expiry from a prior snapshot, use it immediately.
-  if (_LIC.expiry) {
-    const expired = new Date(_LIC.expiry) < new Date();
-    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const d = new Date(_LIC.expiry);
-    const dateStr = d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear();
-    _proceedWithLogin(expired, expired ? dateStr : null);
-  } else {
-    // _LIC not yet populated — fetch directly from Firestore
-    LICENSE_DOC.get().then(doc => {
+  // Helper to format ms timestamp for display
+  const _fmtExpiry = (ms) => {
+    const d = new Date(ms);
+    const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return d.getDate() + ' ' + M[d.getMonth()] + ' ' + d.getFullYear();
+  };
+
+  // If _licInfo already populated (badge sync ran before login), use it directly
+  if (_licInfo && (_licInfo.expiresAt || _licInfo.status === 'revoked')) {
+    const isRevoked = _licInfo.status === 'revoked';
+    const expired   = isRevoked || (_licInfo.expiresAt && _licInfo.expiresAt < Date.now());
+    const dateStr   = _licInfo.expiresAt ? _fmtExpiry(_licInfo.expiresAt) : '';
+    _proceedWithLogin(expired, expired ? (isRevoked ? 'Revoked' : dateStr) : null);
+    return;
+  }
+
+  // Fetch directly from licenses/{key} — the same collection the panel writes to
+  const _licKey = _LIC && _LIC.key && _LIC.key !== 'OPEN' ? _LIC.key : null;
+  const _fetchAndCheck = (key) => {
+    if (!key) { _proceedWithLogin(false, null); return; }
+    db.collection('licenses').doc(key).get().then(doc => {
       if (doc.exists && doc.data()) {
         const data = doc.data();
-        _applyLicData(data); // keep _LIC in sync
-        const expiry = data.expiry || '';
-        const expired = expiry ? new Date(expiry) < new Date() : false;
-        const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-        const d = new Date(expiry);
-        const dateStr = expiry ? d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear() : '';
-        _proceedWithLogin(expired, expired ? dateStr : null);
+        // Normalize expiresAt to ms
+        let expiresAt = data.expiresAt;
+        if (expiresAt && typeof expiresAt.toMillis === 'function') expiresAt = expiresAt.toMillis();
+        else expiresAt = Number(expiresAt) || null;
+        const isRevoked = data.status === 'revoked';
+        const expired   = isRevoked || (expiresAt && expiresAt < Date.now());
+        const dateStr   = expiresAt ? _fmtExpiry(expiresAt) : '';
+        // Sync into _licInfo so isLicenseExpired() works after login too
+        _licInfo = { ...data, expiresAt };
+        _proceedWithLogin(expired, expired ? (isRevoked ? 'Revoked' : dateStr) : null);
       } else {
-        // No license doc — treat as open/unlimited
-        _proceedWithLogin(false, null);
+        // Key not in licenses collection — check config/license as fallback
+        LICENSE_DOC.get().then(doc2 => {
+          if (doc2.exists && doc2.data() && doc2.data().expiry) {
+            const expiry = doc2.data().expiry;
+            _applyLicData(doc2.data());
+            const expired = new Date(expiry) < new Date();
+            _proceedWithLogin(expired, expired ? expiry : null);
+          } else {
+            _proceedWithLogin(false, null);
+          }
+        }).catch(() => _proceedWithLogin(false, null));
       }
     }).catch(e => {
       console.warn('[PlantVisit] License pre-check failed, proceeding:', e);
-      _proceedWithLogin(false, null); // fail open so auth issues don't lock out
+      _proceedWithLogin(false, null);
     });
+  };
+
+  // Get key from config/license first if not yet in _LIC
+  if (_licKey) {
+    _fetchAndCheck(_licKey);
+  } else {
+    LICENSE_DOC.get().then(doc => {
+      const key = doc.exists ? doc.data().key : null;
+      if (key && key !== 'OPEN') { if (doc.data()) _applyLicData(doc.data()); _fetchAndCheck(key); }
+      else _proceedWithLogin(false, null);
+    }).catch(() => _proceedWithLogin(false, null));
   }
 }
 
@@ -7155,6 +7211,11 @@ async function _syncBadgeFromLIC() {
   }
 
   renderLicenseBadge();
+  // Enforce lock immediately after badge data arrives — this is the moment
+  // _licInfo.expiresAt is first known, so isLicenseExpired() now works correctly.
+  if (isLicenseExpired()) {
+    lockApp();
+  }
 }
 
 async function initLicenseBadge() {
