@@ -2073,6 +2073,30 @@ function initFirestoreListeners() {
       // Apply shared logo to all logo slots on every settings push
       applySharedLogo(_settingsData?.app?.logoUrl || '');
     }
+
+    // BUG FIX: Mark settings as loaded from Firestore (even if doc doesn't exist yet —
+    // that just means defaults apply, which is fine).
+    // Then fire an immediate catch-up tick so the scheduler doesn't wait up to 60s
+    // after the page loads before checking whether the digest should fire today.
+    if (!_digestSettingsReady) {
+      _digestSettingsReady = true;
+      // Trigger a catch-up tick now that real settings are available.
+      // Use setTimeout(0) to let the current snapshot callback finish first.
+      setTimeout(() => {
+        const dd = _settingsData.dailyDigest || {};
+        if (!dd.enabled || !dd.sendTime) return;
+        const now     = new Date();
+        const nowMins = now.getHours() * 60 + now.getMinutes();
+        const [ch, cm] = dd.sendTime.split(':').map(Number);
+        const cfgMins  = ch * 60 + cm;
+        const today   = now.toDateString();
+        const lastDay = localStorage.getItem('pv_digest_sent_date');
+        if (nowMins >= cfgMins && lastDay !== today) {
+          console.log('[PlantVisit] 📬 Catch-up digest tick after settings loaded.');
+          sendDailyDigestEmail(false);
+        }
+      }, 0);
+    }
   }, e => console.error(e));
 }
 
@@ -3925,6 +3949,19 @@ async function testGraphConnection() {
     return;
   }
 
+  // BUG FIX: Auto-save the Gmail config before testing so _settingsData.gmail.backendUrl
+  // is always in sync with what's in the input fields. Previously, a user could type
+  // the URL and click "Send Test Email" without clicking "Save" first — the test would
+  // use the DOM value directly (correct), but subsequent sendGmailEmail() calls inside
+  // the app would use getGmailBackendUrl() which reads _settingsData (still empty).
+  _settingsData.gmail = {
+    ...(_settingsData.gmail || {}),
+    backendUrl,
+    toEmail,
+    senderName: document.getElementById('gm_sender_name')?.value.trim() || _settingsData.gmail?.senderName || '',
+  };
+  saveSettings();
+
   statusEl.style.display = 'block';
   statusEl.innerHTML = `<div class="alert alert-info">⏳ Sending test email via Gmail backend…</div>`;
 
@@ -4469,8 +4506,10 @@ async function sendDailyDigestEmail(force = false) {
     _settingsData.dailyDigest = { ...dd, lastSentDate: sentLabel };
     saveSettings();
 
-    // Also persist the send-date to localStorage to prevent double-fire on same day
-    if (!force) localStorage.setItem('pv_digest_sent_date', new Date().toDateString());
+    // Always stamp the send-date so the scheduler doesn't double-fire later the same day,
+    // even when force=true (manual "Send Now" button). The stamp only prevents a second
+    // automatic send — it doesn't block another manual send.
+    localStorage.setItem('pv_digest_sent_date', new Date().toDateString());
 
     if (statusEl) {
       statusEl.innerHTML = `<div class="alert alert-good" style="color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">
@@ -4514,10 +4553,20 @@ async function sendDailyDigestEmail(force = false) {
  *   without waiting up to 60 seconds for the first tick.
  */
 let _digestSchedulerTimer = null;
+let _digestSettingsReady  = false; // true once Firestore settings have loaded at least once
+
 function startDailyDigestScheduler() {
   if (_digestSchedulerTimer) return; // already running
 
   const tick = () => {
+    // BUG FIX: Do NOT run until Firestore has pushed real settings at least once.
+    // activateSession() calls this before the SETTINGS_DOC snapshot resolves, so
+    // _settingsData.dailyDigest.enabled is still the hardcoded default (false).
+    // The very first tick() call (catch-up, immediate) would silently bail on
+    // dd.enabled=false and never fire again until the next 60s interval — by
+    // which time the configured send-time window may have already passed.
+    if (!_digestSettingsReady) return;
+
     const dd = _settingsData.dailyDigest || {};
     if (!dd.enabled) return;
     if (!dd.sendTime) return;
