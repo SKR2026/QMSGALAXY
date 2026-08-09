@@ -123,6 +123,26 @@
     } catch(e) { return { success: false, error: e.message }; }
   };
 
+  // ── LOG: Record a user session ─────────────────────────────
+  window.__spcLogSession = async function(sessionData) {
+    try {
+      const logId = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+      await setDoc(doc(db, 'session_logs', logId), {
+        ...sessionData,
+        loggedAt: serverTimestamp()
+      });
+      return { success: true };
+    } catch(e) { return { success: false, error: e.message }; }
+  };
+
+  // ── LOG: List all session logs ─────────────────────────────
+  window.__spcListSessionLogs = async function() {
+    try {
+      const snap = await getDocs(collection(db, 'session_logs'));
+      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    } catch(e) { return []; }
+  };
+
   window.__spcValidate = validateLicense;
   window.__spcFirebaseReady = true;
   document.dispatchEvent(new Event('firebase-ready'));
@@ -2151,6 +2171,21 @@ async function doActivate() {
       const userRole = user ? user.role : 'user';
       const isAdmin  = userRole === 'admin' || r.data.isAdmin === true;
       _licData = { key: licKey, userName: user?.name||name, userEmail: email, ...r.data };
+
+      // ── Log this sign-in session ──
+      if (window.__spcLogSession) {
+        window.__spcLogSession({
+          userName: user?.name || name,
+          userEmail: email,
+          role: userRole,
+          licenseKey: licKey,
+          company: r.data.company || '—',
+          readOnly: r.readOnly || false,
+          userAgent: navigator.userAgent,
+          signInMethod: 'manual'
+        });
+      }
+
       localStorage.setItem(_SESS, JSON.stringify({
         key: licKey, userName: user?.name||name, userEmail: email,
         company: r.data.company, customerName: r.data.customerName,
@@ -2524,6 +2559,113 @@ function filterLicenses() {
   ));
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  USAGE LOG
+// ═══════════════════════════════════════════════════════════════
+let _allSessionLogs = [];
+
+async function loadSessionLogs() {
+  const el = document.getElementById('session-logs-list');
+  el.innerHTML = '<div style="text-align:center;color:var(--text3);padding:20px;font-size:12px">Loading…</div>';
+  if (!window.__spcListSessionLogs) { el.innerHTML = '<div style="text-align:center;color:var(--red);padding:20px;font-size:12px">Firebase not ready.</div>'; return; }
+  _allSessionLogs = await window.__spcListSessionLogs();
+  // Sort newest first
+  _allSessionLogs.sort((a, b) => {
+    const ta = a.loggedAt?.seconds || 0, tb = b.loggedAt?.seconds || 0;
+    return tb - ta;
+  });
+  document.getElementById('log-count').textContent = `${_allSessionLogs.length} sign-in${_allSessionLogs.length !== 1 ? 's' : ''} total`;
+  renderSessionLogs(_allSessionLogs);
+}
+
+function renderSessionLogs(logs) {
+  const el = document.getElementById('session-logs-list');
+  if (!logs.length) {
+    el.innerHTML = '<div style="text-align:center;color:var(--text3);padding:20px;font-size:12px">No sign-in records found.</div>';
+    return;
+  }
+
+  // ── Summary stats bar ──
+  const uniqueUsers = [...new Set(logs.map(l => (l.userEmail||'').toLowerCase()).filter(Boolean))];
+  const today = new Date(); today.setHours(0,0,0,0);
+  const todayCount = logs.filter(l => {
+    const d = l.loggedAt?.seconds ? new Date(l.loggedAt.seconds * 1000) : null;
+    return d && d >= today;
+  }).length;
+
+  const statsHtml = `
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px;">
+      <div class="kpi-card" style="text-align:center">
+        <div class="kpi-label">Total Sign-ins</div>
+        <div class="kpi-value" style="font-size:22px">${logs.length}</div>
+      </div>
+      <div class="kpi-card" style="text-align:center">
+        <div class="kpi-label">Unique Users</div>
+        <div class="kpi-value" style="font-size:22px">${uniqueUsers.length}</div>
+      </div>
+      <div class="kpi-card" style="text-align:center">
+        <div class="kpi-label">Today's Sign-ins</div>
+        <div class="kpi-value" style="font-size:22px">${todayCount}</div>
+      </div>
+    </div>`;
+
+  const rowsHtml = logs.map((l, idx) => {
+    const ts = l.loggedAt?.seconds ? new Date(l.loggedAt.seconds * 1000) : null;
+    const dateStr = ts ? ts.toLocaleDateString('en-IN') : '—';
+    const timeStr = ts ? ts.toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit' }) : '';
+    const roleColor = l.role === 'admin' ? 'var(--purple)' : 'var(--text2)';
+    const roleBadge = l.role === 'admin'
+      ? `<span class="u-badge badge-admin">admin</span>`
+      : `<span class="u-badge badge-active">user</span>`;
+    const roBadge = l.readOnly
+      ? `<span class="u-badge badge-inactive" style="font-family:'DM Sans',sans-serif">read-only</span>`
+      : '';
+    return `
+      <div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:9px 14px;margin-bottom:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div style="font-size:11px;color:var(--text3);font-family:'DM Mono',monospace;min-width:90px;flex-shrink:0;">${dateStr}<br>${timeStr}</div>
+        <div style="flex:1;min-width:160px;">
+          <div style="font-size:13px;font-weight:600;color:var(--text)">${l.userName||'—'} ${roleBadge} ${roBadge}</div>
+          <div style="font-size:11px;color:var(--text3);margin-top:2px;">📧 ${l.userEmail||'—'} · 🏢 ${l.company||'—'}</div>
+        </div>
+        <div style="font-size:10px;color:var(--text3);font-family:'DM Mono',monospace;min-width:80px;text-align:right;flex-shrink:0;word-break:break-all;">${(l.licenseKey||'—').substring(0,16)}</div>
+      </div>`;
+  }).join('');
+
+  el.innerHTML = statsHtml + rowsHtml;
+}
+
+function filterSessionLogs() {
+  const q = document.getElementById('log-search').value.toLowerCase();
+  if (!q) { renderSessionLogs(_allSessionLogs); return; }
+  renderSessionLogs(_allSessionLogs.filter(l =>
+    (l.userName||'').toLowerCase().includes(q) ||
+    (l.userEmail||'').toLowerCase().includes(q) ||
+    (l.company||'').toLowerCase().includes(q) ||
+    (l.role||'').toLowerCase().includes(q)
+  ));
+}
+
+function exportSessionLogsCSV() {
+  if (!_allSessionLogs.length) { notify('No logs to export.', 'error'); return; }
+  const header = ['Date', 'Time', 'Name', 'Email', 'Role', 'Company', 'License Key', 'Read-Only'];
+  const rows = _allSessionLogs.map(l => {
+    const ts = l.loggedAt?.seconds ? new Date(l.loggedAt.seconds * 1000) : null;
+    return [
+      ts ? ts.toLocaleDateString('en-IN') : '',
+      ts ? ts.toLocaleTimeString('en-IN') : '',
+      l.userName||'', l.userEmail||'', l.role||'user',
+      l.company||'', l.licenseKey||'', l.readOnly ? 'Yes' : 'No'
+    ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(',');
+  });
+  const csv = [header.join(','), ...rows].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `SPC_UsageLog_${new Date().toISOString().split('T')[0]}.csv`;
+  a.click();
+  notify('Usage log exported as CSV.', 'success');
+}
+
 async function toggleLicenseActive(id, current) {
   if (!window.__spcUpdateLicense) { notify('Firebase not ready.', 'error'); return; }
   const res = await window.__spcUpdateLicense(id, { isActive: !current });
@@ -2545,6 +2687,7 @@ async function toggleLicenseActive(id, current) {
     <div class="admin-tab-bar">
       <button class="admin-tab-btn active" onclick="switchAdminTab('users',this)">👥 Users</button>
       <button class="admin-tab-btn" onclick="switchAdminTab('licenses',this)">🔑 Licenses</button>
+      <button class="admin-tab-btn" onclick="switchAdminTab('usagelog',this);loadSessionLogs()">📋 Usage Log</button>
     </div>
     <div class="admin-body">
 
@@ -2660,6 +2803,20 @@ async function toggleLicenseActive(id, current) {
         </div>
         <div id="licenses-list">
           <div style="text-align:center;color:var(--text3);padding:30px;font-size:12px">Click Refresh to load licenses.</div>
+        </div>
+      </div>
+
+      <!-- ── USAGE LOG TAB ── -->
+      <div id="atab-usagelog" class="admin-section">
+        <div class="admin-divider">Sign-In Usage Log</div>
+        <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap;">
+          <input class="admin-input" id="log-search" placeholder="🔍  Search by name, email or company…" oninput="filterSessionLogs()" style="flex:1;min-width:160px;">
+          <button class="btn btn-sm" onclick="loadSessionLogs()">↻ Refresh</button>
+          <button class="btn btn-sm" onclick="exportSessionLogsCSV()">⬇ Export CSV</button>
+          <span id="log-count" style="font-size:11px;color:var(--text3);white-space:nowrap;"></span>
+        </div>
+        <div id="session-logs-list">
+          <div style="text-align:center;color:var(--text3);padding:30px;font-size:12px">Click Refresh to load the sign-in log.</div>
         </div>
       </div>
 
