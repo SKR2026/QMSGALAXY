@@ -1092,7 +1092,7 @@ html.guest-direct-link #mainContent { display: block !important; }
 <main class="content" id="mainContent" style="display:none"></main>
 
 <!-- LICENSE EXPIRED LOCK SCREEN -->
-<div id="licExpiredOverlay" style="display:none;position:fixed;inset:0;z-index:1500;background:var(--navy);flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;padding:32px">
+<div id="licExpiredOverlay" style="display:none;position:fixed;inset:0;z-index:9999;background:var(--navy);flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;padding:32px">
   <div style="font-size:48px">&#x1F512;</div>
   <div style="font-family:var(--font-display);font-size:26px;color:var(--red);letter-spacing:-0.3px">License Expired</div>
   <div style="font-size:14px;color:var(--slate);max-width:360px;line-height:1.7">Your PlantVisit license has expired. Access to the application is suspended.<br>Please contact your administrator or developer to renew.</div>
@@ -2213,31 +2213,48 @@ function initFirestoreListeners() {
                  access Settings to renew the key.
    unlockApp() — removes the overlay (called when a valid key is detected).
    ══════════════════════════════════════════════════════════════════════ */
+let _licLockPending = false;  // set true if lockApp fires before DOM/session ready
+let _licLockExpiry  = null;
+
 function lockApp(expiryDate) {
+  _licLockPending = true;
+  _licLockExpiry  = expiryDate || _licLockExpiry;
+
   const overlay = document.getElementById('licExpiredOverlay');
-  if (!overlay) return;
+  if (!overlay) {
+    // DOM not ready yet — activateSession will call lockApp again
+    return;
+  }
+
   overlay.style.display = 'flex';
-  // Show expiry date if known
+
+  // Show expiry date
   const dateEl = document.getElementById('licExpiredDate');
-  if (dateEl && expiryDate) {
-    const d = new Date(expiryDate);
+  if (dateEl && _licLockExpiry) {
+    const d = new Date(_licLockExpiry);
     const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     dateEl.textContent = 'Expired on ' + d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear();
   }
-  // Allow admin to still reach Settings tab to fix the license
-  if (typeof currentUser !== 'undefined' && currentUser && currentUser.access === 'admin') {
-    document.getElementById('tab-settings').style.display = '';
-  }
+
+  // Hide all nav tabs except Settings for admin
+  document.querySelectorAll('.nav-btn').forEach(btn => {
+    if (btn.id === 'tab-settings') {
+      btn.style.display = (typeof currentUser !== 'undefined' && currentUser && currentUser.access === 'admin') ? '' : 'none';
+    } else {
+      btn.style.display = 'none';
+    }
+  });
 }
 
 function unlockApp() {
+  _licLockPending = false;
+  _licLockExpiry  = null;
   const overlay = document.getElementById('licExpiredOverlay');
   if (overlay) overlay.style.display = 'none';
 }
 
 function isLicenseExpired() {
-  if (!_LIC || _LIC.key === 'OPEN') return false;   // no key = open mode
-  if (!_LIC.expiry) return false;                    // no expiry = unlimited
+  if (!_LIC || !_LIC.expiry) return false;           // no expiry = unlimited
   return new Date(_LIC.expiry) < new Date();
 }
 
@@ -2348,11 +2365,10 @@ function activateSession(user, id, visitId) {
   document.getElementById('mainContent').style.display = 'block';
 
   // ── License expiry gate ─────────────────────────────────────────────────
-  // Lock immediately if expiry is already known at login time.
-  // _applyLicData / Firestore onSnapshot will call lockApp() again if the
-  // expiry snapshot arrives after login (covers the live-revocation case).
-  if (isLicenseExpired()) {
-    lockApp(_LIC.expiry);
+  // Lock if expiry is already known OR if onSnapshot already fired and set
+  // the pending flag before the DOM was ready.
+  if (isLicenseExpired() || _licLockPending) {
+    lockApp(_LIC.expiry || _licLockExpiry);
   }
 
   // ── Start secure session + audit ────────────────────────────────────────
