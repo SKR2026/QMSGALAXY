@@ -492,11 +492,17 @@ function startListeners(){
     S.companyName=d.companyName||'';
     S.publicViewEnabled=d.publicViewEnabled!==false;
     S.empNotifSettings=Object.assign({enabled:false,email:'',backendUrl:'',senderName:'HR System',addSubject:'New Employee Added',addBody:'',delSubject:'Employee Removed',delBody:''},d.empNotifSettings||{});
-    const newLicKeyPub = d.licenseKey || '';
-    if (newLicKeyPub !== S.licenseKey) {
-      S.licenseKey = newLicKeyPub;
-      if (newLicKeyPub) fetchLicenseExpiry(newLicKeyPub);
-      else { S.licenseExpiry = null; S.licenseStatus = ''; }
+    const newLicKey = d.licenseKey || '';
+    if (newLicKey !== S.licenseKey) {
+      S.licenseKey = newLicKey;
+      if (newLicKey) {
+        // Don't render yet — wait for fetchLicenseExpiry to complete so
+        // isLicenseExpired() and licenseBadgeHTML() have real data.
+        fetchLicenseExpiry(newLicKey).then(() => { if(!_importing) render(); });
+        return; // skip the render() below
+      } else {
+        S.licenseExpiry = null; S.licenseStatus = '';
+      }
     }
     if(!_importing) render();
   }));
@@ -538,8 +544,12 @@ function startPublicListeners(){
     const newLicKeyPub = d.licenseKey || '';
     if (newLicKeyPub !== S.licenseKey) {
       S.licenseKey = newLicKeyPub;
-      if (newLicKeyPub) fetchLicenseExpiry(newLicKeyPub);
-      else { S.licenseExpiry = null; S.licenseStatus = ''; }
+      if (newLicKeyPub) {
+        fetchLicenseExpiry(newLicKeyPub).then(() => { if(!_importing) render(); });
+        return;
+      } else {
+        S.licenseExpiry = null; S.licenseStatus = '';
+      }
     }
     if(!_importing) render();
   }));
@@ -704,10 +714,12 @@ async function fetchLicenseExpiry(key) {
     const doc = await db.collection('org_licenses').doc(key).get();
     if (!doc.exists) {
       S.licenseExpiry = null; S.licenseStatus = 'invalid';
+      console.warn('[OrgChart] License key not found in org_licenses:', key);
     } else {
       const data = doc.data();
       let expiresAt = data.expiresAt;
       if (expiresAt && typeof expiresAt.toMillis === 'function') expiresAt = expiresAt.toMillis();
+      else if (expiresAt instanceof Date) expiresAt = expiresAt.getTime();
       else expiresAt = Number(expiresAt) || null;
       S.licenseExpiry = expiresAt;
       if (data.status === 'revoked') {
@@ -718,25 +730,34 @@ async function fetchLicenseExpiry(key) {
         const days = Math.ceil((expiresAt - Date.now()) / 86400000);
         S.licenseStatus = days < 0 ? 'expired' : days <= 30 ? 'expiring' : 'active';
       }
+      console.log('[OrgChart] License:', key, '| status:', S.licenseStatus, '| expiresAt:', expiresAt ? new Date(expiresAt).toLocaleDateString() : 'none');
     }
   } catch(e) {
     console.warn('[OrgChart] License fetch failed:', e);
     S.licenseStatus = ''; // fail-open on network error
   }
+  // Always re-render after fetch so badge + gate reflect real data
   if (!_importing) render();
 }
 
 function isLicenseExpired() {
-  if (!S.licenseKey) return false;           // no key configured = open
-  if (S.licenseStatus === 'revoked') return true;
-  if (S.licenseStatus === 'expired') return true;
+  if (!S.licenseKey) return false;               // no key = open mode
+  if (!S.licenseExpiry && S.licenseStatus === '') return false; // still loading
+  if (S.licenseStatus === 'revoked')  return true;
+  if (S.licenseStatus === 'invalid')  return true;
+  if (S.licenseStatus === 'expired')  return true;
   if (S.licenseExpiry && S.licenseExpiry < Date.now()) return true;
   return false;
 }
 
 function licenseBadgeHTML() {
   // Shown in topbar for ALL roles — badge only, no action
-  if (!S.licenseKey || !S.licenseExpiry) return '';
+  if (!S.licenseKey) return '';
+  // Show loading state while fetch is pending
+  if (!S.licenseExpiry && !S.licenseStatus) {
+    return '<span style="display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:999px;background:rgba(148,163,184,.1);border:1px solid rgba(148,163,184,.25);font-size:11.5px;font-weight:600;color:#8494AA;white-space:nowrap">&#128273; License&hellip;</span>';
+  }
+  if (!S.licenseExpiry) return '';
   const days = Math.ceil((S.licenseExpiry - Date.now()) / 86400000);
   const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const d = new Date(S.licenseExpiry);
@@ -789,15 +810,21 @@ function render(){
     app.innerHTML=publicViewHTML(); bindPublicView(); scrollToHighlighted(); return;
   }
   if(!S.user){ app.innerHTML=loginHTML(); bindLogin(); return; }
-  // ── LICENSE GATE: block all non-super-admin users when expired ──────────
-  // Super-admin can still access Plants & Settings tab to enter/renew the key.
+  // ── LICENSE GATE ────────────────────────────────────────────────────────
+  // If a key is configured but expiry hasn't loaded yet, show a brief
+  // loading screen so we never let the app through before we know the status.
+  if (S.licenseKey && S.licenseStatus === '' && S.licenseExpiry === null) {
+    app.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:var(--g400);font-size:15px;gap:10px"><span style="font-size:20px">&#128273;</span> Verifying license…</div>';
+    return;
+  }
   if (isLicenseExpired()) {
     const role = S.profile?.role;
     if (role !== 'super-admin') {
+      // Block plant-admin, viewers, all other roles
       app.innerHTML = licenseExpiredScreenHTML();
       return;
     }
-    // Super-admin: allow but force-redirect to Plants & Settings so they can fix it
+    // Super-admin: redirect to Plants & Settings to renew key
     if (S.tab !== 'plants') S.tab = 'plants';
   }
   if(!S.profile){
@@ -2487,7 +2514,8 @@ function publicViewHTML(){
         <span style="color:#fff;font-size:16px;font-weight:800;white-space:nowrap">Organisation <span style="color:var(--gold)">Structure</span></span>
         <span style="color:rgba(255,255,255,.45);font-size:12px;white-space:nowrap">${S.companyName||'Organisation'}</span>
       </div>
-      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap">
+        ${licenseBadgeHTML()}
         <span style="background:rgba(34,197,94,.15);color:#4ade80;font-size:10px;font-weight:700;padding:3px 8px;border-radius:20px;letter-spacing:.04em;white-space:nowrap">👁 PUBLIC</span>
         <a href="https://www.qmsgalaxy.com/pp-org/" style="font-size:11px;color:rgba(255,255,255,.5);text-decoration:none;padding:5px 10px;border:1px solid rgba(255,255,255,.15);border-radius:8px;white-space:nowrap">🔐 Login</a>
       </div>
