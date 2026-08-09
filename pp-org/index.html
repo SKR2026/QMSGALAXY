@@ -404,6 +404,9 @@ const S = {
   _saSearch:'',   // search string in superadmin chart views
   activeStructId:'',  // '' = default root collections; else = structures/{id}/...
   structures:[],      // list of {id, name, description, createdAt}
+  licenseKey:'',      // ORG- key stored in Firestore settings/company (set by super-admin only)
+  licenseExpiry:null, // Unix ms — populated from org_licenses/{key} via Firestore
+  licenseStatus:'',   // 'active' | 'expiring' | 'expired' | 'revoked' | ''
 };
 // Detect public view: ?view=public OR #public OR path ends with /public
 if(
@@ -489,6 +492,12 @@ function startListeners(){
     S.companyName=d.companyName||'';
     S.publicViewEnabled=d.publicViewEnabled!==false;
     S.empNotifSettings=Object.assign({enabled:false,email:'',backendUrl:'',senderName:'HR System',addSubject:'New Employee Added',addBody:'',delSubject:'Employee Removed',delBody:''},d.empNotifSettings||{});
+    const newLicKeyPub = d.licenseKey || '';
+    if (newLicKeyPub !== S.licenseKey) {
+      S.licenseKey = newLicKeyPub;
+      if (newLicKeyPub) fetchLicenseExpiry(newLicKeyPub);
+      else { S.licenseExpiry = null; S.licenseStatus = ''; }
+    }
     if(!_importing) render();
   }));
   // Load structures list (super-admin)
@@ -526,6 +535,12 @@ function startPublicListeners(){
     S.companyName=d.companyName||'';
     S.publicViewEnabled=d.publicViewEnabled!==false;
     S.empNotifSettings=Object.assign({enabled:false,email:'',backendUrl:'',senderName:'HR System',addSubject:'New Employee Added',addBody:'',delSubject:'Employee Removed',delBody:''},d.empNotifSettings||{});
+    const newLicKeyPub = d.licenseKey || '';
+    if (newLicKeyPub !== S.licenseKey) {
+      S.licenseKey = newLicKeyPub;
+      if (newLicKeyPub) fetchLicenseExpiry(newLicKeyPub);
+      else { S.licenseExpiry = null; S.licenseStatus = ''; }
+    }
     if(!_importing) render();
   }));
   _unsubs.push(col('plants').onSnapshot(s=>{
@@ -674,18 +689,117 @@ function scrollToHighlighted(){
   })));
 }
 
+/* ══════════════════════════════════════════════════════════
+   LICENSE SYSTEM
+   - licenseKey is set ONLY by super-admin in Plants & Settings
+   - Stored in Firestore settings/company.licenseKey
+   - Expiry fetched from org_licenses/{key} (written by license panel)
+   - Badge shown to ALL roles in topbar
+   - App blocks with lock screen when expired/revoked
+══════════════════════════════════════════════════════════ */
+
+async function fetchLicenseExpiry(key) {
+  if (!key) return;
+  try {
+    const doc = await db.collection('org_licenses').doc(key).get();
+    if (!doc.exists) {
+      S.licenseExpiry = null; S.licenseStatus = 'invalid';
+    } else {
+      const data = doc.data();
+      let expiresAt = data.expiresAt;
+      if (expiresAt && typeof expiresAt.toMillis === 'function') expiresAt = expiresAt.toMillis();
+      else expiresAt = Number(expiresAt) || null;
+      S.licenseExpiry = expiresAt;
+      if (data.status === 'revoked') {
+        S.licenseStatus = 'revoked';
+      } else if (!expiresAt) {
+        S.licenseStatus = 'active';
+      } else {
+        const days = Math.ceil((expiresAt - Date.now()) / 86400000);
+        S.licenseStatus = days < 0 ? 'expired' : days <= 30 ? 'expiring' : 'active';
+      }
+    }
+  } catch(e) {
+    console.warn('[OrgChart] License fetch failed:', e);
+    S.licenseStatus = ''; // fail-open on network error
+  }
+  if (!_importing) render();
+}
+
+function isLicenseExpired() {
+  if (!S.licenseKey) return false;           // no key configured = open
+  if (S.licenseStatus === 'revoked') return true;
+  if (S.licenseStatus === 'expired') return true;
+  if (S.licenseExpiry && S.licenseExpiry < Date.now()) return true;
+  return false;
+}
+
+function licenseBadgeHTML() {
+  // Shown in topbar for ALL roles — badge only, no action
+  if (!S.licenseKey || !S.licenseExpiry) return '';
+  const days = Math.ceil((S.licenseExpiry - Date.now()) / 86400000);
+  const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const d = new Date(S.licenseExpiry);
+  const dateStr = d.getDate() + ' ' + M[d.getMonth()] + ' ' + d.getFullYear();
+  const isRevoked = S.licenseStatus === 'revoked';
+  const isExpired = isRevoked || days < 0;
+  const isWarning = !isExpired && days <= 30;
+
+  const bg    = isExpired ? 'rgba(239,68,68,.10)'   : isWarning ? 'rgba(245,166,35,.10)'   : 'rgba(34,197,94,.09)';
+  const bdr   = isExpired ? 'rgba(239,68,68,.28)'   : isWarning ? 'rgba(245,166,35,.30)'   : 'rgba(34,197,94,.25)';
+  const clr   = isExpired ? '#dc2626'               : isWarning ? '#b45309'                : '#15803d';
+  const dot   = isExpired ? '#ef4444'               : isWarning ? '#f59e0b'                : '#22c55e';
+  const label = isRevoked ? 'Revoked'
+              : isExpired ? 'Expired ' + dateStr
+              : isWarning ? 'Expires ' + dateStr + ' (' + days + 'd)'
+              :             'License · ' + dateStr;
+
+  return `<span style="display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:999px;background:${bg};border:1px solid ${bdr};font-size:11.5px;font-weight:600;color:${clr};white-space:nowrap;letter-spacing:.01em">
+    <span style="width:6px;height:6px;border-radius:50%;background:${dot};flex-shrink:0"></span>
+    🔑 ${label}
+  </span>`;
+}
+
+function licenseExpiredScreenHTML() {
+  const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const d = S.licenseExpiry ? new Date(S.licenseExpiry) : null;
+  const dateStr = d ? d.getDate() + ' ' + M[d.getMonth()] + ' ' + d.getFullYear() : '';
+  const isRevoked = S.licenseStatus === 'revoked';
+  return `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:20px;text-align:center;padding:40px;background:var(--off)">
+    <div style="width:80px;height:80px;border-radius:50%;background:rgba(239,68,68,.08);border:2px solid rgba(239,68,68,.2);display:flex;align-items:center;justify-content:center;font-size:38px">🔒</div>
+    <div style="font-size:26px;font-weight:800;color:var(--err)">${isRevoked ? 'License Revoked' : 'License Expired'}</div>
+    ${dateStr ? `<div style="display:inline-block;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:999px;padding:5px 16px;font-size:13px;font-weight:600;color:#dc2626">${isRevoked ? 'Revoked' : 'Expired on ' + dateStr}</div>` : ''}
+    <div style="font-size:14px;color:var(--g400);max-width:380px;line-height:1.75">
+      Your <strong style="color:var(--navy)">OrgChart</strong> license has expired.<br>
+      Access is <strong style="color:var(--err)">suspended</strong> until renewed.<br>
+      Please contact your developer to renew the license.
+    </div>
+    <button onclick="auth.signOut()" style="margin-top:8px;padding:10px 28px;background:#ef4444;color:#fff;border:none;border-radius:9px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;box-shadow:0 4px 14px rgba(239,68,68,.25)">Sign Out</button>
+  </div>`;
+}
+
 function render(){
   const app=$('app');
   if(S.loading){ app.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:var(--g400);font-size:15px">Loading…</div>'; return; }
   if(S.publicView){
     if(!S.publicViewEnabled){
-      // Public view disabled by superadmin — redirect to login
       S.publicView=false;
       app.innerHTML=loginHTML(); bindLogin(); return;
     }
     app.innerHTML=publicViewHTML(); bindPublicView(); scrollToHighlighted(); return;
   }
   if(!S.user){ app.innerHTML=loginHTML(); bindLogin(); return; }
+  // ── LICENSE GATE: block all non-super-admin users when expired ──────────
+  // Super-admin can still access Plants & Settings tab to enter/renew the key.
+  if (isLicenseExpired()) {
+    const role = S.profile?.role;
+    if (role !== 'super-admin') {
+      app.innerHTML = licenseExpiredScreenHTML();
+      return;
+    }
+    // Super-admin: allow but force-redirect to Plants & Settings so they can fix it
+    if (S.tab !== 'plants') S.tab = 'plants';
+  }
   if(!S.profile){
     app.innerHTML=`<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px;padding:24px;text-align:center">
       <div style="font-size:40px">🔍</div>
@@ -853,7 +967,8 @@ function topbarHTML(title,sub,badge,extra=''){
     </div>
     ${extra?`<div style="width:1px;height:32px;background:var(--g100);margin:0 14px;flex-shrink:0"></div>${extra}`:''}
   </div>
-  <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+  <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap">
+    ${licenseBadgeHTML()}
     ${structBadge}
     <span class="badge bg">${badge}</span>
     <button id="topbar-signout-btn" style="margin-left:4px;display:inline-flex;align-items:center;gap:5px;padding:6px 12px;border:1.5px solid var(--g200);border-radius:8px;background:#fff;color:var(--g600);font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s" onmouseover="this.style.borderColor='#EF4444';this.style.color='#EF4444'" onmouseout="this.style.borderColor='var(--g200)';this.style.color='var(--g600)'">⇤ Sign Out</button>
@@ -965,6 +1080,49 @@ function plantsHTML(){
   return `<div class="fl ac jb mb16">
   <div><h2 style="font-size:17px;font-weight:800;color:var(--navy)">Plants & Settings</h2><p style="font-size:13px;color:var(--g400)">Manage plants and company branding</p></div>
   <button class="btn bp" id="add-plant-btn">+ Add Plant</button>
+</div>
+
+<!-- ── License Key Section (Super-Admin only) ── -->
+<div class="card" style="margin-bottom:20px;border-left:3px solid ${S.licenseStatus==='expired'||S.licenseStatus==='revoked'?'#ef4444':S.licenseStatus==='expiring'?'#f59e0b':'#22c55e'}">
+  <div class="card-h">
+    <h3>🔑 License Key</h3>
+    <span style="font-size:11px;color:var(--g400)">Set by super-admin · Applied to all users · Expiry badge visible to everyone</span>
+  </div>
+  <div style="padding:20px 24px">
+    <!-- Current status row -->
+    <div style="display:flex;align-items:center;gap:14px;margin-bottom:18px;padding:14px 16px;background:var(--g50);border-radius:10px;border:1.5px solid var(--g100);flex-wrap:wrap">
+      <div style="flex:1;min-width:180px">
+        <div style="font-size:12px;font-weight:700;color:var(--g600);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Active Key</div>
+        <div style="font-family:monospace;font-size:14px;font-weight:700;color:var(--navy);letter-spacing:.04em">${S.licenseKey || '— Not configured —'}</div>
+      </div>
+      <div>
+        ${(()=>{
+          if (!S.licenseKey) return '<span style="display:inline-flex;align-items:center;gap:6px;padding:5px 14px;border-radius:999px;background:rgba(148,163,184,.1);border:1px solid rgba(148,163,184,.25);font-size:12px;font-weight:600;color:var(--g400)">⚪ No License</span>';
+          const st = S.licenseStatus;
+          if (st==='revoked')  return '<span style="display:inline-flex;align-items:center;gap:6px;padding:5px 14px;border-radius:999px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);font-size:12px;font-weight:600;color:#dc2626">🔴 Revoked</span>';
+          if (st==='expired')  return '<span style="display:inline-flex;align-items:center;gap=6px;padding:5px 14px;border-radius:999px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);font-size:12px;font-weight:600;color:#dc2626">🔴 Expired</span>';
+          if (st==='expiring') return '<span style="display:inline-flex;align-items:center;gap:6px;padding:5px 14px;border-radius:999px;background:rgba(245,166,35,.1);border:1px solid rgba(245,166,35,.25);font-size:12px;font-weight:600;color:#b45309">⚠ Expiring Soon</span>';
+          if (st==='active')   return '<span style="display:inline-flex;align-items:center;gap:6px;padding:5px 14px;border-radius:999px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);font-size:12px;font-weight:600;color:#15803d">✓ Active</span>';
+          return '<span style="display:inline-flex;align-items:center;gap:6px;padding:5px 14px;border-radius:999px;background:rgba(148,163,184,.1);border:1px solid rgba(148,163,184,.25);font-size:12px;font-weight:600;color:var(--g400)">— Checking…</span>';
+        })()}
+        ${S.licenseExpiry ? ('<div style="font-size:11px;color:var(--g400);margin-top:4px">Expires: '+new Date(S.licenseExpiry).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})+'</div>') : ''}
+      </div>
+    </div>
+    <!-- Key input + save -->
+    <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap">
+      <div style="flex:1;min-width:220px">
+        <label class="lbl">Enter / Update License Key</label>
+        <input class="inp" id="license-key-inp" placeholder="ORG-XXXX-XXXX-XXXX" value="${S.licenseKey||''" style="font-family:monospace;letter-spacing:.04em"/>
+        <div style="font-size:11px;color:var(--g400);margin-top:4px">Paste the key issued by your developer. Leave blank to clear the license.</div>
+      </div>
+      <div style="display:flex;gap:8px;padding-bottom:1px">
+        <button class="btn bp bsm" id="license-key-save-btn">💾 Save Key</button>
+        ${S.licenseKey ? '<button class="btn bd bsm" id="license-key-clear-btn">✕ Clear</button>' : ''}
+      </div>
+    </div>
+    <div id="license-key-status" style="font-size:12px;color:var(--g400);margin-top:8px"></div>
+    ${(S.licenseStatus==='expired'||S.licenseStatus==='revoked') ? '<div style="margin-top:12px;padding:12px 16px;background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.18);border-radius:9px;font-size:13px;color:#dc2626;font-weight:500">⚠ All non-admin users are currently blocked. Enter a valid key to restore access.</div>' : ''}
+  </div>
 </div>
 
 <!-- ── Company Name Section ── -->
@@ -4043,6 +4201,40 @@ function bindAll(){
         requestAnimationFrame(()=>sInp.focus());
       });
     }
+  });
+
+  // ── License Key save/clear (super-admin only) ────────────────────
+  $('license-key-save-btn')?.addEventListener('click', async () => {
+    const inp = $('license-key-inp');
+    const statusEl = $('license-key-status');
+    const key = (inp ? inp.value.trim() : '').toUpperCase();
+    if (key && !/^ORG-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$/.test(key)) {
+      if (statusEl) { statusEl.textContent = '✕ Invalid format. Expected ORG-XXXX-XXXX-XXXX'; statusEl.style.color = 'var(--err)'; }
+      return;
+    }
+    if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.style.color = 'var(--g400)'; }
+    try {
+      await db.collection('settings').doc('company').set({ licenseKey: key }, { merge: true });
+      S.licenseKey = key;
+      if (key) {
+        await fetchLicenseExpiry(key);
+        if (statusEl) { statusEl.textContent = '✓ Key saved and verified.'; statusEl.style.color = 'var(--ok)'; }
+      } else {
+        S.licenseExpiry = null; S.licenseStatus = '';
+        if (statusEl) { statusEl.textContent = '✓ License cleared — app is now open.'; statusEl.style.color = 'var(--ok)'; }
+      }
+      setTimeout(() => { if (statusEl) statusEl.textContent = ''; render(); }, 2000);
+    } catch(e) {
+      if (statusEl) { statusEl.textContent = '✕ Save failed: ' + e.message; statusEl.style.color = 'var(--err)'; }
+    }
+  });
+  $('license-key-clear-btn')?.addEventListener('click', async () => {
+    if (!confirm('Clear the license key? All users will have unrestricted access.')) return;
+    try {
+      await db.collection('settings').doc('company').set({ licenseKey: '' }, { merge: true });
+      S.licenseKey = ''; S.licenseExpiry = null; S.licenseStatus = '';
+      render();
+    } catch(e) { alert('Clear failed: ' + e.message); }
   });
 
   // ── Company Name save ─────────────────────────────────────────────
