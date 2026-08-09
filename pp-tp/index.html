@@ -1328,43 +1328,104 @@ async function _getLicDb() {
    and stored in Firestore dev_panel_config/superadmin.activeKey.
    Users and admins NEVER enter a key. The app fetches it silently.
    ══════════════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════════
+   ACTIVE KEY LOCATION:
+   developer_licenses/_active_key  →  { key: "TP-XXXX-XXXX-XXXX" }
+   — Same collection as licenses (already allows public read in rules)
+   — SuperAdmin publishes from Licensing Panel or Settings
+   — App reads it silently on every boot — no user input ever needed
+   ══════════════════════════════════════════════════════════════════ */
+const _LIC_ACTIVE_DOC = '_active_key'; // special doc inside developer_licenses
+
 async function checkLicense() {
-  // Step 1: Try to fetch the active key from Firestore (set by SuperAdmin)
+  console.log('[License] Starting auto license check…');
+  const licDb = await _getLicDb();
+
+  // ── Step 1: Read activeKey from developer_licenses/_active_key ───────────
+  // This doc lives in the same collection as all license keys, so the
+  // same Firestore rule that allows public read of licenses covers it.
   let activeKey = '';
-  try {
-    const licDb = await _getLicDb();
-    if (licDb) {
-      const cfgDoc = await licDb.collection('dev_panel_config').doc('superadmin').get();
-      if (cfgDoc.exists) {
-        activeKey = cfgDoc.data().activeKey || '';
+  if (licDb) {
+    try {
+      const activeDoc = await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC).get();
+      if (activeDoc.exists) {
+        activeKey = activeDoc.data().key || '';
+        console.log('[License] activeKey from _active_key doc:', activeKey || '(empty)');
       }
+    } catch(e) {
+      console.warn('[License] Could not read _active_key:', e.message);
     }
-  } catch(e) {
-    console.warn('[License] Could not fetch activeKey from Firestore:', e.message);
   }
 
-  // Step 2: Fall back to locally cached key if Firestore unreachable
+  // ── Step 2: REST fallback (if SDK blocked by rules) ───────────────────────
+  if (!activeKey) {
+    try {
+      const url = 'https://firestore.googleapis.com/v1/projects/' + _LIC_FB_CONFIG.projectId
+                + '/databases/(default)/documents/' + _LIC_COLL + '/' + _LIC_ACTIVE_DOC;
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const j = await resp.json();
+        activeKey = j.fields?.key?.stringValue || '';
+        console.log('[License] activeKey from REST:', activeKey || '(empty)');
+      }
+    } catch(e) {
+      console.warn('[License] REST _active_key read failed:', e.message);
+    }
+  }
+
+  // ── Step 3: Scan entire collection for any valid key (last resort) ────────
+  // Handles case where SuperAdmin has created a key but not published activeKey yet.
+  if (!activeKey && licDb) {
+    try {
+      console.log('[License] Scanning developer_licenses for any valid key…');
+      const snap = await licDb.collection(_LIC_COLL).get();
+      const now = new Date();
+      for (const doc of snap.docs) {
+        if (doc.id.startsWith('_')) continue; // skip meta docs
+        const d = doc.data();
+        if (!d.isActive) continue;
+        if (d.expiryDate) {
+          const exp = d.expiryDate.toDate ? d.expiryDate.toDate() : new Date(d.expiryDate);
+          if (now > exp) continue;
+        }
+        activeKey = doc.id;
+        console.log('[License] Found valid key:', activeKey, '— publishing as _active_key');
+        // Auto-publish so next boot is instant
+        try {
+          await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC)
+            .set({ key: activeKey, updatedAt: new Date().toISOString() }, { merge: true });
+        } catch(_) {}
+        break;
+      }
+    } catch(e) {
+      console.warn('[License] Collection scan failed:', e.message);
+    }
+  }
+
+  // ── Step 4: localStorage cache (offline resilience) ───────────────────────
   if (!activeKey) {
     activeKey = localStorage.getItem(_LIC_STORE) || '';
+    if (activeKey) console.log('[License] Using cached key:', activeKey);
   }
 
   if (!activeKey) {
-    // No key configured at all — show lock screen
+    console.warn('[License] No license key found.');
     _licShowLockScreen('No License Configured', 'Contact your developer to set up a license key.');
     return;
   }
 
-  // Step 3: Validate the key
+  // ── Step 5: Validate ───────────────────────────────────────────────────────
+  console.log('[License] Validating key:', activeKey);
   const ok = await _licValidate(activeKey, true);
   if (ok) {
-    localStorage.setItem(_LIC_STORE, activeKey); // cache for offline resilience
+    localStorage.setItem(_LIC_STORE, activeKey);
+    console.log('[License] ✅ Valid — launching app');
     _licLaunch();
   } else {
-    // Expired or revoked
     localStorage.removeItem(_LIC_STORE);
     localStorage.removeItem(_LIC_EXPIRY);
-    const expStr = localStorage.getItem(_LIC_EXPIRY);
-    _licShowLockScreen('License Expired', 'Your Task Planner license has expired or been revoked.', expStr);
+    console.warn('[License] ❌ Invalid/expired:', activeKey);
+    _licShowLockScreen('License Expired', 'Your Task Planner license has expired or been revoked.');
   }
 }
 
@@ -1383,8 +1444,8 @@ async function licSettingsLoad() {
   try {
     const licDb = await _getLicDb();
     if (licDb) {
-      const cfgDoc = await licDb.collection('dev_panel_config').doc('superadmin').get();
-      if (cfgDoc.exists) activeKey = cfgDoc.data().activeKey || '';
+      const activeDoc = await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC).get();
+      if (activeDoc.exists) activeKey = activeDoc.data().key || '';
     }
   } catch(e) {
     console.warn('[LicSettings] Could not fetch activeKey:', e.message);
@@ -1454,10 +1515,9 @@ async function licSettingsPublish() {
   try {
     const licDb = await _getLicDb();
     if (licDb) {
-      await licDb.collection('dev_panel_config').doc('superadmin').set(
-        { activeKey: key, activeKeyUpdated: new Date().toISOString() },
-        { merge: true }
-      );
+      // Store in developer_licenses/_active_key (same collection → same public-read rule)
+      await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC)
+        .set({ key, updatedAt: new Date().toISOString() }, { merge: true });
     }
     localStorage.setItem(_LIC_STORE, key);
     if (statusEl) { statusEl.textContent = '✓ Published! All users will use this key automatically.'; statusEl.style.color = 'var(--green)'; }
@@ -1473,10 +1533,8 @@ async function licSettingsClear() {
   try {
     const licDb = await _getLicDb();
     if (licDb) {
-      await licDb.collection('dev_panel_config').doc('superadmin').set(
-        { activeKey: '', activeKeyUpdated: new Date().toISOString() },
-        { merge: true }
-      );
+      await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC)
+        .set({ key: '', updatedAt: new Date().toISOString() }, { merge: true });
     }
     localStorage.removeItem(_LIC_STORE);
     localStorage.removeItem(_LIC_EXPIRY);
