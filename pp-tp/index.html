@@ -2069,18 +2069,21 @@ function saveTasks() {
 }
 function getTask(id) { return tasks.find(t=>t.id===id); }
 
-// A plant admin may only delete tasks that THEY created (self-assigned, or
-// assigned to a team member from within their own plant portal — identified
-// by t.plant === currentPlantSession.id). Tasks assigned to a plant admin
-// BY the superadmin (no matching plant tag) cannot be deleted by that plant admin.
-// Superadmin (not logged in as a plant owner) can always delete.
-// An assignee logged into their own account (mode==='user') can only delete
-// tasks they personally added for themselves (t.assignedBy is unset) — they
-// can NEVER delete a task that was assigned to them by an admin/plant owner.
-// A "restricted assignee" is either the legacy email-only My-Tasks login
-// (mode==='user') or a real registered account with role 'user'
-// (currentSession-based). Both are ordinary team members who should only
-// ever be able to delete tasks they personally added for themselves.
+// canDeleteTask — permission rules by role:
+//
+// • Superadmin (no plant session, no restricted-assignee mode): can delete anything.
+//
+// • Plant owner (plantOwnerAuthenticated + currentPlantSession):
+//   CAN delete  — task belongs to their plant AND was assigned BY them
+//                 (t.assignedBy is in the plant owners list).
+//   CANNOT delete — task was assigned to them BY the superadmin
+//                   (t.assignedBy is missing, 'superadmin', or any email not in owners).
+//   "Belongs to this plant" means: assignee is one of the plant owners, OR
+//   t.plant === currentPlantSession.id (covers legacy/bulk-uploaded rows).
+//
+// • Restricted assignee (mode==='user' or currentSession.role==='user'):
+//   CAN delete  — only tasks where t.assignedBy === their own email (self-added).
+//   CANNOT delete — tasks assigned to them by anyone else.
 function _isRestrictedAssignee(){
   return mode==='user' || (currentSession && currentSession.role==='user');
 }
@@ -2091,18 +2094,20 @@ function _restrictedAssigneeEmail(){
 function canDeleteTask(t){
   if(!t) return false;
   if(plantOwnerAuthenticated && currentPlantSession){
-    // Must match the SAME scoping rule used everywhere else to decide which
-    // tasks "belong" to this plant (renderPlantPanel, getScopedTasks, etc):
-    // owners.includes(assignee) OR t.plant === this plant's id. Checking only
-    // t.plant here (the old logic) wrongly blocked deletion of legitimate
-    // tasks — e.g. tasks the owner assigned to themself before the `plant`
-    // tag existed, or bulk-uploaded rows — that were never tagged with
-    // t.plant but are still unmistakably this plant owner's own tasks.
+    // A plant owner may only delete tasks that THEY created/assigned.
+    // "Belongs to this plant" (assignee is an owner OR t.plant matches) is
+    // necessary but NOT sufficient — the task must also have been assigned BY
+    // this plant owner (t.assignedBy in owners list).
+    // Tasks where assignedBy is the superadmin (or missing / set to a
+    // different account) cannot be deleted by the plant owner, even if the
+    // plant owner is the assignee.
     const owners = (currentPlantSession.owners||[]).map(o=>o.toLowerCase());
-    return !!(
+    const taskBelongsToPlant = (
       owners.includes((t.assignee||'').toLowerCase()) ||
       (t.plant && t.plant === currentPlantSession.id)
     );
+    const taskCreatedByOwner = !!(t.assignedBy && owners.includes(t.assignedBy.toLowerCase()));
+    return !!(taskBelongsToPlant && taskCreatedByOwner);
   }
   if(_isRestrictedAssignee()){
     // Deny by default — only allow when the task was provably self-added
