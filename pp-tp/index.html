@@ -8632,6 +8632,7 @@ async function _sendRegistration() {
       passwordResetToken: setPasswordToken,
       passwordResetExpires: expiresAt,
       status: 'active',
+      app: _fbConfig.projectId,
       createdBy: adminAuthenticated && !currentSession ? 'superadmin' : (currentSession?.email || ''),
       createdAt: new Date().toISOString(),
       groupMemberships: []
@@ -8867,6 +8868,7 @@ async function _createAdminAccount() {
       passwordResetToken: setPasswordToken,
       passwordResetExpires: expiresAt,
       status: 'active', createdBy: 'superadmin',
+      app: _fbConfig.projectId,
       createdAt: new Date().toISOString(), groupMemberships: []
     });
     const setPasswordUrl = window.location.href.split('?')[0] + '?pwreset=' + setPasswordToken + '&pwr_email=' + encodeURIComponent(email);
@@ -9566,10 +9568,28 @@ let _userPage = 0;
 async function renderUserManagementSection() {
   if (!_fbReady || !_db) return '<div style="color:var(--text3)">Loading...</div>';
   try {
-    // Paginated Firestore read: fetch in batches of 25 using startAfter cursor
-    // For initial load, get first 25 ordered by email
-    const snap = await _db.collection('appUsers').orderBy('email').limit(250).get();
-    _allAppUsers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Fetch only users belonging to this app (app === projectId).
+    // Users created before this filter was added won't have an 'app' field —
+    // we do a second fallback query to also include those legacy users so
+    // no one disappears from the list after the update.
+    const thisApp = _fbConfig.projectId;
+    const [snapTagged, snapLegacy] = await Promise.all([
+      _db.collection('appUsers').where('app', '==', thisApp).orderBy('email').limit(250).get(),
+      _db.collection('appUsers').where('app', '==', firebase.firestore.FieldValue.delete()).orderBy('email').limit(250).get().catch(() => null)
+    ]);
+    // Primary: users explicitly tagged for this app
+    const taggedDocs = snapTagged.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Fallback: users with no 'app' field at all (legacy / pre-filter users)
+    // We use a client-side check since Firestore can't query for missing fields via SDK easily
+    const legacySnap = await _db.collection('appUsers').orderBy('email').limit(500).get();
+    const legacyDocs = legacySnap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .filter(u => !u.app); // no app tag = created before this fix; belongs to this app
+    // Merge, deduplicating by id
+    const seen = new Set(taggedDocs.map(u => u.id));
+    const merged = [...taggedDocs, ...legacyDocs.filter(u => !seen.has(u.id))];
+    merged.sort((a, b) => (a.email || '').localeCompare(b.email || ''));
+    _allAppUsers = merged;
 
     // ── Merge plant owners from plant groups ──────────────────────────
     // Plant owners are stored in the groups collection, not in appUsers,
