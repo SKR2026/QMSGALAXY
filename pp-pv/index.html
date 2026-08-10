@@ -3886,8 +3886,10 @@ function logMail(record, isUpdate) {
   const appUrl  = _settingsData?.app?.appUrl || (window.location.origin + window.location.pathname);
   const directLink = `${appUrl}?visit=${record.id}&guest=1`;
   const company   = _settingsData?.app?.companyName || 'PlantVisit';
-  const notifTitle = _settingsData?.app?.notificationTitle || 'Customer Visit';
-  const subject = `[${isUpdate?'UPDATED':'NEW'}] ${notifTitle} — ${record.company} @ ${record.plant} on ${fmtDateRange(record.visitDate, record.visitDateEnd)}`;
+  const _gm2      = _settingsData.gmail || {};
+  const notifTitle = (_gm2.notifTitle || _settingsData?.app?.notificationTitle || 'Customer Visit').trim();
+  const _prefixTag = (_gm2.prefixTag !== undefined ? _gm2.prefixTag : (_settingsData.notification?.subjectPrefix || '')).trim();
+  const subject = (_prefixTag ? _prefixTag + ' ' : '') + `[${isUpdate?'UPDATED':'NEW'}] ${notifTitle} — ${record.company} @ ${record.plant} on ${fmtDateRange(record.visitDate, record.visitDateEnd)}`;
   const gm      = _settingsData.gmail || {};
   const toAddr  = gm.toEmail || _settingsData.notification?.managementEmail || 'management@company.com';
 
@@ -4254,8 +4256,25 @@ function renderAzureSettings(el) {
         <div class="settings-row-right"><input type="email" class="settings-input" id="gm_to_email" placeholder="management@yourdomain.com" value="${xe(gm.toEmail||'')}"></div>
       </div>
       <div class="settings-row">
-        <div><div class="settings-row-label">Sender Display Name</div><div class="settings-row-sub">Name shown in the From field of notification emails</div></div>
-        <div class="settings-row-right"><input type="text" class="settings-input" id="gm_sender_name" placeholder="PlantVisit Notifications" value="${xe(gm.senderName||'')}"></div>
+        <div><div class="settings-row-label">Sender Display Name (From)</div><div class="settings-row-sub">Name shown in the <em>From</em> field — e.g. "POLYPLASTICS Visits" or "Customer Visit Alerts"</div></div>
+        <div class="settings-row-right"><input type="text" class="settings-input" id="gm_sender_name" placeholder="PlantVisit Notifications" value="${xe(gm.senderName||'')}" oninput="_previewEmailSubject()"></div>
+      </div>
+    </div>
+    <div class="settings-section">
+      <div class="settings-section-title">Email Subject Format</div>
+      <div class="settings-row">
+        <div><div class="settings-row-label">Email Title Starts With</div><div class="settings-row-sub">First word/label in every email subject — shown as the bold sender name in Outlook/Gmail inbox. E.g. "Customer Visit" or "POLYPLASTICS"</div></div>
+        <div class="settings-row-right"><input type="text" class="settings-input" id="gm_notif_title" placeholder="Customer Visit" value="${xe(gm.notifTitle||(_settingsData?.app?.notificationTitle||''))}" oninput="_previewEmailSubject()"></div>
+      </div>
+      <div class="settings-row">
+        <div><div class="settings-row-label">Subject Prefix Tag</div><div class="settings-row-sub">Optional tag in square brackets appended after the title — leave blank to omit. E.g. "[PlantVisit]" or "[Alerts]"</div></div>
+        <div class="settings-row-right"><input type="text" class="settings-input" id="gm_prefix_tag" placeholder="[PlantVisit]" value="${xe(gm.prefixTag!==undefined?gm.prefixTag:(_settingsData?.notification?.subjectPrefix||'[PlantVisit]'))}" oninput="_previewEmailSubject()"></div>
+      </div>
+      <div class="settings-row" style="align-items:flex-start">
+        <div><div class="settings-row-label">Live Preview</div><div class="settings-row-sub">How your subject line will look in the inbox</div></div>
+        <div class="settings-row-right" style="max-width:260px">
+          <div id="gm_subject_preview" style="font-size:11px;color:var(--white2);background:var(--navy3);border:1px solid var(--border2);border-radius:6px;padding:7px 10px;line-height:1.5;word-break:break-all"></div>
+        </div>
       </div>
     </div>
     <div id="az_test_status" style="display:none;margin-bottom:12px"></div>
@@ -4264,15 +4283,53 @@ function renderAzureSettings(el) {
       <button class="btn btn-gold" onclick="saveAzureSettings()">✓ Save Gmail Config</button>
     </div>
   </div>`;
+  setTimeout(_previewEmailSubject, 0);
 }
 function saveAzureSettings() {
   _settingsData.gmail = {
     backendUrl:  document.getElementById('gm_backend_url').value.trim().replace(/\/$/, ''),
     toEmail:     document.getElementById('gm_to_email').value.trim(),
     senderName:  document.getElementById('gm_sender_name').value.trim(),
+    notifTitle:  document.getElementById('gm_notif_title').value.trim(),
+    prefixTag:   document.getElementById('gm_prefix_tag').value.trim(),
   };
+  // Keep legacy fields in sync so old code paths still work
+  if (!_settingsData.app) _settingsData.app = {};
+  _settingsData.app.notificationTitle = _settingsData.gmail.notifTitle || 'Customer Visit';
+  if (!_settingsData.notification) _settingsData.notification = {};
+  _settingsData.notification.subjectPrefix = _settingsData.gmail.prefixTag || '';
   saveSettings();
-  toast('✓ Gmail Config Saved', 'Gmail backend configuration updated successfully.');
+  toast('\u2713 Gmail Config Saved', 'Gmail backend configuration updated successfully.');
+  // Re-push all email settings to Cloud Scheduler so cloud-triggered digest
+  // immediately uses the new notifTitle, prefixTag and senderName.
+  const _bUrl = (_settingsData.gmail || {}).backendUrl;
+  if (_bUrl) {
+    const _dd = _settingsData.dailyDigest || {};
+    const _gm = _settingsData.gmail || {};
+    fetch(`${_bUrl}/api/update-schedule`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sendTime:   _dd.sendTime   || '18:00',
+        notifTitle: (_gm.notifTitle  || 'Customer Visit').trim(),
+        prefixTag:  (_gm.prefixTag   !== undefined ? _gm.prefixTag : '').trim(),
+        senderName: (_gm.senderName  || 'PlantVisit Digest').trim(),
+        recipients: (_dd.recipients  || '').trim(),
+      }),
+    }).catch(() => {}); // silent - user already got the save toast
+  }
+}
+
+function _previewEmailSubject() {
+  const title  = (document.getElementById('gm_notif_title')?.value || 'Customer Visit').trim();
+  const tag    = (document.getElementById('gm_prefix_tag')?.value || '').trim();
+  const sender = (document.getElementById('gm_sender_name')?.value || '').trim();
+  const el     = document.getElementById('gm_subject_preview');
+  if (!el) return;
+  const tagPart = tag ? tag + ' ' : '';
+  el.innerHTML =
+    '<span style="color:var(--slate2);font-size:10px">From: </span><strong>' + (sender||'PlantVisit Notifications') + '</strong><br>' +
+    '<span style="color:var(--slate2);font-size:10px">Subject: </span>' + tagPart + title + ' | Daily Digest — 3 completed · 1 today · 2 upcoming | 10 Aug 2026';
 }
 
 async function testGraphConnection() {
@@ -4298,7 +4355,9 @@ async function testGraphConnection() {
     ...(_settingsData.gmail || {}),
     backendUrl,
     toEmail,
-    senderName: document.getElementById('gm_sender_name')?.value.trim() || _settingsData.gmail?.senderName || '',
+    senderName:  document.getElementById('gm_sender_name')?.value.trim()  || _settingsData.gmail?.senderName  || '',
+    notifTitle:  document.getElementById('gm_notif_title')?.value.trim()   || _settingsData.gmail?.notifTitle   || 'Customer Visit',
+    prefixTag:   document.getElementById('gm_prefix_tag')?.value.trim()    || _settingsData.gmail?.prefixTag    || '',
   };
   saveSettings();
 
@@ -4482,7 +4541,13 @@ function saveNotificationSettings() {
   fetch(`${backendUrl}/api/update-schedule`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ sendTime }),
+    body:    JSON.stringify({
+      sendTime,
+      notifTitle:  ((_settingsData.gmail||{}).notifTitle  || (_settingsData?.app?.notificationTitle||'Customer Visit')).trim(),
+      prefixTag:   ((_settingsData.gmail||{}).prefixTag  !== undefined ? (_settingsData.gmail||{}).prefixTag : ((_settingsData.notification||{}).subjectPrefix||'')).trim(),
+      senderName:  ((_settingsData.gmail||{}).senderName || 'PlantVisit Digest').trim(),
+      recipients:  ((_settingsData.dailyDigest||{}).recipients||'').trim(),
+    }),
   })
   .then(r => r.json())
   .then(data => {
@@ -5080,10 +5145,11 @@ async function sendDailyDigestEmail(force = false) {
     return (critOrder[a.criticality] ?? 4) - (critOrder[b.criticality] ?? 4);
   });
 
-  const prefix     = _settingsData.notification?.subjectPrefix || '[PlantVisit]';
-  const notifLabel = _settingsData?.app?.notificationTitle || 'Customer Visit';
+  const gm2        = _settingsData.gmail || {};
+  const notifLabel = (gm2.notifTitle || _settingsData?.app?.notificationTitle || 'Customer Visit').trim();
+  const prefixTag  = (gm2.prefixTag  !== undefined ? gm2.prefixTag : (_settingsData.notification?.subjectPrefix || '')).trim();
   const dateStr    = new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' });
-  const subject    = `${prefix} ${notifLabel} | Daily Digest — ${relevant.length} completed · ${todayOngoing.length} today · ${upcoming48.length} upcoming | ${dateStr}`;
+  const subject    = (prefixTag ? prefixTag + ' ' : '') + notifLabel + ` | Daily Digest — ${relevant.length} completed · ${todayOngoing.length} today · ${upcoming48.length} upcoming | ${dateStr}`;
 
   // Determine recipients
   const digestRecipients = (dd.recipients || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -5207,10 +5273,6 @@ function renderAppSettings(el) {
       <div class="settings-row">
         <div><div class="settings-row-label">Company Name</div><div class="settings-row-sub">Shown in emails and reports</div></div>
         <div class="settings-row-right"><input type="text" class="settings-input" id="app_company" placeholder="Company Ltd" value="${xe(app.companyName||'')}"></div>
-      </div>
-      <div class="settings-row">
-        <div><div class="settings-row-label">Notification Display Name</div><div class="settings-row-sub">Title shown to users in email subjects &amp; notification bell — e.g. "Customer Visit" or your company name</div></div>
-        <div class="settings-row-right"><input type="text" class="settings-input" id="app_notif_title" placeholder="Customer Visit" value="${xe(app.notificationTitle||'')}"></div>
       </div>
       <div class="settings-row">
         <div><div class="settings-row-label">App URL</div><div class="settings-row-sub">Base URL used to generate direct-access links in notification emails</div></div>
