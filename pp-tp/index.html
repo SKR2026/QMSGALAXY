@@ -1775,12 +1775,17 @@ function startFirestoreListeners() {
       if(s.ejsKey)           localStorage.setItem('ejs_public_key',s.ejsKey);
     }
   }).catch(()=>{});
-  _db.collection('settings').doc('plantGroups').get().then(d=>{
-    if(d.exists&&d.data().plants){
-      localStorage.setItem('pg_plants',JSON.stringify(d.data().plants));
-      renderPlantNav();
-    }
-  }).catch(()=>{});
+  // Realtime listener for plant groups — any Super Admin change reflects instantly
+  if (!window._plantGroupsUnsubscribe) {
+    window._plantGroupsUnsubscribe = _db.collection('settings').doc('plantGroups')
+      .onSnapshot(d => {
+        if (d.exists && d.data().plants) {
+          localStorage.setItem('pg_plants', JSON.stringify(d.data().plants));
+          renderPlantNav();
+          renderDashPlants();
+        }
+      }, err => console.warn('[plantGroups listener]', err.message));
+  }
   // Load departments from Firestore
   _db.collection('settings').doc('departments').get().then(d=>{
     if(d.exists&&Array.isArray(d.data().list)){
@@ -1803,6 +1808,24 @@ function startFirestoreListeners() {
       if(d.exists){ localStorage.setItem('email_tpl_'+key, JSON.stringify(d.data())); }
     }).catch(()=>{});
   });
+  // ── Realtime appUsers listener — reflects status/role/delete changes instantly ──
+  // This means: if Super Admin removes, disables, or restores a user in the app,
+  // Firestore updates are written AND _allAppUsers is refreshed immediately.
+  // Any open user-management panel re-renders automatically.
+  if (!window._appUsersUnsubscribe) {
+    window._appUsersUnsubscribe = _db.collection('appUsers').orderBy('email').limit(250)
+      .onSnapshot(snap => {
+        _allAppUsers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        // Also update nickname cache
+        _allAppUsers.forEach(u => { if(u.email && u.nickname) _nickCache[u.email.toLowerCase()] = u.nickname; });
+        // Re-render user list if the panel is currently visible
+        const container = document.getElementById('user-management-container');
+        if (container) _renderUserPage();
+      }, err => {
+        console.warn('[appUsers listener] error:', err.message);
+      });
+  }
+
   // Subscribe to real-time task updates
   _unsubscribeTasks = _db.collection('tasks').onSnapshot(snap => {
     // Mark connected
@@ -7467,10 +7490,12 @@ async function unifiedLogin() {
     }
 
     // ── Plant owner check ─────────────────────────────────────────────
-    // If this appUser email is also listed as a plant owner in plantGroups,
-    // activate plant owner session instead of the regular admin/user dashboard.
-    const _poGroupsUnified = getPlantGroups();
-    const _poMatchedUnified = _poGroupsUnified.find(p =>
+    // IMPORTANT: Use the _plantGroups already fetched from Firestore earlier
+    // in this login flow (step 2), NOT getPlantGroups() which reads from
+    // localStorage and may be stale/empty on first load. This is the root
+    // cause of Aakash's login failure: localStorage hadn't synced yet, so
+    // getPlantGroups() returned [] and he was treated as a regular user.
+    const _poMatchedUnified = _plantGroups.find(p =>
       (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
     );
     if (_poMatchedUnified) {
@@ -9636,12 +9661,12 @@ let _userPage = 0;
 async function renderUserManagementSection() {
   if (!_fbReady || !_db) return '<div style="color:var(--text3)">Loading...</div>';
   try {
-    // Paginated Firestore read: fetch in batches of 25 using startAfter cursor
-    // For initial load, get first 25 ordered by email
+    // Always fetch fresh from Firestore — the realtime listener keeps _allAppUsers
+    // up to date after this point, so subsequent renders use the live cache.
     const snap = await _db.collection('appUsers').orderBy('email').limit(250).get();
     _allAppUsers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     _userPage = 0;
-    if (!_allAppUsers.length) return '<div style="color:var(--text3);font-size:13px">No accounts yet. Send a registration link to create users.</div>';
+    if (!_allAppUsers.length) return '<div id="user-management-container" style="color:var(--text3);font-size:13px">No accounts yet. Send a registration link to create users.</div>';
     _renderUserPage();
     return ''; // _renderUserPage populates the container directly
   } catch(e) { return '<div style="color:var(--red)">Error: ' + e.message + '</div>'; }
@@ -9674,6 +9699,9 @@ function _renderUserPage() {
   const label = document.getElementById('user-count-label');
   if (label) label.textContent = total + ' account' + (total !== 1 ? 's' : '') + (total < _allAppUsers.length ? ' (filtered from ' + _allAppUsers.length + ')' : '');
 
+  // Tag the nearest ancestor so the realtime snapshot knows user panel is open
+  const _umc = document.getElementById('user-mgmt-list');
+  if (_umc && _umc.parentElement) _umc.parentElement.id = 'user-management-container';
   const list = document.getElementById('user-mgmt-list');
   if (list) {
     if (!pageUsers.length) {
@@ -9746,7 +9774,9 @@ async function _deleteAppUser(docId, displayName) {
   if (!confirm('Remove ' + displayName + ' (' + label + ')? They will be blocked from logging in and from receiving group requests until restored. Their record is kept so you can restore them later — use the 🗑 Delete option (after removing) if you want to erase them permanently instead.')) return;
   if (!docId) { toast('❌ Cannot remove: missing document ID.', 'var(--red)'); return; }
   try {
+    // Write to Firestore — onSnapshot listener will auto-refresh _allAppUsers & UI
     await _db.collection('appUsers').doc(docId).set({ status: 'removed', removedAt: new Date().toISOString() }, { merge: true });
+    // Also update in-memory immediately for instant UI response
     if (u) { u.status = 'removed'; u.removedAt = new Date().toISOString(); }
     _renderUserPage();
     toast('Account removed: ' + label + ' (restorable)', 'var(--amber)');
@@ -9758,7 +9788,9 @@ async function _restoreAppUser(docId) {
   const label = (u && u.email) ? u.email : ('doc: ' + docId);
   if (!confirm('Restore ' + label + '? They will be able to log in again and can receive group requests.')) return;
   try {
+    // Write to Firestore — onSnapshot listener auto-refreshes _allAppUsers & UI
     await _db.collection('appUsers').doc(docId).set({ status: 'active', removedAt: firebase.firestore.FieldValue.delete() }, { merge: true });
+    // Update in-memory immediately for instant UI response
     if (u) { u.status = 'active'; delete u.removedAt; }
     _renderUserPage();
     toast('✅ Account restored: ' + label, 'var(--green)');
@@ -9774,7 +9806,9 @@ async function _purgeAppUser(docId, displayName) {
   if (!confirm('Permanently delete ' + displayName + ' (' + label + ')? This cannot be undone and cannot be restored.')) return;
   if (!docId) { toast('❌ Cannot delete: missing document ID.', 'var(--red)'); return; }
   try {
+    // Hard delete from Firestore — onSnapshot listener auto-removes from _allAppUsers & re-renders
     await _db.collection('appUsers').doc(docId).delete();
+    // Also remove from in-memory immediately for instant UI response
     _allAppUsers = _allAppUsers.filter(u => u.id !== docId);
     _renderUserPage();
     toast('🗑 Account permanently deleted: ' + label, 'var(--red)');
@@ -9787,7 +9821,9 @@ async function _toggleAppUser(docId, currentStatus) {
   const newStatus = currentStatus === 'active' ? 'disabled' : 'active';
   if (!confirm((newStatus === 'disabled' ? 'Disable' : 'Enable') + ' account for ' + label + '?')) return;
   try {
+    // Write status change to Firestore directly — onSnapshot auto-refreshes UI
     await _db.collection('appUsers').doc(docId).set({ status: newStatus }, { merge: true });
+    // Update in-memory immediately for instant UI response
     if (u) u.status = newStatus;
     _renderUserPage();
     toast('Account ' + newStatus + ' for ' + label, newStatus === 'active' ? 'var(--green)' : 'var(--amber)');
@@ -9802,7 +9838,9 @@ async function _changeAppUserRole(docId, newRole) {
   const label = (u && u.email) ? u.email : ('doc: ' + docId);
   if (!confirm('Change role of ' + label + ' to "' + newRole + '"?')) { _renderUserPage(); return; }
   try {
+    // Write role change to Firestore directly — onSnapshot auto-refreshes UI
     await _db.collection('appUsers').doc(docId).set({ role: newRole }, { merge: true });
+    // Update in-memory immediately for instant UI response
     if (u) u.role = newRole;
     _renderUserPage();
     toast('Role updated to "' + newRole + '" for ' + label, 'var(--green)');
