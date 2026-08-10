@@ -5464,73 +5464,89 @@ function applySharedLogo(logoUrl) {
 
 function saveAppSettings() {
   const prev = _settingsData.app || {};
-  const hasNewLogo = !!prev.logoUrl && !prev.logoHttpUrl;
+
+  // Read fields safely — app_notif_title lives in Gmail tab, not here
+  const companyEl = document.getElementById('app_company');
+  const appUrlEl  = document.getElementById('app_url');
 
   _settingsData.app = {
     ...prev,
-    companyName:       document.getElementById('app_company').value.trim(),
-    notificationTitle: document.getElementById('app_notif_title').value.trim(),
-    appUrl:            document.getElementById('app_url').value.trim(),
+    companyName:       companyEl  ? companyEl.value.trim()  : (prev.companyName  || ''),
+    appUrl:            appUrlEl   ? appUrlEl.value.trim()   : (prev.appUrl       || ''),
+    // logoUrl / logoHttpUrl managed separately — preserve whatever is in memory
     logoUrl:           prev.logoUrl     || '',
     logoHttpUrl:       prev.logoHttpUrl || '',
+    // notificationTitle lives in Gmail settings tab — preserve it unchanged
+    notificationTitle: prev.notificationTitle || '',
   };
   saveSettings();
   applySharedLogo(_settingsData.app.logoUrl);
 
-  // Re-render first so the status div exists in the DOM
+  // ── Determine logo upload state ───────────────────────────────────────────
+  const hasLogo        = !!_settingsData.app.logoUrl;
+  const alreadySynced  = !!_settingsData.app.logoHttpUrl;
+  const backendUrl     = (_settingsData.gmail || {}).backendUrl;
+  const needsUpload    = hasLogo && !alreadySynced && !!backendUrl;
+
+  // Re-render so the panel reflects current state (Remove button etc.)
   const el = document.getElementById('settingsContent');
   if (el) renderAppSettings(el);
 
+  // Get statusEl AFTER re-render so it refers to the fresh DOM node
   const statusEl = document.getElementById('logoUploadStatus');
+  if (statusEl) statusEl.style.display = 'block';
 
-  // ── If a logo was loaded but not yet pushed to Storage, do it now ──
-  const backendUrl = (_settingsData.gmail || {}).backendUrl;
-  if (hasNewLogo && backendUrl && _settingsData.app.logoUrl) {
-    // Show uploading state
-    if (statusEl) {
-      statusEl.style.display = 'block';
-      statusEl.innerHTML = `<div class="alert alert-info" style="font-size:12px">⏳ Uploading logo to cloud storage for email…</div>`;
-    }
+  if (needsUpload) {
+    // ── Upload base64 → Firebase Storage → get HTTPS URL ──
+    if (statusEl) statusEl.innerHTML = `<div class="alert alert-info" style="font-size:12px">⏳ Uploading logo to cloud storage for email notifications…</div>`;
+
     fetch(`${backendUrl}/api/upload-logo`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ base64: _settingsData.app.logoUrl, mimeType: 'image/png' }),
+      body:    JSON.stringify({ base64: _settingsData.app.logoUrl, mimeType: 'image/png' }),
     })
     .then(r => r.json())
     .then(data => {
-      if (data.url) {
-        _settingsData.app.logoHttpUrl = data.url;
-        saveSettings();
-        if (statusEl) {
-          statusEl.style.display = 'block';
-          statusEl.innerHTML = `<div class="alert" style="font-size:12px;color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">
-            ✅ Logo saved &amp; uploaded to cloud — all email notifications will show the logo correctly.
-          </div>`;
-        }
-        toast('✓ App Config Saved', 'Settings saved · Logo uploaded to cloud storage successfully.');
-      } else {
-        throw new Error(data.error || 'Upload returned no URL');
+      if (!data.url) throw new Error(data.error || 'No URL returned');
+      _settingsData.app.logoHttpUrl = data.url;
+      saveSettings();
+      const s = document.getElementById('logoUploadStatus');
+      if (s) {
+        s.style.display = 'block';
+        s.innerHTML = `<div class="alert" style="font-size:12px;color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">
+          ✅ App config saved &amp; logo uploaded to cloud — all email notifications will now show the logo correctly.
+        </div>`;
       }
+      toast('✓ Saved', 'App config saved · Logo uploaded to cloud storage.');
     })
     .catch(err => {
       console.warn('[PlantVisit] Logo cloud upload failed:', err);
-      if (statusEl) {
-        statusEl.style.display = 'block';
-        statusEl.innerHTML = `<div class="alert alert-warn" style="font-size:12px">
-          ⚠ Settings saved but logo cloud upload failed — cloud emails will use embedded logo as fallback.<br>
-          <span style="color:var(--slate);font-size:11px">${err.message || ''}</span>
+      const s = document.getElementById('logoUploadStatus');
+      if (s) {
+        s.style.display = 'block';
+        s.innerHTML = `<div class="alert alert-warn" style="font-size:12px">
+          ⚠ App config saved but logo cloud upload failed — emails use CID fallback.<br>
+          <span style="color:var(--slate);font-size:11px">Error: ${err.message || 'unknown'}</span>
         </div>`;
       }
-      toast('✓ App Config Saved', 'Settings saved. Logo upload to cloud failed — check backend URL.');
+      toast('✓ Saved', 'App config saved. Logo cloud upload failed — check backend URL.', true);
     });
+
+  } else if (alreadySynced) {
+    if (statusEl) statusEl.innerHTML = `<div class="alert" style="font-size:12px;color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">
+      ✅ App config saved · Logo already synced to cloud storage.
+    </div>`;
+    toast('✓ App Config Saved', 'Application settings updated across all devices.');
+
+  } else if (hasLogo && !backendUrl) {
+    if (statusEl) statusEl.innerHTML = `<div class="alert alert-warn" style="font-size:12px">
+      ⚠ App config saved · Logo stored locally but <strong>Gmail backend URL not set</strong> — cloud upload skipped.
+      Set the backend URL in the Gmail tab then save again.
+    </div>`;
+    toast('✓ App Config Saved', 'Settings saved. Configure Gmail backend to enable cloud logo upload.');
+
   } else {
-    // No logo upload needed — just confirm save
-    if (statusEl && _settingsData.app.logoHttpUrl) {
-      statusEl.style.display = 'block';
-      statusEl.innerHTML = `<div class="alert" style="font-size:12px;color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">
-        ✅ Settings saved · Logo already synced to cloud.
-      </div>`;
-    }
+    if (statusEl) statusEl.style.display = 'none';
     toast('✓ App Config Saved', 'Application settings updated across all devices.');
   }
 }
