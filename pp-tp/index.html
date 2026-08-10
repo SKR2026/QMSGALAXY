@@ -1034,7 +1034,7 @@ function _ctEq(a, b) {
 
 /* ── Stable per-install signing key ────────────────────────────────── */
 const _SK = (()=>{
-  const K='tp_skrtask_sk_v1';
+  const K='tp_sk_v1';
   let k=localStorage.getItem(K);
   if(!k){
     const a=new Uint8Array(32); crypto.getRandomValues(a);
@@ -1062,7 +1062,7 @@ async function _secGet(key) {
 }
 
 /* ── Brute-force protection ─────────────────────────────────────────── */
-const _BF_STORE='tp_skrtask_bf_v1', _BF_MAX=5, _BF_TTL=900000;
+const _BF_STORE='tp_bf_v1', _BF_MAX=5, _BF_TTL=900000;
 async function _bfCheck(id){
   const s=await _secGet(_BF_STORE)||{};
   const r=s[id];
@@ -1174,7 +1174,7 @@ function _waitForFbReady(maxWaitMs) {
  * Call this whenever branding is loaded/changed.
  */
 function updateSidebarLogo() {
-  const storedUrl = localStorage.getItem('tp_skrtask_company_logo_url');
+  const storedUrl = localStorage.getItem('company_logo_url');
   const img      = document.getElementById('sidebar-logo-img');
   const logoWrap = document.getElementById('sidebar-logo-wrap');
   const textLogo = document.getElementById('sidebar-text-logo');
@@ -1190,7 +1190,7 @@ function updateSidebarLogo() {
 
     img.onerror = function() {
       console.warn('Sidebar logo URL failed to load — reverting to text logo');
-      localStorage.removeItem('tp_skrtask_company_logo_url');
+      localStorage.removeItem('company_logo_url');
       if (logoWrap) logoWrap.style.display = 'none';
       if (textLogo) textLogo.style.display  = '';
       this.onerror = null;
@@ -1218,7 +1218,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // On page load, immediately apply any logo already cached in localStorage
 (function() {
-  const storedUrl = localStorage.getItem('tp_skrtask_company_logo_url');
+  const storedUrl = localStorage.getItem('company_logo_url');
   if (storedUrl) {
     // DOM may not be ready yet — use DOMContentLoaded
     if (document.readyState === 'loading') {
@@ -1287,8 +1287,8 @@ function initFirebaseCore() {
 //  — SuperAdmin creates/manages keys via Developer_Licensing_Panel.html
 // ═══════════════════════════════════════════════════════════════════════
 const _LIC_COLL   = 'developer_licenses';
-const _LIC_STORE  = 'tp_skrtask_license_key';
-const _LIC_EXPIRY = 'tp_skrtask_license_expiry';
+const _LIC_STORE  = 'tp_license_key';
+const _LIC_EXPIRY = 'tp_license_expiry';
 
 // ── Separate Firebase app for license DB (skr-legal project) ──────────
 // The Developer Licensing Panel writes to skr-legal.
@@ -1328,225 +1328,43 @@ async function _getLicDb() {
    and stored in Firestore dev_panel_config/superadmin.activeKey.
    Users and admins NEVER enter a key. The app fetches it silently.
    ══════════════════════════════════════════════════════════════════ */
-/* ══════════════════════════════════════════════════════════════════
-   ACTIVE KEY LOCATION:
-   developer_licenses/_active_key  →  { key: "TP-XXXX-XXXX-XXXX" }
-   — Same collection as licenses (already allows public read in rules)
-   — SuperAdmin publishes from Licensing Panel or Settings
-   — App reads it silently on every boot — no user input ever needed
-   ══════════════════════════════════════════════════════════════════ */
-const _LIC_ACTIVE_DOC = '_active_key'; // special doc inside developer_licenses
-
 async function checkLicense() {
-  console.log('[License] Starting auto license check…');
-  const licDb = await _getLicDb();
-
-  // ── Step 1: Read activeKey from developer_licenses/_active_key ───────────
-  // This doc lives in the same collection as all license keys, so the
-  // same Firestore rule that allows public read of licenses covers it.
+  // Step 1: Try to fetch the active key from Firestore (set by SuperAdmin)
   let activeKey = '';
-  if (licDb) {
-    try {
-      const activeDoc = await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC).get();
-      if (activeDoc.exists) {
-        activeKey = activeDoc.data().key || '';
-        console.log('[License] activeKey from _active_key doc:', activeKey || '(empty)');
+  try {
+    const licDb = await _getLicDb();
+    if (licDb) {
+      const cfgDoc = await licDb.collection('dev_panel_config').doc('superadmin').get();
+      if (cfgDoc.exists) {
+        activeKey = cfgDoc.data().activeKey || '';
       }
-    } catch(e) {
-      console.warn('[License] Could not read _active_key:', e.message);
     }
+  } catch(e) {
+    console.warn('[License] Could not fetch activeKey from Firestore:', e.message);
   }
 
-  // ── Step 2: REST fallback (if SDK blocked by rules) ───────────────────────
-  if (!activeKey) {
-    try {
-      const url = 'https://firestore.googleapis.com/v1/projects/' + _LIC_FB_CONFIG.projectId
-                + '/databases/(default)/documents/' + _LIC_COLL + '/' + _LIC_ACTIVE_DOC;
-      const resp = await fetch(url);
-      if (resp.ok) {
-        const j = await resp.json();
-        activeKey = j.fields?.key?.stringValue || '';
-        console.log('[License] activeKey from REST:', activeKey || '(empty)');
-      }
-    } catch(e) {
-      console.warn('[License] REST _active_key read failed:', e.message);
-    }
-  }
-
-  // ── Step 3: Scan entire collection for any valid key (last resort) ────────
-  // Handles case where SuperAdmin has created a key but not published activeKey yet.
-  if (!activeKey && licDb) {
-    try {
-      console.log('[License] Scanning developer_licenses for any valid key…');
-      const snap = await licDb.collection(_LIC_COLL).get();
-      const now = new Date();
-      for (const doc of snap.docs) {
-        if (doc.id.startsWith('_')) continue; // skip meta docs
-        const d = doc.data();
-        if (!d.isActive) continue;
-        if (d.expiryDate) {
-          const exp = d.expiryDate.toDate ? d.expiryDate.toDate() : new Date(d.expiryDate);
-          if (now > exp) continue;
-        }
-        activeKey = doc.id;
-        console.log('[License] Found valid key:', activeKey, '— publishing as _active_key');
-        // Auto-publish so next boot is instant
-        try {
-          await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC)
-            .set({ key: activeKey, updatedAt: new Date().toISOString() }, { merge: true });
-        } catch(_) {}
-        break;
-      }
-    } catch(e) {
-      console.warn('[License] Collection scan failed:', e.message);
-    }
-  }
-
-  // ── Step 4: localStorage cache (offline resilience) ───────────────────────
+  // Step 2: Fall back to locally cached key if Firestore unreachable
   if (!activeKey) {
     activeKey = localStorage.getItem(_LIC_STORE) || '';
-    if (activeKey) console.log('[License] Using cached key:', activeKey);
   }
 
   if (!activeKey) {
-    console.warn('[License] No license key found — app open, badge will show unlicensed.');
-    // Don't block the app — superadmin needs to log in to publish a key.
-    // Badge will show "No License" state.
-    renderLicenseExpiryBadge();
+    // No key configured at all — show lock screen
+    _licShowLockScreen('No License Configured', 'Contact your developer to set up a license key.');
     return;
   }
 
-  // ── Step 5: Validate ───────────────────────────────────────────────────────
-  console.log('[License] Validating key:', activeKey);
+  // Step 3: Validate the key
   const ok = await _licValidate(activeKey, true);
   if (ok) {
-    localStorage.setItem(_LIC_STORE, activeKey);
-    console.log('[License] ✅ Valid — launching app');
+    localStorage.setItem(_LIC_STORE, activeKey); // cache for offline resilience
     _licLaunch();
   } else {
+    // Expired or revoked
     localStorage.removeItem(_LIC_STORE);
     localStorage.removeItem(_LIC_EXPIRY);
-    console.warn('[License] ❌ Invalid/expired:', activeKey);
-    // Don't block at boot — superadmin must be able to log in.
-    // Non-superadmin roles are blocked after login via showPanel() guard below.
-    renderLicenseExpiryBadge();
-    window._licenseExpired = true; // flag checked after non-SA login
-  }
-}
-
-/* ══════════════════════════════════════════════════════════════════
-   LICENSE SETTINGS PANEL — SuperAdmin Settings → License Key card
-   Reads & writes dev_panel_config/superadmin.activeKey in skr-legal
-   ══════════════════════════════════════════════════════════════════ */
-async function licSettingsLoad() {
-  const keyEl    = document.getElementById('lic-settings-current-key');
-  const expEl    = document.getElementById('lic-settings-expiry');
-  const badgeEl  = document.getElementById('lic-settings-status-badge');
-  const inpEl    = document.getElementById('lic-settings-key-inp');
-
-  // Fetch current active key from Firestore
-  let activeKey = '';
-  try {
-    const licDb = await _getLicDb();
-    if (licDb) {
-      const activeDoc = await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC).get();
-      if (activeDoc.exists) activeKey = activeDoc.data().key || '';
-    }
-  } catch(e) {
-    console.warn('[LicSettings] Could not fetch activeKey:', e.message);
-  }
-  if (!activeKey) activeKey = localStorage.getItem(_LIC_STORE) || '';
-
-  if (keyEl) keyEl.textContent = activeKey || '— Not configured —';
-  if (inpEl && activeKey) inpEl.value = activeKey;
-
-  // Show expiry
-  const expStr = localStorage.getItem(_LIC_EXPIRY);
-  if (expEl) {
-    if (expStr) {
-      const d = new Date(expStr);
-      const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-      const days = Math.ceil((d - new Date()) / 86400000);
-      expEl.textContent = d.getDate() + ' ' + M[d.getMonth()] + ' ' + d.getFullYear()
-        + (days < 0 ? ' (expired)' : ' (' + days + ' days left)');
-      expEl.style.color = days < 0 ? 'var(--red)' : days <= 30 ? 'var(--amber)' : 'var(--text)';
-    } else {
-      expEl.textContent = activeKey ? 'No expiry (perpetual)' : '—';
-    }
-  }
-
-  // Badge
-  if (badgeEl) {
-    if (!activeKey) {
-      badgeEl.textContent = '⚪ No Key Set';
-      badgeEl.style.background = 'rgba(92,102,128,.1)';
-      badgeEl.style.border = '1px solid rgba(92,102,128,.2)';
-      badgeEl.style.color = '#94a3b8';
-    } else {
-      const expiry = expStr ? new Date(expStr) : null;
-      const days = expiry ? Math.ceil((expiry - new Date()) / 86400000) : null;
-      if (days !== null && days < 0) {
-        badgeEl.textContent = '🔴 Expired';
-        badgeEl.style.background = 'rgba(248,113,113,.1)'; badgeEl.style.border = '1px solid rgba(248,113,113,.25)'; badgeEl.style.color = '#f87171';
-      } else if (days !== null && days <= 30) {
-        badgeEl.textContent = '⚠ Expiring Soon';
-        badgeEl.style.background = 'rgba(251,191,36,.1)'; badgeEl.style.border = '1px solid rgba(251,191,36,.25)'; badgeEl.style.color = '#fbbf24';
-      } else {
-        badgeEl.textContent = '✓ Active';
-        badgeEl.style.background = 'rgba(52,211,153,.12)'; badgeEl.style.border = '1px solid rgba(52,211,153,.25)'; badgeEl.style.color = '#34d399';
-      }
-    }
-  }
-}
-
-async function licSettingsPublish() {
-  const inpEl    = document.getElementById('lic-settings-key-inp');
-  const statusEl = document.getElementById('lic-settings-save-status');
-  const key = inpEl ? inpEl.value.trim().toUpperCase() : '';
-
-  if (!key) { if (statusEl) { statusEl.textContent = '⚠ Please enter a license key.'; statusEl.style.color = 'var(--amber)'; } return; }
-  if (key.length < 6) { if (statusEl) { statusEl.textContent = '⚠ Key too short. Format: TP-XXXX-XXXX-XXXX'; statusEl.style.color = 'var(--amber)'; } return; }
-
-  if (statusEl) { statusEl.textContent = 'Validating…'; statusEl.style.color = 'var(--text3)'; }
-
-  // Validate the key first
-  const ok = await _licValidate(key, false);
-  if (!ok) {
-    if (statusEl) { statusEl.textContent = '✕ Invalid, expired, or revoked key. Check the Developer Licensing Panel.'; statusEl.style.color = 'var(--red)'; }
-    return;
-  }
-
-  // Publish to Firestore so all users auto-fetch it
-  try {
-    const licDb = await _getLicDb();
-    if (licDb) {
-      // Store in developer_licenses/_active_key (same collection → same public-read rule)
-      await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC)
-        .set({ key, updatedAt: new Date().toISOString() }, { merge: true });
-    }
-    localStorage.setItem(_LIC_STORE, key);
-    if (statusEl) { statusEl.textContent = '✓ Published! All users will use this key automatically.'; statusEl.style.color = 'var(--green)'; }
-    setTimeout(() => { licSettingsLoad(); renderLicenseExpiryBadge(); }, 500);
-  } catch(e) {
-    if (statusEl) { statusEl.textContent = '✕ Publish failed: ' + e.message; statusEl.style.color = 'var(--red)'; }
-  }
-}
-
-async function licSettingsClear() {
-  if (!confirm('Clear the active license key? All users will be locked out until a new key is published.')) return;
-  const statusEl = document.getElementById('lic-settings-save-status');
-  try {
-    const licDb = await _getLicDb();
-    if (licDb) {
-      await licDb.collection(_LIC_COLL).doc(_LIC_ACTIVE_DOC)
-        .set({ key: '', updatedAt: new Date().toISOString() }, { merge: true });
-    }
-    localStorage.removeItem(_LIC_STORE);
-    localStorage.removeItem(_LIC_EXPIRY);
-    if (statusEl) { statusEl.textContent = '✓ Key cleared.'; statusEl.style.color = 'var(--amber)'; }
-    licSettingsLoad();
-  } catch(e) {
-    if (statusEl) { statusEl.textContent = '✕ Failed: ' + e.message; statusEl.style.color = 'var(--red)'; }
+    const expStr = localStorage.getItem(_LIC_EXPIRY);
+    _licShowLockScreen('License Expired', 'Your Task Planner license has expired or been revoked.', expStr);
   }
 }
 
@@ -1731,11 +1549,21 @@ function licSubmit() { /* disabled — key managed by SuperAdmin via Licensing P
    key is present (or successfully entered just now); false otherwise.
    ══════════════════════════════════════════════════════════════════ */
 async function _requireSuperAdminLicense() {
-  // SuperAdmin ALWAYS gets through — they are the one who manages the license.
-  // Blocking them creates a deadlock where no one can publish a key to unlock the app.
-  // The expiry badge will still show in the topbar so they know renewal is needed.
-  try { renderLicenseExpiryBadge(); } catch(e) {}
-  return true;
+  // Key is fetched automatically — SuperAdmin does NOT enter it manually.
+  // Just validate whatever key is cached (set by checkLicense() on boot).
+  const saved = localStorage.getItem(_LIC_STORE);
+  if (saved) {
+    const ok = await _licValidate(saved, true);
+    if (ok) {
+      try { renderLicenseExpiryBadge(); } catch(e) {}
+      return true;
+    }
+    localStorage.removeItem(_LIC_STORE);
+    localStorage.removeItem(_LIC_EXPIRY);
+  }
+  // No valid key — show the lock screen (same as for all users)
+  _licShowLockScreen('License Expired', 'Your Task Planner license has expired. Contact your developer to renew.');
+  return false;
 }
 
 function startFirestoreListeners() {
@@ -1760,73 +1588,49 @@ function startFirestoreListeners() {
         _db.collection('settings').doc('admin').set({password:hashed},{merge:true}).catch(()=>{});
         pw=hashed;
       }
-      localStorage.setItem('tp_skrtask_admin_password',pw);
+      localStorage.setItem('admin_password',pw);
     }
   }).catch(()=>{});
   _db.collection('settings').doc('msgraph').get().then(d=>{
     if(d.exists){
       const s=d.data();
-      if(s.clientId)        localStorage.setItem('tp_skrtask_ms_client_id',s.clientId);
-      if(s.tenantId)        localStorage.setItem('tp_skrtask_ms_tenant_id',s.tenantId);
-      if(s.testEmail)        localStorage.setItem('tp_skrtask_ms_test_email',s.testEmail);
-      if(s.adminNotifyEmail) localStorage.setItem('tp_skrtask_admin_notify_email',s.adminNotifyEmail);
-      if(s.ejsService)       localStorage.setItem('tp_skrtask_ejs_service_id',s.ejsService);
-      if(s.ejsTemplate)      localStorage.setItem('tp_skrtask_ejs_template_id',s.ejsTemplate);
-      if(s.ejsKey)           localStorage.setItem('tp_skrtask_ejs_public_key',s.ejsKey);
+      if(s.clientId)        localStorage.setItem('ms_client_id',s.clientId);
+      if(s.tenantId)        localStorage.setItem('ms_tenant_id',s.tenantId);
+      if(s.testEmail)        localStorage.setItem('ms_test_email',s.testEmail);
+      if(s.adminNotifyEmail) localStorage.setItem('admin_notify_email',s.adminNotifyEmail);
+      if(s.ejsService)       localStorage.setItem('ejs_service_id',s.ejsService);
+      if(s.ejsTemplate)      localStorage.setItem('ejs_template_id',s.ejsTemplate);
+      if(s.ejsKey)           localStorage.setItem('ejs_public_key',s.ejsKey);
     }
   }).catch(()=>{});
-  // Realtime listener for plant groups — any Super Admin change reflects instantly
-  if (!window._plantGroupsUnsubscribe) {
-    window._plantGroupsUnsubscribe = _db.collection('settings').doc('plantGroups')
-      .onSnapshot(d => {
-        if (d.exists && d.data().plants) {
-          localStorage.setItem('tp_skrtask_pg_plants', JSON.stringify(d.data().plants));
-          renderPlantNav();
-          renderDashPlants();
-        }
-      }, err => console.warn('[plantGroups listener]', err.message));
-  // Note: renderPlantNav() and renderDashPlants() both have their own auth checks inside
-  }
+  _db.collection('settings').doc('plantGroups').get().then(d=>{
+    if(d.exists&&d.data().plants){
+      localStorage.setItem('pg_plants',JSON.stringify(d.data().plants));
+      renderPlantNav();
+    }
+  }).catch(()=>{});
   // Load departments from Firestore
   _db.collection('settings').doc('departments').get().then(d=>{
     if(d.exists&&Array.isArray(d.data().list)){
-      localStorage.setItem('tp_skrtask_tf_departments',JSON.stringify(d.data().list));
+      localStorage.setItem('tf_departments',JSON.stringify(d.data().list));
     }
   }).catch(()=>{});
   // Load company branding (logo/name) so it's shared across all devices/admins
   _db.collection('settings').doc('branding').get().then(d=>{
     if(d.exists){
       const b=d.data();
-      if(b.logoUrl) localStorage.setItem('tp_skrtask_company_logo_url', b.logoUrl);
-      else localStorage.removeItem('tp_skrtask_company_logo_url');
-      if(b.companyName) localStorage.setItem('tp_skrtask_company_name', b.companyName);
+      if(b.logoUrl) localStorage.setItem('company_logo_url', b.logoUrl);
+      else localStorage.removeItem('company_logo_url');
+      if(b.companyName) localStorage.setItem('company_name', b.companyName);
       updateSidebarLogo();
     }
   }).catch(()=>{});
   // Load custom email templates from Firestore
   ['assigned','status_change','completed','reminder','date_change','priority_change','updated'].forEach(key=>{
-    _db.collection('settings').doc('tp_skrtask_email_tpl_'+key).get().then(d=>{
-      if(d.exists){ localStorage.setItem('tp_skrtask_email_tpl_'+key, JSON.stringify(d.data())); }
+    _db.collection('settings').doc('email_tpl_'+key).get().then(d=>{
+      if(d.exists){ localStorage.setItem('email_tpl_'+key, JSON.stringify(d.data())); }
     }).catch(()=>{});
   });
-  // ── Realtime appUsers listener — reflects status/role/delete changes instantly ──
-  // This means: if Super Admin removes, disables, or restores a user in the app,
-  // Firestore updates are written AND _allAppUsers is refreshed immediately.
-  // Any open user-management panel re-renders automatically.
-  if (!window._appUsersUnsubscribe) {
-    window._appUsersUnsubscribe = _db.collection('appUsers').orderBy('email').limit(250)
-      .onSnapshot(snap => {
-        _allAppUsers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        // Also update nickname cache
-        _allAppUsers.forEach(u => { if(u.email && u.nickname) _nickCache[u.email.toLowerCase()] = u.nickname; });
-        // Re-render user list if the panel is currently visible
-        const container = document.getElementById('user-management-container');
-        if (container) _renderUserPage();
-      }, err => {
-        console.warn('[appUsers listener] error:', err.message);
-      });
-  }
-
   // Subscribe to real-time task updates
   _unsubscribeTasks = _db.collection('tasks').onSnapshot(snap => {
     // Mark connected
@@ -1997,11 +1801,6 @@ function startFirestoreListeners() {
       refreshOverdueBadge();
       renderPlantNav();
       if (window._pwResetHandled) return; // password-reset page — don't re-render panels
-      // CRITICAL: Only re-render panels if someone is actually authenticated.
-      // Without this guard, the tasks snapshot fires on every page load and
-      // overwrites the login screen with the dashboard — bypassing auth entirely.
-      const _isAuthenticated = adminAuthenticated || plantOwnerAuthenticated || (currentSession !== null) || (mode === 'user');
-      if (!_isAuthenticated) return;
       if (currentPanel === 'dashboard') renderDashboard();
       else if (currentPanel === 'tasks') renderTasks();
       else if (currentPanel === 'kanban') renderKanban();
@@ -2023,7 +1822,7 @@ function startFirestoreListeners() {
 }
 
 // ── state ─────────────────────────────────────────────────────────────
-let tasks = (()=>{ try{ return JSON.parse(localStorage.getItem('tp_skrtask_tf_tasks')||'null')||SEED; }catch(e){ console.warn('[TaskPlanner] Corrupt tf_tasks cache — resetting.',e); try{localStorage.removeItem('tp_skrtask_tf_tasks');}catch(_){} return SEED; } })();
+let tasks = (()=>{ try{ return JSON.parse(localStorage.getItem('tf_tasks')||'null')||SEED; }catch(e){ console.warn('[TaskPlanner] Corrupt tf_tasks cache — resetting.',e); try{localStorage.removeItem('tf_tasks');}catch(_){} return SEED; } })();
 // plant nav rendered after DOM is ready
 document.addEventListener('DOMContentLoaded',()=>{ setTimeout(renderPlantNav,100); });
 let mode = 'admin'; // 'admin' | 'user'
@@ -2067,17 +1866,17 @@ function _safeSetTasks(arr) {
   const payload  = JSON.stringify(stripped);
 
   try {
-    localStorage.setItem('tp_skrtask_tf_tasks', payload);
+    localStorage.setItem('tf_tasks', payload);
     return; // success
   } catch (e1) {
     // Quota exceeded after stripping attachments — try with fewer tasks
     try {
       const trimmed = JSON.stringify(_stripAttachments(arr.slice(0, 200)));
-      localStorage.setItem('tp_skrtask_tf_tasks', trimmed);
+      localStorage.setItem('tf_tasks', trimmed);
       console.warn('[TaskPlanner] localStorage quota: saved only 200 most-recent tasks as cache. Firestore holds all data.');
     } catch (e2) {
       // Still failing — clear only the tasks key and give up gracefully
-      try { localStorage.removeItem('tp_skrtask_tf_tasks'); } catch(_) {}
+      try { localStorage.removeItem('tf_tasks'); } catch(_) {}
       console.warn('[TaskPlanner] localStorage quota exceeded — skipping local cache. Firestore is the source of truth.', e2);
     }
   }
@@ -2213,14 +2012,6 @@ function setMode(m){
 //  PANEL ROUTER
 // ═══════════════════════════════════════════════════════════════════════
 function showPanel(name){
-  // ── UNAUTHENTICATED: always redirect to login ────────────────────────────
-  const _isAuth = adminAuthenticated || plantOwnerAuthenticated || (currentSession !== null) || (mode === 'user');
-  if (!_isAuth) { showAdminLoginScreen(); return; }
-  // ── LICENSE EXPIRED: block non-superadmin users ──────────────────────────
-  if (window._licenseExpired && !isSuperAdmin()) {
-    _licShowLockScreen('License Expired', 'Your Task Planner license has expired or been revoked.');
-    return;
-  }
   // Block settings for admin and user roles
   if (name === 'settings' && currentSession && (currentSession.role === 'admin' || currentSession.role === 'user')) {
     toast('Settings are only accessible to Super Admin.', 'var(--amber)'); return;
@@ -2372,8 +2163,8 @@ function _updateMyTasksCard(allTasks){
   if(_memberViewActive && _memberViewEmail) selfEmail = _memberViewEmail;
   else if(mode==='user') selfEmail = userEmail||'';
   else if(currentSession) selfEmail = currentSession.email.toLowerCase();
-  else if(adminAuthenticated) selfEmail = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim().toLowerCase();
-  else selfEmail = localStorage.getItem('tp_skrtask_self_email')||'';
+  else if(adminAuthenticated) selfEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+  else selfEmail = localStorage.getItem('self_email')||'';
 
   if(!selfEmail){
     valEl.textContent='—';
@@ -3073,10 +2864,6 @@ function _rebuildDashStats(){
 }
 
 function renderDashboard(){
-  // Auth guard — never render the dashboard if no one is logged in
-  if(!adminAuthenticated && !plantOwnerAuthenticated && !currentSession && mode !== 'user'){
-    showAdminLoginScreen(); return;
-  }
   if(mode==='user'){showPanel('user');return;}
   const c=document.getElementById('content');
   const scopedTasks = getDashScopedTasks();
@@ -3256,7 +3043,7 @@ function renderDashboard(){
 //  PLANT GROUPS — data helpers
 // ═══════════════════════════════════════════════════════════════════════
 function getPlantGroups(){
-  try{ return JSON.parse(localStorage.getItem('tp_skrtask_pg_plants')||'[]'); }catch(e){return [];}
+  try{ return JSON.parse(localStorage.getItem('pg_plants')||'[]'); }catch(e){return [];}
 }
 
 // ── Ensure appUsers loaded for assignee dropdown ─────────────────────
@@ -3309,7 +3096,7 @@ function getPlantLabel(plant) {
   return plant.name;
 }
 function savePlantGroups(arr){
-  localStorage.setItem('tp_skrtask_pg_plants', JSON.stringify(arr));
+  localStorage.setItem('pg_plants', JSON.stringify(arr));
   if(_fbReady&&_db) _db.collection('settings').doc('plantGroups').set({plants:arr}).catch(e=>console.warn('plant save err',e));
 }
 
@@ -3372,15 +3159,7 @@ function renderPlantPanel(){
   }
   // tasks for this plant
   const owners=(plant.owners||[]).map(o=>o.toLowerCase());
-  // When a specific owner is logged in, scope to their tasks + plant-tagged tasks.
-  // When previewing as Super Admin, show all plant tasks (owners array).
-  const _loggedOwnerEmail = plantOwnerAuthenticated ? (_plantOwnerEmail||'').toLowerCase() : null;
-  const plantTasks=tasks.filter(t=>{
-    const assignee=(t.assignee||'').toLowerCase();
-    if(t.plant && t.plant===plant.id) return true;
-    if(_loggedOwnerEmail) return assignee===_loggedOwnerEmail || (t.assignedBy||'').toLowerCase()===_loggedOwnerEmail;
-    return owners.includes(assignee);
-  });
+  const plantTasks=tasks.filter(t=>owners.includes((t.assignee||'').toLowerCase())||(t.plant&&t.plant===plant.id));
   const total=plantTasks.length;
   const done=plantTasks.filter(t=>t.status==='Done').length;
   const inprog=plantTasks.filter(t=>t.status==='In Progress').length;
@@ -3388,7 +3167,7 @@ function renderPlantPanel(){
   const review=plantTasks.filter(t=>t.status==='Review').length;
   const overdue=plantTasks.filter(isOverdue).length;
   const rate=total?Math.round(done/total*100):0;
-  const myTasksCount=(()=>{const me=_getMyTasksScopeEmail();if(!me)return 0;return plantTasks.filter(t=>(t.assignee||'').toLowerCase()===me).length;})();
+  const myTasksCount=(()=>{const me=_getMyTasksScopeEmail();if(!me)return 0;if(plantOwnerAuthenticated&&currentPlantSession){const oe=(currentPlantSession.owners||[]).map(e=>e.toLowerCase());return plantTasks.filter(t=>oe.includes((t.assignee||'').toLowerCase())).length;}return plantTasks.filter(t=>(t.assignee||'').toLowerCase()===me).length;})();
   // reset this panel's search state on every fresh render
   plantTaskAssignedBySearch='';
 
@@ -3587,15 +3366,7 @@ function renderPlantTaskRows(filter){
   if(!plant) return;
   plantTaskFilter=filter;
   const owners=(plant.owners||[]).map(o=>o.toLowerCase());
-  // When a specific owner is logged in, scope to their tasks + plant-tagged tasks.
-  // When previewing as Super Admin, show all plant tasks (owners array).
-  const _loggedOwnerEmail = plantOwnerAuthenticated ? (_plantOwnerEmail||'').toLowerCase() : null;
-  const plantTasks=tasks.filter(t=>{
-    const assignee=(t.assignee||'').toLowerCase();
-    if(t.plant && t.plant===plant.id) return true;
-    if(_loggedOwnerEmail) return assignee===_loggedOwnerEmail || (t.assignedBy||'').toLowerCase()===_loggedOwnerEmail;
-    return owners.includes(assignee);
-  });
+  const plantTasks=tasks.filter(t=>owners.includes((t.assignee||'').toLowerCase())||(t.plant&&t.plant===plant.id));
 
   let filtered;
   let labelText;
@@ -3709,15 +3480,7 @@ function renderPlantTaskRowsByPriority(priority){
   const plant=groups.find(p=>p.id===_activePlantId);
   if(!plant) return;
   const owners=(plant.owners||[]).map(o=>o.toLowerCase());
-  // When a specific owner is logged in, scope to their tasks + plant-tagged tasks.
-  // When previewing as Super Admin, show all plant tasks (owners array).
-  const _loggedOwnerEmail = plantOwnerAuthenticated ? (_plantOwnerEmail||'').toLowerCase() : null;
-  const plantTasks=tasks.filter(t=>{
-    const assignee=(t.assignee||'').toLowerCase();
-    if(t.plant && t.plant===plant.id) return true;
-    if(_loggedOwnerEmail) return assignee===_loggedOwnerEmail || (t.assignedBy||'').toLowerCase()===_loggedOwnerEmail;
-    return owners.includes(assignee);
-  });
+  const plantTasks=tasks.filter(t=>owners.includes((t.assignee||'').toLowerCase())||(t.plant&&t.plant===plant.id));
   const filtered=[...plantTasks.filter(t=>t.priority===priority)]
     .sort((a,b)=>(b.created||b.due||'').localeCompare(a.created||a.due||''));
   plantTaskFilter=priority;
@@ -3730,15 +3493,7 @@ function renderPlantTaskRowsByCreated(ws, we, label){
   const plant=groups.find(p=>p.id===_activePlantId);
   if(!plant) return;
   const owners=(plant.owners||[]).map(o=>o.toLowerCase());
-  // When a specific owner is logged in, scope to their tasks + plant-tagged tasks.
-  // When previewing as Super Admin, show all plant tasks (owners array).
-  const _loggedOwnerEmail = plantOwnerAuthenticated ? (_plantOwnerEmail||'').toLowerCase() : null;
-  const plantTasks=tasks.filter(t=>{
-    const assignee=(t.assignee||'').toLowerCase();
-    if(t.plant && t.plant===plant.id) return true;
-    if(_loggedOwnerEmail) return assignee===_loggedOwnerEmail || (t.assignedBy||'').toLowerCase()===_loggedOwnerEmail;
-    return owners.includes(assignee);
-  });
+  const plantTasks=tasks.filter(t=>owners.includes((t.assignee||'').toLowerCase())||(t.plant&&t.plant===plant.id));
   const filtered=[...plantTasks.filter(t=>t.created&&t.created>=ws&&t.created<=we)]
     .sort((a,b)=>(b.created||b.due||'').localeCompare(a.created||a.due||''));
   plantTaskFilter='All';
@@ -3751,15 +3506,7 @@ function renderPlantTaskRowsByAssigneeName(name){
   const plant=groups.find(p=>p.id===_activePlantId);
   if(!plant) return;
   const owners=(plant.owners||[]).map(o=>o.toLowerCase());
-  // When a specific owner is logged in, scope to their tasks + plant-tagged tasks.
-  // When previewing as Super Admin, show all plant tasks (owners array).
-  const _loggedOwnerEmail = plantOwnerAuthenticated ? (_plantOwnerEmail||'').toLowerCase() : null;
-  const plantTasks=tasks.filter(t=>{
-    const assignee=(t.assignee||'').toLowerCase();
-    if(t.plant && t.plant===plant.id) return true;
-    if(_loggedOwnerEmail) return assignee===_loggedOwnerEmail || (t.assignedBy||'').toLowerCase()===_loggedOwnerEmail;
-    return owners.includes(assignee);
-  });
+  const plantTasks=tasks.filter(t=>owners.includes((t.assignee||'').toLowerCase())||(t.plant&&t.plant===plant.id));
   const filtered=[...plantTasks.filter(t=>{
     const n=(t.assigneeName&&t.assigneeName.trim())||(t.assignee||'').split('@')[0];
     return n===name;
@@ -3880,7 +3627,6 @@ let dashViewMode='mine';    // 'mine' | 'team'  — controls dashboard + all-tas
 let _selectedTasks = new Set();
 
 function renderTasks(){
-  if(!adminAuthenticated && !plantOwnerAuthenticated && !currentSession && mode !== 'user'){ showAdminLoginScreen(); return; }
   if(mode==='user'){showPanel('user');return;}
   _selectedTasks.clear();
   const c=document.getElementById('content');
@@ -4097,7 +3843,6 @@ let _ganttPage     = 0;
 const _GANTT_PAGE_SIZE = 25;
 
 function renderGantt(){
-  if(!adminAuthenticated && !plantOwnerAuthenticated && !currentSession && mode !== 'user'){ showAdminLoginScreen(); return; }
   if(mode==='user'){showPanel('user');return;}
   const c = document.getElementById('content');
 
@@ -4476,7 +4221,6 @@ function ganttExportPDF(){
 }
 
 function renderKanban(){
-  if(!adminAuthenticated && !plantOwnerAuthenticated && !currentSession && mode !== 'user'){ showAdminLoginScreen(); return; }
   if(mode==='user'){showPanel('user');return;}
   const c=document.getElementById('content');
 
@@ -4607,7 +4351,7 @@ function renderReminders(){
 function renderTeam(){
   // Declare me FIRST before any filter that uses it
   const me = currentSession ? currentSession.email.toLowerCase() : null;
-  const myE = me || (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim().toLowerCase();
+  const myE = me || (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
   const authorisedEmails = _getAuthorisedEmails();
 
   // Use the single unified getScopedTasks() so Team always shows the
@@ -4739,13 +4483,13 @@ function renderTeam(){
 // ═══════════════════════════════════════════════════════════════════════
 function getDepartments(){
   try{
-    const local = JSON.parse(localStorage.getItem('tp_skrtask_tf_departments')||'[]');
+    const local = JSON.parse(localStorage.getItem('tf_departments')||'[]');
     return Array.isArray(local) ? local : [];
   }catch(e){ return []; }
 }
 
 function saveDepartments(arr){
-  localStorage.setItem('tp_skrtask_tf_departments', JSON.stringify(arr));
+  localStorage.setItem('tf_departments', JSON.stringify(arr));
   if(_fbReady && _db){
     _db.collection('settings').doc('departments').set({list: arr}).catch(e=>console.warn('dept sync error',e));
   }
@@ -4832,7 +4576,6 @@ function renderSettings(){
           <option value="">All roles</option>
           <option value="admin">Admin</option>
           <option value="user">User</option>
-          <option value="plant-owner">Plant Owner</option>
         </select>
         <select id="user-status-filter" class="form-select" style="font-size:12px;padding:6px 8px;width:auto;" onchange="_filterUserList()">
           <option value="">All statuses</option>
@@ -4855,59 +4598,20 @@ function renderSettings(){
       <button class="btn btn-primary" onclick="changeAdminPassword()">Update Password</button>
     </div>
 
-    <div class="card" id="license-settings-card">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
-        <div>
-          <div style="font-weight:700;font-size:15px;color:var(--text)">🔑 License Key</div>
-          <div style="font-size:11px;color:var(--text3);margin-top:2px">Controlled by SuperAdmin only. Applied automatically to all accounts — users never enter a key.</div>
-        </div>
-        <span id="lic-settings-status-badge" style="font-size:11px;font-weight:700;padding:4px 12px;border-radius:20px;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.25);color:#34d399">Checking…</span>
-      </div>
-
-      <!-- Current active key display -->
-      <div style="display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--surface);border:1px solid var(--border2);border-radius:10px;margin-bottom:16px;flex-wrap:wrap">
-        <div style="flex:1;min-width:140px">
-          <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.7px;margin-bottom:3px">Active Key</div>
-          <div style="font-family:var(--font-mono,monospace);font-size:13px;font-weight:700;color:var(--accent);letter-spacing:.08em" id="lic-settings-current-key">Loading…</div>
-        </div>
-        <div>
-          <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.7px;margin-bottom:3px">Expiry</div>
-          <div style="font-size:13px;font-weight:600;color:var(--text)" id="lic-settings-expiry">—</div>
-        </div>
-      </div>
-
-      <!-- Publish a new / updated key -->
-      <div style="margin-bottom:10px">
-        <label class="form-label" style="margin-bottom:6px">Update License Key</label>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <input class="form-input" id="lic-settings-key-inp"
-            placeholder="TP-XXXX-XXXX-XXXX"
-            maxlength="20"
-            style="flex:1;min-width:180px;font-family:var(--font-mono,monospace);letter-spacing:.08em;font-size:13px;"
-            oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9\-]/g,'')"
-          />
-          <button class="btn btn-primary btn-sm" onclick="licSettingsPublish()">✓ Publish to All</button>
-          <button class="btn btn-ghost btn-sm" onclick="licSettingsClear()" style="color:var(--red);border-color:rgba(248,113,113,.3)">✕ Clear</button>
-        </div>
-        <div style="font-size:11px;color:var(--text3);margin-top:6px">Paste the key from the Developer Licensing Panel. Once published, all users will use this key automatically.</div>
-        <div id="lic-settings-save-status" style="font-size:12px;margin-top:6px;min-height:16px"></div>
-      </div>
-    </div>
-
     <div class="card">
       <div style="font-weight:700;font-size:15px;color:var(--text);margin-bottom:16px">🖼️ Company Branding</div>
       <div style="font-size:12px;color:var(--text3);margin-bottom:14px">Logo and/or company name shown in all outgoing emails. If a logo is uploaded, the text name is hidden automatically.</div>
 
       <!-- Company Name (only shown when no logo) -->
-      ${!localStorage.getItem('tp_skrtask_company_logo_url') ? `
+      ${!localStorage.getItem('company_logo_url') ? `
       <div class="form-group" style="margin-bottom:14px">
         <label class="form-label">Company Name <span style="color:var(--text3);font-weight:400">(shown in emails when no logo is set)</span></label>
         <div style="display:flex;gap:8px;align-items:center">
-          <input class="form-input" id="company-name-input" placeholder="e.g. POLYPLASTICS" value="${localStorage.getItem('tp_skrtask_company_name')||'POLYPLASTICS'}" style="max-width:280px"/>
+          <input class="form-input" id="company-name-input" placeholder="e.g. POLYPLASTICS" value="${localStorage.getItem('company_name')||'POLYPLASTICS'}" style="max-width:280px"/>
           <button class="btn btn-primary btn-sm" onclick="(function(){
             const v=document.getElementById('company-name-input').value.trim();
             if(!v){toast('Enter a company name','var(--amber)');return;}
-            localStorage.setItem('tp_skrtask_company_name',v);
+            localStorage.setItem('company_name',v);
             _db.collection('settings').doc('branding').set({companyName:v},{merge:true})
               .then(()=>toast('Company name saved and synced to all devices!','var(--green)'))
               .catch(err=>toast('Saved locally, but sync failed: '+err.message,'var(--amber)'));
@@ -4918,7 +4622,7 @@ function renderSettings(){
       <!-- Logo upload / preview -->
       <div style="font-size:13px;font-weight:600;color:var(--text2);margin-bottom:8px">Company Logo</div>
       ${(()=>{
-        const existing = localStorage.getItem('tp_skrtask_company_logo_url') || '';
+        const existing = localStorage.getItem('company_logo_url') || '';
         if(existing) return `<div style="display:inline-block;background:var(--card2);border-radius:10px;border:1px solid var(--border2);padding:10px 14px;margin-bottom:12px"><img src="${existing}" alt="logo" style="max-height:60px;max-width:220px;display:block;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'"/></div><p style="font-size:11px;color:var(--green);margin:0 0 10px">✅ Logo active — company name text is hidden in emails.</p>`;
         return '<p style="font-size:12px;color:var(--text3);margin-bottom:12px">No logo uploaded. Company name will be used instead.</p>';
       })()}
@@ -4931,7 +4635,7 @@ function renderSettings(){
             const r=new FileReader();
             r.onload=function(ev){
               const dataUrl = ev.target.result;
-              localStorage.setItem('tp_skrtask_company_logo_url', dataUrl);
+              localStorage.setItem('company_logo_url', dataUrl);
               updateSidebarLogo();
               renderSettings();
               _db.collection('settings').doc('branding').set({logoUrl:dataUrl},{merge:true})
@@ -4941,8 +4645,8 @@ function renderSettings(){
             r.readAsDataURL(f);
           })(event)"/>
         </label>
-        ${localStorage.getItem('tp_skrtask_company_logo_url') ? `<button class="btn btn-danger btn-sm" style="font-size:12px" onclick="(function(){
-            localStorage.removeItem('tp_skrtask_company_logo_url');
+        ${localStorage.getItem('company_logo_url') ? `<button class="btn btn-danger btn-sm" style="font-size:12px" onclick="(function(){
+            localStorage.removeItem('company_logo_url');
             updateSidebarLogo();
             renderSettings();
             _db.collection('settings').doc('branding').set({logoUrl:firebase.firestore.FieldValue.delete()},{merge:true})
@@ -4990,20 +4694,20 @@ function renderSettings(){
         </div>
         <div class="form-row">
           <div class="form-group"><label class="form-label">Azure App Client ID</label>
-            <input class="form-input" id="ms-client-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" value="${localStorage.getItem('tp_skrtask_ms_client_id')||''}" /></div>
+            <input class="form-input" id="ms-client-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" value="${localStorage.getItem('ms_client_id')||''}" /></div>
           <div class="form-group"><label class="form-label">Tenant ID (or "common")</label>
-            <input class="form-input" id="ms-tenant-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" value="${localStorage.getItem('tp_skrtask_ms_tenant_id')||''}" /></div>
+            <input class="form-input" id="ms-tenant-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" value="${localStorage.getItem('ms_tenant_id')||''}" /></div>
         </div>
         <div style="background:rgba(0,0,0,.2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:11px;color:var(--text2);font-family:monospace;line-height:1.9">
           <div><strong style="color:var(--text2)">Currently saved in browser:</strong></div>
-          <div>Client ID: <span id="ms-saved-client-id-display" style="color:${localStorage.getItem('tp_skrtask_ms_client_id')?'var(--green)':'var(--red)'}">${localStorage.getItem('tp_skrtask_ms_client_id') || '❌ not saved yet'}</span></div>
-          <div>Tenant ID: <span id="ms-saved-tenant-id-display" style="color:${localStorage.getItem('tp_skrtask_ms_tenant_id')?'var(--green)':'var(--red)'}">${localStorage.getItem('tp_skrtask_ms_tenant_id') || '❌ not saved yet'}</span></div>
+          <div>Client ID: <span id="ms-saved-client-id-display" style="color:${localStorage.getItem('ms_client_id')?'var(--green)':'var(--red)'}">${localStorage.getItem('ms_client_id') || '❌ not saved yet'}</span></div>
+          <div>Tenant ID: <span id="ms-saved-tenant-id-display" style="color:${localStorage.getItem('ms_tenant_id')?'var(--green)':'var(--red)'}">${localStorage.getItem('ms_tenant_id') || '❌ not saved yet'}</span></div>
           <div style="margin-top:4px"><button class="btn btn-danger btn-sm" style="font-size:10px;padding:3px 10px" onclick="
-            const oldKey=(localStorage.getItem('tp_skrtask_ms_client_id')||'')+'::' +(localStorage.getItem('tp_skrtask_ms_tenant_id')||'');
+            const oldKey=(localStorage.getItem('ms_client_id')||'')+'::' +(localStorage.getItem('ms_tenant_id')||'');
             delete _msalInstances[oldKey];
             _msalSignedIn=false;
-            localStorage.removeItem('tp_skrtask_ms_client_id');
-            localStorage.removeItem('tp_skrtask_ms_tenant_id');
+            localStorage.removeItem('ms_client_id');
+            localStorage.removeItem('ms_tenant_id');
             document.getElementById('ms-client-id').value='';
             document.getElementById('ms-tenant-id').value='';
             document.getElementById('ms-saved-client-id-display').textContent='❌ not saved yet';
@@ -5080,30 +4784,30 @@ function renderSettings(){
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
           <div class="form-group">
             <label class="form-label">Service ID</label>
-            <input class="form-input" id="ejs-service-id" placeholder="service_xxxxxxx" value="${localStorage.getItem('tp_skrtask_ejs_service_id')||''}" />
+            <input class="form-input" id="ejs-service-id" placeholder="service_xxxxxxx" value="${localStorage.getItem('ejs_service_id')||''}" />
           </div>
           <div class="form-group">
             <label class="form-label">Template ID</label>
-            <input class="form-input" id="ejs-template-id" placeholder="template_xxxxxxx" value="${localStorage.getItem('tp_skrtask_ejs_template_id')||''}" />
+            <input class="form-input" id="ejs-template-id" placeholder="template_xxxxxxx" value="${localStorage.getItem('ejs_template_id')||''}" />
           </div>
           <div class="form-group">
             <label class="form-label">Public Key</label>
-            <input class="form-input" id="ejs-public-key" placeholder="xxxxxxxxxxxxxxxxxxxx" value="${localStorage.getItem('tp_skrtask_ejs_public_key')||''}" />
+            <input class="form-input" id="ejs-public-key" placeholder="xxxxxxxxxxxxxxxxxxxx" value="${localStorage.getItem('ejs_public_key')||''}" />
           </div>
         </div>
 
         <!-- Status badge -->
         <div id="ejs-status-badge" style="font-size:12px;margin-top:2px;margin-bottom:4px;min-height:18px;color:var(--text3);">
-          ${(()=>{const s=localStorage.getItem('tp_skrtask_ejs_service_id'),t=localStorage.getItem('tp_skrtask_ejs_template_id'),k=localStorage.getItem('tp_skrtask_ejs_public_key');return s&&t&&k?'<span style="color:var(--green);font-weight:700;">✅ EmailJS configured — ready to send</span>':'<span style="color:var(--amber);">⚠ Enter all three values and Save to enable EmailJS</span>';})()}
+          ${(()=>{const s=localStorage.getItem('ejs_service_id'),t=localStorage.getItem('ejs_template_id'),k=localStorage.getItem('ejs_public_key');return s&&t&&k?'<span style="color:var(--green);font-weight:700;">✅ EmailJS configured — ready to send</span>':'<span style="color:var(--amber);">⚠ Enter all three values and Save to enable EmailJS</span>';})()}
         </div>
       </div>
 
       <!-- Common fields -->
       <div class="form-row" style="margin-top:4px">
         <div class="form-group"><label class="form-label">Admin Notify Email <span style="font-size:10px;color:var(--text2)">(gets task &amp; reply alerts)</span></label>
-          <input class="form-input" id="admin-notify-email" placeholder="admin@company.com" value="${localStorage.getItem('tp_skrtask_admin_notify_email')||''}" /></div>
+          <input class="form-input" id="admin-notify-email" placeholder="admin@company.com" value="${localStorage.getItem('admin_notify_email')||''}" /></div>
         <div class="form-group"><label class="form-label">Test Email (Send To)</label>
-          <input class="form-input" id="ms-test-email" type="email" placeholder="your@email.com" value="${localStorage.getItem('tp_skrtask_ms_test_email')||''}" /></div>
+          <input class="form-input" id="ms-test-email" type="email" placeholder="your@email.com" value="${localStorage.getItem('ms_test_email')||''}" /></div>
       </div>
 
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
@@ -5148,7 +4852,7 @@ function renderSettings(){
         ['priority_change','⚡ Priority Changed'],
         ['updated','✏ Task Updated'],
       ].map(([key,label],i)=>{
-        const saved = (() => { try{ return JSON.parse(localStorage.getItem('tp_skrtask_email_tpl_'+key)||'null'); }catch(e){return null;} })();
+        const saved = (() => { try{ return JSON.parse(localStorage.getItem('email_tpl_'+key)||'null'); }catch(e){return null;} })();
         const defSubj = {
           assigned: '[POLYPLASTICS Tasks] Task Assigned: {{task_title}}',
           status_change: '[POLYPLASTICS Tasks] Status Changed: {{task_title}}',
@@ -5291,8 +4995,6 @@ function renderSettings(){
       }
     }
   }, 0);
-  // Load license settings card data (async, non-blocking)
-  setTimeout(() => { if (typeof licSettingsLoad === 'function') licSettingsLoad(); }, 200);
   // Async-populate user accounts list (super admin only)
   // _renderUserPage is called inside renderUserManagementSection automatically
   renderUserManagementSection().catch(e => {
@@ -5358,7 +5060,6 @@ function renderPgList(){
         <button class="btn btn-ghost btn-sm" onclick="showPlantPanel('${p.id}')" title="View plant dashboard">📊 View</button>
         <button class="btn btn-success btn-sm" onclick="impersonatePlantOwner('${p.id}')" title="Login as this plant owner">👁 Preview</button>
         <button class="btn btn-ghost btn-sm" onclick="startPlantEdit('${p.id}')" title="Edit plant">✏ Edit</button>
-        <button class="btn btn-primary btn-sm" onclick="resetPlantPassword('${p.id}','${esc(p.name)}')" title="Set a new login password for this plant owner">🔑 Reset Pwd</button>
         <button class="btn btn-ghost btn-sm" id="unlock-btn-${p.id}" onclick="unlockPlantLogin('${p.id}','${esc(p.name)}')" title="Clear login lockout for this plant">🔓 Unlock</button>
         <button class="btn btn-danger btn-sm" onclick="deletePlantGroup('${p.id}')" title="Delete plant">🗑</button>
       </div>
@@ -5383,46 +5084,6 @@ function renderPgList(){
       }
     }
   })();
-}
-
-
-// ── Reset plant owner login password (Super Admin only) ──────────────────
-async function resetPlantPassword(plantId, plantName) {
-  const newPwd = prompt('Set a new login password for plant "' + plantName + '":\n(Min 4 characters — share this with the plant owner)');
-  if (newPwd === null) return; // cancelled
-  if (!newPwd || newPwd.trim().length < 4) { toast('❌ Password must be at least 4 characters.', 'var(--red)'); return; }
-
-  try {
-    const hashed = await _hashPw(newPwd.trim(), plantId);
-    // Fetch fresh from Firestore before saving to avoid overwriting with stale localStorage data
-    let groups = getPlantGroups();
-    if (_fbReady && _db) {
-      try {
-        const d = await _db.collection('settings').doc('plantGroups').get();
-        if (d.exists && Array.isArray(d.data().plants)) groups = d.data().plants;
-      } catch(e) { /* use localStorage */ }
-    }
-    groups = groups.map(p => p.id === plantId ? { ...p, password: hashed } : p);
-    savePlantGroups(groups); // saves to localStorage AND Firestore atomically
-
-    // Clear ALL brute-force lockout keys so plant owner can log in immediately:
-    // - plant_<plantId>  : from plantOwnerLogin() failed attempts
-    // - user:<email>     : from overlayAdminLogin/unifiedLogin wrong-path attempts
-    const bfStore = await _secGet(_BF_STORE) || {};
-    delete bfStore['plant_' + plantId];
-    // Clear user: key for every owner email on this plant
-    const updatedPlant = getPlantGroups().find(p => p.id === plantId);
-    (updatedPlant?.owners || []).forEach(ownerEmail => {
-      const key = 'user:' + (ownerEmail || '').trim().toLowerCase();
-      delete bfStore[key];
-    });
-    await _secSet(_BF_STORE, bfStore);
-
-    renderPgList();
-    toast('✅ Password reset for "' + plantName + '". Share the new password with the owner.', 'var(--green)');
-  } catch(e) {
-    toast('❌ Reset failed: ' + e.message, 'var(--red)');
-  }
 }
 
 async function addPlantGroup(){
@@ -5466,15 +5127,7 @@ async function savePlantEdit(id){
   const newPwd=(document.getElementById('pg-edit-pwd-'+id)?.value||'').trim();
   if(!name){ toast('Plant name is required','var(--red)'); return; }
   const owners=ownersRaw?ownersRaw.split(',').map(o=>o.trim()).filter(Boolean):[];
-  // Fetch fresh from Firestore to avoid overwriting with stale localStorage data
-  let baseGroups = getPlantGroups();
-  if (_fbReady && _db) {
-    try {
-      const d = await _db.collection('settings').doc('plantGroups').get();
-      if (d.exists && Array.isArray(d.data().plants)) baseGroups = d.data().plants;
-    } catch(e) { /* use localStorage */ }
-  }
-  const groups=baseGroups.map(p=>{
+  const groups=getPlantGroups().map(p=>{
     if(p.id!==id) return p;
     const updated={...p,name,owners};
     if(newPwd){ updated._pendingPwdHash=true; updated._rawNewPwd=newPwd; updated._pwdForId=p.id; } // hash async below
@@ -5520,12 +5173,6 @@ async function unlockPlantLogin(id, name){
     return;
   }
   delete s[bfId];
-  // Also clear user:<email> BF keys for every owner of this plant
-  const _ulPlant = getPlantGroups().find(p => p.id === id);
-  (_ulPlant?.owners || []).forEach(ownerEmail => {
-    const userKey = 'user:' + (ownerEmail||'').trim().toLowerCase();
-    delete s[userKey];
-  });
   await _secSet(_BF_STORE, s);
   toast('✅ Login unlocked for ' + (name||id) + '. They can now sign in.', 'var(--green)');
   // Update button to show it worked
@@ -5540,36 +5187,16 @@ async function changePlantPassword(){
   const nw=document.getElementById('po-pwd-new')?.value||'';
   const cf=document.getElementById('po-pwd-confirm')?.value||'';
   const status=document.getElementById('po-pwd-status');
-
-  // Always fetch the current password hash fresh from Firestore — never trust
-  // currentPlantSession.password which may be stale from a previous session or
-  // a reset done by Super Admin after login.
-  let storedPw = currentPlantSession.password || '';
-  const plantId = currentPlantSession.id;
-  if (_fbReady && _db) {
-    try {
-      const d = await _db.collection('settings').doc('plantGroups').get();
-      if (d.exists && Array.isArray(d.data().plants)) {
-        const fbPlant = d.data().plants.find(p => p.id === plantId);
-        if (fbPlant?.password) storedPw = fbPlant.password;
-      }
-    } catch(e) { /* fall back to currentPlantSession.password */ }
-  }
-
-  const curOk = await _verifyPw(storedPw, cur, plantId);
+  const storedPw=currentPlantSession.password||'';
+  const curOk=await _verifyPw(storedPw,cur,currentPlantSession.id);
   if(!curOk){status.style.color='var(--red)';status.textContent='❌ Current password is incorrect.';return;}
   if(nw.length<6){status.style.color='var(--red)';status.textContent='❌ New password must be at least 6 characters.';return;}
   if(nw!==cf){status.style.color='var(--red)';status.textContent='❌ Passwords do not match.';return;}
-
-  // Hash new password with plantId as salt (same as login verification)
-  const hashed = await _hashPw(nw, plantId);
-  // Save to both localStorage and Firestore atomically
-  const groups = getPlantGroups().map(p => p.id===plantId ? {...p,password:hashed} : p);
+  // Hash the new password before saving
+  const hashed=await _hashPw(nw,currentPlantSession.id);
+  const groups=getPlantGroups().map(p=>p.id===currentPlantSession.id?{...p,password:hashed}:p);
   savePlantGroups(groups);
-  // Update in-memory session so subsequent changePlantPassword calls within
-  // the same session work correctly without requiring a re-login
-  currentPlantSession = {...currentPlantSession, password: hashed};
-
+  currentPlantSession={...currentPlantSession,password:hashed};
   status.style.color='var(--green)';
   status.textContent='✅ Password updated successfully!';
   document.getElementById('po-pwd-current').value='';
@@ -5588,17 +5215,17 @@ function saveEmailSettings(){
   const ejsKey      = (document.getElementById('ejs-public-key')?.value||'').trim();
 
   // ── Step 1: Write to localStorage ──────────────────────────────────────
-  localStorage.setItem('tp_skrtask_ms_client_id',       clientId);
-  localStorage.setItem('tp_skrtask_ms_tenant_id',       tenantId);
-  localStorage.setItem('tp_skrtask_ms_test_email',      testEmail);
-  localStorage.setItem('tp_skrtask_admin_notify_email', adminNotifyEmail);
-  localStorage.setItem('tp_skrtask_ejs_service_id',     ejsService);
-  localStorage.setItem('tp_skrtask_ejs_template_id',    ejsTemplate);
-  localStorage.setItem('tp_skrtask_ejs_public_key',     ejsKey);
+  localStorage.setItem('ms_client_id',       clientId);
+  localStorage.setItem('ms_tenant_id',       tenantId);
+  localStorage.setItem('ms_test_email',      testEmail);
+  localStorage.setItem('admin_notify_email', adminNotifyEmail);
+  localStorage.setItem('ejs_service_id',     ejsService);
+  localStorage.setItem('ejs_template_id',    ejsTemplate);
+  localStorage.setItem('ejs_public_key',     ejsKey);
 
   // ── Step 2: Verify and update display ──────────────────────────────────
-  const verifyId  = localStorage.getItem('tp_skrtask_ms_client_id');
-  const verifyTen = localStorage.getItem('tp_skrtask_ms_tenant_id');
+  const verifyId  = localStorage.getItem('ms_client_id');
+  const verifyTen = localStorage.getItem('ms_tenant_id');
   console.log('[Settings] Saved Client ID:', verifyId);
   console.log('[Settings] Saved Tenant ID:', verifyTen);
   const cidStatus = document.getElementById('ms-saved-client-id-display');
@@ -5676,8 +5303,8 @@ const EJS_PUBLIC_KEY  = ''; // paste EmailJS Public Key here
 // ── Config helpers ─────────────────────────────────────────────────────
 function getEmailConfig(){
   // Always prefer what is explicitly saved in localStorage by the user
-  const savedClientId = localStorage.getItem('tp_skrtask_ms_client_id');
-  const savedTenantId = localStorage.getItem('tp_skrtask_ms_tenant_id');
+  const savedClientId = localStorage.getItem('ms_client_id');
+  const savedTenantId = localStorage.getItem('ms_tenant_id');
   // Only fall back to hardcoded constants if nothing is saved at all (null = never saved)
   const clientId = (savedClientId !== null) ? savedClientId : MS_CLIENT_ID;
   const tenantId = (savedTenantId !== null) ? savedTenantId : MS_TENANT_ID;
@@ -5687,9 +5314,9 @@ function getEmailConfig(){
   return {
     clientId:  cleanId,
     tenantId:  cleanTen,
-    ejsService:  localStorage.getItem('tp_skrtask_ejs_service_id')  || EJS_SERVICE_ID,
-    ejsTemplate: localStorage.getItem('tp_skrtask_ejs_template_id') || EJS_TEMPLATE_ID,
-    ejsKey:      localStorage.getItem('tp_skrtask_ejs_public_key')  || EJS_PUBLIC_KEY,
+    ejsService:  localStorage.getItem('ejs_service_id')  || EJS_SERVICE_ID,
+    ejsTemplate: localStorage.getItem('ejs_template_id') || EJS_TEMPLATE_ID,
+    ejsKey:      localStorage.getItem('ejs_public_key')  || EJS_PUBLIC_KEY,
   };
 }
 function emailTransport(){
@@ -5795,7 +5422,7 @@ async function getMSGraphToken(cfg, loginHint) {
  */
 function getPlantOwnerLoginHint() {
   if (!plantOwnerAuthenticated || !currentPlantSession) return null;
-  // Always prefer the specific email the plant owner used to log in
+  // Prefer the specific email the plant owner used to log in
   if (_plantOwnerEmail) return _plantOwnerEmail.trim().toLowerCase();
   const owners = (currentPlantSession.owners || []).filter(e => e && e.includes('@'));
   return owners.length > 0 ? owners[0].trim().toLowerCase() : null;
@@ -5969,9 +5596,9 @@ function switchTplTab(key){
 function saveTplSettings(key){
   const subj  = (document.getElementById('tpl-subj-'+key)?.value||'').trim();
   const intro = (document.getElementById('tpl-intro-'+key)?.value||'').trim();
-  localStorage.setItem('tp_skrtask_email_tpl_'+key, JSON.stringify({subject:subj, intro:intro}));
+  localStorage.setItem('email_tpl_'+key, JSON.stringify({subject:subj, intro:intro}));
   if(_fbReady&&_db){
-    _db.collection('settings').doc('tp_skrtask_email_tpl_'+key).set({subject:subj, intro:intro},{merge:true}).catch(e=>console.warn('tpl save error',e));
+    _db.collection('settings').doc('email_tpl_'+key).set({subject:subj, intro:intro},{merge:true}).catch(e=>console.warn('tpl save error',e));
   }
   const st = document.getElementById('tpl-save-status-'+key);
   if(st){ st.style.color='var(--green)'; st.textContent='✅ Template saved!'; setTimeout(()=>{ if(st) st.textContent=''; },2500); }
@@ -5980,8 +5607,8 @@ function saveTplSettings(key){
 
 function resetTplTemplate(key){
   if(!confirm('Reset this template to the default text?')) return;
-  localStorage.removeItem('tp_skrtask_email_tpl_'+key);
-  if(_fbReady&&_db) _db.collection('settings').doc('tp_skrtask_email_tpl_'+key).delete().catch(()=>{});
+  localStorage.removeItem('email_tpl_'+key);
+  if(_fbReady&&_db) _db.collection('settings').doc('email_tpl_'+key).delete().catch(()=>{});
   renderSettings();
   setTimeout(()=>switchTplTab(key),100);
   toast('↺ Template reset to default');
@@ -5993,18 +5620,18 @@ function previewTplTemplate(key){
   const fakeTask = tasks[0]||{title:'Sample Task',assignee:'user@example.com',desc:'Sample description.',due:today(),priority:'High',status:'In Progress',tags:['demo'],completedDate:''};
   const taskLink = window.location.href.split('?')[0]+'?email='+encodeURIComponent(fakeTask.assignee);
   // temporarily override saved template for preview
-  const origVal = localStorage.getItem('tp_skrtask_email_tpl_'+key);
-  localStorage.setItem('tp_skrtask_email_tpl_'+key, JSON.stringify({subject:subj,intro}));
+  const origVal = localStorage.getItem('email_tpl_'+key);
+  localStorage.setItem('email_tpl_'+key, JSON.stringify({subject:subj,intro}));
   const html = buildEmailHtml(fakeTask, key, taskLink, 'Status → In Progress (was To Do)');
   // restore
-  if(origVal) localStorage.setItem('tp_skrtask_email_tpl_'+key,origVal); else localStorage.removeItem('tp_skrtask_email_tpl_'+key);
+  if(origVal) localStorage.setItem('email_tpl_'+key,origVal); else localStorage.removeItem('email_tpl_'+key);
   const w=window.open('','_blank');
   if(w){ w.document.write(html); w.document.close(); }
   else toast('Popup blocked — allow popups','var(--amber)');
 }
 
 function getTplConfig(key){
-  try{ return JSON.parse(localStorage.getItem('tp_skrtask_email_tpl_'+key)||'null'); }catch(e){ return null; }
+  try{ return JSON.parse(localStorage.getItem('email_tpl_'+key)||'null'); }catch(e){ return null; }
 }
 
 function applyTplVars(text, task, changeDetail){
@@ -6048,7 +5675,7 @@ function buildEmailHtml(task, reason, taskLink, changeDetail=''){
   }
 
   // Logo from localStorage — cross-client: VML for Outlook, table for all others
-  const logo = localStorage.getItem('tp_skrtask_company_logo_url') || '';
+  const logo = localStorage.getItem('company_logo_url') || '';
   const LOGO_W = 125, LOGO_H = 22; // 75% of 166x29 (previous reduction)
   const logoHtml = logo ? [
     '<!--[if mso]>',
@@ -6073,7 +5700,7 @@ function buildEmailHtml(task, reason, taskLink, changeDetail=''){
   const isOverdue = task.due && task.due < new Date().toISOString().slice(0,10) && task.status!=='Done';
   const dueTxt = fmt(task.due)||'—';
   const dueColor = (task.due && task.due < new Date().toISOString().slice(0,10)) ? '#dc2626' : '#0f1221';
-  const companyName = localStorage.getItem('tp_skrtask_company_name') || 'POLYPLASTICS';
+  const companyName = localStorage.getItem('company_name') || 'POLYPLASTICS';
   const yr = new Date().getFullYear();
 
   return `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
@@ -6147,7 +5774,7 @@ function buildEmailSubject(reason, taskTitle, task){
   if(tplCfg && tplCfg.subject){
     return applyTplVars(tplCfg.subject, task||{title:taskTitle,assignee:'',priority:'',status:'',due:''}, '');
   }
-  const pfx = '[' + (localStorage.getItem('tp_skrtask_company_name') || 'POLYPLASTICS') + ' Tasks]';
+  const pfx = '[' + (localStorage.getItem('company_name') || 'POLYPLASTICS') + ' Tasks]';
   const lbl = REASON_LABEL[reason] || reason;
   return `${pfx} ${lbl}: ${taskTitle}`;
 }
@@ -6166,7 +5793,7 @@ async function sendViaMsGraph(toEmail, subject, htmlBody, ccEmails=[]){
   let loginHint = getPlantOwnerLoginHint();
   if(!loginHint) {
     // Use account holder email as loginHint so Microsoft 365 sends from their account
-    loginHint = getSessionEmail() || localStorage.getItem('tp_skrtask_admin_notify_email') || null;
+    loginHint = getSessionEmail() || localStorage.getItem('admin_notify_email') || null;
   }
   const token = await withTimeout(getMSGraphToken(cfg, loginHint));
   const msgBody = {
@@ -6197,7 +5824,7 @@ async function sendViaEmailJS(toEmail, subject, htmlBody, task={}){
   if(typeof emailjs === 'undefined') throw new Error('EmailJS library not loaded');
   emailjs.init({ publicKey: c.ejsKey });
   // Use account holder's email as sender identity
-  const _senderEmail = getSessionEmail() || localStorage.getItem('tp_skrtask_admin_notify_email') || 'noreply@polyplastics.com';
+  const _senderEmail = getSessionEmail() || localStorage.getItem('admin_notify_email') || 'noreply@polyplastics.com';
   const _senderNick  = getSessionNick()  || 'POLYPLASTICS Task Manager';
   const params = {
     to_email:   toEmail,
@@ -6258,7 +5885,7 @@ async function notifyAssignee(task, reason, extra={}){
     try{
       const ok = await sendTaskEmail(task, reason, extra);
       if(ok){
-        const _senderHint = getPlantOwnerLoginHint() || getSessionEmail() || localStorage.getItem('tp_skrtask_admin_notify_email') || '';
+        const _senderHint = getPlantOwnerLoginHint() || getSessionEmail() || localStorage.getItem('admin_notify_email') || '';
         const senderLabel = transport==='msgraph'
           ? ('Microsoft 365' + (_senderHint ? ' (from: '+_senderHint+')' : ''))
           : 'EmailJS (from: '+(getSessionEmail()||'account')+')';
@@ -6290,7 +5917,7 @@ async function sendTestMail(){
     if(s){s.textContent='⚠ No email provider configured';s.style.color='var(--amber)';}
     return;
   }
-  const testEmail = (document.getElementById('ms-test-email')?.value?.trim()) || localStorage.getItem('tp_skrtask_ms_test_email') || '';
+  const testEmail = (document.getElementById('ms-test-email')?.value?.trim()) || localStorage.getItem('ms_test_email') || '';
   if(!testEmail){ toast('Enter a Test Email address first','var(--amber)'); return; }
 
   const btn=document.getElementById('test-mail-btn');
@@ -6440,108 +6067,8 @@ document.addEventListener('keydown', function(e){
   }
 })();
 
-
-// ── Shared: activate plant owner session (called after password verified) ──
-function _activatePlantOwnerSession(plant, email) {
-  plantOwnerAuthenticated = true;
-  adminAuthenticated = false;
-  currentSession = null;
-  currentPlantSession = plant;
-  _activePlantId = plant.id;
-  _plantOwnerEmail = email;
-  document.body.classList.add('plant-owner-mode');
-
-  document.getElementById('admin-nav').style.display = 'block';
-  document.getElementById('btn-new-task').style.display = 'flex';
-  document.getElementById('btn-bulk-upload').style.display = 'flex';
-  document.getElementById('btn-export').style.display = 'flex';
-  document.getElementById('btn-admin-mode').style.display = 'none';
-  document.getElementById('btn-user-mode').style.display = 'none';
-  const _poModeLabel = document.querySelector('.sidebar-mode-label');
-  if(_poModeLabel) _poModeLabel.style.display = 'none';
-  const sidebarBottom = document.querySelector('.sidebar-bottom');
-  if(sidebarBottom){ sidebarBottom.style.display=''; sidebarBottom.style.visibility=''; }
-
-  const avatar = document.getElementById('topbar-avatar');
-  if(avatar){ avatar.textContent = plant.name[0].toUpperCase(); avatar.style.background='linear-gradient(135deg,var(--green),var(--cyan))'; }
-  document.getElementById('topbar-title').textContent = '🏭 ' + plant.name;
-  _setSettingsNavVisible(false);
-  const sai = document.getElementById('sidebar-account-info');
-  if(sai) sai.style.display = 'block';
-  _updateSidebarAccountInfo();
-  _renderTopbarUserBadge();
-  renderPlantNav();
-  toast('Welcome, ' + plant.name + ' Owner! 🏭');
-  showPlantPanel(plant.id);
-}
-
-// ── Shared: verify plant owner password and activate session ──────────
-// Called directly from unifiedLogin/overlayAdminLogin — no separate screen needed.
-async function _doPlantOwnerLogin(plant, email, enteredPassword, errEl) {
-  const plantId = plant.id;
-  // Clear wrong-path user: BF key first
-  _bfRecord('user:' + email, true).catch(()=>{});
-
-  // Check plant-specific BF lockout
-  const bfId = 'plant_' + plantId;
-  const bf = await _bfCheck(bfId);
-  if (bf.locked) {
-    if(errEl){ errEl.textContent='⏳ Too many failed attempts. Locked for '+bf.remaining+' min. Ask Super Admin to click 🔓 Unlock.'; errEl.style.display='block'; }
-    return;
-  }
-
-  // Fetch password FRESH from Firestore (always — never trust localStorage at login time)
-  let storedPwd = plant.password || '';
-  let freshPlant = {...plant}; // will be updated with Firestore data
-  if (_fbReady && _db) {
-    try {
-      const d = await _db.collection('settings').doc('plantGroups').get();
-      if (d.exists && Array.isArray(d.data().plants)) {
-        const fbPlant = d.data().plants.find(p => p.id === plantId);
-        if (fbPlant) {
-          freshPlant = fbPlant; // use the fully fresh Firestore record
-          if (fbPlant.password) storedPwd = fbPlant.password;
-        }
-      }
-    } catch(e) { /* use localStorage value */ }
-  }
-
-  // Auto-upgrade plaintext → PBKDF2 hash and persist
-  if (storedPwd && !/^[0-9a-f]{64}$/.test(storedPwd)) {
-    const hashed = await _hashPw(storedPwd, plantId);
-    const upgraded = getPlantGroups().map(p => p.id===plantId ? {...p,password:hashed} : p);
-    savePlantGroups(upgraded);
-    freshPlant = {...freshPlant, password: hashed};
-    storedPwd = hashed;
-  }
-
-  const ok = await _verifyPw(storedPwd, enteredPassword, plantId);
-  if (!ok) {
-    await _bfRecord(bfId, false);
-    const bfA = await _bfCheck(bfId);
-    const msg = bfA.locked
-      ? '⏳ Too many failed attempts. Locked for '+bfA.remaining+' min. Ask Super Admin to click 🔓 Unlock.'
-      : '❌ Incorrect password.' + ((_BF_MAX-(bfA.attempts||0))>0 ? ' '+(_BF_MAX-(bfA.attempts||0))+' attempt(s) left. Ask Super Admin to use 🔑 Reset Pwd if forgotten.' : '');
-    if(errEl){ errEl.textContent=msg; errEl.style.display='block'; }
-    const pwdField = document.getElementById('login-pwd-input') || document.getElementById('overlay-pwd-input');
-    if(pwdField) pwdField.value='';
-    return;
-  }
-
-  await _bfRecord(bfId, true);
-  if(errEl) errEl.style.display='none';
-  // Pass freshPlant (with correct Firestore password hash) so currentPlantSession.password
-  // is always up-to-date — changePlantPassword() depends on this for current-password verification
-  _activatePlantOwnerSession(freshPlant, email);
-}
-
 function showAdminLoginScreen(){
-  // Reset all auth flags — this is the clean slate before any login
   adminAuthenticated = false;
-  plantOwnerAuthenticated = false;
-  currentSession = null;
-  currentPlantSession = null;
-  _plantOwnerEmail = '';
   // Clear stale group member data from the previous session
   _myGroupMemberEmails = [];
   _myGroupPendingEmails = [];
@@ -6591,10 +6118,7 @@ function showAdminLoginScreen(){
 // ═══════════════════════════════════════════════════════════════════════
 
 function showPlantOwnerLoginScreen(){
-  // Deprecated: plant owners now log in via the unified login screen.
-  // Just show the main login — _doPlantOwnerLogin handles auth inline.
-  showAdminLoginScreen(); return;
-  // Legacy dead code below — kept for reference only:
+  // Called from the main login screen when someone wants to log in as plant owner
   adminAuthenticated = false;
   plantOwnerAuthenticated = false;
   currentPlantSession = null;
@@ -6703,8 +6227,8 @@ function plantOwnerLogin(){
     if(!ok){
       await _bfRecord(bfId,false);
       const bfA=await _bfCheck(bfId);
-      if(bfA.locked) err.textContent='⏳ Too many failed attempts. Locked for '+bfA.remaining+' min. Ask Super Admin to click 🔓 Unlock.';
-      else { const rem=_BF_MAX-(bfA.attempts||0); err.textContent='❌ Incorrect password.'+(rem>0&&rem<_BF_MAX?' '+rem+' attempt(s) left. Ask Super Admin to use 🔑 Reset Pwd in Plant Groups if forgotten.':''); }
+      if(bfA.locked) err.textContent='⏳ Too many failed attempts. Locked for '+bfA.remaining+' minute(s).';
+      else { const rem=_BF_MAX-(bfA.attempts||0); err.textContent='❌ Incorrect password.'+(rem>0&&rem<_BF_MAX?' '+rem+' attempt(s) left.':''); }
       err.style.display='block';
       document.getElementById('plant-pwd-input').value=''; return;
     }
@@ -6929,28 +6453,18 @@ function getScopedTasks(){
     );
   }
 
-  // Plant owner path — scope to this specific logged-in owner's tasks + plant tasks
-  // _plantOwnerEmail is the exact email this owner used to log in.
-  // They should only see tasks assigned to/by them, plus any task tagged to their plant.
+  // Plant owner path — unchanged
   if(plantOwnerAuthenticated && currentPlantSession){
-    const myOwnerEmail = (_plantOwnerEmail || '').trim().toLowerCase();
-    const plantId = currentPlantSession.id;
-    return tasks.filter(t => {
-      const assignee   = (t.assignee||'').toLowerCase();
-      const assignedBy = (t.assignedBy||'').toLowerCase();
-      // Tasks assigned to this owner
-      if(myOwnerEmail && assignee === myOwnerEmail) return true;
-      // Tasks assigned by this owner
-      if(myOwnerEmail && assignedBy === myOwnerEmail) return true;
-      // Tasks tagged to this plant
-      if(t.plant && t.plant === plantId) return true;
-      return false;
-    });
+    const owners = (currentPlantSession.owners||[]).map(o=>o.toLowerCase());
+    return tasks.filter(t =>
+      owners.includes((t.assignee||'').toLowerCase()) ||
+      (t.plant && t.plant === currentPlantSession.id)
+    );
   }
 
   // Superadmin — own tasks (assigned to/by me) + accepted group members' tasks
   if(adminAuthenticated && !currentSession){
-    const saEmail    = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim().toLowerCase();
+    const saEmail    = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
     const authorised = _getAuthorisedEmails();
     return tasks.filter(t => {
       const assignee   = (t.assignee||'').toLowerCase();
@@ -7007,14 +6521,12 @@ function getScopedTasks(){
 // "My Tasks" tab — only tasks assigned TO the current user
 function getMyOwnTasks(){
   if(plantOwnerAuthenticated && currentPlantSession){
-    // My Tasks = only tasks assigned TO this specific logged-in owner
-    const myOwnerEmail = (_plantOwnerEmail || '').trim().toLowerCase();
-    if(myOwnerEmail) return tasks.filter(t => (t.assignee||'').toLowerCase() === myOwnerEmail);
-    return [];
+    const owners = (currentPlantSession.owners||[]).map(o=>o.toLowerCase());
+    return tasks.filter(t => owners.includes((t.assignee||'').toLowerCase()));
   }
   // Superadmin: use admin_notify_email as own identity (set in Settings)
   if(adminAuthenticated && !currentSession){
-    const saEmail = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim().toLowerCase();
+    const saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
     if(saEmail) return tasks.filter(t => (t.assignee||'').toLowerCase() === saEmail);
     return []; // no identity set — return empty, prompt in My Tasks panel
   }
@@ -7028,10 +6540,10 @@ function getMyOwnTasks(){
 // Helper: get "my" email for any role (superadmin/admin/user)
 function _getMyEmail(){
   if(plantOwnerAuthenticated && currentPlantSession)
-    return (_plantOwnerEmail || (currentPlantSession.owners||[])[0] || '').toLowerCase();
+    return ((currentPlantSession.owners||[])[0]||'').toLowerCase();
   if(currentSession) return currentSession.email.toLowerCase();
   // Superadmin
-  return (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim().toLowerCase();
+  return (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
 }
 
 // Tasks where I am assignee OR assigner — for "My Dashboard" and "All Tasks"
@@ -7235,16 +6747,12 @@ function showAdminPasswordOverlay(){
   overlay.id = 'admin-pwd-overlay';
   overlay.style.cssText = [
     'position:fixed','inset:0','z-index:9999',
-    'background:rgba(8,9,13,0.95)',
-    'backdrop-filter:blur(8px)',
-    '-webkit-backdrop-filter:blur(8px)',
+    'background:rgba(8,9,13,0.82)',
+    'backdrop-filter:blur(6px)',
+    '-webkit-backdrop-filter:blur(6px)',
     'display:flex','align-items:center','justify-content:center',
-    'padding:20px',
-    'pointer-events:all'  /* absorbs all clicks — overlay cannot be bypassed */
+    'padding:20px'
   ].join(';');
-  // Prevent Escape key from closing or bypassing the overlay
-  overlay._escHandler = (e) => { if(e.key==='Escape') e.stopImmediatePropagation(); };
-  document.addEventListener('keydown', overlay._escHandler, true);
 
   overlay.innerHTML = `
     <div style="
@@ -7288,34 +6796,8 @@ function showAdminPasswordOverlay(){
 }
 
 async function overlayAdminLogin(){
-  // Delegate to unifiedLogin which handles all three roles (SuperAdmin/PlantOwner/User)
-  // Map overlay inputs to the unified login screen inputs, then call unifiedLogin
   const email   = (document.getElementById('overlay-email-input')?.value || '').trim().toLowerCase();
   const entered = document.getElementById('overlay-pwd-input')?.value || '';
-  // Temporarily inject values into unified login fields, call unifiedLogin, then clean up
-  let _injectedEmail = document.getElementById('login-email-input');
-  let _injectedPwd   = document.getElementById('login-pwd-input');
-  let _injectedErr   = document.getElementById('admin-login-error');
-  // If unified login screen is not active, fall through to inline logic
-  if (!_injectedEmail) {
-    // No unified login screen — show it and pre-fill
-    showAdminLoginScreen();
-    setTimeout(() => {
-      const ei = document.getElementById('login-email-input');
-      const pi = document.getElementById('login-pwd-input');
-      if(ei) ei.value = email;
-      if(pi) { pi.value = entered; unifiedLogin(); }
-    }, 80);
-    const ov = document.getElementById('admin-pwd-overlay'); if(ov){ if(ov._escHandler) document.removeEventListener('keydown', ov._escHandler, true); ov.remove(); }
-    return;
-  }
-  _injectedEmail.value = email;
-  _injectedPwd.value   = entered;
-  const ov = document.getElementById('admin-pwd-overlay'); if(ov){ if(ov._escHandler) document.removeEventListener('keydown', ov._escHandler, true); ov.remove(); }
-  await unifiedLogin();
-  return;
-  // Legacy code below — kept for reference but never reached:
-  const _err_UNUSED = null;
   const err     = document.getElementById('overlay-login-error');
 
   if (!email)   { if(err){err.textContent='❌ Enter your email address.';err.style.display='block';} return; }
@@ -7337,19 +6819,17 @@ async function overlayAdminLogin(){
   // to password-only match. This prevents regular users who happen to know
   // the superadmin password from logging in as superadmin.
   const _DEFAULT_PWD = 'poly@123';
-  const _superAdminEmail = (localStorage.getItem('tp_skrtask_admin_notify_email') || '').trim().toLowerCase();
-  const _emailIsSuperAdmin = _superAdminEmail
-    ? email === _superAdminEmail
-    : email === 'superadmin';
+  const _superAdminEmail = (localStorage.getItem('admin_notify_email') || '').trim().toLowerCase();
+  const _emailIsSuperAdmin = !_superAdminEmail || email === _superAdminEmail;
 
   const _tryAsSuperAdmin = _emailIsSuperAdmin && await (async () => {
     try {
       let stored = _DEFAULT_PWD;
       if (_fbReady && _db) {
         const d = await _db.collection('settings').doc('admin').get().catch(() => null);
-        stored = (d && d.exists && d.data().password) ? d.data().password : (localStorage.getItem('tp_skrtask_admin_password') || _DEFAULT_PWD);
+        stored = (d && d.exists && d.data().password) ? d.data().password : (localStorage.getItem('admin_password') || _DEFAULT_PWD);
       } else {
-        stored = localStorage.getItem('tp_skrtask_admin_password') || _DEFAULT_PWD;
+        stored = localStorage.getItem('admin_password') || _DEFAULT_PWD;
       }
       return await _verifyPw(stored, entered, 'admin');
     } catch(e) { return false; }
@@ -7365,7 +6845,7 @@ async function overlayAdminLogin(){
     const _doSuperLogin = async (stored) => {
       if(stored && !/^[0-9a-f]{64}$/.test(stored)){
         const hashed=await _hashPw(stored,'admin');
-        localStorage.setItem('tp_skrtask_admin_password',hashed);
+        localStorage.setItem('admin_password',hashed);
         if(_fbReady&&_db) _db.collection('settings').doc('admin').set({password:hashed},{merge:true}).catch(()=>{});
         stored=hashed;
       }
@@ -7390,9 +6870,9 @@ async function overlayAdminLogin(){
       }
       currentSession = null;
       adminAuthenticated = true;
-      localStorage.setItem('tp_skrtask_admin_password', stored);
+      localStorage.setItem('admin_password', stored);
       const overlay = document.getElementById('admin-pwd-overlay');
-      if(overlay){ if(overlay._escHandler) document.removeEventListener('keydown', overlay._escHandler, true); overlay.remove(); }
+      if(overlay) overlay.remove();
       _setSettingsNavVisible(true);
       _injectRoleNavItems('superadmin');
       // ── Render topbar name/avatar (same as admin path) ──────────────
@@ -7402,7 +6882,7 @@ async function overlayAdminLogin(){
       if(sai) sai.style.display = 'block';
       _updateSidebarAccountInfo();
       // ── Start notification listener for superadmin email ─────────────
-      const _saNotifEmail = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim().toLowerCase();
+      const _saNotifEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
       if(_saNotifEmail) _startNotifListener(_saNotifEmail);
       // ── Load group members + build member bar (same as admin path) ───
       // Reset member arrays immediately so the bar doesn't show stale members
@@ -7410,7 +6890,7 @@ async function overlayAdminLogin(){
       _myGroupMemberEmails = [];
       _myGroupPendingEmails = [];
       buildGlobalMemberBar();
-      const _saKey = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim();
+      const _saKey = (localStorage.getItem('admin_notify_email')||'').trim();
       if(_saKey) {
         _ensureAppUsersLoaded().then(() => {
           _loadGroupMemberEmails(_saKey).then(() => { refreshOverdueBadge(); });
@@ -7421,63 +6901,48 @@ async function overlayAdminLogin(){
     };
     if(_fbReady && _db){
       _db.collection('settings').doc('admin').get()
-        .then(async d=>{ let s=(d.exists&&d.data().password)?d.data().password:(localStorage.getItem('tp_skrtask_admin_password')||_DEFAULT_PWD); await _doSuperLogin(s); })
-        .catch(async ()=>_doSuperLogin(localStorage.getItem('tp_skrtask_admin_password')||_DEFAULT_PWD));
+        .then(async d=>{ let s=(d.exists&&d.data().password)?d.data().password:(localStorage.getItem('admin_password')||_DEFAULT_PWD); await _doSuperLogin(s); })
+        .catch(async ()=>_doSuperLogin(localStorage.getItem('admin_password')||_DEFAULT_PWD));
     } else {
-      await _doSuperLogin(localStorage.getItem('tp_skrtask_admin_password')||_DEFAULT_PWD);
+      await _doSuperLogin(localStorage.getItem('admin_password')||_DEFAULT_PWD);
     }
     return;
   }
 
   // ── Check if email matches a plant owner (only if not a regular appUser) ─
-  // Always fetch plant groups fresh from Firestore at login so we never miss
-  // a plant owner because localStorage hasn't synced yet (new device/browser).
-  let _overlayPlantGroups = getPlantGroups();
-  if (_fbReady && _db) {
-    try {
-      const _pgSnap = await _db.collection('settings').doc('plantGroups').get();
-      if (_pgSnap.exists && Array.isArray(_pgSnap.data().plants)) {
-        _overlayPlantGroups = _pgSnap.data().plants;
-        localStorage.setItem('tp_skrtask_pg_plants', JSON.stringify(_overlayPlantGroups));
-      }
-    } catch(e) { /* fall back to localStorage value */ }
-  }
+  const _overlayPlantGroups = getPlantGroups();
   const _overlayMatchedPlant = _overlayPlantGroups.find(p =>
     (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
   );
   if (_overlayMatchedPlant) {
-    // Only redirect to plant owner login if NOT also an active/pending regular appUser.
-    // A 'removed' or 'disabled' appUsers record must NOT block the plant owner path.
+    // Only redirect to plant owner login if NOT also a regular appUser
     let _isRegularUser = false;
     try {
       const _userSnap = await _db.collection('appUsers').doc(email).get();
-      if (_userSnap.exists) {
-        const _uStatus = (_userSnap.data().status || 'active');
-        if (_uStatus !== 'removed' && _uStatus !== 'disabled') _isRegularUser = true;
-      }
+      if (_userSnap.exists) _isRegularUser = true;
     } catch(e) { /* fall through to plant owner */ }
     if (!_isRegularUser) {
-      // Pure plant owner — remove overlay and verify plant password inline
+      // Remove overlay first, then show plant owner login screen
       const _ov = document.getElementById('admin-pwd-overlay');
       if(_ov) _ov.remove();
-      await _doPlantOwnerLogin(_overlayMatchedPlant, email, entered, err);
+      showPlantOwnerLoginScreen();
+      setTimeout(() => {
+        const emailInp = document.getElementById('plant-email-input');
+        const plantSel = document.getElementById('plant-login-select');
+        const pwdInp   = document.getElementById('plant-pwd-input');
+        if (emailInp) { emailInp.value = email; }
+        if (plantSel) { plantSel.value = _overlayMatchedPlant.id; }
+        if (pwdInp)   { pwdInp.value = entered; plantOwnerLogin(); }
+      }, 80);
       return;
     }
-    // else: also a regular appUser — fall through to normal login below
+    // else: email exists in appUsers — fall through to normal login below
   }
 
   // ── Admin / User path — check appUsers collection ──────────────────
   const bfKey = 'user:' + email;
   const bf = await _bfCheck(bfKey);
   if(bf.locked){
-    // If this email is a plant owner, clear the user: BF key and route to plant login
-    const _bfOvPlant = _overlayPlantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
-    if (_bfOvPlant) {
-      _bfRecord(bfKey, true).catch(()=>{});
-      const _ovBfEl = document.getElementById('admin-pwd-overlay'); if(_ovBfEl) _ovBfEl.remove();
-      await _doPlantOwnerLogin(_bfOvPlant, email, entered, err);
-      return;
-    }
     if(err){err.textContent='⏳ Too many failed attempts. Locked for '+bf.remaining+' minute(s).';err.style.display='block';}
     return;
   }
@@ -7492,22 +6957,8 @@ async function overlayAdminLogin(){
     }
     const u = snap.data();
     if (u.status === 'pending') { if(err){err.textContent='❌ Account pending. Check your email.';err.style.display='block';} return; }
-    if (u.status === 'disabled') {
-      const _disabledPlant = _overlayPlantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
-      if (_disabledPlant) {
-        const _ov2 = document.getElementById('admin-pwd-overlay'); if(_ov2) _ov2.remove();
-        await _doPlantOwnerLogin(_disabledPlant, email, entered, err); return;
-      }
-      if(err){err.textContent='❌ Account disabled. Contact Super Admin.';err.style.display='block';} return;
-    }
-    if (u.status === 'removed') {
-      const _removedPlant = _overlayPlantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
-      if (_removedPlant) {
-        const _ov3 = document.getElementById('admin-pwd-overlay'); if(_ov3) _ov3.remove();
-        await _doPlantOwnerLogin(_removedPlant, email, entered, err); return;
-      }
-      if(err){err.textContent='❌ Account removed. Contact Super Admin to restore access.';err.style.display='block';} return;
-    }
+    if (u.status === 'disabled') { if(err){err.textContent='❌ Account disabled. Contact Super Admin.';err.style.display='block';} return; }
+    if (u.status === 'removed') { if(err){err.textContent='❌ Account removed. Contact Super Admin to restore access.';err.style.display='block';} return; }
 
     const isFirstLogin = u.mustChangePassword === true;
     const ok = isFirstLogin
@@ -7545,7 +6996,37 @@ async function overlayAdminLogin(){
       (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
     );
     if (_poMatchedOverlay) {
-      _activatePlantOwnerSession(_poMatchedOverlay, email);
+      currentSession = null; // plant owners don't use currentSession
+      plantOwnerAuthenticated = true;
+      adminAuthenticated = false;
+      currentPlantSession = _poMatchedOverlay;
+      _activePlantId = _poMatchedOverlay.id;
+      _plantOwnerEmail = email;
+      document.body.classList.add('plant-owner-mode');
+      // Show nav and task buttons exactly like plantOwnerLogin() does
+      document.getElementById('admin-nav').style.display = 'block';
+      document.getElementById('btn-new-task').style.display = 'flex';
+      document.getElementById('btn-bulk-upload').style.display = 'flex';
+      document.getElementById('btn-export').style.display = 'flex';
+      // Hide Admin/User mode toggle — plant owners never see this
+      document.getElementById('btn-admin-mode').style.display = 'none';
+      document.getElementById('btn-user-mode').style.display = 'none';
+      const _poModeLabel = document.querySelector('.sidebar-mode-label');
+      if(_poModeLabel) _poModeLabel.style.display = 'none';
+      const _poSb = document.querySelector('.sidebar-bottom');
+      if(_poSb){ _poSb.style.display=''; _poSb.style.visibility=''; }
+      // Update topbar
+      const _poAvatar = document.getElementById('topbar-avatar');
+      if(_poAvatar){ _poAvatar.textContent = _poMatchedOverlay.name[0].toUpperCase(); _poAvatar.style.background='linear-gradient(135deg,var(--green),var(--cyan))'; }
+      document.getElementById('topbar-title').textContent = '🏭 ' + _poMatchedOverlay.name;
+      _setSettingsNavVisible(false);
+      _renderTopbarUserBadge();
+      const _poSaiO = document.getElementById('sidebar-account-info');
+      if(_poSaiO) _poSaiO.style.display = 'block';
+      _updateSidebarAccountInfo();
+      renderPlantNav();
+      toast('Welcome, ' + _poMatchedOverlay.name + ' Owner! 🏭');
+      showPlantPanel(_poMatchedOverlay.id);
       return;
     }
 
@@ -7572,22 +7053,17 @@ async function unifiedLogin() {
   // email (admin_notify_email). This prevents regular users from accidentally
   // logging in as superadmin if they share the same password.
   const _DEFAULT_PWD = 'poly@123';
-  const _uniSuperAdminEmail = (localStorage.getItem('tp_skrtask_admin_notify_email') || '').trim().toLowerCase();
-  // Only allow superadmin login for the configured email.
-  // If no email is configured yet, only allow the literal 'superadmin' keyword
-  // to prevent any arbitrary email from attempting the admin password.
-  const _uniEmailIsSuperAdmin = _uniSuperAdminEmail
-    ? email === _uniSuperAdminEmail
-    : email === 'superadmin';
+  const _uniSuperAdminEmail = (localStorage.getItem('admin_notify_email') || '').trim().toLowerCase();
+  const _uniEmailIsSuperAdmin = !_uniSuperAdminEmail || email === _uniSuperAdminEmail;
 
   const isSuperAdminPw = _uniEmailIsSuperAdmin && await (async () => {
     try {
       let stored = _DEFAULT_PWD;
       if (_fbReady && _db) {
         const d = await _db.collection('settings').doc('admin').get().catch(() => null);
-        stored = (d && d.exists && d.data().password) ? d.data().password : (localStorage.getItem('tp_skrtask_admin_password') || _DEFAULT_PWD);
+        stored = (d && d.exists && d.data().password) ? d.data().password : (localStorage.getItem('admin_password') || _DEFAULT_PWD);
       } else {
-        stored = localStorage.getItem('tp_skrtask_admin_password') || _DEFAULT_PWD;
+        stored = localStorage.getItem('admin_password') || _DEFAULT_PWD;
       }
       return await _verifyPw(stored, pwd, 'admin');
     } catch(e) { return false; }
@@ -7608,54 +7084,39 @@ async function unifiedLogin() {
   // also a regular appUser account in Firestore. This prevents users
   // who were previously plant owners (but have since been removed) from
   // being incorrectly routed to the plant owner login screen.
-  // Always fetch from Firestore at login so new devices/browsers see current plant data.
-  let _plantGroups = getPlantGroups();
-  if (_fbReady && _db) {
-    try {
-      const _pgSnap2 = await _db.collection('settings').doc('plantGroups').get();
-      if (_pgSnap2.exists && Array.isArray(_pgSnap2.data().plants)) {
-        _plantGroups = _pgSnap2.data().plants;
-        localStorage.setItem('tp_skrtask_pg_plants', JSON.stringify(_plantGroups));
-      }
-    } catch(e) { /* fall back to localStorage value */ }
-  }
+  const _plantGroups = getPlantGroups();
   const _matchedPlant = _plantGroups.find(p =>
     (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
   );
   if (_matchedPlant) {
-    // Check if email is ALSO an active regular appUser — if so, try appUser login first.
+    // Check Firestore first — if email exists as a regular user, skip plant owner redirect
     let _isRegularUser = false;
     if (_fbReady && _db) {
       try {
         const _userSnap = await _db.collection('appUsers').doc(email).get();
-        if (_userSnap.exists) {
-          const _uStatus = (_userSnap.data().status || 'active');
-          if (_uStatus !== 'removed' && _uStatus !== 'disabled') _isRegularUser = true;
-        }
-      } catch(e) { /* ignore */ }
+        if (_userSnap.exists) _isRegularUser = true;
+      } catch(e) { /* ignore, fall through to plant owner login */ }
     }
     if (!_isRegularUser) {
-      // Pure plant owner — verify plant password right here, no second screen
-      await _doPlantOwnerLogin(_matchedPlant, email, pwd, err);
+      // Redirect to plant owner login screen with email pre-filled
+      showPlantOwnerLoginScreen();
+      setTimeout(() => {
+        const emailInp = document.getElementById('plant-email-input');
+        const plantSel = document.getElementById('plant-login-select');
+        const pwdInp   = document.getElementById('plant-pwd-input');
+        if (emailInp) { emailInp.value = email; }
+        if (plantSel) { plantSel.value = _matchedPlant.id; }
+        if (pwdInp)   { pwdInp.value = pwd; plantOwnerLogin(); }
+      }, 80);
       return;
     }
-    // else: also a regular appUser — fall through to appUsers login below
-    // (after which _activatePlantOwnerSession is called if plant match found)
+    // else: fall through to normal Firestore user login below
   }
 
   // ── 3. Check admin / user accounts stored in Firestore ─────────────
   const bfKey = 'user:' + email;
   const bf = await _bfCheck(bfKey);
   if (bf.locked) {
-    // If this email is a plant owner, clear the user: BF key and route to plant login
-    // instead of showing the lockout — plant owners must never be blocked by appUsers BF
-    const _bfPlantMatch = _plantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
-    if (_bfPlantMatch) {
-      // Plant owner locked by wrong-path BF — clear it and auth via plant password inline
-      _bfRecord(bfKey, true).catch(()=>{});
-      await _doPlantOwnerLogin(_bfPlantMatch, email, pwd, err);
-      return;
-    }
     err.textContent = '⏳ Too many failed attempts. Locked for ' + bf.remaining + ' minute(s).';
     err.style.display = 'block'; return;
   }
@@ -7677,13 +7138,9 @@ async function unifiedLogin() {
       err.textContent = '❌ Your account is pending activation. Check your email.'; err.style.display='block'; return;
     }
     if (u.status === 'disabled') {
-      const _uniDisabledPlant = _plantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
-      if (_uniDisabledPlant) { await _doPlantOwnerLogin(_uniDisabledPlant, email, pwd, err); return; }
       err.textContent = '❌ Your account has been disabled. Contact Super Admin.'; err.style.display='block'; return;
     }
     if (u.status === 'removed') {
-      const _uniRemovedPlant = _plantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
-      if (_uniRemovedPlant) { await _doPlantOwnerLogin(_uniRemovedPlant, email, pwd, err); return; }
       err.textContent = '❌ Your account was removed. Contact Super Admin to restore access.'; err.style.display='block'; return;
     }
 
@@ -7721,16 +7178,44 @@ async function unifiedLogin() {
     }
 
     // ── Plant owner check ─────────────────────────────────────────────
-    // IMPORTANT: Use the _plantGroups already fetched from Firestore earlier
-    // in this login flow (step 2), NOT getPlantGroups() which reads from
-    // localStorage and may be stale/empty on first load. This is the root
-    // cause of Aakash's login failure: localStorage hadn't synced yet, so
-    // getPlantGroups() returned [] and he was treated as a regular user.
-    const _poMatchedUnified = _plantGroups.find(p =>
+    // If this appUser email is also listed as a plant owner in plantGroups,
+    // activate plant owner session instead of the regular admin/user dashboard.
+    const _poGroupsUnified = getPlantGroups();
+    const _poMatchedUnified = _poGroupsUnified.find(p =>
       (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
     );
     if (_poMatchedUnified) {
-      _activatePlantOwnerSession(_poMatchedUnified, email);
+      currentSession = null; // plant owners don't use currentSession
+      plantOwnerAuthenticated = true;
+      adminAuthenticated = false;
+      currentPlantSession = _poMatchedUnified;
+      _activePlantId = _poMatchedUnified.id;
+      _plantOwnerEmail = email;
+      document.body.classList.add('plant-owner-mode');
+      // Show nav and task buttons exactly like plantOwnerLogin() does
+      document.getElementById('admin-nav').style.display = 'block';
+      document.getElementById('btn-new-task').style.display = 'flex';
+      document.getElementById('btn-bulk-upload').style.display = 'flex';
+      document.getElementById('btn-export').style.display = 'flex';
+      // Hide Admin/User mode toggle — plant owners never see this
+      document.getElementById('btn-admin-mode').style.display = 'none';
+      document.getElementById('btn-user-mode').style.display = 'none';
+      const _poModeLabel = document.querySelector('.sidebar-mode-label');
+      if(_poModeLabel) _poModeLabel.style.display = 'none';
+      const _poSb = document.querySelector('.sidebar-bottom');
+      if(_poSb){ _poSb.style.display=''; _poSb.style.visibility=''; }
+      // Update topbar
+      const _poAvatar = document.getElementById('topbar-avatar');
+      if(_poAvatar){ _poAvatar.textContent = _poMatchedUnified.name[0].toUpperCase(); _poAvatar.style.background='linear-gradient(135deg,var(--green),var(--cyan))'; }
+      document.getElementById('topbar-title').textContent = '🏭 ' + _poMatchedUnified.name;
+      _setSettingsNavVisible(false);
+      _renderTopbarUserBadge();
+      const _poSaiU = document.getElementById('sidebar-account-info');
+      if(_poSaiU) _poSaiU.style.display = 'block';
+      _updateSidebarAccountInfo();
+      renderPlantNav();
+      toast('Welcome, ' + _poMatchedUnified.name + ' Owner! 🏭');
+      showPlantPanel(_poMatchedUnified.id);
       return;
     }
 
@@ -8457,8 +7942,8 @@ function _updateSidebarAccountInfo() {
       roleLabel = 'Plant Owner';
     } else {
       // Superadmin — use admin_notify_email + self_name
-      email     = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim();
-      nick      = localStorage.getItem('tp_skrtask_self_name') || 'Sushil';
+      email     = (localStorage.getItem('admin_notify_email')||'').trim();
+      nick      = localStorage.getItem('self_name') || 'Sushil';
       roleLabel = 'Super Admin';
     }
     const initial = nick ? nick[0].toUpperCase() : (email ? email[0].toUpperCase() : 'S');
@@ -8483,7 +7968,7 @@ function buildGlobalMemberBar() {
   // Resolve self identity for all roles including superadmin
   const selfEmail = _getMyEmail(); // works for superadmin, admin, user, plant owner
   const selfNick  = getSessionNick()
-    || localStorage.getItem('tp_skrtask_self_name')
+    || localStorage.getItem('self_name')
     || (selfEmail ? selfEmail.split('@')[0] : 'Me');
 
   // Gather: self + accepted group members + pending invitees
@@ -8705,11 +8190,12 @@ function _activateRoleSession(role) {
     toast('Welcome, ' + getSessionNick() + '! (Admin) 👋');
     showPanel('dashboard');
   } else if (role === 'user') {
-    // Users NEVER get adminAuthenticated — that flag is exclusively for SuperAdmin
-    adminAuthenticated = false;
+    adminAuthenticated = true;
     document.getElementById('btn-new-task').style.display = 'flex';
+    // Hide superadmin-only mode toggle — not relevant for user role
     document.getElementById('btn-admin-mode').style.display = 'none';
     document.getElementById('btn-user-mode').style.display = 'none';
+    // Hide the "View Mode" label (only relevant for superadmin)
     const _userModeLabel = document.querySelector('.sidebar-mode-label');
     if(_userModeLabel) _userModeLabel.style.display = 'none';
     _setSettingsNavVisible(false);
@@ -8744,7 +8230,7 @@ function _activateRoleSession(role) {
   // loaded inside their respective role branches above — skip this block.
   if(!currentSession) {
     buildGlobalMemberBar();
-    const _saEmail = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim();
+    const _saEmail = (localStorage.getItem('admin_notify_email')||'').trim();
     if(_saEmail) {
       _ensureAppUsersLoaded().then(() => {
         _loadGroupMemberEmails(_saEmail).then(() => { refreshOverdueBadge(); });
@@ -8803,7 +8289,7 @@ function _renderTopbarUserBadge() {
     }
     // Superadmin: show "Sushil" in topbar
     if (nameEl)  nameEl.textContent  = 'Sushil (Super Admin)';
-    if (emailEl) emailEl.textContent = localStorage.getItem('tp_skrtask_admin_notify_email') || '';
+    if (emailEl) emailEl.textContent = localStorage.getItem('admin_notify_email') || '';
     if (avatar)  { avatar.textContent = 'S'; avatar.title = 'Sushil'; }
     if (info)    info.style.display = 'flex';
     return;
@@ -8961,9 +8447,9 @@ async function _sendRegistration() {
 async function _sendRegistrationEmail(toEmail, nickname, role, setPasswordUrl) {
   const transport   = emailTransport();
   const displayName = nickname || toEmail.split('@')[0];
-  const companyName = localStorage.getItem('tp_skrtask_company_name') || 'POLYPLASTICS';
+  const companyName = localStorage.getItem('company_name') || 'POLYPLASTICS';
   const senderName  = adminAuthenticated && !currentSession ? 'Super Admin' : (getSessionNick() || 'Admin');
-  const logoUrl     = localStorage.getItem('tp_skrtask_company_logo_url') || '';
+  const logoUrl     = localStorage.getItem('company_logo_url') || '';
   const roleLabel   = role.charAt(0).toUpperCase() + role.slice(1);
 
   const logoBlock = logoUrl
@@ -9264,8 +8750,8 @@ async function _sendPasswordResetLink(email) {
 
 async function _sendPasswordResetEmail(toEmail, nickname, resetUrl) {
   const transport   = emailTransport();
-  const companyName = localStorage.getItem('tp_skrtask_company_name') || 'POLYPLASTICS';
-  const logoUrl     = localStorage.getItem('tp_skrtask_company_logo_url') || '';
+  const companyName = localStorage.getItem('company_name') || 'POLYPLASTICS';
+  const logoUrl     = localStorage.getItem('company_logo_url') || '';
   const displayName = nickname || toEmail.split('@')[0];
 
   const logoBlock = logoUrl
@@ -9356,7 +8842,7 @@ async function _sendPasswordResetEmail(toEmail, nickname, resetUrl) {
 // ═══════════════════════════════════════════════════════════════════════
 function showChangeSuperAdminEmail() {
   if(!isSuperAdmin()) { toast('Super Admin only.','var(--red)'); return; }
-  const currentEmail = localStorage.getItem('tp_skrtask_admin_notify_email') || '';
+  const currentEmail = localStorage.getItem('admin_notify_email') || '';
   const c = document.getElementById('content');
   c.innerHTML = `
   <div class="panel-title fade-in">✉️ Change Super Admin Email</div>
@@ -9372,7 +8858,7 @@ function showChangeSuperAdminEmail() {
       </div>
       <div class="form-group">
         <label class="form-label">Display Name <span style="color:var(--text3);font-size:11px">(optional)</span></label>
-        <input id="sa-display-name" class="form-input" placeholder="e.g. Super Admin" value="${esc(localStorage.getItem('tp_skrtask_self_name')||'')}"/>
+        <input id="sa-display-name" class="form-input" placeholder="e.g. Super Admin" value="${esc(localStorage.getItem('self_name')||'')}"/>
       </div>
       <div id="sa-email-status" style="font-size:12px;min-height:16px;margin-bottom:10px"></div>
       <button class="btn btn-primary" onclick="_saveSuperAdminEmail()">💾 Save Email</button>
@@ -9394,8 +8880,8 @@ function _saveSuperAdminEmail() {
   const name  = (document.getElementById('sa-display-name')?.value||'').trim();
   const st    = document.getElementById('sa-email-status');
   if(!email || !email.includes('@')){ st.textContent='❌ Enter a valid email.'; st.style.color='var(--red)'; return; }
-  localStorage.setItem('tp_skrtask_admin_notify_email', email);
-  if(name) localStorage.setItem('tp_skrtask_self_name', name);
+  localStorage.setItem('admin_notify_email', email);
+  if(name) localStorage.setItem('self_name', name);
   st.textContent='✅ Email saved!'; st.style.color='var(--green)';
   toast('✅ Super Admin email updated to '+email,'var(--green)');
   // Update topbar display
@@ -9410,7 +8896,7 @@ function showGroupManagementPanel() {
   if (!isSA && (!currentSession || currentSession.role !== 'admin')) {
     toast('Only Super Admin and Admin accounts can manage groups.', 'var(--red)'); return;
   }
-  const adminEmail = isSA ? (localStorage.getItem('tp_skrtask_admin_notify_email') || 'superadmin') : currentSession.email;
+  const adminEmail = isSA ? (localStorage.getItem('admin_notify_email') || 'superadmin') : currentSession.email;
   const adminNick  = isSA ? 'Super Admin' : (currentSession.nickname || currentSession.email);
 
   if (!_fbReady || !_db) { toast('Database not ready.','var(--red)'); return; }
@@ -9552,7 +9038,7 @@ async function _sendGroupInviteEmail(toEmail, toName, fromEmail, fromName, group
   const baseUrl   = window.location.href.split('?')[0];
   // Deep-link URL: clicking it opens the accept/reject panel directly after login
   const deepLinkUrl = baseUrl + '?grpinvite=' + encodeURIComponent(fromEmail + '::' + (groupId||'')) + '&gi_email=' + encodeURIComponent(toEmail);
-  const company   = localStorage.getItem('tp_skrtask_company_name') || 'POLYPLASTICS';
+  const company   = localStorage.getItem('company_name') || 'POLYPLASTICS';
   const subject   = '[' + company + '] ' + fromName + ' wants to add you to their group';
   const html = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f0f2f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" style="padding:32px 16px;"><tr><td align="center">
@@ -9861,12 +9347,12 @@ let _userPage = 0;
 async function renderUserManagementSection() {
   if (!_fbReady || !_db) return '<div style="color:var(--text3)">Loading...</div>';
   try {
-    // Always fetch fresh from Firestore — the realtime listener keeps _allAppUsers
-    // up to date after this point, so subsequent renders use the live cache.
+    // Paginated Firestore read: fetch in batches of 25 using startAfter cursor
+    // For initial load, get first 25 ordered by email
     const snap = await _db.collection('appUsers').orderBy('email').limit(250).get();
     _allAppUsers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     _userPage = 0;
-    if (!_allAppUsers.length) return '<div id="user-management-container" style="color:var(--text3);font-size:13px">No accounts yet. Send a registration link to create users.</div>';
+    if (!_allAppUsers.length) return '<div style="color:var(--text3);font-size:13px">No accounts yet. Send a registration link to create users.</div>';
     _renderUserPage();
     return ''; // _renderUserPage populates the container directly
   } catch(e) { return '<div style="color:var(--red)">Error: ' + e.message + '</div>'; }
@@ -9876,33 +9362,8 @@ function _getFilteredUsers() {
   const q      = (document.getElementById('user-search')?.value || '').toLowerCase();
   const role   = document.getElementById('user-role-filter')?.value || '';
   const status = document.getElementById('user-status-filter')?.value || '';
-
-  // Build synthetic plant-owner entries from plantGroups for owners who have
-  // no appUsers doc (like Aakash) — so they appear in search results too.
-  const appUserEmails = new Set(_allAppUsers.map(u => (u.email||'').toLowerCase()));
-  const plantOwnerEntries = [];
-  getPlantGroups().forEach(plant => {
-    (plant.owners || []).forEach(ownerEmail => {
-      const low = (ownerEmail || '').trim().toLowerCase();
-      if (!low) return;
-      if (appUserEmails.has(low)) return; // already in appUsers — don't duplicate
-      plantOwnerEntries.push({
-        id: '_plant_owner_' + plant.id + '_' + low,
-        email: low,
-        nickname: low.split('@')[0],
-        role: 'plant-owner',
-        status: 'active',
-        _plantName: plant.name,
-        _plantId: plant.id,
-        _isPlantOwnerOnly: true  // flag: no appUsers doc, managed via Plant Groups
-      });
-    });
-  });
-
-  const combined = [..._allAppUsers, ...plantOwnerEntries];
-
-  return combined.filter(u => {
-    const matchQ      = !q      || (u.email||'').toLowerCase().includes(q) || (u.nickname||'').toLowerCase().includes(q) || (u._plantName||'').toLowerCase().includes(q);
+  return _allAppUsers.filter(u => {
+    const matchQ      = !q      || (u.email||'').toLowerCase().includes(q) || (u.nickname||'').toLowerCase().includes(q);
     const matchRole   = !role   || (u.role||'user') === role;
     const matchStatus = !status || (u.status||'active') === status;
     return matchQ && matchRole && matchStatus;
@@ -9921,44 +9382,16 @@ function _renderUserPage() {
   const pageUsers = filtered.slice(start, start + _USER_PAGE_SIZE);
   const totalPages = Math.ceil(total / _USER_PAGE_SIZE);
 
-  const _allCombined = _getFilteredUsers(); // already includes plant owners
-  const _totalAll = (() => {
-    const appUserEmails = new Set(_allAppUsers.map(u => (u.email||'').toLowerCase()));
-    const plantOnlyCount = [];
-    getPlantGroups().forEach(plant => {
-      (plant.owners||[]).forEach(e => { const l=(e||'').trim().toLowerCase(); if(l&&!appUserEmails.has(l)) plantOnlyCount.push(l); });
-    });
-    return _allAppUsers.length + [...new Set(plantOnlyCount)].length;
-  })();
   const label = document.getElementById('user-count-label');
-  if (label) label.textContent = total + ' account' + (total !== 1 ? 's' : '') + (total < _totalAll ? ' (filtered from ' + _totalAll + ')' : '');
+  if (label) label.textContent = total + ' account' + (total !== 1 ? 's' : '') + (total < _allAppUsers.length ? ' (filtered from ' + _allAppUsers.length + ')' : '');
 
-  // Tag the nearest ancestor so the realtime snapshot knows user panel is open
-  const _umc = document.getElementById('user-mgmt-list');
-  if (_umc && _umc.parentElement) _umc.parentElement.id = 'user-management-container';
   const list = document.getElementById('user-mgmt-list');
   if (list) {
     if (!pageUsers.length) {
       list.innerHTML = '<div style="color:var(--text3);font-size:13px;padding:12px 0">No accounts match your search.</div>';
     } else {
-      list.innerHTML = pageUsers.map(u => {
-        // ── Plant-owner-only row (no appUsers doc) ──
-        if (u._isPlantOwnerOnly) {
-          return `<div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">
-            <div style="width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--green),var(--cyan));display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff;flex-shrink:0;">${esc((u.email||'?')[0].toUpperCase())}</div>
-            <div style="flex:1;min-width:0;">
-              <div style="font-weight:600;font-size:13px">${esc(u.email)}
-                <span style="background:rgba(23,224,138,.15);color:var(--green);border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">🏭 Plant Owner</span>
-                <span style="background:rgba(91,141,238,.08);color:var(--text3);border-radius:4px;padding:1px 7px;font-size:10px;">${esc(u._plantName||'')}</span>
-              </div>
-              <div style="font-size:11px;color:var(--text3);margin-top:1px;">Managed via Settings → Plant Groups</div>
-            </div>
-            <div style="font-size:11px;color:var(--green);margin-right:2px;">active</div>
-            <span style="font-size:11px;color:var(--text3);padding:4px 8px;border:1px solid var(--border);border-radius:6px;">Plant Groups ↗</span>
-          </div>`;
-        }
-        // ── Regular appUsers row ──
-        return `<div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">
+      list.innerHTML = pageUsers.map(u => `
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">
           <div style="width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--purple));display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff;flex-shrink:0;">${esc((u.nickname||u.email||'?')[0].toUpperCase())}</div>
           <div style="flex:1;min-width:0;">
             <div style="font-weight:600;font-size:13px">${esc(u.nickname||'—')} <span style="background:rgba(91,141,238,.15);color:var(--accent);border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">${esc(u.role||'user')}</span></div>
@@ -9975,8 +9408,7 @@ function _renderUserPage() {
             : `<button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--cyan)" title="Send password reset link to user" onclick="_sendPasswordResetLink('${esc(u.email)}')">🔑 Reset Pwd</button>
                <button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="_toggleAppUser('${esc(u.id)}','${esc(u.status||'active')}')">${(u.status||'active')==='active'?'Disable':'Enable'}</button>
                <button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--red)" title="Remove this account — keeps their record but blocks login until restored" onclick="_deleteAppUser('${esc(u.id)}','${esc(u.nickname||u.email||u.id)}')">Remove</button>`}
-        </div>`;
-      }).join('');
+        </div>`).join('');
     }
   }
 
@@ -10025,9 +9457,7 @@ async function _deleteAppUser(docId, displayName) {
   if (!confirm('Remove ' + displayName + ' (' + label + ')? They will be blocked from logging in and from receiving group requests until restored. Their record is kept so you can restore them later — use the 🗑 Delete option (after removing) if you want to erase them permanently instead.')) return;
   if (!docId) { toast('❌ Cannot remove: missing document ID.', 'var(--red)'); return; }
   try {
-    // Write to Firestore — onSnapshot listener will auto-refresh _allAppUsers & UI
     await _db.collection('appUsers').doc(docId).set({ status: 'removed', removedAt: new Date().toISOString() }, { merge: true });
-    // Also update in-memory immediately for instant UI response
     if (u) { u.status = 'removed'; u.removedAt = new Date().toISOString(); }
     _renderUserPage();
     toast('Account removed: ' + label + ' (restorable)', 'var(--amber)');
@@ -10039,9 +9469,7 @@ async function _restoreAppUser(docId) {
   const label = (u && u.email) ? u.email : ('doc: ' + docId);
   if (!confirm('Restore ' + label + '? They will be able to log in again and can receive group requests.')) return;
   try {
-    // Write to Firestore — onSnapshot listener auto-refreshes _allAppUsers & UI
     await _db.collection('appUsers').doc(docId).set({ status: 'active', removedAt: firebase.firestore.FieldValue.delete() }, { merge: true });
-    // Update in-memory immediately for instant UI response
     if (u) { u.status = 'active'; delete u.removedAt; }
     _renderUserPage();
     toast('✅ Account restored: ' + label, 'var(--green)');
@@ -10057,9 +9485,7 @@ async function _purgeAppUser(docId, displayName) {
   if (!confirm('Permanently delete ' + displayName + ' (' + label + ')? This cannot be undone and cannot be restored.')) return;
   if (!docId) { toast('❌ Cannot delete: missing document ID.', 'var(--red)'); return; }
   try {
-    // Hard delete from Firestore — onSnapshot listener auto-removes from _allAppUsers & re-renders
     await _db.collection('appUsers').doc(docId).delete();
-    // Also remove from in-memory immediately for instant UI response
     _allAppUsers = _allAppUsers.filter(u => u.id !== docId);
     _renderUserPage();
     toast('🗑 Account permanently deleted: ' + label, 'var(--red)');
@@ -10072,9 +9498,7 @@ async function _toggleAppUser(docId, currentStatus) {
   const newStatus = currentStatus === 'active' ? 'disabled' : 'active';
   if (!confirm((newStatus === 'disabled' ? 'Disable' : 'Enable') + ' account for ' + label + '?')) return;
   try {
-    // Write status change to Firestore directly — onSnapshot auto-refreshes UI
     await _db.collection('appUsers').doc(docId).set({ status: newStatus }, { merge: true });
-    // Update in-memory immediately for instant UI response
     if (u) u.status = newStatus;
     _renderUserPage();
     toast('Account ' + newStatus + ' for ' + label, newStatus === 'active' ? 'var(--green)' : 'var(--amber)');
@@ -10089,9 +9513,7 @@ async function _changeAppUserRole(docId, newRole) {
   const label = (u && u.email) ? u.email : ('doc: ' + docId);
   if (!confirm('Change role of ' + label + ' to "' + newRole + '"?')) { _renderUserPage(); return; }
   try {
-    // Write role change to Firestore directly — onSnapshot auto-refreshes UI
     await _db.collection('appUsers').doc(docId).set({ role: newRole }, { merge: true });
-    // Update in-memory immediately for instant UI response
     if (u) u.role = newRole;
     _renderUserPage();
     toast('Role updated to "' + newRole + '" for ' + label, 'var(--green)');
@@ -10114,7 +9536,7 @@ async function adminLogin(){
     // Auto-upgrade: if stored is plaintext, hash it now
     if(stored && !/^[0-9a-f]{64}$/.test(stored)){
       const hashed=await _hashPw(stored,'admin');
-      localStorage.setItem('tp_skrtask_admin_password',hashed);
+      localStorage.setItem('admin_password',hashed);
       if(_fbReady&&_db) _db.collection('settings').doc('admin').set({password:hashed},{merge:true}).catch(()=>{});
       stored=hashed;
     }
@@ -10155,15 +9577,15 @@ async function adminLogin(){
   const _DEFAULT_PWD = 'poly@123';
   if(_fbReady&&_db){
     _db.collection('settings').doc('admin').get().then(async d=>{
-      let stored = (d.exists&&d.data().password) ? d.data().password : (localStorage.getItem('tp_skrtask_admin_password') || _DEFAULT_PWD);
-      localStorage.setItem('tp_skrtask_admin_password',stored);
+      let stored = (d.exists&&d.data().password) ? d.data().password : (localStorage.getItem('admin_password') || _DEFAULT_PWD);
+      localStorage.setItem('admin_password',stored);
       await _doLogin(stored);
     }).catch(async ()=>{
-      let stored = localStorage.getItem('tp_skrtask_admin_password') || _DEFAULT_PWD;
+      let stored = localStorage.getItem('admin_password') || _DEFAULT_PWD;
       await _doLogin(stored);
     });
   } else {
-    let stored = localStorage.getItem('tp_skrtask_admin_password') || _DEFAULT_PWD;
+    let stored = localStorage.getItem('admin_password') || _DEFAULT_PWD;
     await _doLogin(stored);
   }
 }
@@ -10352,8 +9774,8 @@ function getAssignedByInfo(t){
   // identify "who assigned this", so searching by email actually finds it
   // even if the admin never explicitly configured a notify address.
   const emails=[...new Set([
-    localStorage.getItem('tp_skrtask_admin_notify_email')||'',
-    localStorage.getItem('tp_skrtask_self_email')||''
+    localStorage.getItem('admin_notify_email')||'',
+    localStorage.getItem('self_email')||''
   ].filter(Boolean))];
   return { label:'Head Office', emails };
 }
@@ -10876,7 +10298,7 @@ async function changeAdminPassword(){
   const current=document.getElementById('pwd-current').value;
   const newPwd=document.getElementById('pwd-new').value;
   const confirm=document.getElementById('pwd-confirm').value;
-  const stored=localStorage.getItem('tp_skrtask_admin_password')||'';
+  const stored=localStorage.getItem('admin_password')||'';
   const statusEl=document.getElementById('pwd-status');
   const curOk=await _verifyPw(stored,current,'admin');
   if(!curOk){statusEl.style.color='var(--red)';statusEl.textContent='❌ Current password is incorrect';return;}
@@ -10884,7 +10306,7 @@ async function changeAdminPassword(){
   if(newPwd!==confirm){statusEl.style.color='var(--red)';statusEl.textContent='❌ Passwords do not match';return;}
   // Hash new password before storing
   const hashed=await _hashPw(newPwd,'admin');
-  localStorage.setItem('tp_skrtask_admin_password',hashed);
+  localStorage.setItem('admin_password',hashed);
   if(_fbReady&&_db) _db.collection('settings').doc('admin').set({password:hashed},{merge:true}).catch(e=>console.warn('pwd save error',e));
   statusEl.style.color='var(--green)';statusEl.textContent='✅ Password updated successfully';
   document.getElementById('pwd-current').value='';
@@ -11112,10 +10534,10 @@ function saveTask(){
       const newStatus=document.getElementById('tm-status').value;
       const ccEmail = (document.getElementById('tm-cc')?.value||'').trim();
       const _poHint = getPlantOwnerLoginHint();
-      const _poEmail = _poHint || _plantOwnerEmail || (plantOwnerAuthenticated && currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : '');
+      const _poEmail = _poHint || (plantOwnerAuthenticated && currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : '');
       const _resolvedAssignedBy = t.assignedBy || _poEmail
         || (currentSession ? currentSession.email : '')
-        || localStorage.getItem('tp_skrtask_admin_notify_email') || '';
+        || localStorage.getItem('admin_notify_email') || '';
       const updated={...t,title,desc:document.getElementById('tm-desc').value,assignee,assigneeName:(document.getElementById('tm-assignee-name')?.value||'').trim()||t.assigneeName||'',department:(document.getElementById('tm-department')?.value||'').trim()||t.department||'',cc:ccEmail||t.cc||'',assignedBy:_resolvedAssignedBy,priority:newPriority,status:newStatus,due,completedDate:document.getElementById('tm-completedDate')?.value||t.completedDate||'',reminder:document.getElementById('tm-reminder').value,tags};
       updateTask(updated);
       // close modal & refresh UI immediately
@@ -11171,8 +10593,8 @@ function saveTask(){
       const ccEmail = (document.getElementById('tm-cc')?.value||'').trim();
       // Determine who is assigning: use current session email for all roles
       const plantOwnerHint = getPlantOwnerLoginHint();
-      const plantOwnerEmail = plantOwnerHint || _plantOwnerEmail || (plantOwnerAuthenticated && currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : '');
-      const adminEmail = localStorage.getItem('tp_skrtask_admin_notify_email')||'';
+      const plantOwnerEmail = plantOwnerHint || (plantOwnerAuthenticated && currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : '');
+      const adminEmail = localStorage.getItem('admin_notify_email')||'';
       // Role-based: currentSession email wins over stored admin email
       const assignedByEmail = plantOwnerEmail
         || (currentSession ? currentSession.email : '')
@@ -11236,7 +10658,7 @@ function saveTask(){
             }
           });
           // Plant admin notification to superadmin — ONLY when the superadmin is the assignee
-          const _saEmail = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim().toLowerCase();
+          const _saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
           if(plantOwnerAuthenticated && currentPlantSession && _saEmail && (nt.assignee||'').toLowerCase() === _saEmail){
             sendAdminTaskCreationEmail(nt).catch(e=>console.warn('admin email error:',e));
           }
@@ -11462,10 +10884,10 @@ function renderMyTasks(){
     selfName  = userEmail||'Me';
   } else {
     // Superadmin: use admin_notify_email (set in Settings → Email Integration)
-    selfEmail = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim();
-    selfName  = localStorage.getItem('tp_skrtask_self_name')||'Super Admin';
+    selfEmail = (localStorage.getItem('admin_notify_email')||'').trim();
+    selfName  = localStorage.getItem('self_name')||'Super Admin';
     // Fallback to legacy self_email if admin_notify_email not set
-    if(!selfEmail) selfEmail = localStorage.getItem('tp_skrtask_self_email')||'';
+    if(!selfEmail) selfEmail = localStorage.getItem('self_email')||'';
   }
 
   // If still no identity for superadmin — prompt them to set admin email in Settings
@@ -11482,7 +10904,7 @@ function renderMyTasks(){
         <button class="btn btn-primary" onclick="showPanel('settings')">⚙ Go to Settings</button>
         <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:200px;">
           <input id="self-email-inp" class="form-input" type="email" placeholder="Or enter your email here…" style="flex:1;"/>
-          <button class="btn btn-ghost" onclick="(()=>{ const e=document.getElementById('self-email-inp')?.value?.trim(); if(e){ localStorage.setItem('tp_skrtask_admin_notify_email',e); renderMyTasks(); } })()">Go</button>
+          <button class="btn btn-ghost" onclick="(()=>{ const e=document.getElementById('self-email-inp')?.value?.trim(); if(e){ localStorage.setItem('admin_notify_email',e); renderMyTasks(); } })()">Go</button>
         </div>
       </div>
     </div>`;
@@ -11524,7 +10946,7 @@ function renderMyTasks(){
   ${(!currentSession && mode==='admin')?`
   <div style="background:rgba(91,141,238,.07);border:1px solid var(--border2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:var(--text2);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
     <span>Identity: <strong style="color:var(--text)">${selfName}</strong> &lt;${selfEmail}&gt;</span>
-    <button class="btn btn-ghost btn-sm" onclick="localStorage.removeItem('tp_skrtask_self_email');localStorage.removeItem('tp_skrtask_self_name');renderMyTasks()">Change Identity</button>
+    <button class="btn btn-ghost btn-sm" onclick="localStorage.removeItem('self_email');localStorage.removeItem('self_name');renderMyTasks()">Change Identity</button>
   </div>`:''}
 
   <!-- View tabs: Assigned to Me / Assigned by Me -->
@@ -11574,7 +10996,7 @@ function filterMyTasks(filter){
   } else {
     selfEmail = currentSession ? currentSession.email
       : mode==='user' ? (userEmail||'')
-      : (localStorage.getItem('tp_skrtask_self_email')||'');
+      : (localStorage.getItem('self_email')||'');
   }
   // Update the filter label pill
   const lbl = document.getElementById('mytasks-filter-label');
@@ -11604,7 +11026,7 @@ function handleMyTasksAssignedBySearch(val){
   } else {
     selfEmail = currentSession ? currentSession.email
       : mode==='user' ? (userEmail||'')
-      : (localStorage.getItem('tp_skrtask_self_email')||'');
+      : (localStorage.getItem('self_email')||'');
   }
   renderMyTaskList(selfEmail, myTasksFilter);
 }
@@ -11697,7 +11119,7 @@ function switchMyTasksViewTab(tab){
   let selfEmail = '';
   if(currentSession) selfEmail = currentSession.email;
   else if(mode==='user') selfEmail = userEmail||'';
-  else selfEmail = (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim();
+  else selfEmail = (localStorage.getItem('admin_notify_email')||'').trim();
 
   // Rebuild assigned-by list
   const assignedByMeT = tasks.filter(t => (t.assignedBy||'').toLowerCase() === selfEmail.toLowerCase() && (t.assignee||'').toLowerCase() !== selfEmail.toLowerCase()).filter(t=>{
@@ -11904,8 +11326,8 @@ function saveSelfIdentity(){
   const name=(document.getElementById('self-name-inp')?.value||'').trim();
   const email=(document.getElementById('self-email-inp')?.value||'').trim();
   if(!name||!email){toast('Please enter both name and email','var(--red)');return;}
-  localStorage.setItem('tp_skrtask_self_name',name);
-  localStorage.setItem('tp_skrtask_self_email',email);
+  localStorage.setItem('self_name',name);
+  localStorage.setItem('self_email',email);
   toast('Identity saved!');
   showPanel('mytasks');
 }
@@ -11922,7 +11344,7 @@ function quickStatusCycle(id){
   const LABEL_TO_FILTER = {'All':'all','To Do':'To Do','In Progress':'In Progress','Review':'Review','Done':'Done','Overdue':'overdue'};
   const currentFilter = lbl ? (LABEL_TO_FILTER[lbl.textContent] || 'all') : 'all';
   if(document.getElementById('my-task-list')){
-    const se = plantOwnerAuthenticated&&currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : (currentSession ? currentSession.email : mode==='user'?(userEmail||''):(localStorage.getItem('tp_skrtask_self_email')||''));
+    const se = plantOwnerAuthenticated&&currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : (currentSession ? currentSession.email : mode==='user'?(userEmail||''):(localStorage.getItem('self_email')||''));
     renderMyTaskList(se, currentFilter);
     refreshOverdueBadge();
   } else {
@@ -11940,7 +11362,7 @@ function deleteMyTask(id){
   const lbl = document.getElementById('mytasks-filter-label');
   const LABEL_TO_FILTER = {'All':'all','To Do':'To Do','In Progress':'In Progress','Review':'Review','Done':'Done','Overdue':'overdue'};
   const currentFilter = lbl ? (LABEL_TO_FILTER[lbl.textContent] || 'all') : 'all';
-  const se = currentSession ? currentSession.email : mode==='user'?(userEmail||''):(plantOwnerAuthenticated?((currentPlantSession?.owners||[])[0]||''):(localStorage.getItem('tp_skrtask_self_email')||''));
+  const se = currentSession ? currentSession.email : mode==='user'?(userEmail||''):(plantOwnerAuthenticated?((currentPlantSession?.owners||[])[0]||''):(localStorage.getItem('self_email')||''));
   renderMyTaskList(se, currentFilter);
   _refreshMyTasksStats(se); // ← update stat cards immediately after delete
   refreshOverdueBadge();
@@ -11953,8 +11375,8 @@ function openSelfTaskModal(editId){
     : (plantOwnerAuthenticated && currentPlantSession
         ? ((currentPlantSession.owners||[])[0]||'')
         : (adminAuthenticated
-            ? (localStorage.getItem('tp_skrtask_admin_notify_email')||'').trim()
-            : (localStorage.getItem('tp_skrtask_self_email')||'')));
+            ? (localStorage.getItem('admin_notify_email')||'').trim()
+            : (localStorage.getItem('self_email')||'')));
   if(!selfEmail&&mode==='admin'&&!plantOwnerAuthenticated){toast('Set your identity first in the My Tasks page','var(--amber)');return;}
   const t=editId?getTask(editId):null;
   const html=`
@@ -12267,7 +11689,7 @@ function buildBulkTask(row){
   const _poEmail = _poHint || (plantOwnerAuthenticated && currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : '');
   const _assignedByEmail = _poEmail
     || (currentSession ? currentSession.email : '')
-    || localStorage.getItem('tp_skrtask_admin_notify_email')
+    || localStorage.getItem('admin_notify_email')
     || 'superadmin';
   return {
     id: uid(),
@@ -12479,7 +11901,7 @@ function downloadJSONTemplate(){
   if (sb) sb.style.display = 'none';
   document.getElementById('topbar-title').textContent = '🔐 Reset Password';
 
-  const companyName = localStorage.getItem('tp_skrtask_company_name') || 'POLYPLASTICS';
+  const companyName = localStorage.getItem('company_name') || 'POLYPLASTICS';
   document.getElementById('content').innerHTML = `
     <div style="max-width:440px;margin:60px auto;" class="fade-in">
       <div style="text-align:center;margin-bottom:28px">
@@ -12598,9 +12020,15 @@ if(mode !== 'user'){
         </div>
       </div>`;
   } else {
-    // No URL params — show the proper login screen (hides all admin UI behind the form,
-    // cannot be dismissed unlike the old overlay approach which left admin nav exposed)
-    showAdminLoginScreen();
+    // No URL params — render full UI (sidebar stays intact) then
+    // gate access behind a full-screen password overlay.
+    document.getElementById('admin-nav').style.display = 'block';
+    document.getElementById('btn-admin-mode').style.display = '';
+    document.getElementById('btn-user-mode').style.display = '';
+    document.getElementById('btn-export').style.display = 'flex';
+    const sb = document.querySelector('.sidebar-bottom');
+    if(sb){ sb.style.display=''; sb.style.visibility=''; }
+    showAdminPasswordOverlay();
   }
 } else {
   // ── Valid assignee link (?token= or ?email=) ──────────────────────
@@ -12660,27 +12088,27 @@ function _refreshAllChartThemeColors(){
 
 function toggleTheme(){
   const isLight = document.body.classList.toggle('light');
-  localStorage.setItem('tp_skrtask_theme', isLight ? 'light' : 'dark');
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
   document.getElementById('btn-theme').textContent = isLight ? '☀️' : '🌙';
   _refreshAllChartThemeColors();
 }
 
 function setColorTheme(color){
   document.body.setAttribute('data-color', color);
-  localStorage.setItem('tp_skrtask_color-theme', color);
+  localStorage.setItem('color-theme', color);
   document.querySelectorAll('.tp-dot').forEach(d => d.classList.remove('active'));
   const dot = document.getElementById('tp-'+color);
   if(dot) dot.classList.add('active');
 }
 
 (function initTheme(){
-  const savedTheme = localStorage.getItem('tp_skrtask_theme');
+  const savedTheme = localStorage.getItem('theme');
   if(savedTheme === 'light'){
     document.body.classList.add('light');
     const btn = document.getElementById('btn-theme');
     if(btn) btn.textContent = '☀️';
   }
-  const savedColor = localStorage.getItem('tp_skrtask_color-theme') || 'blue';
+  const savedColor = localStorage.getItem('color-theme') || 'blue';
   document.body.setAttribute('data-color', savedColor);
   document.querySelectorAll('.tp-dot').forEach(d => d.classList.remove('active'));
   const dot = document.getElementById('tp-'+savedColor);
@@ -13070,7 +12498,7 @@ function goToMyTasksFiltered(){
   }
   // Normal mode: clear team flag and go to My Tasks
   taskFilters.teamAssignedToMe = false;
-  const selfEmail = mode==='user' ? (userEmail||'') : (localStorage.getItem('tp_skrtask_self_email')||'');
+  const selfEmail = mode==='user' ? (userEmail||'') : (localStorage.getItem('self_email')||'');
   if(plantOwnerAuthenticated && currentPlantSession){
     showPanel('mytasks');
     return;
@@ -13171,7 +12599,7 @@ function openExportModal(){
         <button class="btn btn-ghost" onclick="document.getElementById('export-modal-overlay').remove()">Cancel</button>
       </div>
     </div>`;
-  // overlay.addEventListener('click', () => overlay.remove()); // DISABLED — login overlay must not be dismissable
+  overlay.addEventListener('click', () => overlay.remove());
   document.body.appendChild(overlay);
 }
 
@@ -13275,8 +12703,8 @@ function exportPDF(){
   const date = new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
   const statusColor = {'To Do':'#9ca3af','In Progress':'#5b8dee','Review':'#a78bfa','Done':'#34d399'};
   const prioColor = {'High':'#f87171','Medium':'#fbbf24','Low':'#34d399'};
-  const companyName = localStorage.getItem('tp_skrtask_company_name') || 'POLYPLASTICS';
-  const logoUrl = localStorage.getItem('tp_skrtask_company_logo_url') || '';
+  const companyName = localStorage.getItem('company_name') || 'POLYPLASTICS';
+  const logoUrl = localStorage.getItem('company_logo_url') || '';
 
   // ── Capture dashboard Chart.js canvases as PNG data URLs ──────────────
   // Chart IDs as rendered in renderDashboard / _renderDashCharts
@@ -13325,7 +12753,7 @@ function exportPDF(){
   const statRate    = exportList.length ? Math.round(statDone / exportList.length * 100) : 0;
   const statToDo    = exportList.filter(t => t.status === 'To Do').length;
   const statReview  = exportList.filter(t => t.status === 'Review').length;
-  const selfEmail   = currentSession ? currentSession.email : mode === 'user' ? (userEmail || '') : (localStorage.getItem('tp_skrtask_self_email') || '');
+  const selfEmail   = currentSession ? currentSession.email : mode === 'user' ? (userEmail || '') : (localStorage.getItem('self_email') || '');
   const statMyTasks = exportList.filter(t => {
     if(plantOwnerAuthenticated && currentPlantSession){
       const oe = (currentPlantSession.owners || []).map(e => e.toLowerCase());
@@ -13913,7 +13341,7 @@ function _calRenderDayPanel() {
 async function sendReplyNotificationEmail(task, reply){
   const cfg = getEmailConfig();
   if(!cfg.clientId||!cfg.tenantId) return;
-  const adminEmail = localStorage.getItem('tp_skrtask_admin_notify_email') || '';
+  const adminEmail = localStorage.getItem('admin_notify_email') || '';
   // If a plant owner is active, notify their own email; otherwise fall back to admin email
   const loginHint = getPlantOwnerLoginHint();
   const plantOwnerEmail = loginHint || (plantOwnerAuthenticated && currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : '');
@@ -13954,7 +13382,7 @@ async function sendAdminTaskCreationEmail(task){
   if(!cfg.clientId||!cfg.tenantId) return;
 
   // Recipient: the superadmin configured in settings
-  const adminEmail = localStorage.getItem('tp_skrtask_admin_notify_email') || '';
+  const adminEmail = localStorage.getItem('admin_notify_email') || '';
   if(!adminEmail){ console.warn('No admin_notify_email set — skipping admin notification'); return; }
 
   // Sender token: use plant owner's MS account so mail is sent FROM plant owner's mailbox
