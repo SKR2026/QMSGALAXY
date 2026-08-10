@@ -5338,7 +5338,15 @@ async function resetPlantPassword(plantId, plantName) {
 
   try {
     const hashed = await _hashPw(newPwd.trim(), plantId);
-    const groups = getPlantGroups().map(p => p.id === plantId ? { ...p, password: hashed } : p);
+    // Fetch fresh from Firestore before saving to avoid overwriting with stale localStorage data
+    let groups = getPlantGroups();
+    if (_fbReady && _db) {
+      try {
+        const d = await _db.collection('settings').doc('plantGroups').get();
+        if (d.exists && Array.isArray(d.data().plants)) groups = d.data().plants;
+      } catch(e) { /* use localStorage */ }
+    }
+    groups = groups.map(p => p.id === plantId ? { ...p, password: hashed } : p);
     savePlantGroups(groups); // saves to localStorage AND Firestore atomically
 
     // Clear ALL brute-force lockout keys so plant owner can log in immediately:
@@ -5402,7 +5410,15 @@ async function savePlantEdit(id){
   const newPwd=(document.getElementById('pg-edit-pwd-'+id)?.value||'').trim();
   if(!name){ toast('Plant name is required','var(--red)'); return; }
   const owners=ownersRaw?ownersRaw.split(',').map(o=>o.trim()).filter(Boolean):[];
-  const groups=getPlantGroups().map(p=>{
+  // Fetch fresh from Firestore to avoid overwriting with stale localStorage data
+  let baseGroups = getPlantGroups();
+  if (_fbReady && _db) {
+    try {
+      const d = await _db.collection('settings').doc('plantGroups').get();
+      if (d.exists && Array.isArray(d.data().plants)) baseGroups = d.data().plants;
+    } catch(e) { /* use localStorage */ }
+  }
+  const groups=baseGroups.map(p=>{
     if(p.id!==id) return p;
     const updated={...p,name,owners};
     if(newPwd){ updated._pendingPwdHash=true; updated._rawNewPwd=newPwd; updated._pwdForId=p.id; } // hash async below
@@ -5468,16 +5484,36 @@ async function changePlantPassword(){
   const nw=document.getElementById('po-pwd-new')?.value||'';
   const cf=document.getElementById('po-pwd-confirm')?.value||'';
   const status=document.getElementById('po-pwd-status');
-  const storedPw=currentPlantSession.password||'';
-  const curOk=await _verifyPw(storedPw,cur,currentPlantSession.id);
+
+  // Always fetch the current password hash fresh from Firestore — never trust
+  // currentPlantSession.password which may be stale from a previous session or
+  // a reset done by Super Admin after login.
+  let storedPw = currentPlantSession.password || '';
+  const plantId = currentPlantSession.id;
+  if (_fbReady && _db) {
+    try {
+      const d = await _db.collection('settings').doc('plantGroups').get();
+      if (d.exists && Array.isArray(d.data().plants)) {
+        const fbPlant = d.data().plants.find(p => p.id === plantId);
+        if (fbPlant?.password) storedPw = fbPlant.password;
+      }
+    } catch(e) { /* fall back to currentPlantSession.password */ }
+  }
+
+  const curOk = await _verifyPw(storedPw, cur, plantId);
   if(!curOk){status.style.color='var(--red)';status.textContent='❌ Current password is incorrect.';return;}
   if(nw.length<6){status.style.color='var(--red)';status.textContent='❌ New password must be at least 6 characters.';return;}
   if(nw!==cf){status.style.color='var(--red)';status.textContent='❌ Passwords do not match.';return;}
-  // Hash the new password before saving
-  const hashed=await _hashPw(nw,currentPlantSession.id);
-  const groups=getPlantGroups().map(p=>p.id===currentPlantSession.id?{...p,password:hashed}:p);
+
+  // Hash new password with plantId as salt (same as login verification)
+  const hashed = await _hashPw(nw, plantId);
+  // Save to both localStorage and Firestore atomically
+  const groups = getPlantGroups().map(p => p.id===plantId ? {...p,password:hashed} : p);
   savePlantGroups(groups);
-  currentPlantSession={...currentPlantSession,password:hashed};
+  // Update in-memory session so subsequent changePlantPassword calls within
+  // the same session work correctly without requiring a re-login
+  currentPlantSession = {...currentPlantSession, password: hashed};
+
   status.style.color='var(--green)';
   status.textContent='✅ Password updated successfully!';
   document.getElementById('po-pwd-current').value='';
@@ -6398,23 +6434,28 @@ async function _doPlantOwnerLogin(plant, email, enteredPassword, errEl) {
     return;
   }
 
-  // Fetch password from Firestore (always fresh) with localStorage fallback
+  // Fetch password FRESH from Firestore (always — never trust localStorage at login time)
   let storedPwd = plant.password || '';
+  let freshPlant = {...plant}; // will be updated with Firestore data
   if (_fbReady && _db) {
     try {
       const d = await _db.collection('settings').doc('plantGroups').get();
-      if (d.exists && d.data().plants) {
+      if (d.exists && Array.isArray(d.data().plants)) {
         const fbPlant = d.data().plants.find(p => p.id === plantId);
-        if (fbPlant?.password) storedPwd = fbPlant.password;
+        if (fbPlant) {
+          freshPlant = fbPlant; // use the fully fresh Firestore record
+          if (fbPlant.password) storedPwd = fbPlant.password;
+        }
       }
     } catch(e) { /* use localStorage value */ }
   }
 
-  // Auto-upgrade plaintext password
+  // Auto-upgrade plaintext → PBKDF2 hash and persist
   if (storedPwd && !/^[0-9a-f]{64}$/.test(storedPwd)) {
     const hashed = await _hashPw(storedPwd, plantId);
     const upgraded = getPlantGroups().map(p => p.id===plantId ? {...p,password:hashed} : p);
     savePlantGroups(upgraded);
+    freshPlant = {...freshPlant, password: hashed};
     storedPwd = hashed;
   }
 
@@ -6426,7 +6467,6 @@ async function _doPlantOwnerLogin(plant, email, enteredPassword, errEl) {
       ? '⏳ Too many failed attempts. Locked for '+bfA.remaining+' min. Ask Super Admin to click 🔓 Unlock.'
       : '❌ Incorrect password.' + ((_BF_MAX-(bfA.attempts||0))>0 ? ' '+(_BF_MAX-(bfA.attempts||0))+' attempt(s) left. Ask Super Admin to use 🔑 Reset Pwd if forgotten.' : '');
     if(errEl){ errEl.textContent=msg; errEl.style.display='block'; }
-    // Clear the password field
     const pwdField = document.getElementById('login-pwd-input') || document.getElementById('overlay-pwd-input');
     if(pwdField) pwdField.value='';
     return;
@@ -6434,7 +6474,9 @@ async function _doPlantOwnerLogin(plant, email, enteredPassword, errEl) {
 
   await _bfRecord(bfId, true);
   if(errEl) errEl.style.display='none';
-  _activatePlantOwnerSession(plant, email);
+  // Pass freshPlant (with correct Firestore password hash) so currentPlantSession.password
+  // is always up-to-date — changePlantPassword() depends on this for current-password verification
+  _activatePlantOwnerSession(freshPlant, email);
 }
 
 function showAdminLoginScreen(){
