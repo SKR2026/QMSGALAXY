@@ -5341,9 +5341,17 @@ async function resetPlantPassword(plantId, plantName) {
     const groups = getPlantGroups().map(p => p.id === plantId ? { ...p, password: hashed } : p);
     savePlantGroups(groups); // saves to localStorage AND Firestore atomically
 
-    // Also clear any brute-force lockout so plant owner can log in immediately
+    // Clear ALL brute-force lockout keys so plant owner can log in immediately:
+    // - plant_<plantId>  : from plantOwnerLogin() failed attempts
+    // - user:<email>     : from overlayAdminLogin/unifiedLogin wrong-path attempts
     const bfStore = await _secGet(_BF_STORE) || {};
     delete bfStore['plant_' + plantId];
+    // Clear user: key for every owner email on this plant
+    const updatedPlant = getPlantGroups().find(p => p.id === plantId);
+    (updatedPlant?.owners || []).forEach(ownerEmail => {
+      const key = 'user:' + (ownerEmail || '').trim().toLowerCase();
+      delete bfStore[key];
+    });
     await _secSet(_BF_STORE, bfStore);
 
     renderPgList();
@@ -5440,6 +5448,12 @@ async function unlockPlantLogin(id, name){
     return;
   }
   delete s[bfId];
+  // Also clear user:<email> BF keys for every owner of this plant
+  const _ulPlant = getPlantGroups().find(p => p.id === id);
+  (_ulPlant?.owners || []).forEach(ownerEmail => {
+    const userKey = 'user:' + (ownerEmail||'').trim().toLowerCase();
+    delete s[userKey];
+  });
   await _secSet(_BF_STORE, s);
   toast('✅ Login unlocked for ' + (name||id) + '. They can now sign in.', 'var(--green)');
   // Update button to show it worked
@@ -6334,6 +6348,95 @@ document.addEventListener('keydown', function(e){
   }
 })();
 
+
+// ── Shared: activate plant owner session (called after password verified) ──
+function _activatePlantOwnerSession(plant, email) {
+  plantOwnerAuthenticated = true;
+  adminAuthenticated = false;
+  currentSession = null;
+  currentPlantSession = plant;
+  _activePlantId = plant.id;
+  _plantOwnerEmail = email;
+  document.body.classList.add('plant-owner-mode');
+
+  document.getElementById('admin-nav').style.display = 'block';
+  document.getElementById('btn-new-task').style.display = 'flex';
+  document.getElementById('btn-bulk-upload').style.display = 'flex';
+  document.getElementById('btn-export').style.display = 'flex';
+  document.getElementById('btn-admin-mode').style.display = 'none';
+  document.getElementById('btn-user-mode').style.display = 'none';
+  const _poModeLabel = document.querySelector('.sidebar-mode-label');
+  if(_poModeLabel) _poModeLabel.style.display = 'none';
+  const sidebarBottom = document.querySelector('.sidebar-bottom');
+  if(sidebarBottom){ sidebarBottom.style.display=''; sidebarBottom.style.visibility=''; }
+
+  const avatar = document.getElementById('topbar-avatar');
+  if(avatar){ avatar.textContent = plant.name[0].toUpperCase(); avatar.style.background='linear-gradient(135deg,var(--green),var(--cyan))'; }
+  document.getElementById('topbar-title').textContent = '🏭 ' + plant.name;
+  _setSettingsNavVisible(false);
+  const sai = document.getElementById('sidebar-account-info');
+  if(sai) sai.style.display = 'block';
+  _updateSidebarAccountInfo();
+  _renderTopbarUserBadge();
+  renderPlantNav();
+  toast('Welcome, ' + plant.name + ' Owner! 🏭');
+  showPlantPanel(plant.id);
+}
+
+// ── Shared: verify plant owner password and activate session ──────────
+// Called directly from unifiedLogin/overlayAdminLogin — no separate screen needed.
+async function _doPlantOwnerLogin(plant, email, enteredPassword, errEl) {
+  const plantId = plant.id;
+  // Clear wrong-path user: BF key first
+  _bfRecord('user:' + email, true).catch(()=>{});
+
+  // Check plant-specific BF lockout
+  const bfId = 'plant_' + plantId;
+  const bf = await _bfCheck(bfId);
+  if (bf.locked) {
+    if(errEl){ errEl.textContent='⏳ Too many failed attempts. Locked for '+bf.remaining+' min. Ask Super Admin to click 🔓 Unlock.'; errEl.style.display='block'; }
+    return;
+  }
+
+  // Fetch password from Firestore (always fresh) with localStorage fallback
+  let storedPwd = plant.password || '';
+  if (_fbReady && _db) {
+    try {
+      const d = await _db.collection('settings').doc('plantGroups').get();
+      if (d.exists && d.data().plants) {
+        const fbPlant = d.data().plants.find(p => p.id === plantId);
+        if (fbPlant?.password) storedPwd = fbPlant.password;
+      }
+    } catch(e) { /* use localStorage value */ }
+  }
+
+  // Auto-upgrade plaintext password
+  if (storedPwd && !/^[0-9a-f]{64}$/.test(storedPwd)) {
+    const hashed = await _hashPw(storedPwd, plantId);
+    const upgraded = getPlantGroups().map(p => p.id===plantId ? {...p,password:hashed} : p);
+    savePlantGroups(upgraded);
+    storedPwd = hashed;
+  }
+
+  const ok = await _verifyPw(storedPwd, enteredPassword, plantId);
+  if (!ok) {
+    await _bfRecord(bfId, false);
+    const bfA = await _bfCheck(bfId);
+    const msg = bfA.locked
+      ? '⏳ Too many failed attempts. Locked for '+bfA.remaining+' min. Ask Super Admin to click 🔓 Unlock.'
+      : '❌ Incorrect password.' + ((_BF_MAX-(bfA.attempts||0))>0 ? ' '+(_BF_MAX-(bfA.attempts||0))+' attempt(s) left. Ask Super Admin to use 🔑 Reset Pwd if forgotten.' : '');
+    if(errEl){ errEl.textContent=msg; errEl.style.display='block'; }
+    // Clear the password field
+    const pwdField = document.getElementById('login-pwd-input') || document.getElementById('overlay-pwd-input');
+    if(pwdField) pwdField.value='';
+    return;
+  }
+
+  await _bfRecord(bfId, true);
+  if(errEl) errEl.style.display='none';
+  _activatePlantOwnerSession(plant, email);
+}
+
 function showAdminLoginScreen(){
   adminAuthenticated = false;
   // Clear stale group member data from the previous session
@@ -6385,7 +6488,10 @@ function showAdminLoginScreen(){
 // ═══════════════════════════════════════════════════════════════════════
 
 function showPlantOwnerLoginScreen(){
-  // Called from the main login screen when someone wants to log in as plant owner
+  // Deprecated: plant owners now log in via the unified login screen.
+  // Just show the main login — _doPlantOwnerLogin handles auth inline.
+  showAdminLoginScreen(); return;
+  // Legacy dead code below — kept for reference only:
   adminAuthenticated = false;
   plantOwnerAuthenticated = false;
   currentPlantSession = null;
@@ -7204,28 +7310,27 @@ async function overlayAdminLogin(){
       }
     } catch(e) { /* fall through to plant owner */ }
     if (!_isRegularUser) {
-      // Remove overlay first, then show plant owner login screen
+      // Pure plant owner — remove overlay and verify plant password inline
       const _ov = document.getElementById('admin-pwd-overlay');
       if(_ov) _ov.remove();
-      showPlantOwnerLoginScreen();
-      setTimeout(() => {
-        const emailInp = document.getElementById('plant-email-input');
-        const plantSel = document.getElementById('plant-login-select');
-        const pwdInp   = document.getElementById('plant-pwd-input');
-        if (emailInp) { emailInp.value = email; }
-        if (plantSel) { plantSel.value = _overlayMatchedPlant.id; }
-        if (pwdInp)   { pwdInp.value = entered; }
-        // Do NOT auto-submit — let user press Login to avoid worsening BF lockout
-      }, 80);
+      await _doPlantOwnerLogin(_overlayMatchedPlant, email, entered, err);
       return;
     }
-    // else: email exists in appUsers — fall through to normal login below
+    // else: also a regular appUser — fall through to normal login below
   }
 
   // ── Admin / User path — check appUsers collection ──────────────────
   const bfKey = 'user:' + email;
   const bf = await _bfCheck(bfKey);
   if(bf.locked){
+    // If this email is a plant owner, clear the user: BF key and route to plant login
+    const _bfOvPlant = _overlayPlantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
+    if (_bfOvPlant) {
+      _bfRecord(bfKey, true).catch(()=>{});
+      const _ovBfEl = document.getElementById('admin-pwd-overlay'); if(_ovBfEl) _ovBfEl.remove();
+      await _doPlantOwnerLogin(_bfOvPlant, email, entered, err);
+      return;
+    }
     if(err){err.textContent='⏳ Too many failed attempts. Locked for '+bf.remaining+' minute(s).';err.style.display='block';}
     return;
   }
@@ -7241,26 +7346,18 @@ async function overlayAdminLogin(){
     const u = snap.data();
     if (u.status === 'pending') { if(err){err.textContent='❌ Account pending. Check your email.';err.style.display='block';} return; }
     if (u.status === 'disabled') {
-      // If this email is also a plant owner, redirect to plant owner login instead of blocking
-      const _disabledPlant = getPlantGroups().find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
+      const _disabledPlant = _overlayPlantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
       if (_disabledPlant) {
-        _bfRecord('user:' + email, true).catch(()=>{});
         const _ov2 = document.getElementById('admin-pwd-overlay'); if(_ov2) _ov2.remove();
-        showPlantOwnerLoginScreen();
-        setTimeout(() => { const ei=document.getElementById('plant-email-input'); const ps=document.getElementById('plant-login-select'); const pi=document.getElementById('plant-pwd-input'); if(ei)ei.value=email; if(ps)ps.value=_disabledPlant.id; if(pi)pi.value=entered; }, 80);
-        return;
+        await _doPlantOwnerLogin(_disabledPlant, email, entered, err); return;
       }
       if(err){err.textContent='❌ Account disabled. Contact Super Admin.';err.style.display='block';} return;
     }
     if (u.status === 'removed') {
-      // If this email is also a plant owner, redirect to plant owner login instead of blocking
-      const _removedPlant = getPlantGroups().find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
+      const _removedPlant = _overlayPlantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
       if (_removedPlant) {
-        _bfRecord('user:' + email, true).catch(()=>{});
         const _ov3 = document.getElementById('admin-pwd-overlay'); if(_ov3) _ov3.remove();
-        showPlantOwnerLoginScreen();
-        setTimeout(() => { const ei=document.getElementById('plant-email-input'); const ps=document.getElementById('plant-login-select'); const pi=document.getElementById('plant-pwd-input'); if(ei)ei.value=email; if(ps)ps.value=_removedPlant.id; if(pi)pi.value=entered; }, 80);
-        return;
+        await _doPlantOwnerLogin(_removedPlant, email, entered, err); return;
       }
       if(err){err.textContent='❌ Account removed. Contact Super Admin to restore access.';err.style.display='block';} return;
     }
@@ -7301,37 +7398,7 @@ async function overlayAdminLogin(){
       (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
     );
     if (_poMatchedOverlay) {
-      currentSession = null; // plant owners don't use currentSession
-      plantOwnerAuthenticated = true;
-      adminAuthenticated = false;
-      currentPlantSession = _poMatchedOverlay;
-      _activePlantId = _poMatchedOverlay.id;
-      _plantOwnerEmail = email;
-      document.body.classList.add('plant-owner-mode');
-      // Show nav and task buttons exactly like plantOwnerLogin() does
-      document.getElementById('admin-nav').style.display = 'block';
-      document.getElementById('btn-new-task').style.display = 'flex';
-      document.getElementById('btn-bulk-upload').style.display = 'flex';
-      document.getElementById('btn-export').style.display = 'flex';
-      // Hide Admin/User mode toggle — plant owners never see this
-      document.getElementById('btn-admin-mode').style.display = 'none';
-      document.getElementById('btn-user-mode').style.display = 'none';
-      const _poModeLabel = document.querySelector('.sidebar-mode-label');
-      if(_poModeLabel) _poModeLabel.style.display = 'none';
-      const _poSb = document.querySelector('.sidebar-bottom');
-      if(_poSb){ _poSb.style.display=''; _poSb.style.visibility=''; }
-      // Update topbar
-      const _poAvatar = document.getElementById('topbar-avatar');
-      if(_poAvatar){ _poAvatar.textContent = _poMatchedOverlay.name[0].toUpperCase(); _poAvatar.style.background='linear-gradient(135deg,var(--green),var(--cyan))'; }
-      document.getElementById('topbar-title').textContent = '🏭 ' + _poMatchedOverlay.name;
-      _setSettingsNavVisible(false);
-      _renderTopbarUserBadge();
-      const _poSaiO = document.getElementById('sidebar-account-info');
-      if(_poSaiO) _poSaiO.style.display = 'block';
-      _updateSidebarAccountInfo();
-      renderPlantNav();
-      toast('Welcome, ' + _poMatchedOverlay.name + ' Owner! 🏭');
-      showPlantPanel(_poMatchedOverlay.id);
+      _activatePlantOwnerSession(_poMatchedOverlay, email);
       return;
     }
 
@@ -7404,8 +7471,7 @@ async function unifiedLogin() {
     (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
   );
   if (_matchedPlant) {
-    // Check Firestore first — if email exists as an active/pending regular user, skip plant owner redirect.
-    // A 'removed' or 'disabled' appUsers record must NOT block the plant owner path.
+    // Check if email is ALSO an active regular appUser — if so, try appUser login first.
     let _isRegularUser = false;
     if (_fbReady && _db) {
       try {
@@ -7414,31 +7480,30 @@ async function unifiedLogin() {
           const _uStatus = (_userSnap.data().status || 'active');
           if (_uStatus !== 'removed' && _uStatus !== 'disabled') _isRegularUser = true;
         }
-      } catch(e) { /* ignore, fall through to plant owner login */ }
+      } catch(e) { /* ignore */ }
     }
     if (!_isRegularUser) {
-      // Clear any user: BF record so previous failed attempts on the wrong path don't count
-      _bfRecord('user:' + email, true).catch(()=>{});
-      // Redirect to plant owner login screen with email pre-filled
-      showPlantOwnerLoginScreen();
-      setTimeout(() => {
-        const emailInp = document.getElementById('plant-email-input');
-        const plantSel = document.getElementById('plant-login-select');
-        const pwdInp   = document.getElementById('plant-pwd-input');
-        if (emailInp) { emailInp.value = email; }
-        if (plantSel) { plantSel.value = _matchedPlant.id; }
-        if (pwdInp)   { pwdInp.value = pwd; }
-        // Do NOT auto-submit — let user press Login to avoid worsening BF lockout
-      }, 80);
+      // Pure plant owner — verify plant password right here, no second screen
+      await _doPlantOwnerLogin(_matchedPlant, email, pwd, err);
       return;
     }
-    // else: fall through to normal Firestore user login below
+    // else: also a regular appUser — fall through to appUsers login below
+    // (after which _activatePlantOwnerSession is called if plant match found)
   }
 
   // ── 3. Check admin / user accounts stored in Firestore ─────────────
   const bfKey = 'user:' + email;
   const bf = await _bfCheck(bfKey);
   if (bf.locked) {
+    // If this email is a plant owner, clear the user: BF key and route to plant login
+    // instead of showing the lockout — plant owners must never be blocked by appUsers BF
+    const _bfPlantMatch = _plantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
+    if (_bfPlantMatch) {
+      // Plant owner locked by wrong-path BF — clear it and auth via plant password inline
+      _bfRecord(bfKey, true).catch(()=>{});
+      await _doPlantOwnerLogin(_bfPlantMatch, email, pwd, err);
+      return;
+    }
     err.textContent = '⏳ Too many failed attempts. Locked for ' + bf.remaining + ' minute(s).';
     err.style.display = 'block'; return;
   }
@@ -7460,25 +7525,13 @@ async function unifiedLogin() {
       err.textContent = '❌ Your account is pending activation. Check your email.'; err.style.display='block'; return;
     }
     if (u.status === 'disabled') {
-      // If this email is also a plant owner, redirect to plant owner login instead of blocking
       const _uniDisabledPlant = _plantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
-      if (_uniDisabledPlant) {
-        _bfRecord('user:' + email, true).catch(()=>{});
-        showPlantOwnerLoginScreen();
-        setTimeout(() => { const ei=document.getElementById('plant-email-input'); const ps=document.getElementById('plant-login-select'); const pi=document.getElementById('plant-pwd-input'); if(ei)ei.value=email; if(ps)ps.value=_uniDisabledPlant.id; if(pi)pi.value=pwd; }, 80);
-        return;
-      }
+      if (_uniDisabledPlant) { await _doPlantOwnerLogin(_uniDisabledPlant, email, pwd, err); return; }
       err.textContent = '❌ Your account has been disabled. Contact Super Admin.'; err.style.display='block'; return;
     }
     if (u.status === 'removed') {
-      // If this email is also a plant owner, redirect to plant owner login instead of blocking
       const _uniRemovedPlant = _plantGroups.find(p => (p.owners||[]).map(e=>e.trim().toLowerCase()).includes(email));
-      if (_uniRemovedPlant) {
-        _bfRecord('user:' + email, true).catch(()=>{});
-        showPlantOwnerLoginScreen();
-        setTimeout(() => { const ei=document.getElementById('plant-email-input'); const ps=document.getElementById('plant-login-select'); const pi=document.getElementById('plant-pwd-input'); if(ei)ei.value=email; if(ps)ps.value=_uniRemovedPlant.id; if(pi)pi.value=pwd; }, 80);
-        return;
-      }
+      if (_uniRemovedPlant) { await _doPlantOwnerLogin(_uniRemovedPlant, email, pwd, err); return; }
       err.textContent = '❌ Your account was removed. Contact Super Admin to restore access.'; err.style.display='block'; return;
     }
 
@@ -7525,37 +7578,7 @@ async function unifiedLogin() {
       (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
     );
     if (_poMatchedUnified) {
-      currentSession = null; // plant owners don't use currentSession
-      plantOwnerAuthenticated = true;
-      adminAuthenticated = false;
-      currentPlantSession = _poMatchedUnified;
-      _activePlantId = _poMatchedUnified.id;
-      _plantOwnerEmail = email;
-      document.body.classList.add('plant-owner-mode');
-      // Show nav and task buttons exactly like plantOwnerLogin() does
-      document.getElementById('admin-nav').style.display = 'block';
-      document.getElementById('btn-new-task').style.display = 'flex';
-      document.getElementById('btn-bulk-upload').style.display = 'flex';
-      document.getElementById('btn-export').style.display = 'flex';
-      // Hide Admin/User mode toggle — plant owners never see this
-      document.getElementById('btn-admin-mode').style.display = 'none';
-      document.getElementById('btn-user-mode').style.display = 'none';
-      const _poModeLabel = document.querySelector('.sidebar-mode-label');
-      if(_poModeLabel) _poModeLabel.style.display = 'none';
-      const _poSb = document.querySelector('.sidebar-bottom');
-      if(_poSb){ _poSb.style.display=''; _poSb.style.visibility=''; }
-      // Update topbar
-      const _poAvatar = document.getElementById('topbar-avatar');
-      if(_poAvatar){ _poAvatar.textContent = _poMatchedUnified.name[0].toUpperCase(); _poAvatar.style.background='linear-gradient(135deg,var(--green),var(--cyan))'; }
-      document.getElementById('topbar-title').textContent = '🏭 ' + _poMatchedUnified.name;
-      _setSettingsNavVisible(false);
-      _renderTopbarUserBadge();
-      const _poSaiU = document.getElementById('sidebar-account-info');
-      if(_poSaiU) _poSaiU.style.display = 'block';
-      _updateSidebarAccountInfo();
-      renderPlantNav();
-      toast('Welcome, ' + _poMatchedUnified.name + ' Owner! 🏭');
-      showPlantPanel(_poMatchedUnified.id);
+      _activatePlantOwnerSession(_poMatchedUnified, email);
       return;
     }
 
