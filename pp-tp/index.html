@@ -6925,9 +6925,13 @@ function getDashScopedTasks(){
     return _filterByDashPlant(getScopedTasks());
   }
   // Default "mine" view: show only tasks where I am assignee or assigner
+  // Plant-tagged tasks belong exclusively to their plant panel — exclude them here.
   const myEmail = _getMyEmail();
   if(myEmail){
     const myTasks = tasks.filter(t => {
+      // Skip tasks tagged to a specific plant (they belong in the Plant panel)
+      // unless the superadmin is personally the assignee of that task
+      if(t.plant && (t.assignee||'').toLowerCase() !== myEmail) return false;
       const assignee   = (t.assignee||'').toLowerCase();
       const assignedBy = (t.assignedBy||'').toLowerCase();
       return assignee === myEmail || assignedBy === myEmail || assignedBy === 'superadmin';
@@ -12215,39 +12219,16 @@ function previewBulk(){
 }
 
 async function importBulk(){
+  // ── 1. Parse ──────────────────────────────────────────────────────────
   const parsed = _bulkTab==='excel'
     ? parseBulkExcel()
     : parseBulkJSON(document.getElementById('bulk-json-text').value);
 
-  // ── Always show the error panel so skipped rows are never silent ──────
-  const preview = document.getElementById('bulk-preview');
-  const countEl = document.getElementById('bulk-preview-count');
-  const rowsEl  = document.getElementById('bulk-preview-rows');
-  const errsEl  = document.getElementById('bulk-preview-errors');
-  if(preview) preview.style.display='block';
+  const total       = parsed.tasks.length;
+  const skipCount   = parsed.errors.length;
+  const skipErrors  = parsed.errors; // keep reference before any DOM changes
 
-  const _renderErrors = (errs) => {
-    if(!errsEl) return;
-    if(!errs.length){ errsEl.innerHTML=''; return; }
-    errsEl.innerHTML=`<div style="background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);border-radius:8px;padding:10px 14px;margin-top:8px;max-height:160px;overflow-y:auto;">
-      <div style="font-size:12px;font-weight:700;color:var(--red);margin-bottom:6px;">⚠ ${errs.length} row${errs.length!==1?'s':''} skipped — fix and re-upload</div>
-      ${errs.map(e=>`<div style="font-size:12px;color:var(--red);margin-bottom:2px;">${esc(e)}</div>`).join('')}
-    </div>`;
-  };
-
-  if(!parsed.tasks.length){
-    if(countEl) countEl.textContent='(0 valid tasks)';
-    if(rowsEl)  rowsEl.innerHTML='<div style="padding:16px;text-align:center;color:var(--text3);font-size:13px;">No valid tasks to import.</div>';
-    _renderErrors(parsed.errors);
-    toast('⚠ No valid tasks to import — see errors below.','var(--amber)');
-    return;
-  }
-
-  // Show skipped-row errors alongside the count even when some tasks are valid
-  if(countEl) countEl.textContent=`(${parsed.tasks.length} valid · ${parsed.errors.length} skipped)`;
-  _renderErrors(parsed.errors);
-
-  // ── Plant label for toast & progress ─────────────────────────────────
+  // ── 2. Capture plant selection NOW before any DOM manipulation ────────
   let _plantLabel = '';
   let _plantId    = '';
   if(isSuperAdmin()){
@@ -12261,101 +12242,137 @@ async function importBulk(){
     _plantLabel = '🏭 ' + currentPlantSession.name;
   }
 
-  // ── Inject progress bar into modal footer ────────────────────────────
-  const footer = document.querySelector('#bulk-overlay .modal-footer');
-  if(footer){
-    footer.innerHTML=`
-      <div style="width:100%;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-          <span id="bulk-prog-label" style="font-size:12px;font-weight:600;color:var(--text2);">Preparing…</span>
-          <span id="bulk-prog-pct"  style="font-size:12px;font-weight:700;color:var(--accent);">0%</span>
-        </div>
-        <div style="height:8px;border-radius:4px;background:var(--card2);overflow:hidden;">
-          <div id="bulk-prog-bar" style="height:100%;width:0%;background:var(--accent);border-radius:4px;transition:width .2s ease;"></div>
-        </div>
-        <div id="bulk-prog-sub" style="font-size:11px;color:var(--text3);margin-top:5px;">Starting import…</div>
+  // ── 3. Replace entire modal content with import result pane ──────────
+  // We keep the modal OPEN throughout so the user sees progress + errors.
+  // The modal is only closed when they click "Done".
+  const modalInner = document.querySelector('#bulk-overlay .modal');
+  if(!modalInner){ toast('⚠ Modal not found — please try again.','var(--red)'); return; }
+
+  const errorRowsHTML = skipErrors.length
+    ? `<div style="background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.22);border-radius:9px;padding:12px 14px;margin-top:14px;max-height:200px;overflow-y:auto;">
+        <div style="font-size:12px;font-weight:700;color:var(--red);margin-bottom:8px;">⚠ ${skipCount} row${skipCount!==1?'s':''} skipped — fix and re-upload</div>
+        ${skipErrors.map(e=>`<div style="font-size:11px;color:var(--red);padding:2px 0;border-bottom:1px solid rgba(248,113,113,.1);">${esc(e)}</div>`).join('')}
+      </div>` : '';
+
+  if(total === 0){
+    // No valid tasks at all — show errors and a close button
+    modalInner.innerHTML=`
+      <div class="modal-header">
+        <div class="modal-title" style="color:var(--red);">⚠ Nothing to Import</div>
+        <button class="modal-close" onclick="closeBulkModal()">✕</button>
+      </div>
+      <div style="font-size:13px;color:var(--text2);margin-bottom:4px;">All ${skipCount} row${skipCount!==1?'s':''} had errors. No tasks were imported.</div>
+      ${errorRowsHTML}
+      <div class="modal-footer" style="margin-top:18px;">
+        <button class="btn btn-ghost" onclick="closeBulkModal()">Close</button>
       </div>`;
+    return;
   }
 
-  const _setProgress = (done, total, label) => {
-    const pct = total ? Math.round(done/total*100) : 0;
-    const bar   = document.getElementById('bulk-prog-bar');
-    const pctEl = document.getElementById('bulk-prog-pct');
-    const lbl   = document.getElementById('bulk-prog-label');
-    const sub   = document.getElementById('bulk-prog-sub');
-    if(bar)   bar.style.width   = pct+'%';
-    if(pctEl) pctEl.textContent = pct+'%';
-    if(lbl)   lbl.textContent   = label || `Importing task ${done} of ${total}…`;
-    if(sub)   sub.textContent   = `${done} / ${total} tasks written${_plantLabel?' → '+_plantLabel:''}`;
+  // Replace modal with progress pane — keep it open
+  modalInner.innerHTML=`
+    <div class="modal-header">
+      <div class="modal-title">⬆ Importing Tasks…</div>
+    </div>
+    ${_plantLabel ? `<div style="font-size:13px;font-weight:700;color:var(--green);margin-bottom:14px;">🏭 Target: ${esc(_plantLabel)}</div>` : ''}
+    <div style="margin-bottom:18px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span id="bulk-prog-label" style="font-size:13px;font-weight:600;color:var(--text2);">Starting…</span>
+        <span id="bulk-prog-pct"  style="font-size:14px;font-weight:800;color:var(--accent);">0%</span>
+      </div>
+      <div style="height:10px;border-radius:5px;background:var(--card2);overflow:hidden;border:1px solid var(--border);">
+        <div id="bulk-prog-bar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:5px;transition:width .25s ease;"></div>
+      </div>
+      <div id="bulk-prog-sub" style="font-size:11px;color:var(--text3);margin-top:6px;">0 / ${total} tasks written</div>
+    </div>
+    <div id="bulk-import-result" style="display:none;"></div>
+    ${errorRowsHTML}`;
+
+  // ── 4. Helper: update progress bar (safe — elements are inside the open modal) ──
+  const _setP = (done, lbl) => {
+    const pct = total ? Math.round(done/total*100) : 100;
+    const bar = document.getElementById('bulk-prog-bar');
+    const pEl = document.getElementById('bulk-prog-pct');
+    const lEl = document.getElementById('bulk-prog-label');
+    const sEl = document.getElementById('bulk-prog-sub');
+    if(bar) bar.style.width   = pct+'%';
+    if(pEl) pEl.textContent   = pct+'%';
+    if(lEl) lEl.textContent   = lbl || `Writing ${done} of ${total}…`;
+    if(sEl) sEl.textContent   = `${done} / ${total} tasks written${_plantLabel ? ' → '+_plantLabel : ''}`;
   };
 
-  const total = parsed.tasks.length;
-  _setProgress(0, total, 'Writing to Firestore…');
-
-  // Merge into local array immediately so UI stays responsive
+  // ── 5. Merge into local array + localStorage immediately ──────────────
   tasks = [...parsed.tasks, ...tasks];
   _safeSetTasks(tasks);
 
-  if(_fbReady && _db){
-    // ── Write in chunks of 400 (Firestore batch limit is 500) ────────
-    // Using individual awaited batches so we can track progress and
-    // catch per-chunk errors without losing the entire set.
-    const CHUNK = 400;
-    let written = 0;
-    let failed  = 0;
-    const failedTitles = [];
+  // ── 6. Write to Firestore with per-task progress ──────────────────────
+  let written = 0, failed = 0;
+  const failedRows = [];
 
-    for(let i=0; i<parsed.tasks.length; i+=CHUNK){
-      const chunk = parsed.tasks.slice(i, i+CHUNK);
+  if(_fbReady && _db){
+    const CHUNK = 400; // Firestore batch limit is 500; stay safely below
+    for(let i = 0; i < parsed.tasks.length; i += CHUNK){
+      const chunk = parsed.tasks.slice(i, i + CHUNK);
       try{
         const batch = _db.batch();
         chunk.forEach(t => batch.set(_db.collection('tasks').doc(t.id), t));
         await batch.commit();
         written += chunk.length;
-      } catch(e){
-        // Chunk failed — try writing individually to salvage what we can
-        console.warn('[importBulk] chunk failed, trying individually:', e.message);
+      } catch(batchErr){
+        console.warn('[importBulk] batch failed, retrying individually:', batchErr.message);
         for(const t of chunk){
           try{
             await _db.collection('tasks').doc(t.id).set(t);
             written++;
-          } catch(e2){
+          } catch(singleErr){
             failed++;
-            failedTitles.push(t.title);
-            console.warn('[importBulk] single write failed:', t.title, e2.message);
+            failedRows.push(`"${t.title}" — ${singleErr.message}`);
+            console.error('[importBulk] single write failed:', t.title, singleErr);
           }
         }
       }
-      _setProgress(written+failed, total, written+failed < total ? 'Writing to Firestore…' : 'Finalising…');
-      // yield to browser so progress bar animates
-      await new Promise(r=>setTimeout(r,0));
-    }
-
-    closeBulkModal();
-    refreshOverdueBadge();
-    showPanel(currentPanel);
-
-    if(failed===0){
-      toast(`✅ ${written} task${written!==1?'s':''} imported${_plantLabel?' → '+_plantLabel:''}!`);
-    } else {
-      toast(`⚠ ${written} imported, ${failed} failed — check console for details.`, 'var(--amber)');
-      if(errsEl){
-        const existing = errsEl.innerHTML;
-        errsEl.innerHTML = existing + `<div style="background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);border-radius:8px;padding:10px 14px;margin-top:8px;">
-          <div style="font-size:12px;font-weight:700;color:var(--red);margin-bottom:4px;">🔥 ${failed} task${failed!==1?'s':''} failed to write to Firestore</div>
-          ${failedTitles.slice(0,10).map(t=>`<div style="font-size:11px;color:var(--red);">${esc(t)}</div>`).join('')}
-          ${failedTitles.length>10?`<div style="font-size:11px;color:var(--red);">…and ${failedTitles.length-10} more. See browser console.</div>`:''}
-        </div>`;
-      }
+      _setP(written + failed, written + failed < total ? null : 'Finalising…');
+      await new Promise(r => setTimeout(r, 0)); // yield so browser repaints
     }
   } else {
-    // Offline — already in localStorage, will sync when Firebase is ready
-    _setProgress(total, total, 'Saved locally…');
-    await new Promise(r=>setTimeout(r,300));
-    closeBulkModal();
-    refreshOverdueBadge();
-    showPanel(currentPanel);
-    toast(`✅ ${total} task${total!==1?'s':''} imported${_plantLabel?' → '+_plantLabel:''} (offline — will sync when connected).`);
+    // Offline path — show fake progress so user knows it worked
+    for(let i = 0; i <= total; i++){
+      _setP(i, i < total ? 'Saved locally…' : 'All saved locally!');
+      if(i < total) await new Promise(r => setTimeout(r, 8));
+    }
+    written = total;
+  }
+
+  // ── 7. Show result inside modal — user clicks Done to close ──────────
+  refreshOverdueBadge();
+
+  const resultEl = document.getElementById('bulk-import-result');
+  const progLbl  = document.getElementById('bulk-prog-label');
+  const progPct  = document.getElementById('bulk-prog-pct');
+  if(progLbl) progLbl.textContent = failed ? `Done — ${failed} task${failed!==1?'s':''} failed` : 'Complete!';
+  if(progPct) { progPct.textContent = failed ? '⚠' : '✅'; progPct.style.color = failed ? 'var(--amber)' : 'var(--green)'; }
+
+  const failedHTML = failedRows.length
+    ? `<div style="background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);border-radius:8px;padding:10px 14px;margin-top:10px;max-height:140px;overflow-y:auto;">
+        <div style="font-size:12px;font-weight:700;color:var(--red);margin-bottom:6px;">🔥 ${failed} Firestore write${failed!==1?'s':''} failed</div>
+        ${failedRows.slice(0,10).map(r=>`<div style="font-size:11px;color:var(--red);padding:1px 0;">${esc(r)}</div>`).join('')}
+        ${failedRows.length>10?`<div style="font-size:11px;color:var(--text3);margin-top:4px;">…and ${failedRows.length-10} more — see browser console.</div>`:''}
+      </div>` : '';
+
+  if(resultEl){
+    resultEl.style.display='block';
+    resultEl.innerHTML=`
+      <div style="background:${failed?'rgba(251,191,36,.08)':'rgba(52,211,153,.08)'};border:1px solid ${failed?'rgba(251,191,36,.25)':'rgba(52,211,153,.25)'};border-radius:9px;padding:14px 16px;">
+        <div style="font-size:14px;font-weight:700;color:${failed?'var(--amber)':'var(--green)'};margin-bottom:4px;">
+          ${failed ? `⚠ ${written} imported, ${failed} failed` : `✅ ${written} task${written!==1?'s':''} imported successfully`}
+        </div>
+        ${_plantLabel ? `<div style="font-size:12px;color:var(--text2);">Tagged to: <strong style="color:var(--green)">${esc(_plantLabel)}</strong></div>` : ''}
+        ${skipCount   ? `<div style="font-size:12px;color:var(--amber);margin-top:2px;">⚠ ${skipCount} row${skipCount!==1?'s':''} skipped (see errors below)</div>` : ''}
+      </div>
+      ${failedHTML}
+      <div style="margin-top:16px;display:flex;justify-content:flex-end;">
+        <button class="btn btn-primary" onclick="closeBulkModal();showPanel(currentPanel);">✓ Done</button>
+      </div>`;
   }
 }
 
