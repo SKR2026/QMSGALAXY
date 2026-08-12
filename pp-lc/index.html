@@ -5108,27 +5108,89 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove }) {
               </div>
 
               {/* ── Send Time Settings ── */}
-              <div className={`p-4 rounded-xl border space-y-4 ${dk?'bg-gray-700/50 border-gray-600':'bg-gray-50 border-gray-200'}`}>
-                <p className="text-xs font-bold uppercase tracking-wider text-indigo-500">🕐 Send Time Settings (IST) — fires regardless of browser</p>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
-                  {[
-                    { key:'legalDigestTime',   label:'📋 Daily Digest',        default:'07:00', desc:'→ digest recipients daily' },
-                    { key:'legalReminderTime', label:'⏰ Lead-Day Reminders',   default:'08:00', desc:'→ assignees on threshold days' },
-                    { key:'legalOverdueTime',  label:'🚨 Overdue Alert',        default:'09:00', desc:'→ overdue recipients daily' },
-                    { key:'legalWeeklyTime',   label:'📊 Weekly Summary',       default:'07:30', desc:'→ digest recipients Mondays' },
-                    { key:'legalMonthlyTime',  label:'📅 Monthly Report',       default:'08:00', desc:'→ digest recipients 1st of month' },
-                  ].map(({ key, label, default: def, desc }) => (
-                    <FormField key={key} label={label}>
-                      <input type="time" value={settings[key]||def} onChange={e=>set(key,e.target.value)} className={inputCls} />
-                      <p className={`text-xs mt-1 ${sub}`}>{desc}</p>
-                    </FormField>
-                  ))}
-                </div>
-                <div className={`rounded-xl p-3 text-xs ${dk?'bg-gray-700 text-gray-300':'bg-gray-100 text-gray-700'}`}>
-                  <p className="font-semibold mb-1">ℹ️ How to schedule</p>
-                  <p>In GCP Console → Cloud Scheduler → create a job pointing to your <code>legalEmailNow</code> URL with body <code>{`{"type":"all"}`}</code> on cron <code>0 7,8,9 * * *</code> (IST offset: UTC+5:30 → use <code>30 1,2,3,30 * * *</code> UTC). The function reads these time settings and skips types outside their window.</p>
-                </div>
-              </div>
+              {(() => {
+                const [schedStatus, setSchedStatus] = React.useState(null);
+                const [schedMsg,    setSchedMsg]    = React.useState('');
+
+                const updateSchedule = async () => {
+                  if (!settings.cloudFnUrl)    { setSchedMsg('Enter Cloud Function URL first'); setSchedStatus('error'); setTimeout(()=>setSchedStatus(null),4000); return; }
+                  if (!settings.cloudFnSecret) { setSchedMsg('Enter internal secret first');    setSchedStatus('error'); setTimeout(()=>setSchedStatus(null),4000); return; }
+                  setSchedStatus('saving'); setSchedMsg('');
+                  try {
+                    // Save settings to Firestore first
+                    await save();
+                    // Then call cloud function to update Cloud Scheduler
+                    const endpoint = settings.cloudFnUrl.replace(/\/$/, '') + '/api/legal-update-schedule';
+                    const res = await fetch(endpoint, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', 'x-internal-secret': settings.cloudFnSecret },
+                      body: JSON.stringify({
+                        digestTime:   settings.legalDigestTime   || '07:00',
+                        reminderTime: settings.legalReminderTime || '08:00',
+                        overdueTime:  settings.legalOverdueTime  || '09:00',
+                        weeklyTime:   settings.legalWeeklyTime   || '07:30',
+                        monthlyTime:  settings.legalMonthlyTime  || '08:00',
+                        subjectPrefix: settings.legalMailSubjectPrefix || '',
+                        fromName:      settings.gmailFromName || '',
+                      }),
+                    });
+                    const data = await res.json().catch(()=>({}));
+                    if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+                    if (data.schedulerUpdated) {
+                      setSchedStatus('success');
+                      setSchedMsg(`✅ Cloud Scheduler updated — cron: ${data.cron} UTC · Settings saved to Firestore`);
+                    } else {
+                      setSchedStatus('warn');
+                      setSchedMsg(`✅ Settings saved to Firestore. ${data.note || 'Set LEGAL_SCHEDULER_JOB_NAME env var to auto-update Cloud Scheduler.'}`);
+                    }
+                  } catch(e) {
+                    setSchedStatus('error');
+                    setSchedMsg('❌ ' + (e?.message || String(e)));
+                  }
+                  setTimeout(()=>setSchedStatus(null), 12000);
+                };
+
+                return (
+                  <div className={`p-4 rounded-xl border space-y-4 ${dk?'bg-gray-700/50 border-gray-600':'bg-gray-50 border-gray-200'}`}>
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <p className="text-xs font-bold uppercase tracking-wider text-indigo-500">🕐 Send Time Settings (IST)</p>
+                      <button onClick={updateSchedule} disabled={schedStatus==='saving' || !settings.cloudFnUrl}
+                        className="px-4 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-40 flex items-center gap-1.5"
+                        style={{background:'var(--p600)'}}>
+                        {schedStatus==='saving' ? '⏳ Saving…' : '🕐 Update Schedule'}
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                      {[
+                        { key:'legalDigestTime',   label:'📋 Daily Digest',      default:'07:00', desc:'Sent to digest recipients daily' },
+                        { key:'legalReminderTime', label:'⏰ Lead-Day Reminders', default:'08:00', desc:'Sent to assignees on threshold days' },
+                        { key:'legalOverdueTime',  label:'🚨 Overdue Alert',      default:'09:00', desc:'Sent to overdue recipients daily' },
+                        { key:'legalWeeklyTime',   label:'📊 Weekly Summary',     default:'07:30', desc:'Sent Mondays to digest recipients' },
+                        { key:'legalMonthlyTime',  label:'📅 Monthly Report',     default:'08:00', desc:'Sent 1st of month to digest recipients' },
+                      ].map(({ key, label, default: def, desc }) => (
+                        <FormField key={key} label={label}>
+                          <input type="time" value={settings[key]||def} onChange={e=>set(key,e.target.value)} className={inputCls} />
+                          <p className={`text-xs mt-1 ${sub}`}>{desc}</p>
+                        </FormField>
+                      ))}
+                    </div>
+
+                    {schedStatus==='success' && <p className="text-xs text-green-600 dark:text-green-400 font-medium">{schedMsg}</p>}
+                    {schedStatus==='warn'    && <p className="text-xs text-amber-600 dark:text-amber-400 font-medium">{schedMsg}</p>}
+                    {schedStatus==='error'   && <p className="text-xs text-red-500 font-medium">{schedMsg}</p>}
+
+                    <div className={`rounded-xl p-3 text-xs space-y-2 ${dk?'bg-gray-700 text-gray-300':'bg-gray-100 text-gray-700'}`}>
+                      <p className="font-semibold">⚙️ One-time Cloud Scheduler setup</p>
+                      <p>1. GCP Console → Cloud Scheduler → <strong>Create job</strong></p>
+                      <p>2. URL: <code className="bg-white/50 px-1 rounded">{settings.cloudFnUrl||'your legalEmailNow URL'}</code></p>
+                      <p>3. Body: <code className="bg-white/50 px-1 rounded">{`{"type":"all"}`}</code> · Method: POST · Header: <code className="bg-white/50 px-1 rounded">x-internal-secret: your-secret</code></p>
+                      <p>4. Cron: <code className="bg-white/50 px-1 rounded">0,30 1,2,3,4 * * *</code> (UTC) — covers 06:30–09:30 IST. After saving times above, clicking <strong>Update Schedule</strong> adjusts this automatically.</p>
+                      <p>5. Set env var <code className="bg-white/50 px-1 rounded">LEGAL_SCHEDULER_JOB_NAME</code> = your job name on the Cloud Function → then <strong>Update Schedule</strong> button updates cron live without touching GCP Console.</p>
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* ── Test Buttons ── */}
               {(() => {
