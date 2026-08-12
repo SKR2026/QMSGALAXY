@@ -5150,6 +5150,25 @@ function renderSettings(){
         </div>
       </div>
 
+      <!-- ── From name & subject prefix ── -->
+      <div style="background:rgba(91,141,238,.05);border:1px solid rgba(91,141,238,.18);border-radius:10px;padding:14px 16px;margin-bottom:14px;">
+        <div style="font-size:12px;font-weight:700;color:var(--accent);margin-bottom:12px;">✉️ Email Identity — Task Planner only</div>
+        <div class="form-row" style="margin-bottom:0">
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">From Display Name</label>
+            <input class="form-input" id="tp-sender-name" placeholder="e.g. POLYPLASTICS Task Manager"
+              value="${localStorage.getItem('tp_sender_name')||''}" />
+            <div style="font-size:11px;color:var(--text3);margin-top:4px">Shown as the sender name in all task emails. Does not affect Plant Visit or CSAT.</div>
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">Mail Subject Prefix</label>
+            <input class="form-input" id="tp-subject-prefix" placeholder="e.g. [POLYPLASTICS Tasks]"
+              value="${localStorage.getItem('tp_subject_prefix')||''}" />
+            <div style="font-size:11px;color:var(--text3);margin-top:4px">Prepended to every task notification subject line. Leave blank to use company name.</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Common fields -->
       <div class="form-row" style="margin-top:4px">
         <div class="form-group"><label class="form-label">Admin Notify Email <span style="font-size:10px;color:var(--text2)">(gets task &amp; reply alerts)</span></label>
@@ -5630,15 +5649,20 @@ function saveEmailSettings(){
   const ejsService  = (document.getElementById('ejs-service-id')?.value||'').trim();
   const ejsTemplate = (document.getElementById('ejs-template-id')?.value||'').trim();
   const ejsKey      = (document.getElementById('ejs-public-key')?.value||'').trim();
+  // ── Task Planner identity fields (do not affect Plant Visit / CSAT) ────
+  const tpSenderName    = (document.getElementById('tp-sender-name')?.value||'').trim();
+  const tpSubjectPrefix = (document.getElementById('tp-subject-prefix')?.value||'').trim();
 
   // ── Step 1: Write to localStorage ──────────────────────────────────────
-  localStorage.setItem('ms_client_id',       clientId);
-  localStorage.setItem('ms_tenant_id',       tenantId);
-  localStorage.setItem('ms_test_email',      testEmail);
-  localStorage.setItem('admin_notify_email', adminNotifyEmail);
-  localStorage.setItem('ejs_service_id',     ejsService);
-  localStorage.setItem('ejs_template_id',    ejsTemplate);
-  localStorage.setItem('ejs_public_key',     ejsKey);
+  localStorage.setItem('ms_client_id',        clientId);
+  localStorage.setItem('ms_tenant_id',        tenantId);
+  localStorage.setItem('ms_test_email',       testEmail);
+  localStorage.setItem('admin_notify_email',  adminNotifyEmail);
+  localStorage.setItem('ejs_service_id',      ejsService);
+  localStorage.setItem('ejs_template_id',     ejsTemplate);
+  localStorage.setItem('ejs_public_key',      ejsKey);
+  localStorage.setItem('tp_sender_name',      tpSenderName);
+  localStorage.setItem('tp_subject_prefix',   tpSubjectPrefix);
 
   // ── Step 2: Verify and update display ──────────────────────────────────
   const verifyId  = localStorage.getItem('ms_client_id');
@@ -5677,6 +5701,12 @@ function saveEmailSettings(){
     ).then(()=>{
       console.log('[Settings] Email config synced to Firestore ✓');
     }).catch(e => console.warn('[Settings] Firestore save error:', e));
+    // Task Planner identity stored in its own doc — never touches config/appSettings
+    // (that doc belongs to Plant Visit / Customer Visit digest).
+    _db.collection('settings').doc('taskPlanner').set(
+      {senderName: tpSenderName, subjectPrefix: tpSubjectPrefix},
+      {merge: true}
+    ).catch(e => console.warn('[Settings] taskPlanner identity save error:', e));
   }
 
   // ── Step 6: Confirmation toast ───────────────────────────────────────────
@@ -6191,7 +6221,9 @@ function buildEmailSubject(reason, taskTitle, task){
   if(tplCfg && tplCfg.subject){
     return applyTplVars(tplCfg.subject, task||{title:taskTitle,assignee:'',priority:'',status:'',due:''}, '');
   }
-  const pfx = '[' + (localStorage.getItem('company_name') || 'POLYPLASTICS') + ' Tasks]';
+  // Use tp_subject_prefix if set, otherwise fall back to [CompanyName Tasks]
+  const savedPrefix = (localStorage.getItem('tp_subject_prefix')||'').trim();
+  const pfx = savedPrefix || ('[' + (localStorage.getItem('company_name') || 'POLYPLASTICS') + ' Tasks]');
   const lbl = REASON_LABEL[reason] || reason;
   return `${pfx} ${lbl}: ${taskTitle}`;
 }
@@ -6213,11 +6245,18 @@ async function sendViaMsGraph(toEmail, subject, htmlBody, ccEmails=[]){
     loginHint = getSessionEmail() || localStorage.getItem('admin_notify_email') || null;
   }
   const token = await withTimeout(getMSGraphToken(cfg, loginHint));
+  // Use tp_sender_name as the display name shown to recipients ("From: Name <email>")
+  const tpSenderName = (localStorage.getItem('tp_sender_name')||'').trim();
   const msgBody = {
     subject,
     body:{ contentType:'HTML', content:htmlBody },
     toRecipients:[{ emailAddress:{ address:toEmail } }]
   };
+  if(tpSenderName){
+    // Graph API allows overriding the display name while keeping the mailbox address
+    const senderEmail = getSessionEmail() || localStorage.getItem('admin_notify_email') || '';
+    if(senderEmail) msgBody.from = { emailAddress:{ name: tpSenderName, address: senderEmail } };
+  }
   // ccEmails may be a string (single) or array (multiple) — normalise to array
   const ccList = Array.isArray(ccEmails)
     ? ccEmails
@@ -6243,6 +6282,8 @@ async function sendViaEmailJS(toEmail, subject, htmlBody, task={}){
   // Use account holder's email as sender identity
   const _senderEmail = getSessionEmail() || localStorage.getItem('admin_notify_email') || 'noreply@polyplastics.com';
   const _senderNick  = getSessionNick()  || 'POLYPLASTICS Task Manager';
+  // Prefer the configured tp_sender_name; fall back to session nick
+  const _tpSenderName = (localStorage.getItem('tp_sender_name')||'').trim();
   const params = {
     to_email:   toEmail,
     to_name:    toEmail.split('@')[0],
@@ -6255,7 +6296,7 @@ async function sendViaEmailJS(toEmail, subject, htmlBody, task={}){
     task_desc:  task.desc||'',
     task_assignee: task.assignee||'',
     reply_to:   _senderEmail,
-    from_name:  _senderNick + ' (POLYPLASTICS Task Manager)',
+    from_name:  _tpSenderName || _senderNick,
     from_email: _senderEmail,
   };
   const r = await withTimeout(emailjs.send(c.ejsService, c.ejsTemplate, params));
@@ -10198,7 +10239,13 @@ async function triggerCloudRemindersNow(silent=false){
     const headers  = { 'Content-Type': 'application/json' };
     if(secret) headers['x-gcf-secret'] = secret;
 
-    const res  = await fetch(endpoint, { method:'POST', headers, body: JSON.stringify({ force: true }) });
+    const tpSenderName    = localStorage.getItem('tp_sender_name')||'';
+    const tpSubjectPrefix = localStorage.getItem('tp_subject_prefix')||'';
+    const res  = await fetch(endpoint, { method:'POST', headers, body: JSON.stringify({
+      force: true,
+      senderName:    tpSenderName    || undefined,
+      subjectPrefix: tpSubjectPrefix || undefined,
+    }) });
     const data = await res.json();
 
     if(!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
