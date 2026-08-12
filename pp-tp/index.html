@@ -6745,9 +6745,28 @@ function showAdminLoginScreen(){
       </div>
       <div id="admin-login-error" style="color:var(--red);font-size:13px;margin-bottom:10px;display:none">❌ Incorrect credentials.</div>
       <button class="btn btn-primary" style="width:100%;justify-content:center;margin-bottom:10px" onclick="unifiedLogin()">🔓 Sign In</button>
+
+      <div id="main-bio-divider" style="display:none;align-items:center;gap:10px;margin:12px 0 10px;">
+        <div style="flex:1;height:1px;background:var(--border)"></div>
+        <span style="font-size:11px;color:var(--text3);font-weight:600;letter-spacing:.6px;text-transform:uppercase;">or</span>
+        <div style="flex:1;height:1px;background:var(--border)"></div>
+      </div>
+      <button id="main-bio-btn" onclick="mainBiometricLogin()" style="display:none;width:100%;padding:14px;border:1.5px solid var(--accent);border-radius:10px;background:rgba(91,141,238,.06);color:var(--accent);font-family:var(--font-body);font-size:15px;font-weight:700;cursor:pointer;transition:all .2s;align-items:center;justify-content:center;gap:10px;margin-bottom:4px;">
+        <span id="main-bio-icon" style="font-size:24px;line-height:1;">🔒</span>
+        <span id="main-bio-label">Sign in with Biometrics</span>
+      </button>
+      <div id="main-bio-status" style="font-size:12px;color:var(--text3);text-align:center;margin-top:8px;min-height:18px;"></div>
+      <div id="main-bio-register-wrap" style="display:none;margin-top:8px;">
+        <button onclick="mainBiometricRegister()" style="width:100%;padding:11px;border:1px dashed var(--border2);border-radius:9px;background:transparent;color:var(--text2);font-family:var(--font-body);font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;">
+          ＋ Enable Biometric Login for this device
+        </button>
+      </div>
     </div>
   </div>`;
-  setTimeout(()=>document.getElementById('login-email-input')?.focus(), 50);
+  setTimeout(()=>{
+    document.getElementById('login-email-input')?.focus();
+    _biometricInitMain();
+  }, 50);
 }
 
 
@@ -7876,10 +7895,12 @@ async function unifiedLogin() {
       renderPlantNav();
       toast('Welcome, ' + _poMatchedUnified.name + ' Owner! 🏭');
       showPanel('dashboard');
+      _biometricOfferRegistration(email);
       return;
     }
 
     _activateRoleSession(u.role);
+    _biometricOfferRegistration(email);
   } catch(e) {
     err.textContent = '❌ Login error: ' + e.message; err.style.display='block';
   }
@@ -15095,6 +15116,130 @@ document.addEventListener('DOMContentLoaded', () => {
     };
   }
 });
+
+// ══════════════════════════════════════════════════════════════════════
+//  BIOMETRIC — MAIN LOGIN SCREEN (mobile #content login, not overlay)
+// ══════════════════════════════════════════════════════════════════════
+
+async function _biometricInitMain() {
+  const type = await _biometricGetType();
+
+  const divider   = document.getElementById('main-bio-divider');
+  const btn       = document.getElementById('main-bio-btn');
+  const icon      = document.getElementById('main-bio-icon');
+  const lbl       = document.getElementById('main-bio-label');
+  const regWrap   = document.getElementById('main-bio-register-wrap');
+  if (!btn || !divider) return;
+
+  if (!type) return; // no biometric hardware
+
+  icon.textContent = type.icon;
+  lbl.textContent  = type.label;
+
+  const lastEmail = localStorage.getItem(_BIO_EMAIL_KEY) || '';
+  const credMap   = _biometricGetStoredCred(null);
+  const hasCred   = credMap && Object.keys(credMap).length > 0;
+
+  divider.style.display = 'flex';
+  btn.style.display     = 'flex';
+
+  if (hasCred) {
+    if (lastEmail) {
+      const emailInp = document.getElementById('login-email-input');
+      if (emailInp && !emailInp.value) emailInp.value = lastEmail;
+    }
+  } else {
+    regWrap.style.display = 'block';
+    btn.style.opacity = '0.55';
+  }
+}
+
+async function mainBiometricLogin() {
+  const emailInp = document.getElementById('login-email-input');
+  const email    = (emailInp?.value || localStorage.getItem(_BIO_EMAIL_KEY) || '').trim().toLowerCase();
+  const err      = document.getElementById('admin-login-error');
+  const status   = document.getElementById('main-bio-status');
+  const btn      = document.getElementById('main-bio-btn');
+
+  if (!email) {
+    if(err){ err.textContent='❌ Enter your email first, then tap the biometric button.'; err.style.display='block'; }
+    return;
+  }
+
+  const credId = _biometricGetStoredCred(email);
+  if (!credId) {
+    if(err){ err.textContent='❌ No biometric registered for this device. Sign in with password once, then tap "Enable Biometric Login".'; err.style.display='block'; }
+    const rw = document.getElementById('main-bio-register-wrap');
+    if(rw) rw.style.display='block';
+    return;
+  }
+
+  if(status) status.textContent = '⏳ Waiting for biometric…';
+  if(status) status.style.color = 'var(--text3)';
+  if(err)    err.style.display  = 'none';
+  if(btn)    btn.style.opacity  = '0.6';
+
+  try {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    await navigator.credentials.get({
+      publicKey: {
+        rpId: _BIO_RP_ID,
+        challenge,
+        allowCredentials: [{ type:'public-key', id:_b642buf(credId), transports:['internal'] }],
+        userVerification: 'required',
+        timeout: 60000
+      }
+    });
+
+    if(status){ status.textContent='✅ Verified! Signing you in…'; status.style.color='var(--green)'; }
+    await _biometricCompleteLogin(email, err, status);
+  } catch(e) {
+    if(btn) btn.style.opacity='1';
+    const msg = e.name==='NotAllowedError'
+      ? '❌ Biometric was cancelled or timed out.'
+      : e.name==='SecurityError'
+      ? '❌ Needs HTTPS to use biometrics.'
+      : '❌ Biometric failed: '+e.message;
+    if(status){ status.textContent=msg; status.style.color='var(--red)'; }
+  }
+}
+
+async function mainBiometricRegister() {
+  const email = (document.getElementById('login-email-input')?.value || '').trim().toLowerCase();
+  const pwd   = document.getElementById('login-pwd-input')?.value || '';
+  const err   = document.getElementById('admin-login-error');
+  const status = document.getElementById('main-bio-status');
+
+  if (!email) {
+    if(err){ err.textContent='❌ Enter your email first.'; err.style.display='block'; } return;
+  }
+  if (!pwd) {
+    if(err){ err.textContent='❌ Sign in with your password once first to enable biometrics.'; err.style.display='block'; } return;
+  }
+
+  if(status){ status.textContent='⏳ Follow your device prompt to register biometric…'; status.style.color='var(--text3)'; }
+
+  try {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const uid = new TextEncoder().encode(email);
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        rp: { id:_BIO_RP_ID, name:_BIO_RP_NAME },
+        user: { id:uid, name:email, displayName:email },
+        challenge,
+        pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],
+        authenticatorSelection:{ authenticatorAttachment:'platform', userVerification:'required', residentKey:'preferred' },
+        timeout:60000, attestation:'none'
+      }
+    });
+    _biometricStoreCred(email, _buf2b64(cred.rawId));
+    if(status){ status.textContent='✅ Biometric enabled! Use it next time to sign in instantly.'; status.style.color='var(--green)'; }
+    setTimeout(_biometricInitMain, 400);
+  } catch(e) {
+    const msg = e.name==='NotAllowedError' ? '❌ Biometric registration cancelled.' : '❌ Registration failed: '+e.message;
+    if(status){ status.textContent=msg; status.style.color='var(--red)'; }
+  }
+}
 
 // ── Manage biometrics from Settings (called by settings panel) ────────
 function biometricManage() {
