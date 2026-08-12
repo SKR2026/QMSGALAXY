@@ -7444,10 +7444,29 @@ function showAdminPasswordOverlay(){
         🔓 Sign In
       </button>
 
+      <div id="biometric-divider" style="display:none;align-items:center;gap:10px;margin:10px 0;">
+        <div style="flex:1;height:1px;background:var(--border)"></div>
+        <span style="font-size:11px;color:var(--text3);font-weight:600;letter-spacing:.6px;text-transform:uppercase;">or</span>
+        <div style="flex:1;height:1px;background:var(--border)"></div>
+      </div>
+      <button id="biometric-btn" onclick="biometricLogin()" style="display:none;width:100%;padding:13px;border:1.5px solid var(--border2);border-radius:9px;background:transparent;color:var(--text);font-family:var(--font-body);font-size:14px;font-weight:600;cursor:pointer;transition:all .2s;align-items:center;justify-content:center;gap:10px;">
+        <span id="biometric-btn-icon" style="font-size:22px;line-height:1;">⬛</span>
+        <span id="biometric-btn-label">Use Biometrics</span>
+      </button>
+      <div id="biometric-status" style="margin-top:10px;font-size:12px;color:var(--text3);text-align:center;display:none;"></div>
+      <div id="biometric-register-wrap" style="display:none;margin-top:10px;">
+        <button onclick="biometricRegister()" style="width:100%;padding:10px;border:1px dashed var(--border2);border-radius:8px;background:transparent;color:var(--text2);font-family:var(--font-body);font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;">
+          ＋ Enable Biometric Login for this device
+        </button>
+      </div>
+
     </div>`;
 
   document.body.appendChild(overlay);
-  setTimeout(()=>document.getElementById('overlay-email-input')?.focus(), 80);
+  setTimeout(()=>{
+    document.getElementById('overlay-email-input')?.focus();
+    _biometricInitOverlay();
+  }, 80);
 }
 
 async function overlayAdminLogin(){
@@ -14643,6 +14662,455 @@ document.addEventListener('DOMContentLoaded', () => {
 window.addEventListener('resize', () => {
   if (window.innerWidth > 768) mobCloseSidebar();
 });
+
+// ══════════════════════════════════════════════════════════════════════
+//  BIOMETRIC AUTHENTICATION — WebAuthn (Face ID / Touch ID / Fingerprint)
+// ══════════════════════════════════════════════════════════════════════
+
+const _BIO_CRED_KEY  = 'poly_bio_credId';    // localStorage key for credential ID
+const _BIO_EMAIL_KEY = 'poly_bio_email';      // localStorage key for last biometric email
+const _BIO_RP_ID     = location.hostname || 'localhost';
+const _BIO_RP_NAME   = 'POLYPLASTICS Task Manager';
+
+// ── Detect what biometric is available and return a friendly label ────
+async function _biometricGetType() {
+  if (!window.PublicKeyCredential) return null;
+  try {
+    const avail = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+    if (!avail) return null;
+    // Try to detect Face ID vs Touch ID vs Fingerprint via user-agent hints
+    const ua = navigator.userAgent.toLowerCase();
+    const pf = (navigator.userAgentData?.platform || navigator.platform || '').toLowerCase();
+    if (/iphone|ipad/.test(ua)) return { icon: '🔒', label: 'Sign in with Face ID / Touch ID' };
+    if (/mac/.test(pf) || /mac/.test(ua)) return { icon: '👆', label: 'Sign in with Touch ID' };
+    if (/android/.test(ua)) return { icon: '🫆', label: 'Sign in with Fingerprint / Face' };
+    if (/windows/.test(ua)) return { icon: '🪪', label: 'Sign in with Windows Hello' };
+    return { icon: '🔒', label: 'Sign in with Biometrics' };
+  } catch { return null; }
+}
+
+// ── Check if a credential is stored for a given email ────────────────
+function _biometricGetStoredCred(email) {
+  try {
+    const raw = localStorage.getItem(_BIO_CRED_KEY);
+    if (!raw) return null;
+    const map = JSON.parse(raw);
+    return email ? (map[email.toLowerCase()] || null) : map;
+  } catch { return null; }
+}
+function _biometricStoreCred(email, credIdBase64) {
+  try {
+    const raw = localStorage.getItem(_BIO_CRED_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    map[email.toLowerCase()] = credIdBase64;
+    localStorage.setItem(_BIO_CRED_KEY, JSON.stringify(map));
+    localStorage.setItem(_BIO_EMAIL_KEY, email.toLowerCase());
+  } catch {}
+}
+function _biometricRemoveCred(email) {
+  try {
+    const raw = localStorage.getItem(_BIO_CRED_KEY);
+    if (!raw) return;
+    const map = JSON.parse(raw);
+    delete map[email.toLowerCase()];
+    localStorage.setItem(_BIO_CRED_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+// ── ArrayBuffer ↔ base64url helpers ──────────────────────────────────
+function _buf2b64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+function _b642buf(b64) {
+  const s = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+  return Uint8Array.from(s, c=>c.charCodeAt(0)).buffer;
+}
+
+// ── Initialize biometric UI elements in the overlay ──────────────────
+async function _biometricInitOverlay() {
+  const type = await _biometricGetType();
+  if (!type) return; // no platform authenticator
+
+  const divider   = document.getElementById('biometric-divider');
+  const btn       = document.getElementById('biometric-btn');
+  const icon      = document.getElementById('biometric-btn-icon');
+  const lbl       = document.getElementById('biometric-btn-label');
+  const regWrap   = document.getElementById('biometric-register-wrap');
+  if (!btn) return;
+
+  // Style the icon/label
+  icon.textContent = type.icon;
+  lbl.textContent  = type.label;
+
+  // Check if we have a stored credential for any email
+  const lastEmail = localStorage.getItem(_BIO_EMAIL_KEY) || '';
+  const credMap   = _biometricGetStoredCred(null);
+  const hasCred   = credMap && Object.keys(credMap).length > 0;
+
+  divider.style.display = 'flex';
+  btn.style.display      = 'flex';
+
+  if (hasCred) {
+    // Pre-fill email if we have it
+    if (lastEmail) {
+      const emailInp = document.getElementById('overlay-email-input');
+      if (emailInp && !emailInp.value) emailInp.value = lastEmail;
+    }
+    // Biometric button = sign in
+    btn.style.borderColor = 'var(--accent)';
+    btn.style.color       = 'var(--accent)';
+    btn.onmouseover = () => { btn.style.background='rgba(91,141,238,.08)'; };
+    btn.onmouseout  = () => { btn.style.background='transparent'; };
+  } else {
+    // No credential yet: show register hint
+    regWrap.style.display = 'block';
+    // Still show sign-in button in muted style (will show register prompt if no cred)
+    btn.style.opacity = '0.6';
+  }
+}
+
+// ── REGISTER: create a new passkey / platform credential ─────────────
+async function biometricRegister() {
+  const email = (document.getElementById('overlay-email-input')?.value || '').trim().toLowerCase();
+  const pwd   = document.getElementById('overlay-pwd-input')?.value || '';
+  const err   = document.getElementById('overlay-login-error');
+  const status = document.getElementById('biometric-status');
+
+  if (!email) {
+    if(err){ err.textContent='❌ Enter your email first, then enable biometrics.'; err.style.display='block'; }
+    return;
+  }
+  if (!pwd) {
+    if(err){ err.textContent='❌ Sign in with your password once first to enable biometrics.'; err.style.display='block'; }
+    return;
+  }
+
+  // Show progress
+  if(status){ status.textContent = '⏳ Registering biometric — follow your device prompt…'; status.style.display='block'; status.style.color='var(--text3)'; }
+
+  try {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const uid = new TextEncoder().encode(email);
+
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        rp: { id: _BIO_RP_ID, name: _BIO_RP_NAME },
+        user: { id: uid, name: email, displayName: email },
+        challenge,
+        pubKeyCredParams: [
+          { type: 'public-key', alg: -7  },  // ES256
+          { type: 'public-key', alg: -257 }   // RS256
+        ],
+        authenticatorSelection: {
+          authenticatorAttachment: 'platform',
+          userVerification: 'required',
+          residentKey: 'preferred'
+        },
+        timeout: 60000,
+        attestation: 'none'
+      }
+    });
+
+    const credId = _buf2b64(cred.rawId);
+    _biometricStoreCred(email, credId);
+
+    if(status){ status.textContent = '✅ Biometric registered! You can now sign in with ' + (await _biometricGetType())?.label?.replace('Sign in with ','') + '.'; status.style.color='var(--green)'; }
+    const err2 = document.getElementById('overlay-login-error');
+    if(err2) err2.style.display='none';
+
+    // Refresh UI to show sign-in mode
+    setTimeout(_biometricInitOverlay, 400);
+
+  } catch(e) {
+    const msg = e.name === 'NotAllowedError'
+      ? '❌ Biometric was cancelled or denied.'
+      : e.name === 'InvalidStateError'
+      ? '❌ A passkey already exists for this device.'
+      : '❌ Biometric registration failed: ' + e.message;
+    if(status){ status.textContent = msg; status.style.display='block'; status.style.color='var(--red)'; }
+  }
+}
+
+// ── LOGIN: verify using stored passkey ────────────────────────────────
+async function biometricLogin() {
+  const emailInp = document.getElementById('overlay-email-input');
+  const email    = (emailInp?.value || localStorage.getItem(_BIO_EMAIL_KEY) || '').trim().toLowerCase();
+  const err      = document.getElementById('overlay-login-error');
+  const status   = document.getElementById('biometric-status');
+  const btn      = document.getElementById('biometric-btn');
+
+  // Need email to find the right credential
+  if (!email) {
+    if(err){ err.textContent='❌ Enter your email first, then tap the biometric button.'; err.style.display='block'; }
+    return;
+  }
+
+  const credId = _biometricGetStoredCred(email);
+  if (!credId) {
+    // No credential stored yet — prompt to register
+    if(err){ err.textContent='❌ No biometric registered for this device. Sign in with password first, then enable biometrics.'; err.style.display='block'; }
+    const regWrap = document.getElementById('biometric-register-wrap');
+    if(regWrap) regWrap.style.display='block';
+    return;
+  }
+
+  if(status){ status.textContent='⏳ Waiting for biometric…'; status.style.display='block'; status.style.color='var(--text3)'; }
+  if(err) err.style.display='none';
+  if(btn) btn.style.opacity='0.6';
+
+  try {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        rpId: _BIO_RP_ID,
+        challenge,
+        allowCredentials: [{
+          type: 'public-key',
+          id: _b642buf(credId),
+          transports: ['internal']
+        }],
+        userVerification: 'required',
+        timeout: 60000
+      }
+    });
+
+    // Biometric was verified by the OS — the device confirmed identity.
+    // Now perform the same login flow as password login but skip password check.
+    // We still need Firebase to resolve the user record.
+    if(status){ status.textContent='✅ Biometric verified! Signing you in…'; status.style.color='var(--green)'; }
+
+    await _biometricCompleteLogin(email, err, status);
+
+  } catch(e) {
+    if(btn) btn.style.opacity='1';
+    const msg = e.name === 'NotAllowedError'
+      ? '❌ Biometric was cancelled or timed out.'
+      : e.name === 'SecurityError'
+      ? '❌ Biometric not available on this connection (needs HTTPS).'
+      : '❌ Biometric failed: ' + e.message;
+    if(status){ status.textContent=msg; status.style.display='block'; status.style.color='var(--red)'; }
+  }
+}
+
+// ── Complete login after successful biometric assertion ───────────────
+// This mirrors overlayAdminLogin() but skips password verification.
+async function _biometricCompleteLogin(email, err, status) {
+  // ── Wait for Firebase ───────────────────────────────────────────────
+  if (!_fbReady) {
+    const ready = await _waitForFbReady(8000);
+    if (!ready) {
+      if(status){ status.textContent='❌ Database not ready. Please refresh.'; status.style.color='var(--red)'; }
+      return;
+    }
+  }
+
+  // ── Super admin check ───────────────────────────────────────────────
+  const _superAdminEmail = (localStorage.getItem('admin_notify_email') || '').trim().toLowerCase();
+  if (_superAdminEmail && email === _superAdminEmail) {
+    // Super admin biometric sign in
+    const bf = await _bfCheck('admin');
+    if (bf.locked) {
+      if(status){ status.textContent='⏳ Account locked. Try again in '+bf.remaining+' min(s).'; status.style.color='var(--red)'; }
+      return;
+    }
+    await _bfRecord('admin', true);
+    const licOK = await _requireSuperAdminLicense();
+    if (!licOK) {
+      if(status){ status.textContent='❌ Super Admin requires a valid license key.'; status.style.color='var(--red)'; }
+      return;
+    }
+    currentSession     = null;
+    adminAuthenticated = true;
+    const overlay = document.getElementById('admin-pwd-overlay');
+    if(overlay) overlay.remove();
+    _setSettingsNavVisible(true);
+    _injectRoleNavItems('superadmin');
+    _renderTopbarUserBadge();
+    const sai = document.getElementById('sidebar-account-info');
+    if(sai) sai.style.display = 'block';
+    _updateSidebarAccountInfo();
+    const saNotifEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    if(saNotifEmail) _startNotifListener(saNotifEmail);
+    _myGroupMemberEmails = [];
+    _myGroupPendingEmails = [];
+    buildGlobalMemberBar();
+    const saKey = (localStorage.getItem('admin_notify_email')||'').trim();
+    if(saKey) {
+      _ensureAppUsersLoaded().then(() => {
+        _loadGroupMemberEmails(saKey).then(() => { refreshOverdueBadge(); });
+      });
+    }
+    toast('🔒 Biometric sign-in successful! Welcome back, Super Admin 👋');
+    showPanel('dashboard');
+    return;
+  }
+
+  // ── Plant owner check ──────────────────────────────────────────────
+  const _plantGroups = getPlantGroups();
+  const _matchedPlant = _plantGroups.find(p =>
+    (p.owners || []).map(e => e.trim().toLowerCase()).includes(email)
+  );
+  if (_matchedPlant) {
+    const overlay = document.getElementById('admin-pwd-overlay');
+    if(overlay) overlay.remove();
+    currentSession         = null;
+    plantOwnerAuthenticated = true;
+    adminAuthenticated      = false;
+    currentPlantSession     = _matchedPlant;
+    _activePlantId          = _matchedPlant.id;
+    _plantOwnerEmail        = email;
+    document.body.classList.add('plant-owner-mode');
+    document.getElementById('admin-nav').style.display             = 'block';
+    document.getElementById('btn-new-task').style.display          = 'flex';
+    document.getElementById('btn-bulk-upload').style.display       = 'flex';
+    document.getElementById('btn-export').style.display            = 'flex';
+    document.getElementById('btn-admin-mode').style.display        = 'none';
+    document.getElementById('btn-user-mode').style.display         = 'none';
+    const poModeLabel = document.querySelector('.sidebar-mode-label');
+    if(poModeLabel) poModeLabel.style.display = 'none';
+    const poSb = document.querySelector('.sidebar-bottom');
+    if(poSb){ poSb.style.display=''; poSb.style.visibility=''; }
+    const poAvatar = document.getElementById('topbar-avatar');
+    if(poAvatar){ poAvatar.textContent = _matchedPlant.name[0].toUpperCase(); poAvatar.style.background='linear-gradient(135deg,var(--green),var(--cyan))'; }
+    document.getElementById('topbar-title').textContent = '🏭 ' + _matchedPlant.name;
+    _setSettingsNavVisible(false);
+    _renderTopbarUserBadge();
+    const poSai = document.getElementById('sidebar-account-info');
+    if(poSai) poSai.style.display = 'block';
+    _updateSidebarAccountInfo();
+    renderPlantNav();
+    toast('🔒 Biometric sign-in successful! Welcome, ' + _matchedPlant.name + ' Owner 🏭');
+    showPanel('dashboard');
+    return;
+  }
+
+  // ── Admin / User from appUsers collection ──────────────────────────
+  if (!_fbReady || !_db) {
+    if(status){ status.textContent='❌ Database not ready.'; status.style.color='var(--red)'; }
+    return;
+  }
+  try {
+    const snap = await _db.collection('appUsers').doc(email).get();
+    if (!snap.exists) {
+      if(status){ status.textContent='❌ Account not found. Contact your admin.'; status.style.color='var(--red)'; }
+      _biometricRemoveCred(email); // remove stale cred
+      return;
+    }
+    const u = snap.data();
+    if (u.status === 'pending')  { if(status){ status.textContent='❌ Account pending. Check your email.'; status.style.color='var(--red)'; } return; }
+    if (u.status === 'disabled') { if(status){ status.textContent='❌ Account disabled.'; status.style.color='var(--red)'; } return; }
+    if (u.status === 'removed')  { if(status){ status.textContent='❌ Account removed.'; status.style.color='var(--red)'; } return; }
+    if (u.mustChangePassword)    { if(status){ status.textContent='❌ You must reset your password first.'; status.style.color='var(--red)'; } return; }
+
+    await _bfRecord('user:'+email, true);
+    currentSession = { email: u.email, nickname: u.nickname||'', role: u.role, uid: snap.id };
+
+    const overlay = document.getElementById('admin-pwd-overlay');
+    if(overlay) overlay.remove();
+
+    toast('🔒 Biometric sign-in successful! Welcome back' + (u.nickname ? ', '+u.nickname : '') + ' 👋');
+    _activateRoleSession(u.role);
+  } catch(e) {
+    if(status){ status.textContent='❌ Sign-in error: '+e.message; status.style.color='var(--red)'; }
+  }
+}
+
+// ── Auto-trigger biometric if credential exists for pre-filled email ──
+// Called after password login succeeds to offer biometric registration ─
+function _biometricOfferRegistration(email) {
+  if (!window.PublicKeyCredential) return;
+  PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(avail => {
+    if (!avail) return;
+    const stored = _biometricGetStoredCred(email);
+    if (stored) return; // already registered
+    // Show a gentle toast offering registration
+    setTimeout(() => {
+      const toastEl = document.createElement('div');
+      toastEl.id = 'bio-offer-toast';
+      toastEl.style.cssText = [
+        'position:fixed','bottom:90px','left:50%','transform:translateX(-50%)',
+        'z-index:10000','background:var(--card)','border:1px solid var(--accent)',
+        'border-radius:12px','padding:14px 18px','min-width:280px','max-width:92vw',
+        'box-shadow:0 8px 32px rgba(0,0,0,.5)','animation:slideUp .2s ease',
+        'font-family:var(--font-body)','text-align:center'
+      ].join(';');
+      toastEl.innerHTML = `
+        <div style="font-size:24px;margin-bottom:6px">🔒</div>
+        <div style="font-weight:700;font-size:14px;color:var(--text);margin-bottom:4px">Enable Biometric Login?</div>
+        <div style="font-size:12px;color:var(--text2);margin-bottom:12px">Sign in faster next time with Face ID, Touch ID, or fingerprint — no password needed.</div>
+        <div style="display:flex;gap:8px;justify-content:center;">
+          <button onclick="_biometricOfferRegisterNow('${email}')" style="padding:8px 16px;border:none;border-radius:8px;background:var(--accent);color:#fff;font-family:var(--font-body);font-size:13px;font-weight:700;cursor:pointer;">Enable</button>
+          <button onclick="document.getElementById('bio-offer-toast')?.remove()" style="padding:8px 14px;border:1px solid var(--border2);border-radius:8px;background:transparent;color:var(--text2);font-family:var(--font-body);font-size:13px;cursor:pointer;">Not now</button>
+        </div>`;
+      document.body.appendChild(toastEl);
+      setTimeout(() => toastEl.remove(), 15000);
+    }, 800);
+  }).catch(()=>{});
+}
+
+async function _biometricOfferRegisterNow(email) {
+  const toast2 = document.getElementById('bio-offer-toast');
+  if(toast2){ toast2.innerHTML = '<div style="font-size:13px;color:var(--text2);padding:8px 0">⏳ Follow your device prompt…</div>'; }
+  try {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const uid       = new TextEncoder().encode(email);
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        rp: { id: _BIO_RP_ID, name: _BIO_RP_NAME },
+        user: { id: uid, name: email, displayName: email },
+        challenge,
+        pubKeyCredParams: [
+          { type:'public-key', alg:-7   },
+          { type:'public-key', alg:-257 }
+        ],
+        authenticatorSelection: { authenticatorAttachment:'platform', userVerification:'required', residentKey:'preferred' },
+        timeout: 60000,
+        attestation: 'none'
+      }
+    });
+    _biometricStoreCred(email, _buf2b64(cred.rawId));
+    const t2 = document.getElementById('bio-offer-toast');
+    if(t2){ t2.innerHTML='<div style="font-size:13px;font-weight:700;color:var(--green);padding:8px 0">✅ Biometric enabled! Sign in faster next time.</div>'; }
+    setTimeout(() => document.getElementById('bio-offer-toast')?.remove(), 3000);
+  } catch(e) {
+    const t3 = document.getElementById('bio-offer-toast');
+    if(t3) t3.remove();
+  }
+}
+
+// ── Hook into successful password login to offer biometric ────────────
+// Patch the post-login success handlers to call _biometricOfferRegistration
+const _origActivateRole = typeof _activateRoleSession !== 'undefined' ? _activateRoleSession : null;
+// We inject via a wrapper assigned at runtime when the function exists
+document.addEventListener('DOMContentLoaded', () => {
+  // This fires after all script is parsed, so _activateRoleSession is defined
+  const _origARS = window._activateRoleSession;
+  if (typeof _origARS === 'function') {
+    window._activateRoleSession = function(role) {
+      const email = (document.getElementById('overlay-email-input')?.value || '').trim().toLowerCase();
+      _origARS.call(this, role);
+      if (email) _biometricOfferRegistration(email);
+    };
+  }
+});
+
+// ── Manage biometrics from Settings (called by settings panel) ────────
+function biometricManage() {
+  const credMap = _biometricGetStoredCred(null) || {};
+  const entries = Object.entries(credMap);
+  if (entries.length === 0) {
+    toast('No biometric credentials registered on this device.', 'var(--amber)');
+    return;
+  }
+  const list = entries.map(([e]) => `• ${e}`).join('\n');
+  if (confirm('Biometric credentials on this device:\n\n' + list + '\n\nRemove all biometric credentials?')) {
+    localStorage.removeItem(_BIO_CRED_KEY);
+    localStorage.removeItem(_BIO_EMAIL_KEY);
+    toast('✅ All biometric credentials removed.', 'var(--green)');
+  }
+}
 
 // ── Admin notification on task creation (called ONLY when plant admin assigns) ────
 // Sends an email to the superadmin (admin_notify_email) informing them that
