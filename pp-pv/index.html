@@ -1161,7 +1161,7 @@ html.guest-direct-link #mainContent { display: block !important; }
 
   <!-- Fingerprint sensor -->
   <div class="bio-sensor-wrap">
-    <div class="bio-sensor" id="bioSensor" onclick="_pvBioTap()">
+    <div class="bio-sensor" id="bioSensor" onclick="_pvBioLogin()">
       <div class="bio-sensor-bg">
         <svg class="bio-fp-icon" viewBox="0 0 24 24">
           <path d="M12 2C8.7 2 6 4.7 6 8v2"/>
@@ -1183,7 +1183,7 @@ html.guest-direct-link #mainContent { display: block !important; }
 
     <!-- Face ID -->
     <div class="bio-alts">
-      <div class="bio-faceid-btn" onclick="_pvBioTap('face')">
+      <div class="bio-faceid-btn" onclick="_pvBioLogin()">
         <svg viewBox="0 0 24 24">
           <path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3M3 16v3a2 2 0 002 2h3m8 0h3a2 2 0 002-2v-3"/>
           <circle cx="9" cy="10" r="1" fill="currentColor" stroke="none"/>
@@ -2823,6 +2823,9 @@ function doLogin() {
     }
     // License OK — proceed
     activateSession(user, username, null);
+
+    // Offer biometric registration after successful password login
+    _pvBioOfferRegistration(username);
 
     // ★ FIX: Re-authenticate with Firebase using email/password so the auth
     // token becomes non-anonymous. This is required for Firestore write rules.
@@ -8242,10 +8245,17 @@ function showLicenseInfo() {
 </script>
 
 <script>
-/* ══════════════════════════════════════════════════════
-   BIOMETRIC LOGIN — PlantVisit mobile auth helpers
-══════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════════════
+   BIOMETRIC AUTHENTICATION — WebAuthn (Face ID / Touch ID / Fingerprint)
+   Ported from TaskPlanner v151 — adapted for PlantVisit login screen IDs
+══════════════════════════════════════════════════════════════════════ */
 
+const _PV_BIO_CRED_KEY  = 'pv_bio_credId';   // map of { username → credIdBase64 }
+const _PV_BIO_USER_KEY  = 'pv_bio_lastUser';  // last username that biometrically logged in
+const _PV_BIO_RP_ID     = location.hostname || 'localhost';
+const _PV_BIO_RP_NAME   = 'PlantVisit';
+
+// ── UI helpers ────────────────────────────────────────────────────────
 function _pvTogglePw() {
   const inp = document.getElementById('loginPass');
   if (inp) inp.type = inp.type === 'password' ? 'text' : 'password';
@@ -8260,85 +8270,288 @@ function _pvToggleForm() {
   if (tog) tog.innerHTML = isOpen
     ? '<span>Use username &amp; password</span>'
     : 'Back to biometrics';
-  // (form is open by default, so toggling closed shows "Use username & password")
   if (!isOpen) {
-    setTimeout(() => {
-      const u = document.getElementById('loginUser');
-      if (u) u.focus();
-    }, 320);
+    setTimeout(() => { const u = document.getElementById('loginUser'); if (u) u.focus(); }, 320);
   }
 }
 
-async function _pvBioTap(type) {
+// ── Detect biometric type from UA ─────────────────────────────────────
+async function _pvBioGetType() {
+  if (!window.PublicKeyCredential) return null;
+  try {
+    const avail = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+    if (!avail) return null;
+    const ua = navigator.userAgent.toLowerCase();
+    const pf = (navigator.userAgentData?.platform || navigator.platform || '').toLowerCase();
+    if (/iphone|ipad/.test(ua)) return { icon: '🔒', label: 'Face ID / Touch ID' };
+    if (/mac/.test(pf) || /mac/.test(ua)) return { icon: '👆', label: 'Touch ID' };
+    if (/android/.test(ua))               return { icon: '🫆', label: 'Fingerprint / Face' };
+    if (/windows/.test(ua))               return { icon: '🪪', label: 'Windows Hello' };
+    return { icon: '🔒', label: 'Biometrics' };
+  } catch { return null; }
+}
+
+// ── Credential storage ────────────────────────────────────────────────
+function _pvBioGetCred(username) {
+  try {
+    const raw = localStorage.getItem(_PV_BIO_CRED_KEY);
+    if (!raw) return null;
+    const map = JSON.parse(raw);
+    return username ? (map[username.toLowerCase()] || null) : map;
+  } catch { return null; }
+}
+function _pvBioStoreCred(username, credIdBase64) {
+  try {
+    const raw = localStorage.getItem(_PV_BIO_CRED_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    map[username.toLowerCase()] = credIdBase64;
+    localStorage.setItem(_PV_BIO_CRED_KEY, JSON.stringify(map));
+    localStorage.setItem(_PV_BIO_USER_KEY, username.toLowerCase());
+  } catch {}
+}
+function _pvBioRemoveCred(username) {
+  try {
+    const raw = localStorage.getItem(_PV_BIO_CRED_KEY);
+    if (!raw) return;
+    const map = JSON.parse(raw);
+    delete map[username.toLowerCase()];
+    localStorage.setItem(_PV_BIO_CRED_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+// ── Buffer ↔ base64url ────────────────────────────────────────────────
+function _pvBuf2b64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+function _pvB642buf(b64) {
+  const s = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+  return Uint8Array.from(s, c => c.charCodeAt(0)).buffer;
+}
+
+// ── Visual state helpers ──────────────────────────────────────────────
+function _pvBioSetState(state, text) {
   const sensor = document.getElementById('bioSensor');
   const status = document.getElementById('bioStatus');
-  if (!sensor || !status) return;
-
-  // Visual: scanning state
-  sensor.className = 'bio-sensor scanning';
-  status.className = 'bio-status scanning';
-  status.textContent = type === 'face' ? 'Looking for your face…' : 'Reading fingerprint…';
-
-  // Try real WebAuthn (Touch ID / Face ID / Windows Hello)
-  if (window.PublicKeyCredential) {
-    try {
-      const cred = await navigator.credentials.get({
-        publicKey: {
-          challenge: crypto.getRandomValues(new Uint8Array(32)),
-          timeout: 14000,
-          userVerification: 'required',
-          rpId: location.hostname || 'localhost',
-        }
-      });
-      if (cred) {
-        _pvBioSuccess(sensor, status);
-        return;
-      }
-    } catch(e) {
-      // Biometrics not enrolled or cancelled — show credential form
-      _pvBioFallback(sensor, status);
-      return;
-    }
-  }
-
-  // No WebAuthn API — simulate scan, then show credentials
-  setTimeout(() => _pvBioFallback(sensor, status), 1800);
+  if (sensor) sensor.className = 'bio-sensor' + (state ? ' ' + state : '');
+  if (status) { status.className = 'bio-status' + (state ? ' ' + state : ''); if (text) status.textContent = text; }
 }
 
-function _pvBioSuccess(sensor, status) {
-  sensor.className = 'bio-sensor success';
-  status.className = 'bio-status success';
-  status.textContent = '✓ Identity verified';
-  setTimeout(() => {
-    const ls = document.getElementById('loginScreen');
-    if (ls) ls.classList.add('hidden');
-  }, 800);
-}
-
-function _pvBioFallback(sensor, status) {
-  sensor.className = 'bio-sensor';
-  status.className = 'bio-status';
-  status.textContent = 'Enter credentials below';
+function _pvBioFallback() {
+  _pvBioSetState('', 'Enter credentials below');
   const sec = document.getElementById('bioPwSection');
   const tog = document.getElementById('bioToggleForm');
   if (sec && !sec.classList.contains('open')) {
     sec.classList.add('open');
     if (tog) tog.innerHTML = 'Back to biometrics';
   }
-  setTimeout(() => {
-    const u = document.getElementById('loginUser');
-    if (u) u.focus();
-  }, 320);
+  setTimeout(() => { const u = document.getElementById('loginUser'); if (u) u.focus(); }, 320);
 }
 
-// Check platform authenticator availability on load
-document.addEventListener('DOMContentLoaded', () => {
-  if (window.PublicKeyCredential) {
-    PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()
-      .then(avail => {
-        const status = document.getElementById('bioStatus');
-        if (status && !avail) status.textContent = 'Tap to sign in';
-      }).catch(() => {});
+// ── MAIN ENTRY: tap the sensor ────────────────────────────────────────
+async function _pvBioLogin() {
+  const sensor = document.getElementById('bioSensor');
+  const status = document.getElementById('bioStatus');
+  if (!sensor || !status) return;
+
+  // If no credential stored at all, open the form instead
+  const credMap = _pvBioGetCred(null);
+  const hasCred = credMap && Object.keys(credMap).length > 0;
+  if (!hasCred) {
+    _pvBioFallback();
+    return;
+  }
+
+  // Figure out which username to authenticate
+  const userInp = document.getElementById('loginUser');
+  const username = (userInp?.value.trim().toLowerCase())
+    || localStorage.getItem(_PV_BIO_USER_KEY)
+    || '';
+
+  const credId = _pvBioGetCred(username);
+  if (!credId) {
+    // Pre-fill last known username and fall back to password form
+    if (!username && localStorage.getItem(_PV_BIO_USER_KEY)) {
+      if (userInp) userInp.value = localStorage.getItem(_PV_BIO_USER_KEY);
+    }
+    _pvBioFallback();
+    return;
+  }
+
+  _pvBioSetState('scanning', 'Verifying identity…');
+
+  try {
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        timeout: 60000,
+        userVerification: 'required',
+        rpId: _PV_BIO_RP_ID,
+        allowCredentials: [{ id: _pvB642buf(credId), type: 'public-key' }]
+      }
+    });
+
+    if (!assertion) throw new Error('No assertion returned');
+
+    // ── Success: run PlantVisit's normal login logic without password check ──
+    _pvBioSetState('success', '✓ Identity verified');
+    setTimeout(() => _pvBioCompleteLogin(username), 700);
+
+  } catch(e) {
+    if (e.name === 'NotAllowedError') {
+      _pvBioSetState('', 'Cancelled — use password below');
+    } else {
+      _pvBioSetState('error', '❌ Biometric failed — use password');
+    }
+    setTimeout(_pvBioFallback, 1200);
+  }
+}
+
+// ── Complete login after successful biometric assertion ───────────────
+function _pvBioCompleteLogin(username) {
+  const user = (_usersData && _usersData[username]) || (typeof DEFAULT_USERS !== 'undefined' && DEFAULT_USERS[username]);
+  if (!user) {
+    _pvBioSetState('error', '❌ Account not found');
+    _pvBioRemoveCred(username);
+    setTimeout(_pvBioFallback, 1500);
+    return;
+  }
+
+  localStorage.setItem('pv_session', JSON.stringify({ id: username, name: user.name }));
+  _pendingVisitId = null;
+
+  // Reuse the same license-check + activateSession path as password login
+  const errEl = document.getElementById('loginErr');
+  const _proceed = (licExpired, licExpiry) => {
+    if (licExpired) {
+      _pvBioSetState('error', '🔒 License expired');
+      if (errEl) { errEl.textContent = '🔒 License Expired' + (licExpiry ? ' (' + licExpiry + ')' : '') + ' — contact your administrator.'; errEl.classList.add('show'); }
+      localStorage.removeItem('pv_session');
+      setTimeout(_pvBioFallback, 1500);
+      return;
+    }
+    activateSession(user, username, null);
+    // Re-authenticate with Firebase
+    const email = user.email || (username + '@plantvisit.internal');
+    const fbPass = 'pv_' + username + '_realuser_2025';
+    try {
+      firebase.auth().signInWithEmailAndPassword(email, fbPass).catch(err => {
+        if (err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
+          firebase.auth().createUserWithEmailAndPassword(email, fbPass).catch(()=>{});
+        }
+      });
+    } catch(e) {}
+  };
+
+  // Reuse license-check logic (same as doLogin)
+  const _fmtExpiry = ms => { const d=new Date(ms); const M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return d.getDate()+' '+M[d.getMonth()]+' '+d.getFullYear(); };
+  if (_licInfo && (_licInfo.expiresAt || _licInfo.status === 'revoked')) {
+    const isRevoked = _licInfo.status === 'revoked';
+    const expired   = isRevoked || (_licInfo.expiresAt && _licInfo.expiresAt < Date.now());
+    _proceed(expired, expired ? (isRevoked ? 'Revoked' : _fmtExpiry(_licInfo.expiresAt)) : null);
+    return;
+  }
+  const _licKey = _LIC && _LIC.key && _LIC.key !== 'OPEN' ? _LIC.key : null;
+  if (_licKey) {
+    db.collection('licenses').doc(_licKey).get().then(doc => {
+      if (doc.exists) {
+        const data = doc.data();
+        let expiresAt = data.expiresAt;
+        if (expiresAt && typeof expiresAt.toMillis === 'function') expiresAt = expiresAt.toMillis();
+        else expiresAt = Number(expiresAt) || null;
+        const isRevoked = data.status === 'revoked';
+        const expired   = isRevoked || (expiresAt && expiresAt < Date.now());
+        _licInfo = { ...data, expiresAt };
+        _proceed(expired, expired ? (isRevoked ? 'Revoked' : _fmtExpiry(expiresAt)) : null);
+      } else { _proceed(false, null); }
+    }).catch(() => _proceed(false, null));
+  } else { _proceed(false, null); }
+}
+
+// ── REGISTER: create a new passkey after password login succeeds ──────
+async function _pvBioRegister(username) {
+  if (!window.PublicKeyCredential) return;
+  try {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const uid = new TextEncoder().encode(username);
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        rp:   { id: _PV_BIO_RP_ID, name: _PV_BIO_RP_NAME },
+        user: { id: uid, name: username, displayName: username },
+        challenge,
+        pubKeyCredParams: [
+          { type: 'public-key', alg: -7   },   // ES256
+          { type: 'public-key', alg: -257 }    // RS256
+        ],
+        authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'preferred' },
+        timeout: 60000,
+        attestation: 'none'
+      }
+    });
+    _pvBioStoreCred(username, _pvBuf2b64(cred.rawId));
+    return true;
+  } catch(e) { return false; }
+}
+
+// ── Offer registration toast after successful password login ──────────
+function _pvBioOfferRegistration(username) {
+  if (!window.PublicKeyCredential) return;
+  PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(async avail => {
+    if (!avail) return;
+    if (_pvBioGetCred(username)) return; // already registered
+    const type = await _pvBioGetType();
+    if (!type) return;
+    setTimeout(() => {
+      const existing = document.getElementById('pv-bio-offer-toast');
+      if (existing) existing.remove();
+      const toast = document.createElement('div');
+      toast.id = 'pv-bio-offer-toast';
+      toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:10000;background:#fff;border:1.5px solid #2563eb;border-radius:14px;padding:16px 20px;min-width:280px;max-width:92vw;box-shadow:0 8px 32px rgba(37,99,235,.18);font-family:var(--font,sans-serif);text-align:center';
+      toast.innerHTML = `
+        <div style="font-size:26px;margin-bottom:6px">${type.icon}</div>
+        <div style="font-weight:700;font-size:14px;color:#1e293b;margin-bottom:4px">Enable ${type.label}?</div>
+        <div style="font-size:12px;color:#64748b;margin-bottom:14px">Sign in faster next time — no password needed.</div>
+        <div style="display:flex;gap:8px;justify-content:center;">
+          <button id="pvBioEnableBtn" style="padding:9px 18px;border:none;border-radius:9px;background:#2563eb;color:#fff;font-size:13px;font-weight:700;cursor:pointer;">Enable</button>
+          <button onclick="document.getElementById('pv-bio-offer-toast')?.remove()" style="padding:9px 14px;border:1.5px solid #dbe4f0;border-radius:9px;background:#f8faff;color:#475569;font-size:13px;cursor:pointer;">Not now</button>
+        </div>`;
+      document.body.appendChild(toast);
+      document.getElementById('pvBioEnableBtn').onclick = async () => {
+        toast.innerHTML = '<div style="font-size:13px;color:#64748b;padding:8px 0">⏳ Follow your device prompt…</div>';
+        const ok = await _pvBioRegister(username);
+        toast.innerHTML = ok
+          ? '<div style="font-size:13px;font-weight:700;color:#16a34a;padding:8px 0">✅ Enabled! Sign in with biometrics next time.</div>'
+          : '<div style="font-size:13px;color:#dc2626;padding:8px 0">❌ Registration cancelled.</div>';
+        setTimeout(() => toast.remove(), 3000);
+      };
+      setTimeout(() => toast.remove(), 15000);
+    }, 900);
+  }).catch(()=>{});
+}
+
+// ── Init sensor UI on load ────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', async () => {
+  const status = document.getElementById('bioStatus');
+  const type = await _pvBioGetType();
+  const credMap = _pvBioGetCred(null);
+  const hasCred = credMap && Object.keys(credMap).length > 0;
+  const lastUser = localStorage.getItem(_PV_BIO_USER_KEY) || '';
+
+  if (!type) {
+    // No platform authenticator — open form immediately
+    _pvBioFallback();
+    return;
+  }
+
+  if (hasCred) {
+    // Pre-fill username field if we know the last user
+    if (lastUser) {
+      const userInp = document.getElementById('loginUser');
+      if (userInp && !userInp.value) userInp.value = lastUser;
+    }
+    if (status) status.textContent = `Tap to sign in with ${type.label}`;
+  } else {
+    if (status) status.textContent = 'Touch to authenticate';
   }
 });
 </script>
