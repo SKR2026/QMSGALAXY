@@ -9294,6 +9294,7 @@ function computeStatus(actual, target, direction, pct) {
 
 // ── Expose to global scope so existing inline handlers can call them ──
 window.FB = {
+  _auth: auth,
   loginUser, logoutUser, onAuthChange,
   getUserProfile, getAllUsers, createUser, updateUser, registerUser, deleteUserDoc, repairOrphanProfile, changePassword, adminResetPassword,
   getPlants, addPlant, updatePlant, deletePlant,
@@ -10096,7 +10097,7 @@ function showLoginOverlay() {
 
   <!-- Fingerprint sensor -->
   <div class="bio-sensor-wrap">
-    <div class="bio-sensor" id="bioSensor" onclick="window._biometricTap()">
+    <div class="bio-sensor" id="bioSensor" onclick="window._kpiBioLogin()">
       <div class="bio-sensor-bg">
         <svg class="bio-fp-icon" viewBox="0 0 24 24">
           <path d="M12 2C8.7 2 6 4.7 6 8v2"/>
@@ -10118,7 +10119,7 @@ function showLoginOverlay() {
 
     <!-- Face ID / alternative -->
     <div class="bio-alts">
-      <div class="bio-faceid-btn" onclick="window._biometricTap('face')">
+      <div class="bio-faceid-btn" onclick="window._kpiBioLogin()">
         <svg viewBox="0 0 24 24">
           <path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3M3 16v3a2 2 0 002 2h3m8 0h3a2 2 0 002-2v-3"/>
           <circle cx="9" cy="10" r="1" fill="currentColor" stroke="none"/>
@@ -10177,18 +10178,27 @@ function showLoginOverlay() {
     if (el) el.addEventListener('keydown', e => { if (e.key === 'Enter') window._doLogin(); });
   });
 
-  // Auto-try WebAuthn / biometrics if supported
-  setTimeout(() => { window._tryWebAuthn && window._tryWebAuthn(); }, 600);
+  // Biometric init runs automatically via _kpiBioInit() IIFE below
 }
 
-// Toggle password visibility
+// ══════════════════════════════════════════════════════════════════════
+//  BIOMETRIC AUTHENTICATION — WebAuthn (Face ID / Touch ID / Fingerprint)
+//  Ported from PlantVisit / TaskPlanner — adapted for KPI Dashboard
+// ══════════════════════════════════════════════════════════════════════
+
+const _KPI_BIO_CRED_KEY = 'kpi_bio_credId';   // { email → credIdBase64 }
+const _KPI_BIO_USER_KEY = 'kpi_bio_lastEmail'; // last email that biometrically logged in
+const _KPI_BIO_RP_ID    = location.hostname || 'localhost';
+const _KPI_BIO_RP_NAME  = 'Polyplastics KPI Dashboard';
+
+// ── Toggle password visibility ────────────────────────────────────────
 window._toggleBioPw = function() {
   const inp = document.getElementById('loginPassword');
   if (!inp) return;
   inp.type = inp.type === 'password' ? 'text' : 'password';
 };
 
-// Show/hide password form
+// ── Show / hide password form ─────────────────────────────────────────
 window._toggleBioForm = function() {
   const sec = document.getElementById('bioPwSection');
   const tog = document.getElementById('bioToggleForm');
@@ -10198,78 +10208,248 @@ window._toggleBioForm = function() {
   if (tog) tog.innerHTML = isOpen ? '<span>Use email &amp; password</span>' : 'Back to biometrics';
 };
 
-// Biometric tap simulation (visual feedback + WebAuthn attempt)
-window._biometricTap = async function(type) {
+// ── Detect biometric type from UA ─────────────────────────────────────
+async function _kpiBioGetType() {
+  if (!window.PublicKeyCredential) return null;
+  try {
+    const avail = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+    if (!avail) return null;
+    const ua = navigator.userAgent.toLowerCase();
+    const pf = (navigator.userAgentData?.platform || navigator.platform || '').toLowerCase();
+    if (/iphone|ipad/.test(ua)) return { icon: '🔒', label: 'Face ID / Touch ID' };
+    if (/mac/.test(pf) || /mac/.test(ua)) return { icon: '👆', label: 'Touch ID' };
+    if (/android/.test(ua))               return { icon: '🫆', label: 'Fingerprint / Face' };
+    if (/windows/.test(ua))               return { icon: '🪪', label: 'Windows Hello' };
+    return { icon: '🔒', label: 'Biometrics' };
+  } catch { return null; }
+}
+
+// ── Credential storage ────────────────────────────────────────────────
+function _kpiBioGetCred(email) {
+  try {
+    const raw = localStorage.getItem(_KPI_BIO_CRED_KEY);
+    if (!raw) return null;
+    const map = JSON.parse(raw);
+    return email ? (map[email.toLowerCase()] || null) : map;
+  } catch { return null; }
+}
+function _kpiBioStoreCred(email, credIdBase64) {
+  try {
+    const raw = localStorage.getItem(_KPI_BIO_CRED_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    map[email.toLowerCase()] = credIdBase64;
+    localStorage.setItem(_KPI_BIO_CRED_KEY, JSON.stringify(map));
+    localStorage.setItem(_KPI_BIO_USER_KEY, email.toLowerCase());
+  } catch {}
+}
+function _kpiBioRemoveCred(email) {
+  try {
+    const raw = localStorage.getItem(_KPI_BIO_CRED_KEY);
+    if (!raw) return;
+    const map = JSON.parse(raw);
+    delete map[email.toLowerCase()];
+    localStorage.setItem(_KPI_BIO_CRED_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+// ── Buffer ↔ base64url ────────────────────────────────────────────────
+function _kpiBuf2b64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+function _kpiB642buf(b64) {
+  const s = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+  return Uint8Array.from(s, c => c.charCodeAt(0)).buffer;
+}
+
+// ── Visual state helpers ──────────────────────────────────────────────
+function _kpiBioSetState(state, text) {
   const sensor = document.getElementById('bioSensor');
   const status = document.getElementById('bioStatus');
-  if (!sensor || !status) return;
-
-  // Reset
-  sensor.className = 'bio-sensor scanning';
-  status.className = 'bio-status scanning';
-  status.textContent = type === 'face' ? 'Looking for your face…' : 'Reading fingerprint…';
-
-  // Try real WebAuthn
-  if (window.PublicKeyCredential) {
-    try {
-      const cred = await navigator.credentials.get({
-        publicKey: {
-          challenge: crypto.getRandomValues(new Uint8Array(32)),
-          timeout: 12000,
-          userVerification: 'required',
-          rpId: location.hostname || 'localhost',
-        }
-      });
-      if (cred) {
-        _bioSuccess(sensor, status);
-        return;
-      }
-    } catch(e) {
-      // Not enrolled or cancelled — show password form
-      _bioFallback(sensor, status);
-      return;
-    }
-  }
-
-  // Fallback: simulate visual scan then prompt password
-  setTimeout(() => { _bioFallback(sensor, status); }, 1800);
-};
-
-// Try WebAuthn automatically on load
-window._tryWebAuthn = function() {
-  if (window.PublicKeyCredential && navigator.credentials) {
-    // Check if platform authenticator is available
-    PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(available => {
-      if (!available) {
-        const status = document.getElementById('bioStatus');
-        if (status) { status.textContent = 'Tap to sign in with password'; }
-      }
-    }).catch(()=>{});
-  }
-};
-
-function _bioSuccess(sensor, status) {
-  sensor.className = 'bio-sensor success';
-  status.className = 'bio-status success';
-  status.textContent = '✓ Identity verified';
-  // If actually authenticated via WebAuthn, close overlay
-  setTimeout(() => {
-    const overlay = document.getElementById('loginOverlay');
-    if (overlay) overlay.style.display = 'none';
-  }, 900);
+  if (sensor) sensor.className = 'bio-sensor' + (state ? ' ' + state : '');
+  if (status) { status.className = 'bio-status' + (state ? ' ' + state : ''); if (text) status.textContent = text; }
 }
 
-function _bioFallback(sensor, status) {
-  sensor.className = 'bio-sensor';
-  status.className = 'bio-status';
-  status.textContent = 'Use password below';
-  // Auto-open password form
+function _kpiBioFallback(msg) {
+  _kpiBioSetState('', msg || 'Use password below');
   const sec = document.getElementById('bioPwSection');
   const tog = document.getElementById('bioToggleForm');
-  if (sec) { sec.classList.add('open'); }
-  if (tog) { tog.innerHTML = 'Back to biometrics'; }
-  setTimeout(() => { document.getElementById('loginEmail') && document.getElementById('loginEmail').focus(); }, 300);
+  if (sec) sec.classList.add('open');
+  if (tog) tog.innerHTML = 'Back to biometrics';
+  setTimeout(() => { const e = document.getElementById('loginEmail'); if (e) e.focus(); }, 300);
 }
+
+// ── MAIN ENTRY: sensor / Face ID tap ─────────────────────────────────
+window._kpiBioLogin = async function() {
+  const credMap = _kpiBioGetCred(null);
+  const hasCred = credMap && Object.keys(credMap).length > 0;
+
+  if (!hasCred) {
+    // No credential stored — open password form
+    _kpiBioFallback('No biometric registered yet — sign in with password first');
+    return;
+  }
+
+  // Determine which email to authenticate
+  const emailInp = document.getElementById('loginEmail');
+  const email = (emailInp?.value.trim().toLowerCase())
+    || localStorage.getItem(_KPI_BIO_USER_KEY)
+    || '';
+
+  const credId = _kpiBioGetCred(email);
+  if (!credId) {
+    // Pre-fill last known email and fall back
+    const last = localStorage.getItem(_KPI_BIO_USER_KEY);
+    if (last && emailInp && !emailInp.value) emailInp.value = last;
+    _kpiBioFallback('No biometric for this email — use password');
+    return;
+  }
+
+  _kpiBioSetState('scanning', 'Verifying identity…');
+
+  try {
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        timeout: 60000,
+        userVerification: 'required',
+        rpId: _KPI_BIO_RP_ID,
+        allowCredentials: [{ id: _kpiB642buf(credId), type: 'public-key' }]
+      }
+    });
+    if (!assertion) throw new Error('No assertion');
+
+    _kpiBioSetState('success', '✓ Identity verified');
+
+    // ── Complete login ──────────────────────────────────────────────
+    // Firebase uses LOCAL persistence, so if the user previously signed in
+    // on this device, auth.currentUser is still valid.  We just hide the
+    // overlay and let the existing Firebase session drive the app.
+    // If the session has truly expired (e.g. password changed remotely),
+    // we fall back to the password form with a clear message.
+    setTimeout(async () => {
+      try {
+        // Access auth via window.FB._auth (exposed from the module block above)
+        const fbAuth = window.FB?._auth;
+        const currentUser = fbAuth?.currentUser || null;
+
+        if (currentUser) {
+          // Session alive — just dismiss the overlay
+          const overlay = document.getElementById('loginOverlay');
+          if (overlay) overlay.style.display = 'none';
+        } else {
+          // Session expired — tell user to re-enter password once
+          _kpiBioSetState('', 'Session expired — sign in with password once');
+          _kpiBioFallback('Session expired — please sign in with password');
+        }
+      } catch(e) {
+        _kpiBioFallback('Sign-in error — use password');
+      }
+    }, 700);
+
+  } catch(e) {
+    if (e.name === 'NotAllowedError') {
+      _kpiBioSetState('', 'Cancelled — use password below');
+    } else {
+      _kpiBioSetState('error', '❌ Biometric failed — use password');
+    }
+    setTimeout(() => _kpiBioFallback(), 1200);
+  }
+};
+
+// ── REGISTER: create a new passkey ───────────────────────────────────
+async function _kpiBioRegister(email) {
+  if (!window.PublicKeyCredential) return false;
+  try {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const uid = new TextEncoder().encode(email);
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        rp:   { id: _KPI_BIO_RP_ID, name: _KPI_BIO_RP_NAME },
+        user: { id: uid, name: email, displayName: email },
+        challenge,
+        pubKeyCredParams: [
+          { type: 'public-key', alg: -7   },  // ES256
+          { type: 'public-key', alg: -257 }   // RS256
+        ],
+        authenticatorSelection: {
+          authenticatorAttachment: 'platform',
+          userVerification: 'required',
+          residentKey: 'preferred'
+        },
+        timeout: 60000,
+        attestation: 'none'
+      }
+    });
+    _kpiBioStoreCred(email, _kpiBuf2b64(cred.rawId));
+    return true;
+  } catch(e) { return false; }
+}
+
+// ── Offer registration toast after successful password login ──────────
+function _kpiBioOfferRegistration(email) {
+  if (!window.PublicKeyCredential) return;
+  PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(async avail => {
+    if (!avail) return;
+    if (_kpiBioGetCred(email)) return; // already registered
+    const type = await _kpiBioGetType();
+    if (!type) return;
+    setTimeout(() => {
+      const existing = document.getElementById('kpi-bio-offer-toast');
+      if (existing) existing.remove();
+      const toast = document.createElement('div');
+      toast.id = 'kpi-bio-offer-toast';
+      toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:10000;background:#fff;border:1.5px solid #185FA5;border-radius:14px;padding:16px 20px;min-width:280px;max-width:92vw;box-shadow:0 8px 32px rgba(24,95,165,.18);font-family:inherit;text-align:center';
+      toast.innerHTML = `
+        <div style="font-size:26px;margin-bottom:6px">${type.icon}</div>
+        <div style="font-weight:700;font-size:14px;color:#1a2a3a;margin-bottom:4px">Enable ${type.label}?</div>
+        <div style="font-size:12px;color:#6b84a0;margin-bottom:14px">Sign in faster next time — no password needed.</div>
+        <div style="display:flex;gap:8px;justify-content:center;">
+          <button id="kpiBioEnableBtn" style="padding:9px 18px;border:none;border-radius:9px;background:#185FA5;color:#fff;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;">Enable</button>
+          <button onclick="document.getElementById('kpi-bio-offer-toast')?.remove()" style="padding:9px 14px;border:1.5px solid #dde5ef;border-radius:9px;background:#f4f8fc;color:#475569;font-size:13px;cursor:pointer;font-family:inherit;">Not now</button>
+        </div>`;
+      document.body.appendChild(toast);
+      document.getElementById('kpiBioEnableBtn').onclick = async () => {
+        toast.innerHTML = '<div style="font-size:13px;color:#6b84a0;padding:8px 0">⏳ Follow your device prompt…</div>';
+        const ok = await _kpiBioRegister(email);
+        toast.innerHTML = ok
+          ? '<div style="font-size:13px;font-weight:700;color:#3B6D11;padding:8px 0">✅ Enabled! Sign in with biometrics next time.</div>'
+          : '<div style="font-size:13px;color:#A32D2D;padding:8px 0">❌ Registration cancelled.</div>';
+        setTimeout(() => toast.remove(), 3000);
+      };
+      setTimeout(() => toast.remove(), 15000);
+    }, 900);
+  }).catch(()=>{});
+}
+
+// ── Expose auth reference for biometric session check ─────────────────
+// (auth is module-scoped; accessed via window.FB._auth which we expose above)
+// No extra assignment needed — window.FB._auth is set in the module block.
+
+// ── Init sensor label on load ─────────────────────────────────────────
+(async function _kpiBioInit() {
+  const status = document.getElementById('bioStatus');
+  const type = await _kpiBioGetType();
+  const credMap = _kpiBioGetCred(null);
+  const hasCred = credMap && Object.keys(credMap).length > 0;
+  const lastEmail = localStorage.getItem(_KPI_BIO_USER_KEY) || '';
+
+  if (!type) {
+    // No platform authenticator available — open form
+    _kpiBioFallback('Enter your email and password to sign in');
+    return;
+  }
+
+  if (hasCred) {
+    if (lastEmail) {
+      const emailInp = document.getElementById('loginEmail');
+      if (emailInp && !emailInp.value) emailInp.value = lastEmail;
+    }
+    if (status) status.textContent = `Tap to sign in with ${type.label}`;
+  } else {
+    if (status) status.textContent = 'Touch to authenticate';
+  }
+})();
 
 window._doLogin = async function() {
   const email    = document.getElementById('loginEmail').value.trim();
@@ -10281,6 +10461,8 @@ window._doLogin = async function() {
   btn.disabled = true;
   try {
     await loginUser(email, password);
+    // Offer biometric registration after successful password login
+    _kpiBioOfferRegistration(email);
     // onAuthChange will handle the rest
   } catch (err) {
     console.error('Login error:', err.code, err.message);
