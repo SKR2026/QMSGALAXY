@@ -2278,6 +2278,33 @@ function initFirestoreListeners() {
       if (v.status === 'Confirmed') v.status = 'Scheduled';
       return v;
     });
+
+    // ── Auto-complete: mark past non-Cancelled visits as Completed ──
+    // If a visit's effective end date is before today and status is not
+    // Completed or Cancelled, automatically update it to Completed in Firestore.
+    (function _autoCompletePastVisits() {
+      function _localToday() {
+        const n = new Date();
+        return n.getFullYear() + '-' + String(n.getMonth()+1).padStart(2,'0') + '-' + String(n.getDate()).padStart(2,'0');
+      }
+      const todayStr = _localToday();
+      const acBatch = db.batch();
+      let acCount = 0;
+      _visitsData.forEach(v => {
+        if (v.status === 'Cancelled' || v.status === 'Completed') return;
+        const effectiveEnd = v.visitDateEnd || v.visitDate;
+        if (!effectiveEnd) return;
+        if (effectiveEnd < todayStr) {
+          v.status = 'Completed';
+          acBatch.update(db.collection(VISITS_COL).doc(v.id), { status: 'Completed' });
+          acCount++;
+        }
+      });
+      if (acCount > 0) {
+        acBatch.commit().catch(err => console.warn('[AutoComplete] Firestore update failed:', err));
+      }
+    })();
+
     if (!_appReady) {
       if (_visitsData.length === 0) {
         const _ls = document.getElementById('loaderStatus'); if (_ls) _ls.textContent = 'Seeding sample data…';
@@ -5522,7 +5549,7 @@ async function sendDailyDigestEmail(force = false) {
   const relevant = _visitsData.filter(v => {
     if (v.status === 'Cancelled') return false;
     const effectiveEnd = v.visitDateEnd || v.visitDate;
-    return effectiveEnd === todayLocal || effectiveEnd === yestLocal;
+    return effectiveEnd === yestLocal;  // only yesterday's visits are "concluded"
   }).sort((a, b) => {
     const critOrder = { Critical:0, High:1, Medium:2, Low:3 };
     return (critOrder[a.criticality] ?? 4) - (critOrder[b.criticality] ?? 4);
@@ -5533,7 +5560,7 @@ async function sendDailyDigestEmail(force = false) {
   // shift the date one day back via UTC conversion.
   const todayStr = todayLocal;
   const todayOngoing = _visitsData.filter(v => {
-    if (!['Scheduled', 'Confirmed', 'In Progress'].includes(v.status)) return false;
+    if (v.status === 'Cancelled') return false;  // only exclude Cancelled
     if (!v.visitDate) return false;
     const start = v.visitDate;
     const end   = v.visitDateEnd || v.visitDate;
