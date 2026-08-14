@@ -3262,6 +3262,11 @@ function _saveNotifs() {
 function addNotif(text, visitId) {
   if (!currentUser) return;
   if (currentUser.access !== 'admin' && currentUser.access !== 'management') return;
+  // Dedup: skip if a notification for this visitId was added in the last 10 s
+  if (visitId) {
+    const _recent = Date.now() - 10000;
+    if (_notifs.some(n => n.visitId === visitId && n.id && parseInt(n.id.slice(1),10) > _recent)) return;
+  }
   const now = new Date();
   const time = now.toLocaleDateString('en-IN', {day:'2-digit',month:'short'}) + ' ' +
                now.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
@@ -4184,6 +4189,13 @@ async function sendGmailDigest(recipients, subject, bodyHtml, signal) {
 }
 
 function logMail(record, isUpdate) {
+  // ── Dedup guard: prevent double-notification if logMail is called twice
+  // for the same visit within 10 seconds (e.g. multi-tab or race condition).
+  const _dedupKey = 'pv_logmail_' + record.id + '_' + (isUpdate ? 'u' : 'n');
+  const _lastSent = parseInt(sessionStorage.getItem(_dedupKey) || '0', 10);
+  if (Date.now() - _lastSent < 10000) return;  // skip if sent < 10s ago
+  sessionStorage.setItem(_dedupKey, String(Date.now()));
+
   const logs    = loadMail();
   const appUrl  = _settingsData?.app?.appUrl || (window.location.origin + window.location.pathname);
   const directLink = `${appUrl}?visit=${record.id}&guest=1`;
@@ -4943,7 +4955,7 @@ function buildDailyDigestHtml(visits, since, company, allVisits, upcomingVisits,
     const critColor = CRIT_COLOR[v.criticality] || '#8888aa';
     const statColor = STAT_COLOR[v.status]      || '#8888aa';
     const directLink = `${appUrl}?visit=${v.id}&guest=1`;
-    const isNew = v.createdAt && v.visitDate >= yestLocal;  // date-based, no hours
+    const isNew = v.createdAt && (Date.now() - new Date(v.createdAt).getTime()) < 24*60*60*1000;  // NEW badge: created within last 24h
     const needsUpdate = v.status !== 'Completed';
     return `
     <tr>
@@ -5440,12 +5452,15 @@ async function sendDailyDigestEmail(force = false) {
     return (critOrder[a.criticality] ?? 4) - (critOrder[b.criticality] ?? 4);
   });
 
-  // Newly added visits — any status, createdAt within the last 24 hours
-  // Newly added: visits whose visitDate >= yesterday (date-based, no hour logic)
+  // Newly added visits — createdAt within the last 24 hours.
+  // MUST use createdAt, NOT visitDate — a visit created today for a past/future
+  // date is "new"; a visit created weeks ago whose visitDate happens to be
+  // yesterday is NOT. Also exclude Completed: they belong in the concluded section.
+  const _24hAgo = Date.now() - 24 * 60 * 60 * 1000;
   const newlyAdded = _visitsData.filter(v => {
-    if (!v.visitDate) return false;
-    if (v.status === 'Cancelled') return false;
-    return v.visitDate === yestLocal;   // only visits dated yesterday
+    if (!v.createdAt) return false;
+    if (v.status === 'Cancelled' || v.status === 'Completed') return false;
+    return new Date(v.createdAt).getTime() >= _24hAgo;
   }).sort((a, b) => {
     // Sort by visit date ascending so readers see the nearest visits first
     const da = a.visitDate ? new Date(a.visitDate) : new Date(0);
