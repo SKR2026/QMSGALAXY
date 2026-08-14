@@ -1388,6 +1388,7 @@ const NAV=[
     {id:'settings-users',label:'Users & Roles',icon:'<circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/>',roles:['super-admin','admin']},
     {id:'settings-escalation',label:'Escalation Rules',icon:'<path d="M8 1l2 5h5l-4 3 1.5 5L8 11l-4.5 3L5 9 1 6h5z"/>'},
     {id:'settings-notifications',label:'Notifications',icon:'<path d="M8 1a5 5 0 015 5v3l1 2H2l1-2V6a5 5 0 015-5zM6 13a2 2 0 004 0"/>'},
+    {id:'settings-gmail-reminders',label:'Gmail Auto-Reminders',icon:'<rect x="1" y="3" width="14" height="10" rx="1"/><path d="M1 4l7 5 7-5"/>'},
     {id:'settings-plants',label:'Plants & Admins',icon:'<rect x="1" y="8" width="6" height="7" rx="1"/><rect x="9" y="4" width="6" height="11" rx="1"/><path d="M4 8V5a4 4 0 018 0v3"/>'},
     {id:'settings-company',label:'Company',icon:'<rect x="2" y="3" width="12" height="10" rx="1"/><path d="M7 13v3M5 16h6"/>'},
     {id:'settings-meeting-types',label:'Meeting Types',icon:'<path d="M3 6h10M3 10h10M3 14h6"/><circle cx="13" cy="13" r="3"/><path d="M13 11.5v3M11.5 13h3"/>'},
@@ -1443,7 +1444,7 @@ function accessDenied(){
 /* pages restricted to super-admin / admin only */
 const SA_ONLY=['bulk-upload','reports','audit','email-log',
   'settings-firebase','settings-email','settings-users',
-  'settings-escalation','settings-notifications','settings-company','settings-meeting-types','settings-plants'];
+  'settings-escalation','settings-notifications','settings-gmail-reminders','settings-company','settings-meeting-types','settings-plants'];
 /* pages hidden from assignee and manager */
 const NO_ASSIGNEE=[];
 
@@ -1470,9 +1471,9 @@ function navigate(page){
   document.querySelectorAll('.ni').forEach(n=>n.classList.remove('active'));
   const el=document.getElementById('ni-'+page);
   if(el)el.classList.add('active');
-  const titles={dashboard:'Dashboard Overview',meetings:'All Meetings',tasks:'My Tasks',escalations:'Escalation Tracker',calendar:'Calendar View','meeting-dashboard':'Meeting Dashboard','bulk-upload':'Bulk Upload',reports:'Reports & Analytics',audit:'Audit Trail','email-log':'Email Log','settings-firebase':'Firebase Configuration','settings-email':'Email — Office 365','settings-users':'Users & Roles','settings-escalation':'Escalation Rules','settings-notifications':'Notification Settings','settings-company':'Company Settings','settings-meeting-types':'Meeting Types','settings-plants':'Plants & Admins','dev-console':'Developer Console','dev-api':'API Configuration','dev-system':'System Information'};
+  const titles={dashboard:'Dashboard Overview',meetings:'All Meetings',tasks:'My Tasks',escalations:'Escalation Tracker',calendar:'Calendar View','meeting-dashboard':'Meeting Dashboard','bulk-upload':'Bulk Upload',reports:'Reports & Analytics',audit:'Audit Trail','email-log':'Email Log','settings-firebase':'Firebase Configuration','settings-email':'Email — Office 365','settings-users':'Users & Roles','settings-escalation':'Escalation Rules','settings-notifications':'Notification Settings','settings-gmail-reminders':'Gmail Auto-Reminders','settings-company':'Company Settings','settings-meeting-types':'Meeting Types','settings-plants':'Plants & Admins','dev-console':'Developer Console','dev-api':'API Configuration','dev-system':'System Information'};
   document.getElementById('pt').textContent=titles[page]||page;
-  const fns={dashboard:renderDashboard,meetings:renderMeetings,tasks:renderTasks,escalations:renderEscalations,calendar:renderCalendar,'meeting-dashboard':renderMeetingDashboard,'bulk-upload':renderBulkUpload,reports:renderReports,audit:renderAudit,'email-log':renderEmailLog,'settings-firebase':renderFirebase,'settings-email':renderEmailCfg,'settings-users':renderUsers,'settings-escalation':renderEscCfg,'settings-notifications':renderNotifCfg,'settings-company':renderCompanySettings,'settings-meeting-types':renderMeetingTypes,'settings-plants':renderPlants,'dev-console':renderDevConsole,'dev-api':renderDevApi,'dev-system':renderDevSystem};
+  const fns={dashboard:renderDashboard,meetings:renderMeetings,tasks:renderTasks,escalations:renderEscalations,calendar:renderCalendar,'meeting-dashboard':renderMeetingDashboard,'bulk-upload':renderBulkUpload,reports:renderReports,audit:renderAudit,'email-log':renderEmailLog,'settings-firebase':renderFirebase,'settings-email':renderEmailCfg,'settings-users':renderUsers,'settings-escalation':renderEscCfg,'settings-notifications':renderNotifCfg,'settings-gmail-reminders':renderGmailReminderSettings,'settings-company':renderCompanySettings,'settings-meeting-types':renderMeetingTypes,'settings-plants':renderPlants,'dev-console':renderDevConsole,'dev-api':renderDevApi,'dev-system':renderDevSystem};
   if(fns[page])fns[page]();
 }
 
@@ -8263,4 +8264,663 @@ function _bypassLicGateForNonAdmin(){
 
 </script>
 </body>
-</html>
+</html><script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   GMAIL AUTO-REMINDER SYSTEM  — MoM Pro
+   All config lives in localStorage under key: MOM_GMAIL_REMINDER_CFG
+   Reminders are scheduled inside the browser using setInterval.
+   For persistent cloud-based scheduling, point to a Cloud Run backend.
+═══════════════════════════════════════════════════════════════════════════ */
+
+const GMAIL_REM_KEY = 'mom_gmail_reminder_cfg_v1';
+
+/* ── Default config shape ── */
+const GMAIL_REM_DEFAULTS = {
+  backendUrl:   '',           // Cloud Run service URL
+  senderEmail:  '',           // Gmail address used as sender (info only)
+  adminEmail:   '',           // Always-CC address
+  enabled:      false,
+
+  // Per-rule config:  { enabled, frequencyHours, sendTime (HH:MM), lastSent (ISO) }
+  rules: {
+    taskAssigned:  { enabled: true,  frequencyHours: 0,    sendTime: '',     lastSent: null }, // immediate
+    upcoming3d:    { enabled: true,  frequencyHours: 24,   sendTime: '08:00', lastSent: null },
+    overdue:       { enabled: true,  frequencyHours: 24,   sendTime: '08:00', lastSent: null },
+    escalation:    { enabled: true,  frequencyHours: 0,    sendTime: '',     lastSent: null }, // immediate
+    momPublished:  { enabled: true,  frequencyHours: 0,    sendTime: '',     lastSent: null }, // immediate
+    weeklyDigest:  { enabled: true,  frequencyHours: 168,  sendTime: '09:00', lastSent: null },
+  },
+
+  // Cloud Scheduler sync
+  schedulerSynced: false,
+};
+
+function gmailReminderCfg() {
+  try {
+    const raw = localStorage.getItem(GMAIL_REM_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      // Deep-merge defaults so new rule keys are always present
+      parsed.rules = Object.assign({}, GMAIL_REM_DEFAULTS.rules, parsed.rules || {});
+      return parsed;
+    }
+  } catch(e) {}
+  return JSON.parse(JSON.stringify(GMAIL_REM_DEFAULTS));
+}
+
+function saveGmailReminderCfg(cfg) {
+  localStorage.setItem(GMAIL_REM_KEY, JSON.stringify(cfg));
+}
+
+/* ── Rule metadata (display only) ── */
+const RULE_META = {
+  taskAssigned:  { label: 'Task Assigned',       desc: 'Sent immediately when a task is created or assigned to someone.',        icon: '📋', canSchedule: false },
+  upcoming3d:    { label: 'Upcoming Reminder',    desc: 'Sent to assignees whose tasks are due within the next 3 days.',          icon: '📅', canSchedule: true  },
+  overdue:       { label: 'Overdue Alert',        desc: 'Sent when a task passes its due date without being marked complete.',    icon: '🔴', canSchedule: true  },
+  escalation:    { label: 'Escalation Notice',    desc: 'Sent immediately when a task escalation level changes.',                 icon: '⚠️', canSchedule: false },
+  momPublished:  { label: 'MoM Published',        desc: 'Sent to attendees immediately after a new meeting is saved.',            icon: '📄', canSchedule: false },
+  weeklyDigest:  { label: 'Weekly Digest',        desc: 'Weekly summary of all open tasks, grouped per assignee.',               icon: '📬', canSchedule: true  },
+};
+
+const FREQ_OPTIONS = [
+  { label: 'Daily',        hours: 24  },
+  { label: 'Every 2 days', hours: 48  },
+  { label: 'Every 3 days', hours: 72  },
+  { label: 'Weekly',       hours: 168 },
+];
+
+/* ══════════════════════════════════════════════════════
+   RENDER SETTINGS PAGE
+══════════════════════════════════════════════════════ */
+function renderGmailReminderSettings() {
+  const cfg = gmailReminderCfg();
+  const configured = !!(cfg.backendUrl && cfg.senderEmail);
+
+  document.getElementById('content').innerHTML = `
+  <div style="max-width:760px;">
+
+    <!-- ── Status banner ── -->
+    <div style="background:${cfg.enabled && configured ? 'var(--ol)' : 'var(--wl)'};
+         border:1px solid ${cfg.enabled && configured ? 'var(--ok)' : 'var(--wn)'};
+         border-radius:var(--r);padding:12px 18px;margin-bottom:18px;
+         display:flex;align-items:center;gap:12px;">
+      <span style="font-size:20px;">${cfg.enabled && configured ? '✅' : '⚙️'}</span>
+      <div style="flex:1;">
+        <div style="font-size:13px;font-weight:600;color:${cfg.enabled && configured ? 'var(--ok)' : 'var(--wn)'};">
+          ${cfg.enabled && configured ? 'Auto-Reminders Active — Gmail Cloud Run backend connected' : 'Auto-Reminders not fully configured'}
+        </div>
+        <div style="font-size:11px;color:var(--t3);margin-top:2px;">
+          ${configured ? 'Backend: ' + cfg.backendUrl : 'Enter your Cloud Run backend URL and sender email below, then enable reminders.'}
+        </div>
+      </div>
+      <span class="bdg ${cfg.enabled && configured ? 'b-ok' : 'b-wn'}">${cfg.enabled && configured ? '● Live' : '⚙ Setup'}</span>
+    </div>
+
+    <!-- ── How it works ── -->
+    <div class="card" style="margin-bottom:18px;background:var(--bg3);border-style:dashed;">
+      <div style="display:flex;gap:14px;">
+        <span style="font-size:26px;flex-shrink:0;">📡</span>
+        <div>
+          <div style="font-size:13px;font-weight:600;margin-bottom:6px;">How Gmail Auto-Reminders work</div>
+          <div style="font-size:12px;color:var(--t2);line-height:1.8;">
+            MoM Pro calls your <b>Google Cloud Run backend</b> (a lightweight Node.js service) to send emails via the Gmail API.
+            <br>• <b>Immediate rules</b> (Task Assigned, Escalation, MoM Published) fire the moment the event occurs.
+            <br>• <b>Scheduled rules</b> (Upcoming, Overdue, Weekly Digest) are triggered by the browser at the configured send time, and by Cloud Scheduler when the app is closed.
+            <br>• The backend URL must point to a deployed <code style="font-family:var(--mo)">plantvisit-email</code>-compatible Cloud Run service.
+          </div>
+          <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+            <span class="bdg b-ok">✓ No SMTP credentials</span>
+            <span class="bdg b-ok">✓ Gmail API via OAuth2</span>
+            <span class="bdg b-ok">✓ Cloud Scheduler sync</span>
+            <span class="bdg b-ok">✓ Browser fallback scheduler</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Backend Connection ── -->
+    <div class="card" style="margin-bottom:18px;">
+      <div class="ch"><div class="ctit">🔗 Gmail Backend Connection</div></div>
+      <div class="fgrid">
+        <div class="fg full">
+          <label>CLOUD RUN BACKEND URL *</label>
+          <input id="gr_backend_url" type="url"
+            placeholder="https://plantvisit-email-xxxx-uc.a.run.app"
+            value="${xe(cfg.backendUrl||'')}"
+            style="font-family:var(--mo);font-size:12px;">
+          <div style="font-size:10px;color:var(--t3);margin-top:3px;">Your deployed Cloud Run service URL — no trailing slash. Used for all email sends and Cloud Scheduler sync.</div>
+        </div>
+        <div class="fg">
+          <label>GMAIL SENDER ADDRESS *</label>
+          <input id="gr_sender_email" type="email"
+            placeholder="reminders@yourcompany.com"
+            value="${xe(cfg.senderEmail||'')}">
+          <div style="font-size:10px;color:var(--t3);margin-top:3px;">Gmail account authorised in your Cloud Run service (info only — used in subject line)</div>
+        </div>
+        <div class="fg">
+          <label>ALWAYS-CC ADMIN EMAIL</label>
+          <input id="gr_admin_email" type="email"
+            placeholder="admin@yourcompany.com"
+            value="${xe(cfg.adminEmail||'')}">
+          <div style="font-size:10px;color:var(--t3);margin-top:3px;">Optional — receives a copy of every outgoing reminder</div>
+        </div>
+      </div>
+      <div id="gr_conn_status" style="display:none;margin-bottom:12px;"></div>
+      <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:4px;">
+        <button class="btn" onclick="testGmailReminderBackend()">⚡ Test Connection</button>
+        <button class="btn bp" onclick="saveGmailReminderBackend()">✓ Save Backend Config</button>
+      </div>
+    </div>
+
+    <!-- ── Master Switch ── -->
+    <div class="card" style="margin-bottom:18px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;">
+        <div>
+          <div style="font-size:14px;font-weight:600;">Enable Auto-Reminders</div>
+          <div style="font-size:12px;color:var(--t2);margin-top:3px;">Master switch — turns all reminder rules on or off. Individual rules can still be toggled below.</div>
+        </div>
+        <div class="tgl${cfg.enabled?' on':''}" id="gr_master_tgl" onclick="toggleGmailReminderMaster()" title="Toggle auto-reminders"></div>
+      </div>
+    </div>
+
+    <!-- ── Reminder Rules ── -->
+    <div class="card" style="margin-bottom:18px;">
+      <div class="ch">
+        <div class="ctit">⏰ Reminder Rules & Schedule</div>
+        <button class="btn bs bp" onclick="saveGmailReminderRules()">Save All Rules</button>
+      </div>
+      <p style="font-size:12px;color:var(--t2);margin-bottom:16px;">
+        Configure which reminders are sent, how often, and at what time of day. Immediate rules fire the moment the event happens — no schedule needed.
+      </p>
+
+      ${Object.entries(RULE_META).map(([ruleId, meta]) => {
+        const rule = cfg.rules[ruleId] || {};
+        const freqHours = rule.frequencyHours || 24;
+        const lastSent  = rule.lastSent ? new Date(rule.lastSent).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+        return `
+        <div style="padding:14px 0;border-bottom:1px solid var(--br);" id="rule-row-${ruleId}">
+          <div style="display:flex;align-items:flex-start;gap:12px;">
+            <span style="font-size:20px;flex-shrink:0;line-height:1.2;">${meta.icon}</span>
+            <div style="flex:1;min-width:0;">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px;">
+                <span style="font-size:13px;font-weight:600;">${meta.label}</span>
+                ${!meta.canSchedule ? '<span class="bdg b-in" style="font-size:10px;">Immediate</span>' : ''}
+                ${rule.lastSent ? `<span style="font-size:10px;color:var(--t3);">Last sent: ${lastSent}</span>` : ''}
+              </div>
+              <div style="font-size:11px;color:var(--t3);margin-bottom:${meta.canSchedule?'10px':'0'};">${meta.desc}</div>
+              ${meta.canSchedule ? `
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <label style="font-size:11px;font-weight:600;color:var(--t2);white-space:nowrap;">FREQUENCY</label>
+                  <select id="gr_freq_${ruleId}" style="width:140px;font-size:12px;padding:5px 8px;">
+                    ${FREQ_OPTIONS.map(o=>`<option value="${o.hours}" ${freqHours===o.hours?'selected':''}>${o.label}</option>`).join('')}
+                  </select>
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <label style="font-size:11px;font-weight:600;color:var(--t2);white-space:nowrap;">SEND TIME</label>
+                  <input type="time" id="gr_time_${ruleId}"
+                    value="${rule.sendTime||'08:00'}"
+                    style="width:110px;font-size:12px;padding:5px 8px;">
+                </div>
+                <button class="btn bs" onclick="sendReminderRuleNow('${ruleId}')" title="Send now (test)">📤 Send Now</button>
+              </div>` : `
+              <div style="margin-top:6px;">
+                <button class="btn bs" onclick="sendReminderRuleNow('${ruleId}')" title="Fire this rule now (test)">📤 Send Now</button>
+              </div>`}
+            </div>
+            <div class="tgl${rule.enabled?' on':''}" id="gr_tgl_${ruleId}"
+              onclick="document.getElementById('gr_tgl_${ruleId}').classList.toggle('on')"
+              title="Enable/disable this rule"></div>
+          </div>
+        </div>`;
+      }).join('')}
+
+      <div style="margin-top:16px;display:flex;gap:9px;flex-wrap:wrap;">
+        <button class="btn bp" onclick="saveGmailReminderRules()">✓ Save All Rules</button>
+        <button class="btn" onclick="syncCloudScheduler()">☁ Sync to Cloud Scheduler</button>
+        <span id="gr_save_status" style="font-size:12px;color:var(--t3);align-self:center;"></span>
+      </div>
+    </div>
+
+    <!-- ── Send Test Reminder ── -->
+    <div class="card" style="margin-bottom:18px;">
+      <div class="ch"><div class="ctit">📤 Send Ad-Hoc Reminder Now</div></div>
+      <div class="fgrid" style="margin-bottom:14px;">
+        <div class="fg">
+          <label>REMINDER TYPE</label>
+          <select id="gr_adhoc_type">
+            ${Object.entries(RULE_META).map(([id,m])=>`<option value="${id}">${m.icon} ${m.label}</option>`).join('')}
+          </select>
+        </div>
+        <div class="fg">
+          <label>RECIPIENT(S)</label>
+          <select id="gr_adhoc_user">
+            <option value="all">— All assignees with open tasks —</option>
+            ${(typeof USERS !== 'undefined' ? USERS : []).filter(u=>(typeof TASKS!=='undefined'?TASKS:[]).some(t=>t.uid===u.id)).map(u=>`<option value="${u.id}">${u.name} (${u.email})</option>`).join('')}
+          </select>
+        </div>
+        <div class="fg full">
+          <label>CUSTOM NOTE (optional)</label>
+          <input id="gr_adhoc_note" placeholder="e.g. Please update tasks before end of day.">
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <button class="btn bp" onclick="sendAdHocGmailReminder()">📤 Send Reminder Now</button>
+        <span id="gr_adhoc_status" style="font-size:12px;color:var(--t3);"></span>
+      </div>
+    </div>
+
+    <!-- ── Reminder Log ── -->
+    <div class="card">
+      <div class="ch">
+        <div class="ctit">📋 Reminder Send Log</div>
+        <button class="btn bs" onclick="clearReminderLog()">Clear Log</button>
+      </div>
+      <div id="gr_log_container" style="max-height:260px;overflow-y:auto;">
+        ${_renderReminderLog()}
+      </div>
+    </div>
+
+  </div>`;
+
+  // Start browser-side scheduler while settings page is open (also starts on login)
+  _startBrowserReminderScheduler();
+}
+
+/* ── Render log ── */
+const REMINDER_LOG = [];
+function _renderReminderLog() {
+  if (!REMINDER_LOG.length) return `<div style="text-align:center;padding:24px;color:var(--t3);font-size:12px;">No reminders sent yet in this session.</div>`;
+  return `<table style="width:100%;border-collapse:collapse;font-size:12px;">
+    <thead><tr>
+      <th style="text-align:left;padding:7px 10px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);border-bottom:1px solid var(--br);">Time</th>
+      <th style="text-align:left;padding:7px 10px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);border-bottom:1px solid var(--br);">Rule</th>
+      <th style="text-align:left;padding:7px 10px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);border-bottom:1px solid var(--br);">Recipient</th>
+      <th style="text-align:left;padding:7px 10px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);border-bottom:1px solid var(--br);">Status</th>
+    </tr></thead>
+    <tbody>
+      ${REMINDER_LOG.slice().reverse().map(r=>`
+      <tr>
+        <td style="padding:8px 10px;border-bottom:1px solid var(--br);font-family:var(--mo);font-size:11px;white-space:nowrap;">${r.time}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid var(--br);">${RULE_META[r.rule]?.icon||''} ${RULE_META[r.rule]?.label||r.rule}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid var(--br);font-size:11px;color:var(--t3);">${r.to}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid var(--br);">
+          <span class="bdg ${r.status==='sent'?'b-ok':r.status==='failed'?'b-er':'b-wn'}">${r.status}</span>
+        </td>
+      </tr>`).join('')}
+    </tbody>
+  </table>`;
+}
+
+function clearReminderLog() {
+  REMINDER_LOG.length = 0;
+  const el = document.getElementById('gr_log_container');
+  if (el) el.innerHTML = _renderReminderLog();
+}
+
+/* ══════════════════════════════════════════════════════
+   SAVE / TOGGLE
+══════════════════════════════════════════════════════ */
+function saveGmailReminderBackend() {
+  const cfg = gmailReminderCfg();
+  cfg.backendUrl   = (document.getElementById('gr_backend_url')?.value||'').trim().replace(/\/$/,'');
+  cfg.senderEmail  = (document.getElementById('gr_sender_email')?.value||'').trim();
+  cfg.adminEmail   = (document.getElementById('gr_admin_email')?.value||'').trim();
+  if (!cfg.backendUrl) { showToast('Backend URL is required.','warn'); return; }
+  if (!cfg.senderEmail || !cfg.senderEmail.includes('@')) { showToast('Enter a valid sender email.','warn'); return; }
+  saveGmailReminderCfg(cfg);
+  showToast('Backend config saved.','ok');
+  renderGmailReminderSettings();
+}
+
+function toggleGmailReminderMaster() {
+  const cfg = gmailReminderCfg();
+  cfg.enabled = !cfg.enabled;
+  saveGmailReminderCfg(cfg);
+  const tgl = document.getElementById('gr_master_tgl');
+  if (tgl) tgl.classList.toggle('on', cfg.enabled);
+  showToast(cfg.enabled ? 'Auto-reminders enabled.' : 'Auto-reminders disabled.', cfg.enabled?'ok':'info');
+}
+
+function saveGmailReminderRules() {
+  const cfg = gmailReminderCfg();
+  Object.keys(RULE_META).forEach(ruleId => {
+    const tgl  = document.getElementById(`gr_tgl_${ruleId}`);
+    const freq = document.getElementById(`gr_freq_${ruleId}`);
+    const time = document.getElementById(`gr_time_${ruleId}`);
+    cfg.rules[ruleId] = {
+      ...(cfg.rules[ruleId]||{}),
+      enabled:       tgl  ? tgl.classList.contains('on') : (cfg.rules[ruleId]?.enabled??true),
+      frequencyHours:freq ? Number(freq.value) : (cfg.rules[ruleId]?.frequencyHours||24),
+      sendTime:      time ? time.value : (cfg.rules[ruleId]?.sendTime||'08:00'),
+    };
+  });
+  saveGmailReminderCfg(cfg);
+  const statusEl = document.getElementById('gr_save_status');
+  if (statusEl) { statusEl.textContent = '✓ Saved at ' + new Date().toLocaleTimeString(); setTimeout(()=>{ if(statusEl)statusEl.textContent=''; },4000); }
+  showToast('Reminder rules saved.','ok');
+}
+
+/* ══════════════════════════════════════════════════════
+   BACKEND COMMS
+══════════════════════════════════════════════════════ */
+async function testGmailReminderBackend() {
+  const url      = (document.getElementById('gr_backend_url')?.value||'').trim().replace(/\/$/,'');
+  const toEmail  = (document.getElementById('gr_sender_email')?.value||'').trim();
+  const statusEl = document.getElementById('gr_conn_status');
+  if (!url) { showToast('Enter the Cloud Run backend URL first.','warn'); return; }
+  if (statusEl) { statusEl.style.display='block'; statusEl.innerHTML=`<div style="background:var(--il);border:1px solid var(--in);border-radius:var(--rs);padding:10px 14px;font-size:12px;color:var(--in);">⏳ Testing connection…</div>`; }
+  try {
+    const res = await fetch(`${url}/api/test-connection`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ to: toEmail||'test@example.com' })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error||res.statusText);
+    if (statusEl) statusEl.innerHTML=`<div style="background:var(--ol);border:1px solid var(--ok);border-radius:var(--rs);padding:10px 14px;font-size:12px;color:var(--ok);">✅ Connected — test email sent from ${data.from||'backend'}</div>`;
+    showToast('✅ Backend connected.','ok');
+  } catch(e) {
+    if (statusEl) statusEl.innerHTML=`<div style="background:var(--el);border:1px solid var(--er);border-radius:var(--rs);padding:10px 14px;font-size:12px;color:var(--er);">❌ ${e.message}</div>`;
+    showToast('Connection failed: '+e.message,'warn');
+  }
+  setTimeout(()=>{ if(statusEl) statusEl.style.display='none'; },8000);
+}
+
+/* Send a reminder via the Cloud Run backend */
+async function _sendGmailReminder(to, subject, htmlBody, ruleId) {
+  const cfg = gmailReminderCfg();
+  if (!cfg.backendUrl) {
+    // Fallback: try the existing Microsoft Graph path
+    try { await sendNotificationEmail(to, subject, htmlBody); } catch(e){}
+    return;
+  }
+  const recipients = [to, cfg.adminEmail].filter(Boolean).filter((v,i,a)=>a.indexOf(v)===i);
+  try {
+    const res = await fetch(`${cfg.backendUrl}/api/send`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ to: recipients[0], cc: recipients.slice(1), subject, html: htmlBody })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(()=>({ error: res.statusText }));
+      throw new Error(err.error||res.statusText);
+    }
+    REMINDER_LOG.push({ time: new Date().toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}), rule: ruleId, to: recipients.join(', '), status:'sent' });
+    // Update lastSent
+    const cfgW = gmailReminderCfg();
+    if (cfgW.rules[ruleId]) { cfgW.rules[ruleId].lastSent = new Date().toISOString(); saveGmailReminderCfg(cfgW); }
+  } catch(e) {
+    REMINDER_LOG.push({ time: new Date().toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}), rule: ruleId, to, status:'failed' });
+    showToast('Reminder failed: '+e.message,'warn');
+  }
+  // Refresh log if on this page
+  const logEl = document.getElementById('gr_log_container');
+  if (logEl) logEl.innerHTML = _renderReminderLog();
+}
+
+/* ══════════════════════════════════════════════════════
+   RULE EXECUTION
+══════════════════════════════════════════════════════ */
+
+/* Build a clean task-reminder HTML body */
+function _buildReminderHtml({ user, tasks, heading, note, color }) {
+  const accentColor = color || '#0284c7';
+  const taskRows = tasks.map((t,i) => {
+    const mtg = (typeof MEETINGS !== 'undefined' ? MEETINGS : []).find(m=>m.id===t.mid)||{};
+    const due = t.due ? new Date(t.due).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) : '—';
+    const isOver = t.due && new Date(t.due) < new Date() && t.status!=='completed';
+    return `<tr>
+      <td style="padding:8px 10px;border-bottom:1px solid #f0f0f0;font-size:13px;">${i+1}. ${t.title||'Untitled'}</td>
+      <td style="padding:8px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;color:${isOver?'#dc2626':'#555'};">${due}${isOver?' ⚠':''}</td>
+      <td style="padding:8px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;"><span style="background:${t.status==='completed'?'#dcfce7':t.status==='in-progress'?'#e0f2fe':'#fef3c7'};color:${t.status==='completed'?'#16a34a':t.status==='in-progress'?'#0369a1':'#b45309'};padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;">${t.status||'pending'}</span></td>
+      <td style="padding:8px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;color:#777;">${mtg.title||'—'}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+  <div style="font-family:'Segoe UI',Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8fafd;">
+    <div style="background:${accentColor};padding:22px 28px;border-radius:10px 10px 0 0;">
+      <div style="font-size:18px;font-weight:700;color:#fff;">MoM Pro — ${heading}</div>
+      <div style="font-size:12px;color:rgba(255,255,255,.75);margin-top:4px;">Minutes of Meeting · Task Reminder</div>
+    </div>
+    <div style="background:#fff;padding:22px 28px;">
+      <div style="font-size:14px;margin-bottom:14px;">Hi <strong>${user.name||'Team'}</strong>,</div>
+      ${note ? `<div style="background:#eff6ff;border-left:3px solid ${accentColor};padding:10px 14px;border-radius:0 6px 6px 0;font-size:13px;color:#1e3a5f;margin-bottom:14px;">${note}</div>` : ''}
+      <table style="width:100%;border-collapse:collapse;margin-bottom:18px;">
+        <thead>
+          <tr style="background:#f0f6ff;">
+            <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#555;border-bottom:2px solid #dde;">Task</th>
+            <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#555;border-bottom:2px solid #dde;">Due Date</th>
+            <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#555;border-bottom:2px solid #dde;">Status</th>
+            <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#555;border-bottom:2px solid #dde;">Meeting</th>
+          </tr>
+        </thead>
+        <tbody>${taskRows}</tbody>
+      </table>
+      <div style="font-size:12px;color:#888;border-top:1px solid #eee;padding-top:14px;">
+        This is an automated reminder from MoM Pro. Please update your tasks by clicking the link in the original assignment email.
+      </div>
+    </div>
+    <div style="background:#f0f6ff;padding:12px 28px;border-radius:0 0 10px 10px;text-align:center;font-size:11px;color:#888;">
+      MoM Pro · Minutes of Meeting Management · Sent ${new Date().toLocaleString('en-IN')}
+    </div>
+  </div>`;
+}
+
+/* ── Fire a specific rule right now ── */
+async function _executeRule(ruleId, overrideNote='') {
+  const cfg = gmailReminderCfg();
+  if (!cfg.enabled && !overrideNote) { showToast('Auto-reminders are disabled. Enable them in Settings → Gmail Auto-Reminders.','warn'); return; }
+
+  const tasks = typeof TASKS !== 'undefined' ? TASKS : [];
+  const users = typeof USERS !== 'undefined' ? USERS : [];
+  const now   = new Date();
+  let targetsFound = 0;
+
+  if (ruleId === 'upcoming3d') {
+    // Tasks due in next 3 days, not completed
+    const cutoff = new Date(now.getTime() + 3*24*60*60*1000);
+    const relevant = tasks.filter(t => t.status!=='completed' && t.due && new Date(t.due)>=now && new Date(t.due)<=cutoff);
+    const byUser = {};
+    relevant.forEach(t=>{ if(!byUser[t.uid])byUser[t.uid]=[]; byUser[t.uid].push(t); });
+    for (const [uid, ut] of Object.entries(byUser)) {
+      const u = users.find(u=>u.id===Number(uid));
+      if (!u?.email) continue;
+      const html = _buildReminderHtml({ user:u, tasks:ut, heading:'Upcoming Tasks — Due in 3 Days', note: overrideNote||`You have <strong>${ut.length} task${ut.length>1?'s':''}</strong> due within the next 3 days. Please review and update your progress.`, color:'#0284c7' });
+      await _sendGmailReminder(u.email, `[MoM Pro] ⏰ Upcoming Tasks — ${ut.length} due soon`, html, ruleId);
+      targetsFound++;
+    }
+
+  } else if (ruleId === 'overdue') {
+    const relevant = tasks.filter(t => t.status!=='completed' && t.due && new Date(t.due)<now);
+    const byUser = {};
+    relevant.forEach(t=>{ if(!byUser[t.uid])byUser[t.uid]=[]; byUser[t.uid].push(t); });
+    for (const [uid, ut] of Object.entries(byUser)) {
+      const u = users.find(u=>u.id===Number(uid));
+      if (!u?.email) continue;
+      const html = _buildReminderHtml({ user:u, tasks:ut, heading:'Overdue Tasks — Immediate Attention Required', note: overrideNote||`You have <strong>${ut.length} overdue task${ut.length>1?'s':''}</strong>. Please update status or request an extension.`, color:'#dc2626' });
+      await _sendGmailReminder(u.email, `[MoM Pro] 🔴 Overdue Alert — ${ut.length} task${ut.length>1?'s':''} past due`, html, ruleId);
+      targetsFound++;
+    }
+
+  } else if (ruleId === 'weeklyDigest') {
+    const relevant = tasks.filter(t => t.status!=='completed');
+    const byUser = {};
+    relevant.forEach(t=>{ if(!byUser[t.uid])byUser[t.uid]=[]; byUser[t.uid].push(t); });
+    for (const [uid, ut] of Object.entries(byUser)) {
+      const u = users.find(u=>u.id===Number(uid));
+      if (!u?.email) continue;
+      const html = _buildReminderHtml({ user:u, tasks:ut, heading:'Weekly Task Digest', note: overrideNote||`Here is your weekly summary of <strong>${ut.length} open task${ut.length>1?'s':''}</strong>.`, color:'#7c3aed' });
+      await _sendGmailReminder(u.email, `[MoM Pro] 📬 Weekly Digest — ${ut.length} open task${ut.length>1?'s':''}`, html, ruleId);
+      targetsFound++;
+    }
+
+  } else if (ruleId === 'taskAssigned' || ruleId === 'escalation' || ruleId === 'momPublished') {
+    showToast(`${RULE_META[ruleId]?.label} fires automatically on the event — use "Send Now" to test with current data.`,'info');
+    return;
+  }
+
+  if (targetsFound === 0) {
+    showToast('No matching tasks / recipients found for this rule.', 'info');
+  } else {
+    showToast(`✅ ${RULE_META[ruleId]?.label} sent to ${targetsFound} recipient${targetsFound>1?'s':''}.`, 'ok');
+  }
+}
+
+/* ── "Send Now" button per rule ── */
+function sendReminderRuleNow(ruleId) {
+  _executeRule(ruleId, '(Manual test send — ' + new Date().toLocaleDateString('en-IN') + ')');
+}
+
+/* ── Ad-hoc send ── */
+async function sendAdHocGmailReminder() {
+  const ruleId   = document.getElementById('gr_adhoc_type')?.value || 'overdue';
+  const userId   = document.getElementById('gr_adhoc_user')?.value || 'all';
+  const note     = (document.getElementById('gr_adhoc_note')?.value||'').trim();
+  const statusEl = document.getElementById('gr_adhoc_status');
+  if (statusEl) statusEl.textContent = 'Sending…';
+
+  const tasks = (typeof TASKS!=='undefined'?TASKS:[]).filter(t => userId==='all' || t.uid===parseInt(userId));
+  const open  = tasks.filter(t=>t.status!=='completed');
+  if (!open.length) { showToast('No open tasks match selection.','warn'); if(statusEl)statusEl.textContent=''; return; }
+
+  await _executeRule(ruleId, note || undefined);
+  if (statusEl) { statusEl.textContent = '✓ Sent at ' + new Date().toLocaleTimeString(); setTimeout(()=>{ if(statusEl)statusEl.textContent=''; },5000); }
+}
+
+/* ══════════════════════════════════════════════════════
+   BROWSER-SIDE SCHEDULER
+   Checks every 5 minutes whether a scheduled rule is due
+══════════════════════════════════════════════════════ */
+let _reminderSchedulerTimer = null;
+
+function _startBrowserReminderScheduler() {
+  if (_reminderSchedulerTimer) return; // already running
+  _reminderSchedulerTimer = setInterval(_checkScheduledReminders, 5 * 60 * 1000);
+  _checkScheduledReminders(); // run immediately on start
+}
+
+function _checkScheduledReminders() {
+  const cfg = gmailReminderCfg();
+  if (!cfg.enabled || !cfg.backendUrl) return;
+
+  const now = new Date();
+  const nowHHMM = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+
+  const scheduledRules = ['upcoming3d','overdue','weeklyDigest'];
+  scheduledRules.forEach(ruleId => {
+    const rule = cfg.rules[ruleId];
+    if (!rule?.enabled) return;
+
+    // Check if it's the right time of day (within 5 min window)
+    const sendTime = rule.sendTime || '08:00';
+    if (Math.abs(_minutesDiff(nowHHMM, sendTime)) > 5) return;
+
+    // Check if enough time has passed since lastSent
+    if (rule.lastSent) {
+      const elapsed = (now - new Date(rule.lastSent)) / (1000 * 60 * 60); // hours
+      if (elapsed < (rule.frequencyHours || 24)) return;
+    }
+
+    // Fire the rule
+    console.log('[MoM Reminders] Firing scheduled rule:', ruleId);
+    _executeRule(ruleId);
+  });
+}
+
+function _minutesDiff(t1, t2) {
+  const [h1,m1] = t1.split(':').map(Number);
+  const [h2,m2] = t2.split(':').map(Number);
+  return (h1*60+m1) - (h2*60+m2);
+}
+
+/* ══════════════════════════════════════════════════════
+   CLOUD SCHEDULER SYNC
+══════════════════════════════════════════════════════ */
+async function syncCloudScheduler() {
+  // Save rules first
+  saveGmailReminderRules();
+  const cfg = gmailReminderCfg();
+  if (!cfg.backendUrl) { showToast('Backend URL not configured — cannot sync Cloud Scheduler.','warn'); return; }
+
+  const payload = {
+    rules: Object.entries(cfg.rules)
+      .filter(([id]) => RULE_META[id]?.canSchedule)
+      .map(([id, rule]) => ({
+        ruleId: id,
+        label:  RULE_META[id].label,
+        enabled: rule.enabled,
+        frequencyHours: rule.frequencyHours || 24,
+        sendTime: rule.sendTime || '08:00',
+      })),
+    adminEmail: cfg.adminEmail,
+    senderEmail: cfg.senderEmail,
+  };
+
+  try {
+    const res = await fetch(`${cfg.backendUrl}/api/update-reminder-schedule`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error((await res.json().catch(()=>({}))).error || res.statusText);
+    const cfgW = gmailReminderCfg();
+    cfgW.schedulerSynced = true;
+    saveGmailReminderCfg(cfgW);
+    showToast('☁ Cloud Scheduler synced successfully.','ok');
+  } catch(e) {
+    showToast('Scheduler sync failed: '+e.message,'warn');
+  }
+}
+
+/* ══════════════════════════════════════════════════════
+   HOOK INTO APP EVENTS
+   Override existing notification calls to also route
+   through Gmail when the Gmail backend is configured
+══════════════════════════════════════════════════════ */
+
+/* Wrap sendGroupedTaskNotifications to also fire Gmail */
+const _origSendGrouped = typeof sendGroupedTaskNotifications === 'function' ? sendGroupedTaskNotifications : null;
+if (typeof sendGroupedTaskNotifications === 'function') {
+  const _orig = sendGroupedTaskNotifications;
+  window.sendGroupedTaskNotifications = async function(taskIds, context, meeting, extraNote) {
+    // Call original (Office 365 path)
+    const result = await _orig(taskIds, context, meeting, extraNote);
+
+    // Additionally: send via Gmail backend for immediate rules
+    const cfg = gmailReminderCfg();
+    if (!cfg.enabled || !cfg.backendUrl) return result;
+
+    const ruleMap = { assigned:'taskAssigned', escalation:'escalation', reminder:'upcoming3d' };
+    const ruleId  = ruleMap[context] || 'taskAssigned';
+    const rule    = cfg.rules[ruleId];
+    if (!rule?.enabled) return result;
+
+    const tasks = (typeof TASKS!=='undefined'?TASKS:[]).filter(t=>taskIds.includes(t.id));
+    const users = typeof USERS!=='undefined'?USERS:[];
+    const byUser = {};
+    tasks.forEach(t=>{ if(!byUser[t.uid])byUser[t.uid]=[]; byUser[t.uid].push(t); });
+
+    for (const [uid, ut] of Object.entries(byUser)) {
+      const u = users.find(u=>u.id===Number(uid));
+      if (!u?.email) continue;
+      const contextMeta = { assigned:{heading:'New Task Assigned',color:'#0284c7'}, escalation:{heading:'Escalation Alert',color:'#dc2626'}, reminder:{heading:'Task Reminder',color:'#d97706'} }[context]||{heading:'Task Update',color:'#0284c7'};
+      const html = _buildReminderHtml({ user:u, tasks:ut, heading:contextMeta.heading, note:extraNote||'', color:contextMeta.color });
+      const subject = context==='escalation'
+        ? `[MoM Pro] ⚠ Escalation — ${ut.length} task${ut.length>1?'s':''} require attention`
+        : `[MoM Pro] 📋 ${contextMeta.heading} — ${ut.length} task${ut.length>1?'s':''}`;
+      await _sendGmailReminder(u.email, subject, html, ruleId);
+    }
+    return result;
+  };
+}
+
+/* Auto-start scheduler after login */
+document.addEventListener('DOMContentLoaded', () => {
+  setTimeout(_startBrowserReminderScheduler, 3000);
+});
+
+/* xe() helper — safe if already defined globally */
+if (typeof xe !== 'function') {
+  window.xe = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+</script>
