@@ -4160,7 +4160,7 @@ async function sendGmailEmail(toEmail, subject, bodyHtml) {
  * sendGmailDigest(recipients, subject, bodyHtml)
  * Calls POST /api/send-digest on the Cloud Run backend.
  */
-async function sendGmailDigest(recipients, subject, bodyHtml) {
+async function sendGmailDigest(recipients, subject, bodyHtml, signal) {
   const backendUrl = getGmailBackendUrl();
   if (!backendUrl) return false;
   const gm = _settingsData.gmail || {};
@@ -4173,6 +4173,7 @@ async function sendGmailDigest(recipients, subject, bodyHtml) {
       htmlBody: bodyHtml,
       senderName: gm.senderName || 'PlantVisit Digest',
     }),
+    signal,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -5483,49 +5484,53 @@ async function sendDailyDigestEmail(force = false) {
     return;
   }
 
-  // Update UI status if the settings panel is open
+  // ── Build HTML synchronously (fast, no network) ──────────────────────
+  const bodyHtml = buildDailyDigestHtml(relevant, since, company, _visitsData, upcoming48, todayOngoing, newlyAdded);
+
+  // ── Stamp send-date + settings immediately so the scheduler won't double-fire
+  // even if the backend is slow or the tab is closed before the response arrives.
+  const sentLabel = new Date().toLocaleString('en-IN');
+  _settingsData.dailyDigest = { ...dd, lastSentDate: sentLabel };
+  saveSettings();
+  localStorage.setItem('pv_digest_sent_date', new Date().toDateString());
+
+  // ── Update UI immediately — don't make the user wait for the backend ──
   const statusEl = document.getElementById('dd_send_status');
   if (statusEl) {
     statusEl.style.display = 'block';
-    statusEl.innerHTML = `<div class="alert alert-info">⏳ Sending digest via Gmail backend…</div>`;
+    statusEl.innerHTML = `<div class="alert alert-info">📤 Digest queued — sending to ${digestRecipients.join(', ')}…</div>`;
+  }
+  toast('📬 Digest Queued', `Sending ${relevant.length} record${relevant.length !== 1 ? 's' : ''} → ${digestRecipients.join(', ')}`);
+
+  // Refresh notifications panel to show updated lastSentDate right away
+  if (_settingsActiveTab === 'notifications') {
+    const settingsEl = document.getElementById('settingsContent');
+    if (settingsEl) renderNotificationSettings(settingsEl);
   }
 
-  try {
-    const bodyHtml = buildDailyDigestHtml(relevant, since, company, _visitsData, upcoming48, todayOngoing, newlyAdded);
-    await sendGmailDigest(digestRecipients, subject, bodyHtml);
+  // ── Fire-and-forget network call with 30 s timeout ───────────────────
+  const _abortCtrl = new AbortController();
+  const _abortTimer = setTimeout(() => _abortCtrl.abort(), 30000);
 
-    // Record last sent date (both in memory and Firestore)
-    const sentLabel = new Date().toLocaleString('en-IN');
-    _settingsData.dailyDigest = { ...dd, lastSentDate: sentLabel };
-    saveSettings();
-
-    // Always stamp the send-date so the scheduler doesn't double-fire later the same day,
-    // even when force=true (manual "Send Now" button). The stamp only prevents a second
-    // automatic send — it doesn't block another manual send.
-    localStorage.setItem('pv_digest_sent_date', new Date().toDateString());
-
-    if (statusEl) {
-      statusEl.innerHTML = `<div class="alert alert-good" style="color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">
-        ✅ Digest sent to ${digestRecipients.join(', ')} — ${relevant.length} record${relevant.length !== 1 ? 's' : ''} included.
-      </div>`;
-      setTimeout(() => { statusEl.style.display = 'none'; }, 8000);
-    }
-
-    toast('📬 Daily Digest Sent', `${relevant.length} record${relevant.length !== 1 ? 's' : ''} summarised → ${digestRecipients.join(', ')}`);
-
-    // Refresh notifications panel to show updated lastSentDate
-    if (_settingsActiveTab === 'notifications') {
-      const settingsEl = document.getElementById('settingsContent');
-      if (settingsEl) renderNotificationSettings(settingsEl);
-    }
-
-  } catch(err) {
-    if (statusEl) {
-      statusEl.innerHTML = `<div class="alert alert-warn">❌ Failed: ${err?.message || String(err)}</div>`;
-      setTimeout(() => { statusEl.style.display = 'none'; }, 9000);
-    }
-    toast('Digest Failed', err?.message || String(err), true);
-  }
+  sendGmailDigest(digestRecipients, subject, bodyHtml, _abortCtrl.signal)
+    .then(() => {
+      clearTimeout(_abortTimer);
+      if (statusEl) {
+        statusEl.innerHTML = `<div class="alert alert-good" style="color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">
+          ✅ Digest delivered to ${digestRecipients.join(', ')} — ${relevant.length} record${relevant.length !== 1 ? 's' : ''} included.
+        </div>`;
+        setTimeout(() => { statusEl.style.display = 'none'; }, 8000);
+      }
+    })
+    .catch(err => {
+      clearTimeout(_abortTimer);
+      const msg = _abortCtrl.signal.aborted ? 'Request timed out (30 s) — backend may still deliver it.' : (err?.message || String(err));
+      if (statusEl) {
+        statusEl.innerHTML = `<div class="alert alert-warn">⚠ ${msg}</div>`;
+        setTimeout(() => { statusEl.style.display = 'none'; }, 9000);
+      }
+      toast('Digest Warning', msg, true);
+    });
 }
 
 /**
