@@ -2895,6 +2895,30 @@ function _resp(obj) {
 /* ── Send one email via Apps Script Web App ── */
 async function sendGmailViaAppsScript(toEmail, toName, subject, htmlBody){
   const cfg = DB.settings;
+
+  // ── PRIMARY: Route through Cloud Run (same service as scheduler, no CORS issues) ──
+  if(cfg.cloudFnUrl && cfg.cloudFnSecret){
+    try {
+      const res = await fetch(cfg.cloudFnUrl.replace(/\/$/, '') + '/api/send-email', {
+        method:  'POST',
+        headers: {'Content-Type':'application/json', 'x-internal-secret': cfg.cloudFnSecret},
+        body: JSON.stringify({
+          to:       toEmail,
+          subject:  subject,
+          htmlBody: htmlBody,
+          fromName: cfg.companyName || 'IncidentPro'
+        })
+      });
+      const json = await res.json().catch(()=>({}));
+      if(json.ok) return {ok:true};
+      // If endpoint doesn't exist yet fall through to Apps Script relay
+      if(res.status !== 404) return {ok:false, error: json.error||'Cloud Run email error'};
+    } catch(e){
+      console.warn('[Gmail] Cloud Run send failed, falling back to Apps Script:', e.message);
+    }
+  }
+
+  // ── FALLBACK: Apps Script relay (used when Cloud Run not configured) ──
   if(!cfg.gmailWebAppUrl){ return {ok:false, reason:'no-url'}; }
   if(!cfg.gmailSecret){    return {ok:false, reason:'no-secret'}; }
 
@@ -2906,7 +2930,7 @@ async function sendGmailViaAppsScript(toEmail, toName, subject, htmlBody){
     fromName: cfg.companyName || 'IncidentPro'
   });
 
-  // ── Strategy 1: Standard fetch with JSON (works when Apps Script CORS is open) ──
+  // Strategy 1: Standard JSON fetch
   try {
     const resp = await fetch(cfg.gmailWebAppUrl, {
       method: 'POST',
@@ -2917,16 +2941,11 @@ async function sendGmailViaAppsScript(toEmail, toName, subject, htmlBody){
     if(resp.ok || resp.status === 200){
       const json = await resp.json().catch(()=>({ok:true}));
       if(json.ok !== false) return {ok:true};
-      // Fall through to strategy 2 only if explicit failure
       if(json.error && json.error !== 'Unauthorized') return json;
     }
-  } catch(e1){
-    // CORS blocked — try strategy 2
-  }
+  } catch(e1){ /* CORS blocked — try no-cors */ }
 
-  // ── Strategy 2: no-cors mode (Apps Script always accepts; we assume success) ──
-  // Apps Script Web Apps deployed as "Access: Anyone" always process the request.
-  // With no-cors we can't read the response, so we treat a completed fetch as success.
+  // Strategy 2: no-cors (opaque response — assume success if no throw)
   try {
     await fetch(cfg.gmailWebAppUrl, {
       method: 'POST',
@@ -2934,7 +2953,6 @@ async function sendGmailViaAppsScript(toEmail, toName, subject, htmlBody){
       headers: {'Content-Type': 'application/json'},
       body: payload
     });
-    // no-cors returns opaque response — if fetch didn't throw, the request was sent
     return {ok:true};
   } catch(err){
     return {ok:false, reason:'fetch-error', detail: err.message};
