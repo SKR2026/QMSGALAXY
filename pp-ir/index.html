@@ -1129,8 +1129,28 @@ function userName(id){ return DB.users.find(u=>u.id===id)?.name||id||'—'; }
 /* ═══════════════════════════════════════════════════════
    DASHBOARD
 ═══════════════════════════════════════════════════════ */
-function renderDashboard(){
-  const inc = visibleIncidents();
+/* ── Dashboard filter state ── */
+let _dashFilter = { year: 'all', month: 'all', plant: 'all' };
+
+function renderDashboard(patch){
+  if(patch) Object.assign(_dashFilter, patch);
+
+  const thisYear = new Date().getFullYear();
+  // Collect available years from incidents
+  const allInc = visibleIncidents();
+  const years = [...new Set(allInc.map(i=>i.createdAt?new Date(i.createdAt).getFullYear():null).filter(Boolean))].sort((a,b)=>b-a);
+  if(!years.includes(thisYear)) years.unshift(thisYear);
+
+  // Apply filters
+  let inc = allInc.filter(i=>{
+    if(!i.createdAt) return true;
+    const d = new Date(i.createdAt);
+    if(_dashFilter.year!=='all' && d.getFullYear()!==+_dashFilter.year) return false;
+    if(_dashFilter.month!=='all' && d.getMonth()!==+_dashFilter.month) return false;
+    if(_dashFilter.plant!=='all' && currentUser?.role==='super-admin' && i.plantId!==_dashFilter.plant) return false;
+    return true;
+  });
+
   const open = inc.filter(i=>i.status==='open').length;
   const investigating = inc.filter(i=>i.status==='investigating').length;
   const resolved = inc.filter(i=>i.status==='resolved').length;
@@ -1145,14 +1165,86 @@ function renderDashboard(){
   // By plant (super-admin)
   const byPlant = DB.plants.map(p=>({ plant:p, count:inc.filter(i=>i.plantId===p.id).length }));
 
+  // Month-wise data: always show 12 months for selected year (or current year if 'all')
+  const chartYear = _dashFilter.year!=='all' ? +_dashFilter.year : thisYear;
+  const MONTH_LABELS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const monthData = MONTH_LABELS.map((_,mi)=>{
+    const monthInc = allInc.filter(i=>{
+      if(!i.createdAt) return false;
+      const d=new Date(i.createdAt);
+      if(d.getFullYear()!==chartYear) return false;
+      if(d.getMonth()!==mi) return false;
+      if(_dashFilter.plant!=='all' && currentUser?.role==='super-admin' && i.plantId!==_dashFilter.plant) return false;
+      return true;
+    });
+    return {
+      label: MONTH_LABELS[mi],
+      total: monthInc.length,
+      open: monthInc.filter(i=>i.status==='open').length,
+      investigating: monthInc.filter(i=>i.status==='investigating').length,
+      resolved: monthInc.filter(i=>['resolved','closed'].includes(i.status)).length,
+      critical: monthInc.filter(i=>i.severity==='critical').length,
+    };
+  });
+  const maxBar = Math.max(...monthData.map(m=>m.total), 1);
+
+  // Pill helpers
+  const yPill = (val,lbl) => `<button class="dash-pill${_dashFilter.year===val?' active':''}" onclick="renderDashboard({year:'${val}'})">${lbl}</button>`;
+  const mPill = (val,lbl) => `<button class="dash-pill${_dashFilter.month===val?' active':''}" onclick="renderDashboard({month:'${val}'})">${lbl}</button>`;
+  const pPill = (val,lbl) => `<button class="dash-pill${_dashFilter.plant===val?' active':''}" onclick="renderDashboard({plant:'${val}'})">${lbl}</button>`;
+
+  const isSA = currentUser?.role==='super-admin';
+
   document.getElementById('content').innerHTML = `
-  <div style="display:flex;justify-content:flex-end;margin-bottom:14px;gap:8px">
-    <button class="btn bs" onclick="exportDashboardPDF()" style="gap:5px">
-      <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3M3 17V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
-      Export Dashboard PDF
-    </button>
+  <style>
+    .dash-pill{padding:4px 11px;border-radius:20px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--br2);background:var(--bg2);color:var(--t2);transition:all .15s;font-family:var(--fn);white-space:nowrap}
+    .dash-pill:hover{background:var(--bg3);color:var(--tx)}
+    .dash-pill.active{background:var(--ac);color:#fff;border-color:var(--ac)}
+    .dash-filter-row{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:16px;padding:10px 14px;background:var(--sf);border:1px solid var(--br);border-radius:var(--r);box-shadow:var(--sh)}
+    .dash-filter-sep{width:1px;height:20px;background:var(--br2);margin:0 4px;flex-shrink:0}
+    .dash-filter-lbl{font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-right:2px;white-space:nowrap}
+    .bar-wrap{display:flex;flex-direction:column;gap:0;height:100%}
+    .bar-chart{display:flex;align-items:flex-end;gap:6px;height:160px;padding:0 4px}
+    .bar-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0}
+    .bar-col-inner{width:100%;display:flex;flex-direction:column;justify-content:flex-end;position:relative;cursor:default}
+    .bar-seg{width:100%;border-radius:3px 3px 0 0;transition:opacity .2s;min-height:2px}
+    .bar-lbl{font-size:10px;color:var(--t3);font-weight:500;text-align:center;margin-top:4px}
+    .bar-val{font-size:10px;font-weight:700;color:var(--tx);text-align:center}
+    .bar-col-inner:hover .bar-tip{display:block}
+    .bar-tip{display:none;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);background:var(--tx);color:var(--bg2);font-size:11px;font-weight:500;padding:4px 8px;border-radius:5px;white-space:nowrap;z-index:10;pointer-events:none}
+    .bar-tip::after{content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);border:4px solid transparent;border-top-color:var(--tx)}
+    .chart-legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px}
+    .legend-dot{width:10px;height:10px;border-radius:2px;display:inline-block;margin-right:4px}
+  </style>
+
+  <!-- FILTER ROW -->
+  <div class="dash-filter-row">
+    <span class="dash-filter-lbl">📅 Year</span>
+    ${yPill('all','All')}
+    ${years.map(y=>yPill(String(y),String(y))).join('')}
+
+    <div class="dash-filter-sep"></div>
+    <span class="dash-filter-lbl">📆 Month</span>
+    ${mPill('all','All')}
+    ${MONTH_LABELS.map((m,mi)=>mPill(String(mi),m)).join('')}
+
+    ${isSA?`
+    <div class="dash-filter-sep"></div>
+    <span class="dash-filter-lbl">🏭 Plant</span>
+    ${pPill('all','All Plants')}
+    ${DB.plants.map(p=>pPill(p.id,p.name.replace('Plant — ',''))).join('')}
+    `:''}
+
+    <div style="margin-left:auto">
+      <button class="btn bs" onclick="exportDashboardPDF()" style="gap:5px">
+        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3M3 17V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+        Export PDF
+      </button>
+    </div>
   </div>
-  <div class="stat-grid">
+
+  <!-- STAT CARDS -->
+  <div class="stat-grid" style="margin-bottom:16px">
     <div class="stat-card" style="border-left-color:var(--er)">
       <div class="stat-lbl">Open Incidents</div>
       <div class="stat-val">${open}</div>
@@ -1175,23 +1267,56 @@ function renderDashboard(){
     </div>
   </div>
 
+  <!-- MONTH-WISE BAR CHART -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-hd">
+      <div class="card-title">Monthly Incidents — ${chartYear}</div>
+      <span style="font-size:11px;color:var(--t3)">${inc.length} total in selected period</span>
+    </div>
+    <div class="bar-chart">
+      ${monthData.map(m=>{
+        const barH = maxBar>0 ? Math.round((m.total/maxBar)*140) : 0;
+        const rH   = maxBar>0 ? Math.round((m.resolved/maxBar)*140) : 0;
+        const iH   = maxBar>0 ? Math.round((m.investigating/maxBar)*140) : 0;
+        const oH   = maxBar>0 ? Math.round((m.open/maxBar)*140) : 0;
+        const cH   = maxBar>0 ? Math.round((m.critical/maxBar)*140) : 0;
+        const restH= Math.max(0, barH - rH - iH - oH);
+        return '<div class="bar-col">'
+          + (m.total>0?'<div class="bar-val">'+m.total+'</div>':'<div class="bar-val" style="color:var(--t3)">—</div>')
+          + '<div class="bar-col-inner" style="height:'+barH+'px">'
+          + '<div class="bar-tip">'+m.label+': '+m.total+' total<br>Open: '+m.open+' | Inv: '+m.investigating+'<br>Resolved: '+m.resolved+' | Critical: '+m.critical+'</div>'
+          + (rH>0?'<div class="bar-seg" style="height:'+rH+'px;background:var(--ok)"></div>':'')
+          + (iH>0?'<div class="bar-seg" style="height:'+iH+'px;background:var(--wn)"></div>':'')
+          + (oH>0?'<div class="bar-seg" style="height:'+oH+'px;background:var(--er)"></div>':'')
+          + (restH>0?'<div class="bar-seg" style="height:'+restH+'px;background:var(--br2)"></div>':'')
+          + '</div>'
+          + '<div class="bar-lbl">'+m.label+'</div>'
+          + '</div>';
+      }).join('')}
+    </div>
+    <div class="chart-legend">
+      <span><span class="legend-dot" style="background:var(--er)"></span><span style="font-size:11px;color:var(--t2)">Open</span></span>
+      <span><span class="legend-dot" style="background:var(--wn)"></span><span style="font-size:11px;color:var(--t2)">Investigating</span></span>
+      <span><span class="legend-dot" style="background:var(--ok)"></span><span style="font-size:11px;color:var(--t2)">Resolved/Closed</span></span>
+      <span><span class="legend-dot" style="background:var(--br2)"></span><span style="font-size:11px;color:var(--t2)">Other</span></span>
+    </div>
+  </div>
+
+  <!-- BOTTOM ROW: Recent Incidents + Severity + By Plant -->
   <div class="g2" style="margin-bottom:20px">
     <div class="card">
       <div class="card-hd"><div class="card-title">Recent Incidents</div><button class="btn bs" onclick="navigate('incidents')">View All →</button></div>
-      ${recent.length===0?`<div class="empty"><p>No incidents yet</p></div>`:`
-      <div class="tw"><table>
-        <thead><tr><th>ID</th><th>Title</th><th>Plant</th><th>Severity</th><th>Status</th><th>Date</th></tr></thead>
-        <tbody>
-        ${recent.map(i=>`<tr style="cursor:pointer" onclick="openIncident('${i.id}')">
-          <td><span style="font-family:var(--mo);font-size:11px;color:var(--t3)">${i.incidentNo}</span></td>
-          <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${xe(i.title)}">${xe(i.title)}</td>
-          <td style="font-size:12px">${xe(plantName(i.plantId))}</td>
-          <td>${sevBdg(i.severity)}</td>
-          <td>${stsBdg(i.status)}</td>
-          <td style="font-size:11px;color:var(--t3)">${fmtDateShort(i.createdAt)}</td>
-        </tr>`).join('')}
-        </tbody>
-      </table></div>`}
+      ${recent.length===0?'<div class="empty"><p>No incidents in selected period</p></div>':''}
+      ${recent.length>0?'<div class="tw"><table><thead><tr><th>ID</th><th>Title</th><th>Plant</th><th>Severity</th><th>Status</th><th>Date</th></tr></thead><tbody>'
+        +recent.map(i=>'<tr style="cursor:pointer" onclick="openIncident(\''+i.id+'\')">'
+          +'<td><span style="font-family:var(--mo);font-size:11px;color:var(--t3)">'+i.incidentNo+'</span></td>'
+          +'<td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+xe(i.title)+'">'+xe(i.title)+'</td>'
+          +'<td style="font-size:12px">'+xe(plantName(i.plantId))+'</td>'
+          +'<td>'+sevBdg(i.severity)+'</td>'
+          +'<td>'+stsBdg(i.status)+'</td>'
+          +'<td style="font-size:11px;color:var(--t3)">'+fmtDateShort(i.createdAt)+'</td>'
+          +'</tr>').join('')
+        +'</tbody></table></div>':''}
     </div>
 
     <div style="display:flex;flex-direction:column;gap:16px">
@@ -1199,22 +1324,19 @@ function renderDashboard(){
         <div class="card-hd"><div class="card-title">By Severity</div></div>
         ${SEVERITIES.map(s=>{
           const cnt=bySev[s]; const total=inc.length||1;
-          return `<div style="margin-bottom:10px">
-            <div style="display:flex;justify-content:space-between;margin-bottom:3px">
-              ${sevBdg(s)} <span style="font-size:12px;font-weight:600">${cnt}</span>
-            </div>
-            <div class="prog"><div class="pf ${s==='critical'?'cr':s==='high'?'':s==='medium'?'wn':'ok'}" style="width:${Math.round(cnt/total*100)}%"></div></div>
-          </div>`;
+          return '<div style="margin-bottom:10px">'
+            +'<div style="display:flex;justify-content:space-between;margin-bottom:3px">'
+            +sevBdg(s)+' <span style="font-size:12px;font-weight:600">'+cnt+'</span>'
+            +'</div>'
+            +'<div class="prog"><div class="pf '+(s==='critical'?'cr':s==='high'?'':s==='medium'?'wn':'ok')+'" style="width:'+Math.round(cnt/total*100)+'%"></div></div>'
+            +'</div>';
         }).join('')}
       </div>
 
-      ${currentUser?.role==='super-admin'?`
-      <div class="card">
-        <div class="card-hd"><div class="card-title">By Plant</div></div>
-        ${byPlant.map(({plant,count})=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--br);font-size:13px">
-          <span>${xe(plant.name)}</span><span class="chip">${count}</span>
-        </div>`).join('')}
-      </div>`:''}
+      ${isSA?'<div class="card"><div class="card-hd"><div class="card-title">By Plant</div></div>'
+        +byPlant.map(({plant,count})=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--br);font-size:13px">'
+          +'<span>'+xe(plant.name)+'</span><span class="chip">'+count+'</span></div>').join('')
+        +'</div>':''}
     </div>
   </div>`;
 }
