@@ -128,6 +128,9 @@ tr:hover td{background:var(--bg3)}
 .b-closed{background:var(--bg3);color:var(--t2)}
 .b-in{background:var(--il);color:var(--in)}
 .b-ok{background:var(--ol);color:var(--ok)}
+.b-major{background:var(--el);color:var(--er)}
+.b-minor{background:var(--wl);color:var(--wn)}
+.b-nearmiss{background:var(--il);color:var(--in)}
 
 /* ── FORMS ── */
 .fg{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
@@ -1125,11 +1128,14 @@ function navigate(page){
 ═══════════════════════════════════════════════════════ */
 const SEVERITIES = ['critical','high','medium','low'];
 const STATUSES = ['open','investigating','closed'];
+const ACCIDENT_CATEGORIES = ['major','minor','nearmiss'];
+const ACCIDENT_CATEGORY_LABELS = { major:'Major', minor:'Minor', nearmiss:'Near Miss' };
 const _DEFAULT_INCIDENT_TYPES = ['Safety Hazard','Near Miss','Equipment Failure','Environmental','Quality Issue','Security Breach','Fire/Explosion','Chemical Spill','Injury/Illness','Process Deviation','Utility Failure','Other'];
 function getIncidentTypes(){ return (DB.incidentTypes && DB.incidentTypes.length) ? DB.incidentTypes : _DEFAULT_INCIDENT_TYPES; }
 
 function sevBdg(s){ const m={critical:'b-critical',high:'b-high',medium:'b-medium',low:'b-low'}; return `<span class="bdg ${m[s]||'b-low'}">${s?.toUpperCase()||'—'}</span>`; }
 function stsBdg(s){ const m={open:'b-open',investigating:'b-investigating',resolved:'b-resolved',closed:'b-closed'}; return `<span class="bdg ${m[s]||'b-closed'}">${s?.charAt(0).toUpperCase()+s?.slice(1)||'—'}</span>`; }
+function accBdg(c){ if(!c) return '<span style="color:var(--t3);font-size:11px">—</span>'; const m={major:'b-major',minor:'b-minor',nearmiss:'b-nearmiss'}; return `<span class="bdg ${m[c]||'b-low'}">${ACCIDENT_CATEGORY_LABELS[c]||c}</span>`; }
 function plantName(id){ return DB.plants.find(p=>p.id===id)?.name||id||'—'; }
 function userName(id){ return DB.users.find(u=>u.id===id)?.name||id||'—'; }
 
@@ -1197,10 +1203,10 @@ function renderDashboard(patch){
 
   const open        = inc.filter(i=>i.status==='open').length;
   const investigating = inc.filter(i=>i.status==='investigating').length;
-  const resolved    = inc.filter(i=>i.status==='resolved').length;
+  const closed       = inc.filter(i=>i.status==='closed').length;
   const critical    = inc.filter(i=>i.severity==='critical'&&i.status!=='closed').length;
   const now72       = Date.now()-72*3600*1000;
-  const overdue     = inc.filter(i=>!['resolved','closed'].includes(i.status)&&new Date(i.createdAt)<new Date(now72)).length;
+  const overdue     = inc.filter(i=>i.status!=='closed'&&new Date(i.createdAt)<new Date(now72)).length;
   const recent      = [...inc].sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,8);
 
   // By severity
@@ -1208,6 +1214,25 @@ function renderDashboard(patch){
   SEVERITIES.forEach(s=>bySev[s]=inc.filter(i=>i.severity===s).length);
   // By plant (super-admin)
   const byPlant = DB.plants.map(p=>({ plant:p, count:inc.filter(i=>i.plantId===p.id).length }));
+
+  // ── Accident categories (Major / Minor / Near Miss) ──
+  // Scoped by plant filter only (not year/month) — this is a live safety metric, not a historical slice
+  const accScope = allInc.filter(i=>{
+    if(_dashFilter.plant!=='all' && currentUser?.role==='super-admin' && i.plantId!==_dashFilter.plant) return false;
+    return true;
+  });
+  const accidents = accScope.filter(i=>ACCIDENT_CATEGORIES.includes(i.accidentCategory));
+  const lastAccident = accidents.length
+    ? accidents.reduce((latest,i)=>{
+        const d = new Date(i.incidentDt||i.createdAt);
+        return (!latest || d>latest) ? d : latest;
+      }, null)
+    : null;
+  const accidentFreeDays = lastAccident ? Math.max(0, Math.floor((Date.now()-lastAccident.getTime())/86400000)) : null;
+
+  // By accident category (within selected period, for the summary panel)
+  const byAccCat = {};
+  ACCIDENT_CATEGORIES.forEach(c=>byAccCat[c]=inc.filter(i=>i.accidentCategory===c).length);
 
   // ── Month-wise bar chart ──
   // Chart always shows 12 months of the selected (or current) label year, in mode order
@@ -1235,11 +1260,35 @@ function renderDashboard(patch){
       total: monthInc.length,
       open: monthInc.filter(i=>i.status==='open').length,
       investigating: monthInc.filter(i=>i.status==='investigating').length,
-      resolved: monthInc.filter(i=>['resolved','closed'].includes(i.status)).length,
+      closed: monthInc.filter(i=>i.status==='closed').length,
       critical: monthInc.filter(i=>i.severity==='critical').length,
     };
   });
   const maxBar = Math.max(...monthData.map(m=>m.total), 1);
+
+  // ── Accident category monthly chart data ──
+  const accMonthData = monthOrder.map(mi=>{
+    const monthInc = accScope.filter(i=>{
+      if(!i.createdAt) return false;
+      const d = new Date(i.createdAt);
+      if(isFY){
+        const s = new Date(chartLY, 3, 1), e = new Date(chartLY+1, 3, 1);
+        if(d < s || d >= e) return false;
+      } else {
+        if(d.getFullYear() !== chartLY) return false;
+      }
+      if(d.getMonth() !== mi) return false;
+      return true;
+    });
+    return {
+      mi,
+      label: MONTH_LABELS[mi],
+      major: monthInc.filter(i=>i.accidentCategory==='major').length,
+      minor: monthInc.filter(i=>i.accidentCategory==='minor').length,
+      nearmiss: monthInc.filter(i=>i.accidentCategory==='nearmiss').length,
+    };
+  });
+  const maxAccBar = Math.max(...accMonthData.map(m=>m.major+m.minor+m.nearmiss), 1);
 
   // ── Pill / toggle helpers ──
   const yPill  = (val,lbl) => `<button class="dash-pill${_dashFilter.year===val?' active':''}" onclick="renderDashboard({year:'${val}'})">${lbl}</button>`;
@@ -1311,6 +1360,17 @@ function renderDashboard(patch){
     ${DB.plants.map(p=>pPill(p.id,p.name.replace('Plant — ',''))).join('')}
   </div>`:'<div style="margin-bottom:16px"></div>'}
 
+  <!-- ACCIDENT-FREE DAYS BANNER -->
+  <div class="card" style="margin-bottom:16px;text-align:center;padding:20px;background:linear-gradient(135deg,var(--sf),var(--bg3));border:1px solid var(--br)">
+    <div style="font-size:11px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">🛡️ Accident-Free Days</div>
+    <div style="font-size:44px;font-weight:800;letter-spacing:-1.5px;color:${accidentFreeDays===null?'var(--t3)':'var(--ok)'}">${accidentFreeDays===null?'—':accidentFreeDays}</div>
+    <div style="font-size:12px;color:var(--t3);margin-top:4px">
+      ${lastAccident
+        ? `Since last Major/Minor/Near-Miss on ${fmtDateShort(lastAccident.toISOString())}`
+        : 'No Major, Minor, or Near-Miss incidents recorded yet'}
+    </div>
+  </div>
+
   <!-- STAT CARDS -->
   <div class="stat-grid" style="margin-bottom:16px">
     <div class="stat-card" style="border-left-color:var(--er)">
@@ -1324,8 +1384,8 @@ function renderDashboard(patch){
       <div class="stat-sub">In progress</div>
     </div>
     <div class="stat-card ok-border">
-      <div class="stat-lbl">Resolved</div>
-      <div class="stat-val">${resolved}</div>
+      <div class="stat-lbl">Closed</div>
+      <div class="stat-val">${closed}</div>
       <div class="stat-sub">This period</div>
     </div>
     <div class="stat-card cr-border">
@@ -1344,16 +1404,15 @@ function renderDashboard(patch){
     <div class="bar-chart">
       ${monthData.map(m=>{
         const barH = maxBar>0 ? Math.round((m.total/maxBar)*140) : 0;
-        const rH   = maxBar>0 ? Math.round((m.resolved/maxBar)*140) : 0;
+        const cH   = maxBar>0 ? Math.round((m.closed/maxBar)*140) : 0;
         const iH   = maxBar>0 ? Math.round((m.investigating/maxBar)*140) : 0;
         const oH   = maxBar>0 ? Math.round((m.open/maxBar)*140) : 0;
-        const cH   = maxBar>0 ? Math.round((m.critical/maxBar)*140) : 0;
-        const restH= Math.max(0, barH - rH - iH - oH);
+        const restH= Math.max(0, barH - cH - iH - oH);
         return '<div class="bar-col">'
           + (m.total>0?'<div class="bar-val">'+m.total+'</div>':'<div class="bar-val" style="color:var(--t3)">—</div>')
           + '<div class="bar-col-inner" style="height:'+barH+'px">'
-          + '<div class="bar-tip">'+m.label+': '+m.total+' total<br>Open: '+m.open+' | Inv: '+m.investigating+'<br>Resolved: '+m.resolved+' | Critical: '+m.critical+'</div>'
-          + (rH>0?'<div class="bar-seg" style="height:'+rH+'px;background:var(--ok)"></div>':'')
+          + '<div class="bar-tip">'+m.label+': '+m.total+' total<br>Open: '+m.open+' | Inv: '+m.investigating+'<br>Closed: '+m.closed+' | Critical: '+m.critical+'</div>'
+          + (cH>0?'<div class="bar-seg" style="height:'+cH+'px;background:var(--ok)"></div>':'')
           + (iH>0?'<div class="bar-seg" style="height:'+iH+'px;background:var(--wn)"></div>':'')
           + (oH>0?'<div class="bar-seg" style="height:'+oH+'px;background:var(--er)"></div>':'')
           + (restH>0?'<div class="bar-seg" style="height:'+restH+'px;background:var(--br2)"></div>':'')
@@ -1365,8 +1424,39 @@ function renderDashboard(patch){
     <div class="chart-legend">
       <span><span class="legend-dot" style="background:var(--er)"></span><span style="font-size:11px;color:var(--t2)">Open</span></span>
       <span><span class="legend-dot" style="background:var(--wn)"></span><span style="font-size:11px;color:var(--t2)">Investigating</span></span>
-      <span><span class="legend-dot" style="background:var(--ok)"></span><span style="font-size:11px;color:var(--t2)">Resolved/Closed</span></span>
-      <span><span class="legend-dot" style="background:var(--br2)"></span><span style="font-size:11px;color:var(--t2)">Other</span></span>
+      <span><span class="legend-dot" style="background:var(--ok)"></span><span style="font-size:11px;color:var(--t2)">Closed</span></span>
+    </div>
+  </div>
+
+  <!-- ACCIDENTS BY CATEGORY CHART -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-hd">
+      <div class="card-title">Accidents by Category — ${isFY ? 'FY '+chartLY+'-'+String(chartLY+1).slice(2) : chartLY}</div>
+      <span style="font-size:11px;color:var(--t3)">${accidents.filter(i=>{const d=new Date(i.createdAt); return isFY ? (d>=new Date(chartLY,3,1)&&d<new Date(chartLY+1,3,1)) : d.getFullYear()===chartLY;}).length} accidents in selected year</span>
+    </div>
+    <div class="bar-chart">
+      ${accMonthData.map(m=>{
+        const total = m.major+m.minor+m.nearmiss;
+        const barH = maxAccBar>0 ? Math.round((total/maxAccBar)*140) : 0;
+        const majH = maxAccBar>0 ? Math.round((m.major/maxAccBar)*140) : 0;
+        const minH = maxAccBar>0 ? Math.round((m.minor/maxAccBar)*140) : 0;
+        const nmH  = maxAccBar>0 ? Math.round((m.nearmiss/maxAccBar)*140) : 0;
+        return '<div class="bar-col">'
+          + (total>0?'<div class="bar-val">'+total+'</div>':'<div class="bar-val" style="color:var(--t3)">—</div>')
+          + '<div class="bar-col-inner" style="height:'+barH+'px">'
+          + '<div class="bar-tip">'+m.label+': '+total+' total<br>Major: '+m.major+' | Minor: '+m.minor+' | Near Miss: '+m.nearmiss+'</div>'
+          + (majH>0?'<div class="bar-seg" style="height:'+majH+'px;background:var(--er)"></div>':'')
+          + (minH>0?'<div class="bar-seg" style="height:'+minH+'px;background:var(--wn)"></div>':'')
+          + (nmH>0?'<div class="bar-seg" style="height:'+nmH+'px;background:var(--in)"></div>':'')
+          + '</div>'
+          + '<div class="bar-lbl">'+m.label+'</div>'
+          + '</div>';
+      }).join('')}
+    </div>
+    <div class="chart-legend">
+      <span><span class="legend-dot" style="background:var(--er)"></span><span style="font-size:11px;color:var(--t2)">Major</span></span>
+      <span><span class="legend-dot" style="background:var(--wn)"></span><span style="font-size:11px;color:var(--t2)">Minor</span></span>
+      <span><span class="legend-dot" style="background:var(--in)"></span><span style="font-size:11px;color:var(--t2)">Near Miss</span></span>
     </div>
   </div>
 
@@ -1397,6 +1487,19 @@ function renderDashboard(patch){
             +sevBdg(s)+' <span style="font-size:12px;font-weight:600">'+cnt+'</span>'
             +'</div>'
             +'<div class="prog"><div class="pf '+(s==='critical'?'cr':s==='high'?'':s==='medium'?'wn':'ok')+'" style="width:'+Math.round(cnt/total*100)+'%"></div></div>'
+            +'</div>';
+        }).join('')}
+      </div>
+
+      <div class="card">
+        <div class="card-hd"><div class="card-title">By Accident Category</div></div>
+        ${ACCIDENT_CATEGORIES.map(c=>{
+          const cnt=byAccCat[c]; const total=inc.length||1;
+          return '<div style="margin-bottom:10px">'
+            +'<div style="display:flex;justify-content:space-between;margin-bottom:3px">'
+            +accBdg(c)+' <span style="font-size:12px;font-weight:600">'+cnt+'</span>'
+            +'</div>'
+            +'<div class="prog"><div class="pf '+(c==='major'?'':c==='minor'?'wn':'ok')+'" style="width:'+Math.round(cnt/total*100)+'%"></div></div>'
             +'</div>';
         }).join('')}
       </div>
@@ -1500,6 +1603,7 @@ function openIncident(id){
     <div><div class="stat-lbl">Plant</div><div style="font-size:14px">${xe(plant?.name||'—')}</div></div>
     <div><div class="stat-lbl">Severity</div><div>${sevBdg(i.severity)}</div></div>
     <div><div class="stat-lbl">Status</div><div>${stsBdg(i.status)}</div></div>
+    <div><div class="stat-lbl">Accident Category</div><div>${accBdg(i.accidentCategory)}</div></div>
     <div><div class="stat-lbl">Type</div><div style="font-size:13px">${xe(i.type||'—')}</div></div>
     <div><div class="stat-lbl">Department</div><div style="font-size:13px">${xe(i.department||'—')}</div></div>
     <div><div class="stat-lbl">Reported By</div><div style="font-size:13px">${xe(i.reportedBy||'—')}</div></div>
@@ -1515,7 +1619,7 @@ function openIncident(id){
   <div class="tl">
     ${updates.length===0?'<div style="font-size:12px;color:var(--t3)">No updates yet.</div>':''}
     ${[...updates].reverse().map(u=>`<div class="tl-item">
-      <div class="tl-dot ${u.statusChange==='resolved'?'ok':u.statusChange==='investigating'?'wn':''}"></div>
+      <div class="tl-dot ${(u.statusChange==='closed'||u.statusChange==='resolved')?'ok':u.statusChange==='investigating'?'wn':''}"></div>
       <div class="tl-time">${fmtDate(u.ts)}</div>
       <div class="tl-body">${xe(u.note)}</div>
       ${u.statusChange?`<span class="bdg b-in" style="margin-top:3px;font-size:10px">→ ${u.statusChange}</span>`:''}
@@ -1627,6 +1731,9 @@ function showIncidentForm(editId){
     <div class="fg"><label class="required">Severity</label>
       <select id="f-severity">${SEVERITIES.map(s=>`<option value="${s}"${i?.severity===s?` selected`:s==='medium'&&!i?' selected':''}>${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}</select>
     </div>
+    <div class="fg"><label>Accident Category</label>
+      <select id="f-acccat"><option value=""${!i?.accidentCategory?' selected':''}>— Not Applicable —</option>${ACCIDENT_CATEGORIES.map(c=>`<option value="${c}"${i?.accidentCategory===c?' selected':''}>${ACCIDENT_CATEGORY_LABELS[c]}</option>`).join('')}</select>
+    </div>
     <div class="fg"><label>Department</label>
       <select id="f-dept"><option value="">— Select —</option>${DB.departments.map(d=>`<option value="${d}"${i?.department===d?' selected':''}>${d}</option>`).join('')}</select>
     </div>
@@ -1657,6 +1764,7 @@ function saveIncident(editId){
   const plantId = document.getElementById('f-plant').value;
   const type = document.getElementById('f-type').value;
   const severity = document.getElementById('f-severity').value;
+  const accidentCategory = document.getElementById('f-acccat').value;
   const dept = document.getElementById('f-dept').value;
   const reporter = document.getElementById('f-reporter').value.trim();
   const description = document.getElementById('f-desc').value.trim();
@@ -1675,13 +1783,13 @@ function saveIncident(editId){
     const i = DB.incidents.find(x=>x.id===editId);
     if(!i) return;
     const status = document.getElementById('f-status').value;
-    Object.assign(i,{title,plantId,type,severity,department:dept,reportedBy:reporter,description,immediateAction:action,rootCause,location,witnesses,incidentDt,status,updatedAt:now()});
+    Object.assign(i,{title,plantId,type,severity,accidentCategory,department:dept,reportedBy:reporter,description,immediateAction:action,rootCause,location,witnesses,incidentDt,status,updatedAt:now()});
     auditLog('Edit',`Incident ${i.incidentNo} edited`);
     saveDB(); closeModal(); showToast('Incident updated.','ok');
     openIncident(editId);
   } else {
     const incidentNo = 'INC-'+String(DB.incidents.length+1).padStart(4,'0');
-    const i = { id:uid(), incidentNo, title, plantId, type, severity, department:dept, reportedBy:reporter, description, immediateAction:action, rootCause, location, witnesses, incidentDt, status:'open', createdAt:now(), updatedAt:now(), updates:[] };
+    const i = { id:uid(), incidentNo, title, plantId, type, severity, accidentCategory, department:dept, reportedBy:reporter, description, immediateAction:action, rootCause, location, witnesses, incidentDt, status:'open', createdAt:now(), updatedAt:now(), updates:[] };
     DB.incidents.unshift(i);
     auditLog('Create',`Incident ${incidentNo} created by ${reporter}`);
     checkEscalation(i);
@@ -3180,15 +3288,14 @@ function exportDashboardPDF(){
   const inc = visibleIncidents();
   const open = inc.filter(i=>i.status==='open').length;
   const investigating = inc.filter(i=>i.status==='investigating').length;
-  const resolved = inc.filter(i=>i.status==='resolved').length;
   const closed = inc.filter(i=>i.status==='closed').length;
   const critical = inc.filter(i=>i.severity==='critical').length;
   const high = inc.filter(i=>i.severity==='high').length;
   const medium = inc.filter(i=>i.severity==='medium').length;
   const low = inc.filter(i=>i.severity==='low').length;
   const ageLimit72h = Date.now()-72*3600*1000;
-  const overdue = inc.filter(i=>!['resolved','closed'].includes(i.status)&&new Date(i.createdAt)<new Date(ageLimit72h)).length;
-  const critActive = inc.filter(i=>i.severity==='critical'&&!['resolved','closed'].includes(i.status)).length;
+  const overdue = inc.filter(i=>i.status!=='closed'&&new Date(i.createdAt)<new Date(ageLimit72h)).length;
+  const critActive = inc.filter(i=>i.severity==='critical'&&i.status!=='closed').length;
   const total = inc.length||1;
 
   // By plant (for SA)
@@ -3202,7 +3309,7 @@ function exportDashboardPDF(){
 
   // Escalated
   const escalated = inc.filter(i=>{
-    if(['resolved','closed'].includes(i.status)) return false;
+    if(i.status==='closed') return false;
     const ageH=(Date.now()-new Date(i.createdAt).getTime())/3600000;
     return i.severity==='critical' || ageH>24;
   });
@@ -3232,9 +3339,9 @@ function exportDashboardPDF(){
         <div class="pdf-stat-sub">In progress</div>
       </div>
       <div class="pdf-stat ok">
-        <div class="pdf-stat-lbl">Resolved</div>
-        <div class="pdf-stat-val" style="color:#1a7a4a">${resolved}</div>
-        <div class="pdf-stat-sub">${closed} closed</div>
+        <div class="pdf-stat-lbl">Closed</div>
+        <div class="pdf-stat-val" style="color:#1a7a4a">${closed}</div>
+        <div class="pdf-stat-sub">All completed</div>
       </div>
     </div>
     <div class="pdf-stat-row">
@@ -3255,8 +3362,8 @@ function exportDashboardPDF(){
       </div>
       <div class="pdf-stat">
         <div class="pdf-stat-lbl">Closure Rate</div>
-        <div class="pdf-stat-val">${inc.length>0?Math.round((resolved+closed)/inc.length*100):0}%</div>
-        <div class="pdf-stat-sub">${resolved+closed} of ${inc.length}</div>
+        <div class="pdf-stat-val">${inc.length>0?Math.round(closed/inc.length*100):0}%</div>
+        <div class="pdf-stat-sub">${closed} of ${inc.length}</div>
       </div>
     </div>
   </div>
@@ -3279,7 +3386,7 @@ function exportDashboardPDF(){
 
     <div class="pdf-section pdf-avoid">
       <div class="pdf-section-title">By Status</div>
-      ${[['open','#c0291a'],['investigating','#c07a10'],['resolved','#1a7a4a'],['closed','#3a5472']].map(([sts,col])=>{
+      ${[['open','#c0291a'],['investigating','#c07a10'],['closed','#1a7a4a']].map(([sts,col])=>{
         const cnt = inc.filter(i=>i.status===sts).length;
         const pct = Math.round(cnt/total*100);
         return `<div style="margin-bottom:8px">
@@ -3287,7 +3394,7 @@ function exportDashboardPDF(){
             <span>${_pdfBadge('sts',sts)}</span>
             <strong>${cnt} (${pct}%)</strong>
           </div>
-          <div class="pdf-bar-wrap"><div class="pdf-bar ${sts==='resolved'?'ok':sts==='closed'?'low':sts==='medium'?'medium':sts}" style="width:${pct}%;background:${col} !important"></div></div>
+          <div class="pdf-bar-wrap"><div class="pdf-bar" style="width:${pct}%;background:${col} !important"></div></div>
         </div>`;
       }).join('')}
     </div>
@@ -3380,7 +3487,7 @@ function exportIncidentsExcel(){
   const inc = visibleIncidents();
   const isSA = currentUser?.role==='super-admin';
   const rows = [
-    ['Incident No.','Title','Type','Plant','Severity','Status','Department','Reported By','Location','Date Reported','Date Updated','Description','Immediate Action','Root Cause','Witnesses']
+    ['Incident No.','Title','Type','Plant','Severity','Accident Category','Status','Department','Reported By','Location','Date Reported','Date Updated','Description','Immediate Action','Root Cause','Witnesses']
   ];
   inc.forEach(i=>{
     rows.push([
@@ -3389,6 +3496,7 @@ function exportIncidentsExcel(){
       i.type||'',
       plantName(i.plantId),
       i.severity||'',
+      ACCIDENT_CATEGORY_LABELS[i.accidentCategory]||'',
       i.status||'',
       i.department||'',
       i.reportedBy||'',
@@ -3853,7 +3961,7 @@ if(DB.incidents.length===0 && !_fbReady){
   const demos=[
     {id:uid(),incidentNo:'INC-0001',title:'Chemical Spill in Mixing Area',plantId:'P1',type:'Chemical Spill',severity:'high',department:'Operations',reportedBy:'Rajesh Sharma',description:'During routine mixing operation, a 20L container of solvent tipped and spilled on the floor. Area evacuated immediately.',immediateAction:'Area cordoned off, spill kit deployed, ventilation increased.',rootCause:'Improper container placement on elevated shelf.',location:'Mixing Zone B',witnesses:'Suresh Kumar, Anil Patel',status:'investigating',createdAt:'2025-06-10T08:30:00Z',updatedAt:'2025-06-10T10:00:00Z',updates:[{id:uid(),ts:'2025-06-10T10:00:00Z',note:'Environmental team on site. Spill contained, floor being cleaned.',by:'Plant Safety Officer',statusChange:'investigating'}]},
     {id:uid(),incidentNo:'INC-0002',title:'Near Miss — Forklift and Pedestrian',plantId:'P2',type:'Near Miss',severity:'critical',department:'Logistics',reportedBy:'Priya Shah',description:'Forklift nearly struck a pedestrian at intersection of Aisle 5 and main corridor. No injury but very close call.',immediateAction:'Forklift operation halted. Incident investigation team assembled.',rootCause:'Blind spot at aisle intersection. No mirror installed.',location:'Warehouse Aisle 5',witnesses:'3 workers present',status:'open',createdAt:'2025-06-11T14:00:00Z',updatedAt:'2025-06-11T14:00:00Z',updates:[]},
-    {id:uid(),incidentNo:'INC-0003',title:'Machine Guard Missing — Press Line 3',plantId:'P1',type:'Safety Hazard',severity:'medium',department:'Maintenance',reportedBy:'Amit Desai',description:'Guard cover on Press Line 3 found missing during shift start inspection. Machine isolated and tagged out.',immediateAction:'Machine tagged out. Guard replacement ordered.',rootCause:'Guard removed for maintenance last shift, not replaced.',location:'Press Line 3',witnesses:'Shift Supervisor',status:'resolved',createdAt:'2025-06-08T06:00:00Z',updatedAt:'2025-06-09T15:00:00Z',updates:[{id:uid(),ts:'2025-06-09T15:00:00Z',note:'New guard installed and tested. Machine back in service.',by:'Maintenance Team',statusChange:'resolved'}]},
+    {id:uid(),incidentNo:'INC-0003',title:'Machine Guard Missing — Press Line 3',plantId:'P1',type:'Safety Hazard',severity:'medium',department:'Maintenance',reportedBy:'Amit Desai',description:'Guard cover on Press Line 3 found missing during shift start inspection. Machine isolated and tagged out.',immediateAction:'Machine tagged out. Guard replacement ordered.',rootCause:'Guard removed for maintenance last shift, not replaced.',location:'Press Line 3',witnesses:'Shift Supervisor',status:'closed',createdAt:'2025-06-08T06:00:00Z',updatedAt:'2025-06-09T15:00:00Z',updates:[{id:uid(),ts:'2025-06-09T15:00:00Z',note:'New guard installed and tested. Machine back in service.',by:'Maintenance Team',statusChange:'closed'}]},
   ];
   DB.incidents=demos;
   saveDB();
