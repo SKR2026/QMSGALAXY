@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>IncidentPro — Multi-Plant Incident Management</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!-- Firebase SDK -->
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-storage-compat.js"></script>
 <style>
 /* ── TOKENS ── */
 :root {
@@ -474,31 +479,61 @@ textarea{resize:vertical;min-height:80px}
 
 <script>
 /* ═══════════════════════════════════════════════════════
-   DATA STORE
+   FIREBASE CONFIGURATION & INIT
 ═══════════════════════════════════════════════════════ */
-const DB_KEY = 'incidentpro_v1';
+const _FB_CONFIG = {
+  apiKey:            "AIzaSyCsd_IOB8DPRNbT8TrBsltQksZ6yD7nlqQ",
+  authDomain:        "skr-mom.firebaseapp.com",
+  databaseURL:       "https://skr-mom-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId:         "skr-mom",
+  storageBucket:     "skr-mom.firebasestorage.app",
+  messagingSenderId: "993069516449",
+  appId:             "1:993069516449:web:a837cd9bde24727113d2e0",
+  measurementId:     "G-MMF7E44JJF"
+};
 
-function loadDB(){
-  try{ const s=localStorage.getItem(DB_KEY); if(s) return JSON.parse(s); }catch(e){}
-  return null;
-}
-function saveDB(){
-  try{ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }catch(e){}
-}
+let _fbApp  = null;
+let _db     = null;   // Firestore instance
+let _fbReady = false;
+let _fbSaving = false;
 
-let DB = loadDB() || {
+(function initFirebase(){
+  try {
+    _fbApp = firebase.initializeApp(_FB_CONFIG);
+    _db    = firebase.firestore(_fbApp);
+    _db.enablePersistence({ synchronizeTabs:true }).catch(()=>{});
+    _fbReady = true;
+    console.log('[IncidentPro] Firebase ready ✓');
+  } catch(e) {
+    console.warn('[IncidentPro] Firebase init failed, using localStorage fallback:', e);
+  }
+})();
+
+/* ═══════════════════════════════════════════════════════
+   DATA STORE — Firestore-backed with localStorage cache
+   • Firestore is the source of truth
+   • localStorage caches for fast startup & offline
+   • DB object is always in memory; saveDB() persists it
+═══════════════════════════════════════════════════════ */
+const DB_KEY    = 'incidentpro_v1';
+const FS_DOC    = 'incidentpro';   // Firestore collection
+const FS_META   = 'meta';          // doc id for settings/users/plants/rules
+const FS_INC    = 'incidents';     // sub-collection id
+
+/* Default data — used only on first-ever run */
+const _DEFAULTS = {
   settings: {
     companyName: 'Polyplastics India',
-    logo: '',          // base64 logo
+    logo: '',
     emailDomain: '',
     reminderHours: 24,
     escalationEmail: '',
     smtpConfigured: false,
   },
   plants: [
-    { id:'P1', name:'Plant — Pune',     location:'Pune, Maharashtra',    adminId:'admin_p1' },
-    { id:'P2', name:'Plant — Surat',    location:'Surat, Gujarat',       adminId:'admin_p2' },
-    { id:'P3', name:'Plant — Chennai',  location:'Chennai, Tamil Nadu',  adminId:null },
+    { id:'P1', name:'Plant — Pune',    location:'Pune, Maharashtra',   adminId:'admin_p1' },
+    { id:'P2', name:'Plant — Surat',   location:'Surat, Gujarat',      adminId:'admin_p2' },
+    { id:'P3', name:'Plant — Chennai', location:'Chennai, Tamil Nadu', adminId:null },
   ],
   departments: ['Operations','Safety','Maintenance','Quality','HR','Engineering','Logistics','Management'],
   users: [
@@ -508,23 +543,209 @@ let DB = loadDB() || {
   ],
   incidents: [],
   escalationRules: [
-    { id:'ESC1', name:'Critical Auto-Escalate', trigger:'severity', value:'critical', delayHours:0, notifyEmails:'', enabled:true, description:'Immediately alert on critical severity' },
+    { id:'ESC1', name:'Critical Auto-Escalate', trigger:'severity', value:'critical', delayHours:0,  notifyEmails:'', enabled:true, description:'Immediately alert on critical severity' },
     { id:'ESC2', name:'Unresolved 24h',         trigger:'age',      value:'24',       delayHours:24, notifyEmails:'', enabled:true, description:'Escalate if not resolved within 24 hours' },
     { id:'ESC3', name:'Unresolved 72h',         trigger:'age',      value:'72',       delayHours:72, notifyEmails:'', enabled:true, description:'Escalate to senior management after 72h' },
   ],
   reminderRules: [
-    { id:'REM1', name:'Open Incident Reminder',    triggerHours:24, enabled:true, description:'Remind assignees of open incidents every 24h' },
-    { id:'REM2', name:'Investigating Reminder',    triggerHours:48, enabled:true, description:'Follow up on investigating incidents after 48h' },
+    { id:'REM1', name:'Open Incident Reminder', triggerHours:24, enabled:true, description:'Remind assignees of open incidents every 24h' },
+    { id:'REM2', name:'Investigating Reminder', triggerHours:48, enabled:true, description:'Follow up on investigating incidents after 48h' },
   ],
-  auditLog: [],
+  auditLog:      [],
+  notifications: [],
 };
 
-/* ensure defaults */
-if(!DB.settings.reminderHours) DB.settings.reminderHours=24;
-if(!DB.escalationRules) DB.escalationRules=[];
-if(!DB.reminderRules) DB.reminderRules=[];
-if(!DB.auditLog) DB.auditLog=[];
-if(!DB.notifications) DB.notifications=[];
+/* ── In-memory DB (always fresh) ── */
+function _loadLocalCache(){
+  try{ const s=localStorage.getItem(DB_KEY); if(s) return JSON.parse(s); }catch(e){}
+  return null;
+}
+function _saveLocalCache(){
+  try{
+    // Don't cache logo in localStorage if it's large — keep separately
+    const clone = {...DB, settings:{...DB.settings}};
+    if((clone.settings.logo||'').length > 50000) clone.settings.logo = DB.settings.logo; // keep as-is, localStorage can handle ~5MB
+    localStorage.setItem(DB_KEY, JSON.stringify(clone));
+  }catch(e){ console.warn('localStorage cache failed',e); }
+}
+
+let DB = _loadLocalCache() || JSON.parse(JSON.stringify(_DEFAULTS));
+
+/* ensure runtime fields exist */
+if(!DB.settings)          DB.settings       = _DEFAULTS.settings;
+if(!DB.settings.reminderHours) DB.settings.reminderHours = 24;
+if(!DB.escalationRules)   DB.escalationRules = _DEFAULTS.escalationRules;
+if(!DB.reminderRules)     DB.reminderRules   = _DEFAULTS.reminderRules;
+if(!DB.auditLog)          DB.auditLog        = [];
+if(!DB.notifications)     DB.notifications   = [];
+
+/* ── saveDB: write to Firestore + local cache ── */
+let _saveTimer = null;
+function saveDB(){
+  _saveLocalCache(); // immediate local save
+  if(!_fbReady||!_db) return;
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(_fsFlush, 800); // debounce 800ms to batch rapid saves
+}
+
+async function _fsFlush(){
+  if(!_fbReady||!_db) return;
+  try {
+    // Meta document: everything except incidents (they live in sub-collection)
+    const meta = {
+      settings:       DB.settings,
+      plants:         DB.plants,
+      departments:    DB.departments,
+      users:          DB.users,
+      escalationRules:DB.escalationRules,
+      reminderRules:  DB.reminderRules,
+      notifications:  (DB.notifications||[]).slice(0,100), // cap at 100
+      auditLog:       (DB.auditLog||[]).slice(0,200),      // cap at 200
+      _updated:       new Date().toISOString(),
+    };
+    await _db.collection(FS_DOC).doc(FS_META).set(meta, { merge:true });
+
+    // Incidents: each incident as its own Firestore document (scalable)
+    const batch = _db.batch();
+    (DB.incidents||[]).forEach(inc => {
+      const ref = _db.collection(FS_DOC).doc(FS_INC + '_' + inc.id);
+      batch.set(ref, { ...inc, _t:'incident' }, { merge:true });
+    });
+    await batch.commit();
+
+  } catch(e) {
+    console.warn('[IncidentPro] Firestore save error:', e);
+  }
+}
+
+/* ── loadFromFirestore: called once after login overlay shows ── */
+let _fsLoaded = false;
+async function loadFromFirestore(){
+  if(!_fbReady||!_db){ _onFSLoaded(); return; }
+  if(_fsLoaded){ _onFSLoaded(); return; }
+
+  showSyncBanner('Syncing data from cloud…');
+  try {
+    // Load meta
+    const metaDoc = await _db.collection(FS_DOC).doc(FS_META).get();
+    if(metaDoc.exists){
+      const m = metaDoc.data();
+      if(m.settings)       DB.settings        = m.settings;
+      if(m.plants)         DB.plants          = m.plants;
+      if(m.departments)    DB.departments     = m.departments;
+      if(m.users)          DB.users           = m.users;
+      if(m.escalationRules)DB.escalationRules = m.escalationRules;
+      if(m.reminderRules)  DB.reminderRules   = m.reminderRules;
+      if(m.notifications)  DB.notifications   = m.notifications;
+      if(m.auditLog)       DB.auditLog        = m.auditLog;
+    }
+
+    // Load incidents
+    const incSnap = await _db.collection(FS_DOC).where('_t','==','incident').get();
+    if(!incSnap.empty){
+      DB.incidents = incSnap.docs
+        .map(d=>{ const d2={...d.data()}; delete d2._t; return d2; })
+        .sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+    }
+
+    _saveLocalCache(); // refresh local cache from Firestore
+    _fsLoaded = true;
+    hideSyncBanner();
+    console.log(`[IncidentPro] Loaded from Firestore: ${DB.incidents.length} incidents, ${DB.users.length} users`);
+  } catch(e) {
+    console.warn('[IncidentPro] Firestore load error (using local cache):', e);
+    hideSyncBanner();
+  }
+  _onFSLoaded();
+}
+
+/* Real-time listener — updates DB when other users make changes */
+let _unsubscribe = null;
+function startRealtimeSync(){
+  if(!_fbReady||!_db||_unsubscribe) return;
+  _unsubscribe = _db.collection(FS_DOC).onSnapshot(snap=>{
+    let metaChanged=false, incChanged=false;
+    snap.docChanges().forEach(change=>{
+      const d = change.doc;
+      if(d.id===FS_META && change.type!=='removed'){
+        const m=d.data();
+        if(m.settings)        DB.settings        = m.settings;
+        if(m.plants)          DB.plants          = m.plants;
+        if(m.departments)     DB.departments     = m.departments;
+        if(m.users)           DB.users           = m.users;
+        if(m.escalationRules) DB.escalationRules = m.escalationRules;
+        if(m.reminderRules)   DB.reminderRules   = m.reminderRules;
+        if(m.notifications)   DB.notifications   = m.notifications;
+        if(m.auditLog)        DB.auditLog        = m.auditLog;
+        metaChanged=true;
+      } else if(d.id.startsWith(FS_INC+'_')){
+        const inc={...d.data()}; delete inc._t;
+        if(change.type==='removed'){
+          DB.incidents=DB.incidents.filter(x=>x.id!==inc.id);
+        } else {
+          const idx=DB.incidents.findIndex(x=>x.id===inc.id);
+          if(idx>=0) DB.incidents[idx]=inc; else DB.incidents.unshift(inc);
+        }
+        DB.incidents.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+        incChanged=true;
+      }
+    });
+    if(metaChanged||incChanged){
+      _saveLocalCache();
+      updateBellCount();
+      buildNav();
+      // Refresh current view silently
+      if(typeof _currentPage!=='undefined' && _currentPage && typeof navigate==='function'){
+        try{ const fn={dashboard:renderDashboard,incidents:renderIncidents,'my-plant':renderMyPlant,escalations:renderEscalations}; if(fn[_currentPage]) fn[_currentPage](); }catch(e){}
+      }
+    }
+  });
+}
+
+function stopRealtimeSync(){ if(_unsubscribe){ _unsubscribe(); _unsubscribe=null; } }
+
+/* Sync banner UI */
+function showSyncBanner(msg){
+  let b=document.getElementById('sync-banner');
+  if(!b){ b=document.createElement('div'); b.id='sync-banner';
+    b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99000;background:linear-gradient(90deg,#0369a1,#0284c7);color:#fff;font-size:12px;font-weight:500;padding:5px 16px;text-align:center;display:flex;align-items:center;justify-content:center;gap:8px;';
+    document.body.prepend(b);
+  }
+  b.innerHTML=`<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="animation:spin 1s linear infinite;flex-shrink:0"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg><span>${msg}</span>`;
+}
+function hideSyncBanner(){ const b=document.getElementById('sync-banner'); if(b) b.remove(); }
+
+/* Called after FS load completes — refreshes login UI */
+function _onFSLoaded(){
+  populateLoginPlants();
+  applyLoginLogo();
+}
+
+/* Delete incident from Firestore */
+async function _fsDeleteIncident(id){
+  if(!_fbReady||!_db) return;
+  try{ await _db.collection(FS_DOC).doc(FS_INC+'_'+id).delete(); }catch(e){ console.warn('FS delete error',e); }
+}
+
+/* Reset: clear Firestore + local cache */
+async function resetAll(){
+  if(!confirm('Delete ALL data from cloud and reset? This cannot be undone.')) return;
+  if(!_fbReady||!_db){ localStorage.removeItem(DB_KEY); location.reload(); return; }
+  showSyncBanner('Deleting all data…');
+  try{
+    const snap = await _db.collection(FS_DOC).get();
+    const batch = _db.batch();
+    snap.docs.forEach(d=>batch.delete(d.ref));
+    await batch.commit();
+  }catch(e){}
+  localStorage.removeItem(DB_KEY);
+  location.reload();
+}
+
+/* CSS for spin animation */
+const _spinStyle=document.createElement('style');
+_spinStyle.textContent='@keyframes spin{to{transform:rotate(360deg)}}';
+document.head.appendChild(_spinStyle);
 
 function uid(){ return Math.random().toString(36).slice(2,10).toUpperCase(); }
 function now(){ return new Date().toISOString(); }
@@ -575,12 +796,16 @@ function enterPublic(){
 }
 
 function doLogout(){
+  stopRealtimeSync();
+  _fsLoaded = false;
   currentUser = null;
   publicSession = null;
   document.getElementById('app').style.display='none';
   document.getElementById('public-overlay').style.display='none';
   document.getElementById('login-overlay').style.display='flex';
   document.getElementById('l-pass').value='';
+  // Reload from Firestore for next login
+  loadFromFirestore();
 }
 
 function showApp(){
@@ -591,6 +816,7 @@ function showApp(){
   updateTopbarUser();
   updateBellCount();
   navigate('dashboard');
+  startRealtimeSync(); // begin live sync after login
 }
 
 function switchLTab(tab){
@@ -1006,6 +1232,7 @@ function deleteIncident(id){
   const i = DB.incidents.find(x=>x.id===id);
   if(i) auditLog('Delete', `Incident ${i.incidentNo} deleted`);
   DB.incidents = DB.incidents.filter(x=>x.id!==id);
+  _fsDeleteIncident(id); // remove from Firestore
   saveDB(); closeModal(); showToast('Incident deleted.','ok');
   if(_page==='incidents') renderIncidents();
   else renderDashboard();
@@ -2692,8 +2919,12 @@ document.addEventListener('click', function(e){
 });
 
 /* ── INIT ── */
-// Add some demo incidents if empty
-if(DB.incidents.length===0){
+// Load from Firestore immediately on page load
+loadFromFirestore();
+
+// Add some demo incidents if empty (only if no data exists)
+if(DB.incidents.length===0 && !_fbReady){
+  // Only seed demo data when Firebase is unavailable (local dev without network)
   const demos=[
     {id:uid(),incidentNo:'INC-0001',title:'Chemical Spill in Mixing Area',plantId:'P1',type:'Chemical Spill',severity:'high',department:'Operations',reportedBy:'Rajesh Sharma',description:'During routine mixing operation, a 20L container of solvent tipped and spilled on the floor. Area evacuated immediately.',immediateAction:'Area cordoned off, spill kit deployed, ventilation increased.',rootCause:'Improper container placement on elevated shelf.',location:'Mixing Zone B',witnesses:'Suresh Kumar, Anil Patel',status:'investigating',createdAt:'2025-06-10T08:30:00Z',updatedAt:'2025-06-10T10:00:00Z',updates:[{id:uid(),ts:'2025-06-10T10:00:00Z',note:'Environmental team on site. Spill contained, floor being cleaned.',by:'Plant Safety Officer',statusChange:'investigating'}]},
     {id:uid(),incidentNo:'INC-0002',title:'Near Miss — Forklift and Pedestrian',plantId:'P2',type:'Near Miss',severity:'critical',department:'Logistics',reportedBy:'Priya Shah',description:'Forklift nearly struck a pedestrian at intersection of Aisle 5 and main corridor. No injury but very close call.',immediateAction:'Forklift operation halted. Incident investigation team assembled.',rootCause:'Blind spot at aisle intersection. No mirror installed.',location:'Warehouse Aisle 5',witnesses:'3 workers present',status:'open',createdAt:'2025-06-11T14:00:00Z',updatedAt:'2025-06-11T14:00:00Z',updates:[]},
