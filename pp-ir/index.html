@@ -674,7 +674,14 @@ async function loadFromFirestore(){
       if(m.settings)        DB.settings        = m.settings;
       if(m.plants)          DB.plants          = m.plants;
       if(m.departments)     DB.departments     = m.departments;
-      if(m.users)           DB.users           = m.users;
+      if(m.users){
+        // Deduplicate by id (self-heal if Firestore stored duplicates)
+        const _seen=new Set();
+        DB.users = m.users.filter(u=>{ if(_seen.has(u.id)) return false; _seen.add(u.id); return true; });
+        if(DB.users.length !== m.users.length){
+          console.warn('[IncidentPro] Removed '+(m.users.length-DB.users.length)+' duplicate user(s) — will self-heal on next save');
+        }
+      }
       if(m.escalationRules) DB.escalationRules = m.escalationRules;
       if(m.reminderRules)   DB.reminderRules   = m.reminderRules;
       if(m.notifications)   DB.notifications   = m.notifications;
@@ -715,7 +722,10 @@ function startRealtimeSync(){
         if(m.settings)        DB.settings        = m.settings;
         if(m.plants)          DB.plants          = m.plants;
         if(m.departments)     DB.departments     = m.departments;
-        if(m.users)           DB.users           = m.users;
+        if(m.users){
+          const _seen=new Set();
+          DB.users = m.users.filter(u=>{ if(_seen.has(u.id)) return false; _seen.add(u.id); return true; });
+        }
         if(m.escalationRules) DB.escalationRules = m.escalationRules;
         if(m.reminderRules)   DB.reminderRules   = m.reminderRules;
         if(m.notifications)   DB.notifications   = m.notifications;
@@ -761,20 +771,26 @@ function hideSyncBanner(){ const b=document.getElementById('sync-banner'); if(b)
 /* Guarantee the default superadmin always exists in DB.users */
 function _ensureSuperAdmin(){
   if(!DB.users) DB.users = [];
-  // For each default SA, add it if no DB user shares the same username.
-  // This keeps Firestore-modified SA accounts intact while always allowing
-  // the hardcoded default credentials as a recovery path.
-  _DEFAULTS.users.filter(u=>u.role==='super-admin').forEach(defSA=>{
-    const exists = DB.users.some(u=>u.username===defSA.username);
-    if(!exists){
-      DB.users = [defSA, ...DB.users];
-      console.log('[IncidentPro] Restored default super admin:', defSA.username);
-    }
-  });
+  const hasSA = DB.users.some(u=>u.role==='super-admin');
+  if(!hasSA){
+    // No SA in Firestore at all — restore defaults into DB.users
+    const defaults = _DEFAULTS.users.filter(u=>u.role==='super-admin');
+    DB.users = [...defaults, ...DB.users];
+    console.log('[IncidentPro] Restored default super admin accounts');
+  }
+  // Never add duplicates — doLoginSA handles fallback credentials in-memory
 }
 
 /* Called after FS load completes — refreshes login UI with fresh data */
 function _onFSLoaded(){
+  // Deduplicate DB.users by id one final time, then self-heal Firestore if needed
+  const _bc = DB.users.length;
+  const _seen = new Set();
+  DB.users = DB.users.filter(u=>{ if(_seen.has(u.id)) return false; _seen.add(u.id); return true; });
+  if(DB.users.length < _bc){
+    console.log('[IncidentPro] Deduped users: removed', _bc - DB.users.length, '— saving clean list to Firestore');
+    saveDB(); // push cleaned list back so duplicates are gone from Firestore too
+  }
   _ensureSuperAdmin();
   populateLoginPlants();
   applyLoginLogo();
