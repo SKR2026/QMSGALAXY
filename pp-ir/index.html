@@ -1019,11 +1019,13 @@ function showApp(){
   updateBellCount();
   navigate('dashboard');
   startRealtimeSync();
+  startAutoEngine(); // ← start escalation+reminder engine
 }
 
 /* ── Logout ── */
 function doLogout(){
   stopRealtimeSync();
+  stopAutoEngine(); // ← stop engine on logout
   _fsLoaded=false;
   currentUser=null; publicSession=null; managementSession=null;
   document.getElementById('app').style.display='none';
@@ -2419,15 +2421,268 @@ function hodSubmitInline(incidentId){
 /* ═══════════════════════════════════════════════════════
    ESCALATIONS
 ═══════════════════════════════════════════════════════ */
-function checkEscalation(incident){
-  const age = (Date.now()-new Date(incident.createdAt).getTime())/3600000;
-  DB.escalationRules.filter(r=>r.enabled).forEach(r=>{
-    if(r.trigger==='severity'&&incident.severity===r.value){
-      auditLog('Escalation Triggered',`Rule "${r.name}" fired for ${incident.incidentNo} (${incident.severity})`);
-      addNotification(incident, 'escalation', `⚡ Escalation: "${r.name}" triggered for ${incident.incidentNo}`);
-      if(r.notifyEmails) simulateSendEmail(r.notifyEmails,incident,'escalation');
+/* ═══════════════════════════════════════════════════════
+   AUTO-ESCALATION & REMINDER ENGINE
+   -------------------------------------------------------
+   • Runs every 60 seconds while anyone is logged in
+   • Evaluates all open incidents against:
+       - Escalation rules (severity trigger OR age trigger)
+       - Reminder rules (age threshold, repeating)
+   • Sends real Gmail emails via the Apps Script relay
+   • Tracks what was already notified in incident.notified[]
+     to avoid duplicate emails across sessions
+   • All activity logged to Audit Trail
+═══════════════════════════════════════════════════════ */
+
+let _autoEngineTimer = null;
+const AUTO_ENGINE_INTERVAL_MS = 60 * 1000; // check every 60 seconds
+
+function startAutoEngine(){
+  if(_autoEngineTimer) return; // already running
+  console.log('[AutoEngine] Started');
+  _autoEngineTimer = setInterval(runAutoEngine, AUTO_ENGINE_INTERVAL_MS);
+  // Also run once immediately after a short delay (let Firestore load first)
+  setTimeout(runAutoEngine, 3000);
+}
+
+function stopAutoEngine(){
+  if(_autoEngineTimer){ clearInterval(_autoEngineTimer); _autoEngineTimer=null; }
+  console.log('[AutoEngine] Stopped');
+}
+
+/* Main engine tick — called every 60 s */
+async function runAutoEngine(){
+  if(!DB.settings?.gmailWebAppUrl || !DB.settings?.gmailSecret){
+    return; // Gmail not configured — nothing to do
+  }
+  const now_ts = Date.now();
+  const openInc = DB.incidents.filter(i=>!['closed'].includes(i.status));
+  if(!openInc.length) return;
+
+  let anyChange = false;
+
+  for(const incident of openInc){
+    if(!incident.notified) incident.notified = {};
+    const ageH = (now_ts - new Date(incident.createdAt).getTime()) / 3600000;
+
+    // ── ESCALATION RULES ──
+    for(const rule of (DB.escalationRules||[]).filter(r=>r.enabled)){
+      const key = `esc_${rule.id}`;
+      if(incident.notified[key]) continue; // already sent for this rule
+
+      let triggered = false;
+      if(rule.trigger==='severity' && incident.severity===rule.value) triggered = true;
+      if(rule.trigger==='age'      && ageH >= Number(rule.value))     triggered = true;
+      if(!triggered) continue;
+
+      // Mark immediately to prevent duplicate sends
+      incident.notified[key] = new Date().toISOString();
+      anyChange = true;
+
+      console.log(`[AutoEngine] Escalation "${rule.name}" fired for ${incident.incidentNo}`);
+      addNotification(incident, 'escalation',
+        `⚡ Escalation: "${rule.name}" triggered for ${incident.incidentNo} (age ${Math.round(ageH)}h)`);
+      auditLog('Auto Escalation',
+        `Rule "${rule.name}" fired for ${incident.incidentNo} — age ${Math.round(ageH)}h, severity ${incident.severity}`);
+
+      await sendEscalationEmail(incident, rule, Math.round(ageH));
     }
+
+    // ── REMINDER RULES ──
+    for(const rule of (DB.reminderRules||[]).filter(r=>r.enabled)){
+      if(ageH < rule.triggerHours) continue; // not old enough yet
+
+      // Reminders repeat: track how many reminder cycles have been sent
+      const cyclesDue   = Math.floor(ageH / rule.triggerHours);
+      const key         = `rem_${rule.id}`;
+      const cyclesSent  = incident.notified[key] || 0;
+      if(cyclesDue <= cyclesSent) continue; // already reminded for this cycle
+
+      incident.notified[key] = cyclesDue;
+      anyChange = true;
+
+      console.log(`[AutoEngine] Reminder "${rule.name}" cycle ${cyclesDue} for ${incident.incidentNo}`);
+      addNotification(incident, 'escalation',
+        `🔔 Reminder: ${incident.incidentNo} still ${incident.status} after ${Math.round(ageH)}h`);
+      auditLog('Auto Reminder',
+        `Rule "${rule.name}" (cycle ${cyclesDue}) for ${incident.incidentNo} — age ${Math.round(ageH)}h`);
+
+      await sendReminderEmail(incident, rule, Math.round(ageH));
+    }
+  }
+
+  if(anyChange){
+    DB.settings._lastAutoRun = new Date().toISOString();
+    saveDB();
+    buildNav(); updateBellCount();
+  } else {
+    // Still update lastChecked even if no emails sent
+    DB.settings._lastAutoRun = new Date().toISOString();
+    // lightweight — don't saveDB every tick just for timestamp
+  }
+
+  // Update status indicator if visible
+  _updateAutoEngineStatus();
+}
+
+/* ── Build recipient list for escalation/reminder emails ── */
+function getEscRecipients(incident){
+  const { superAdmins, admins, safetyOfficers, plantHeads } = getPlantRoleUsers(incident.plantId);
+  const recipients = [];
+
+  // Plant Heads → magic link
+  plantHeads.forEach(ph=>{
+    const tok = generateToken(incident.id, ph.id, ph.name, ph.email, 'plant-head-view');
+    recipients.push({ name:ph.name, email:ph.email, action:'escalation-alert', tokenUrl:getTokenURL(tok) });
   });
+
+  // SO, Admin, SA → direct (they login)
+  [...safetyOfficers, ...admins, ...superAdmins].forEach(u=>{
+    recipients.push({ name:u.name, email:u.email, action:'escalation-alert', tokenUrl:null });
+  });
+
+  return recipients;
+}
+
+/* ── Send escalation email ── */
+async function sendEscalationEmail(incident, rule, ageH){
+  const recipients = getEscRecipients(incident);
+  if(!recipients.length) return;
+
+  const plant   = DB.plants.find(p=>p.id===incident.plantId);
+  const company = DB.settings.companyName||'Your Company';
+  const sevColors = {critical:'#7c3aed',high:'#c0291a',medium:'#c07a10',low:'#1a5ab3'};
+  const sevColor  = sevColors[incident.severity]||'#888';
+  const subject   = `[IncidentPro] ⚡ ESCALATION — ${incident.incidentNo} (${(incident.severity||'').toUpperCase()}) ${rule.trigger==='age'?`Open ${ageH}h`:''} — ${incident.title}`;
+
+  saveDB(); // save tokens before sending
+
+  await Promise.all(recipients.map(r=>{
+    const actionLink = r.tokenUrl || window.location.href;
+    const htmlBody = `
+      <div style="font-family:Inter,sans-serif;max-width:600px;margin:0 auto">
+        <div style="background:#0d1f33;padding:20px 24px;border-bottom:3px solid #d64a1a">
+          <h2 style="color:#fff;margin:0;font-size:18px">⚡ Escalation Alert — ${xe(incident.incidentNo)}</h2>
+          <p style="color:#90c0e0;margin:4px 0 0;font-size:12px">${xe(company)} · IncidentPro Auto-Escalation</p>
+        </div>
+        <div style="background:#fff;padding:24px">
+          <p style="margin:0 0 8px">Dear <strong>${xe(r.name)}</strong>,</p>
+          <p style="color:#555;margin:0 0 16px">The escalation rule <strong>"${xe(rule.name)}"</strong> has been triggered for the following incident:</p>
+          <div style="background:#f5f7fa;border-radius:8px;padding:16px;margin-bottom:16px;border-left:4px solid ${sevColor}">
+            <div style="font-size:13px;font-weight:700;color:#0d1f33;margin-bottom:2px">${xe(incident.incidentNo)} — ${xe(incident.title)}</div>
+            <div style="font-size:12px;color:#555;margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:4px">
+              <span><strong>Plant:</strong> ${xe(plant?.name||'—')}</span>
+              <span><strong>Status:</strong> ${xe(incident.status)}</span>
+              <span><strong>Severity:</strong> <span style="color:${sevColor};font-weight:700">${(incident.severity||'').toUpperCase()}</span></span>
+              <span><strong>Age:</strong> <span style="color:#c0291a;font-weight:700">${ageH} hours</span></span>
+              <span><strong>Dept:</strong> ${xe(incident.department||'—')}</span>
+              <span><strong>Reported by:</strong> ${xe(incident.reportedBy||'—')}</span>
+            </div>
+          </div>
+          <div style="background:#fef3d0;border:1px solid #c07a10;border-radius:6px;padding:10px 14px;margin-bottom:20px;font-size:12px;color:#7a4a00">
+            <strong>Rule triggered:</strong> ${xe(rule.description||rule.name)}<br>
+            ${rule.trigger==='age'?`Incident has been open for <strong>${ageH} hours</strong> (threshold: ${rule.value}h).`:`Severity is <strong>${xe(rule.value)}</strong>.`}
+          </div>
+          <a href="${xe(actionLink)}" style="display:inline-block;background:#d64a1a;color:#fff;padding:12px 28px;border-radius:8px;font-size:14px;font-weight:600;text-decoration:none">
+            ⚡ View &amp; Act on Incident →
+          </a>
+          <p style="font-size:11px;color:#999;margin-top:20px;padding-top:12px;border-top:1px solid #eee">
+            ${xe(company)} · IncidentPro Auto-Escalation · ${new Date().toLocaleString('en-IN')}
+          </p>
+        </div>
+      </div>`;
+    return sendGmailViaAppsScript(r.email, r.name, subject, htmlBody);
+  }));
+}
+
+/* ── Send reminder email ── */
+async function sendReminderEmail(incident, rule, ageH){
+  const recipients = getEscRecipients(incident);
+  if(!recipients.length) return;
+
+  const plant   = DB.plants.find(p=>p.id===incident.plantId);
+  const company = DB.settings.companyName||'Your Company';
+  const sevColors = {critical:'#7c3aed',high:'#c0291a',medium:'#c07a10',low:'#1a5ab3'};
+  const sevColor  = sevColors[incident.severity]||'#888';
+  const subject   = `[IncidentPro] 🔔 Reminder — ${incident.incidentNo} still ${incident.status} after ${ageH}h — ${incident.title}`;
+
+  // HOD reminder if assigned but hasn't submitted
+  const hodUser = incident.assignedHOD && !incident.hodSubmittedAt
+    ? DB.users.find(u=>u.id===incident.assignedHOD) : null;
+
+  saveDB();
+
+  const allToSend = [...recipients];
+
+  // Add HOD to reminder list with their magic link
+  if(hodUser){
+    const tok = generateToken(incident.id, hodUser.id, hodUser.name, hodUser.email, 'hod-response');
+    allToSend.push({ name:hodUser.name, email:hodUser.email, action:'hod-reminder', tokenUrl:getTokenURL(tok) });
+  }
+
+  await Promise.all(allToSend.map(r=>{
+    const actionLink = r.tokenUrl || window.location.href;
+    const isHOD = r.action==='hod-reminder';
+    const htmlBody = `
+      <div style="font-family:Inter,sans-serif;max-width:600px;margin:0 auto">
+        <div style="background:#0d1f33;padding:20px 24px;border-bottom:3px solid #c07a10">
+          <h2 style="color:#fff;margin:0;font-size:18px">🔔 Reminder — ${xe(incident.incidentNo)}</h2>
+          <p style="color:#90c0e0;margin:4px 0 0;font-size:12px">${xe(company)} · IncidentPro Auto-Reminder</p>
+        </div>
+        <div style="background:#fff;padding:24px">
+          <p style="margin:0 0 8px">Dear <strong>${xe(r.name)}</strong>,</p>
+          ${isHOD
+            ? `<p style="color:#555;margin:0 0 16px">This is a reminder that you have a <strong>pending analysis</strong> for the incident below. Please submit your Root Cause and Action Plan at your earliest convenience.</p>`
+            : `<p style="color:#555;margin:0 0 16px">This is an automated reminder. The following incident remains <strong>${xe(incident.status)}</strong> after <strong>${ageH} hours</strong>.</p>`
+          }
+          <div style="background:#f5f7fa;border-radius:8px;padding:16px;margin-bottom:16px;border-left:4px solid ${sevColor}">
+            <div style="font-size:13px;font-weight:700;color:#0d1f33;margin-bottom:2px">${xe(incident.incidentNo)} — ${xe(incident.title)}</div>
+            <div style="font-size:12px;color:#555;margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:4px">
+              <span><strong>Plant:</strong> ${xe(plant?.name||'—')}</span>
+              <span><strong>Status:</strong> <span style="color:#c0291a;font-weight:700">${xe(incident.status)}</span></span>
+              <span><strong>Severity:</strong> <span style="color:${sevColor};font-weight:700">${(incident.severity||'').toUpperCase()}</span></span>
+              <span><strong>Open for:</strong> <span style="color:#c0291a;font-weight:700">${ageH}h</span></span>
+              ${incident.assignedHOD?`<span><strong>HOD:</strong> ${xe(hodUser?.name||'Assigned')}</span>`:''}
+              ${incident.hodSubmittedAt?`<span style="color:#1a7a4a"><strong>HOD submitted ✓</strong></span>`:''}
+            </div>
+          </div>
+          <a href="${xe(actionLink)}" style="display:inline-block;background:${isHOD?'#d64a1a':'#c07a10'};color:#fff;padding:12px 28px;border-radius:8px;font-size:14px;font-weight:600;text-decoration:none">
+            ${isHOD ? '📋 Submit Root Cause & Action Plan →' : '🔔 View Incident →'}
+          </a>
+          <p style="font-size:11px;color:#999;margin-top:20px;padding-top:12px;border-top:1px solid #eee">
+            ${xe(company)} · IncidentPro Auto-Reminder (${xe(rule.name)}) · ${new Date().toLocaleString('en-IN')}
+          </p>
+        </div>
+      </div>`;
+    return sendGmailViaAppsScript(r.email, r.name, subject, htmlBody);
+  }));
+}
+
+/* ── on-demand: check one incident right now (called at create/update) ── */
+async function checkEscalation(incident){
+  if(!incident.notified) incident.notified = {};
+  const ageH = (Date.now()-new Date(incident.createdAt).getTime())/3600000;
+  for(const rule of (DB.escalationRules||[]).filter(r=>r.enabled && r.trigger==='severity')){
+    const key = `esc_${rule.id}`;
+    if(incident.notified[key]) continue;
+    if(incident.severity !== rule.value) continue;
+    incident.notified[key] = new Date().toISOString();
+    addNotification(incident,'escalation',`⚡ Escalation: "${rule.name}" for ${incident.incidentNo}`);
+    auditLog('Escalation Triggered',`Rule "${rule.name}" fired for ${incident.incidentNo}`);
+    await sendEscalationEmail(incident, rule, Math.round(ageH));
+  }
+}
+
+/* ── Status indicator (shown in Escalation Tracker page header) ── */
+function _updateAutoEngineStatus(){
+  const el = document.getElementById('auto-engine-status');
+  if(!el) return;
+  const running = !!_autoEngineTimer;
+  const last    = DB.settings._lastAutoRun;
+  const gmailOk = !!(DB.settings?.gmailWebAppUrl && DB.settings?.gmailSecret);
+  el.innerHTML = running && gmailOk
+    ? `<span style="color:var(--ok)">● Auto-engine running</span> · Last checked: ${last?fmtDate(last):'never'}`
+    : `<span style="color:var(--wn)">● ${!gmailOk?'Gmail not connected — ':''}${!running?'Engine paused':'Engine running'}</span>`;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -3103,36 +3358,7 @@ function getEscalatedIncidents(){
   });
 }
 
-function renderEscalations(){
-  const esc = getEscalatedIncidents();
-  document.getElementById('content').innerHTML=`
-  <div class="alert alert-warn"><svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 00-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 01-1.1 0L7.1 5.995A.905.905 0 018 5zm.002 6a1 1 0 110 2 1 1 0 010-2z"/></svg>
-    ${esc.length} incident${esc.length!==1?'s':''} currently meeting escalation criteria.</div>
-
-  <div class="card">
-    <div class="card-hd"><div class="card-title">Escalated Incidents</div></div>
-    ${esc.length===0?`<div class="empty"><p>No escalations</p><small>All incidents are within thresholds</small></div>`:`
-    <div class="tw"><table>
-      <thead><tr><th>Incident</th><th>Title</th><th>Plant</th><th>Severity</th><th>Status</th><th>Age</th><th>Reason</th><th></th></tr></thead>
-      <tbody>
-      ${esc.map(i=>{
-        const ageH=Math.round((Date.now()-new Date(i.createdAt).getTime())/3600000);
-        const reason = i.severity==='critical'?'Critical severity':`Open ${ageH}h (threshold exceeded)`;
-        return `<tr>
-          <td style="font-family:var(--mo);font-size:11px">${xe(i.incidentNo)}</td>
-          <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${xe(i.title)}</td>
-          <td style="font-size:12px">${xe(plantName(i.plantId))}</td>
-          <td>${sevBdg(i.severity)}</td>
-          <td>${stsBdg(i.status)}</td>
-          <td style="font-size:12px;color:var(--er);font-weight:600">${ageH}h</td>
-          <td style="font-size:11px;color:var(--t3)">${xe(reason)}</td>
-          <td><button class="btn bs bp" onclick="openIncident('${i.id}')">Act</button></td>
-        </tr>`;
-      }).join('')}
-      </tbody>
-    </table></div>`}
-  </div>`;
-}
+/* renderEscalations — defined below near ESC_LEVELS */
 
 /* ═══════════════════════════════════════════════════════
    ESCALATION RULES
@@ -3289,14 +3515,17 @@ function renderReminderRules(){
     <div class="card">
       <div class="card-hd"><div class="card-title">ℹ How Reminders Work</div></div>
       <p style="font-size:13px;color:var(--t2);line-height:1.8">
-        Reminder rules monitor open and investigating incidents. When an incident exceeds the configured time threshold without being resolved, a reminder notification is triggered.
+        Reminder rules are evaluated <strong>automatically every 60 seconds</strong> while an admin is logged in. When an open incident exceeds the configured threshold without being resolved, a real Gmail email is sent to the Safety Officer, Plant Admin, and SuperAdmin.
       </p>
       <ul style="font-size:13px;color:var(--t2);line-height:2;padding-left:18px;margin-top:10px">
-        <li>Rules are evaluated automatically</li>
-        <li>Notifications appear in the bell tray</li>
-        <li>Email alerts go to the configured channel</li>
+        <li>Reminders repeat on every threshold cycle (e.g. every 24h)</li>
+        <li>If the HOD hasn't submitted analysis, they also get a reminder</li>
+        <li>Notifications also appear in the bell tray</li>
+        <li>Gmail must be connected in Settings for emails to send</li>
         <li>Toggle rules on/off without deleting them</li>
       </ul>
+      <div class="sep"></div>
+      <div style="font-size:12px;color:var(--t3)">Gmail status: <strong style="color:${DB.settings?.gmailWebAppUrl?'var(--ok)':'var(--er)'}">${DB.settings?.gmailWebAppUrl?'✅ Connected':'❌ Not connected — go to Settings'}</strong></div>
     </div>
   </div>`;
 }
@@ -5089,8 +5318,32 @@ function renderEscalations(){
   }).filter(g=>g.items.length>0);
 
   const total = byLevel.reduce((s,g)=>s+g.items.length,0);
+  const gmailOk = !!(DB.settings?.gmailWebAppUrl && DB.settings?.gmailSecret);
+  const last    = DB.settings._lastAutoRun;
 
   let html = `
+  <!-- Auto-engine status bar -->
+  <div style="background:var(--sf);border:1px solid var(--br);border-radius:var(--r);padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;flex-wrap:wrap;gap:12px">
+    <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:0">
+      <div style="width:10px;height:10px;border-radius:50%;background:${gmailOk?'var(--ok)':'var(--wn)'};flex-shrink:0"></div>
+      <div>
+        <div style="font-size:13px;font-weight:600">${gmailOk?'Auto-Engine Active':'Auto-Engine — Gmail Not Connected'}</div>
+        <div id="auto-engine-status" style="font-size:11px;color:var(--t3)">
+          ${gmailOk
+            ? `Checks every 60s · Last run: ${last?fmtDate(last):'not yet run this session'}`
+            : 'Connect Gmail in <a href="#" onclick="navigate(\'settings\')" style="color:var(--in)">Settings</a> to enable automatic emails'}
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-shrink:0">
+      ${gmailOk?`<button class="btn bs bok" onclick="runAutoEngine().then(()=>renderEscalations())">▶ Run Now</button>`:''}
+      <button class="btn bs" onclick="exportEscalationReport()">
+        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3M3 17V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+        Export Report
+      </button>
+    </div>
+  </div>
+
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
     <div>
       <div class="alert alert-warn" style="margin:0">
@@ -5098,10 +5351,6 @@ function renderEscalations(){
         ${total} incident${total!==1?'s':''} require attention across ${byLevel.length} escalation level${byLevel.length!==1?'s':''}.
       </div>
     </div>
-    <button class="btn bs" onclick="exportEscalationReport()">
-      <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3M3 17V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
-      Export Escalation Report
-    </button>
   </div>
 
   <!-- Escalation Level Summary Cards -->
@@ -5153,15 +5402,72 @@ function renderEscalations(){
   document.getElementById('content').innerHTML = html;
 }
 
-function sendLevelIntimation(level){
+async function sendLevelIntimation(level){
   const lvDef = ESC_LEVELS[level-1];
   const items = visibleIncidents().filter(i=>getIncidentEscLevel(i)?.level===level);
-  const emails = DB.settings.escalationEmail||'(not configured)';
-  const msg = `Intimation email (simulated) sent to: ${emails}\n\n${lvDef.icon} ${lvDef.label}\n${items.length} incident(s):\n`
-    + items.map(i=>`• ${i.incidentNo} — ${i.title} (${plantName(i.plantId)}, ${i.severity})`).join('\n');
-  auditLog('Intimation Sent', `Level ${level} escalation intimation for ${items.length} incident(s) to ${emails}`);
-  alert(msg);
-  showToast(`L${level} intimation logged for ${items.length} incident(s)`, 'ok');
+  if(!items.length){ showToast('No incidents at this level.','warn'); return; }
+
+  if(!DB.settings?.gmailWebAppUrl || !DB.settings?.gmailSecret){
+    showToast('Gmail not connected — go to Settings to configure.','warn');
+    return;
+  }
+
+  showToast(`Sending ${lvDef.label} intimation to ${items.length} incident(s)…`,'info');
+
+  const company = DB.settings.companyName||'Your Company';
+  const subject = `[IncidentPro] ${lvDef.icon} ${lvDef.label} — ${items.length} open incident${items.length!==1?'s':''} require attention`;
+
+  // Build one digest email per role-group per plant
+  const { superAdmins, admins: _a } = getPlantRoleUsers('all_plants');
+  const allAdmins = DB.users.filter(u=>['super-admin','admin','safety-officer'].includes(u.role));
+  const uniqueRecipients = [...new Map(allAdmins.map(u=>[u.id,u])).values()];
+
+  const tableRows = items.map(i=>{
+    const ageH = Math.round((Date.now()-new Date(i.createdAt).getTime())/3600000);
+    const overdueH = ageH-(level===1?24:level===2?48:72);
+    return `<tr style="border-bottom:1px solid #eee">
+      <td style="padding:6px 8px;font-family:monospace;font-size:12px;color:#d64a1a">${xe(i.incidentNo)}</td>
+      <td style="padding:6px 8px;font-size:12px">${xe(i.title.slice(0,40))}</td>
+      <td style="padding:6px 8px;font-size:12px">${xe(plantName(i.plantId))}</td>
+      <td style="padding:6px 8px;font-size:12px;font-weight:700;color:#c0291a">${ageH}h (+${overdueH}h)</td>
+      <td style="padding:6px 8px;font-size:12px">${xe(i.severity)}</td>
+    </tr>`;
+  }).join('');
+
+  await Promise.all(uniqueRecipients.map(u=>{
+    if(!u.email) return Promise.resolve();
+    const htmlBody=`
+      <div style="font-family:Inter,sans-serif;max-width:640px;margin:0 auto">
+        <div style="background:#0d1f33;padding:18px 22px;border-bottom:3px solid ${lvDef.color}">
+          <h2 style="color:#fff;margin:0;font-size:17px">${lvDef.icon} ${lvDef.label} Intimation</h2>
+          <p style="color:#90c0e0;margin:4px 0 0;font-size:11px">${xe(company)} · IncidentPro Manual Intimation</p>
+        </div>
+        <div style="background:#fff;padding:22px">
+          <p>Dear <strong>${xe(u.name)}</strong>,</p>
+          <p style="color:#555;margin:8px 0 16px">The following <strong>${items.length}</strong> incident${items.length!==1?'s':''} require your attention — they are overdue by more than ${level===1?24:level===2?48:72} hours:</p>
+          <table style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead><tr style="background:#0d1f33;color:#fff">
+              <th style="padding:7px 8px;text-align:left">Incident</th>
+              <th style="padding:7px 8px;text-align:left">Title</th>
+              <th style="padding:7px 8px;text-align:left">Plant</th>
+              <th style="padding:7px 8px;text-align:left">Age (overdue)</th>
+              <th style="padding:7px 8px;text-align:left">Severity</th>
+            </tr></thead>
+            <tbody>${tableRows}</tbody>
+          </table>
+          <a href="${window.location.href}" style="display:inline-block;background:${lvDef.color};color:#fff;padding:11px 24px;border-radius:7px;font-size:13px;font-weight:600;text-decoration:none;margin-top:18px">
+            Open IncidentPro →
+          </a>
+          <p style="font-size:11px;color:#999;margin-top:18px;padding-top:12px;border-top:1px solid #eee">
+            ${xe(company)} · IncidentPro · ${new Date().toLocaleString('en-IN')}
+          </p>
+        </div>
+      </div>`;
+    return sendGmailViaAppsScript(u.email, u.name, subject, htmlBody);
+  }));
+
+  auditLog('Level Intimation Sent',`${lvDef.label} intimation for ${items.length} incidents → ${uniqueRecipients.length} recipients`);
+  showToast(`✅ ${lvDef.label} intimation sent to ${uniqueRecipients.length} recipients`,'ok');
 }
 
 function exportEscalationReport(){
