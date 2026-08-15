@@ -628,6 +628,13 @@ const _DEFAULTS = {
     gmailWebAppUrl: '',
     gmailSecret: '',
     emailEnabled: false,
+    // Cloud Scheduler / Cloud Function settings
+    cloudFnUrl: '',
+    cloudFnSecret: '',
+    cloudSchedulerEnabled: false,
+    incidentReminderTime: '09:00',   // IST — daily open-incident digest
+    incidentEscalationTime: '08:00', // IST — escalation summary
+    incidentSchedulerJobName: '',    // GCP Cloud Scheduler job name
   },
   plants: [
     { id:'P1', name:'Plant — Pune',    location:'Pune, Maharashtra',   adminId:'admin_p1', safetyOfficerId:'so_p1', plantHeadId:'ph_p1' },
@@ -2437,6 +2444,34 @@ function hodSubmitInline(incidentId){
 let _autoEngineTimer = null;
 const AUTO_ENGINE_INTERVAL_MS = 60 * 1000; // check every 60 seconds
 
+/* ── Cloud Function trigger — sends type:'all' to the incident Cloud Run service ── */
+async function triggerIncidentCloudReminder(type='all', force=false){
+  const cfg = DB.settings;
+  if(!cfg.cloudFnUrl || !cfg.cloudFnSecret) return { ok:false, reason:'not-configured' };
+  try{
+    const res = await fetch(cfg.cloudFnUrl.replace(/\/$/, '') + '/', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-internal-secret':cfg.cloudFnSecret},
+      body: JSON.stringify({ type, force }),
+    });
+    const data = await res.json().catch(()=>({}));
+    console.log(`[CloudFn] trigger ${type}:`, data);
+    return data;
+  }catch(e){
+    console.warn('[CloudFn] trigger error:', e.message);
+    return { ok:false, reason:'fetch-error', detail:e.message };
+  }
+}
+
+/* ── IST time check for browser scheduler ── */
+function _istNowMins(){
+  const now = new Date(Date.now() + 5.5*60*60*1000);
+  return now.getUTCHours()*60 + now.getUTCMinutes();
+}
+function _istDateKey(){
+  return new Date(Date.now() + 5.5*60*60*1000).toISOString().slice(0,10);
+}
+
 function startAutoEngine(){
   if(_autoEngineTimer) return; // already running
   console.log('[AutoEngine] Started');
@@ -2452,8 +2487,37 @@ function stopAutoEngine(){
 
 /* Main engine tick — called every 60 s */
 async function runAutoEngine(){
-  if(!DB.settings?.gmailWebAppUrl || !DB.settings?.gmailSecret){
-    return; // Gmail not configured — nothing to do
+  const cfg = DB.settings || {};
+
+  // ── PRIMARY: Cloud Scheduler path ──────────────────────────────────────────
+  // If Cloud Function is configured, check if it's time to trigger it.
+  // The Cloud Scheduler job fires at the set times independently, but this
+  // browser-side check acts as a backup trigger when the tab is open.
+  if(cfg.cloudSchedulerEnabled && cfg.cloudFnUrl && cfg.cloudFnSecret){
+    const nowMins   = _istNowMins();
+    const todayKey  = _istDateKey();
+    const lastKey   = '_cloudTriggeredDate';
+
+    const remMins = (t => { const [h,m]=t.split(':').map(Number); return h*60+m; })(cfg.incidentReminderTime||'09:00');
+    const escMins = (t => { const [h,m]=t.split(':').map(Number); return h*60+m; })(cfg.incidentEscalationTime||'08:00');
+
+    const inRemWindow = nowMins >= remMins && nowMins <= remMins + 59;
+    const inEscWindow = nowMins >= escMins && nowMins <= escMins + 59;
+    const lastTriggered = localStorage.getItem(lastKey) || '';
+
+    if((inRemWindow || inEscWindow) && lastTriggered !== todayKey){
+      localStorage.setItem(lastKey, todayKey);
+      console.log('[AutoEngine] Browser backup trigger → Cloud Function');
+      await triggerIncidentCloudReminder('all', false);
+    }
+    // Don't fall through to browser engine — cloud handles email sending
+    _updateAutoEngineStatus();
+    return;
+  }
+
+  // ── FALLBACK: Browser-side engine (Gmail Apps Script) ──────────────────────
+  if(!cfg.gmailWebAppUrl || !cfg.gmailSecret){
+    return; // Neither cloud nor Gmail configured — nothing to do
   }
   const now_ts = Date.now();
   const openInc = DB.incidents.filter(i=>!['closed'].includes(i.status));
@@ -4134,6 +4198,59 @@ function renderSettings(){
         <button class="btn bp bs" onclick="saveNotifSettings()">Save</button>
       </div>
 
+      <!-- CLOUD SCHEDULER CARD -->
+      <div class="card" style="border-left:3px solid ${s.cloudSchedulerEnabled?'var(--ok)':'var(--wn)'}">
+        <div class="card-hd">
+          <div class="card-title">☁️ Cloud Scheduler (Auto Reminders)</div>
+          <span class="bdg ${s.cloudSchedulerEnabled?'b-ok':'b-medium'}">${s.cloudSchedulerEnabled?'✅ Enabled':'⚠ Not Set'}</span>
+        </div>
+        <div class="alert ${s.cloudSchedulerEnabled?'alert-ok':'alert-warn'}" style="margin-bottom:14px;font-size:12px">
+          ${s.cloudSchedulerEnabled
+            ? 'Cloud Scheduler active — reminders &amp; escalations fire automatically even when the app is closed.'
+            : 'Without Cloud Scheduler, reminders only fire while this browser tab is open. Configure below to enable server-side scheduling.'}
+        </div>
+
+        <div class="fg"><label>Cloud Function URL</label>
+          <input id="s-cf-url" value="${xe(s.cloudFnUrl||'')}" placeholder="https://incident-email-now-xxx.run.app">
+          <small style="color:var(--t3)">Your Cloud Run service URL (deploy incident_index.js)</small>
+        </div>
+        <div class="fg"><label>Internal Secret</label>
+          <input id="s-cf-secret" type="password" value="${xe(s.cloudFnSecret||'')}" placeholder="Must match INCIDENT_SECRET env var on Cloud Run">
+        </div>
+
+        <div style="font-size:12px;font-weight:600;color:var(--t2);margin:12px 0 6px">📅 Send Times (IST)</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+          <div class="fg"><label>🔔 Daily Reminder Digest</label>
+            <input type="time" id="s-cf-remtime" value="${xe(s.incidentReminderTime||'09:00')}">
+            <small style="color:var(--t3)">Open incident summary — sent daily</small>
+          </div>
+          <div class="fg"><label>⚡ Escalation Summary</label>
+            <input type="time" id="s-cf-esctime" value="${xe(s.incidentEscalationTime||'08:00')}">
+            <small style="color:var(--t3)">Unresolved escalations — sent daily</small>
+          </div>
+        </div>
+
+        <div class="fg"><label>GCP Scheduler Job Name <small style="color:var(--t3)">(optional — enables live cron update)</small></label>
+          <input id="s-cf-jobname" value="${xe(s.incidentSchedulerJobName||'')}" placeholder="incident-email-daily">
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px">
+          <button class="btn bp" onclick="saveCloudSchedulerSettings()">💾 Save &amp; Update Schedule</button>
+          ${s.cloudSchedulerEnabled?`<button class="btn bok bs" onclick="testCloudFunction()">🧪 Send Test</button>`:''}
+        </div>
+        <div id="cf-sched-msg" style="margin-top:8px;font-size:12px;color:var(--t2)"></div>
+
+        <details style="margin-top:14px">
+          <summary style="font-size:12px;color:var(--t3);cursor:pointer">📖 Setup Instructions</summary>
+          <ol style="font-size:12px;color:var(--t2);padding-left:16px;line-height:2;margin-top:8px">
+            <li>Deploy <code>incident_index.js</code> as Cloud Run service <strong>incident-email-now</strong> in project <strong>skr-mom</strong></li>
+            <li>Set env vars: <code>INCIDENT_SECRET</code>, <code>GOOGLE_CLOUD_PROJECT=skr-mom</code>, <code>INCIDENT_SCHEDULER_JOB_NAME=incident-email-daily</code>, <code>INCIDENT_SCHEDULER_LOCATION=asia-south1</code></li>
+            <li>In GCP Cloud Scheduler, create job → URL = Cloud Run URL, body = <code>{"type":"all"}</code>, auth header = <code>x-internal-secret: your-secret</code></li>
+            <li>Enter URL + secret above, set send times, click <strong>Save &amp; Update Schedule</strong></li>
+          </ol>
+        </details>
+      </div>
+
     </div>
   </div>`;
 }
@@ -4148,6 +4265,66 @@ function saveNotifSettings(){
   DB.settings.escalationEmail = document.getElementById('s-esc-email').value.trim();
   DB.settings.reminderHours   = parseInt(document.getElementById('s-rem-hrs').value)||24;
   saveDB(); showToast('Notification settings saved.','ok');
+}
+
+async function saveCloudSchedulerSettings(){
+  const url        = (document.getElementById('s-cf-url')?.value     || '').trim();
+  const secret     = (document.getElementById('s-cf-secret')?.value  || '').trim();
+  const remTime    = document.getElementById('s-cf-remtime')?.value  || '09:00';
+  const escTime    = document.getElementById('s-cf-esctime')?.value  || '08:00';
+  const jobName    = (document.getElementById('s-cf-jobname')?.value || '').trim();
+  const msgEl      = document.getElementById('cf-sched-msg');
+
+  if(!url || !secret){ showToast('Enter Cloud Function URL and secret first.','warn'); return; }
+
+  DB.settings.cloudFnUrl               = url;
+  DB.settings.cloudFnSecret            = secret;
+  DB.settings.incidentReminderTime     = remTime;
+  DB.settings.incidentEscalationTime   = escTime;
+  DB.settings.incidentSchedulerJobName = jobName;
+  DB.settings.cloudSchedulerEnabled    = true;
+  saveDB();
+
+  if(msgEl) msgEl.textContent = '⏳ Saving and updating schedule…';
+
+  try {
+    const endpoint = url.replace(/\/$/, '') + '/api/incident-update-schedule';
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-internal-secret': secret },
+      body: JSON.stringify({ reminderTime: remTime, escalationTime: escTime, jobName }),
+    });
+    const data = await res.json().catch(()=>({}));
+    if(!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+    if(data.schedulerUpdated){
+      if(msgEl) msgEl.innerHTML = `<span style="color:var(--ok)">✅ Cloud Scheduler updated — cron: ${data.cron} (Asia/Kolkata)</span>`;
+      showToast('Schedule updated!','ok');
+    } else {
+      if(msgEl) msgEl.innerHTML = `<span style="color:var(--wn)">✅ Settings saved to Firestore. ${data.note||'Set INCIDENT_SCHEDULER_JOB_NAME env var to enable live cron updates.'}</span>`;
+      showToast('Settings saved.','ok');
+    }
+  } catch(e){
+    if(msgEl) msgEl.innerHTML = `<span style="color:var(--er)">❌ ${e.message}</span>`;
+    showToast('Cloud Function error: '+e.message,'err');
+  }
+  renderSettings();
+}
+
+async function testCloudFunction(){
+  const url    = DB.settings.cloudFnUrl;
+  const secret = DB.settings.cloudFnSecret;
+  if(!url||!secret){ showToast('Configure Cloud Function URL and secret first.','warn'); return; }
+  showToast('Sending test…','info');
+  try{
+    const res  = await fetch(url.replace(/\/$/, '') + '/api/test', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-internal-secret':secret},
+      body: JSON.stringify({ to: currentUser?.email }),
+    });
+    const data = await res.json().catch(()=>({}));
+    if(data.ok) showToast('✅ Test email sent to '+currentUser?.email,'ok');
+    else showToast('❌ '+(data.error||data.reason||'failed'),'err');
+  }catch(e){ showToast('❌ '+e.message,'err'); }
 }
 
 function saveGmailSettings(){
