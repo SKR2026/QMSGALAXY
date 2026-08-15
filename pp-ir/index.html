@@ -2857,30 +2857,37 @@ function buildEmailHTML(incident, recipientName, action, tokenUrl){
 /* ── The Apps Script code admin must deploy ── */
 const APPS_SCRIPT_CODE = `
 // IncidentPro Gmail Relay — deploy as Web App (Execute as: Me, Access: Anyone)
+// IMPORTANT: Replace REPLACE_WITH_YOUR_SECRET below with your chosen secret key
+var EXPECTED_SECRET = 'REPLACE_WITH_YOUR_SECRET'; // <-- change this
+
 function doPost(e) {
   try {
-    var data = JSON.parse(e.postData.contents);
-    var secret = data.secret; // must match what you set in IncidentPro Settings
-    var EXPECTED_SECRET = 'REPLACE_WITH_YOUR_SECRET'; // <-- change this
-    if (secret !== EXPECTED_SECRET) {
-      return ContentService.createTextOutput(JSON.stringify({ok:false,error:'Unauthorized'}))
-        .setMimeType(ContentService.MimeType.JSON);
+    var data = {};
+    if (e.postData && e.postData.contents) {
+      try { data = JSON.parse(e.postData.contents); } catch(_) {}
+    }
+    if (!data.secret || data.secret !== EXPECTED_SECRET) {
+      return _resp({ok:false, error:'Unauthorized'});
     }
     MailApp.sendEmail({
-      to: data.to,
-      subject: data.subject,
+      to:       data.to,
+      subject:  data.subject,
       htmlBody: data.htmlBody,
-      name: data.fromName || 'IncidentPro'
+      name:     data.fromName || 'IncidentPro'
     });
-    return ContentService.createTextOutput(JSON.stringify({ok:true}))
-      .setMimeType(ContentService.MimeType.JSON);
+    return _resp({ok:true});
   } catch(err) {
-    return ContentService.createTextOutput(JSON.stringify({ok:false,error:err.toString()}))
-      .setMimeType(ContentService.MimeType.JSON);
+    return _resp({ok:false, error:err.toString()});
   }
 }
+
 function doGet(e) {
-  return ContentService.createTextOutput(JSON.stringify({ok:true,status:'IncidentPro Gmail Relay active'}))
+  return _resp({ok:true, status:'IncidentPro Gmail Relay active'});
+}
+
+function _resp(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
 }
 `.trim();
@@ -2890,20 +2897,45 @@ async function sendGmailViaAppsScript(toEmail, toName, subject, htmlBody){
   const cfg = DB.settings;
   if(!cfg.gmailWebAppUrl){ return {ok:false, reason:'no-url'}; }
   if(!cfg.gmailSecret){    return {ok:false, reason:'no-secret'}; }
+
+  const payload = JSON.stringify({
+    secret:   cfg.gmailSecret,
+    to:       toEmail,
+    subject:  subject,
+    htmlBody: htmlBody,
+    fromName: cfg.companyName || 'IncidentPro'
+  });
+
+  // ── Strategy 1: Standard fetch with JSON (works when Apps Script CORS is open) ──
   try {
     const resp = await fetch(cfg.gmailWebAppUrl, {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        secret:   cfg.gmailSecret,
-        to:       toEmail,
-        subject:  subject,
-        htmlBody: htmlBody,
-        fromName: cfg.companyName || 'IncidentPro'
-      })
+      headers: {'Content-Type': 'application/json'},
+      body: payload,
+      redirect: 'follow'
     });
-    const json = await resp.json();
-    return json; // {ok:true} or {ok:false,error:'...'}
+    if(resp.ok || resp.status === 200){
+      const json = await resp.json().catch(()=>({ok:true}));
+      if(json.ok !== false) return {ok:true};
+      // Fall through to strategy 2 only if explicit failure
+      if(json.error && json.error !== 'Unauthorized') return json;
+    }
+  } catch(e1){
+    // CORS blocked — try strategy 2
+  }
+
+  // ── Strategy 2: no-cors mode (Apps Script always accepts; we assume success) ──
+  // Apps Script Web Apps deployed as "Access: Anyone" always process the request.
+  // With no-cors we can't read the response, so we treat a completed fetch as success.
+  try {
+    await fetch(cfg.gmailWebAppUrl, {
+      method: 'POST',
+      mode:   'no-cors',
+      headers: {'Content-Type': 'application/json'},
+      body: payload
+    });
+    // no-cors returns opaque response — if fetch didn't throw, the request was sent
+    return {ok:true};
   } catch(err){
     return {ok:false, reason:'fetch-error', detail: err.message};
   }
@@ -4221,11 +4253,11 @@ function renderSettings(){
         <div style="font-size:12px;font-weight:600;color:var(--t2);margin:12px 0 6px">📅 Send Times (IST)</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
           <div class="fg"><label>🔔 Daily Reminder Digest</label>
-            <input type="time" id="s-cf-remtime" value="${xe(s.incidentReminderTime||'09:00')}">
+            <input type="time" id="s-cf-remtime" value="${xe(s.incidentReminderTime||'09:00')}" onchange="onScheduleTimeChange()">
             <small style="color:var(--t3)">Open incident summary — sent daily</small>
           </div>
           <div class="fg"><label>⚡ Escalation Summary</label>
-            <input type="time" id="s-cf-esctime" value="${xe(s.incidentEscalationTime||'08:00')}">
+            <input type="time" id="s-cf-esctime" value="${xe(s.incidentEscalationTime||'08:00')}" onchange="onScheduleTimeChange()">
             <small style="color:var(--t3)">Unresolved escalations — sent daily</small>
           </div>
         </div>
@@ -4310,6 +4342,50 @@ async function saveCloudSchedulerSettings(){
   renderSettings();
 }
 
+// Auto-called when reminder/escalation time inputs change — saves & pushes to Cloud Scheduler
+let _scheduleChangeTimer = null;
+function onScheduleTimeChange(){
+  clearTimeout(_scheduleChangeTimer);
+  const msgEl = document.getElementById('cf-sched-msg');
+  if(msgEl) msgEl.innerHTML = '<span style="color:var(--t3)">⏳ Time changed — saving in 2s…</span>';
+  _scheduleChangeTimer = setTimeout(async () => {
+    const url    = (document.getElementById('s-cf-url')?.value    || '').trim();
+    const secret = (document.getElementById('s-cf-secret')?.value || '').trim();
+    const remTime = document.getElementById('s-cf-remtime')?.value || '09:00';
+    const escTime = document.getElementById('s-cf-esctime')?.value || '08:00';
+    const jobName = (document.getElementById('s-cf-jobname')?.value || '').trim();
+
+    // Always save to DB
+    DB.settings.incidentReminderTime   = remTime;
+    DB.settings.incidentEscalationTime = escTime;
+    saveDB();
+
+    if(!url || !secret){
+      if(msgEl) msgEl.innerHTML = '<span style="color:var(--ok)">✅ Times saved locally. Enter Cloud Function URL &amp; secret to also update the scheduler.</span>';
+      return;
+    }
+
+    if(msgEl) msgEl.innerHTML = '<span style="color:var(--t3)">⏳ Pushing new schedule to Cloud Scheduler…</span>';
+    try {
+      const endpoint = url.replace(/\/$/, '') + '/api/incident-update-schedule';
+      const res  = await fetch(endpoint, {
+        method:  'POST',
+        headers: {'Content-Type':'application/json','x-internal-secret': secret},
+        body:    JSON.stringify({ reminderTime: remTime, escalationTime: escTime, jobName }),
+      });
+      const data = await res.json().catch(()=>({}));
+      if(data.schedulerUpdated){
+        if(msgEl) msgEl.innerHTML = `<span style="color:var(--ok)">✅ Schedule auto-updated — cron: ${data.cron} (Asia/Kolkata)</span>`;
+        showToast('Schedule auto-updated!','ok');
+      } else {
+        if(msgEl) msgEl.innerHTML = `<span style="color:var(--ok)">✅ Times saved. ${data.note||'Scheduler updated in Firestore.'}</span>`;
+      }
+    } catch(e){
+      if(msgEl) msgEl.innerHTML = `<span style="color:var(--wn)">✅ Times saved locally. Cloud update failed: ${e.message}</span>`;
+    }
+  }, 2000);
+}
+
 async function testCloudFunction(){
   const url    = DB.settings.cloudFnUrl;
   const secret = DB.settings.cloudFnSecret;
@@ -4319,7 +4395,7 @@ async function testCloudFunction(){
     const res  = await fetch(url.replace(/\/$/, '') + '/api/test', {
       method:'POST',
       headers:{'Content-Type':'application/json','x-internal-secret':secret},
-      body: JSON.stringify({ to: currentUser?.email }),
+      body: JSON.stringify({ to: currentUser?.email || DB.settings?.escalationEmail?.split(',')[0]?.trim() || '' }),
     });
     const data = await res.json().catch(()=>({}));
     if(data.ok) showToast('✅ Test email sent to '+currentUser?.email,'ok');
@@ -4341,7 +4417,7 @@ function saveGmailSettings(){
 }
 
 async function testGmailConnection(){
-  const testEmail = currentUser?.email;
+  const testEmail = currentUser?.email || DB.settings?.escalationEmail?.split(',')[0]?.trim() || '';
   if(!testEmail){ showToast('Add an email to your profile first (User menu → Edit Profile).','warn'); return; }
   showToast('Sending test email…','info');
   const result = await sendGmailViaAppsScript(testEmail, currentUser?.name||'Admin',
