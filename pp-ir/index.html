@@ -761,13 +761,16 @@ function hideSyncBanner(){ const b=document.getElementById('sync-banner'); if(b)
 /* Guarantee the default superadmin always exists in DB.users */
 function _ensureSuperAdmin(){
   if(!DB.users) DB.users = [];
-  const hasSA = DB.users.some(u=>u.role==='super-admin');
-  if(!hasSA){
-    // No super admin found — restore from defaults
-    const defaults = _DEFAULTS.users.filter(u=>u.role==='super-admin');
-    DB.users = [...defaults, ...DB.users];
-    console.log('[IncidentPro] Restored default super admin accounts');
-  }
+  // For each default SA, add it if no DB user shares the same username.
+  // This keeps Firestore-modified SA accounts intact while always allowing
+  // the hardcoded default credentials as a recovery path.
+  _DEFAULTS.users.filter(u=>u.role==='super-admin').forEach(defSA=>{
+    const exists = DB.users.some(u=>u.username===defSA.username);
+    if(!exists){
+      DB.users = [defSA, ...DB.users];
+      console.log('[IncidentPro] Restored default super admin:', defSA.username);
+    }
+  });
 }
 
 /* Called after FS load completes — refreshes login UI with fresh data */
@@ -840,12 +843,22 @@ function doLoginSA(){
   const errEl=document.getElementById('login-err-sa');
   errEl.style.display='none';
   if(!username||!password){ errEl.textContent='Please enter username and password.'; errEl.style.display='block'; return; }
-  // Check DB.users first, then fall back to _DEFAULTS (covers first-run before Firestore loads)
-  const allUsers = [...(DB.users||[]), ..._DEFAULTS.users];
-  const seen = new Set();
-  const unique = allUsers.filter(u=>{ if(seen.has(u.id)) return false; seen.add(u.id); return true; });
-  const user = unique.find(u=>u.username===username && u.password===password && u.role==='super-admin');
+
+  // Build candidate list: DB.users (Firestore) PLUS _DEFAULTS (local hardcoded).
+  // IMPORTANT: dedup by username (not id) so if Firestore has changed the password
+  // for superadmin, the default credential still works as a recovery option.
+  // We keep BOTH versions — Firestore first (custom password), defaults appended.
+  const fsUsers      = (DB.users||[]).filter(u=>u.role==='super-admin');
+  const defaultSA    = _DEFAULTS.users.filter(u=>u.role==='super-admin');
+  const allSA        = [...fsUsers, ...defaultSA]; // try Firestore first, then hardcoded defaults
+
+  const user = allSA.find(u=>
+    (u.username||'').toLowerCase()===username && u.password===password
+  );
   if(!user){
+    // Debug: show which usernames are recognised (not passwords)
+    const knownNames = [...new Set(allSA.map(u=>u.username))].join(', ');
+    console.warn('[IncidentPro] SA login failed. Known SA usernames:', knownNames);
     errEl.textContent='Incorrect username or password.';
     errEl.style.display='block'; return;
   }
