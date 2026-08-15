@@ -625,6 +625,9 @@ const _DEFAULTS = {
     reminderHours: 24,
     escalationEmail: '',
     smtpConfigured: false,
+    gmailWebAppUrl: '',
+    gmailSecret: '',
+    emailEnabled: false,
   },
   plants: [
     { id:'P1', name:'Plant — Pune',    location:'Pune, Maharashtra',   adminId:'admin_p1', safetyOfficerId:'so_p1', plantHeadId:'ph_p1' },
@@ -679,6 +682,9 @@ let DB = _cached || JSON.parse(JSON.stringify(_DEFAULTS));
 /* ensure runtime fields exist */
 if(!DB.settings)          DB.settings       = _DEFAULTS.settings;
 if(!DB.settings.reminderHours) DB.settings.reminderHours = 24;
+if(!DB.settings.gmailWebAppUrl) DB.settings.gmailWebAppUrl = '';
+if(!DB.settings.gmailSecret)   DB.settings.gmailSecret   = '';
+if(DB.settings.emailEnabled===undefined) DB.settings.emailEnabled = false;
 if(!DB.escalationRules)   DB.escalationRules = _DEFAULTS.escalationRules;
 if(!DB.reminderRules)     DB.reminderRules   = _DEFAULTS.reminderRules;
 if(!DB.auditLog)          DB.auditLog        = [];
@@ -2515,46 +2521,191 @@ function buildEmailHTML(incident, recipientName, action, tokenUrl){
     <div class="em-footer">${xe(company)} · IncidentPro Automated Notification · Do not reply to this email</div>`;
 }
 
-/* ── Core email dispatch (shows preview in a modal for demo; in production would POST to SMTP) ── */
-function dispatchEmail(recipientName, recipientEmail, subject, htmlBody, tokenUrl){
-  // In production: POST to SMTP API here
-  // For demo: show the email preview in a styled modal
-  auditLog('Email Dispatched', `"${subject}" → ${recipientEmail} [token link generated]`);
-  // Return the preview content for display
-  return { recipientName, recipientEmail, subject, htmlBody, tokenUrl };
+/* ═══════════════════════════════════════════════════════
+   GMAIL SENDING — via Google Apps Script Web App
+   -------------------------------------------------------
+   HOW IT WORKS:
+   1. Admin deploys a tiny Google Apps Script as a Web App
+      (Settings → Gmail Setup shows the script to copy-paste)
+   2. Apps Script receives POST from this page and uses
+      Gmail API (MailApp.sendEmail) to send real emails
+   3. No credentials stored in browser — the script runs
+      under the admin's Google account
+   4. Free, up to 100 emails/day on personal Gmail or
+      1500/day on Workspace
+═══════════════════════════════════════════════════════ */
+
+/* ── The Apps Script code admin must deploy ── */
+const APPS_SCRIPT_CODE = `
+// IncidentPro Gmail Relay — deploy as Web App (Execute as: Me, Access: Anyone)
+function doPost(e) {
+  try {
+    var data = JSON.parse(e.postData.contents);
+    var secret = data.secret; // must match what you set in IncidentPro Settings
+    var EXPECTED_SECRET = 'REPLACE_WITH_YOUR_SECRET'; // <-- change this
+    if (secret !== EXPECTED_SECRET) {
+      return ContentService.createTextOutput(JSON.stringify({ok:false,error:'Unauthorized'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    MailApp.sendEmail({
+      to: data.to,
+      subject: data.subject,
+      htmlBody: data.htmlBody,
+      name: data.fromName || 'IncidentPro'
+    });
+    return ContentService.createTextOutput(JSON.stringify({ok:true}))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch(err) {
+    return ContentService.createTextOutput(JSON.stringify({ok:false,error:err.toString()}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+function doGet(e) {
+  return ContentService.createTextOutput(JSON.stringify({ok:true,status:'IncidentPro Gmail Relay active'}))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+`.trim();
+
+/* ── Send one email via Apps Script Web App ── */
+async function sendGmailViaAppsScript(toEmail, toName, subject, htmlBody){
+  const cfg = DB.settings;
+  if(!cfg.gmailWebAppUrl){ return {ok:false, reason:'no-url'}; }
+  if(!cfg.gmailSecret){    return {ok:false, reason:'no-secret'}; }
+  try {
+    const resp = await fetch(cfg.gmailWebAppUrl, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        secret:   cfg.gmailSecret,
+        to:       toEmail,
+        subject:  subject,
+        htmlBody: htmlBody,
+        fromName: cfg.companyName || 'IncidentPro'
+      })
+    });
+    const json = await resp.json();
+    return json; // {ok:true} or {ok:false,error:'...'}
+  } catch(err){
+    return {ok:false, reason:'fetch-error', detail: err.message};
+  }
 }
 
-/* ── Show email preview modal (so admin can see exactly what went out) ── */
-function showEmailPreviewModal(emails){
-  if(!emails||!emails.length) return;
-  let emailsHTML = emails.map((e,idx)=>`
-    <div class="email-preview" style="margin-bottom:16px">
-      <div class="email-preview-hd">
-        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
-        <div><strong>To: ${xe(e.recipientName)}</strong> &lt;${xe(e.recipientEmail||'(no email set)')}&gt;</div>
-        <div style="margin-left:auto;font-size:10px;opacity:.7">Simulated</div>
-      </div>
-      <div style="padding:6px 16px;background:rgba(255,255,255,.05);font-size:11px;color:#90c0e0;border-bottom:1px solid #1e3550">
-        Subject: ${xe(e.subject)}
-      </div>
-      <div class="email-preview-body">${e.htmlBody}</div>
-      ${e.tokenUrl?`<div style="padding:10px 16px;background:#0a1520;border-top:1px solid #1e3550;font-size:11px;color:#60a0c0">
-        <strong>🔗 Magic Link URL:</strong><br>
-        <a href="${xe(e.tokenUrl)}" target="_blank" style="color:#60d0f0;word-break:break-all">${xe(e.tokenUrl)}</a>
-        <span style="margin-left:8px;font-size:10px;color:#3a5a7a">(Click to test the recipient experience)</span>
-      </div>`:''}
+/* ── Dispatch one email: real send + audit + return result ── */
+async function dispatchEmail(recipientName, recipientEmail, subject, htmlBody, tokenUrl){
+  const result = {recipientName, recipientEmail, subject, htmlBody, tokenUrl, sent:false, reason:''};
+  if(!recipientEmail){ result.reason='no-email'; auditLog('Email Skipped', `No email address for ${recipientName}`); return result; }
+  const sendResult = await sendGmailViaAppsScript(recipientEmail, recipientName, subject, htmlBody);
+  result.sent = !!sendResult.ok;
+  result.reason = sendResult.error || sendResult.reason || (sendResult.ok?'sent':'unknown');
+  auditLog(sendResult.ok?'Email Sent':'Email Failed',
+    `${subject.slice(0,60)} → ${recipientEmail} [${result.reason}]`);
+  return result;
+}
+
+/* ── Send all emails in a batch, show results modal ── */
+async function dispatchAllEmails(emailList){
+  if(!emailList||!emailList.length) return;
+  const cfg = DB.settings;
+
+  // If Gmail not configured → show preview-only modal with setup prompt
+  if(!cfg.gmailWebAppUrl || !cfg.gmailSecret){
+    _showEmailPreviewOnly(emailList, true);
+    return;
+  }
+
+  showToast('Sending emails…','info');
+  const results = await Promise.all(emailList.map(e=>
+    dispatchEmail(e.recipientName, e.recipientEmail, e.subject, e.htmlBody, e.tokenUrl)
+  ));
+  _showEmailResultsModal(results);
+}
+
+/* ── Build the email list (does NOT send) — returns array for dispatchAllEmails ── */
+function buildEmailList(incident, recipients){
+  // recipients: [{name, email, action, tokenUrl?}]
+  return recipients.map(r=>{
+    const subject = buildSubject(incident, r.action);
+    const htmlBody = buildEmailHTML(incident, r.name, r.action, r.tokenUrl||window.location.href);
+    return { recipientName:r.name, recipientEmail:r.email, subject, htmlBody, tokenUrl:r.tokenUrl||null };
+  });
+}
+
+function buildSubject(incident, action){
+  const sev = (incident.severity||'').toUpperCase();
+  const no  = incident.incidentNo;
+  const ttl = incident.title;
+  if(action==='hod-response')          return `[IncidentPro] ACTION REQUIRED — Assigned: ${no} (${sev}) ${ttl}`;
+  if(action==='plant-head-view')       return `[IncidentPro] Incident Alert: ${no} — ${sev} — ${ttl}`;
+  if(action==='closure-ack')           return `[IncidentPro] Incident Closed: ${no} — ${ttl}`;
+  if(action==='hod-submission-notify') return `[IncidentPro] HOD Analysis Ready — Review & Close: ${no}`;
+  return `[IncidentPro] Notification: ${no} — ${ttl}`;
+}
+
+/* ── Results modal (sent / failed breakdown) ── */
+function _showEmailResultsModal(results){
+  const sent   = results.filter(r=>r.sent);
+  const failed = results.filter(r=>!r.sent);
+  const noEmail= failed.filter(r=>r.reason==='no-email');
+  const errored= failed.filter(r=>r.reason!=='no-email');
+
+  const sentRows = sent.map(r=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--br)">
+      <span style="color:var(--ok);font-size:16px">✅</span>
+      <div><div style="font-size:13px;font-weight:500">${xe(r.recipientName)}</div>
+      <div style="font-size:11px;color:var(--t3)">${xe(r.recipientEmail)}</div></div>
+      ${r.tokenUrl?`<a href="${xe(r.tokenUrl)}" target="_blank" class="btn bs" style="margin-left:auto">🔗 Link</a>`:''}
     </div>`).join('');
 
-  document.getElementById('modal-title').textContent = `📧 Email Notifications Sent (${emails.length})`;
+  const failRows = errored.map(r=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--br)">
+      <span style="color:var(--er);font-size:16px">❌</span>
+      <div><div style="font-size:13px;font-weight:500">${xe(r.recipientName)}</div>
+      <div style="font-size:11px;color:var(--er)">${xe(r.recipientEmail)} — ${xe(r.reason)}</div></div>
+    </div>`).join('');
+
+  const skipRows = noEmail.map(r=>`
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 0;font-size:12px;color:var(--t3)">
+      <span>⚠</span><span>${xe(r.recipientName)} — no email address configured</span>
+    </div>`).join('');
+
+  document.getElementById('modal-title').textContent = `📧 Email Results — ${sent.length} sent, ${errored.length} failed`;
   document.getElementById('modal-body').innerHTML = `
-    <div class="alert alert-ok" style="margin-bottom:14px">
-      <svg width="13" height="13" fill="currentColor" viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 010 .708l-7 7a.5.5 0 01-.708 0l-3.5-3.5a.5.5 0 11.708-.708L6.5 10.293l6.646-6.647a.5.5 0 01.708 0z"/></svg>
-      ${emails.length} email notification${emails.length!==1?'s':''} dispatched. Click any magic link to preview the recipient experience.
-    </div>
-    ${emailsHTML}`;
-  document.getElementById('modal-footer').innerHTML = `<button class="btn bp" onclick="closeModal()">Done</button>`;
-  document.getElementById('modal-inner').className = 'modal';
-  document.getElementById('modal').style.display = 'flex';
+    ${sent.length?`<div style="font-size:12px;font-weight:600;color:var(--ok);margin-bottom:6px">✅ Sent (${sent.length})</div>${sentRows}`:''}
+    ${errored.length?`<div style="font-size:12px;font-weight:600;color:var(--er);margin:12px 0 6px">❌ Failed (${errored.length})</div>
+      <div class="alert alert-err" style="margin-bottom:8px">Check Gmail Web App URL and secret in Settings → Gmail Setup. Also ensure the Apps Script is deployed as "Execute as: Me" and "Access: Anyone".</div>
+      ${failRows}`:''}
+    ${noEmail.length?`<div style="margin-top:10px">${skipRows}</div>`:''}`;
+  document.getElementById('modal-footer').innerHTML=`
+    ${errored.length?`<button class="btn bs" onclick="navigate('settings')">⚙ Fix Gmail Setup</button>`:''}
+    <button class="btn bp" onclick="closeModal()">Done</button>`;
+  document.getElementById('modal-inner').className='modal sm';
+  document.getElementById('modal').style.display='flex';
+}
+
+/* ── Preview-only modal when Gmail not yet configured ── */
+function _showEmailPreviewOnly(emailList, showSetupPrompt){
+  const rows = emailList.map(e=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--br)">
+      <span style="font-size:16px">📧</span>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:500">${xe(e.recipientName)}</div>
+        <div style="font-size:11px;color:var(--t3)">${xe(e.recipientEmail||'No email set')}</div>
+        <div style="font-size:11px;color:var(--t2);margin-top:2px">${xe(e.subject.slice(0,60))}</div>
+      </div>
+      ${e.tokenUrl?`<a href="${xe(e.tokenUrl)}" target="_blank" class="btn bs">🔗 Magic Link</a>`:''}
+    </div>`).join('');
+
+  document.getElementById('modal-title').textContent = `📧 Emails Queued (${emailList.length}) — Gmail Not Connected`;
+  document.getElementById('modal-body').innerHTML = `
+    ${showSetupPrompt?`<div class="alert alert-warn" style="margin-bottom:14px">
+      <strong>Gmail not configured.</strong> Emails were not sent. Go to Settings → Gmail Setup to connect your Gmail account. Magic links below are still usable.
+    </div>`:''}
+    ${rows}`;
+  document.getElementById('modal-footer').innerHTML=`
+    <button class="btn bs bin" onclick="closeModal();navigate('settings')">⚙ Setup Gmail</button>
+    <button class="btn bp" onclick="closeModal()">Close</button>`;
+  document.getElementById('modal-inner').className='modal sm';
+  document.getElementById('modal').style.display='flex';
 }
 
 /* ── Workflow notification helpers (now generate tokens for HOD/PlantHead) ── */
@@ -2571,9 +2722,8 @@ function getRecipientEmails(users){
   return users.map(u=>u.email).filter(Boolean).join(', ')||'(none configured)';
 }
 
-// New incident → notify SO, Admin, SuperAdmin (they login normally)
-//              → Plant Head gets a magic-link email (no login)
-function notifyIncidentCreated(incident){
+// New incident → notify SO, Admin, SuperAdmin + Plant Head (magic link)
+async function notifyIncidentCreated(incident){
   const { superAdmins, admins, safetyOfficers, plantHeads } = getPlantRoleUsers(incident.plantId);
   const msgType = incident.severity==='critical'?'critical':'new';
   const msg = incident.severity==='critical'
@@ -2581,86 +2731,69 @@ function notifyIncidentCreated(incident){
     : `📋 New ${incident.severity} incident reported: ${incident.title} at ${plantName(incident.plantId)}`;
   addNotification(incident, msgType, msg);
 
-  const previews = [];
-  const subject = `[IncidentPro] New Incident: ${incident.incidentNo} — ${incident.severity.toUpperCase()} — ${incident.title}`;
+  const recipients = [];
 
-  // Plant Heads — magic link (no login needed)
+  // Plant Heads → magic link (no login)
   plantHeads.forEach(ph=>{
     const tok = generateToken(incident.id, ph.id, ph.name, ph.email, 'plant-head-view');
-    saveDB();
-    const url = getTokenURL(tok);
-    const html = buildEmailHTML(incident, ph.name, 'plant-head-view', url);
-    previews.push(dispatchEmail(ph.name, ph.email, subject, html, url));
+    recipients.push({ name:ph.name, email:ph.email, action:'plant-head-view', tokenUrl:getTokenURL(tok) });
   });
 
-  // Logged-in roles (SO, Admin, SuperAdmin) — standard email, no token needed
+  // SO, Admin, SuperAdmin → direct login link
   [...safetyOfficers, ...admins, ...superAdmins].forEach(u=>{
-    const html = buildEmailHTML(incident, u.name, 'plant-head-view', window.location.href);
-    previews.push(dispatchEmail(u.name, u.email, subject, html, null));
+    recipients.push({ name:u.name, email:u.email, action:'plant-head-view', tokenUrl:null });
   });
 
-  auditLog('Notification Sent', `New incident ${incident.incidentNo} → ${previews.length} emails dispatched`);
-  if(previews.length) showEmailPreviewModal(previews);
+  saveDB();
+  auditLog('Notification Sent', `New incident ${incident.incidentNo} → ${recipients.length} recipients`);
+  await dispatchAllEmails(buildEmailList(incident, recipients));
 }
 
 // HOD assigned → HOD gets magic-link email (no login needed)
-function notifyHODAssigned(incident, hodUser){
+async function notifyHODAssigned(incident, hodUser){
   const tok = generateToken(incident.id, hodUser.id, hodUser.name, hodUser.email, 'hod-response');
   saveDB();
   const url = getTokenURL(tok);
-  const subject = `[IncidentPro] Action Required: You are assigned to ${incident.incidentNo} — ${incident.title}`;
-  const html = buildEmailHTML(incident, hodUser.name, 'hod-response', url);
-  const preview = dispatchEmail(hodUser.name, hodUser.email, subject, html, url);
-  addNotification(incident, 'update', `🔗 Magic link emailed to HOD ${hodUser.name} for ${incident.incidentNo}`);
-  auditLog('HOD Assigned', `${incident.incidentNo} assigned to HOD ${hodUser.name} — magic link generated`);
-  showEmailPreviewModal([preview]);
+  addNotification(incident, 'update', `🔗 Action-required email sent to HOD ${hodUser.name} for ${incident.incidentNo}`);
+  auditLog('HOD Assigned', `${incident.incidentNo} assigned to HOD ${hodUser.name} — email link generated`);
+  const list = buildEmailList(incident, [{ name:hodUser.name, email:hodUser.email, action:'hod-response', tokenUrl:url }]);
+  await dispatchAllEmails(list);
 }
 
-// HOD submits → notify SO, Admin, SuperAdmin (they login normally)
-function notifyHODSubmission(incident, hodName){
+// HOD submits → notify SO, Admin, SuperAdmin with review link
+async function notifyHODSubmission(incident, hodName){
   const { superAdmins, admins, safetyOfficers } = getPlantRoleUsers(incident.plantId);
   const msg = `📝 HOD submitted root cause & action plan for ${incident.incidentNo} — by ${hodName}`;
   addNotification(incident, 'update', msg);
-  const subject = `[IncidentPro] HOD Analysis Submitted: ${incident.incidentNo} — Ready for Closure`;
-  const previews = [];
-  [...safetyOfficers, ...admins, ...superAdmins].forEach(u=>{
+  const recipients = [...safetyOfficers, ...admins, ...superAdmins].map(u=>{
     const tok = generateToken(incident.id, u.id, u.name, u.email, 'hod-submission-notify');
-    const url = getTokenURL(tok);
-    const html = buildEmailHTML(incident, u.name, 'hod-submission-notify', url);
-    previews.push(dispatchEmail(u.name, u.email, subject, html, url));
+    return { name:u.name, email:u.email, action:'hod-submission-notify', tokenUrl:getTokenURL(tok) };
   });
   saveDB();
-  auditLog('HOD Submission Notified', `${incident.incidentNo} — ${previews.length} recipients`);
-  if(previews.length) showEmailPreviewModal(previews);
+  auditLog('HOD Submission Notified', `${incident.incidentNo} — ${recipients.length} recipients`);
+  await dispatchAllEmails(buildEmailList(incident, recipients));
 }
 
-// Incident closed → HOD + Plant Head get magic-link closure email; Admin/SA login normally
-function notifyIncidentClosed(incident, closedBy){
+// Incident closed → HOD + Plant Head (magic link), Admin + SuperAdmin (direct)
+async function notifyIncidentClosed(incident, closedBy){
   const { superAdmins, admins, plantHeads } = getPlantRoleUsers(incident.plantId);
   const hodUser = incident.assignedHOD ? DB.users.find(u=>u.id===incident.assignedHOD) : null;
-  const msg = `✅ Incident ${incident.incidentNo} CLOSED by ${closedBy}`;
-  addNotification(incident, 'update', msg);
-  const subject = `[IncidentPro] Incident Closed: ${incident.incidentNo} — ${incident.title}`;
-  const previews = [];
+  addNotification(incident, 'update', `✅ Incident ${incident.incidentNo} CLOSED by ${closedBy}`);
 
-  // HOD + Plant Heads — magic link (no login)
-  const noLoginRecipients = [...(hodUser?[hodUser]:[]), ...plantHeads];
-  noLoginRecipients.forEach(u=>{
+  const recipients = [];
+  // HOD + Plant Heads → magic link
+  [...(hodUser?[hodUser]:[]), ...plantHeads].forEach(u=>{
     const tok = generateToken(incident.id, u.id, u.name, u.email, 'closure-ack');
-    const url = getTokenURL(tok);
-    const html = buildEmailHTML(incident, u.name, 'closure-ack', url);
-    previews.push(dispatchEmail(u.name, u.email, subject, html, url));
+    recipients.push({ name:u.name, email:u.email, action:'closure-ack', tokenUrl:getTokenURL(tok) });
   });
-
-  // Admin / SuperAdmin — no magic link needed (they login)
+  // Admin + SuperAdmin → direct
   [...admins, ...superAdmins].forEach(u=>{
-    const html = buildEmailHTML(incident, u.name, 'closure-ack', window.location.href);
-    previews.push(dispatchEmail(u.name, u.email, subject, html, null));
+    recipients.push({ name:u.name, email:u.email, action:'closure-ack', tokenUrl:null });
   });
 
   saveDB();
-  auditLog('Closure Notified', `${incident.incidentNo} closed by ${closedBy} — ${previews.length} emails`);
-  if(previews.length) showEmailPreviewModal(previews);
+  auditLog('Closure Notified', `${incident.incidentNo} closed by ${closedBy} — ${recipients.length} emails`);
+  await dispatchAllEmails(buildEmailList(incident, recipients));
 }
 
 // Badge helpers
@@ -3669,65 +3802,157 @@ function renderAudit(){
    SETTINGS
 ═══════════════════════════════════════════════════════ */
 function renderSettings(){
+  const s = DB.settings;
+  const gmailOk = !!(s.gmailWebAppUrl && s.gmailSecret);
   document.getElementById('content').innerHTML=`
-  <div class="g2">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+
+    <!-- LEFT COLUMN -->
     <div style="display:flex;flex-direction:column;gap:16px">
+
       <div class="card">
         <div class="card-hd"><div class="card-title">🏢 Company Settings</div></div>
-        <div class="fg"><label>Company Name</label><input id="s-company" value="${xe(DB.settings.companyName)}"></div>
-        <div class="fg"><label>Email Domain (for notifications)</label><input id="s-domain" value="${xe(DB.settings.emailDomain)}" placeholder="@company.com"></div>
+        <div class="fg"><label>Company Name</label><input id="s-company" value="${xe(s.companyName||'')}"></div>
+        <div class="fg"><label>Email Domain</label><input id="s-domain" value="${xe(s.emailDomain||'')}" placeholder="@company.com"></div>
         <button class="btn bp bs" onclick="saveCompanySettings()">Save</button>
       </div>
 
       <div class="card">
         <div class="card-hd"><div class="card-title">🖼 Company Logo</div></div>
-        <p style="font-size:12px;color:var(--t3);margin-bottom:12px">Logo appears on the login screen, sidebar, and public reporting form. PNG or JPEG recommended.</p>
-        ${DB.settings.logo?`<div style="margin-bottom:12px"><img src="${DB.settings.logo}" style="max-height:60px;max-width:200px;object-fit:contain;background:var(--bg3);padding:8px;border-radius:var(--rs)"></div>`:''}
-        <div class="fg"><label>Upload Logo</label>
-          <input type="file" id="s-logo" accept="image/png,image/jpeg,image/svg+xml" onchange="handleLogoUpload(this)">
-        </div>
-        ${DB.settings.logo?`<button class="btn bs ber" onclick="removeLogo()">Remove Logo</button>`:''}
-      </div>
-    </div>
-
-    <div style="display:flex;flex-direction:column;gap:16px">
-      <div class="card">
-        <div class="card-hd"><div class="card-title">📧 Notification Channel</div></div>
-        <p style="font-size:12px;color:var(--t3);margin-bottom:12px">Configure email channel for escalation and reminder notifications.</p>
-        <div class="fg"><label>Global Escalation Email(s)</label>
-          <input id="s-esc-email" value="${xe(DB.settings.escalationEmail)}" placeholder="admin@co.com, manager@co.com">
-        </div>
-        <div class="fg"><label>Reminder Interval (hours)</label>
-          <input type="number" id="s-rem-hrs" value="${DB.settings.reminderHours}" min="1">
-        </div>
-        <div class="alert alert-info" style="margin-bottom:10px">
-          <svg width="13" height="13" fill="currentColor" viewBox="0 0 16 16"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>
-          Email sending is simulated in this demo. Connect an SMTP server for live notifications.
-        </div>
-        <button class="btn bp bs" onclick="saveNotifSettings()">Save Notification Settings</button>
+        ${s.logo?`<div style="margin-bottom:12px"><img src="${s.logo}" style="max-height:60px;max-width:200px;object-fit:contain;background:var(--bg3);padding:8px;border-radius:var(--rs)"></div>`:''}
+        <div class="fg"><label>Upload Logo</label><input type="file" id="s-logo" accept="image/png,image/jpeg,image/svg+xml" onchange="handleLogoUpload(this)"></div>
+        ${s.logo?`<button class="btn bs ber" onclick="removeLogo()">Remove Logo</button>`:''}
       </div>
 
       <div class="card">
         <div class="card-hd"><div class="card-title">⚙ System</div></div>
-        <div style="font-size:12px;color:var(--t3);margin-bottom:10px">
-          Version 1.0 · All data stored locally in your browser.
-        </div>
+        <div style="font-size:12px;color:var(--t3);margin-bottom:10px">Version 1.0 · Data stored in Firebase Firestore.</div>
         <button class="btn bs ber" onclick="if(confirm('Clear ALL data and reset? This cannot be undone.'))resetAll()">Reset All Data</button>
       </div>
+    </div>
+
+    <!-- RIGHT COLUMN -->
+    <div style="display:flex;flex-direction:column;gap:16px">
+
+      <!-- GMAIL SETUP CARD -->
+      <div class="card" style="border-left:3px solid ${gmailOk?'var(--ok)':'var(--wn)'}">
+        <div class="card-hd">
+          <div class="card-title">📧 Gmail Setup</div>
+          <span class="bdg ${gmailOk?'b-ok':'b-medium'}">${gmailOk?'✅ Connected':'⚠ Not Connected'}</span>
+        </div>
+
+        ${gmailOk?`
+        <div class="alert alert-ok" style="margin-bottom:14px">Gmail is connected. Emails will be sent from your Google account via the deployed Apps Script relay.</div>
+        `:`
+        <div class="alert alert-warn" style="margin-bottom:14px">
+          Gmail is not connected. Follow the 3 steps below to enable real email delivery. Takes ~5 minutes.
+        </div>`}
+
+        <!-- STEP 1 -->
+        <div style="background:var(--bg3);border-radius:var(--rs);padding:12px 14px;margin-bottom:12px">
+          <div style="font-size:12px;font-weight:700;color:var(--ac);margin-bottom:6px">STEP 1 — Deploy the Gmail Relay Script</div>
+          <ol style="font-size:12px;color:var(--t2);padding-left:16px;line-height:2">
+            <li>Open <a href="https://script.google.com" target="_blank" style="color:var(--in)">script.google.com</a> and click <strong>New project</strong></li>
+            <li>Delete the default code. Paste the script below.</li>
+            <li>Click <strong>Deploy → New deployment → Web App</strong></li>
+            <li>Set <em>Execute as</em>: <strong>Me</strong>, <em>Access</em>: <strong>Anyone</strong></li>
+            <li>Click Deploy, authorise Gmail access, copy the <strong>Web App URL</strong></li>
+          </ol>
+          <div style="position:relative;margin-top:8px">
+            <textarea readonly style="width:100%;height:180px;font-family:monospace;font-size:11px;background:#0a1520;color:#90d090;padding:10px;border:1px solid var(--br);border-radius:4px;resize:none;line-height:1.5" id="gas-code-area">${xe(APPS_SCRIPT_CODE)}</textarea>
+            <button class="btn bs" style="position:absolute;top:6px;right:6px;font-size:11px" onclick="navigator.clipboard.writeText(document.getElementById('gas-code-area').value);showToast('Copied!','ok')">Copy</button>
+          </div>
+        </div>
+
+        <!-- STEP 2 -->
+        <div style="background:var(--bg3);border-radius:var(--rs);padding:12px 14px;margin-bottom:12px">
+          <div style="font-size:12px;font-weight:700;color:var(--ac);margin-bottom:8px">STEP 2 — Set a Secret Key in the Script</div>
+          <p style="font-size:12px;color:var(--t2);margin-bottom:8px">In the script, replace <code style="background:var(--bg2);padding:1px 5px;border-radius:3px">REPLACE_WITH_YOUR_SECRET</code> with any private passphrase you choose (e.g. <em>MyPlant2025!</em>). Enter the same value below.</p>
+          <div class="fg">
+            <label>Your Secret Key (must match the script)</label>
+            <input id="s-gmail-secret" value="${xe(s.gmailSecret||'')}" placeholder="e.g. MyPlant2025!" type="password">
+          </div>
+        </div>
+
+        <!-- STEP 3 -->
+        <div style="background:var(--bg3);border-radius:var(--rs);padding:12px 14px;margin-bottom:14px">
+          <div style="font-size:12px;font-weight:700;color:var(--ac);margin-bottom:8px">STEP 3 — Paste Your Web App URL</div>
+          <div class="fg">
+            <label>Apps Script Web App URL</label>
+            <input id="s-gmail-url" value="${xe(s.gmailWebAppUrl||'')}" placeholder="https://script.google.com/macros/s/…/exec">
+          </div>
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn bp" onclick="saveGmailSettings()">💾 Save Gmail Settings</button>
+          ${gmailOk?`<button class="btn bok bs" onclick="testGmailConnection()">🧪 Send Test Email</button>`:''}
+        </div>
+
+        <div style="margin-top:12px;font-size:11px;color:var(--t3);line-height:1.7">
+          Emails are sent from your own Gmail account. Free quota: 100 emails/day (personal) or 1,500/day (Google Workspace).
+          The secret key prevents unauthorised use of your relay. Never share the Web App URL publicly.
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-hd"><div class="card-title">🔔 Escalation Settings</div></div>
+        <div class="fg"><label>Global Escalation Email(s)</label>
+          <input id="s-esc-email" value="${xe(s.escalationEmail||'')}" placeholder="admin@co.com, manager@co.com">
+        </div>
+        <div class="fg"><label>Reminder Interval (hours)</label>
+          <input type="number" id="s-rem-hrs" value="${s.reminderHours||24}" min="1">
+        </div>
+        <button class="btn bp bs" onclick="saveNotifSettings()">Save</button>
+      </div>
+
     </div>
   </div>`;
 }
 
 function saveCompanySettings(){
-  DB.settings.companyName=document.getElementById('s-company').value.trim();
-  DB.settings.emailDomain=document.getElementById('s-domain').value.trim();
+  DB.settings.companyName = document.getElementById('s-company').value.trim();
+  DB.settings.emailDomain = document.getElementById('s-domain').value.trim();
   saveDB(); showToast('Settings saved.','ok');
 }
 
 function saveNotifSettings(){
-  DB.settings.escalationEmail=document.getElementById('s-esc-email').value.trim();
-  DB.settings.reminderHours=parseInt(document.getElementById('s-rem-hrs').value)||24;
+  DB.settings.escalationEmail = document.getElementById('s-esc-email').value.trim();
+  DB.settings.reminderHours   = parseInt(document.getElementById('s-rem-hrs').value)||24;
   saveDB(); showToast('Notification settings saved.','ok');
+}
+
+function saveGmailSettings(){
+  const url    = document.getElementById('s-gmail-url').value.trim();
+  const secret = document.getElementById('s-gmail-secret').value.trim();
+  if(url && !url.startsWith('https://script.google.com')){
+    showToast('URL must start with https://script.google.com','warn'); return;
+  }
+  DB.settings.gmailWebAppUrl = url;
+  DB.settings.gmailSecret    = secret;
+  DB.settings.emailEnabled   = !!(url && secret);
+  saveDB(); renderSettings();
+  showToast(url&&secret ? 'Gmail settings saved. Click "Send Test Email" to verify.' : 'Settings cleared.', url&&secret?'ok':'warn');
+}
+
+async function testGmailConnection(){
+  const testEmail = currentUser?.email;
+  if(!testEmail){ showToast('Add an email to your profile first (User menu → Edit Profile).','warn'); return; }
+  showToast('Sending test email…','info');
+  const result = await sendGmailViaAppsScript(testEmail, currentUser?.name||'Admin',
+    '[IncidentPro] ✅ Gmail Test — Connection Successful',
+    `<h2 style="color:#1a7a4a">Gmail relay is working!</h2>
+     <p>This test was sent from <strong>IncidentPro</strong> via your Google Apps Script relay.</p>
+     <p>All incident notifications will now be delivered to real email inboxes.</p>
+     <hr style="border:none;border-top:1px solid #eee;margin:16px 0">
+     <p style="font-size:12px;color:#888">Sent at ${new Date().toLocaleString()} · Relay: ${DB.settings.gmailWebAppUrl}</p>`
+  );
+  if(result.ok){
+    showToast(`✅ Test email sent to ${testEmail}!`,'ok');
+    auditLog('Gmail Test', `Test email sent to ${testEmail} — success`);
+  } else {
+    showToast(`❌ Failed: ${result.error||result.reason||'unknown error'}`,'err');
+    auditLog('Gmail Test Failed', `${result.error||result.reason}`);
+  }
 }
 
 function handleLogoUpload(input){
