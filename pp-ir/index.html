@@ -597,7 +597,13 @@ function _saveLocalCache(){
   }catch(e){ console.warn('localStorage cache failed',e); }
 }
 
-let DB = _loadLocalCache() || JSON.parse(JSON.stringify(_DEFAULTS));
+let _cached = _loadLocalCache();
+// If cached version has no users array or no super-admin, discard it (corrupted)
+if(_cached && (!_cached.users || !Array.isArray(_cached.users) || !_cached.users.some(u=>u.role==='super-admin'))){
+  console.log('[IncidentPro] Cache has no super-admin — using defaults');
+  _cached = null;
+}
+let DB = _cached || JSON.parse(JSON.stringify(_DEFAULTS));
 
 /* ensure runtime fields exist */
 if(!DB.settings)          DB.settings       = _DEFAULTS.settings;
@@ -606,6 +612,7 @@ if(!DB.escalationRules)   DB.escalationRules = _DEFAULTS.escalationRules;
 if(!DB.reminderRules)     DB.reminderRules   = _DEFAULTS.reminderRules;
 if(!DB.auditLog)          DB.auditLog        = [];
 if(!DB.notifications)     DB.notifications   = [];
+if(!DB.users || !DB.users.length) DB.users   = _DEFAULTS.users;
 
 /* ── saveDB: write to Firestore + local cache ── */
 let _saveTimer = null;
@@ -671,6 +678,8 @@ async function loadFromFirestore(){
       if(m.notifications)   DB.notifications   = m.notifications;
       if(m.auditLog)        DB.auditLog        = m.auditLog;
     }
+    // Always guarantee at least one super-admin exists (use defaults if none found)
+    _ensureSuperAdmin();
 
     if(syncMsg) syncMsg.textContent='Loading incidents…';
     const incSnap = await _db.collection(FS_DOC).where('_t','==','incident').get();
@@ -747,8 +756,21 @@ function showSyncBanner(msg){
 }
 function hideSyncBanner(){ const b=document.getElementById('sync-banner'); if(b) b.remove(); }
 
+/* Guarantee the default superadmin always exists in DB.users */
+function _ensureSuperAdmin(){
+  if(!DB.users) DB.users = [];
+  const hasSA = DB.users.some(u=>u.role==='super-admin');
+  if(!hasSA){
+    // No super admin found — restore from defaults
+    const defaults = _DEFAULTS.users.filter(u=>u.role==='super-admin');
+    DB.users = [...defaults, ...DB.users];
+    console.log('[IncidentPro] Restored default super admin accounts');
+  }
+}
+
 /* Called after FS load completes — refreshes login UI with fresh data */
 function _onFSLoaded(){
+  _ensureSuperAdmin();
   populateLoginPlants();
   applyLoginLogo();
   // If app is already open, refresh nav badge counts
@@ -815,8 +837,16 @@ function doLoginSA(){
   const password=document.getElementById('sa-pass').value||'';
   const errEl=document.getElementById('login-err-sa');
   errEl.style.display='none';
-  const user=DB.users.find(u=>u.username===username&&u.password===password&&u.role==='super-admin');
-  if(!user){ errEl.textContent='Invalid super admin credentials.'; errEl.style.display='block'; return; }
+  if(!username||!password){ errEl.textContent='Please enter username and password.'; errEl.style.display='block'; return; }
+  // Check DB.users first, then fall back to _DEFAULTS (covers first-run before Firestore loads)
+  const allUsers = [...(DB.users||[]), ..._DEFAULTS.users];
+  const seen = new Set();
+  const unique = allUsers.filter(u=>{ if(seen.has(u.id)) return false; seen.add(u.id); return true; });
+  const user = unique.find(u=>u.username===username && u.password===password && u.role==='super-admin');
+  if(!user){
+    errEl.textContent='Invalid super admin credentials. Default: superadmin / admin123';
+    errEl.style.display='block'; return;
+  }
   currentUser=user; currentPlantFilter='all';
   showApp();
 }
