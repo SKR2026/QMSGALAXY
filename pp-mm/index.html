@@ -326,12 +326,20 @@ body.has-ro-banner #login-overlay{top:36px;}
       </div>
     </div>
     <div class="lic-err" id="lic-gate-err"></div>
-    <!-- Super Admin can navigate to settings to enter a new key while blocked -->
-    <div style="margin-top:16px;text-align:center;">
-      <button class="lic-btn" id="lic-gate-renew-btn" onclick="_licGateOpenSettings()" style="background:linear-gradient(135deg,#0e3d6a,#0a2540);border:1px solid #1a5a8a;font-size:13px;padding:10px;">
-        🔑 Enter New License Key
+    <!-- Inline key entry — only visible to Super Admin after login -->
+    <div id="lic-gate-sa-section" style="display:none;margin-top:18px;border-top:1px solid #0e3d6a;padding-top:18px;">
+      <div style="font-size:11px;color:#3a7eaa;margin-bottom:10px;text-align:center;letter-spacing:.5px;text-transform:uppercase;font-weight:600;">Super Admin — Enter Renewed Key</div>
+      <div style="position:relative;margin-bottom:10px;">
+        <input id="lic-gate-key-inp" class="lic-inp" maxlength="19" placeholder="XXXX-XXXX-XXXX-XXXX"
+          oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'').replace(/(.{4})(?=.)/g,'$1-').substring(0,19)"
+          onkeydown="if(event.key==='Enter')_licGateActivateKey()" style="font-size:14px;">
+        <span class="lic-ico">🔑</span>
+      </div>
+      <div id="lic-gate-key-status" style="font-size:11px;color:#3a7eaa;min-height:16px;margin-bottom:8px;text-align:center;"></div>
+      <button class="lic-btn" onclick="_licGateActivateKey()" style="padding:10px;font-size:13px;">
+        <span id="lic-gate-activate-lbl">Activate New License Key</span>
+        <div class="lic-spin" id="lic-gate-activate-spin" style="display:none;"></div>
       </button>
-      <div style="margin-top:8px;font-size:10px;color:#1a5a8a;">Super Admin only</div>
     </div>
     <div class="lic-foot" style="margin-top:18px;">
       <strong>Polyplastics India</strong> · MoM Pro v3<br>
@@ -8190,6 +8198,7 @@ function _showLicGate(msg) {
     if (bodyEl) bodyEl.innerHTML = msg.body || 'Your MoM Pro license has expired.<br>Access is blocked for all users.<br>Please contact your Super Admin to renew.';
   }
   gate.classList.add('show');
+  _updateLicGateSASection(); // show inline key entry only for super-admin
 }
 
 function _hideLicGate() {
@@ -8197,12 +8206,46 @@ function _hideLicGate() {
   if (gate) gate.classList.remove('show');
 }
 
-/* Opens License Settings from inside the lock gate.
-   Only Super Admin can actually save a key there.
-   The gate re-appears if navigation leaves the settings page while still invalid. */
-function _licGateOpenSettings() {
-  _hideLicGate(); // temporarily let SA reach settings
-  if(typeof navigate === 'function') navigate('settings-license');
+/* Shows/hides the SA inline key-entry section based on role */
+function _updateLicGateSASection(){
+  const sec = document.getElementById('lic-gate-sa-section');
+  if(!sec) return;
+  sec.style.display = (currentRole === 'super-admin') ? 'block' : 'none';
+}
+
+/* Activates a new key entered directly in the lock gate (Super Admin only) */
+async function _licGateActivateKey(){
+  if(currentRole !== 'super-admin') return;
+  const inp = document.getElementById('lic-gate-key-inp');
+  const statusEl = document.getElementById('lic-gate-key-status');
+  const lbl = document.getElementById('lic-gate-activate-lbl');
+  const spin = document.getElementById('lic-gate-activate-spin');
+  const key = inp ? inp.value.trim() : '';
+  if(!key){ statusEl.innerHTML='<span style="color:#fca5a5;">Please enter a license key.</span>'; return; }
+  statusEl.innerHTML='<span style="color:#7ab8e0;">Validating…</span>';
+  lbl.style.display='none'; spin.style.display='block';
+  const r = await _validateLicKey(key);
+  lbl.style.display=''; spin.style.display='none';
+  if(!r.ok){
+    const msgs={ NOT_FOUND:'Key not found in database.', NO_KEY:'Enter a license key.', ERROR:'Validation error — check connection.' };
+    statusEl.innerHTML='<span style="color:#fca5a5;">'+(msgs[r.reason]||'Invalid key.')+'</span>';
+    return;
+  }
+  if(r.readOnly){
+    const exp = r.data.expiryDate ? new Date(r.data.expiryDate).toLocaleDateString('en-IN') : '?';
+    statusEl.innerHTML='<span style="color:#fca5a5;">⚠ This key also expired ('+exp+'). Enter a valid renewed key.</span>';
+    return;
+  }
+  /* ✅ Valid — save, stop watchdog, unlock */
+  _licData = r.data; _licRO = false;
+  localStorage.setItem(_LIC_SESS, JSON.stringify({ key }));
+  window._licPreCheck = { state: 'valid', data: r.data, exp: r.data.expiryDate ? new Date(r.data.expiryDate) : null };
+  if(window._licWatchdogTimer){ clearInterval(window._licWatchdogTimer); window._licWatchdogTimer = null; }
+  _updateLicChip();
+  _hideLicGate();
+  showToast('✅ License activated — app is now unlocked!', 'ok');
+  inp.value = '';
+  statusEl.innerHTML = '';
 }
 
 /* doLicGateSubmit — disabled: the expiry gate has no key-entry form.
@@ -8364,13 +8407,18 @@ function _startLicWatchdog(){
   _licWatchdogTimer = setInterval(()=>{
     const pc = window._licPreCheck;
     if(!pc || pc.state === 'valid'){
+      /* License became valid — stop and unlock */
       clearInterval(_licWatchdogTimer); _licWatchdogTimer = null;
       _hideLicGate();
       return;
     }
-    /* Re-assert gate — covers any edge cases where it got hidden */
+    /* License still invalid — keep gate visible.
+       SA inline key input is inside the gate so no conflict. */
     const gate = document.getElementById('lic-gate');
-    if(gate && !gate.classList.contains('show')) gate.classList.add('show');
+    if(gate && !gate.classList.contains('show')){
+      gate.classList.add('show');
+      _updateLicGateSASection();
+    }
   }, 500);
 }
 
