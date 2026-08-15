@@ -363,13 +363,10 @@ textarea{resize:vertical;min-height:80px}
       <span id="login-sync-msg">Loading data…</span>
     </div>
     <div class="login-body">
-      <!-- THREE tabs -->
+      <!-- TABS: Admin | Report/Update | Management View -->
       <div class="login-tabs">
-        <div class="ltab active" id="ltab-superadmin" onclick="switchLTab('superadmin')">
-          🛡 Super Admin
-        </div>
-        <div class="ltab" id="ltab-admin" onclick="switchLTab('admin')">
-          🔐 Plant Admin
+        <div class="ltab active" id="ltab-admin" onclick="switchLTab('admin')">
+          🔐 Admin Login
         </div>
         <div class="ltab" id="ltab-public" onclick="switchLTab('public')">
           📋 Report / Update
@@ -379,29 +376,22 @@ textarea{resize:vertical;min-height:80px}
         </div>
       </div>
 
-      <!-- ── SUPER ADMIN pane ── -->
-      <div id="lpane-superadmin">
+      <!-- ── UNIFIED ADMIN pane (role auto-detected from credentials) ── -->
+      <div id="lpane-admin">
         <div style="font-size:11px;color:#60a0c0;margin-bottom:12px;padding:8px 10px;background:rgba(2,132,199,.1);border-radius:5px;border-left:3px solid #0284c7;">
-          Full system access across all plants.
-        </div>
-        <div class="login-err" id="login-err-sa"></div>
-        <input class="login-inp" id="sa-user" placeholder="Super Admin Username" autocomplete="username">
-        <input class="login-inp" type="password" id="sa-pass" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLoginSA()">
-        <button class="login-btn" onclick="doLoginSA()">Sign In as Super Admin</button>
-      </div>
-
-      <!-- ── PLANT ADMIN pane ── -->
-      <div id="lpane-admin" style="display:none">
-        <div style="font-size:11px;color:#60a0c0;margin-bottom:12px;padding:8px 10px;background:rgba(2,132,199,.1);border-radius:5px;border-left:3px solid #0284c7;">
-          Access restricted to your assigned plant.
+          Enter your credentials — Super Admin or Plant Admin access is granted automatically.
         </div>
         <div class="login-err" id="login-err-admin"></div>
-        <select class="login-inp" id="l-plant">
-          <option value="">-- Select Your Plant --</option>
-        </select>
-        <input class="login-inp" id="l-user" placeholder="Admin Username" autocomplete="username">
-        <input class="login-inp" type="password" id="l-pass" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLoginAdmin()">
-        <button class="login-btn" onclick="doLoginAdmin()">Sign In as Plant Admin</button>
+        <input class="login-inp" id="l-user" placeholder="Username" autocomplete="username">
+        <input class="login-inp" type="password" id="l-pass" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLoginUnified()">
+        <button class="login-btn" onclick="doLoginUnified()">Sign In</button>
+      </div>
+
+      <!-- legacy stub pane — keeps references to sa-user/sa-pass alive (used in doLogout) -->
+      <div id="lpane-superadmin" style="display:none">
+        <div class="login-err" id="login-err-sa"></div>
+        <input id="sa-user" style="display:none" tabindex="-1">
+        <input id="sa-pass" type="password" style="display:none" tabindex="-1">
       </div>
 
       <!-- ── PUBLIC REPORTER pane ── -->
@@ -860,15 +850,19 @@ let currentUser = null;
 let currentPlantFilter = 'all';
 let publicSession = null;
 
-/* ── Tab switcher — 3 tabs ── */
+/* ── Tab switcher ── */
 function switchLTab(tab){
-  ['superadmin','admin','public','mgmt'].forEach(t=>{
+  // Active tabs: admin | public | mgmt  (superadmin stub hidden always)
+  ['admin','public','mgmt'].forEach(t=>{
     const el=document.getElementById('ltab-'+t);
     if(el) el.classList.toggle('active', t===tab);
     const pane=document.getElementById('lpane-'+t);
     if(pane) pane.style.display = t===tab?'block':'none';
   });
-  // populate mgmt plant dropdown
+  // Always keep legacy stub hidden
+  const stub=document.getElementById('lpane-superadmin');
+  if(stub) stub.style.display='none';
+  // Populate mgmt plant dropdown
   if(tab==='mgmt'){
     const sel=document.getElementById('l-mgmt-plant');
     if(sel){
@@ -878,57 +872,44 @@ function switchLTab(tab){
   }
 }
 
-/* ── SUPER ADMIN login ── */
-function doLoginSA(){
-  const username=(document.getElementById('sa-user').value||'').trim().toLowerCase();
-  const password=document.getElementById('sa-pass').value||'';
-  const errEl=document.getElementById('login-err-sa');
-  errEl.style.display='none';
-  if(!username||!password){ errEl.textContent='Please enter username and password.'; errEl.style.display='block'; return; }
-
-  // Build candidate list: DB.users (Firestore) PLUS _DEFAULTS (local hardcoded).
-  // IMPORTANT: dedup by username (not id) so if Firestore has changed the password
-  // for superadmin, the default credential still works as a recovery option.
-  // We keep BOTH versions — Firestore first (custom password), defaults appended.
-  const fsUsers      = (DB.users||[]).filter(u=>u.role==='super-admin');
-  const defaultSA    = _DEFAULTS.users.filter(u=>u.role==='super-admin');
-  const allSA        = [...fsUsers, ...defaultSA]; // try Firestore first, then hardcoded defaults
-
-  const user = allSA.find(u=>
-    (u.username||'').toLowerCase()===username && u.password===password
-  );
-  if(!user){
-    // Debug: show which usernames are recognised (not passwords)
-    const knownNames = [...new Set(allSA.map(u=>u.username))].join(', ');
-    console.warn('[IncidentPro] SA login failed. Known SA usernames:', knownNames);
-    errEl.textContent='Incorrect username or password.';
-    errEl.style.display='block'; return;
-  }
-  currentUser=user; currentPlantFilter='all';
-  showApp();
-}
-
-/* ── PLANT ADMIN login ── */
-function doLoginAdmin(){
-  const plant=document.getElementById('l-plant').value;
+/* ── UNIFIED ADMIN LOGIN — auto-detects Super Admin vs Plant Admin ── */
+function doLoginUnified(){
   const username=(document.getElementById('l-user').value||'').trim().toLowerCase();
   const password=document.getElementById('l-pass').value||'';
   const errEl=document.getElementById('login-err-admin');
   errEl.style.display='none';
   if(!username||!password){ errEl.textContent='Please enter username and password.'; errEl.style.display='block'; return; }
-  // Merge DB.users with _DEFAULTS (same pattern as SA login) so login works even before Firestore finishes loading
+
+  // Build full user pool: Firestore DB first, then hardcoded defaults (recovery fallback)
   const allUsers = [...(DB.users||[]), ..._DEFAULTS.users];
   const seen = new Set();
   const unique = allUsers.filter(u=>{ if(seen.has(u.id)) return false; seen.add(u.id); return true; });
-  const user=unique.find(u=>u.username===username&&u.password===password&&u.role==='admin');
-  if(!user){ errEl.textContent='Invalid admin credentials.'; errEl.style.display='block'; return; }
-  if(plant && user.plant!==plant){ errEl.textContent='You are not the admin for the selected plant.'; errEl.style.display='block'; return; }
-  currentUser=user; currentPlantFilter=user.plant;
+
+  const user = unique.find(u=>
+    (u.username||'').toLowerCase()===username && u.password===password &&
+    ['super-admin','admin'].includes(u.role)
+  );
+
+  if(!user){
+    console.warn('[IncidentPro] Login failed for username:', username);
+    errEl.textContent='Incorrect username or password.';
+    errEl.style.display='block'; return;
+  }
+
+  // Route by role
+  if(user.role==='super-admin'){
+    currentUser=user; currentPlantFilter='all';
+  } else {
+    // Plant Admin
+    currentUser=user; currentPlantFilter=user.plant||'all';
+  }
   showApp();
 }
 
-/* Keep old doLogin as alias (used by Enter key etc.) */
-function doLogin(){ doLoginAdmin(); }
+/* Legacy aliases — keep so any older inline onclick references don't break */
+function doLoginSA(){ doLoginUnified(); }
+function doLoginAdmin(){ doLoginUnified(); }
+function doLogin(){ doLoginUnified(); }
 
 /* ── PUBLIC REPORTER ── */
 function enterPublic(){
@@ -974,15 +955,16 @@ function doLogout(){
   document.getElementById('user-dropdown-wrap').innerHTML='';
   document.getElementById('bell-panel-wrap').innerHTML='';
   document.getElementById('login-overlay').style.display='flex';
-  // Clear all password fields
-  ['sa-pass','l-pass'].forEach(id=>{ const el=document.getElementById(id); if(el) el.value=''; });
+  // Clear all login fields
+  ['l-user','l-pass'].forEach(id=>{ const el=document.getElementById(id); if(el) el.value=''; });
   // Refresh data for next login
   loadFromFirestore();
 }
 
 /* populate plant selects on login */
 function populateLoginPlants(){
-  const selectors = ['l-plant','l-plant-pub'];
+  // Only the public reporter plant selector remains in the login form
+  const selectors = ['l-plant-pub'];
   selectors.forEach(id=>{
     const sel=document.getElementById(id); if(!sel) return;
     const cur=sel.value;
