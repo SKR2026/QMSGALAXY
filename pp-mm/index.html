@@ -212,6 +212,7 @@ input[type=checkbox].task-cb{width:15px;height:15px;accent-color:var(--ac);curso
   background:linear-gradient(135deg,#0a1628 0%,#0d2040 100%);
   align-items:center;justify-content:center;
   font-family:'DM Sans',sans-serif;
+  pointer-events: all; /* gate itself must always be clickable */
 }
 #lic-gate.show { display:flex; }
 .lic-card {
@@ -247,7 +248,10 @@ input[type=checkbox].task-cb{width:15px;height:15px;accent-color:var(--ac);curso
 .lic-foot{margin-top:18px;text-align:center;font-size:10px;color:#0e3d6a;line-height:1.9;}
 .lic-foot strong{color:#3a7eaa;}
 
-/* RO banner */
+/* When license gate is shown, block all interaction with the app beneath */
+#lic-gate.show ~ * { pointer-events: none !important; }
+body:has(#lic-gate.show) .app { pointer-events: none !important; }
+body:has(#lic-gate.show) #toast { pointer-events: none !important; }
 #ro-banner{display:none;position:fixed;top:0;left:0;right:0;z-index:9000;background:linear-gradient(90deg,#92400e,#b45309);color:#fef3c7;padding:7px 18px;font-size:12px;font-weight:600;flex-align:center;justify-content:space-between;align-items:center;}
 #ro-banner.show{display:flex;}
 .ro-l{display:flex;align-items:center;gap:8px;}
@@ -1495,6 +1499,20 @@ const NO_ASSIGNEE=[];
 let _currentPage = 'dashboard';
 
 function navigate(page){
+  /* ── LICENSE GUARD — block ALL navigation when license is not valid ──
+     Only active after a user is logged in (loggedInAs is set).
+     While _licPreCheck is null (still loading) we allow navigation so the
+     app can render normally; the gate will appear once the check resolves.
+     settings-license is always allowed for super-admin to enter a new key. */
+  if(loggedInAs) {
+    const pc = window._licPreCheck;
+    const licInvalid = pc !== null && pc.state !== 'valid';
+    const isSA = currentRole === 'super-admin';
+    if(licInvalid && !(page === 'settings-license' && isSA)){
+      _showLicGate(); // keep gate visible — block navigation
+      return;
+    }
+  }
   // Handle plant-detail-{id} pages
   if(page && page.startsWith('plant-detail-')){
     const plantId = page.replace('plant-detail-','');
@@ -8131,8 +8149,9 @@ async function _saveLicKeyFromSettings(){
       window._licPreCheck = { state: 'expired', expStr };
       setTimeout(_showLicExpiredUI,300); setTimeout(openLicRenewalModal,600);
     } else {
-      /* ✅ Valid new key — reset cache and dismiss the lock gate */
+      /* ✅ Valid new key — reset cache, stop watchdog, dismiss the lock gate */
       window._licPreCheck = { state: 'valid', data: r.data, exp: expObj };
+      if(window._licWatchdogTimer){ clearInterval(window._licWatchdogTimer); window._licWatchdogTimer = null; }
       _hideLicGate();
       const banner=document.getElementById('lic-expired-banner'); if(banner) banner.classList.remove('show');
       showToast('✅ License activated — app is now unlocked!', 'ok');
@@ -8304,11 +8323,13 @@ async function checkLicenseAfterLogin(){
 
   if(pc.state === 'no_key') {
     _showLicGate({ title: 'License Required', body: 'No license key is registered for this installation.<br>Access is blocked for all users.<br>Please contact your <strong>Super Admin</strong> to enter a valid license key.' });
+    _startLicWatchdog();
     return;
   }
 
   if(pc.state === 'not_found') {
     _showLicGate({ title: 'License Not Found', body: 'The registered license key could not be verified.<br>Access is blocked for all users.<br>Please contact your <strong>Super Admin</strong> to register a valid license key.' });
+    _startLicWatchdog();
     return;
   }
 
@@ -8317,6 +8338,7 @@ async function checkLicenseAfterLogin(){
       title: 'License Expired',
       body: `Your MoM Pro license expired on <strong>${pc.expStr}</strong>.<br>Access is blocked for <strong>all users</strong>, including Admins.<br>Contact your <strong>Super Admin</strong> to renew the license key.`
     });
+    _startLicWatchdog();
     return;
   }
 
@@ -8332,6 +8354,24 @@ async function checkLicenseAfterLogin(){
       }, 1500);
     }
   }
+}
+
+/* Watchdog: re-asserts the gate every 500ms while license is invalid.
+   Stops automatically once _licPreCheck becomes 'valid'. */
+let _licWatchdogTimer = null;
+function _startLicWatchdog(){
+  if(_licWatchdogTimer) return; // already running
+  _licWatchdogTimer = setInterval(()=>{
+    const pc = window._licPreCheck;
+    if(!pc || pc.state === 'valid'){
+      clearInterval(_licWatchdogTimer); _licWatchdogTimer = null;
+      _hideLicGate();
+      return;
+    }
+    /* Re-assert gate — covers any edge cases where it got hidden */
+    const gate = document.getElementById('lic-gate');
+    if(gate && !gate.classList.contains('show')) gate.classList.add('show');
+  }, 500);
 }
 
 /* ══════════════════════════════════════════════════════
