@@ -318,7 +318,21 @@ textarea{resize:vertical;min-height:80px}
 
 @media(max-width:1100px){.stat-grid{grid-template-columns:repeat(4,1fr)}}
 @media(max-width:900px){.stat-grid{grid-template-columns:1fr 1fr}.g3{grid-template-columns:1fr 1fr}.bell-panel{width:320px;right:10px}}
-@media(max-width:640px){.sidebar{display:none}.g2,.fgrid,.fgrid3{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.bell-panel{width:calc(100vw - 20px);right:10px}}
+@media(max-width:640px){
+  .g2,.fgrid,.fgrid3{grid-template-columns:1fr}
+  .stat-grid{grid-template-columns:1fr 1fr}
+  .bell-panel{width:calc(100vw - 20px);right:10px}
+  /* Mobile sidebar: hidden off-screen by default, slides in when .mob-open */
+  .sidebar{
+    position:fixed;top:0;left:0;height:100vh;z-index:2000;
+    transform:translateX(-100%);transition:transform .25s ease;
+    width:var(--sw) !important;overflow:hidden;display:flex;
+  }
+  .sidebar.mob-open{transform:translateX(0)}
+  /* Dark overlay behind sidebar */
+  #mob-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1999}
+  #mob-overlay.visible{display:block}
+}
 
 /* ══════════════════════════════════════════════════
    PDF EXPORT — Print styles
@@ -507,6 +521,8 @@ textarea{resize:vertical;min-height:80px}
 
 <!-- MAIN APP -->
 <div class="app" id="app" style="display:none">
+  <!-- Mobile sidebar overlay -->
+  <div id="mob-overlay" onclick="closeMobileSidebar()"></div>
   <!-- Sidebar -->
   <aside class="sidebar" id="sidebar">
     <div class="sb-brand">
@@ -534,7 +550,7 @@ textarea{resize:vertical;min-height:80px}
   <!-- Main -->
   <div class="main">
     <div class="topbar">
-      <button class="btn bs" onclick="document.getElementById('sidebar').classList.toggle('collapsed')" style="padding:5px 8px">
+      <button class="btn bs" onclick="toggleMobileSidebar()" style="padding:5px 8px">
         <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
       </button>
       <div class="title" id="page-title">Dashboard</div>
@@ -854,12 +870,7 @@ function startRealtimeSync(){
       }
     }
 
-    // BUG FIX (ported from PlantVisit): Mark settings as loaded from Firestore.
-    // startAutoEngine() fires an immediate tick but _engineSettingsReady was false
-    // so it bailed out. Now that real settings are here, fire a catch-up tick
-    // immediately — setTimeout(0) lets this snapshot callback finish first.
-    // This ensures a tab opened after the configured reminder time still triggers
-    // without waiting up to 60 s for the next interval tick.
+    // Mark settings as loaded — allow engine to run, fire catch-up tick immediately
     if(!_engineSettingsReady){
       _engineSettingsReady = true;
       setTimeout(runAutoEngine, 0); // catch-up with real Firestore settings
@@ -1217,7 +1228,7 @@ function onPlantFilterChange(){
   navigate(_page);
 }
 
-function navigate(page){
+function navigate(page){ closeMobileSidebar();
   _page = page;
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   const el=document.getElementById('ni-'+page); if(el)el.classList.add('active');
@@ -2495,12 +2506,29 @@ function _istDateKey(){
   return new Date(Date.now() + 5.5*60*60*1000).toISOString().slice(0,10);
 }
 
+
+function toggleMobileSidebar(){
+  const sb  = document.getElementById('sidebar');
+  const ov  = document.getElementById('mob-overlay');
+  if(!sb) return;
+  if(window.innerWidth <= 640){
+    const open = sb.classList.toggle('mob-open');
+    ov && ov.classList.toggle('visible', open);
+  } else {
+    sb.classList.toggle('collapsed');
+  }
+}
+function closeMobileSidebar(){
+  const sb = document.getElementById('sidebar');
+  const ov = document.getElementById('mob-overlay');
+  sb && sb.classList.remove('mob-open');
+  ov && ov.classList.remove('visible');
+}
 function startAutoEngine(){
   if(_autoEngineTimer) return; // already running
   console.log('[AutoEngine] Started');
-  // tick() checks _engineSettingsReady so it's safe to call immediately —
-  // it will no-op until Firestore has pushed real settings at least once.
-  runAutoEngine(); // catch-up: fires at once, bails early if settings not ready yet
+  // Immediate catch-up tick — safe because runAutoEngine bails if !_engineSettingsReady
+  runAutoEngine();
   _autoEngineTimer = setInterval(runAutoEngine, AUTO_ENGINE_INTERVAL_MS);
 }
 
@@ -2511,21 +2539,14 @@ function stopAutoEngine(){
 
 /* Main engine tick — called every 60 s */
 async function runAutoEngine(){
-  // BUG FIX (ported from PlantVisit): Do NOT run until Firestore has pushed real
-  // settings at least once. startAutoEngine() fires an immediate catch-up tick,
-  // but if Firestore hasn't resolved yet _engineSettingsReady is still false and
-  // we'd evaluate stale defaults — silently bailing and never re-checking the
-  // configured time until the next 60 s interval (by which point the window may
-  // have already passed). The onSnapshot handler sets _engineSettingsReady=true
-  // and fires its own catch-up tick, so nothing is ever missed.
+  // Guard: bail until Firestore has pushed real settings at least once.
+  // startAutoEngine() fires an immediate tick but settings may not be ready yet.
+  // onSnapshot sets _engineSettingsReady=true and fires its own catch-up tick.
   if(!_engineSettingsReady) return;
 
   const cfg = DB.settings || {};
 
   // ── PRIMARY: Cloud Scheduler path ──────────────────────────────────────────
-  // If Cloud Function is configured, check if it's time to trigger it.
-  // The Cloud Scheduler job fires at the set times independently, but this
-  // browser-side check acts as a backup trigger when the tab is open.
   if(cfg.cloudSchedulerEnabled && cfg.cloudFnUrl && cfg.cloudFnSecret){
     const nowMins   = _istNowMins();
     const todayKey  = _istDateKey();
@@ -2534,22 +2555,18 @@ async function runAutoEngine(){
     const remMins = (t => { const [h,m]=t.split(':').map(Number); return h*60+m; })(cfg.incidentReminderTime||'09:00');
     const escMins = (t => { const [h,m]=t.split(':').map(Number); return h*60+m; })(cfg.incidentEscalationTime||'08:00');
 
-    // BUG FIX (ported from PlantVisit): Old code used a strict 60-minute window
-    // (nowMins >= X && nowMins <= X+59). If the tab was opened/refreshed after
-    // that window — e.g. user opens the app at 10:05 when reminder is set to 09:00
-    // — the condition was already false and the day's trigger was silently skipped.
-    // New check: fire any time ON OR AFTER the configured time (not yet sent today),
-    // matching exactly how PlantVisit's startDailyDigestScheduler works.
+    // FIX: old code used a 60-min window (nowMins <= X+59) — if tab opened after
+    // that window the trigger was silently skipped for the whole day.
+    // New: fire any time ON OR AFTER the configured time (not yet sent today).
     const shouldRem = nowMins >= remMins;
     const shouldEsc = nowMins >= escMins;
     const lastTriggered = localStorage.getItem(lastKey) || '';
 
     if((shouldRem || shouldEsc) && lastTriggered !== todayKey){
       localStorage.setItem(lastKey, todayKey);
-      console.log(`[AutoEngine] Browser backup trigger → Cloud Function (rem=${cfg.incidentReminderTime} esc=${cfg.incidentEscalationTime})`);
+      console.log('[AutoEngine] Browser backup trigger → Cloud Function');
       await triggerIncidentCloudReminder('all', false);
     }
-    // Don't fall through to browser engine — cloud handles email sending
     _updateAutoEngineStatus();
     return;
   }
@@ -4332,8 +4349,8 @@ function renderSettings(){
         <details style="margin-top:14px">
           <summary style="font-size:12px;color:var(--t3);cursor:pointer">📖 Setup Instructions</summary>
           <ol style="font-size:12px;color:var(--t2);padding-left:16px;line-height:2;margin-top:8px">
-            <li>Deploy <code>incident_index.js</code> as Cloud Run service <strong>incident-email-now</strong> in project <strong>skr-mom</strong></li>
-            <li>Set env vars: <code>INCIDENT_SECRET</code>, <code>GOOGLE_CLOUD_PROJECT=skr-mom</code>, <code>INCIDENT_SCHEDULER_JOB_NAME=incident-email-daily</code>, <code>INCIDENT_SCHEDULER_LOCATION=asia-south1</code></li>
+            <li>Function <strong>incidentEmailNow</strong> is deployed in project <strong>skr-task</strong> (same as PlantVisit)</li>
+            <li>Env vars required: <code>INCIDENT_SECRET</code>, <code>GMAIL_USER</code>, <code>GMAIL_APP_PASS</code>, <code>INCIDENT_SCHEDULER_JOB_NAME=incident-email-daily</code></li>
             <li>In GCP Cloud Scheduler, create job → URL = Cloud Run URL, body = <code>{"type":"all"}</code>, auth header = <code>x-internal-secret: your-secret</code></li>
             <li>Enter URL + secret above, set send times, click <strong>Save &amp; Update Schedule</strong></li>
           </ol>
