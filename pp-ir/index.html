@@ -223,6 +223,13 @@ textarea{resize:vertical;min-height:80px}
 .login-divider::before{left:0}.login-divider::after{right:0}
 .login-public-btn{width:100%;padding:10px;background:transparent;border:1px solid #1e3550;color:#7aa0c0;border-radius:var(--rs);font-size:13px;font-weight:500;cursor:pointer;font-family:var(--fn);transition:all .15s;text-align:center}
 .login-public-btn:hover{background:#061828;border-color:#2a4a6a}
+.photo-upload-area{border:2px dashed var(--br);border-radius:var(--rs);padding:16px;text-align:center;cursor:pointer;transition:border-color .15s;background:var(--bg2)}
+.photo-upload-area:hover{border-color:var(--ac)}
+.photo-upload-area input[type=file]{display:none}
+.photo-thumb-grid{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.photo-thumb{position:relative;width:80px;height:80px;border-radius:8px;overflow:hidden;border:1px solid var(--br)}
+.photo-thumb img{width:100%;height:100%;object-fit:cover}
+.photo-thumb .del-photo{position:absolute;top:2px;right:2px;background:rgba(0,0,0,.6);color:#fff;border:none;border-radius:50%;width:18px;height:18px;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1}
 .bio-btn{width:100%;padding:11px;background:#0d3050;border:1px solid #1e5080;color:#60d0ff;border-radius:var(--rs);font-size:14px;font-weight:600;cursor:pointer;font-family:var(--fn);transition:all .15s;margin-top:8px;display:flex;align-items:center;justify-content:center;gap:8px}
 .bio-btn:hover{background:#1a4070;border-color:#3a80c0}
 .bio-btn:disabled{opacity:.5;cursor:not-allowed}
@@ -625,14 +632,16 @@ const _FB_CONFIG = {
 };
 
 let _fbApp  = null;
-let _db     = null;   // Firestore instance
+let _db      = null;   // Firestore instance
+let _storage = null;   // Firebase Storage instance
 let _fbReady = false;
 let _fbSaving = false;
 
 (function initFirebase(){
   try {
     _fbApp = firebase.initializeApp(_FB_CONFIG);
-    _db    = firebase.firestore(_fbApp);
+    _db      = firebase.firestore(_fbApp);
+    _storage = firebase.storage(_fbApp);   // for logo hosting
     // Offline persistence (compat SDK v10)
     _db.enablePersistence({ synchronizeTabs:true }).catch(()=>{});
     _fbReady = true;
@@ -2115,23 +2124,45 @@ function submitUpdate(incidentId){
   const update = { id:uid(), ts:now(), note, by, statusChange:statusChange||null };
   i.updates.push(update);
   const prevStatus = i.status;
-  if(statusChange) i.status=statusChange;
-  i.updatedAt=now();
+  if(statusChange) i.status = statusChange;
+  i.updatedAt = now();
   auditLog('Update', `${i.incidentNo} updated by ${by}: ${note.slice(0,60)}`);
   checkEscalation(i);
-  const updateMsg = statusChange ? `${i.incidentNo} status changed to "${statusChange}" by ${by}` : `${i.incidentNo} updated by ${by}`;
+  const updateMsg = statusChange
+    ? `${i.incidentNo} status changed to "${statusChange}" by ${by}`
+    : `${i.incidentNo} updated by ${by}`;
   addNotification(i, 'update', updateMsg);
-  // If closed by safety officer → notify dept head, admin, superadmin, plant head
-  if(statusChange==='closed' && prevStatus!=='closed'){
+
+  // Send email notifications for status changes
+  if(statusChange === 'closed' && prevStatus !== 'closed'){
+    // Closed → notify all parties
     notifyIncidentClosed(i, by);
+    showToast(`✅ ${i.incidentNo} closed — notifications sent.`, 'ok');
+  } else if(statusChange && statusChange !== prevStatus){
+    // Other status change → notify SO, Admin, SuperAdmin
+    const { superAdmins, admins, safetyOfficers, plantHeads } = getPlantRoleUsers(i.plantId);
+    const notifRecipients = [...safetyOfficers, ...admins, ...superAdmins, ...plantHeads]
+      .filter(u => u.email && u.id !== currentUser?.id);
+    if(notifRecipients.length){
+      const emailList = buildEmailList(i, notifRecipients.map(u=>({
+        name: u.name, email: u.email, action: 'plant-head-view', tokenUrl: null
+      })));
+      dispatchAllEmails(emailList);
+    }
+    showToast(`✅ Status updated to "${statusChange}" — notifications sent.`, 'ok');
+  } else {
+    showToast('✅ Update saved.', 'ok');
   }
-  simulateSendEmail('(workflow)', i, statusChange==='closed'?'closure':'update');
+
   saveDB();
-  showToast('Update saved.','ok');
-  closeModal();
-  openIncident(incidentId);
+  // Refresh underlying view before re-opening modal
   if(_page==='incidents') renderIncidents();
   else if(_page==='dashboard') renderDashboard();
+  else if(_page==='my-plant') renderMyPlant();
+  else if(_page==='escalations') renderEscalations();
+  closeModal();
+  // Re-open incident with a small delay so the toast is visible first
+  setTimeout(()=>openIncident(incidentId), 300);
 }
 
 function deleteIncident(id){
@@ -2196,6 +2227,11 @@ function showIncidentForm(editId){
       <select id="f-status">${STATUSES.map(s=>`<option value="${s}"${i?.status===s?' selected':''}>${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}</select>
     </div>`:''}
     <div class="fg"><label>Witness Names</label><input id="f-witnesses" value="${xe(i?.witnesses||'')}" placeholder="Comma-separated names"></div>
+    <div class="fg full">
+      <label>Photos / Evidence</label>
+      ${buildPhotoUploadHtml('f-photo','f-photo-input', false)}
+    </div>
+    ${i?.photos?.length ? `<div class="fg full"><label>Existing Photos</label><div style="display:flex;flex-wrap:wrap;gap:8px">${i.photos.map(u=>`<a href="${xe(u)}" target="_blank" class="photo-thumb"><img src="${xe(u)}" alt="Photo"></a>`).join('')}</div></div>` : ''}
   </div>`;
 
   const footer=`<button class="btn" onclick="closeModal()">Cancel</button>
@@ -2206,9 +2242,10 @@ function showIncidentForm(editId){
   document.getElementById('modal-footer').innerHTML=footer;
   document.getElementById('modal-inner').className='modal';
   document.getElementById('modal').style.display='flex';
+  initPhotoUpload('f-photo','f-photo-input');
 }
 
-function saveIncident(editId){
+async function saveIncident(editId){
   const title = document.getElementById('f-title').value.trim();
   const plantId = document.getElementById('f-plant').value;
   const type = document.getElementById('f-type').value;
@@ -2238,13 +2275,17 @@ function saveIncident(editId){
     const i = DB.incidents.find(x=>x.id===editId);
     if(!i) return;
     const status = document.getElementById('f-status').value;
-    Object.assign(i,{title,plantId,type,severity,accidentCategory,department:dept,reportedBy:reporter,description,immediateAction:action,rootCause,location,witnesses,incidentDt,status,updatedAt:now()});
+    const _editPhotos = _pendingPhotos.length ? await uploadPhotosToStorage(i.id) : [];
+    const _allPhotos = [...(i.photos||[]), ..._editPhotos];
+    Object.assign(i,{title,plantId,type,severity,accidentCategory,department:dept,reportedBy:reporter,description,immediateAction:action,rootCause,location,witnesses,incidentDt,status,photos:_allPhotos,updatedAt:now()});
     auditLog('Edit',`Incident ${i.incidentNo} edited`);
     saveDB(); closeModal(); showToast('Incident updated.','ok');
     openIncident(editId);
   } else {
     const incidentNo = 'INC-'+String(DB.incidents.length+1).padStart(4,'0');
-    const i = { id:uid(), incidentNo, title, plantId, type, severity, accidentCategory, department:dept, reportedBy:reporter, description, immediateAction:action, rootCause, location, witnesses, incidentDt, status:'open', createdAt:now(), updatedAt:now(), updates:[], assignedHOD:null, hodRootCause:'', hodActionPlan:'', hodSubmittedAt:null };
+    const _newId = uid();
+    const _newPhotos = await uploadPhotosToStorage(_newId);
+    const i = { id:_newId, incidentNo, title, plantId, type, severity, accidentCategory, department:dept, reportedBy:reporter, description, immediateAction:action, rootCause, location, witnesses, incidentDt, status:'open', photos:_newPhotos, createdAt:now(), updatedAt:now(), updates:[], assignedHOD:null, hodRootCause:'', hodActionPlan:'', hodSubmittedAt:null };
     DB.incidents.unshift(i);
     auditLog('Create',`Incident ${incidentNo} created by ${reporter}`);
     checkEscalation(i);
@@ -2288,6 +2329,7 @@ function switchPubView(view){
 }
 
 function renderPubReport(){
+  initPhotoUpload('pf-photo','pf-photo-input');
   document.getElementById('pub-view').innerHTML=`
   <div class="fgrid">
     <div class="fg full"><label class="required">Incident Title</label><input id="pf-title" placeholder="Brief description"></div>
@@ -2304,14 +2346,18 @@ function renderPubReport(){
     <div class="fg"><label>Location / Area</label><input id="pf-location" placeholder="e.g. Production Floor A"></div>
     <div class="fg full"><label class="required">Description</label><textarea id="pf-desc" rows="4" placeholder="What happened? Describe the incident clearly…"></textarea></div>
     <div class="fg full"><label>Immediate Action Taken</label><textarea id="pf-action" rows="3" placeholder="Any immediate steps you or others took…"></textarea></div>
-    <div class="fg"><label>Witness Names</label><input id="pf-witnesses" placeholder="Names, comma separated"></div>
+        <div class="fg"><label>Witness Names</label><input id="pf-witnesses" placeholder="Names, comma separated"></div>
+    <div class="fg full">
+      <label>Photos / Evidence</label>
+      ${buildPhotoUploadHtml('pf-photo','pf-photo-input', true)}
+    </div>
     <div class="fg full" style="margin-top:8px">
       <button class="btn bp" style="width:100%;padding:11px;font-size:14px" onclick="submitPublicIncident()">Submit Incident Report →</button>
     </div>
   </div>`;
 }
 
-function submitPublicIncident(){
+async function submitPublicIncident(){
   const title = document.getElementById('pf-title').value.trim();
   const type = document.getElementById('pf-type').value;
   const severity = document.getElementById('pf-severity').value;
@@ -2331,7 +2377,9 @@ function submitPublicIncident(){
 
   const incidentNo = 'INC-'+String(DB.incidents.length+1).padStart(4,'0');
   const reporter = publicSession.name + (publicSession.dept?` (${publicSession.dept})`:'');
-  const i = { id:uid(), incidentNo, title, plantId:publicSession.plantId, type, severity, department:dept, reportedBy:reporter, description:desc, immediateAction:action, rootCause:'', location, witnesses, incidentDt:dt, status:'open', createdAt:now(), updatedAt:now(), updates:[], assignedHOD:null, hodRootCause:'', hodActionPlan:'', hodSubmittedAt:null };
+  const _pubId = uid();
+  const _pubPhotos = await uploadPhotosToStorage(_pubId);
+  const i = { id:_pubId, incidentNo, title, plantId:publicSession.plantId, type, severity, department:dept, reportedBy:reporter, description:desc, immediateAction:action, rootCause:'', location, witnesses, incidentDt:dt, status:'open', photos:_pubPhotos, createdAt:now(), updatedAt:now(), updates:[], assignedHOD:null, hodRootCause:'', hodActionPlan:'', hodSubmittedAt:null };
   DB.incidents.unshift(i);
   auditLog('Public Report',`Incident ${incidentNo} filed by ${reporter}`);
   checkEscalation(i);
@@ -2763,6 +2811,94 @@ function closeMobileSidebar(){
   sb && sb.classList.remove('mob-open');
   ov && ov.classList.remove('visible');
 }
+
+/* ══ PHOTO UPLOAD — works for both admin form and public form ══ */
+let _pendingPhotos = []; // [{dataUrl, name}] — cleared on each form open
+
+function initPhotoUpload(containerId, inputId){
+  _pendingPhotos = [];
+  renderPhotoThumbs(containerId);
+}
+
+function handlePhotoSelect(inputId, containerId){
+  const input = document.getElementById(inputId);
+  if(!input || !input.files.length) return;
+  const maxPhotos = 5;
+  const remaining = maxPhotos - _pendingPhotos.length;
+  const files = Array.from(input.files).slice(0, remaining);
+  if(files.length < input.files.length) showToast(`Max ${maxPhotos} photos allowed.`,'warn');
+
+  let loaded = 0;
+  files.forEach(file => {
+    if(file.size > 5*1024*1024){ showToast(`${file.name} is over 5MB — skipped.`,'warn'); loaded++; return; }
+    const reader = new FileReader();
+    reader.onload = e => {
+      _pendingPhotos.push({ dataUrl: e.target.result, name: file.name });
+      loaded++;
+      if(loaded === files.length) renderPhotoThumbs(containerId);
+    };
+    reader.readAsDataURL(file);
+  });
+  input.value = ''; // reset so same file can be re-added if removed
+}
+
+function removePhoto(idx, containerId){
+  _pendingPhotos.splice(idx, 1);
+  renderPhotoThumbs(containerId);
+}
+
+function renderPhotoThumbs(containerId){
+  const grid = document.getElementById(containerId + '-thumbs');
+  if(!grid) return;
+  if(!_pendingPhotos.length){ grid.innerHTML = ''; return; }
+  grid.innerHTML = _pendingPhotos.map((p,i) =>
+    `<div class="photo-thumb">
+      <img src="${p.dataUrl}" alt="${xe(p.name)}">
+      <button class="del-photo" onclick="removePhoto(${i},'${containerId}')" title="Remove">&#215;</button>
+    </div>`
+  ).join('');
+}
+
+async function uploadPhotosToStorage(incidentId){
+  if(!_storage || !_pendingPhotos.length) return _pendingPhotos.map(p=>p.dataUrl);
+  const urls = [];
+  for(let i=0; i<_pendingPhotos.length; i++){
+    try{
+      const p = _pendingPhotos[i];
+      const ext = p.name.split('.').pop()||'jpg';
+      const ref = _storage.ref('incidentpro/photos/' + incidentId + '/' + uid() + '.' + ext);
+      // Convert dataUrl to blob
+      const res  = await fetch(p.dataUrl);
+      const blob = await res.blob();
+      const snap = await ref.put(blob, { cacheControl:'public,max-age=31536000' });
+      const url  = await snap.ref.getDownloadURL();
+      urls.push(url);
+    }catch(e){
+      console.warn('[Photo] Upload failed, using dataUrl:', e.message);
+      urls.push(_pendingPhotos[i].dataUrl);
+    }
+  }
+  return urls;
+}
+
+function buildPhotoUploadHtml(containerId, inputId, allowCamera){
+  const cameraCapture = allowCamera ? 'capture="environment"' : '';
+  return `<div class="photo-upload-area" onclick="document.getElementById('${inputId}').click()">
+    <input type="file" id="${inputId}" accept="image/*" multiple ${cameraCapture}
+      onchange="handlePhotoSelect('${inputId}','${containerId}')">
+    <div style="display:flex;align-items:center;justify-content:center;gap:12px;color:var(--t3)">
+      <svg width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+        <path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/>
+        <circle cx="12" cy="13" r="3"/>
+      </svg>
+      <div style="text-align:left">
+        <div style="font-size:13px;font-weight:500;color:var(--t2)">Add Photos</div>
+        <div style="font-size:11px">Camera or file upload · up to 5 photos · 5MB each</div>
+      </div>
+    </div>
+  </div>
+  <div id="${containerId}-thumbs" class="photo-thumb-grid"></div>`;
+}
 function startAutoEngine(){
   if(_autoEngineTimer) return; // already running
   console.log('[AutoEngine] Started');
@@ -3028,16 +3164,19 @@ function getTokenURL(token){
 function buildEmailWrapper(opts){
   var company=opts.company, logo=opts.logoBase64||'', hc=opts.headerColor, ha=opts.headerAccent, title=opts.title, sub=opts.subtitle, body=opts.body;
   var xe=function(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');};
-  var logoHtml = logo
+  // Prefer HTTPS URL (email-safe) over base64
+  var logoSrc = (opts.logoUrl && opts.logoUrl.startsWith('https')) ? opts.logoUrl
+              : (logo && logo.startsWith('data:')) ? logo : '';
+  var logoHtml = logoSrc
     ? '<!--[if mso]><table cellpadding="0" cellspacing="0" border="0">'
     + '<tr><td width="180" bgcolor="#ffffff" style="width:180px;padding:8px 12px;border-radius:12px;">'
-    + '<img src="'+logo+'" width="156" height="40" border="0"'
+    + '<img src="'+logoSrc+'" width="156" height="40" border="0"'
     + ' style="display:block;width:156px;height:40px">'
     + '</td></tr></table>'
     + '<![endif]-->'
     + '<!--[if !mso]><!-->'
     + '<div style="display:inline-block;background:#ffffff;border-radius:12px;padding:8px 12px;margin-bottom:14px">'
-    + '<img src="'+logo+'" alt="'+xe(company)+'" style="max-height:40px;max-width:156px;height:auto;display:block;border:0">'
+    + '<img src="'+logoSrc+'" alt="'+xe(company)+'" style="max-height:40px;max-width:156px;height:auto;display:block;border:0">'
     + '</div>'
     + '<!--<![endif]-->'
     : '<div style="font-size:11px;font-weight:700;letter-spacing:2px;color:#90c0e0;text-transform:uppercase;margin-bottom:14px">IncidentPro</div>';
@@ -3063,6 +3202,11 @@ function _incidentCard(incident, plant, sevColor){
   var sevBg={critical:'#f3e8ff',high:'#fee2e2',medium:'#fffbeb',low:'#eff6ff'}[incident.severity]||'#f8fafc';
   var sevLabel=(xe(incident.severity)||'').toUpperCase();
   var desc=incident.description?'<div style="margin-top:10px;padding:10px 12px;background:rgba(255,255,255,0.75);border-radius:8px;font-size:12px;color:#334155;line-height:1.6">'+xe(incident.description)+'</div>':'';
+  var photoHtml='';
+  if(incident.photos&&incident.photos.length){
+    var pLinks=incident.photos.slice(0,3).map(function(u,i){return '<a href="'+u+'" style="display:inline-block;margin-right:6px;font-size:12px;color:#1a5ab3">📷 Photo '+(i+1)+'</a>';}).join('');
+    photoHtml='<div style="margin-top:8px;font-size:12px;color:#475569">'+pLinks+(incident.photos.length>3?'<span style="color:#94a3b8"> +more</span>':'')+'</div>';
+  }
   var dt=xe((incident.incidentDt||incident.createdAt||'').slice(0,16).replace('T',' '));
   return '<table width="100%" cellpadding="0" cellspacing="0" style="background:'+sevBg+';border-radius:14px;margin:16px 0;border-left:5px solid '+sevColor+'">'
     +'<tr><td style="padding:16px 20px">'
@@ -3073,7 +3217,7 @@ function _incidentCard(incident, plant, sevColor){
     +'<tr><td>&#127981; <b>Plant:</b> '+xe(plant&&plant.name||'—')+'</td><td>&#128194; <b>Type:</b> '+xe(incident.type||'—')+'</td></tr>'
     +'<tr><td>&#127970; <b>Dept:</b> '+xe(incident.department||'—')+'</td><td>&#128100; <b>By:</b> '+xe(incident.reportedBy||'—')+'</td></tr>'
     +'<tr><td colspan="2">&#128197; <b>Date:</b> '+dt+'</td></tr>'
-    +'</table>'+desc+'</td></tr></table>';
+    +'</table>'+desc+photoHtml+'</td></tr></table>';
 }
 
 function _actionBtn(label, url, color){
@@ -3089,6 +3233,7 @@ function buildEmailHTML(incident, recipientName, action, tokenUrl){
   var sevColor={critical:'#7c3aed',high:'#c0291a',medium:'#c07a10',low:'#1a5ab3'}[incident.severity]||'#888';
   var company=DB.settings&&DB.settings.companyName||'Your Company';
   var logo=DB.settings&&DB.settings.logo||'';
+  var logoUrl=DB.settings&&DB.settings.logoUrl||'';
   var card=_incidentCard(incident,plant,sevColor);
   var hc='#0d1f33',ha='#d64a1a',title='&#9888; Incident Alert',sub=company+' &middot; IncidentPro',msg='',btn='';
   if(action==='hod-response'){
@@ -3114,7 +3259,7 @@ function buildEmailHTML(incident, recipientName, action, tokenUrl){
     btn=_actionBtn('&#128203; Review &amp; Close Incident &rarr;',tokenUrl,'#1a5ab3');
   }
   var body=msg+card+btn+'<p style="font-size:11px;color:#94a3b8;margin-top:8px">This link is valid for 7 days and is unique to you &mdash; do not share it.</p>';
-  return buildEmailWrapper({company:company,logoBase64:logo,headerColor:hc,headerAccent:ha,title:title,subtitle:sub,body:body});
+  return buildEmailWrapper({company:company,logoBase64:logo,logoUrl:logoUrl,headerColor:hc,headerAccent:ha,title:title,subtitle:sub,body:body});
 }
 
 function _buildEscalationHtml(incident, rule, ageH, recipientName, actionLink, plantName, company, logo){
@@ -3126,7 +3271,8 @@ function _buildEscalationHtml(incident, rule, ageH, recipientName, actionLink, p
     +_incidentCard(incident,plant,sevColor)
     +'<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:12px 16px;margin:16px 0;font-size:13px;color:#9a3412"><strong>Rule:</strong> '+xe(rule.description||rule.name)+'<br>'+ruleNote+'</div>'
     +_actionBtn('&#9889; View &amp; Act on Incident &rarr;',actionLink,'#d64a1a');
-  return buildEmailWrapper({company:company,logoBase64:logo||'',headerColor:'#1a0800',headerAccent:'#d64a1a',title:'&#9889; Escalation Alert &mdash; '+xe(incident.incidentNo),subtitle:xe(company)+' &middot; Auto-Escalation',body:body});
+  var _lurl=DB.settings&&DB.settings.logoUrl||'';
+  return buildEmailWrapper({company:company,logoBase64:logo||'',logoUrl:_lurl,headerColor:'#1a0800',headerAccent:'#d64a1a',title:'&#9889; Escalation Alert &mdash; '+xe(incident.incidentNo),subtitle:xe(company)+' &middot; Auto-Escalation',body:body});
 }
 
 function _buildReminderHtml(incident, rule, ageH, recipientName, actionLink, plantName, company, logo, isHOD){
@@ -3137,7 +3283,8 @@ function _buildReminderHtml(incident, rule, ageH, recipientName, actionLink, pla
   var body='<p style="color:#475569;font-size:14px;line-height:1.7;margin:0 0 16px">Dear <strong>'+xe(recipientName)+'</strong>,<br><br>'+msg+'</p>'
     +_incidentCard(incident,plant,sevColor)
     +_actionBtn(isHOD?'&#128203; Submit Root Cause &amp; Action Plan &rarr;':'&#128276; View Incident &rarr;',actionLink,isHOD?'#d64a1a':'#c07a10');
-  return buildEmailWrapper({company:company,logoBase64:logo||'',headerColor:'#1a1000',headerAccent:'#c07a10',title:'&#128276; Reminder &mdash; '+xe(incident.incidentNo),subtitle:xe(company)+' &middot; Auto-Reminder ('+xe(rule.name)+')',body:body});
+  var _lurl2=DB.settings&&DB.settings.logoUrl||'';
+  return buildEmailWrapper({company:company,logoBase64:logo||'',logoUrl:_lurl2,headerColor:'#1a1000',headerAccent:'#c07a10',title:'&#128276; Reminder &mdash; '+xe(incident.incidentNo),subtitle:xe(company)+' &middot; Auto-Reminder ('+xe(rule.name)+')',body:body});
 }
 
 
@@ -3466,24 +3613,29 @@ async function notifyHODAssigned(incident, hodUser){
   dispatchAllEmails(buildEmailList(incident, recipients));
 }
 
-// HOD submits → notify SO, Admin, SuperAdmin with review link
+// HOD submits → notify SO, Admin, SuperAdmin, Plant Head with review link
 async function notifyHODSubmission(incident, hodName){
-  const { superAdmins, admins, safetyOfficers } = getPlantRoleUsers(incident.plantId);
+  const { superAdmins, admins, safetyOfficers, plantHeads } = getPlantRoleUsers(incident.plantId);
   const msg = `📝 HOD submitted root cause & action plan for ${incident.incidentNo} — by ${hodName}`;
   addNotification(incident, 'update', msg);
-  const recipients = [...safetyOfficers, ...admins, ...superAdmins].map(u=>{
-    const tok = generateToken(incident.id, u.id, u.name, u.email, 'hod-submission-notify');
-    return { name:u.name, email:u.email, action:'hod-submission-notify', tokenUrl:getTokenURL(tok) };
-  });
+  const recipients = [...safetyOfficers, ...admins, ...superAdmins, ...plantHeads]
+    .filter(u => u.email)
+    .map(u=>{
+      const tok = generateToken(incident.id, u.id, u.name, u.email, 'hod-submission-notify');
+      return { name:u.name, email:u.email, action:'hod-submission-notify', tokenUrl:getTokenURL(tok) };
+    });
   saveDB();
-  auditLog('HOD Submission Notified', `${incident.incidentNo} — ${recipients.length} recipients`);
+  auditLog('HOD Submission Notified', `${incident.incidentNo} — ${recipients.length} recipients (SO, Admin, SuperAdmin, Plant Head)`);
   dispatchAllEmails(buildEmailList(incident, recipients));
 }
 
 // Incident closed → HOD + Plant Head (magic link), Admin + SuperAdmin (direct)
 async function notifyIncidentClosed(incident, closedBy){
   const { superAdmins, admins, plantHeads } = getPlantRoleUsers(incident.plantId);
-  const hodUser = incident.assignedHOD ? DB.users.find(u=>u.id===incident.assignedHOD) : null;
+  // Support both DB users and email-based HODs (no account)
+  const hodUser = incident.assignedHOD
+    ? (DB.users.find(u=>u.id===incident.assignedHOD) || (incident._hodEmail ? {id:incident.assignedHOD, name:incident._hodName, email:incident._hodEmail} : null))
+    : null;
   addNotification(incident, 'update', `✅ Incident ${incident.incidentNo} CLOSED by ${closedBy}`);
 
   const recipients = [];
@@ -4826,22 +4978,55 @@ async function testGmailConnection(){
   }
 }
 
-function handleLogoUpload(input){
-  const file=input.files[0]; if(!file) return;
-  if(file.size>500000){ showToast('Logo must be under 500KB.','warn'); return; }
-  const reader=new FileReader();
-  reader.onload=e=>{
-    DB.settings.logo=e.target.result;
+async function handleLogoUpload(input){
+  const file = input.files[0]; if(!file) return;
+  if(file.size > 500000){ showToast('Logo must be under 500KB.','warn'); return; }
+
+  showToast('Uploading logo…', 'info');
+
+  // Always store base64 for in-app display (sidebar, login, PDF)
+  const reader = new FileReader();
+  reader.onload = async e => {
+    DB.settings.logo = e.target.result; // base64 for app UI
+
+    // Also upload to Firebase Storage for email-safe HTTPS URL
+    if(_storage){
+      try {
+        const ext = file.name.split('.').pop().toLowerCase() || 'png';
+        const ref  = _storage.ref('incidentpro/logo.' + ext);
+        // Make file publicly readable
+        const metadata = { contentType: file.type, cacheControl: 'public,max-age=31536000' };
+        const snap = await ref.put(file, metadata);
+        const url  = await snap.ref.getDownloadURL();
+        DB.settings.logoUrl = url; // HTTPS URL — safe in all email clients
+        console.log('[Logo] Uploaded to Storage:', url);
+        showToast('Logo uploaded ✅', 'ok');
+      } catch(e) {
+        console.warn('[Logo] Storage upload failed, using base64 fallback:', e.message);
+        DB.settings.logoUrl = ''; // clear stale URL if any
+        showToast('Logo saved (email display may be limited — check Storage permissions).','warn');
+      }
+    } else {
+      DB.settings.logoUrl = '';
+      showToast('Logo uploaded ✅', 'ok');
+    }
+
     saveDB();
     applyLogo(); applyLoginLogo(); applyPublicLogo();
     renderSettings();
-    showToast('Logo uploaded.','ok');
   };
   reader.readAsDataURL(file);
 }
 
 function removeLogo(){
-  DB.settings.logo='';
+  DB.settings.logo = '';
+  DB.settings.logoUrl = '';
+  // Also delete from Storage if it exists
+  if(_storage){
+    ['png','jpg','jpeg','svg','gif'].forEach(ext=>{
+      _storage.ref('incidentpro/logo.'+ext).delete().catch(()=>{});
+    });
+  }
   saveDB(); applyLogo(); applyLoginLogo(); applyPublicLogo(); renderSettings(); showToast('Logo removed.','ok');
 }
 
