@@ -223,6 +223,9 @@ textarea{resize:vertical;min-height:80px}
 .login-divider::before{left:0}.login-divider::after{right:0}
 .login-public-btn{width:100%;padding:10px;background:transparent;border:1px solid #1e3550;color:#7aa0c0;border-radius:var(--rs);font-size:13px;font-weight:500;cursor:pointer;font-family:var(--fn);transition:all .15s;text-align:center}
 .login-public-btn:hover{background:#061828;border-color:#2a4a6a}
+.bio-btn{width:100%;padding:11px;background:#0d3050;border:1px solid #1e5080;color:#60d0ff;border-radius:var(--rs);font-size:14px;font-weight:600;cursor:pointer;font-family:var(--fn);transition:all .15s;margin-top:8px;display:flex;align-items:center;justify-content:center;gap:8px}
+.bio-btn:hover{background:#1a4070;border-color:#3a80c0}
+.bio-btn:disabled{opacity:.5;cursor:not-allowed}
 
 /* ── PUBLIC INCIDENT FORM ── */
 #public-overlay{position:fixed;inset:0;background:var(--bg);z-index:7000;display:none;overflow-y:auto;padding:20px}
@@ -447,6 +450,13 @@ textarea{resize:vertical;min-height:80px}
         <input class="login-inp" id="l-user" placeholder="Username" autocomplete="username">
         <input class="login-inp" type="password" id="l-pass" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLoginUnified()">
         <button class="login-btn" onclick="doLoginUnified()">Sign In</button>
+        <div id="bio-section" style="display:none">
+          <div class="login-divider">or</div>
+          <button class="bio-btn" id="bio-btn" onclick="doBiometricLogin()">
+            <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 008 4.07M3 15.364c.64-1.319 1-2.8 1-4.364 0-1.457.39-2.823 1.07-4"/></svg>
+            Sign in with Biometrics
+          </button>
+        </div>
       </div>
 
       <!-- legacy stub pane — keeps references to sa-user/sa-pass alive (used in doLogout) -->
@@ -990,6 +1000,135 @@ function switchLTab(tab){
 }
 
 /* ── UNIFIED ADMIN LOGIN — auto-detects Super Admin vs Plant Admin ── */
+
+/* ══════════════════════════════════════════════════════════════════════
+   BIOMETRIC AUTH — WebAuthn (Face ID / Touch ID / Fingerprint)
+   Flow:
+     Register:  after successful password login → offer to save biometric
+     Login:     on next visit → "Sign in with Biometrics" button
+   Storage:    credentialId stored in localStorage (non-sensitive public id)
+               actual secret never leaves device secure enclave
+   ══════════════════════════════════════════════════════════════════════ */
+
+const BIO_KEY      = 'ip_bio_cred';   // stores {credId, username}
+const BIO_USER_KEY = 'ip_bio_user';   // stores encrypted username for re-auth
+
+function _bioSupported(){
+  return !!(window.PublicKeyCredential &&
+    typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable === 'function');
+}
+
+async function _bioAvailable(){
+  if(!_bioSupported()) return false;
+  try{ return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable(); }
+  catch(e){ return false; }
+}
+
+function _b64url(buf){
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function _fromB64url(s){
+  s = s.replace(/-/g,'+').replace(/_/g,'/');
+  while(s.length%4) s+='=';
+  return Uint8Array.from(atob(s), c=>c.charCodeAt(0)).buffer;
+}
+
+/* Called after successful password login — offer to register biometric */
+async function offerBiometricEnroll(user){
+  if(!await _bioAvailable()) return;
+  const existing = localStorage.getItem(BIO_KEY);
+  if(existing) return; // already enrolled
+  const ok = confirm('Enable biometric login (Face ID / fingerprint) for faster sign-in?');
+  if(!ok) return;
+  await enrollBiometric(user);
+}
+
+async function enrollBiometric(user){
+  try{
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const uid_bytes = new TextEncoder().encode(user.id || user.username);
+
+    const cred = await navigator.credentials.create({ publicKey:{
+      challenge,
+      rp:{ name:'IncidentPro', id: location.hostname },
+      user:{ id: uid_bytes, name: user.username, displayName: user.name },
+      pubKeyCredParams:[
+        { type:'public-key', alg:-7  }, // ES256
+        { type:'public-key', alg:-257 }, // RS256
+      ],
+      authenticatorSelection:{ authenticatorAttachment:'platform', userVerification:'required' },
+      timeout: 60000,
+    }});
+
+    const credData = { credId: _b64url(cred.rawId), username: user.username };
+    localStorage.setItem(BIO_KEY, JSON.stringify(credData));
+    showToast('✅ Biometric login enabled! Use it next time you sign in.','ok');
+    // Refresh login screen to show biometric button next time
+    document.getElementById('bio-section') && initBioButton();
+  }catch(e){
+    if(e.name!=='NotAllowedError') showToast('Biometric setup failed: '+e.message,'err');
+  }
+}
+
+async function doBiometricLogin(){
+  const stored = localStorage.getItem(BIO_KEY);
+  if(!stored){ showToast('No biometric credential found. Sign in with password first.','warn'); return; }
+  const { credId, username } = JSON.parse(stored);
+
+  const btn = document.getElementById('bio-btn');
+  if(btn){ btn.disabled=true; btn.childNodes[1] && (btn.childNodes[1].textContent=' Verifying…'); }
+
+  try{
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const assertion = await navigator.credentials.get({ publicKey:{
+      challenge,
+      allowCredentials:[{ type:'public-key', id: _fromB64url(credId) }],
+      userVerification:'required',
+      timeout:60000,
+    }});
+
+    // Biometric verified by device — find the user and log them in
+    const allUsers = [...(DB.users||[]), ..._DEFAULTS.users];
+    const seen=new Set();
+    const unique=allUsers.filter(u=>{ if(seen.has(u.id)) return false; seen.add(u.id); return true; });
+    const user = unique.find(u=>(u.username||'').toLowerCase()===username.toLowerCase());
+
+    if(!user){ showToast('User not found — please sign in with password.','err'); return; }
+
+    if(user.role==='super-admin'){ currentUser=user; currentPlantFilter='all'; }
+    else { currentUser=user; currentPlantFilter=user.plant||'all'; }
+    showApp();
+  }catch(e){
+    if(e.name==='NotAllowedError') showToast('Biometric cancelled.','warn');
+    else showToast('Biometric failed: '+e.message,'err');
+  }finally{
+    if(btn){ btn.disabled=false; btn.innerHTML='<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 008 4.07M3 15.364c.64-1.319 1-2.8 1-4.364 0-1.457.39-2.823 1.07-4"/></svg> Sign in with Biometrics'; }
+  }
+}
+
+/* Remove biometric enrollment (called from settings) */
+function removeBiometric(){
+  localStorage.removeItem(BIO_KEY);
+  initBioButton();
+  showToast('Biometric login removed.','ok');
+}
+
+/* Show/hide biometric button based on enrollment + device support */
+async function initBioButton(){
+  const sec = document.getElementById('bio-section');
+  const btn = document.getElementById('bio-btn');
+  if(!sec) return;
+  const available = await _bioAvailable();
+  const enrolled  = !!localStorage.getItem(BIO_KEY);
+  // Show button only if device supports biometrics AND user has enrolled
+  sec.style.display = (available && enrolled) ? 'block' : 'none';
+  if(btn && enrolled){
+    const {username} = JSON.parse(localStorage.getItem(BIO_KEY));
+    btn.title = 'Sign in as '+username;
+  }
+}
+
 function doLoginUnified(){
   const username=(document.getElementById('l-user').value||'').trim().toLowerCase();
   const password=document.getElementById('l-pass').value||'';
@@ -1020,6 +1159,8 @@ function doLoginUnified(){
     currentUser=user; currentPlantFilter=user.plant||'all';
   }
   showApp();
+  // Offer biometric enrollment after successful password login
+  setTimeout(()=>offerBiometricEnroll(user), 1500);
 }
 
 /* Legacy aliases — keep so any older inline onclick references don't break */
@@ -4389,14 +4530,28 @@ function renderSettings(){
         </details>
       </div>
 
+      <!-- Biometric Login Card -->
+      <div class="card" style="margin-top:16px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:8px">
+          <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 008 4.07M3 15.364c.64-1.319 1-2.8 1-4.364 0-1.457.39-2.823 1.07-4"/></svg>
+          Biometric Login
+        </div>
+        <div id="bio-settings-card"><span style="font-size:12px;color:var(--t3)">Checking device support…</span></div>
+      </div>
+
     </div>
   </div>`;
+  setTimeout(renderBioCard, 0);
 }
 
 function saveCompanySettings(){
   DB.settings.companyName = document.getElementById('s-company').value.trim();
   DB.settings.emailDomain = document.getElementById('s-domain').value.trim();
   saveDB(); showToast('Settings saved.','ok');
+}
+
+function saveBioSettings(){
+  // placeholder — biometric managed via removeBiometric()
 }
 
 function saveNotifSettings(){
@@ -4507,6 +4662,26 @@ async function testCloudFunction(){
     if(data.ok) showToast('✅ Test email sent to '+currentUser?.email,'ok');
     else showToast('❌ '+(data.error||data.reason||'failed'),'err');
   }catch(e){ showToast('❌ '+e.message,'err'); }
+}
+
+function renderBioCard(){
+  const sec = document.getElementById('bio-settings-card');
+  if(!sec) return;
+  const enrolled = !!localStorage.getItem('ip_bio_cred');
+  sec.innerHTML = enrolled
+    ? `<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+         <div>
+           <div style="font-size:13px;font-weight:600;color:var(--ok)">✅ Biometric login enabled</div>
+           <div style="font-size:12px;color:var(--t3);margin-top:2px">Face ID / Touch ID / Fingerprint active for this device</div>
+         </div>
+         <button class="btn bs" style="color:var(--er);border-color:var(--er)" onclick="removeBiometric();renderBioCard()">Remove</button>
+       </div>`
+    : `<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+         <div>
+           <div style="font-size:13px;font-weight:600;color:var(--t2)">Biometric login not set up</div>
+           <div style="font-size:12px;color:var(--t3);margin-top:2px">Sign in with password first — you'll be prompted to enable biometrics</div>
+         </div>
+       </div>`;
 }
 
 function saveGmailSettings(){
@@ -5898,6 +6073,7 @@ document.addEventListener('click', function(e){
 /* ── INIT ── */
 // All DOM interactions deferred to DOMContentLoaded
 document.addEventListener('DOMContentLoaded', function _appInit(){
+  initBioButton(); // show biometric button if device supports it & user enrolled
   // Ensure login is visible, app hidden
   const lo = document.getElementById('login-overlay');
   const ap = document.getElementById('app');
