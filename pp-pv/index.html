@@ -1122,6 +1122,17 @@ tr.bulk-selected td{background:rgba(224,85,85,.07) !important}
    70%  { box-shadow:0 0 0 6px transparent; }
   100%  { box-shadow:0 0 0 0 transparent; }
 }
+
+/* ── Recipient toggle switch ── */
+.recip-toggle{position:relative;display:inline-block;width:32px;height:18px;flex-shrink:0}
+.recip-toggle input{opacity:0;width:0;height:0;position:absolute}
+.recip-toggle .slider{position:absolute;inset:0;background:var(--navy3);border-radius:18px;transition:.2s;cursor:pointer}
+.recip-toggle .slider:before{content:"";position:absolute;width:12px;height:12px;left:3px;bottom:3px;background:var(--slate);border-radius:50%;transition:.2s}
+.recip-toggle input:checked+.slider{background:var(--green,#3ecf8e)}
+.recip-toggle input:checked+.slider:before{transform:translateX(14px);background:#fff}
+.recip-toggle-bulk{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--slate);cursor:pointer;padding:3px 8px;border-radius:4px;border:1px solid var(--navy3);background:var(--navy4);transition:background .15s;user-select:none}
+.recip-toggle-bulk:hover{background:var(--navy3)}
+
 </style>
 <script>
 // Instantly hide login screen for any email link — runs before DOM paints
@@ -4684,7 +4695,7 @@ function saveAzureSettings() {
         notifTitle: (_gm.notifTitle  || 'Customer Visit').trim(),
         prefixTag:  (_gm.prefixTag   !== undefined ? _gm.prefixTag : '').trim(),
         senderName: (_gm.senderName  || 'PlantVisit Digest').trim(),
-        recipients: (_dd.recipients  || '').trim(),
+        recipients: _ddActiveEmails().join(', ') || (_dd.recipients || '').trim(),
       }),
     }).catch(() => {}); // silent - user already got the save toast
   }
@@ -5585,7 +5596,10 @@ async function sendDailyDigestEmail(force = false) {
   const subject    = (prefixTag ? prefixTag + ' ' : '') + notifLabel + ` | Daily Digest — ${relevant.length} completed · ${newlyAdded.length} new · ${todayOngoing.length} today · ${upcoming48.length} upcoming | ${dateStr}`;
 
   // Determine recipients
-  const digestRecipients = (dd.recipients || '').split(',').map(s => s.trim()).filter(Boolean);
+  // Use only active (enabled) digest recipients; fall back to primary toEmail
+  const digestRecipients = _ddActiveEmails().length
+    ? _ddActiveEmails()
+    : ((dd.recipients || '').split(',').map(s=>s.trim()).filter(Boolean));
   if (!digestRecipients.length && gm.toEmail) digestRecipients.push(gm.toEmail);
   if (!digestRecipients.length) {
     toast('No Recipients', 'Please set digest recipient emails in Notification Settings.', true);
@@ -8555,73 +8569,86 @@ function _pvBioOfferRegistration(username) {
 // ══════════════════════════════════════════════════════════════════════
 
 /* ── Shared state ── */
-const _gmRecipients  = [];   // Gmail To/CC recipient list
-const _ddRecipients  = [];   // Daily Digest recipient list
+// _gmRecipients / _ddRecipients now store {email, enabled} objects
+const _gmRecipients  = [];   // Gmail To/CC recipient list  [{email, enabled}]
+const _ddRecipients  = [];   // Daily Digest recipient list [{email, enabled}]
 
 /* ── Helpers ── */
 function _isValidEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim()); }
 function _normaliseEmails(raw) {
-  return raw
-    .split(/[\n,;]+/)
-    .map(s => s.trim().toLowerCase())
-    .filter(e => _isValidEmail(e));
+  return raw.split(/[\n,;]+/).map(s => s.trim().toLowerCase()).filter(e => _isValidEmail(e));
+}
+function _gmActiveEmails()  { return _gmRecipients.filter(r=>r.enabled).map(r=>r.email); }
+function _ddActiveEmails()  { return _ddRecipients.filter(r=>r.enabled).map(r=>r.email); }
+function _gmHasEmail(em)    { return _gmRecipients.some(r=>r.email===em); }
+function _ddHasEmail(em)    { return _ddRecipients.some(r=>r.email===em); }
+
+/* ── Shared toggle renderer ── */
+function _mkToggle(id, checked, onchange) {
+  return `<label class="recip-toggle" title="${checked?'Enabled — click to mute':'Muted — click to enable'}">
+    <input type="checkbox" id="${id}" ${checked?'checked':''} onchange="${onchange}">
+    <span class="slider"></span>
+  </label>`;
 }
 
 /* ─────────────── GMAIL RECIPIENTS ─────────────── */
 
 function _gmRenderList() {
-  const listEl   = document.getElementById('gm_recip_list');
-  const emptyEl  = document.getElementById('gm_recip_empty');
-  const countEl  = document.getElementById('gm_recip_count');
-  const selBtn   = document.getElementById('gm_delete_selected_btn');
-  const toSel    = document.getElementById('gm_to_email');
+  const listEl  = document.getElementById('gm_recip_list');
+  const countEl = document.getElementById('gm_recip_count');
+  const selBtn  = document.getElementById('gm_delete_selected_btn');
+  const toSel   = document.getElementById('gm_to_email');
   if (!listEl) return;
 
-  const n = _gmRecipients.length;
-  countEl.textContent = n + ' address' + (n !== 1 ? 'es' : '');
+  const n       = _gmRecipients.length;
+  const enabled = _gmActiveEmails().length;
+  countEl.textContent = n + ' address' + (n !== 1 ? 'es' : '') + (n ? ` · ${enabled} active` : '');
 
   if (n === 0) {
-    listEl.innerHTML = '';
-    listEl.appendChild(emptyEl || _mkGmEmpty());
-    if (toSel) { toSel.innerHTML = '<option value="">— select from recipients above —</option>'; }
+    listEl.innerHTML = `<div style="text-align:center;padding:24px 12px;color:var(--slate);font-size:12px">No recipients added yet. Enter an email above or upload a CSV file.</div>`;
+    if (toSel) toSel.innerHTML = '<option value="">— select from recipients above —</option>';
     return;
   }
 
-  // Save current To: value
   const prevTo = toSel ? toSel.value : '';
 
-  // Rebuild rows
-  listEl.innerHTML = _gmRecipients.map((email, i) => `
-    <div id="gm_row_${i}" style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;transition:background .12s"
+  listEl.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;padding:4px 8px 6px;border-bottom:1px solid var(--navy3);margin-bottom:4px">
+      <input type="checkbox" id="gm_select_all_chk" style="accent-color:var(--gold);width:14px;height:14px;cursor:pointer" onchange="_gmToggleSelectAll(this.checked)" title="Select all">
+      <span style="font-size:11px;color:var(--slate);flex:1">Select all</span>
+      <label class="recip-toggle-bulk" title="Enable all" onclick="_gmBulkEnable(true)">▶ All On</label>
+      <label class="recip-toggle-bulk" title="Disable all" onclick="_gmBulkEnable(false)">⏸ All Off</label>
+    </div>` +
+  _gmRecipients.map((r, i) => `
+    <div id="gm_row_${i}" style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;transition:background .12s;${!r.enabled?'opacity:.45':''}"
          onmouseover="this.style.background='var(--navy4)'" onmouseout="this.style.background=''">
       <input type="checkbox" class="gm-chk" data-idx="${i}"
         style="accent-color:var(--gold);width:14px;height:14px;flex-shrink:0;cursor:pointer"
         onchange="_gmOnCheck()">
       <svg width="13" height="13" fill="none" stroke="var(--slate)" stroke-width="1.6" viewBox="0 0 24 24" style="flex-shrink:0"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="22,4 12,13 2,4"/></svg>
-      <span style="font-size:13px;color:var(--white2);flex:1;word-break:break-all">${xe(email)}</span>
+      <span style="font-size:13px;color:${r.enabled?'var(--white2)':'var(--slate)'};flex:1;word-break:break-all">${xe(r.email)}</span>
+      ${_mkToggle('gm_tog_'+i, r.enabled, '_gmToggleOne('+i+',this.checked)')}
       <button onclick="_gmDeleteOne(${i})"
         style="background:none;border:none;cursor:pointer;color:var(--slate);padding:3px 5px;border-radius:4px;line-height:1;font-size:14px;flex-shrink:0"
         title="Remove" onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--slate)'">✕</button>
     </div>`).join('');
 
-  // Rebuild primary To: dropdown
   if (toSel) {
     toSel.innerHTML = '<option value="">— select primary To: —</option>' +
-      _gmRecipients.map(e => `<option value="${xe(e)}"${e===prevTo?' selected':''}>${xe(e)}</option>`).join('');
-    if (prevTo && _gmRecipients.includes(prevTo)) toSel.value = prevTo;
+      _gmRecipients.map(r => `<option value="${xe(r.email)}"${r.email===prevTo?' selected':''} ${!r.enabled?'style="color:var(--slate)"':''}>${xe(r.email)}${!r.enabled?' (muted)':''}</option>`).join('');
+    if (prevTo && _gmHasEmail(prevTo)) toSel.value = prevTo;
   }
-
   if (selBtn) selBtn.style.display = 'none';
-  const allChk = document.getElementById('gm_select_all_chk');
-  if (allChk) allChk.checked = false;
 }
 
-function _mkGmEmpty() {
-  const d = document.createElement('div');
-  d.id = 'gm_recip_empty';
-  d.style.cssText = 'text-align:center;padding:24px 12px;color:var(--slate);font-size:12px';
-  d.textContent = 'No recipients added yet. Enter an email above or upload a CSV file.';
-  return d;
+function _gmToggleOne(idx, enabled) {
+  if (_gmRecipients[idx]) { _gmRecipients[idx].enabled = enabled; _gmRenderList(); _gmSyncHidden(); }
+}
+
+function _gmBulkEnable(enabled) {
+  _gmRecipients.forEach(r => r.enabled = enabled);
+  _gmRenderList(); _gmSyncHidden();
+  toast(enabled ? '▶ All On' : '⏸ All Off', `${_gmRecipients.length} Gmail recipients ${enabled?'enabled':'muted'}.`);
 }
 
 function _gmAddSingleEmail() {
@@ -8629,49 +8656,39 @@ function _gmAddSingleEmail() {
   if (!inp) return;
   const email = inp.value.trim().toLowerCase();
   if (!_isValidEmail(email)) { toast('Invalid Email', 'Please enter a valid email address.', true); return; }
-  if (_gmRecipients.includes(email)) { toast('Duplicate', 'This email is already in the list.', true); inp.value=''; return; }
-  _gmRecipients.push(email);
+  if (_gmHasEmail(email)) { toast('Duplicate', 'This email is already in the list.', true); inp.value=''; return; }
+  _gmRecipients.push({email, enabled:true});
   inp.value = '';
-  _gmRenderList();
-  _gmSyncHidden();
+  _gmRenderList(); _gmSyncHidden();
 }
 
 function _gmBulkUpload(input) {
-  const file = input.files[0];
-  if (!file) return;
+  const file = input.files[0]; if (!file) return;
   const reader = new FileReader();
   reader.onload = e => {
     const emails = _normaliseEmails(e.target.result);
     let added = 0;
-    emails.forEach(em => { if (!_gmRecipients.includes(em)) { _gmRecipients.push(em); added++; } });
-    _gmRenderList();
-    _gmSyncHidden();
+    emails.forEach(em => { if (!_gmHasEmail(em)) { _gmRecipients.push({email:em, enabled:true}); added++; } });
+    _gmRenderList(); _gmSyncHidden();
     toast('✅ Uploaded', `${added} new address${added!==1?'es':''} added (${emails.length-added} duplicate${(emails.length-added)!==1?'s':''} skipped).`);
     input.value = '';
   };
   reader.readAsText(file);
 }
 
-function _gmDeleteOne(idx) {
-  _gmRecipients.splice(idx, 1);
-  _gmRenderList();
-  _gmSyncHidden();
-}
+function _gmDeleteOne(idx) { _gmRecipients.splice(idx, 1); _gmRenderList(); _gmSyncHidden(); }
 
 function _gmDeleteSelected() {
   const checked = [...document.querySelectorAll('.gm-chk:checked')].map(c => parseInt(c.dataset.idx)).sort((a,b)=>b-a);
   checked.forEach(i => _gmRecipients.splice(i, 1));
-  _gmRenderList();
-  _gmSyncHidden();
+  _gmRenderList(); _gmSyncHidden();
   toast('🗑 Deleted', `${checked.length} address${checked.length!==1?'es':''} removed.`);
 }
 
 function _gmClearAllRecipients() {
   if (_gmRecipients.length === 0) return;
   if (!confirm(`Remove all ${_gmRecipients.length} recipients?`)) return;
-  _gmRecipients.length = 0;
-  _gmRenderList();
-  _gmSyncHidden();
+  _gmRecipients.length = 0; _gmRenderList(); _gmSyncHidden();
 }
 
 function _gmToggleSelectAll(checked) {
@@ -8688,10 +8705,7 @@ function _gmOnCheck() {
     document.querySelectorAll('.gm-chk:checked').length === document.querySelectorAll('.gm-chk').length;
 }
 
-function _gmSyncHidden() {
-  // Keep gm_to_email dropdown value accessible for saveAzureSettings()
-  // The hidden input is the dropdown itself — no extra sync needed.
-}
+function _gmSyncHidden() { /* dropdown rebuilt in _gmRenderList */ }
 
 /* ─────────────── DAILY DIGEST RECIPIENTS ─────────────── */
 
@@ -8702,8 +8716,9 @@ function _ddRenderList() {
   const hidEl   = document.getElementById('dd_recipients');
   if (!listEl) return;
 
-  const n = _ddRecipients.length;
-  countEl.textContent = n + ' address' + (n !== 1 ? 'es' : '');
+  const n       = _ddRecipients.length;
+  const enabled = _ddActiveEmails().length;
+  countEl.textContent = n + ' address' + (n !== 1 ? 'es' : '') + (n ? ` · ${enabled} active` : '');
 
   if (n === 0) {
     listEl.innerHTML = `<div style="text-align:center;padding:20px 12px;color:var(--slate);font-size:12px">No digest recipients yet. Falls back to the primary Gmail <em>To:</em> address.</div>`;
@@ -8711,23 +8726,39 @@ function _ddRenderList() {
     return;
   }
 
-  listEl.innerHTML = _ddRecipients.map((email, i) => `
-    <div style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;transition:background .12s"
+  listEl.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;padding:4px 8px 6px;border-bottom:1px solid var(--navy3);margin-bottom:4px">
+      <input type="checkbox" id="dd_select_all_chk" style="accent-color:var(--blue);width:14px;height:14px;cursor:pointer" onchange="_ddToggleSelectAll(this.checked)" title="Select all">
+      <span style="font-size:11px;color:var(--slate);flex:1">Select all</span>
+      <label class="recip-toggle-bulk" onclick="_ddBulkEnable(true)">▶ All On</label>
+      <label class="recip-toggle-bulk" onclick="_ddBulkEnable(false)">⏸ All Off</label>
+    </div>` +
+  _ddRecipients.map((r, i) => `
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;transition:background .12s;${!r.enabled?'opacity:.45':''}"
          onmouseover="this.style.background='var(--navy4)'" onmouseout="this.style.background=''">
       <input type="checkbox" class="dd-chk" data-idx="${i}"
         style="accent-color:var(--blue);width:14px;height:14px;flex-shrink:0;cursor:pointer"
         onchange="_ddOnCheck()">
       <svg width="13" height="13" fill="none" stroke="var(--slate)" stroke-width="1.6" viewBox="0 0 24 24" style="flex-shrink:0"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="22,4 12,13 2,4"/></svg>
-      <span style="font-size:13px;color:var(--white2);flex:1;word-break:break-all">${xe(email)}</span>
+      <span style="font-size:13px;color:${r.enabled?'var(--white2)':'var(--slate)'};flex:1;word-break:break-all">${xe(r.email)}</span>
+      ${_mkToggle('dd_tog_'+i, r.enabled, '_ddToggleOne('+i+',this.checked)')}
       <button onclick="_ddDeleteOne(${i})"
         style="background:none;border:none;cursor:pointer;color:var(--slate);padding:3px 5px;border-radius:4px;line-height:1;font-size:14px;flex-shrink:0"
         title="Remove" onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--slate)'">✕</button>
     </div>`).join('');
 
-  if (hidEl) hidEl.value = _ddRecipients.join(', ');
+  if (hidEl) hidEl.value = _ddActiveEmails().join(', ');
   if (selBtn) selBtn.style.display = 'none';
-  const allChk = document.getElementById('dd_select_all_chk');
-  if (allChk) allChk.checked = false;
+}
+
+function _ddToggleOne(idx, enabled) {
+  if (_ddRecipients[idx]) { _ddRecipients[idx].enabled = enabled; _ddRenderList(); }
+}
+
+function _ddBulkEnable(enabled) {
+  _ddRecipients.forEach(r => r.enabled = enabled);
+  _ddRenderList();
+  toast(enabled ? '▶ All On' : '⏸ All Off', `${_ddRecipients.length} digest recipients ${enabled?'enabled':'muted'}.`);
 }
 
 function _ddAddSingleEmail() {
@@ -8735,20 +8766,18 @@ function _ddAddSingleEmail() {
   if (!inp) return;
   const email = inp.value.trim().toLowerCase();
   if (!_isValidEmail(email)) { toast('Invalid Email', 'Please enter a valid email address.', true); return; }
-  if (_ddRecipients.includes(email)) { toast('Duplicate', 'This email is already in the digest list.', true); inp.value=''; return; }
-  _ddRecipients.push(email);
-  inp.value = '';
-  _ddRenderList();
+  if (_ddHasEmail(email)) { toast('Duplicate', 'This email is already in the digest list.', true); inp.value=''; return; }
+  _ddRecipients.push({email, enabled:true});
+  inp.value = ''; _ddRenderList();
 }
 
 function _ddBulkUpload(input) {
-  const file = input.files[0];
-  if (!file) return;
+  const file = input.files[0]; if (!file) return;
   const reader = new FileReader();
   reader.onload = e => {
     const emails = _normaliseEmails(e.target.result);
     let added = 0;
-    emails.forEach(em => { if (!_ddRecipients.includes(em)) { _ddRecipients.push(em); added++; } });
+    emails.forEach(em => { if (!_ddHasEmail(em)) { _ddRecipients.push({email:em, enabled:true}); added++; } });
     _ddRenderList();
     toast('✅ Uploaded', `${added} new address${added!==1?'es':''} added to digest list.`);
     input.value = '';
@@ -8756,10 +8785,7 @@ function _ddBulkUpload(input) {
   reader.readAsText(file);
 }
 
-function _ddDeleteOne(idx) {
-  _ddRecipients.splice(idx, 1);
-  _ddRenderList();
-}
+function _ddDeleteOne(idx) { _ddRecipients.splice(idx, 1); _ddRenderList(); }
 
 function _ddDeleteSelected() {
   const checked = [...document.querySelectorAll('.dd-chk:checked')].map(c => parseInt(c.dataset.idx)).sort((a,b)=>b-a);
@@ -8771,8 +8797,7 @@ function _ddDeleteSelected() {
 function _ddClearAllRecipients() {
   if (_ddRecipients.length === 0) return;
   if (!confirm(`Remove all ${_ddRecipients.length} digest recipients?`)) return;
-  _ddRecipients.length = 0;
-  _ddRenderList();
+  _ddRecipients.length = 0; _ddRenderList();
 }
 
 function _ddToggleSelectAll(checked) {
@@ -8794,14 +8819,16 @@ function _gmBootstrap() {
   const gm = (_settingsData && _settingsData.gmail) || {};
   const dd = (_settingsData && _settingsData.dailyDigest) || {};
 
-  // Gmail recipients: populate from toEmail + any stored recipientList
+  // Gmail recipients: populate from stored recipientList (supports {email,enabled} or legacy string)
   _gmRecipients.length = 0;
   const storedList = (gm.recipientList || []);
   if (storedList.length) {
-    storedList.forEach(e => { if (!_gmRecipients.includes(e)) _gmRecipients.push(e); });
+    storedList.forEach(e => {
+      if (typeof e === 'string') { if (!_gmHasEmail(e)) _gmRecipients.push({email:e, enabled:true}); }
+      else if (e && e.email)    { if (!_gmHasEmail(e.email)) _gmRecipients.push({email:e.email, enabled:e.enabled!==false}); }
+    });
   } else if (gm.toEmail) {
-    // Legacy: single email → migrate to list
-    _gmRecipients.push(gm.toEmail.trim().toLowerCase());
+    _gmRecipients.push({email:gm.toEmail.trim().toLowerCase(), enabled:true});
   }
   setTimeout(_gmRenderList, 0);
 
@@ -8809,9 +8836,12 @@ function _gmBootstrap() {
   _ddRecipients.length = 0;
   const ddStored = (dd.recipientList || []);
   if (ddStored.length) {
-    ddStored.forEach(e => { if (!_ddRecipients.includes(e)) _ddRecipients.push(e); });
+    ddStored.forEach(e => {
+      if (typeof e === 'string') { if (!_ddHasEmail(e)) _ddRecipients.push({email:e, enabled:true}); }
+      else if (e && e.email)    { if (!_ddHasEmail(e.email)) _ddRecipients.push({email:e.email, enabled:e.enabled!==false}); }
+    });
   } else if (dd.recipients) {
-    _normaliseEmails(dd.recipients).forEach(e => { if (!_ddRecipients.includes(e)) _ddRecipients.push(e); });
+    _normaliseEmails(dd.recipients).forEach(e => { if (!_ddHasEmail(e)) _ddRecipients.push({email:e, enabled:true}); });
   }
   setTimeout(_ddRenderList, 0);
 }
@@ -8825,7 +8855,7 @@ function saveAzureSettings() {
     ...(_settingsData.gmail || {}),
     backendUrl:    (document.getElementById('gm_backend_url')?.value || '').trim().replace(/\/$/, ''),
     toEmail,
-    recipientList: [..._gmRecipients],
+    recipientList: _gmRecipients.map(r=>({email:r.email,enabled:r.enabled})),
     senderName:    (document.getElementById('gm_sender_name')?.value || '').trim(),
     notifTitle:    (document.getElementById('gm_notif_title')?.value || '').trim(),
     prefixTag:     (document.getElementById('gm_prefix_tag')?.value  || '').trim(),
@@ -8847,7 +8877,7 @@ function saveAzureSettings() {
         notifTitle: (_gm.notifTitle  || 'Customer Visit').trim(),
         prefixTag:  (_gm.prefixTag   !== undefined ? _gm.prefixTag : '').trim(),
         senderName: (_gm.senderName  || 'PlantVisit Digest').trim(),
-        recipients: (_dd.recipients  || '').trim(),
+        recipients: _ddActiveEmails().join(', ') || (_dd.recipients || '').trim(),
       }),
     }).catch(() => {});
   }
@@ -8867,8 +8897,8 @@ function saveNotificationSettings() {
     ...(_settingsData.dailyDigest || {}),
     enabled:       (document.getElementById('dd_enable')?.value === 'true'),
     sendTime,
-    recipients:    _ddRecipients.join(', '),
-    recipientList: [..._ddRecipients],
+    recipients:    _ddActiveEmails().join(', '),
+    recipientList: _ddRecipients.map(r=>({email:r.email,enabled:r.enabled})),
   };
   saveSettings();
   toast('✓ Notification Config Saved', 'Email notification rules updated.');
@@ -8883,7 +8913,7 @@ function saveNotificationSettings() {
       notifTitle: ((_settingsData.gmail||{}).notifTitle || 'Customer Visit').trim(),
       prefixTag:  ((_settingsData.gmail||{}).prefixTag  || '').trim(),
       senderName: ((_settingsData.gmail||{}).senderName || 'PlantVisit Digest').trim(),
-      recipients: _ddRecipients.join(', '),
+      recipients: _ddActiveEmails().join(', '),
     }),
   }).then(async r => {
     const ok = r.ok;
@@ -8917,9 +8947,12 @@ if (typeof renderNotificationSettings === 'function') {
     const dd = (_settingsData && _settingsData.dailyDigest) || {};
     const ddStored = (dd.recipientList || []);
     if (ddStored.length) {
-      ddStored.forEach(e => { if (!_ddRecipients.includes(e)) _ddRecipients.push(e); });
+      ddStored.forEach(e => {
+        if (typeof e === 'string') { if (!_ddHasEmail(e)) _ddRecipients.push({email:e, enabled:true}); }
+        else if (e && e.email)    { if (!_ddHasEmail(e.email)) _ddRecipients.push({email:e.email, enabled:e.enabled!==false}); }
+      });
     } else if (dd.recipients) {
-      _normaliseEmails(dd.recipients).forEach(e => { if (!_ddRecipients.includes(e)) _ddRecipients.push(e); });
+      _normaliseEmails(dd.recipients).forEach(e => { if (!_ddHasEmail(e)) _ddRecipients.push({email:e, enabled:true}); });
     }
     setTimeout(_ddRenderList, 0);
   };
