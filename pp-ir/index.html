@@ -649,6 +649,7 @@ const _FB_CONFIG = {
 let _fbApp  = null;
 let _db      = null;   // Firestore instance
 let _storage = null;   // Firebase Storage instance
+let _auth    = null;   // Firebase Auth instance (for anonymous photo upload)
 let _fbReady = false;
 let _fbSaving = false;
 
@@ -657,6 +658,7 @@ let _fbSaving = false;
     _fbApp = firebase.initializeApp(_FB_CONFIG);
     _db      = firebase.firestore(_fbApp);
     _storage = firebase.storage(_fbApp);   // for logo hosting
+    _auth    = firebase.auth(_fbApp);      // for anonymous upload auth
     // Offline persistence (compat SDK v10)
     _db.enablePersistence({ synchronizeTabs:true }).catch(()=>{});
     _fbReady = true;
@@ -2921,11 +2923,31 @@ function renderPhotoThumbs(containerId){
   ).join('');
 }
 
+/* Ensure we have Firebase Auth (anonymous) before writing to Storage */
+async function _ensureStorageAuth(){
+  if(!_auth) return false;
+  if(_auth.currentUser) return true;
+  try{
+    await _auth.signInAnonymously();
+    console.log('[Auth] Signed in anonymously for Storage access');
+    return true;
+  }catch(e){
+    console.warn('[Auth] Anonymous sign-in failed:', e.message);
+    return false;
+  }
+}
+
 async function uploadPhotosToStorage(incidentId){
   if(!_pendingPhotos.length) return [];
   if(!_storage){
     // No storage — return empty (don't embed base64 in Firestore or emails)
     console.warn('[Photo] Firebase Storage not ready — photos not uploaded');
+    return [];
+  }
+  // Ensure authenticated before Storage write
+  const authOk = await _ensureStorageAuth();
+  if(!authOk){
+    showToast('Photo upload needs Firebase Auth — check Storage rules.','warn');
     return [];
   }
   showToast(`Uploading ${_pendingPhotos.length} photo${_pendingPhotos.length!==1?'s':''}…`,'info');
@@ -3297,16 +3319,18 @@ function getTokenURL(token){
 function buildEmailWrapper(opts){
   var company=opts.company, logo=opts.logoBase64||'', hc=opts.headerColor, ha=opts.headerAccent, title=opts.title, sub=opts.subtitle, body=opts.body;
   var xe=function(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');};
-  // Prefer HTTPS URL (email-safe) over base64
-  var logoSrc = (opts.logoUrl && opts.logoUrl.startsWith('https')) ? opts.logoUrl
-              : (logo && logo.startsWith('data:')) ? logo : '';
+  // HTTPS URL only — base64 is blocked by all major email clients
+  var logoSrc = (opts.logoUrl && opts.logoUrl.startsWith('https')) ? opts.logoUrl : '';
   var logoHtml = logoSrc
     ? '<table cellpadding="0" cellspacing="0" border="0" style="margin-bottom:14px">'
     + '<tr><td width="176" bgcolor="#ffffff" style="background:#ffffff;border-radius:12px;padding:8px 12px">'
     + '<img src="'+ logoSrc +'" alt="'+ xe(company) +'" width="152" height="40" border="0"'
     + ' style="display:block;width:152px;max-width:152px;height:40px;max-height:40px;object-fit:contain;border:0">'
     + '</td></tr></table>'
-    : '<div style="font-size:11px;font-weight:700;letter-spacing:2px;color:#90c0e0;text-transform:uppercase;margin-bottom:14px">IncidentPro</div>';
+    : '<div style="margin-bottom:14px">'
+    + '<div style="font-size:16px;font-weight:700;color:#ffffff;letter-spacing:.5px">'+ xe(company) +'</div>'
+    + '<div style="font-size:10px;color:#90c0e0;letter-spacing:1.5px;text-transform:uppercase;margin-top:2px">IncidentPro</div>'
+    + '</div>';
   return '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
     +'<body style="margin:0;padding:0;background:#e8edf4;font-family:Arial,sans-serif">'
     +'<table width="100%" cellpadding="0" cellspacing="0" style="background:#e8edf4;padding:36px 16px">'
@@ -4796,7 +4820,13 @@ function renderSettings(){
       <div class="card">
         <div class="card-hd"><div class="card-title">🖼 Company Logo</div></div>
         ${s.logo?`<div style="margin-bottom:12px"><img src="${s.logo}" style="max-height:60px;max-width:200px;object-fit:contain;background:var(--bg3);padding:8px;border-radius:var(--rs)"></div>`:''}
-        <div class="fg"><label>Upload Logo</label><input type="file" id="s-logo" accept="image/png,image/jpeg,image/svg+xml" onchange="handleLogoUpload(this)"></div>
+        <div class="fg">
+          <label>Upload Logo</label>
+          <input type="file" id="s-logo" accept="image/png,image/jpeg,image/svg+xml" onchange="handleLogoUpload(this)">
+          <div style="font-size:11px;color:var(--t3);margin-top:4px">
+            ${DB.settings.logoUrl ? '✅ Logo uploaded to Storage — will show in emails.' : '⚠ Upload logo to enable it in notification emails (requires Firebase Storage).'}
+          </div>
+        </div>
         ${s.logo?`<button class="btn bs ber" onclick="removeLogo()">Remove Logo</button>`:''}
       </div>
 
@@ -5135,6 +5165,8 @@ async function handleLogoUpload(input){
 
     // Also upload to Firebase Storage for email-safe HTTPS URL
     if(_storage){
+      // Ensure authenticated for Storage write
+      await _ensureStorageAuth();
       try {
         const ext = file.name.split('.').pop().toLowerCase() || 'png';
         const ref  = _storage.ref('incidentpro/logo.' + ext);
