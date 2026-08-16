@@ -1037,11 +1037,29 @@ function _fromB64url(s){
 /* Called after successful password login — offer to register biometric */
 async function offerBiometricEnroll(user){
   if(!await _bioAvailable()) return;
-  const existing = localStorage.getItem(BIO_KEY);
-  if(existing) return; // already enrolled
-  const ok = confirm('Enable biometric login (Face ID / fingerprint) for faster sign-in?');
-  if(!ok) return;
-  await enrollBiometric(user);
+  if(localStorage.getItem(BIO_KEY)) return; // already enrolled
+  if(sessionStorage.getItem('ip_bio_declined')) return; // declined this session
+
+  // Strict mobile-only check — never show on desktop
+  const isMobile = navigator.maxTouchPoints > 0 && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  if(!isMobile) return;
+
+  // Slide-up toast — no confirm() dialog, desktop never sees this
+  const old = document.getElementById('bio-enroll-prompt');
+  if(old) old.remove();
+  const el = document.createElement('div');
+  el.id = 'bio-enroll-prompt';
+  el.style.cssText = 'position:fixed;bottom:76px;left:50%;transform:translateX(-50%);z-index:9999;background:#0d1f33;color:#fff;border-radius:16px;padding:16px 20px;box-shadow:0 8px 32px rgba(0,0,0,.45);width:calc(100vw - 40px);max-width:320px;font-family:var(--fn)';
+  el.innerHTML = '<div style="font-size:13px;font-weight:600;margin-bottom:4px">Enable Biometric Login &#128272;</div>'
+    + '<div style="font-size:12px;color:#90c0e0;margin-bottom:14px">Use Face ID or fingerprint &mdash; no password needed</div>'
+    + '<div style="display:flex;gap:8px">'
+    + '<button id="bio-yes" style="flex:1;padding:10px;background:#1a7a4a;color:#fff;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer">Enable</button>'
+    + '<button id="bio-no" style="flex:1;padding:10px;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:10px;font-size:13px;cursor:pointer">Not now</button>'
+    + '</div>';
+  document.body.appendChild(el);
+  const t = setTimeout(()=>el.remove(), 15000);
+  document.getElementById('bio-yes').onclick = async()=>{ clearTimeout(t); el.remove(); await enrollBiometric(user); };
+  document.getElementById('bio-no').onclick  = ()=>{ clearTimeout(t); el.remove(); sessionStorage.setItem('ip_bio_declined','1'); };
 }
 
 async function enrollBiometric(user){
@@ -1191,6 +1209,14 @@ function enterManagement(){
 }
 
 /* ── Show main app ── */
+function _warmUpCloudFn(){
+  // Silently ping CF health endpoint to prevent cold-start delay on first email
+  const cfg = DB.settings;
+  if(!cfg.cloudFnUrl || !cfg.cloudFnSecret) return;
+  fetch(cfg.cloudFnUrl.replace(/\/$/, '') + '/health', { method:'GET' })
+    .catch(()=>{}); // fire-and-forget, ignore all errors
+}
+
 function showApp(){
   document.getElementById('login-overlay').style.display='none';
   document.getElementById('app').style.display='flex';
@@ -1201,6 +1227,7 @@ function showApp(){
   navigate('dashboard');
   startRealtimeSync();
   startAutoEngine(); // ← start escalation+reminder engine
+  setTimeout(_warmUpCloudFn, 3000); // warm up CF to avoid cold-start on first email
 }
 
 /* ── Logout ── */
@@ -3125,6 +3152,8 @@ async function sendGmailViaAppsScript(toEmail, toName, subject, htmlBody){
   // ── PRIMARY: Route through Cloud Run (same service as scheduler, no CORS issues) ──
   if(cfg.cloudFnUrl && cfg.cloudFnSecret){
     try {
+      const _ctrl = new AbortController();
+      const _timer = setTimeout(()=>_ctrl.abort(), 8000); // 8s max — fail fast on cold start
       const res = await fetch(cfg.cloudFnUrl.replace(/\/$/, '') + '/api/send-email', {
         method:  'POST',
         headers: {'Content-Type':'application/json', 'x-internal-secret': cfg.cloudFnSecret},
@@ -3133,8 +3162,10 @@ async function sendGmailViaAppsScript(toEmail, toName, subject, htmlBody){
           subject:  subject,
           htmlBody: htmlBody,
           fromName: cfg.companyName || 'IncidentPro'
-        })
+        }),
+        signal: _ctrl.signal
       });
+      clearTimeout(_timer);
       const json = await res.json().catch(()=>({}));
       if(json.ok) return {ok:true};
       // If endpoint doesn't exist yet fall through to Apps Script relay
