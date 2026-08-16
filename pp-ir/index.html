@@ -2494,13 +2494,11 @@ function renderAssignHOD(){
   const plantInc = DB.incidents.filter(i=>i.plantId===currentUser?.plant && i.status!=='closed');
   const unassigned = plantInc.filter(i=>!i.assignedHOD);
   const assigned = plantInc.filter(i=>!!i.assignedHOD);
-  const hodUsers = DB.users.filter(u=>u.role==='hod'&&u.plant===currentUser?.plant);
-
   document.getElementById('content').innerHTML=`
   <div style="margin-bottom:16px">
     <div class="alert alert-info">
       <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>
-      As Safety Officer, you assign each incident to the relevant Department Head (HOD) for root cause investigation.
+      As Safety Officer, enter the HOD&rsquo;s name and email to assign them — no account required. They receive a direct email with a magic link to submit their analysis.
     </div>
   </div>
 
@@ -2518,14 +2516,18 @@ function renderAssignHOD(){
         </div>
         <div style="display:flex;gap:6px;align-items:center">${sevBdg(i.severity)}${stsBdg(i.status)}</div>
       </div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <select id="hod-sel-${i.id}" style="flex:1">
-          <option value="">— Select HOD to assign —</option>
-          ${hodUsers.map(u=>`<option value="${u.id}">${xe(u.name)} (${xe(u.department||u.username)})</option>`).join('')}
-          ${hodUsers.length===0?'<option disabled>No HODs configured — add HOD users first</option>':''}
-        </select>
-        <button class="btn bs bin" onclick="soAssignHODInline('${i.id}')">Assign</button>
-        <button class="btn bs" onclick="openIncident('${i.id}')">View</button>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;gap:8px">
+          <input id="hod-name-${i.id}" placeholder="HOD Name" style="flex:1;min-width:0" value="${i._hodName||''}">
+          <input id="hod-email-${i.id}" type="email" placeholder="HOD Email" style="flex:1;min-width:0" value="${i._hodEmail||''}">
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn bs bin" style="flex:1" onclick="soAssignHODInline('${i.id}')">
+            <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+            Assign &amp; Notify
+          </button>
+          <button class="btn bs" onclick="openIncident('${i.id}')">View</button>
+        </div>
       </div>
     </div>`).join('')}
   </div>
@@ -2534,7 +2536,7 @@ function renderAssignHOD(){
     <div class="card-hd"><div class="card-title">✅ Assigned Incidents (${assigned.length})</div></div>
     ${assigned.length===0?`<div class="empty"><p>No assigned incidents</p></div>`:''}
     ${assigned.map(i=>{
-      const hodUser = DB.users.find(u=>u.id===i.assignedHOD);
+      const hodUser = DB.users.find(u=>u.id===i.assignedHOD) || (i._hodEmail ? {name:i._hodName, email:i._hodEmail} : null);
       return `<div class="esc-rule" style="margin-bottom:8px">
         <div class="esc-rule-info">
           <div style="display:flex;gap:6px;align-items:center">
@@ -2543,7 +2545,7 @@ function renderAssignHOD(){
             ${i.hodSubmittedAt?`<span class="bdg b-ok" style="font-size:10px">HOD ✓</span>`:''}
           </div>
           <div style="font-size:13px;font-weight:500">${xe(i.title)}</div>
-          <div style="font-size:11px;color:var(--in);margin-top:2px">👤 HOD: ${xe(hodUser?.name||i.assignedHOD)}</div>
+          <div style="font-size:11px;color:var(--in);margin-top:2px">👤 HOD: ${xe(i._hodName||hodUser?.name||i.assignedHOD)} ${i._hodEmail?`<span style="color:var(--t3)">&lt;${xe(i._hodEmail)}&gt;</span>`:''}</div>
         </div>
         <button class="btn bs" onclick="openIncident('${i.id}')">View</button>
       </div>`;
@@ -2553,21 +2555,35 @@ function renderAssignHOD(){
 }
 
 function soAssignHODInline(incidentId){
-  const hodId = document.getElementById('hod-sel-'+incidentId)?.value;
-  if(!hodId){ showToast('Please select an HOD.','warn'); return; }
   const i = DB.incidents.find(x=>x.id===incidentId);
   if(!i) return;
-  const hodUser = DB.users.find(u=>u.id===hodId);
-  i.assignedHOD = hodId;
-  i.updatedAt = now();
-  if(!i.updates) i.updates=[];
-  i.updates.push({ id:uid(), ts:now(), note:`Assigned to HOD: ${hodUser?.name||hodId}`, by:currentUser?.name||'Safety Officer', statusChange:'investigating' });
+
+  const hodName  = (document.getElementById('hod-name-'+incidentId)?.value||'').trim();
+  const hodEmail = (document.getElementById('hod-email-'+incidentId)?.value||'').trim().toLowerCase();
+
+  if(!hodName)  { showToast('Please enter the HOD name.','warn'); return; }
+  if(!hodEmail || !/^[^@]+@[^@]+\.[^@]+$/.test(hodEmail)){
+    showToast('Please enter a valid HOD email address.','warn'); return;
+  }
+
+  // Store HOD as email-based virtual user (no account required)
+  const virtualHodId = 'hod_email_' + hodEmail.replace(/[^a-z0-9]/g,'_');
+  i.assignedHOD  = virtualHodId;
+  i._hodName     = hodName;
+  i._hodEmail    = hodEmail;
+  i.updatedAt    = now();
+  if(!i.updates) i.updates = [];
+  i.updates.push({ id:uid(), ts:now(), note:`Assigned to HOD: ${hodName} <${hodEmail}>`, by:currentUser?.name||'Safety Officer', statusChange:'investigating' });
   i.status = 'investigating';
-  auditLog('Assign HOD', `${i.incidentNo} assigned to HOD ${hodUser?.name} by ${currentUser?.name}`);
+
+  // Build virtual HOD user object for notification
+  const hodUser = { id: virtualHodId, name: hodName, email: hodEmail };
+
+  auditLog('Assign HOD', `${i.incidentNo} assigned to HOD ${hodName} (${hodEmail}) by ${currentUser?.name}`);
   notifyHODAssigned(i, hodUser);
-  addNotification(i, 'update', `🔗 ${i.incidentNo} assigned to HOD ${hodUser?.name} for investigation`);
+  addNotification(i, 'update', `🔗 ${i.incidentNo} assigned to HOD ${hodName} (${hodEmail}) for investigation`);
   saveDB();
-  showToast(`Assigned to ${hodUser?.name}.`,'ok');
+  showToast(`Assigned to ${hodName} — notifications sent.`,'ok');
   renderAssignHOD();
 }
 
