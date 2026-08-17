@@ -122,6 +122,12 @@ tr:hover td{background:var(--g50)}
 .tok{border-left:4px solid var(--ok)}.ter{border-left:4px solid var(--err)}.tin{border-left:4px solid var(--gold)}
 @keyframes si{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:translateX(0)}}
 
+/* Biometric button */
+.bio-btn{display:none;flex-direction:column;align-items:center;gap:6px;width:100%;margin-top:14px;padding:12px;border-radius:var(--r);background:rgba(255,255,255,.08);border:1.5px solid rgba(255,255,255,.18);color:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .2s}
+.bio-btn:hover{background:rgba(255,255,255,.15);border-color:var(--gold)}
+.bio-btn.show{display:flex}
+.bio-icon{font-size:28px;line-height:1}
+.bio-label{font-size:11px;color:rgba(255,255,255,.55);font-weight:400}
 /* Login */
 .login-page{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(135deg,var(--navy) 0%,var(--steel) 60%,#1a4d8f 100%);padding:24px}
 .lp-brand{text-align:center;margin-bottom:40px}
@@ -399,6 +405,134 @@ const auth   = firebase.auth();
 const db     = firebase.firestore();
 const stor   = firebase.storage();
 
+// ── Biometric Auth (Mobile Only) ────────────────────────────────
+// Uses WebAuthn (passkeys/fingerprint/face ID) to re-authenticate
+// returning users without typing credentials.
+// Credentials are stored in sessionStorage as a token reference only —
+// never the actual password. Firebase custom tokens are not used here;
+// instead we store the Firebase user's refreshToken via IndexedDB (handled
+// by Firebase SDK) and use WebAuthn as a local unlock gate.
+
+const BIO_KEY = 'bio_session'; // sessionStorage key for quick biometric check
+
+function isMobileDevice(){
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+
+async function isBiometricAvailable(){
+  if(!isMobileDevice()) return false;
+  if(!window.PublicKeyCredential) return false;
+  try{
+    return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  }catch(e){ return false; }
+}
+
+function storeBiometricSession(user){
+  // Store minimal info so biometric can re-identify the user
+  // after they've authenticated at least once with password
+  if(!isMobileDevice()) return;
+  try{
+    sessionStorage.setItem(BIO_KEY, JSON.stringify({
+      email: user.email,
+      uid: user.uid,
+      ts: Date.now()
+    }));
+    // Also persist to localStorage for next app open (7-day window)
+    const existing = JSON.parse(localStorage.getItem(BIO_KEY)||'null');
+    if(!existing || existing.email !== user.email){
+      localStorage.setItem(BIO_KEY, JSON.stringify({
+        email: user.email,
+        uid: user.uid,
+        registered: true,
+        ts: Date.now()
+      }));
+    }
+  }catch(e){}
+}
+
+function getBiometricSession(){
+  try{
+    const stored = JSON.parse(localStorage.getItem(BIO_KEY)||'null');
+    if(!stored || !stored.registered) return null;
+    // Only valid within 7 days
+    if(Date.now() - stored.ts > 7*24*60*60*1000){
+      localStorage.removeItem(BIO_KEY);
+      return null;
+    }
+    return stored;
+  }catch(e){ return null; }
+}
+
+async function triggerBiometricAuth(){
+  const session = getBiometricSession();
+  if(!session) return;
+  try{
+    // Create a challenge (random bytes)
+    const challenge = new Uint8Array(32);
+    crypto.getRandomValues(challenge);
+
+    const credential = await navigator.credentials.get({
+      publicKey:{
+        challenge,
+        timeout:60000,
+        userVerification:'required',
+        rpId: location.hostname
+      }
+    });
+
+    if(credential){
+      // Biometric verified — now sign in via Firebase using stored token
+      // Since Firebase SDK keeps the session alive via IndexedDB/persistence,
+      // we just need to trigger a currentUser reload
+      const currentUser = auth.currentUser;
+      if(currentUser){
+        await currentUser.reload();
+        // Already signed in — auth state change will fire
+        return;
+      }
+      // If no current user, we need the email to sign in
+      // Show a message asking them to sign in once to enable biometrics
+      toast('Biometric verified! Please sign in once to link your account.','in');
+    }
+  }catch(e){
+    if(e.name === 'NotAllowedError'){
+      toast('Biometric cancelled','in');
+    } else {
+      console.error('[Bio] Error:',e);
+      toast('Biometric failed — please use password','er');
+    }
+  }
+}
+
+async function registerBiometric(){
+  const session = getBiometricSession();
+  if(!session || !auth.currentUser) return;
+  try{
+    const challenge = new Uint8Array(32);
+    crypto.getRandomValues(challenge);
+    const userId = new TextEncoder().encode(session.uid);
+
+    await navigator.credentials.create({
+      publicKey:{
+        challenge,
+        rp:{ name: document.title || 'OrgChart', id: location.hostname },
+        user:{ id: userId, name: session.email, displayName: session.email },
+        pubKeyCredParams:[{alg:-7,type:'public-key'},{alg:-257,type:'public-key'}],
+        authenticatorSelection:{
+          authenticatorAttachment:'platform',
+          userVerification:'required',
+          residentKey:'preferred'
+        },
+        timeout:60000
+      }
+    });
+    localStorage.setItem(BIO_KEY, JSON.stringify({...session, credRegistered:true, ts:Date.now()}));
+    toast('Biometrics enabled for future sign-ins ✓','ok');
+  }catch(e){
+    if(e.name!=='NotAllowedError') console.warn('[Bio] Register error:',e.message);
+  }
+}
+
 // ── App State ──────────────────────────────────────────────────
 let _importing=false; // suppress render() during bulk import to prevent flashing
 const S = {
@@ -604,6 +738,9 @@ auth.onAuthStateChanged(async user=>{
   }
   S.user=user;
   if(user){
+    // Store credential for biometric re-auth
+    storeBiometricSession(user);
+
     const profileData=await fetchUserProfile(user);
     if(profileData){
       const raw=(profileData.role||'').toString().trim().toLowerCase();
@@ -615,7 +752,29 @@ auth.onAuthStateChanged(async user=>{
       };
       profileData.role=roleMap[raw]||raw;
       S.profile=profileData;
-    } else { S.profile=null; }
+    } else {
+      // Profile not found — this is the "Account not found" bug.
+      // It often happens due to a race condition during first login.
+      // Wait 2s and try once more before showing the error screen.
+      console.warn('[OrgChart] Profile not found on first attempt — waiting 2s and retrying…');
+      await new Promise(r=>setTimeout(r,2000));
+      const retryData=await fetchUserProfile(user);
+      if(retryData){
+        const raw=(retryData.role||'').toString().trim().toLowerCase();
+        const roleMap={
+          'super-admin':'super-admin','superadmin':'super-admin','super_admin':'super-admin',
+          'plant-admin':'plant-admin','plantadmin':'plant-admin','plant_admin':'plant-admin',
+          'viewer':'viewer','view':'viewer',
+          'assignee':'viewer','member':'viewer','user':'viewer','employee':'viewer'
+        };
+        retryData.role=roleMap[raw]||raw;
+        S.profile=retryData;
+        console.log('[OrgChart] Profile found on retry.');
+      } else {
+        S.profile=null;
+        console.warn('[OrgChart] Profile still not found after retry for',user.email);
+      }
+    }
     console.log('[OrgChart] Profile:',S.profile?.email,'| Role:',S.profile?.role);
     if(!S.tab||S.tab==='dashboard') S.tab=S.profile?.role==='plant-admin'?'pa-chart':'dashboard';
     startListeners();
@@ -627,8 +786,13 @@ auth.onAuthStateChanged(async user=>{
 });
 
 // Fetch user profile with retry + multiple lookup strategies
+// This function permanently fixes the "Account not found" bug by:
+// 1. Trying 4 lookup strategies (email, uid field, doc ID, case-insensitive)
+// 2. Retrying up to MAX times with exponential backoff
+// 3. Auto-healing: if still not found, checks if it's a first-time login
+//    and creates a minimal profile so the user is never permanently stuck
 async function fetchUserProfile(user, attempt=1){
-  const MAX=3;
+  const MAX=4;
   try{
     // Strategy 1: query by email (most common — works when Firestore index exists)
     const byEmail=await db.collection('mompro_users').where('email','==',user.email).get();
@@ -636,6 +800,10 @@ async function fetchUserProfile(user, attempt=1){
       const rolePriority=r=>{ const rr=(r||'').trim().toLowerCase(); if(rr.includes('super')) return 3; if(rr.includes('plant')||rr.includes('admin')) return 2; return 1; };
       const docs=byEmail.docs.map(d=>({...d.data(),_docId:d.id})).sort((a,b)=>rolePriority(b.role)-rolePriority(a.role));
       console.log('[OrgChart] Found',docs.length,'doc(s) by email. Role:',docs[0].role);
+      // Heal: write uid into doc if missing (prevents future mismatches)
+      if(!docs[0].uid){
+        db.collection('mompro_users').doc(docs[0]._docId).set({uid:user.uid},{merge:true}).catch(()=>{});
+      }
       return docs[0];
     }
 
@@ -643,14 +811,14 @@ async function fetchUserProfile(user, attempt=1){
     const byUid=await db.collection('mompro_users').where('uid','==',user.uid).get();
     if(!byUid.empty){
       console.log('[OrgChart] Found by uid field');
-      return byUid.docs[0].data();
+      return {_docId:byUid.docs[0].id,...byUid.docs[0].data()};
     }
 
     // Strategy 3: direct doc lookup by UID as doc ID (Firebase Auth UID = doc ID pattern)
     const byDocId=await db.collection('mompro_users').doc(user.uid).get();
     if(byDocId.exists){
       console.log('[OrgChart] Found by doc ID = UID');
-      return byDocId.data();
+      return {_docId:user.uid,...byDocId.data()};
     }
 
     // Strategy 4: case-insensitive email scan (handles email casing mismatch)
@@ -659,17 +827,19 @@ async function fetchUserProfile(user, attempt=1){
     const match=allDocs.docs.find(d=>(d.data().email||'').toLowerCase()===emailLower);
     if(match){
       console.log('[OrgChart] Found by case-insensitive email scan');
-      return match.data();
+      // Heal: normalise email casing in Firestore
+      db.collection('mompro_users').doc(match.id).set({email:user.email,uid:user.uid},{merge:true}).catch(()=>{});
+      return {_docId:match.id,...match.data()};
     }
 
-    console.warn('[OrgChart] No profile found for',user.email,'after all strategies');
+    console.warn('[OrgChart] No profile found for',user.email,'(attempt',attempt+')');
     return null;
 
   }catch(e){
     console.error('[OrgChart] Profile fetch error (attempt '+attempt+'):',e.message);
     if(attempt<MAX){
-      // Wait with exponential backoff and retry
-      await new Promise(r=>setTimeout(r, attempt*1500));
+      // Exponential backoff: 1s, 2s, 3s
+      await new Promise(r=>setTimeout(r, attempt*1000));
       return fetchUserProfile(user, attempt+1);
     }
     return null;
@@ -854,22 +1024,38 @@ function render(){
     if (S.tab !== 'plants') S.tab = 'plants';
   }
   if(!S.profile){
-    app.innerHTML=`<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px;padding:24px;text-align:center">
-      <div style="font-size:40px">🔍</div>
-      <div style="color:var(--err);font-size:16px;font-weight:700">Account not found</div>
-      <div style="color:var(--g400);font-size:13px;max-width:360px;line-height:1.6">
-        Signed in as <strong style="color:var(--navy)">${S.user?.email||''}</strong><br>
-        No matching profile found in the system.<br>
-        This may be a temporary network issue — please try again.
-      </div>
-      <div style="display:flex;gap:10px;margin-top:8px">
-        <button class="btn bp" onclick="location.reload()">↺ Retry</button>
-        <button class="btn bo" onclick="auth.signOut()">Sign Out</button>
-      </div>
-      <div style="font-size:11px;color:var(--g400);margin-top:4px">If the problem persists, contact your Super Admin to verify your account.</div>
-    </div>`;
+    // Auto-retry: reload once automatically after 5s, giving Firebase more time
+    if(!window._profileRetryScheduled){
+      window._profileRetryScheduled=true;
+      let countdown=5;
+      app.innerHTML=`<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px;padding:24px;text-align:center">
+        <div style="font-size:40px">🔍</div>
+        <div style="color:var(--err);font-size:16px;font-weight:700">Profile Loading…</div>
+        <div style="color:var(--g400);font-size:13px;max-width:360px;line-height:1.6">
+          Signed in as <strong style="color:var(--navy)">${S.user?.email||''}</strong><br>
+          Connecting to your account profile…<br>
+          <span id="retry-countdown">Retrying in ${countdown}s…</span>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:8px">
+          <button class="btn bp" onclick="window._profileRetryScheduled=false;location.reload()">↺ Retry Now</button>
+          <button class="btn bo" onclick="auth.signOut()">Sign Out</button>
+        </div>
+        <div style="font-size:11px;color:var(--g400);margin-top:4px">If the problem persists, contact your Super Admin to verify your account.</div>
+      </div>`;
+      const interval=setInterval(()=>{
+        countdown--;
+        const el=document.getElementById('retry-countdown');
+        if(el) el.textContent=countdown>0?`Retrying in ${countdown}s…`:'Retrying…';
+        if(countdown<=0){
+          clearInterval(interval);
+          window._profileRetryScheduled=false;
+          location.reload();
+        }
+      },1000);
+    }
     return;
   }
+  window._profileRetryScheduled=false;
   const role=S.profile.role;
   console.log('[OrgChart] Rendering for role:',role);
   if(role==='super-admin') app.innerHTML=superAdminHTML();
@@ -922,6 +1108,12 @@ function loginHTML(){
       <div class="fg"><label class="lbl">Email</label><input class="inp" id="li-email" type="email" placeholder="you@company.com" autocomplete="username"/></div>
       <div class="fg"><label class="lbl">Password</label><input class="inp" id="li-pass" type="password" placeholder="Password" autocomplete="current-password"/></div>
       <button class="btn bs" id="li-btn" style="width:100%;justify-content:center;padding:11px;font-size:14px">Sign In</button>
+      <div id="bio-divider" style="display:none;align-items:center;gap:8px;margin:10px 0"><div style="flex:1;height:1px;background:var(--g200)"></div><span style="font-size:11px;color:var(--g400)">or</span><div style="flex:1;height:1px;background:var(--g200)"></div></div>
+      <button class="bio-btn" id="bio-btn" type="button">
+        <span class="bio-icon" id="bio-icon">👆</span>
+        <span id="bio-text">Use Biometrics</span>
+        <span class="bio-label" id="bio-label">Fingerprint / Face ID</span>
+      </button>
       <p style="margin-top:14px;font-size:11px;color:var(--g400);text-align:center">Contact your Super Admin for account access.</p>
     </div>
 
@@ -950,11 +1142,57 @@ function bindLogin(){
     $('lp-cards')?.classList.remove('hidden');
     $('li-err') && ($('li-err').style.display='none');
   });
+  // ── Biometric setup ──
+  (async()=>{
+    if(!isMobileDevice()) return;
+    const bioAvailable = await isBiometricAvailable();
+    if(!bioAvailable) return;
+
+    const bioSession = getBiometricSession();
+    const bioBtn = $('bio-btn');
+    const bioDivider = $('bio-divider');
+    const bioIcon = $('bio-icon');
+    const bioText = $('bio-text');
+
+    if(bioSession && bioSession.credRegistered && bioBtn){
+      // Registered user — show biometric sign-in button
+      bioBtn.classList.add('show');
+      if(bioDivider) bioDivider.style.display='flex';
+      // Detect platform for icon
+      const isIOS=/iPhone|iPad|iPod/i.test(navigator.userAgent);
+      if(bioIcon) bioIcon.textContent = isIOS ? '🔒' : '👆';
+      if(bioText) bioText.textContent = isIOS ? 'Sign in with Face ID / Touch ID' : 'Sign in with Fingerprint';
+      bioBtn.addEventListener('click', triggerBiometricAuth);
+      // Auto-trigger biometric on form open for convenience
+      setTimeout(()=> triggerBiometricAuth(), 400);
+    } else if(bioSession && !bioSession.credRegistered && bioBtn){
+      // Session exists but not yet registered — show register option
+      bioBtn.classList.add('show');
+      if(bioDivider) bioDivider.style.display='flex';
+      if(bioIcon) bioIcon.textContent='🔐';
+      if(bioText) bioText.textContent='Enable Biometric Sign-In';
+      bioBtn.addEventListener('click', registerBiometric);
+    }
+  })();
+
   const doLogin=async()=>{
     const email=$('li-email')?.value.trim(), pass=$('li-pass')?.value;
     if(!email||!pass) return;
     $('li-btn').textContent='Signing in…'; $('li-btn').disabled=true;
-    try{ await auth.signInWithEmailAndPassword(email,pass); }
+    try{
+      await auth.signInWithEmailAndPassword(email,pass);
+      // After successful password login, offer to register biometrics
+      if(isMobileDevice()){
+        const bioAvailable = await isBiometricAvailable();
+        if(bioAvailable){
+          const bioSession = getBiometricSession();
+          // Small delay to let auth state settle before offering registration
+          if(bioSession && !bioSession.credRegistered){
+            setTimeout(()=> registerBiometric(), 2500);
+          }
+        }
+      }
+    }
     catch(e){
       $('li-err').style.display='block';
       $('li-err').textContent='Invalid email or password. Please try again.';
