@@ -2547,10 +2547,16 @@ function _updateMyTasksCard(allTasks){
       const low=(o||'').toLowerCase();
       if(low && low!==selfEmail) teamEmails.add(low);
     }));
-    const myT = filtered.filter(t =>
-      (t.assignee||'').toLowerCase()===selfEmail.toLowerCase() &&
-      teamEmails.has((t.assignedBy||'').toLowerCase())
-    );
+    // BUG FIX v157: Include tasks assigned by superadmin (assignedBy='superadmin'
+    // or admin_notify_email) — previously invisible because 'superadmin' was not in teamEmails.
+    const _saEmailDash = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    const myT = filtered.filter(t => {
+      if((t.assignee||'').toLowerCase() !== selfEmail.toLowerCase()) return false;
+      const ab = (t.assignedBy||'').toLowerCase();
+      return teamEmails.has(ab)
+        || ab === 'superadmin'
+        || (_saEmailDash && ab === _saEmailDash && !currentSession);
+    });
     const myOpen=myT.filter(t=>t.status!=='Done').length;
     const myOver=myT.filter(t=>isOverdue(t)).length;
     valEl.textContent=myT.length;
@@ -3200,10 +3206,13 @@ function _rebuildDashStats(){
         const low=(o||'').toLowerCase();
         if(low && low!==_rebuildMe) teamEmails.add(low);
       }));
-      cards[1].querySelector('.stat-value').textContent = filtered.filter(t=>
-        (t.assignee||'').toLowerCase()===_rebuildMe &&
-        teamEmails.has((t.assignedBy||'').toLowerCase())
-      ).length;
+      // BUG FIX v157: Include superadmin-assigned tasks in team mode stat count
+      const _saEmailStat = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+      cards[1].querySelector('.stat-value').textContent = filtered.filter(t=>{
+        if((t.assignee||'').toLowerCase() !== _rebuildMe) return false;
+        const ab = (t.assignedBy||'').toLowerCase();
+        return teamEmails.has(ab) || ab === 'superadmin' || (_saEmailStat && ab === _saEmailStat && !currentSession);
+      }).length;
     } else {
       cards[1].querySelector('.stat-value').textContent = filtered.filter(t=>{
         if(plantOwnerAuthenticated&&currentPlantSession){
@@ -3277,7 +3286,13 @@ function renderDashboard(){
           const teamEmails=new Set();
           (_myGroupMemberEmails||[]).forEach(e=>{if(e!==me)teamEmails.add(e.toLowerCase());});
           getPlantGroups().forEach(p=>(p.owners||[]).forEach(o=>{const low=(o||'').toLowerCase();if(low&&low!==me)teamEmails.add(low);}));
-          return tasks.filter(t=>(t.assignee||'').toLowerCase()===me&&teamEmails.has((t.assignedBy||'').toLowerCase())).length;
+          // BUG FIX v157: Also count tasks assigned by superadmin
+          const _saEmailInline=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+          return tasks.filter(t=>{
+            if((t.assignee||'').toLowerCase()!==me) return false;
+            const ab=(t.assignedBy||'').toLowerCase();
+            return teamEmails.has(ab)||ab==='superadmin'||(_saEmailInline&&ab===_saEmailInline&&!currentSession);
+          }).length;
         }
         return scopedTasks.filter(t=>(t.assignee||'').toLowerCase()===me).length;
       })()}</div>
@@ -4210,10 +4225,17 @@ function renderTaskRows(){
       const low=(o||'').toLowerCase().trim();
       if(low && low!==myEmail) teamEmails.add(low);
     }));
-    baseList = tasks.filter(t=>
-      (t.assignee||'').toLowerCase()===myEmail &&
-      teamEmails.has((t.assignedBy||'').toLowerCase())
-    );
+    // BUG FIX v157: Also include tasks assigned by superadmin (assignedBy='superadmin'
+    // or assignedBy matching admin_notify_email). Previously these were invisible in
+    // "Team Tasks" because teamEmails never contained 'superadmin'.
+    const saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    baseList = tasks.filter(t=>{
+      if((t.assignee||'').toLowerCase() !== myEmail) return false;
+      const ab = (t.assignedBy||'').toLowerCase();
+      return teamEmails.has(ab)
+        || ab === 'superadmin'
+        || (saEmail && ab === saEmail && !currentSession); // legacy tasks stored with saEmail
+    });
   } else if(taskFilters._assigneeEmail){
     // Team Overview stat click — show ALL tasks for that member regardless of scope
     baseList = tasks.filter(t=>(t.assignee||'').toLowerCase()===taskFilters._assigneeEmail.toLowerCase());
@@ -6421,11 +6443,18 @@ async function sendViaMsGraph(toEmail, subject, htmlBody, ccEmails=[]){
   toEmail = toEmail.trim();
   const cfg = getEmailConfig();
   // When a plant owner is logged in, use their account.
-  // Otherwise, use the logged-in account holder's email so email is sent FROM their mailbox.
+  // For role-based sessions (admin/user), use their session email.
+  // For superadmin (no currentSession), pass null — superadmin has no
+  // email identity in the app; do NOT fall back to admin_notify_email
+  // (that may be a different user's address, e.g. Aniket) which would
+  // cause MS Graph to send the email FROM that person's mailbox.
+  // MSAL will use whichever Microsoft account is already signed in.
   let loginHint = getPlantOwnerLoginHint();
   if(!loginHint) {
-    // Use account holder email as loginHint so Microsoft 365 sends from their account
-    loginHint = getSessionEmail() || localStorage.getItem('admin_notify_email') || null;
+    // Only use session email for role-based logins (admin/user), NOT for superadmin
+    loginHint = getSessionEmail() || null;
+    // Do NOT fall back to admin_notify_email here — that is a notification
+    // address, not necessarily the Microsoft account owner's email.
   }
   const token = await withTimeout(getMSGraphToken(cfg, loginHint));
   // Use tp_sender_name as the display name shown to recipients ("From: Name <email>")
@@ -6462,8 +6491,11 @@ async function sendViaEmailJS(toEmail, subject, htmlBody, task={}){
   const c = getEmailConfig();
   if(typeof emailjs === 'undefined') throw new Error('EmailJS library not loaded');
   emailjs.init({ publicKey: c.ejsKey });
-  // Use account holder's email as sender identity
-  const _senderEmail = getSessionEmail() || localStorage.getItem('admin_notify_email') || 'noreply@polyplastics.com';
+  // Use account holder's email as sender identity.
+  // For superadmin (no currentSession), getSessionEmail() returns ''.
+  // Do NOT fall back to admin_notify_email — that is a separate user's
+  // address (e.g. Aniket) and would show wrong sender to recipients.
+  const _senderEmail = getSessionEmail() || 'noreply@polyplastics.com';
   const _senderNick  = getSessionNick()  || 'POLYPLASTICS Task Manager';
   // Prefer the configured tp_sender_name; fall back to session nick
   const _tpSenderName = (localStorage.getItem('tp_sender_name')||'').trim();
@@ -11670,11 +11702,18 @@ function saveTask(){
       const plantOwnerHint = getPlantOwnerLoginHint();
       const plantOwnerEmail = plantOwnerHint || (plantOwnerAuthenticated && currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : '');
       const adminEmail = localStorage.getItem('admin_notify_email')||'';
-      // Role-based: currentSession email wins over stored admin email
+      // Role-based: currentSession email wins over stored admin email.
+      // IMPORTANT: For superadmin (no currentSession, no plantOwner),
+      // always store 'superadmin' as assignedBy — NOT admin_notify_email.
+      // Using admin_notify_email here caused two bugs:
+      // (1) If admin_notify_email changes later, old tasks become invisible
+      //     in All Tasks because the filter checks assignedBy === saEmail.
+      // (2) When team members received tasks, the email appeared to come
+      //     from admin_notify_email (e.g. Aniket) instead of Sushil.
+      // The superadmin filter in getAllTasks already handles 'superadmin' string.
       const assignedByEmail = plantOwnerEmail
         || (currentSession ? currentSession.email : '')
-        || adminEmail
-        || 'superadmin'; // fallback so filter always matches
+        || (adminAuthenticated ? 'superadmin' : (adminEmail || 'superadmin')); // superadmin always stores 'superadmin'
       const nt={
         id:uid(), title,
         desc:document.getElementById('tm-desc').value,
