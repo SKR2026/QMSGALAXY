@@ -6478,7 +6478,11 @@ async function sendViaMsGraph(toEmail, subject, htmlBody, ccEmails=[]){
   };
   if(tpSenderName){
     // Graph API allows overriding the display name while keeping the mailbox address
-    const senderEmail = getSessionEmail() || localStorage.getItem('admin_notify_email') || '';
+    // BUG FIX v160: Do NOT fall back to admin_notify_email — that is a different
+    // user's address (e.g. Aniket) and would make emails appear sent FROM them.
+    // Use only the authenticated session email; if blank (superadmin), omit the
+    // override entirely — MS Graph uses the signed-in MSAL account automatically.
+    const senderEmail = getSessionEmail();
     if(senderEmail) msgBody.from = { emailAddress:{ name: tpSenderName, address: senderEmail } };
   }
   // ccEmails may be a string (single) or array (multiple) — normalise to array
@@ -7300,6 +7304,25 @@ function getTeamOnlyTasks(){
     });
   });
 
+  // BUG FIX v160: Also include tasks assigned BY any role-user (admin/user session),
+  // even if they haven't been added as an explicit group member. Previously, tasks
+  // created by Kunal (a role user) were invisible in Team Tasks because his email
+  // wasn't in _myGroupMemberEmails or plant owners — despite his task being in Firestore.
+  // We detect role-user assignedBy emails as: non-empty, not 'superadmin', not saEmail,
+  // and not a plant owner — i.e. any real email that assigned a task.
+  const saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+  tasks.forEach(t => {
+    const ab = (t.assignedBy||'').toLowerCase();
+    if(ab && ab !== 'superadmin' && ab !== saEmail && ab !== myEmail && ab.includes('@')) {
+      teamEmails.add(ab);
+    }
+    // Also catch assignees who are role-users (they may assign tasks back)
+    const ae = (t.assignee||'').toLowerCase();
+    if(ae && ae !== saEmail && ae !== myEmail && ae.includes('@')) {
+      teamEmails.add(ae);
+    }
+  });
+
   // Query the FULL task list directly — not getScopedTasks()
   // so plant-owner tasks aren't filtered out by the superadmin scope guard.
   return tasks.filter(t => {
@@ -7344,19 +7367,16 @@ function getDashScopedTasks(forceMine){
   if(plantOwnerAuthenticated && currentPlantSession){
     return _filterByDashPlant(getScopedTasks());
   }
-  // Default "mine" view: show only tasks where I am assignee or assigner
+  // Default "mine" view: show only tasks where I am assignee or assigner.
   // Plant-tagged tasks belong exclusively to their plant panel — exclude them here.
+  // BUG FIX v160: Previously only showed tasks where assignedBy === 'superadmin',
+  // which excluded tasks created by role-users (e.g. Kunal). Use getScopedTasks()
+  // which already has the correct, complete visibility logic for all roles.
   const myEmail = _getMyEmail();
   if(myEmail){
-    const myTasks = tasks.filter(t => {
-      // Skip tasks tagged to a specific plant (they belong in the Plant panel)
-      // unless the superadmin is personally the assignee of that task
-      if(t.plant && (t.assignee||'').toLowerCase() !== myEmail) return false;
-      const assignee   = (t.assignee||'').toLowerCase();
-      const assignedBy = (t.assignedBy||'').toLowerCase();
-      return assignee === myEmail || assignedBy === myEmail || assignedBy === 'superadmin';
-    });
-    return _filterByDashPlant(myTasks);
+    // getScopedTasks() is the single source of truth — it handles superadmin,
+    // role-admin, role-user, plant-owner and group-member scoping correctly.
+    return _filterByDashPlant(getScopedTasks());
   }
   return _filterByDashPlant(getScopedTasks());
 }
