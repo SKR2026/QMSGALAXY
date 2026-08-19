@@ -2510,33 +2510,20 @@ function initFirestoreListeners() {
       applySharedLogo(_settingsData?.app?.logoUrl || '');
     }
 
-    // BUG FIX: Mark settings as loaded from Firestore (even if doc doesn't exist yet —
+    // Mark settings as loaded from Firestore (even if doc doesn't exist yet —
     // that just means defaults apply, which is fine).
-    // Then fire an immediate catch-up tick so the scheduler doesn't wait up to 60s
-    // after the page loads before checking whether the digest should fire today.
+    // NOTE: Catch-up digest on app open is intentionally disabled.
+    // The Cloud Scheduler is the sole trigger for digest emails — no in-app send.
     if (!_digestSettingsReady) {
       _digestSettingsReady = true;
-      // Trigger a catch-up tick now that real settings are available.
-      // Use setTimeout(0) to let the current snapshot callback finish first.
+      // Sync localStorage so the in-app scheduler stays quiet if Cloud already sent today.
       setTimeout(() => {
         const dd = _settingsData.dailyDigest || {};
-        if (!dd.enabled || !dd.sendTime) return;
-        const now     = new Date();
-        const nowMins = now.getHours() * 60 + now.getMinutes();
-        const [ch, cm] = dd.sendTime.split(':').map(Number);
-        const cfgMins  = ch * 60 + cm;
-        const today   = now.toDateString();
-        const lastDay = localStorage.getItem('pv_digest_sent_date');
-        // Also check Firestore lastSentDate — the Cloud Function stamps this field
-        // when it sends on schedule, so we don't re-send when the app is opened later.
         const fsLastSent = dd.lastSentDate ? new Date(dd.lastSentDate).toDateString() : '';
-        if (nowMins >= cfgMins && lastDay !== today && fsLastSent !== today) {
-          console.log('[PlantVisit] 📬 Catch-up digest tick after settings loaded.');
-          sendDailyDigestEmail(false);
-        } else if (fsLastSent === today && lastDay !== today) {
-          // Cloud Function already sent today — sync localStorage so scheduler stays quiet
+        const today = new Date().toDateString();
+        if (fsLastSent === today) {
           localStorage.setItem('pv_digest_sent_date', today);
-          console.log('[PlantVisit] ✅ Cloud Function already sent digest today — skipping catch-up.');
+          console.log('[PlantVisit] ✅ Cloud Scheduler already sent digest today — in-app send suppressed.');
         }
       }, 0);
     }
@@ -5706,46 +5693,10 @@ let _digestSchedulerTimer = null;
 let _digestSettingsReady  = false; // true once Firestore settings have loaded at least once
 
 function startDailyDigestScheduler() {
-  if (_digestSchedulerTimer) return; // already running
-
-  const tick = () => {
-    // BUG FIX: Do NOT run until Firestore has pushed real settings at least once.
-    // activateSession() calls this before the SETTINGS_DOC snapshot resolves, so
-    // _settingsData.dailyDigest.enabled is still the hardcoded default (false).
-    // The very first tick() call (catch-up, immediate) would silently bail on
-    // dd.enabled=false and never fire again until the next 60s interval — by
-    // which time the configured send-time window may have already passed.
-    if (!_digestSettingsReady) return;
-
-    const dd = _settingsData.dailyDigest || {};
-    if (!dd.enabled) return;
-    if (!dd.sendTime) return;
-
-    const now      = new Date();
-    const nowMins  = now.getHours() * 60 + now.getMinutes();
-    const [ch, cm] = dd.sendTime.split(':').map(Number);
-    const cfgMins  = ch * 60 + cm;
-    const today    = now.toDateString();
-    const lastDay  = localStorage.getItem('pv_digest_sent_date');
-    // Also check Firestore lastSentDate — stamped by the Cloud Function on schedule send
-    const fsLastSent = dd.lastSentDate ? new Date(dd.lastSentDate).toDateString() : '';
-
-    if (fsLastSent === today && lastDay !== today) {
-      // Cloud Function already sent today — sync localStorage and stay quiet
-      localStorage.setItem('pv_digest_sent_date', today);
-      console.log('[PlantVisit] ✅ Cloud Function sent digest today — scheduler skipping.');
-      return;
-    }
-
-    // Fire once any time on or after the configured time (not yet sent today)
-    if (nowMins >= cfgMins && lastDay !== today && fsLastSent !== today) {
-      console.log(`[PlantVisit] 📬 Daily digest firing — now=${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')} cfg=${dd.sendTime}`);
-      sendDailyDigestEmail(false);
-    }
-  };
-
-  tick(); // catch up immediately if configured time already passed today
-  _digestSchedulerTimer = setInterval(tick, 60_000); // then check every minute
+  // In-app scheduler is intentionally disabled.
+  // Digest emails are sent exclusively by the Cloud Scheduler (server-side).
+  // This prevents duplicate emails when the app is opened after the send time.
+  console.log('[PlantVisit] ℹ️ In-app digest scheduler is disabled — Cloud Scheduler is the sole sender.');
 }
 
 function stopDailyDigestScheduler() {
