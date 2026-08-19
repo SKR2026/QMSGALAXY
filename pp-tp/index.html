@@ -3212,16 +3212,19 @@ function _rebuildDashStats(){
   const cards = document.querySelectorAll('#dash-stats-grid .stat-card');
   if(cards.length>=8){
     cards[0].querySelector('.stat-value').textContent = total;
-    const _rebuildMe = _getMyEmail();
-    // In team mode: count only tasks assigned TO me BY a team member
-    if(dashViewMode === 'team' && _rebuildMe){
+    // Resolve "whose dashboard is active" — member viewer > self
+    const _rebuildMe = (_memberViewActive && _memberViewEmail)
+      ? _memberViewEmail.toLowerCase()
+      : _getMyEmail();
+
+    // In team mode: "Assigned to Me" card = tasks assigned TO Sushil BY any team member
+    if(dashViewMode === 'team' && !_memberViewActive && _rebuildMe){
       const teamEmails = new Set();
       (_myGroupMemberEmails||[]).forEach(e=>{ if(e!==_rebuildMe) teamEmails.add(e.toLowerCase()); });
       getPlantGroups().forEach(p=>(p.owners||[]).forEach(o=>{
         const low=(o||'').toLowerCase();
         if(low && low!==_rebuildMe) teamEmails.add(low);
       }));
-      // BUG FIX v157: Include superadmin-assigned tasks in team mode stat count
       const _saEmailStat = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
       cards[1].querySelector('.stat-value').textContent = filtered.filter(t=>{
         if((t.assignee||'').toLowerCase() !== _rebuildMe) return false;
@@ -3229,8 +3232,9 @@ function _rebuildDashStats(){
         return teamEmails.has(ab) || ab === 'superadmin' || (_saEmailStat && ab === _saEmailStat && !currentSession);
       }).length;
     } else {
+      // Mine mode or member viewer: show tasks assigned TO the active person
       cards[1].querySelector('.stat-value').textContent = filtered.filter(t=>{
-        if(plantOwnerAuthenticated&&currentPlantSession){
+        if(plantOwnerAuthenticated&&currentPlantSession&&!_memberViewActive){
           const oe=(currentPlantSession.owners||[]).map(e=>e.toLowerCase());
           return oe.includes((t.assignee||'').toLowerCase());
         }
@@ -7287,49 +7291,44 @@ function getMyPersonalTasks(){
 // Returns ALL tasks where assignee OR assigner is any team member
 // (group members + plant owners), regardless of whether I'm also involved.
 function getTeamOnlyTasks(){
+  // ── Team = Sushil (me) + all accepted group members + all plant owners ──
+  // This is what the "Team" pill on the dashboard shows.
+  // It does NOT include random assignees from the task list — only people
+  // who are explicitly part of the team (accepted members + plant owners + self).
   const myEmail = _getMyEmail();
+  const saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
 
-  // Build the complete set of team member emails
   const teamEmails = new Set();
+
+  // Always include self (Sushil / the logged-in account)
+  if(myEmail) teamEmails.add(myEmail);
+  if(saEmail && saEmail !== myEmail) teamEmails.add(saEmail);
+
   // Accepted group members
   (_myGroupMemberEmails || []).forEach(e => {
     const low = e.toLowerCase();
-    if(low !== myEmail) teamEmails.add(low);
+    if(low) teamEmails.add(low);
   });
-  // Plant owners from every plant group
+
+  // All plant owners from every plant group
   getPlantGroups().forEach(p => {
     (p.owners || []).forEach(o => {
       const low = (o || '').toLowerCase().trim();
-      if(low && low !== myEmail) teamEmails.add(low);
+      if(low) teamEmails.add(low);
     });
   });
 
-  // BUG FIX v160: Also include tasks assigned BY any role-user (admin/user session),
-  // even if they haven't been added as an explicit group member. Previously, tasks
-  // created by Kunal (a role user) were invisible in Team Tasks because his email
-  // wasn't in _myGroupMemberEmails or plant owners — despite his task being in Firestore.
-  // We detect role-user assignedBy emails as: non-empty, not 'superadmin', not saEmail,
-  // and not a plant owner — i.e. any real email that assigned a task.
-  const saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-  tasks.forEach(t => {
-    const ab = (t.assignedBy||'').toLowerCase();
-    if(ab && ab !== 'superadmin' && ab !== saEmail && ab !== myEmail && ab.includes('@')) {
-      teamEmails.add(ab);
-    }
-    // Also catch assignees who are role-users (they may assign tasks back)
-    const ae = (t.assignee||'').toLowerCase();
-    if(ae && ae !== saEmail && ae !== myEmail && ae.includes('@')) {
-      teamEmails.add(ae);
-    }
-  });
-
-  // Query the FULL task list directly — not getScopedTasks()
-  // so plant-owner tasks aren't filtered out by the superadmin scope guard.
+  // Return tasks where assignee OR assignedBy is anyone in the team set.
+  // For superadmin-created tasks, assignedBy may be 'superadmin' — treat that
+  // as belonging to the superadmin (saEmail / myEmail).
   return tasks.filter(t => {
     const assignee   = (t.assignee||'').toLowerCase();
     const assignedBy = (t.assignedBy||'').toLowerCase();
-    // Include if assignee OR assigner is a known team member
-    return teamEmails.has(assignee) || teamEmails.has(assignedBy);
+    if(teamEmails.has(assignee)) return true;
+    if(teamEmails.has(assignedBy)) return true;
+    // Superadmin-created tasks (assignedBy === 'superadmin') belong to me
+    if(!currentSession && (assignedBy === 'superadmin' || !assignedBy) && assignee) return true;
+    return false;
   });
 }
 
@@ -7357,26 +7356,44 @@ function _filterByDashPlant(arr){
 // ── Helper: session-scoped tasks, further narrowed by the dashboard's
 //    single-click Plant filter tab (if one is active) ──────────────────
 function getDashScopedTasks(forceMine){
-  // When in "team" view mode, show only team members' tasks (not mine)
-  // forceMine=true bypasses this so All Tasks always shows the full personal scope
-  if(!forceMine && dashViewMode === 'team') return _filterByDashPlant(getTeamOnlyTasks());
-  // Plant owner: Dashboard totals must match the Plant Overview panel —
-  // scope strictly to this plant (owners' tasks + tasks tagged to this plant),
-  // not the generic "assignee/assignedBy === me OR assignedBy === superadmin"
-  // rule below, which pulled in unrelated tasks from other plants.
+  // ── MEMBER VIEWER: viewing another member's dashboard ─────────────────
+  // Always scope strictly to that member regardless of dashViewMode.
+  if(!forceMine && _memberViewActive && _memberViewEmail){
+    const mv = _memberViewEmail.toLowerCase();
+    return _filterByDashPlant(tasks.filter(t =>
+      (t.assignee||'').toLowerCase() === mv ||
+      (t.assignedBy||'').toLowerCase() === mv
+    ));
+  }
+
+  // ── TEAM mode: entire team's tasks (plant owners + group members) ──────
+  // forceMine=true bypasses this so All Tasks panel always shows full scope.
+  if(!forceMine && dashViewMode === 'team'){
+    return _filterByDashPlant(getTeamOnlyTasks());
+  }
+
+  // ── PLANT OWNER logged in: scope to their plant ────────────────────────
   if(plantOwnerAuthenticated && currentPlantSession){
     return _filterByDashPlant(getScopedTasks());
   }
-  // Default "mine" view: show only tasks where I am assignee or assigner.
-  // Plant-tagged tasks belong exclusively to their plant panel — exclude them here.
-  // BUG FIX v160: Previously only showed tasks where assignedBy === 'superadmin',
-  // which excluded tasks created by role-users (e.g. Kunal). Use getScopedTasks()
-  // which already has the correct, complete visibility logic for all roles.
+
+  // ── MINE mode (Sushil chip selected): ONLY tasks assigned TO or BY me ──
+  // This is the key fix: when Sushil's chip is active, dashboard shows only
+  // Sushil's personal tasks (124 assigned to him + 46 assigned by him = 170),
+  // NOT the entire group scope.
   const myEmail = _getMyEmail();
   if(myEmail){
-    // getScopedTasks() is the single source of truth — it handles superadmin,
-    // role-admin, role-user, plant-owner and group-member scoping correctly.
-    return _filterByDashPlant(getScopedTasks());
+    const saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    return _filterByDashPlant(tasks.filter(t => {
+      const assignee   = (t.assignee||'').toLowerCase();
+      const assignedBy = (t.assignedBy||'').toLowerCase();
+      // Tasks assigned TO me
+      if(assignee === myEmail) return true;
+      // Tasks assigned BY me (superadmin stores 'superadmin' as assignedBy)
+      if(assignedBy === myEmail) return true;
+      if(!currentSession && (assignedBy === 'superadmin' || (saEmail && assignedBy === saEmail))) return true;
+      return false;
+    }));
   }
   return _filterByDashPlant(getScopedTasks());
 }
