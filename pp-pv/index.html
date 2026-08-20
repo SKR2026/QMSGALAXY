@@ -4156,6 +4156,40 @@ function closeModal() {
  * getGmailBackendUrl()
  * Returns the Cloud Run backend URL from settings.
  */
+/* ── Debounced Cloud Scheduler sync ─────────────────────────────────────
+   All update-schedule calls go through here. Multiple rapid calls (e.g.
+   from simultaneous saves) collapse into one request after 1.5 s, preventing
+   Cloud Scheduler 409 "sync mutate calls cannot be queued" errors.
+─────────────────────────────────────────────────────────────────────── */
+let _scheduleDebounceTimer = null;
+function _pushSchedule(statusEl) {
+  if (_scheduleDebounceTimer) clearTimeout(_scheduleDebounceTimer);
+  _scheduleDebounceTimer = setTimeout(() => {
+    _scheduleDebounceTimer = null;
+    const backendUrl = getGmailBackendUrl();
+    if (!backendUrl) return;
+    const gm = _settingsData.gmail        || {};
+    const dd = _settingsData.dailyDigest  || {};
+    fetch(`${backendUrl}/api/update-schedule`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sendTime:   dd.sendTime   || '18:00',
+        notifTitle: (gm.notifTitle  || 'Customer Visit').trim(),
+        prefixTag:  (gm.prefixTag   !== undefined ? gm.prefixTag : '').trim(),
+        senderName: (gm.senderName  || 'PlantVisit Digest').trim(),
+        recipients: _ddActiveEmails().join(', ') || (dd.recipients || '').trim(),
+      }),
+    }).then(r => {
+      if (statusEl) statusEl.innerHTML = r.ok
+        ? `<span style="color:var(--green);font-size:12px">✅ Scheduler updated</span>`
+        : `<span style="color:var(--red);font-size:12px">⚠ Scheduler update failed</span>`;
+      if (statusEl) setTimeout(() => { statusEl.innerHTML = ''; }, 5000);
+    }).catch(() => {
+      if (statusEl) statusEl.innerHTML = `<span style="color:var(--red);font-size:12px">⚠ Scheduler unreachable</span>`;
+    });
+  }, 1500);
+}
+
 function getGmailBackendUrl() {
   return (_settingsData.gmail || {}).backendUrl || '';
 }
@@ -4699,24 +4733,8 @@ function saveAzureSettings() {
   _settingsData.notification.subjectPrefix = _settingsData.gmail.prefixTag || '';
   saveSettings();
   toast('\u2713 Gmail Config Saved', 'Gmail backend configuration updated successfully.');
-  // Re-push all email settings to Cloud Scheduler so cloud-triggered digest
-  // immediately uses the new notifTitle, prefixTag and senderName.
-  const _bUrl = (_settingsData.gmail || {}).backendUrl;
-  if (_bUrl) {
-    const _dd = _settingsData.dailyDigest || {};
-    const _gm = _settingsData.gmail || {};
-    fetch(`${_bUrl}/api/update-schedule`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sendTime:        _dd.sendTime   || '18:00',
-        notifTitle:      (_gm.notifTitle  || 'Customer Visit').trim(),
-        prefixTag:       (_gm.prefixTag   !== undefined ? _gm.prefixTag : '').trim(),
-        senderName:      (_gm.senderName  || 'PlantVisit Digest').trim(),
-        recipients:      _ddActiveEmails().join(', ') || (_dd.recipients || '').trim(),
-      }),
-    }).catch(() => {}); // silent - user already got the save toast
-  }
+  // Re-push all email settings to Cloud Scheduler
+  _pushSchedule(null);
 }
 
 function _previewEmailSubject() {
@@ -4958,54 +4976,10 @@ function saveNotificationSettings() {
   saveSettings();
   toast('✓ Notification Config Saved', 'Email notification rules updated.');
 
-  // ── Sync Cloud Scheduler job to the new send time ──────────────────────────
-  const backendUrl = getGmailBackendUrl();
-  if (!backendUrl) {
-    console.warn('[PlantVisit] Gmail backend URL not configured — Cloud Scheduler not updated.');
-    return;
-  }
+  // ── Sync Cloud Scheduler (debounced — prevents 409 race conditions) ──
   const schedulerStatusEl = document.getElementById('schedulerUpdateStatus');
-  if (schedulerStatusEl) {
-    schedulerStatusEl.innerHTML =
-      `<span style="color:var(--slate);font-size:12px">⏳ Updating Cloud Scheduler…</span>`;
-  }
-  fetch(`${backendUrl}/api/update-schedule`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({
-      sendTime,
-      notifTitle:      ((_settingsData.gmail||{}).notifTitle  || (_settingsData?.app?.notificationTitle||'Customer Visit')).trim(),
-      prefixTag:       ((_settingsData.gmail||{}).prefixTag  !== undefined ? (_settingsData.gmail||{}).prefixTag : ((_settingsData.notification||{}).subjectPrefix||'')).trim(),
-      senderName:      ((_settingsData.gmail||{}).senderName || 'PlantVisit Digest').trim(),
-      recipients:      ((_settingsData.dailyDigest||{}).recipients||'').trim(),
-    }),
-  })
-  .then(r => r.json())
-  .then(data => {
-    if (data.success) {
-      console.log(`[PlantVisit] ✅ Cloud Scheduler updated → "${data.cron}" IST`);
-      toast('🕐 Scheduler Synced', `Cloud Scheduler will now fire at ${sendTime} IST (cron: ${data.cron})`);
-      if (schedulerStatusEl) {
-        schedulerStatusEl.innerHTML =
-          `<span style="color:var(--green);font-size:12px">✅ Scheduler updated → fires at <strong>${sendTime}</strong> IST</span>`;
-      }
-    } else {
-      console.warn('[PlantVisit] Cloud Scheduler update failed:', data.error);
-      toast('⚠ Scheduler Not Updated', data.error || 'Unknown error from backend.', true);
-      if (schedulerStatusEl) {
-        schedulerStatusEl.innerHTML =
-          `<span style="color:var(--red);font-size:12px">⚠ Scheduler update failed: ${data.error || 'unknown error'}</span>`;
-      }
-    }
-  })
-  .catch(err => {
-    console.error('[PlantVisit] Cloud Scheduler fetch error:', err);
-    toast('⚠ Scheduler Not Updated', 'Could not reach the backend. Check the backend URL.', true);
-    if (schedulerStatusEl) {
-      schedulerStatusEl.innerHTML =
-        `<span style="color:var(--red);font-size:12px">⚠ Could not reach backend.</span>`;
-    }
-  });
+  if (schedulerStatusEl) schedulerStatusEl.innerHTML = `<span style="color:var(--slate);font-size:12px">⏳ Updating Cloud Scheduler…</span>`;
+  _pushSchedule(schedulerStatusEl);
 }
 
 
@@ -5046,28 +5020,10 @@ function _autoSaveNotifSettings(source) {
     setTimeout(() => { if (statusEl) statusEl.innerHTML = ''; }, 2500);
   }
 
-  // Sync Cloud Scheduler when time or digest toggle changes
+  // Sync Cloud Scheduler when time or digest toggle changes (debounced)
   if (source === 'time' || source === 'digest-toggle') {
-    const backendUrl = getGmailBackendUrl();
-    if (!backendUrl) return;
     if (statusEl) statusEl.innerHTML = `<span style="color:var(--slate);font-size:11px">⏳ Syncing scheduler…</span>`;
-    fetch(`${backendUrl}/api/update-schedule`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sendTime,
-        notifTitle:      ((_settingsData.gmail||{}).notifTitle  || 'Customer Visit').trim(),
-        prefixTag:       ((_settingsData.gmail||{}).prefixTag   || '').trim(),
-        senderName:      ((_settingsData.gmail||{}).senderName  || 'PlantVisit Digest').trim(),
-        recipients:      ((_settingsData.dailyDigest||{}).recipients||'').trim(),
-      }),
-    }).then(r => {
-      if (statusEl) statusEl.innerHTML = r.ok
-        ? `<span style="color:var(--green);font-size:11px">✅ Scheduler synced → ${sendTime}</span>`
-        : `<span style="color:var(--red);font-size:11px">⚠ Scheduler sync failed</span>`;
-      setTimeout(() => { if (statusEl) statusEl.innerHTML = ''; }, 4000);
-    }).catch(() => {
-      if (statusEl) statusEl.innerHTML = `<span style="color:var(--red);font-size:11px">⚠ Backend unreachable</span>`;
-    });
+    _pushSchedule(statusEl);
   }
 }
 
@@ -8941,21 +8897,7 @@ function saveAzureSettings() {
   _settingsData.notification.subjectPrefix = _settingsData.gmail.prefixTag || '';
   saveSettings();
   toast('✓ Gmail Config Saved', 'Gmail backend configuration updated successfully.');
-  const _bUrl = (_settingsData.gmail || {}).backendUrl;
-  if (_bUrl) {
-    const _dd = _settingsData.dailyDigest || {};
-    const _gm = _settingsData.gmail || {};
-    fetch(`${_bUrl}/api/update-schedule`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sendTime:        _dd.sendTime || '18:00',
-        notifTitle:      (_gm.notifTitle  || 'Customer Visit').trim(),
-        prefixTag:       (_gm.prefixTag   !== undefined ? _gm.prefixTag : '').trim(),
-        senderName:      (_gm.senderName  || 'PlantVisit Digest').trim(),
-        recipients:      _ddActiveEmails().join(', ') || (_dd.recipients || '').trim(),
-      }),
-    }).catch(() => {});
-  }
+  _pushSchedule(null);
 }
 
 /* ── Patch saveNotificationSettings to persist dd recipientList ── */
@@ -8977,28 +8919,9 @@ function saveNotificationSettings() {
   };
   saveSettings();
   toast('✓ Notification Config Saved', 'Email notification rules updated.');
-  const backendUrl = getGmailBackendUrl();
-  if (!backendUrl) return;
   const schedulerStatusEl = document.getElementById('schedulerUpdateStatus');
   if (schedulerStatusEl) schedulerStatusEl.innerHTML = `<span style="color:var(--slate);font-size:12px">⏳ Updating Cloud Scheduler…</span>`;
-  fetch(`${backendUrl}/api/update-schedule`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sendTime,
-      notifTitle:      ((_settingsData.gmail||{}).notifTitle || 'Customer Visit').trim(),
-      prefixTag:       ((_settingsData.gmail||{}).prefixTag  || '').trim(),
-      senderName:      ((_settingsData.gmail||{}).senderName || 'PlantVisit Digest').trim(),
-      recipients:      _ddActiveEmails().join(', '),
-    }),
-  }).then(async r => {
-    const ok = r.ok;
-    if (schedulerStatusEl) schedulerStatusEl.innerHTML = ok
-      ? `<span style="color:var(--green);font-size:12px">✅ Scheduler updated</span>`
-      : `<span style="color:var(--red);font-size:12px">⚠ Scheduler update failed</span>`;
-    setTimeout(() => { if (schedulerStatusEl) schedulerStatusEl.innerHTML = ''; }, 5000);
-  }).catch(() => {
-    if (schedulerStatusEl) schedulerStatusEl.innerHTML = `<span style="color:var(--red);font-size:12px">⚠ Scheduler unreachable</span>`;
-  });
+  _pushSchedule(schedulerStatusEl);
 }
 
 /* ── Hook into renderGmailSettings / renderNotificationSettings to bootstrap lists ── */
