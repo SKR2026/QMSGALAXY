@@ -2272,9 +2272,10 @@ function submitUpdate(incidentId){
     const notifRecipients = [...safetyOfficers, ...admins, ...superAdmins, ...plantHeads]
       .filter(u => u.email && u.id !== currentUser?.id);
     if(notifRecipients.length){
-      const emailList = buildEmailList(i, notifRecipients.map(u=>({
-        name: u.name, email: u.email, action: 'plant-head-view', tokenUrl: null
-      })));
+      const emailList = buildEmailList(i, notifRecipients.map(u=>{
+        const tok = generateToken(i.id, u.id, u.name, u.email, 'plant-head-view');
+        return { name: u.name, email: u.email, action: 'plant-head-view', tokenUrl: getTokenURL(tok) };
+      }));
       dispatchAllEmails(emailList);
     }
     showToast(`✅ Status updated to "${statusChange}" — notifications sent.`, 'ok');
@@ -3260,9 +3261,10 @@ function getEscRecipients(incident){
     recipients.push({ name:ph.name, email:ph.email, action:'escalation-alert', tokenUrl:getTokenURL(tok) });
   });
 
-  // SO, Admin, SA → direct (they login)
+  // SO, Admin, SA → magic link (direct incident view, no login needed)
   [...safetyOfficers, ...admins, ...superAdmins].forEach(u=>{
-    recipients.push({ name:u.name, email:u.email, action:'escalation-alert', tokenUrl:null });
+    const tok = generateToken(incident.id, u.id, u.name, u.email, 'plant-head-view');
+    recipients.push({ name:u.name, email:u.email, action:'escalation-alert', tokenUrl:getTokenURL(tok) });
   });
 
   return recipients;
@@ -3807,9 +3809,10 @@ async function notifyIncidentCreated(incident){
     recipients.push({ name:ph.name, email:ph.email, action:'plant-head-view', tokenUrl:getTokenURL(tok) });
   });
 
-  // SO, Admin, SuperAdmin → direct login link
+  // SO, Admin, SuperAdmin → magic link (direct incident view, no login needed)
   [...safetyOfficers, ...admins, ...superAdmins].forEach(u=>{
-    recipients.push({ name:u.name, email:u.email, action:'plant-head-view', tokenUrl:null });
+    const tok = generateToken(incident.id, u.id, u.name, u.email, 'plant-head-view');
+    recipients.push({ name:u.name, email:u.email, action:'plant-head-view', tokenUrl:getTokenURL(tok) });
   });
 
   saveDB();
@@ -3837,16 +3840,18 @@ async function notifyHODAssigned(incident, hodUser){
     recipients.push({ name: u.name, email: u.email, action: 'plant-head-view', tokenUrl: getTokenURL(t) });
   });
 
-  // Plant Admins — direct app link (they have login)
+  // Plant Admins — magic link (direct incident view, no login needed)
   admins.forEach(u => {
     if(!u.email) return;
-    recipients.push({ name: u.name, email: u.email, action: 'plant-head-view', tokenUrl: null });
+    const tok = generateToken(incident.id, u.id, u.name, u.email, 'plant-head-view');
+    recipients.push({ name: u.name, email: u.email, action: 'plant-head-view', tokenUrl: getTokenURL(tok) });
   });
 
-  // SuperAdmins — direct app link
+  // SuperAdmins — magic link (direct incident view, no login needed)
   superAdmins.forEach(u => {
     if(!u.email) return;
-    recipients.push({ name: u.name, email: u.email, action: 'plant-head-view', tokenUrl: null });
+    const tok = generateToken(incident.id, u.id, u.name, u.email, 'plant-head-view');
+    recipients.push({ name: u.name, email: u.email, action: 'plant-head-view', tokenUrl: getTokenURL(tok) });
   });
 
   saveDB();
@@ -3886,9 +3891,10 @@ async function notifyIncidentClosed(incident, closedBy){
     const tok = generateToken(incident.id, u.id, u.name, u.email, 'closure-ack');
     recipients.push({ name:u.name, email:u.email, action:'closure-ack', tokenUrl:getTokenURL(tok) });
   });
-  // Admin + SuperAdmin → direct
+  // Admin + SuperAdmin → magic link closure acknowledgement
   [...admins, ...superAdmins].forEach(u=>{
-    recipients.push({ name:u.name, email:u.email, action:'closure-ack', tokenUrl:null });
+    const tok = generateToken(incident.id, u.id, u.name, u.email, 'closure-ack');
+    recipients.push({ name:u.name, email:u.email, action:'closure-ack', tokenUrl:getTokenURL(tok) });
   });
 
   saveDB();
@@ -3913,6 +3919,33 @@ function getMyHODAssignments(){
 ═══════════════════════════════════════════════════════ */
 function handleTokenPage(){
   const params = new URLSearchParams(window.location.search);
+
+  // ?incident=<id> deep-link — used by Cloud Run email engine (no token needed)
+  // Shows the incident in the token overlay as a read-only "plant-head-view"
+  const incidentDeepLink = params.get('incident');
+  if(incidentDeepLink){
+    const incident = DB.incidents.find(i=>i.id===incidentDeepLink || i.incidentNo===incidentDeepLink);
+    if(incident){
+      document.getElementById('login-overlay').style.display='none';
+      document.getElementById('token-overlay').style.display='block';
+      if(DB.settings?.logo){
+        const img=document.getElementById('tok-logo');
+        if(img){ img.src=DB.settings.logo; img.style.display='block'; }
+      }
+      // Synthesise a temporary read-only token object (not persisted)
+      const fakeToken = {
+        id: null, incidentId: incident.id, recipientId: null,
+        recipientName: 'Viewer', recipientEmail: '',
+        action: 'plant-head-view',
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now()+7*24*3600*1000).toISOString(),
+        used: false, usedAt: null,
+      };
+      renderTokenPage(fakeToken);
+      return true;
+    }
+  }
+
   const tokenId = params.get('token');
   if(!tokenId) return false;
 
@@ -5002,7 +5035,7 @@ function renderSettings(){
           <small style="color:var(--t3)">Your Cloud Run service URL (deploy incident_index.js)</small>
         </div>
         <div class="fg"><label>App URL <small style="color:var(--t3)">(link in notification emails)</small></label>
-          <input id="s-app-url" value="${xe(s.appUrl||'')}" placeholder="https://www.example.com/pp-ir/">
+          <input id="s-app-url" value="${xe(s.appUrl||'')}" placeholder="https://www.qmsgalaxy.com/pp-ir/">
           <small style="color:var(--t3)">URL recipients land on when clicking "View Incident" in emails</small>
         </div>
         <div class="fg"><label>Internal Secret</label>
