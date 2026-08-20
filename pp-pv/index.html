@@ -2097,10 +2097,6 @@ let _settingsData = {
     recipients: '',
     lastSentDate: ''
   },
-  reminder: {
-    enabled: true,
-    sendTime: '09:00'
-  },
   app: {
     companyName: 'Company Ltd',
     appUrl: window.location.origin + window.location.pathname,
@@ -2510,10 +2506,7 @@ function initFirestoreListeners() {
       if (doc.data().dailyDigest) {
         _settingsData.dailyDigest = { ..._settingsData.dailyDigest, ...doc.data().dailyDigest };
       }
-      // Ensure reminder sub-object is always fully merged
-      if (doc.data().reminder) {
-        _settingsData.reminder = { ..._settingsData.reminder, ...doc.data().reminder };
-      }
+
       // Apply shared logo to all logo slots on every settings push
       applySharedLogo(_settingsData?.app?.logoUrl || '');
     }
@@ -2764,9 +2757,8 @@ function activateSession(user, id, visitId) {
   // ★ Initialize license expiry badge in header
   initLicenseBadge();
 
-  // Start daily-digest scheduler (Cloud Scheduler fires digest; in-app sends reminder)
+  // Digest is sent exclusively by Cloud Scheduler (server-side)
   startDailyDigestScheduler();
-  startReminderScheduler();
 
   // Navigate
   _pendingVisitId = null;
@@ -4713,7 +4705,6 @@ function saveAzureSettings() {
   if (_bUrl) {
     const _dd = _settingsData.dailyDigest || {};
     const _gm = _settingsData.gmail || {};
-    const _rm = _settingsData.reminder || {};
     fetch(`${_bUrl}/api/update-schedule`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -4945,46 +4936,7 @@ function renderNotificationSettings(el) {
     </div>
     <!-- /DAILY DIGEST -->
 
-    <!-- ═══ UPCOMING VISIT REMINDER ═══ -->
-    <div class="settings-section" style="border-top:1px solid var(--border);padding-top:20px;margin-top:4px">
-      <div class="settings-section-title" style="display:flex;align-items:center;gap:10px">
-        ⏰ Upcoming Visit Reminder
-        <span class="badge badge-medium" style="font-size:10px">Day-Before Alert</span>
-      </div>
-      <div class="alert alert-info" style="margin:10px 0 16px;font-size:12px">
-        A reminder email is sent each morning listing visits scheduled for <strong>tomorrow</strong>.
-        Synced to the same Cloud Run backend — no separate setup needed.
-      </div>
-      <div class="settings-row">
-        <div>
-          <div class="settings-row-label" style="display:flex;align-items:center;gap:10px">
-            Enable Reminder
-            <select class="settings-input" id="rm_enable" style="width:110px;font-size:12px;padding:4px 8px"
-              onchange="document.getElementById('rm_time_row').style.opacity=this.value==='true'?'1':'0.4';_autoSaveNotifSettings('reminder-toggle')">
-              <option value="true"${((_settingsData.reminder||{}).enabled!==false)?' selected':''}>Enabled</option>
-              <option value="false"${((_settingsData.reminder||{}).enabled===false)?' selected':''}>Disabled</option>
-            </select>
-          </div>
-          <div class="settings-row-sub">Send a morning reminder for tomorrow's visits</div>
-        </div>
-      </div>
-      <div class="settings-row" id="rm_time_row" style="opacity:${((_settingsData.reminder||{}).enabled!==false)?'1':'0.4'}">
-        <div>
-          <div class="settings-row-label">Reminder Send Time</div>
-          <div class="settings-row-sub">Morning time to send the day-before reminder (24-hour format). Synced to Cloud Scheduler.</div>
-        </div>
-        <div class="settings-row-right" style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
-          <input type="time" class="settings-input" id="rm_time"
-            value="${xe(((_settingsData.reminder||{}).sendTime)||'09:00')}"
-            style="width:130px;font-size:14px;padding:8px 12px"
-            onchange="_autoSaveNotifSettings('reminder-time')">
-        </div>
-      </div>
-      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:10px">
-        <button class="btn btn-ghost" onclick="sendReminderEmail()">⏰ Send Reminder Now</button>
-      </div>
-    </div>
-    <!-- /UPCOMING VISIT REMINDER -->
+
 
   </div>`;
 
@@ -5086,25 +5038,18 @@ function _autoSaveNotifSettings(source) {
     recipients: ddRecipEl ? ddRecipEl.value.trim() : ((_settingsData.dailyDigest||{}).recipients||''),
   };
 
-  // Save reminder settings
-  const rmEnableEl = document.getElementById('rm_enable');
-  const rmTimeEl   = document.getElementById('rm_time');
-  const reminderEnabled = rmEnableEl ? rmEnableEl.value === 'true' : ((_settingsData.reminder||{}).enabled !== false);
-  const reminderTime    = rmTimeEl   ? (rmTimeEl.value || '09:00') : ((_settingsData.reminder||{}).sendTime || '09:00');
-  _settingsData.reminder = { enabled: reminderEnabled, sendTime: reminderTime };
-
   saveSettings();
 
   // Show a subtle inline indicator instead of a full toast
   const statusEl = document.getElementById('schedulerUpdateStatus');
-  const label = (source === 'time' || source === 'reminder-time') ? 'Time saved' : 'Saved';
+  const label = source === 'time' ? 'Time saved' : 'Saved';
   if (statusEl) {
     statusEl.innerHTML = `<span style="color:var(--green);font-size:11px">✓ ${label}</span>`;
     setTimeout(() => { if (statusEl) statusEl.innerHTML = ''; }, 2500);
   }
 
-  // Sync Cloud Scheduler whenever any toggle or time changes
-  if (source === 'time' || source === 'reminder-time' || source === 'digest-toggle' || source === 'reminder-toggle') {
+  // Sync Cloud Scheduler when time or digest toggle changes
+  if (source === 'time' || source === 'digest-toggle') {
     const backendUrl = getGmailBackendUrl();
     if (!backendUrl) return;
     if (statusEl) statusEl.innerHTML = `<span style="color:var(--slate);font-size:11px">⏳ Syncing scheduler…</span>`;
@@ -5634,207 +5579,10 @@ function buildDailyDigestHtml(visits, since, company, allVisits, upcomingVisits,
 }
 
 /**
- * buildReminderHtml(tomorrowVisits, company)
- * Generates a branded HTML reminder email listing all visits scheduled for tomorrow.
- */
-function buildReminderHtml(tomorrowVisits, company) {
-  const appUrl   = _settingsData?.app?.appUrl || (window.location.origin + window.location.pathname);
-  const dateStr  = new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' });
-  const tmrw     = new Date(); tmrw.setDate(tmrw.getDate() + 1);
-  const tmrwStr  = tmrw.toLocaleDateString('en-IN', { weekday:'long', day:'2-digit', month:'long', year:'numeric' });
-  const xe = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-
-  const critColor = { Critical:'#e05555', High:'#e08540', Medium:'#e8c547', Low:'#5abf7a' };
-
-  const rows = tomorrowVisits.map(v => {
-    const cc = critColor[v.criticality] || '#8888aa';
-    const link = `${appUrl}?visit=${v.id}&guest=1`;
-    return `
-    <tr>
-      <td style="padding:10px 12px;border-bottom:1px solid #1e1e38;font-size:13px;color:#e0e0f0">${xe(v.plant||'—')}</td>
-      <td style="padding:10px 12px;border-bottom:1px solid #1e1e38;font-size:13px;color:#e0e0f0">${xe(v.company||'—')}</td>
-      <td style="padding:10px 12px;border-bottom:1px solid #1e1e38;font-size:13px;color:#e0e0f0">${xe(v.rep||'—')}</td>
-      <td style="padding:10px 12px;border-bottom:1px solid #1e1e38;font-size:12px">
-        <span style="background:${cc}22;color:${cc};border-radius:4px;padding:2px 8px;font-weight:600">${xe(v.criticality||'—')}</span>
-      </td>
-      <td style="padding:10px 12px;border-bottom:1px solid #1e1e38;font-size:12px;color:#c8c8e0">${xe(v.coordinator||'—')}</td>
-      <td style="padding:10px 12px;border-bottom:1px solid #1e1e38">
-        <a href="${link}" style="font-size:11px;color:#e8c547;text-decoration:none;border:1px solid #e8c547;border-radius:4px;padding:3px 8px">View →</a>
-      </td>
-    </tr>`;
-  }).join('');
-
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#0f0f1a;font-family:'Segoe UI',Arial,sans-serif">
-<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#0f0f1a;padding:24px 0">
-<tr><td align="center">
-<table width="600" cellpadding="0" cellspacing="0" border="0" style="background:#16162a;border-radius:18px;border:1px solid rgba(255,255,255,0.07);overflow:hidden">
-
-  <!-- Header -->
-  <tr>
-    <td style="background:#1e1e38;padding:22px 30px;border-bottom:1px solid rgba(232,197,71,0.15)">
-      <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
-        <td><span style="font-size:20px;font-weight:700;color:#e8c547;letter-spacing:-0.5px">PlantVisit</span>
-          <span style="font-size:11px;color:#8888aa;margin-left:8px;text-transform:uppercase;letter-spacing:.5px">· ${xe(company)}</span></td>
-        <td align="right" style="font-size:11px;color:#8888aa">${dateStr}</td>
-      </tr></table>
-    </td>
-  </tr>
-
-  <!-- Title -->
-  <tr>
-    <td style="padding:24px 30px 16px">
-      <div style="font-size:18px;font-weight:700;color:#f0f0f8;margin-bottom:6px">⏰ Tomorrow's Visit Reminder</div>
-      <div style="font-size:13px;color:#8888aa">${tomorrowVisits.length} visit${tomorrowVisits.length !== 1 ? 's' : ''} scheduled for <strong style="color:#aaaac8">${tmrwStr}</strong></div>
-    </td>
-  </tr>
-
-  <!-- Table -->
-  <tr>
-    <td style="padding:0 30px 24px">
-      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid rgba(255,255,255,0.07);border-radius:10px;overflow:hidden">
-        <thead>
-          <tr style="background:#1e1e38">
-            <th style="padding:9px 12px;text-align:left;font-size:10px;color:#8888aa;font-weight:600;letter-spacing:.4px;text-transform:uppercase">Plant</th>
-            <th style="padding:9px 12px;text-align:left;font-size:10px;color:#8888aa;font-weight:600;letter-spacing:.4px;text-transform:uppercase">Company</th>
-            <th style="padding:9px 12px;text-align:left;font-size:10px;color:#8888aa;font-weight:600;letter-spacing:.4px;text-transform:uppercase">Rep</th>
-            <th style="padding:9px 12px;text-align:left;font-size:10px;color:#8888aa;font-weight:600;letter-spacing:.4px;text-transform:uppercase">Priority</th>
-            <th style="padding:9px 12px;text-align:left;font-size:10px;color:#8888aa;font-weight:600;letter-spacing:.4px;text-transform:uppercase">Coordinator</th>
-            <th style="padding:9px 12px;text-align:left;font-size:10px;color:#8888aa;font-weight:600;letter-spacing:.4px;text-transform:uppercase">Link</th>
-          </tr>
-        </thead>
-        <tbody>${rows || `<tr><td colspan="6" style="padding:20px;text-align:center;color:#8888aa;font-style:italic">No visits found for tomorrow.</td></tr>`}</tbody>
-      </table>
-    </td>
-  </tr>
-
-  <!-- CTA -->
-  <tr>
-    <td style="padding:0 30px 20px">
-      <table cellpadding="0" cellspacing="0" border="0"><tr>
-        <td style="border-radius:50px;background:#e8c547">
-          <a href="${appUrl}?guest=1" style="display:inline-block;padding:10px 24px;font-size:11px;font-weight:700;color:#0f0f1a;text-decoration:none;border-radius:50px;letter-spacing:.3px">Open Dashboard →</a>
-        </td>
-      </tr></table>
-    </td>
-  </tr>
-
-  <!-- Footer -->
-  <tr>
-    <td style="background:#0f0f1a;padding:15px 30px;border-radius:0 0 18px 18px">
-      <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
-        <td style="font-size:10px;color:#8888aa;line-height:1.6">
-          Auto-generated by <strong style="color:#aaaac8">PlantVisit · ${xe(company)}</strong>.<br>
-          You are receiving this because the upcoming visit reminder is enabled.
-        </td>
-        <td align="right" style="font-size:10px;color:#8888aa;white-space:nowrap;vertical-align:top">${dateStr}</td>
-      </tr></table>
-    </td>
-  </tr>
-
-</table>
-</td></tr></table>
-</body></html>`;
-}
-
-/**
- * sendReminderEmail()
- * Sends a morning reminder for visits scheduled tomorrow.
- * Called by the in-app reminder scheduler — dedup key: 'pv_reminder_sent_date'.
- */
-async function sendReminderEmail() {
-  const gm      = _settingsData.gmail    || {};
-  const rm      = _settingsData.reminder || {};
-  const company = _settingsData?.app?.companyName || 'PlantVisit';
-
-  if (!gm.backendUrl) return;
-  if (rm.enabled === false) return;
-
-  // Build tomorrow's date string
-  const now  = new Date();
-  const tmrw = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-  const pad  = n => String(n).padStart(2, '0');
-  const tmrwLocal = `${tmrw.getFullYear()}-${pad(tmrw.getMonth()+1)}-${pad(tmrw.getDate())}`;
-
-  const tomorrowVisits = _visitsData.filter(v => {
-    if (v.status === 'Cancelled') return false;
-    const start = v.visitDate;
-    const end   = v.visitDateEnd || v.visitDate;
-    return start <= tmrwLocal && tmrwLocal <= end;
-  }).sort((a, b) => {
-    const o = { Critical:0, High:1, Medium:2, Low:3 };
-    return (o[a.criticality] ?? 4) - (o[b.criticality] ?? 4);
-  });
-
-  // Determine recipients — same as digest list, fall back to primary
-  const recipients = _ddActiveEmails().length
-    ? _ddActiveEmails()
-    : (((_settingsData.dailyDigest||{}).recipients||'').split(',').map(s=>s.trim()).filter(Boolean));
-  if (!recipients.length && gm.toEmail) recipients.push(gm.toEmail);
-  if (!recipients.length) return;
-
-  const gm2        = _settingsData.gmail || {};
-  const notifLabel = (gm2.notifTitle || _settingsData?.app?.notificationTitle || 'Customer Visit').trim();
-  const prefixTag  = (gm2.prefixTag  !== undefined ? gm2.prefixTag : (_settingsData.notification?.subjectPrefix||'')).trim();
-  const dateStr    = tmrw.toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' });
-  const subject    = (prefixTag ? prefixTag + ' ' : '') + notifLabel + ` | ⏰ Tomorrow's Visits — ${tomorrowVisits.length} scheduled | ${dateStr}`;
-
-  const bodyHtml = buildReminderHtml(tomorrowVisits, company);
-
-  // Dedup stamp
-  localStorage.setItem('pv_reminder_sent_date', new Date().toDateString());
-
-  try {
-    await sendGmailDigest(recipients, subject, bodyHtml);
-    console.log('[PlantVisit] ✅ Reminder sent to', recipients.join(', '));
-    toast('⏰ Reminder Sent', `Tomorrow's visit reminder sent to ${recipients.join(', ')}`);
-  } catch(err) {
-    console.warn('[PlantVisit] ⚠ Reminder send failed:', err?.message || err);
-  }
-}
-
-/**
- * startReminderScheduler()
- * In-app scheduler: checks every 60 s whether it's time to send the morning
- * reminder email. Uses localStorage 'pv_reminder_sent_date' to dedup per day.
- * Fires immediately on first call so a page opened after the configured time
- * still sends without waiting up to 60 s.
- */
-let _reminderSchedulerTimer = null;
-
-function startReminderScheduler() {
-  function _checkReminder() {
-    const rm = _settingsData.reminder || {};
-    if (rm.enabled === false) return;
-    if (!_settingsData.gmail?.backendUrl) return;
-
-    const alreadySent = localStorage.getItem('pv_reminder_sent_date') === new Date().toDateString();
-    if (alreadySent) return;
-
-    const [h, m]    = (rm.sendTime || '09:00').split(':').map(Number);
-    const now       = new Date();
-    const nowMins   = now.getHours() * 60 + now.getMinutes();
-    const targetMin = h * 60 + m;
-
-    if (nowMins >= targetMin) {
-      sendReminderEmail();
-    }
-  }
-
-  _checkReminder(); // fire immediately on load
-  if (_reminderSchedulerTimer) clearInterval(_reminderSchedulerTimer);
-  _reminderSchedulerTimer = setInterval(_checkReminder, 60000);
-  console.log('[PlantVisit] ⏰ In-app reminder scheduler started.');
-}
-
-function stopReminderScheduler() {
-  if (_reminderSchedulerTimer) { clearInterval(_reminderSchedulerTimer); _reminderSchedulerTimer = null; }
-}
-
-/**
  * sendDailyDigestEmail(force)
  * Collects all visits created/updated in the last 24 hours and sends
- * a consolidated digest email via Microsoft Graph API.
+ * a consolidated digest email via Gmail backend (Cloud Run).
+ * Digest is sent exclusively by Cloud Scheduler (server-side).
  * When force=true (e.g. "Send Now" button), the daily dedup check is skipped.
  */
 async function sendDailyDigestEmail(force = false) {
