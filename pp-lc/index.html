@@ -2459,45 +2459,11 @@ function useDailyDigestScheduler(requirements, plants, users) {
   useEffect(() => { plantRef.current = plants;       }, [plants]);
   useEffect(() => { userRef.current  = users;        }, [users]);
 
-  useEffect(() => {
-    const tick = async () => {
-      try {
-        const raw = localStorage.getItem('adminSettings');
-        if (!raw) return;
-        const cfg = JSON.parse(raw);
-        if (!cfg.dailyDigestEnabled) return;
-
-        const digestTime = cfg.dailyDigestTime || '08:00'; // HH:mm IST
-        const [hh, mm]   = digestTime.split(':').map(Number);
-        const now        = new Date();
-        const todayKey   = now.toISOString().slice(0,10); // YYYY-MM-DD
-        const lastSent   = localStorage.getItem('lastDailyDigestSent') || '';
-        const lastSentDay= lastSent.slice(0,10);
-
-        const nowMins = now.getHours() * 60 + now.getMinutes();
-        const cfgMins = hh * 60 + mm;
-
-        if (nowMins >= cfgMins && lastSentDay !== todayKey) {
-          localStorage.setItem('lastDailyDigestSent', now.toISOString());
-
-          // ── PRIMARY: call Cloud Function (Office 365 SMTP, server-side) ──
-          const cloudResult = await triggerCloudReminder('digest');
-
-          // ── FALLBACK: browser-side MS Graph (only if Cloud Fn not configured) ──
-          if (!cloudResult.ok && (cfg.msClientId && cfg.msTenantId)) {
-            console.log('↩ Cloud Fn not configured — falling back to browser MS Graph send');
-            await sendDailyDigestMail(reqRef.current, plantRef.current, userRef.current);
-          }
-        }
-      } catch(e) {
-        console.warn('⚠️ Digest scheduler tick error:', e?.message||e);
-      }
-    };
-
-    tick(); // run once on mount — catches up if configured time already passed today
-    const id = setInterval(tick, 60000); // check every minute
-    return () => clearInterval(id);
-  }, []); // stable: interval created once, refs keep data current without resetting it
+  // Browser-based scheduling removed — Cloud Scheduler handles all email types
+  // at their exact configured times via dedicated per-type jobs.
+  // Each job POSTs { type: 'digest'|'reminders'|'overdue'|'weekly'|'monthly' }
+  // directly to the Cloud Run service — no app needs to be open.
+  console.log('[LegalComp] Email scheduling is fully cloud-based. No browser tab required.');
 }
 
 /* ═══════════════════════════════════════════
@@ -5177,11 +5143,12 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove }) {
                     const data = await res.json().catch(()=>({}));
                     if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
                     if (data.schedulerUpdated) {
+                      const jobSummary = (data.jobs||[]).map(j=>j.action==='created'?`Created: ${j.job}`:j.error?`Error: ${j.job}`:`Updated: ${j.job}`).join(' · ');
                       setSchedStatus('success');
-                      setSchedMsg(`✅ Cloud Scheduler updated — cron: ${data.cron} UTC · Settings saved to Firestore`);
+                      setSchedMsg(`✅ ${(data.jobs||[]).length} Cloud Scheduler jobs updated — each type fires at its exact IST time. ${jobSummary}`);
                     } else {
                       setSchedStatus('warn');
-                      setSchedMsg(`✅ Settings saved to Firestore. ${data.note || 'Set LEGAL_SCHEDULER_JOB_NAME env var to auto-update Cloud Scheduler.'}`);
+                      setSchedMsg(`✅ Settings saved to Firestore. ${data.note || 'Set LEGAL_SCHEDULER_JOB_NAME + LEGAL_SERVICE_URL env vars on Cloud Run to enable auto-scheduling.'}`);
                     }
                   } catch(e) {
                     setSchedStatus('error');
@@ -5222,11 +5189,10 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove }) {
 
                     <div className={`rounded-xl p-3 text-xs space-y-2 ${dk?'bg-gray-700 text-gray-300':'bg-gray-100 text-gray-700'}`}>
                       <p className="font-semibold">⚙️ One-time Cloud Scheduler setup</p>
-                      <p>1. GCP Console → Cloud Scheduler → <strong>Create job</strong></p>
-                      <p>2. URL: <code className="bg-white/50 px-1 rounded">{settings.cloudFnUrl||'your legalEmailNow URL'}</code></p>
-                      <p>3. Body: <code className="bg-white/50 px-1 rounded">{`{"type":"all"}`}</code> · Method: POST · Header: <code className="bg-white/50 px-1 rounded">x-internal-secret: your-secret</code></p>
-                      <p>4. Cron: <code className="bg-white/50 px-1 rounded">0,30 1,2,3,4 * * *</code> (UTC) — covers 06:30–09:30 IST. After saving times above, clicking <strong>Update Schedule</strong> adjusts this automatically.</p>
-                      <p>5. Set env var <code className="bg-white/50 px-1 rounded">LEGAL_SCHEDULER_JOB_NAME</code> = your job name on the Cloud Function → then <strong>Update Schedule</strong> button updates cron live without touching GCP Console.</p>
+                      <p>1. Set env vars on your Cloud Run service: <code className="bg-white/50 px-1 rounded">LEGAL_SCHEDULER_JOB_NAME</code> (base job name, e.g. <strong>legal-reminder-daily</strong>) and <code className="bg-white/50 px-1 rounded">LEGAL_SERVICE_URL</code> (your Cloud Run URL).</p>
+                      <p>2. Click <strong>Update Schedule</strong> below — it auto-creates 5 separate Cloud Scheduler jobs (digest, reminders, overdue, weekly, monthly), each firing at its exact configured IST time. No manual GCP setup needed.</p>
+                      <p>3. Each job posts its specific type directly — emails fire at the exact minute regardless of whether the app is open.</p>
+                      <p>4. To change a time: update it here and click <strong>Update Schedule</strong> again — all 5 jobs update automatically.</p>
                     </div>
                   </div>
                 );
