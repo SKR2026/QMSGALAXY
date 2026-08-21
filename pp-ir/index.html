@@ -2109,6 +2109,39 @@ function openIncident(id){
   <div style="font-size:13px;font-weight:700;color:var(--in);margin-bottom:10px">🔍 HOD Analysis${i.hodSubmittedAt?` <span style="font-size:10px;font-weight:400;color:var(--t3)">submitted ${fmtDate(i.hodSubmittedAt)}</span>`:''}</div>
   ${i.hodRootCause?`<div class="fg" style="margin-bottom:12px"><div class="stat-lbl">Root Cause (by HOD)</div><div style="font-size:13px;background:var(--el);padding:10px 12px;border-radius:var(--rs);white-space:pre-wrap;border-left:3px solid var(--er)">${xe(i.hodRootCause)}</div></div>`:''}
   ${i.hodActionPlan?`<div class="fg" style="margin-bottom:12px"><div class="stat-lbl">Action Plan (by HOD)</div><div style="font-size:13px;background:var(--ol);padding:10px 12px;border-radius:var(--rs);white-space:pre-wrap;border-left:3px solid var(--ok)">${xe(i.hodActionPlan)}</div></div>`:''}
+
+  ${/* SO Return remark display if already returned */i.soActionPlanStatus==='returned'?`
+  <div class="alert alert-warn" style="margin-bottom:10px">
+    <div><strong>⚠ Action Plan Returned by Safety Officer</strong>${i.soReturnedAt?` <span style="font-size:10px;font-weight:400">${fmtDate(i.soReturnedAt)}</span>`:''}
+    <br><span style="font-size:12px">${xe(i.soReturnRemark||'Please revise and resubmit.')}</span></div>
+  </div>`:''}
+  ${i.soActionPlanStatus==='approved'?`
+  <div class="alert alert-ok" style="margin-bottom:10px">
+    <div><strong>✅ Action Plan Approved by Safety Officer</strong>${i.soApprovedAt?` <span style="font-size:10px;font-weight:400">${fmtDate(i.soApprovedAt)}</span>`:''}
+    ${i.soApproveRemark?`<br><span style="font-size:12px">${xe(i.soApproveRemark)}</span>`:''}
+    </div>
+  </div>`:''}
+
+  ${/* SO: Approve or Return action plan — only shown if HOD submitted and SO hasn't yet decided (or wants to re-review) */
+    isSO && i.hodSubmittedAt && i.soActionPlanStatus !== 'approved' && i.status !== 'closed' ? `
+  <div class="sep"></div>
+  <div style="font-size:13px;font-weight:700;color:var(--wn);margin-bottom:8px">🔎 Safety Officer Review</div>
+  <div class="alert alert-info" style="margin-bottom:12px">Review the HOD's root cause analysis and action plan above. You may approve it or return it with remarks for revision.</div>
+  <div class="fg">
+    <label>Remark / Comment (required for Return; optional for Approve)</label>
+    <textarea id="so-review-remark" rows="3" placeholder="Enter your remarks, observations, or reason for return…"></textarea>
+  </div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap">
+    <button class="btn bok" onclick="soApproveActionPlan('${i.id}')">
+      <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>
+      ✅ Approve Action Plan
+    </button>
+    <button class="btn" style="background:var(--wl);color:var(--wn);border-color:var(--wn)" onclick="soReturnActionPlan('${i.id}')">
+      <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 010 11H11"/></svg>
+      ↩ Return for Revision
+    </button>
+  </div>
+  `:''}
   `:''}
 
   ${isSO&&!i.assignedHOD&&i.status!=='closed'?`
@@ -2187,6 +2220,106 @@ function openIncident(id){
     ${canUpdate?`<button class="btn bp" onclick="submitUpdate('${i.id}')">Save Update</button>`:''}`;
 
   openModal('view-incident', i.id, `Incident — ${i.incidentNo}`, body, footer);
+}
+
+/* Safety Officer APPROVES HOD action plan */
+function soApproveActionPlan(incidentId){
+  const remark = document.getElementById('so-review-remark')?.value.trim();
+  const i = DB.incidents.find(x=>x.id===incidentId);
+  if(!i) return;
+  i.soActionPlanStatus = 'approved';
+  i.soApproveRemark = remark;
+  i.soApprovedAt = now();
+  i.updatedAt = now();
+  if(!i.updates) i.updates=[];
+  i.updates.push({ id:uid(), ts:now(), note:`✅ Action Plan APPROVED by Safety Officer: ${currentUser?.name}${remark?'. Remark: '+remark:''}`, by:currentUser?.name||'Safety Officer', statusChange:null });
+  auditLog('SO Approved Action Plan', `${i.incidentNo} action plan approved by ${currentUser?.name}`);
+  addNotification(i, 'update', `✅ Action Plan APPROVED for ${i.incidentNo} by SO ${currentUser?.name}`);
+  _notifySOActionPlanDecision(i, 'approved', remark);
+  saveDB();
+  showToast('✅ Action Plan approved. All relevant persons notified.','ok');
+  closeModal();
+  setTimeout(()=>openIncident(incidentId), 300);
+}
+
+/* Safety Officer RETURNS HOD action plan for revision */
+function soReturnActionPlan(incidentId){
+  const remark = document.getElementById('so-review-remark')?.value.trim();
+  if(!remark){ showToast('Please enter a remark explaining the reason for return.','warn'); return; }
+  const i = DB.incidents.find(x=>x.id===incidentId);
+  if(!i) return;
+  // Reset HOD submission so HOD must resubmit
+  i.soActionPlanStatus = 'returned';
+  i.soReturnRemark = remark;
+  i.soReturnedAt = now();
+  i.hodSubmittedAt = null; // allow HOD to resubmit
+  i.updatedAt = now();
+  if(!i.updates) i.updates=[];
+  i.updates.push({ id:uid(), ts:now(), note:`↩ Action Plan RETURNED by Safety Officer: ${currentUser?.name}. Reason: ${remark}`, by:currentUser?.name||'Safety Officer', statusChange:null });
+  auditLog('SO Returned Action Plan', `${i.incidentNo} action plan returned by ${currentUser?.name}: ${remark}`);
+  addNotification(i, 'update', `↩ Action Plan RETURNED for ${i.incidentNo} — please revise. SO: ${currentUser?.name}`);
+  _notifySOActionPlanDecision(i, 'returned', remark);
+  saveDB();
+  showToast('↩ Action Plan returned for revision. HOD & all relevant persons notified.','warn');
+  closeModal();
+  setTimeout(()=>openIncident(incidentId), 300);
+}
+
+/* Email all relevant persons on SO approval/return decision */
+async function _notifySOActionPlanDecision(incident, decision, remark){
+  const { superAdmins, admins, safetyOfficers, plantHeads } = getPlantRoleUsers(incident.plantId);
+  const soName = currentUser?.name || 'Safety Officer';
+  const isApproved = decision === 'approved';
+  const subjectVerb = isApproved ? 'APPROVED' : 'RETURNED for Revision';
+  const colorHex = isApproved ? '#1a7a4a' : '#c07a10';
+  const iconEmoji = isApproved ? '✅' : '↩';
+
+  // HOD recipient
+  const hodUser = incident.assignedHOD
+    ? (DB.users.find(u=>u.id===incident.assignedHOD) || (incident._hodEmail ? {id:incident.assignedHOD, name:incident._hodName||'HOD', email:incident._hodEmail} : null))
+    : null;
+
+  const allRecipients = [
+    ...(hodUser ? [{ ...hodUser, role:'hod' }] : []),
+    ...plantHeads, ...admins, ...superAdmins
+  ].filter(u=>u.email);
+
+  const company = DB.settings?.companyName || 'Your Company';
+  const subject = `${iconEmoji} [${incident.incidentNo}] Action Plan ${subjectVerb} — ${incident.title}`;
+
+  allRecipients.forEach(u=>{
+    const isHODRecip = hodUser && u.id === hodUser.id;
+    const hodInstruction = isApproved
+      ? 'The Safety Officer has reviewed and approved your action plan. Please proceed with implementation.'
+      : `The Safety Officer has reviewed your action plan and returned it for revision. Please update and resubmit.<br><br><strong>Reason / Remark:</strong><br><div style="background:#fff3cd;padding:10px 14px;border-radius:6px;border-left:3px solid #c07a10;font-size:13px">${xe(remark)}</div>`;
+    const otherInstruction = isApproved
+      ? `The Safety Officer <strong>${xe(soName)}</strong> has approved the HOD action plan for this incident.${remark?`<br><br><em>Remark: ${xe(remark)}</em>`:''}`
+      : `The Safety Officer <strong>${xe(soName)}</strong> has returned the HOD action plan for revision.<br><br><strong>Reason:</strong><br><div style="background:#fff3cd;padding:10px 14px;border-radius:6px;border-left:3px solid #c07a10;font-size:13px">${xe(remark)}</div>`;
+
+    const htmlBody = `
+      <div style="font-family:'Inter',sans-serif;max-width:640px;margin:0 auto;border:1px solid #d1dce8;border-radius:10px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#0d1f33,#1a3a5a);padding:18px 24px;border-bottom:3px solid ${colorHex}">
+          <div style="font-size:18px;font-weight:700;color:#fff">${iconEmoji} Action Plan ${subjectVerb}</div>
+          <div style="font-size:12px;color:#90b4d0;margin-top:4px">${xe(company)} · Incident Management</div>
+        </div>
+        <div style="background:#fff;padding:22px 24px">
+          <p>Dear <strong>${xe(u.name)}</strong>,</p>
+          <p style="margin:10px 0">${isHODRecip ? hodInstruction : otherInstruction}</p>
+          <div style="background:#f0f4f8;border-radius:8px;padding:14px 16px;margin:16px 0;font-size:12px">
+            <div style="margin-bottom:4px"><strong>Incident No.:</strong> ${xe(incident.incidentNo)}</div>
+            <div style="margin-bottom:4px"><strong>Title:</strong> ${xe(incident.title)}</div>
+            <div style="margin-bottom:4px"><strong>Plant:</strong> ${xe(plantName(incident.plantId))}</div>
+            <div style="margin-bottom:4px"><strong>Severity:</strong> ${xe(incident.severity)}</div>
+            <div><strong>Decision By:</strong> ${xe(soName)} on ${new Date().toLocaleString('en-IN')}</div>
+          </div>
+          ${incident.hodActionPlan?`<div style="margin-top:10px;font-size:12px;color:#555"><strong>HOD Action Plan:</strong><div style="background:#e8f4ec;border-left:3px solid #1a7a4a;padding:10px 14px;border-radius:6px;margin-top:6px;white-space:pre-wrap">${xe(incident.hodActionPlan)}</div></div>`:''}
+          <a href="${window.location.href}" style="display:inline-block;background:${colorHex};color:#fff;padding:11px 24px;border-radius:7px;font-size:13px;font-weight:600;text-decoration:none;margin-top:18px">Open IncidentPro →</a>
+          <p style="font-size:11px;color:#999;margin-top:18px;padding-top:12px;border-top:1px solid #eee">${xe(company)} · IncidentPro · ${new Date().toLocaleString('en-IN')}</p>
+        </div>
+      </div>`;
+    sendGmailViaAppsScript(u.email, u.name, subject, htmlBody);
+  });
+  auditLog(`SO ${isApproved?'Approved':'Returned'} Action Plan`, `${incident.incidentNo} — ${allRecipients.length} notifications sent`);
 }
 
 /* Safety Officer assigns HOD — email only, no account needed */
@@ -2414,7 +2547,7 @@ async function saveIncident(editId){
     const incidentNo = 'INC-'+String(DB.incidents.length+1).padStart(4,'0');
     const _newId = uid();
     const _newPhotos = await uploadPhotosToStorage(_newId);
-    const i = { id:_newId, incidentNo, title, plantId, type, severity, accidentCategory, department:dept, reportedBy:reporter, description, immediateAction:action, rootCause, location, witnesses, incidentDt, status:'open', photos:_newPhotos, createdAt:now(), updatedAt:now(), updates:[], assignedHOD:null, hodRootCause:'', hodActionPlan:'', hodSubmittedAt:null };
+    const i = { id:_newId, incidentNo, title, plantId, type, severity, accidentCategory, department:dept, reportedBy:reporter, description, immediateAction:action, rootCause, location, witnesses, incidentDt, status:'open', photos:_newPhotos, createdAt:now(), updatedAt:now(), updates:[], assignedHOD:null, hodRootCause:'', hodActionPlan:'', hodSubmittedAt:null, soActionPlanStatus:null, soReturnRemark:'' };
     DB.incidents.unshift(i);
     auditLog('Create',`Incident ${incidentNo} created by ${reporter}`);
     checkEscalation(i);
@@ -2719,7 +2852,7 @@ function renderAssignHOD(){
           <div style="display:flex;gap:6px;align-items:center">
             <span style="font-family:var(--mo);font-size:11px;color:var(--ac)">${xe(i.incidentNo)}</span>
             ${stsBdg(i.status)}
-            ${i.hodSubmittedAt?`<span class="bdg b-ok" style="font-size:10px">HOD ✓</span>`:''}
+            ${i.hodSubmittedAt&&i.soActionPlanStatus==='approved'?`<span class="bdg b-ok" style="font-size:10px">SO ✅</span>`:i.hodSubmittedAt&&i.soActionPlanStatus==='returned'?`<span class="bdg b-medium" style="font-size:10px">↩ Returned</span>`:i.hodSubmittedAt?`<span class="bdg b-ok" style="font-size:10px">HOD ✓</span>`:''}
           </div>
           <div style="font-size:13px;font-weight:500">${xe(i.title)}</div>
           <div style="font-size:11px;color:var(--in);margin-top:2px">👤 HOD: ${xe(i._hodName||hodUser?.name||i.assignedHOD)} ${i._hodEmail?`<span style="color:var(--t3)">&lt;${xe(i._hodEmail)}&gt;</span>`:''}</div>
@@ -5432,6 +5565,21 @@ function markAllRead(){
   saveDB(); updateBellCount(); renderBellPanel();
 }
 
+function clearAllNotifications(){
+  if(!confirm('Clear all notifications? This cannot be undone.')) return;
+  const visible = getVisibleNotifications();
+  const visibleIds = new Set(visible.map(n=>n.id));
+  DB.notifications = DB.notifications.filter(n=>!visibleIds.has(n.id));
+  saveDB(); updateBellCount(); renderBellPanel();
+}
+
+function clearReadNotifications(){
+  const visible = getVisibleNotifications();
+  const readIds = new Set(visible.filter(n=>n.read).map(n=>n.id));
+  DB.notifications = DB.notifications.filter(n=>!readIds.has(n.id));
+  saveDB(); updateBellCount(); renderBellPanel();
+}
+
 function toggleBell(e){
   if(e) e.stopPropagation();
   closeUserMenu();
@@ -5458,11 +5606,13 @@ function renderBellPanel(){
   <div class="bell-panel" id="bell-panel" onclick="event.stopPropagation()">
     <div class="bell-hd">
       <div class="bell-hd-title">Notifications ${unread>0?`<span class="bell-dot" style="position:relative;top:0;right:0;display:inline-flex;margin-left:4px">${unread}</span>`:'✓'}</div>
-      <div style="display:flex;gap:6px">
-        ${unread>0?`<button class="btn bs" onclick="markAllRead()">Mark all read</button>`:''}
+      <div style="display:flex;gap:6px;align-items:center">
+        ${unread>0?`<button class="btn bs" onclick="markAllRead()" title="Mark all as read">Mark read</button>`:''}
+        ${notifs.length>0?`<button class="btn bs ber" onclick="clearAllNotifications()" title="Clear all notifications" style="font-size:11px">Clear All</button>`:''}
         <button class="btn bs" onclick="document.getElementById('bell-panel-wrap').innerHTML=''">✕</button>
       </div>
     </div>
+    ${notifs.length>0?`<div style="padding:4px 16px 6px;font-size:10px;color:var(--t3)">Tap a notification to open & auto-clear it</div>`:''}
     <div class="bell-body">
       ${notifs.length===0?`<div class="bell-empty">🔔 No notifications yet</div>`:
         notifs.slice(0,40).map(n=>{
@@ -5487,9 +5637,11 @@ function renderBellPanel(){
 }
 
 function bellItemClick(incidentId, notifId){
-  // Mark read
+  // Mark read and auto-remove from log (read = cleared)
   const n = DB.notifications?.find(x=>x.id===notifId);
-  if(n) n.read=true;
+  if(n){ n.read=true; }
+  // Auto-clear after marking read
+  DB.notifications = (DB.notifications||[]).filter(x=>x.id!==notifId);
   saveDB(); updateBellCount();
   document.getElementById('bell-panel-wrap').innerHTML='';
   // Open the incident
