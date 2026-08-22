@@ -6,7 +6,7 @@
 <meta http-equiv="X-Content-Type-Options" content="nosniff"/>
 <meta name="referrer" content="no-referrer"/>
 <meta name="robots" content="noindex, nofollow"/>
-<title>POLYPLASTICS — Task Manager (Secured)</title>
+<title>POLYPLASTICS — Task Manager (Secured) v166</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -1995,6 +1995,11 @@ function startFirestoreListeners() {
       if(d.exists){ localStorage.setItem('email_tpl_'+key, JSON.stringify(d.data())); }
     }).catch(()=>{});
   });
+  // ── v166: Subscribe to cloud-sent reminder log from Firestore ────────
+  // Scheduled sends happen server-side; this listener catches them and
+  // merges them into localStorage so the Reminder Log tab stays current.
+  startReminderLogListener();
+
   // Subscribe to real-time task updates
   // ── FIX v157: _firstFsSnapshot guard ────────────────────────────────
   // On app open, tasks[] is pre-populated from localStorage cache.
@@ -4804,28 +4809,143 @@ function renderKanban(){
 //  REMINDERS
 // ═══════════════════════════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════════════════
-//  REMINDER SENT LOG — localStorage-backed, max 200 entries
+//  REMINDER SENT LOG — Firestore-backed (primary) + localStorage cache
+// ══════════════════════════════════════════════════════════════════════
+// HOW IT WORKS
+// ─────────────────────────────────────────────────────────────────────
+// 1. Every reminder sent FROM THE BROWSER (manual trigger / test) calls
+//    pushReminderLog() which writes to BOTH localStorage AND the Firestore
+//    collection  reminderRuns/{autoId}  so all devices stay in sync.
+//
+// 2. Scheduled sends happen SERVER-SIDE (Cloud Function). The browser never
+//    runs pushReminderLog() for these, which is why the log appeared empty.
+//    FIX: startReminderLogListener() subscribes to the Firestore
+//    reminderRuns collection via onSnapshot(). Whenever the Cloud Function
+//    writes a new document there, the listener fires immediately and merges
+//    the entry into localStorage — the log now shows scheduled sends too.
+//
+// CLOUD FUNCTION REQUIREMENT
+// ─────────────────────────────────────────────────────────────────────
+// Your Cloud Function must write a document to Firestore after each run:
+//
+//   await db.collection('reminderRuns').add({
+//     ts:        admin.firestore.FieldValue.serverTimestamp(),
+//     to:        `${emailsSent} recipient(s)`,
+//     taskTitle: `Reminder Batch (${sent} task(s))`,
+//     type:      'batch',
+//     transport: 'cloud',
+//     count:     emailsSent,
+//     source:    'scheduler'   // distinguishes scheduled vs manual
+//   });
+//
+// The listener below handles the rest automatically.
 // ══════════════════════════════════════════════════════════════════════
 const REMINDER_LOG_KEY = 'tp_reminder_sent_log';
 const REMINDER_LOG_MAX = 200;
+
+let _reminderLogUnsub = null; // Firestore onSnapshot unsubscriber
 
 function getReminderLog(){
   try{ return JSON.parse(localStorage.getItem(REMINDER_LOG_KEY)||'[]'); }
   catch(e){ return []; }
 }
 
-function pushReminderLog(entry){
-  // entry: { ts, to, taskTitle, type, transport, count }
-  const log = getReminderLog();
-  log.unshift({ ...entry, ts: new Date().toISOString() });
+function _saveReminderLog(log){
   if(log.length > REMINDER_LOG_MAX) log.length = REMINDER_LOG_MAX;
   try{ localStorage.setItem(REMINDER_LOG_KEY, JSON.stringify(log)); }
-  catch(e){ console.warn('[ReminderLog] save failed', e); }
+  catch(e){ console.warn('[ReminderLog] localStorage save failed', e); }
+}
+
+function pushReminderLog(entry){
+  // entry: { ts, to, taskTitle, type, transport, count }
+  const now = new Date().toISOString();
+  const fullEntry = { ...entry, ts: now };
+
+  // 1. Write to localStorage immediately (fast, offline-safe)
+  const log = getReminderLog();
+  log.unshift(fullEntry);
+  _saveReminderLog(log);
+
+  // 2. Mirror to Firestore so other devices (and the listener below) see it
+  if(_fbReady && _db){
+    _db.collection('reminderRuns').add({
+      ...fullEntry,
+      ts: firebase.firestore.FieldValue.serverTimestamp(),
+      source: entry.source || 'browser'
+    }).catch(e => console.warn('[ReminderLog] Firestore write failed', e));
+  }
+}
+
+/**
+ * Subscribe to the Firestore reminderRuns collection.
+ * Called once from startFirestoreListeners().
+ * Any document added by the Cloud Function scheduler is automatically
+ * merged into localStorage and reflected in the Reminder Log UI.
+ */
+function startReminderLogListener(){
+  if(!_fbReady || !_db) return;
+  if(_reminderLogUnsub) return; // already listening
+
+  // Listen to last 200 runs, newest first
+  _reminderLogUnsub = _db.collection('reminderRuns')
+    .orderBy('ts', 'desc')
+    .limit(REMINDER_LOG_MAX)
+    .onSnapshot(snap => {
+      if(snap.empty) return;
+
+      // Build a full log from Firestore (source of truth)
+      const fsLog = snap.docs.map(doc => {
+        const d = doc.data();
+        return {
+          id:        doc.id,
+          ts:        d.ts?.toDate ? d.ts.toDate().toISOString() : (d.ts || new Date().toISOString()),
+          to:        d.to        || '',
+          taskTitle: d.taskTitle || '',
+          type:      d.type      || '',
+          transport: d.transport || 'cloud',
+          count:     d.count     || undefined,
+          source:    d.source    || 'cloud'
+        };
+      });
+
+      // Merge with any localStorage-only entries (e.g. written while offline)
+      // De-duplicate by Firestore id (if present) or by ts+to
+      const localLog = getReminderLog();
+      const fsIds    = new Set(fsLog.map(e => e.id).filter(Boolean));
+      const fsTsTo   = new Set(fsLog.map(e => e.ts + '|' + e.to));
+
+      const localOnly = localLog.filter(e =>
+        (!e.id || !fsIds.has(e.id)) && !fsTsTo.has(e.ts + '|' + e.to)
+      );
+
+      const merged = [...fsLog, ...localOnly]
+        .sort((a, b) => new Date(b.ts) - new Date(a.ts))
+        .slice(0, REMINDER_LOG_MAX);
+
+      _saveReminderLog(merged);
+
+      // Re-render the log UI if it is currently visible
+      const logPane = document.getElementById('rem-pane-log');
+      if(logPane && logPane.style.display !== 'none') renderReminderLog();
+    }, err => {
+      console.warn('[ReminderLog] Firestore listener error:', err.message);
+    });
 }
 
 function clearReminderLog(){
   if(!confirm('Clear all reminder log entries?')) return;
   localStorage.removeItem(REMINDER_LOG_KEY);
+
+  // Also delete from Firestore (batch delete — max 500 docs, plenty for 200-entry cap)
+  if(_fbReady && _db){
+    _db.collection('reminderRuns').limit(REMINDER_LOG_MAX).get().then(snap => {
+      if(snap.empty) return;
+      const batch = _db.batch();
+      snap.docs.forEach(doc => batch.delete(doc.ref));
+      return batch.commit();
+    }).catch(e => console.warn('[ReminderLog] Firestore clear failed', e));
+  }
+
   renderReminders();
   // re-open log tab
   setTimeout(()=>switchReminderTab('log'), 50);
