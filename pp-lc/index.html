@@ -283,6 +283,40 @@ let CATEGORIES = (() => { try { const s=localStorage.getItem('categories'); retu
 const PRIORITIES  = ['Critical','High','Medium','Low'];
 const STATUSES    = ['Pending','In Progress','Completed','Overdue'];
 const REM_FREQS   = ['Daily','Weekly','Bi-Weekly','Monthly'];
+
+// ── Compliance (recurrence) frequencies ──────────────────────────────────────
+// Governs how often a requirement repeats after it is marked Completed.
+// When a requirement is completed, nextDueDate is auto-computed and the
+// status rolls back to 'Pending' so the cycle restarts automatically.
+const COMPLIANCE_FREQS = [
+  { value:'one_time',    label:'One-Time (No Repeat)' },
+  { value:'monthly',     label:'Monthly'              },
+  { value:'quarterly',   label:'Quarterly (3 months)' },
+  { value:'half_yearly', label:'Half-Yearly (6 months)'},
+  { value:'annual',      label:'Annual (Yearly)'       },
+  { value:'2_yearly',   label:'Every 2 Years'         },
+  { value:'5_yearly',   label:'Every 5 Years'         },
+];
+
+/**
+ * Given a due date string (YYYY-MM-DD) and a compliance frequency value,
+ * return the next due date string (YYYY-MM-DD) for the next cycle.
+ * Returns null for 'one_time' (no recurrence).
+ */
+function computeNextDueDate(fromDate, freq) {
+  if (!fromDate || !freq || freq === 'one_time') return null;
+  const d = new Date(fromDate);
+  switch (freq) {
+    case 'monthly':     d.setMonth(d.getMonth() + 1);     break;
+    case 'quarterly':   d.setMonth(d.getMonth() + 3);     break;
+    case 'half_yearly': d.setMonth(d.getMonth() + 6);     break;
+    case 'annual':      d.setFullYear(d.getFullYear() + 1); break;
+    case '2_yearly':   d.setFullYear(d.getFullYear() + 2); break;
+    case '5_yearly':   d.setFullYear(d.getFullYear() + 5); break;
+    default:            return null;
+  }
+  return d.toISOString().split('T')[0];
+}
 const IND_STATES  = ['Maharashtra','Gujarat','Tamil Nadu','Karnataka','Rajasthan','West Bengal','Uttar Pradesh','Telangana','Andhra Pradesh','Punjab','Madhya Pradesh','Odisha','Haryana'];
 const ALL_IND_STATES = IND_STATES; // full list for dropdowns
 const ESC_LABELS  = ['Level 1 – Plant Head','Level 2 – Regional Manager','Level 3 – Top Management'];
@@ -1838,6 +1872,8 @@ async function sendComplianceMail({ trigger, req, plant, assignee, oldAssignee, 
         ['✅','Completion Date', req?.completionDate ? fmtDate(req.completionDate) : null],
         ['⌛','Days Left',    req?.dueDate ? `${calcDays(req.dueDate)} days` : null],
         ['🔔','Reminder',     req?.reminderFrequency],
+        ['🔁','Compliance Cycle', req?.complianceFrequency ? (COMPLIANCE_FREQS.find(f=>f.value===req.complianceFrequency)||{label:req.complianceFrequency}).label : null],
+        ['📅','Next Cycle Due', req?.nextDueDate && req?.complianceFrequency!=='one_time' ? fmtDate(req.nextDueDate) : null],
         ['🏭','Plant',        plant ? `${plant.name} (${plant.state})` : null],
         ['⬆️','Escalation',   req?.escalationLevel ? `Level ${req.escalationLevel}` : null],
         ['📧','Escalation Emails', escEmailList.length ? escEmailList.join(' | ') : null],
@@ -2576,7 +2612,7 @@ function EscalationLevelPanel({ level, allEmails, onUpdate, dk }) {
 ═══════════════════════════════════════════ */
 function RequirementModal({ open, onClose, onSave, initial, plants, users, dk, categories: catsProp }) {
   const cats = catsProp || CATEGORIES;
-  const blank = { title:'', description:'', category: (catsProp||CATEGORIES)[0]||'', priority:'High', plantId:'', plantIds:[], assignedTo:[], status:'Pending', dueDate:'', completionDate:'', reminderFrequency:'Weekly', escalationLevel:1, escalationEmail:'', escalationEmails:{ 1:[], 2:[], 3:[] }, applicableRule:'', legalClause:'' };
+  const blank = { title:'', description:'', category: (catsProp||CATEGORIES)[0]||'', priority:'High', plantId:'', plantIds:[], assignedTo:[], status:'Pending', dueDate:'', completionDate:'', nextDueDate:'', complianceFrequency:'annual', reminderFrequency:'Weekly', escalationLevel:1, escalationEmail:'', escalationEmails:{ 1:[], 2:[], 3:[] }, applicableRule:'', legalClause:'' };
   const [form, setForm] = useState(blank);
   const [saving, setSaving] = useState(false);
   useEffect(()=>{
@@ -2693,12 +2729,63 @@ function RequirementModal({ open, onClose, onSave, initial, plants, users, dk, c
             {STATUSES.map(s=><option key={s}>{s}</option>)}
           </select>
         </FormField>
-        <FormField label="Due Date" required>
+        <FormField label="Compliance Frequency" required>
+          <select value={form.complianceFrequency||'annual'} onChange={e=>set('complianceFrequency',e.target.value)} className={selectCls}>
+            {COMPLIANCE_FREQS.map(f=><option key={f.value} value={f.value}>{f.label}</option>)}
+          </select>
+        </FormField>
+        <FormField label="Due Date (First / Current Cycle)" required>
           <input type="date" value={form.dueDate} onChange={e=>set('dueDate',e.target.value)} className={inputCls} />
         </FormField>
+        {/* Show computed next due date live when frequency is recurring */}
+        {form.dueDate && form.complianceFrequency && form.complianceFrequency !== 'one_time' && (
+          <div className={`sm:col-span-2 flex items-center gap-3 px-4 py-3 rounded-xl border ${dk?'bg-blue-900/20 border-blue-800':'bg-blue-50 border-blue-100'}`}>
+            <span className="text-lg">🔄</span>
+            <div>
+              <p className={`text-xs font-semibold ${dk?'text-blue-300':'text-blue-700'}`}>Next cycle due date (auto-computed)</p>
+              <p className={`text-sm font-bold ${dk?'text-blue-200':'text-blue-800'}`}>
+                {(()=>{ const nd=computeNextDueDate(form.dueDate,form.complianceFrequency); return nd ? formatDate(nd) : '—'; })()}
+              </p>
+              <p className={`text-xs mt-0.5 ${dk?'text-blue-400':'text-blue-500'}`}>
+                After marking this cycle <strong>Completed</strong>, the due date will advance automatically and status resets to Pending.
+              </p>
+            </div>
+          </div>
+        )}
         <FormField label="Completion Date">
-          <input type="date" value={form.completionDate||''} onChange={e=>set('completionDate',e.target.value)} className={inputCls} title="Actual or target completion date" />
+          <input type="date" value={form.completionDate||''} onChange={e=>set('completionDate',e.target.value)} className={inputCls} title="Actual date this compliance was completed" />
         </FormField>
+        {/* Status summary chip */}
+        {form.dueDate && (
+          <div className={`flex items-center gap-3 px-4 py-3 rounded-xl border ${
+            form.status==='Completed'
+              ? dk?'bg-green-900/20 border-green-800':'bg-green-50 border-green-200'
+              : daysLeft(form.dueDate)<0
+                ? dk?'bg-red-900/20 border-red-800':'bg-red-50 border-red-200'
+                : daysLeft(form.dueDate)<=7
+                  ? dk?'bg-amber-900/20 border-amber-800':'bg-amber-50 border-amber-200'
+                  : dk?'bg-gray-700 border-gray-600':'bg-gray-50 border-gray-200'
+          }`}>
+            <span className="text-lg">
+              {form.status==='Completed' ? '✅' : daysLeft(form.dueDate)<0 ? '🔴' : daysLeft(form.dueDate)<=7 ? '⚠️' : '🟡'}
+            </span>
+            <div>
+              <p className={`text-xs font-semibold ${
+                form.status==='Completed'?'text-green-600':daysLeft(form.dueDate)<0?'text-red-500':daysLeft(form.dueDate)<=7?'text-amber-600':dk?'text-gray-300':'text-gray-600'}`}>
+                {form.status==='Completed'
+                  ? `✅ Completed${form.completionDate ? ' on ' + formatDate(form.completionDate) : ''}`
+                  : daysLeft(form.dueDate)<0
+                    ? `Overdue by ${Math.abs(daysLeft(form.dueDate))} day${Math.abs(daysLeft(form.dueDate))!==1?'s':''} — still open`
+                    : daysLeft(form.dueDate)===0
+                      ? 'Due today — still open'
+                      : `Open — ${daysLeft(form.dueDate)} day${daysLeft(form.dueDate)!==1?'s':''} remaining`}
+              </p>
+              {form.nextDueDate && form.complianceFrequency !== 'one_time' && (
+                <p className={`text-xs mt-0.5 ${dk?'text-gray-400':'text-gray-500'}`}>Next cycle: {formatDate(form.nextDueDate)}</p>
+              )}
+            </div>
+          </div>
+        )}
         <FormField label="Reminder Frequency">
           <select value={form.reminderFrequency} onChange={e=>set('reminderFrequency',e.target.value)} className={selectCls}>
             {REM_FREQS.map(r=><option key={r}>{r}</option>)}
@@ -2808,7 +2895,11 @@ function AdminOnBehalfModal({ dk, req: initialReq, requirements, users, plants, 
       isAdminAction: true,
     };
     const completionDate = newStatus === 'Completed' ? now.split('T')[0] : req.completionDate || '';
-    const updated = { ...req, status: newStatus, completionDate, comments: [...(req.comments || []), comment] };
+    const freq = req.complianceFrequency;
+    const nextDueDate = (newStatus === 'Completed' && freq && freq !== 'one_time')
+      ? (computeNextDueDate(completionDate || req.dueDate, freq) || req.nextDueDate || '')
+      : req.nextDueDate || '';
+    const updated = { ...req, status: newStatus, completionDate, nextDueDate, comments: [...(req.comments || []), comment] };
     updateRequirements(requirements.map(r => r.id === req.id ? updated : r));
     setReq(updated);
     sendComplianceMail({ trigger: 'status_change', req: updated, plant, assignee: actingUser || assignees[0] || null, oldStatus: req.status, changedBy: null });
@@ -3199,7 +3290,27 @@ function AdminRequirements({ dk, plants, users, requirements, updateRequirements
 
   const saveEdit = form => {
     const old = requirements.find(r => r.id === editReq.id);
-    const updated = { ...old, ...form };
+    let updated = { ...old, ...form };
+
+    // ── Auto-advance: when status flips to Completed on a recurring requirement ──
+    // compute the next cycle due date and reset status to Pending for the new cycle.
+    const wasCompleted = old.status === 'Completed';
+    const nowCompleted = updated.status === 'Completed';
+    const freq = updated.complianceFrequency;
+    if (!wasCompleted && nowCompleted && freq && freq !== 'one_time') {
+      const baseDateForNext = updated.completionDate || updated.dueDate;
+      const next = computeNextDueDate(baseDateForNext, freq);
+      if (next) {
+        updated = {
+          ...updated,
+          // Keep completionDate for this cycle's record
+          nextDueDate: next,
+          // Do NOT auto-reset here — admin controls status manually.
+          // nextDueDate is surfaced in the UI so admin knows when to reopen.
+        };
+      }
+    }
+
     updateRequirements(requirements.map(r => r.id === editReq.id ? updated : r));
     if (!old) return;
     const plant = plants.find(p => p.id === updated.plantId);
@@ -3603,10 +3714,28 @@ function AdminRequirements({ dk, plants, users, requirements, updateRequirements
                       ) : <span className="text-xs text-red-400">Unassigned</span>}
                     </td>
                     <td className="px-4 py-3"><Badge label={req.priority} color={PRIORITY_CLR[req.priority]} /></td>
-                    <td className="px-4 py-3"><Badge label={req.status}   color={STATUS_CLR[req.status]} /></td>
+                    <td className="px-4 py-3">
+                      <Badge label={req.status} color={STATUS_CLR[req.status]} />
+                      {req.status==='Completed' && req.completionDate && (
+                        <p className="text-xs text-green-500 mt-0.5 whitespace-nowrap">✅ {formatDate(req.completionDate)}</p>
+                      )}
+                      {req.status!=='Completed' && (dl<0
+                        ? <p className="text-xs text-red-400 mt-0.5 whitespace-nowrap">🔴 {Math.abs(dl)}d overdue</p>
+                        : dl<=7
+                          ? <p className="text-xs text-amber-500 mt-0.5 whitespace-nowrap">⚠️ {dl}d left</p>
+                          : null
+                      )}
+                    </td>
                     <td className="px-4 py-3 whitespace-nowrap">
                       <p className={`text-xs ${dl<0?'text-red-500':dl<7?'text-amber-500':sub}`}>{formatDate(req.dueDate)}</p>
-                      {dl<0 && <p className="text-xs text-red-400">{Math.abs(dl)}d overdue</p>}
+                      {req.nextDueDate && req.complianceFrequency && req.complianceFrequency!=='one_time' && (
+                        <p className="text-xs text-blue-400 mt-0.5" title="Next cycle due date">🔄 {formatDate(req.nextDueDate)}</p>
+                      )}
+                      {req.complianceFrequency && req.complianceFrequency!=='one_time' && (
+                        <p className={`text-xs mt-0.5 ${sub}`} style={{fontSize:'10px'}}>
+                          {(COMPLIANCE_FREQS.find(f=>f.value===req.complianceFrequency)||{label:req.complianceFrequency}).label}
+                        </p>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1">
@@ -5356,7 +5485,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
   const sub  = dk?'text-gray-400':'text-gray-500';
 
   /* ── CSV template columns ── */
-  const COLS = ['title','description','category','priority','status','plant_id','state','due_date','reminder_frequency','escalation_level','escalation_email','assigned_email','applicable_rule','legal_clause'];
+  const COLS = ['title','description','category','priority','status','plant_id','state','due_date','compliance_frequency','reminder_frequency','escalation_level','escalation_email','assigned_email','applicable_rule','legal_clause'];
 
   /* ── Download template ── */
   const downloadTemplate = () => {
@@ -5372,6 +5501,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
           p.id,
           p.state,
           new Date(Date.now()+(i+1)*30*86400000).toISOString().split('T')[0],
+          COMPLIANCE_FREQS[(i+1)%COMPLIANCE_FREQS.length].value,
           REM_FREQS[i%4],
           (i%3)+1,
           'ceo@legalcomp.com',
@@ -5406,6 +5536,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       { key:'plant_id',           label:'Plant ID',             width:14, note:'Plant ID from the directory below (e.g. P001). Use this OR state.' },
       { key:'state',              label:'State',                width:18, note:'State name (e.g. Maharashtra). Used if plant_id is blank.' },
       { key:'due_date',           label:'Due Date *',           width:14, note:'Required. Format: YYYY-MM-DD (e.g. 2025-12-31).' },
+      { key:'compliance_frequency',label:'Compliance Frequency', width:22, note:`One of: ${COMPLIANCE_FREQS.map(f=>f.value).join(', ')} — controls how often the requirement recurs after completion.` },
       { key:'reminder_frequency', label:'Reminder Frequency',   width:20, note:`One of: ${REM_FREQS.join(', ')}` },
       { key:'escalation_level',   label:'Escalation Level',     width:18, note:'1, 2 or 3.' },
       { key:'escalation_email',   label:'Escalation Email',     width:28, note:'Email address for escalation alerts.' },
@@ -5438,6 +5569,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         p.id,
         p.state,
         new Date(Date.now() + (i + 1) * 30 * 86400000).toISOString().split('T')[0],
+        COMPLIANCE_FREQS[(i + 1) % COMPLIANCE_FREQS.length].value,
         REM_FREQS[i % 4],
         (i % 3) + 1,
         'ceo@legalcomp.com',
@@ -5496,7 +5628,8 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       { col: colIdx('category'),           sqref: `C2:C500`, formula: cats.map(v=>`"${v}"`).join(','),       prompt: 'Select a category' },
       { col: colIdx('priority'),           sqref: `D2:D500`, formula: PRIORITIES.join(','),                  prompt: 'Select priority' },
       { col: colIdx('status'),             sqref: `E2:E500`, formula: STATUSES.join(','),                    prompt: 'Select status' },
-      { col: colIdx('reminder_frequency'), sqref: `I2:I500`, formula: REM_FREQS.join(','),                   prompt: 'Select frequency' },
+      { col: colIdx('compliance_frequency'), sqref: `I2:I500`, formula: COMPLIANCE_FREQS.map(f=>f.value).join(','), prompt: 'Select compliance recurrence frequency' },
+      { col: colIdx('reminder_frequency'), sqref: `J2:J500`, formula: REM_FREQS.join(','),                   prompt: 'Select reminder frequency' },
       { col: colIdx('escalation_level'),   sqref: `J2:J500`, formula: '1,2,3',                              prompt: '1, 2 or 3' },
     ];
     ws['!dataValidation'] = dataValidations.map(dv => ({
@@ -5531,6 +5664,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       ['category',           cats.join(' | ')],
       ['priority',           PRIORITIES.join(' | ')],
       ['status',             STATUSES.join(' | ')],
+      ['compliance_frequency', COMPLIANCE_FREQS.map(f=>`${f.value} (${f.label})`).join(' | ')],
       ['reminder_frequency', REM_FREQS.join(' | ')],
       ['escalation_level',   '1 | 2 | 3'],
       ['due_date format',    'YYYY-MM-DD  (e.g. 2025-12-31)'],
@@ -5605,6 +5739,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         plantId:          plant?.id || '',
         state:            plant?.state || obj.state,
         dueDate:          obj.due_date,
+        complianceFrequency: COMPLIANCE_FREQS.find(f=>f.value===obj.compliance_frequency) ? obj.compliance_frequency : 'annual',
         reminderFrequency: REM_FREQS.includes(obj.reminder_frequency) ? obj.reminder_frequency : 'Weekly',
         escalationLevel:  escLvl,
         escalationEmail:  obj.escalation_email || '',
@@ -5686,6 +5821,8 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         reminderFrequency: r.reminderFrequency,
         escalationLevel:   r.escalationLevel,
         escalationEmail:   r.escalationEmail,
+        complianceFrequency: r.complianceFrequency || 'annual',
+        nextDueDate:       computeNextDueDate(r.dueDate, r.complianceFrequency||'annual') || '',
         applicableRule:    r.applicableRule || '',
         legalClause:       r.legalClause || '',
         createdAt:         new Date().toISOString(),
