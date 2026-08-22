@@ -431,17 +431,19 @@ function storeBiometricSession(user){
   // Store minimal info so biometric can re-identify the user
   // after they've authenticated at least once with password
   if(!isMobileDevice()) return;
+  if(!user || !user.uid) return; // guard: no user
   try{
+    const emailVal = user.email || '';
     sessionStorage.setItem(BIO_KEY, JSON.stringify({
-      email: user.email,
+      email: emailVal,
       uid: user.uid,
       ts: Date.now()
     }));
     // Also persist to localStorage for next app open (7-day window)
     const existing = JSON.parse(localStorage.getItem(BIO_KEY)||'null');
-    if(!existing || existing.email !== user.email){
+    if(!existing || existing.email !== emailVal){
       localStorage.setItem(BIO_KEY, JSON.stringify({
-        email: user.email,
+        email: emailVal,
         uid: user.uid,
         registered: true,
         ts: Date.now()
@@ -778,7 +780,7 @@ auth.onAuthStateChanged(async user=>{
         console.log('[OrgChart] Profile found on retry.');
       } else {
         S.profile=null;
-        console.warn('[OrgChart] Profile still not found after retry for',user.email);
+        console.warn('[OrgChart] Profile still not found after retry for uid:',user.uid,'email:',user.email||'(none)');
       }
     }
     console.log('[OrgChart] Profile:',S.profile?.email,'| Role:',S.profile?.role);
@@ -799,18 +801,28 @@ auth.onAuthStateChanged(async user=>{
 //    and creates a minimal profile so the user is never permanently stuck
 async function fetchUserProfile(user, attempt=1){
   const MAX=4;
+
+  // Guard: user object or required fields missing — cannot look up profile
+  if(!user || !user.uid){
+    console.error('[OrgChart] fetchUserProfile called with invalid user object');
+    return null;
+  }
+  const userEmail = (user.email || '').trim(); // email may be null for phone/anonymous auth
+
   try{
     // Strategy 1: query by email (most common — works when Firestore index exists)
-    const byEmail=await db.collection('mompro_users').where('email','==',user.email).get();
-    if(!byEmail.empty){
-      const rolePriority=r=>{ const rr=(r||'').trim().toLowerCase(); if(rr.includes('super')) return 3; if(rr.includes('plant')||rr.includes('admin')) return 2; return 1; };
-      const docs=byEmail.docs.map(d=>({...d.data(),_docId:d.id})).sort((a,b)=>rolePriority(b.role)-rolePriority(a.role));
-      console.log('[OrgChart] Found',docs.length,'doc(s) by email. Role:',docs[0].role);
-      // Heal: write uid into doc if missing (prevents future mismatches)
-      if(!docs[0].uid){
-        db.collection('mompro_users').doc(docs[0]._docId).set({uid:user.uid},{merge:true}).catch(()=>{});
+    if(userEmail){
+      const byEmail=await db.collection('mompro_users').where('email','==',userEmail).get();
+      if(!byEmail.empty){
+        const rolePriority=r=>{ const rr=(r||'').trim().toLowerCase(); if(rr.includes('super')) return 3; if(rr.includes('plant')||rr.includes('admin')) return 2; return 1; };
+        const docs=byEmail.docs.map(d=>({...d.data(),_docId:d.id})).sort((a,b)=>rolePriority(b.role)-rolePriority(a.role));
+        console.log('[OrgChart] Found',docs.length,'doc(s) by email. Role:',docs[0].role);
+        // Heal: write uid into doc if missing (prevents future mismatches)
+        if(!docs[0].uid){
+          db.collection('mompro_users').doc(docs[0]._docId).set({uid:user.uid},{merge:true}).catch(()=>{});
+        }
+        return docs[0];
       }
-      return docs[0];
     }
 
     // Strategy 2: query by uid field (some setups store uid separately)
@@ -828,17 +840,19 @@ async function fetchUserProfile(user, attempt=1){
     }
 
     // Strategy 4: case-insensitive email scan (handles email casing mismatch)
-    const emailLower=user.email.toLowerCase();
-    const allDocs=await db.collection('mompro_users').limit(500).get();
-    const match=allDocs.docs.find(d=>(d.data().email||'').toLowerCase()===emailLower);
-    if(match){
-      console.log('[OrgChart] Found by case-insensitive email scan');
-      // Heal: normalise email casing in Firestore
-      db.collection('mompro_users').doc(match.id).set({email:user.email,uid:user.uid},{merge:true}).catch(()=>{});
-      return {_docId:match.id,...match.data()};
+    if(userEmail){
+      const emailLower=userEmail.toLowerCase();
+      const allDocs=await db.collection('mompro_users').limit(500).get();
+      const match=allDocs.docs.find(d=>(d.data().email||'').toLowerCase()===emailLower);
+      if(match){
+        console.log('[OrgChart] Found by case-insensitive email scan');
+        // Heal: normalise email casing in Firestore
+        db.collection('mompro_users').doc(match.id).set({email:userEmail,uid:user.uid},{merge:true}).catch(()=>{});
+        return {_docId:match.id,...match.data()};
+      }
     }
 
-    console.warn('[OrgChart] No profile found for',user.email,'(attempt',attempt+')');
+    console.warn('[OrgChart] No profile found for uid:',user.uid,'email:',userEmail||'(none)','(attempt',attempt+')');
     return null;
 
   }catch(e){
