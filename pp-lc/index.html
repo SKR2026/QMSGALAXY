@@ -1132,101 +1132,211 @@ function _bioSetCred(email, credId64) {
   } catch {}
 }
 
-function BiometricButton({ email, onSuccess, onError }) {
-  const [bioType,   setBioType]   = useState(null);
-  const [bioStatus, setBioStatus] = useState('');
-  const [busy,      setBusy]      = useState(false);
-  const [showReg,   setShowReg]   = useState(false);
+/* ═══════════════════════════════════════════
+   BIOMETRIC SETTINGS PANEL
+   Shown in Settings page. Handles registration,
+   sign-in test, and removal — all from one place.
+   Works on any device that has WebAuthn platform
+   authenticator (Face ID, fingerprint, etc.)
+═══════════════════════════════════════════ */
+function BiometricSettings({ dk, currentUser }) {
+  const [bioType,    setBioType]    = useState(null);   // {icon, label} or null
+  const [creds,      setCreds]      = useState({});     // email→credId map
+  const [status,     setStatus]     = useState('');     // feedback message
+  const [statusOk,   setStatusOk]   = useState(true);
+  const [busy,       setBusy]       = useState(false);
+  const [supported,  setSupported]  = useState(null);   // null=checking, true/false
 
+  const email = currentUser?.email?.toLowerCase() || '';
+
+  // Load state on mount
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      if (!_bioIsMobile()) return;
-      const t = await _bioGetType();
-      if (cancelled || !t) return;
-      setBioType(t);
-      const anyMap = _bioGetCred(null);
-      setShowReg(!(anyMap && Object.keys(anyMap).length > 0));
+      if (!window.PublicKeyCredential) {
+        if (!cancelled) setSupported(false);
+        return;
+      }
+      try {
+        const avail = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+        if (cancelled) return;
+        setSupported(avail);
+        if (!avail) return;
+        const ua = navigator.userAgent.toLowerCase();
+        if (/iphone|ipad/.test(ua))       setBioType({ icon:'🔒', label:'Face ID / Touch ID' });
+        else if (/android/.test(ua))       setBioType({ icon:'🫆', label:'Fingerprint / Face Unlock' });
+        else if (/windows/.test(ua))       setBioType({ icon:'🪪', label:'Windows Hello' });
+        else if (/mac/.test(ua))           setBioType({ icon:'👆', label:'Touch ID' });
+        else                               setBioType({ icon:'🔒', label:'Biometrics' });
+      } catch { if (!cancelled) setSupported(false); }
+      // Load stored credentials
+      try {
+        const raw = localStorage.getItem(_BIO_CRED_KEY);
+        if (!cancelled) setCreds(raw ? JSON.parse(raw) : {});
+      } catch { if (!cancelled) setCreds({}); }
     })();
     return () => { cancelled = true; };
-  }, [email]);
+  }, []);
 
-  if (!bioType) return null;
-
-  const handleBioLogin = async () => {
-    const em = (email || localStorage.getItem(_BIO_EMAIL_KEY) || '').trim().toLowerCase();
-    if (!em) { onError('Enter your email first, then tap the biometric button.'); return; }
-    const credId = _bioGetCred(em);
-    if (!credId) { setShowReg(true); onError('No biometric registered. Sign in with password first, then tap "Enable Biometric Login".'); return; }
-    setBusy(true); setBioStatus('Waiting for biometric…');
-    try {
-      const challenge = crypto.getRandomValues(new Uint8Array(32));
-      await navigator.credentials.get({
-        publicKey: { rpId:_BIO_RP_ID, challenge,
-          allowCredentials:[{type:'public-key',id:_bioB642buf(credId),transports:['internal','hybrid']}],
-          userVerification:'required', timeout:60000 }
-      });
-      setBioStatus('✅ Verified! Signing you in…');
-      onSuccess(em);
-    } catch(e) {
-      setBusy(false);
-      const msg = e.name==='NotAllowedError' ? 'Biometric was cancelled or timed out.'
-                : e.name==='SecurityError'   ? 'Biometrics require HTTPS.'
-                : 'Biometric failed: '+e.message;
-      setBioStatus(''); onError(msg);
-    }
+  const refreshCreds = () => {
+    try { const raw = localStorage.getItem(_BIO_CRED_KEY); setCreds(raw ? JSON.parse(raw) : {}); }
+    catch { setCreds({}); }
   };
 
-  const handleBioRegister = async () => {
-    const em = (email||'').trim().toLowerCase();
-    if (!em) { onError('Enter your email address first.'); return; }
-    setBusy(true); setBioStatus('Follow your device prompt to register biometric…');
+  const showMsg = (msg, ok = true) => { setStatus(msg); setStatusOk(ok); };
+
+  const hasCred = !!creds[email];
+
+  const handleRegister = async () => {
+    if (!email) { showMsg('No email found for your account.', false); return; }
+    setBusy(true); showMsg('Follow your device prompt to register biometric…');
     try {
       const challenge = crypto.getRandomValues(new Uint8Array(32));
-      const uid = new TextEncoder().encode(em);
+      const uid = new TextEncoder().encode(email);
       const cred = await navigator.credentials.create({
-        publicKey: { rp:{id:_BIO_RP_ID,name:_BIO_RP_NAME}, user:{id:uid,name:em,displayName:em},
-          challenge, pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],
-          authenticatorSelection:{authenticatorAttachment:'platform',userVerification:'required',residentKey:'preferred'},
-          timeout:60000, attestation:'none' }
+        publicKey: {
+          rp: { id: _BIO_RP_ID, name: _BIO_RP_NAME },
+          user: { id: uid, name: email, displayName: currentUser?.name || email },
+          challenge,
+          pubKeyCredParams: [{ type:'public-key', alg:-7 }, { type:'public-key', alg:-257 }],
+          authenticatorSelection: { authenticatorAttachment:'platform', userVerification:'required', residentKey:'preferred' },
+          timeout: 60000, attestation: 'none',
+        }
       });
-      _bioSetCred(em, _bioBuf2b64(cred.rawId));
-      setBioStatus('✅ Biometric enabled! Use it next time to sign in instantly.');
-      setShowReg(false); setBusy(false);
+      _bioSetCred(email, _bioBuf2b64(cred.rawId));
+      refreshCreds();
+      showMsg('✅ Biometric login enabled! You can now sign in using ' + (bioType?.label || 'biometrics') + '.', true);
     } catch(e) {
-      setBusy(false);
-      const msg = e.name==='NotAllowedError'   ? 'Biometric registration cancelled.'
-                : e.name==='InvalidStateError' ? 'A passkey already exists for this device.'
-                : 'Registration failed: '+e.message;
-      setBioStatus(''); onError(msg);
+      const msg = e.name === 'NotAllowedError'   ? 'Registration cancelled or timed out.'
+                : e.name === 'InvalidStateError' ? 'A passkey already exists for this device.'
+                : 'Registration failed: ' + e.message;
+      showMsg('❌ ' + msg, false);
     }
+    setBusy(false);
   };
+
+  const handleTest = async () => {
+    if (!hasCred) { showMsg('Register biometric first.', false); return; }
+    setBusy(true); showMsg('Waiting for biometric verification…');
+    try {
+      const challenge = crypto.getRandomValues(new Uint8Array(32));
+      const credId = creds[email];
+      await navigator.credentials.get({
+        publicKey: {
+          rpId: _BIO_RP_ID, challenge,
+          allowCredentials: [{ type:'public-key', id: _bioB642buf(credId), transports: ['internal','hybrid'] }],
+          userVerification: 'required', timeout: 60000,
+        }
+      });
+      showMsg('✅ Biometric verified successfully! Login is ready to use.', true);
+    } catch(e) {
+      const msg = e.name === 'NotAllowedError' ? 'Verification cancelled or timed out.'
+                : e.name === 'SecurityError'   ? 'Requires HTTPS.'
+                : 'Verification failed: ' + e.message;
+      showMsg('❌ ' + msg, false);
+    }
+    setBusy(false);
+  };
+
+  const handleRemove = () => {
+    try {
+      const raw = localStorage.getItem(_BIO_CRED_KEY);
+      const map = raw ? JSON.parse(raw) : {};
+      delete map[email];
+      localStorage.setItem(_BIO_CRED_KEY, JSON.stringify(map));
+      if (localStorage.getItem(_BIO_EMAIL_KEY) === email) localStorage.removeItem(_BIO_EMAIL_KEY);
+    } catch {}
+    refreshCreds();
+    showMsg('Biometric credential removed from this device.', true);
+  };
+
+  const card    = `rounded-2xl border shadow-sm p-6 ${dk?'bg-gray-800 border-gray-700':'bg-white border-gray-200'}`;
+  const sub     = dk?'text-gray-400':'text-gray-500';
+  const inp     = `w-full border rounded-xl px-3 py-2.5 text-sm outline-none transition-colors ${dk?'bg-gray-700 border-gray-600 text-white':'bg-white border-gray-300 text-gray-900'} focus:border-[color:var(--p400)]`;
+  const btnBase = {display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'10px 18px',borderRadius:10,border:'none',fontSize:13,fontWeight:700,cursor:'pointer',transition:'all .2s',fontFamily:"'DM Sans',sans-serif"};
 
   return (
-    <div>
-      <div style={{display:'flex',alignItems:'center',gap:10,margin:'16px 0 14px'}}>
-        <div style={{flex:1,height:1,background:'#e5e7eb'}}/>
-        <span style={{fontSize:11,color:'#9ca3af',fontWeight:600,letterSpacing:'.6px',textTransform:'uppercase'}}>or</span>
-        <div style={{flex:1,height:1,background:'#e5e7eb'}}/>
-      </div>
-      <button onClick={handleBioLogin} disabled={busy}
-        style={{width:'100%',display:'flex',alignItems:'center',justifyContent:'center',gap:10,padding:'13px 16px',
-          border:'1.5px solid var(--p400)',borderRadius:12,background:'rgba(99,102,241,.06)',color:'var(--p700)',
-          fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:700,cursor:busy?'not-allowed':'pointer',
-          opacity:busy?0.6:1,transition:'all .2s',marginBottom:8}}>
-        <span style={{fontSize:22,lineHeight:1}}>{bioType.icon}</span>
-        <span>{bioType.label}</span>
-      </button>
-      {bioStatus && (
-        <p style={{fontSize:12,textAlign:'center',marginTop:6,color:bioStatus.startsWith('✅')?'#16a34a':'#6b7280'}}>{bioStatus}</p>
+    <div className={card}>
+      <h3 className="font-semibold mb-1 flex items-center gap-2" style={{fontFamily:"'Outfit',sans-serif"}}>
+        <span>🔐</span> Biometric Login
+      </h3>
+      <p className={`text-xs mb-5 ${sub}`}>
+        Enable Face ID, fingerprint, or Windows Hello to sign in without a password on this device.
+        Each device must be registered separately.
+      </p>
+
+      {/* Hardware check */}
+      {supported === false && (
+        <div className={`rounded-xl px-4 py-3 text-sm border ${dk?'bg-gray-700 border-gray-600 text-gray-300':'bg-amber-50 border-amber-200 text-amber-800'}`}>
+          ⚠️ This device or browser does not support biometric authentication (WebAuthn). Try Chrome or Safari on a mobile device.
+        </div>
       )}
-      {showReg && !busy && (
-        <button onClick={handleBioRegister}
-          style={{width:'100%',padding:11,marginTop:8,border:'1px dashed #d1d5db',borderRadius:10,
-            background:'transparent',color:'#6b7280',fontFamily:"'DM Sans',sans-serif",fontSize:13,
-            fontWeight:600,cursor:'pointer',transition:'all .2s'}}>
-          ＋ Enable Biometric Login for this device
-        </button>
+
+      {supported === null && (
+        <div className={`text-sm ${sub}`}>Checking device capabilities…</div>
+      )}
+
+      {supported === true && (
+        <div className="space-y-4">
+          {/* Current account */}
+          <div className={`rounded-xl px-4 py-3 flex items-center gap-3 ${dk?'bg-gray-700/60':'bg-slate-50'} border ${dk?'border-gray-600':'border-gray-200'}`}>
+            <span style={{fontSize:22}}>{bioType?.icon || '🔒'}</span>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold truncate">{bioType?.label || 'Biometrics'}</p>
+              <p className={`text-xs truncate ${sub}`}>{email || 'No account'}</p>
+            </div>
+            <span style={{
+              display:'inline-flex',alignItems:'center',gap:4,padding:'3px 10px',borderRadius:20,
+              fontSize:11,fontWeight:700,
+              background: hasCred ? 'rgba(16,185,129,.12)' : 'rgba(239,68,68,.10)',
+              color: hasCred ? '#059669' : '#dc2626',
+              border: `1px solid ${hasCred ? 'rgba(16,185,129,.3)' : 'rgba(239,68,68,.25)'}`,
+            }}>
+              {hasCred ? '✅ Registered' : '○ Not registered'}
+            </span>
+          </div>
+
+          {/* Actions */}
+          <div className="flex flex-wrap gap-3">
+            {!hasCred ? (
+              <button onClick={handleRegister} disabled={busy || !email}
+                style={{...btnBase, background:'var(--p600)', color:'#fff', opacity:(busy||!email)?0.6:1, flex:1, minWidth:160}}>
+                {busy ? '⏳ Registering…' : `＋ Enable ${bioType?.label || 'Biometric'} Login`}
+              </button>
+            ) : (
+              <>
+                <button onClick={handleTest} disabled={busy}
+                  style={{...btnBase, background:'rgba(99,102,241,.1)', color:'var(--p600)', border:'1.5px solid var(--p300)', flex:1, minWidth:140, opacity:busy?0.6:1}}>
+                  {busy ? '⏳ Testing…' : '🧪 Test Biometric'}
+                </button>
+                <button onClick={handleRemove} disabled={busy}
+                  style={{...btnBase, background:'rgba(239,68,68,.08)', color:'#dc2626', border:'1.5px solid rgba(239,68,68,.25)', flex:1, minWidth:140, opacity:busy?0.6:1}}>
+                  🗑️ Remove
+                </button>
+              </>
+            )}
+          </div>
+
+          {/* Status message */}
+          {status && (
+            <div className={`rounded-xl px-4 py-3 text-sm font-medium border ${
+              statusOk
+                ? (dk?'bg-green-900/30 border-green-700 text-green-300':'bg-green-50 border-green-200 text-green-800')
+                : (dk?'bg-red-900/30 border-red-700 text-red-300':'bg-red-50 border-red-200 text-red-700')
+            }`}>
+              {status}
+            </div>
+          )}
+
+          {/* How it works */}
+          <div className={`rounded-xl px-4 py-3 text-xs space-y-1 ${dk?'bg-gray-700/50 text-gray-400':'bg-slate-50 text-gray-500'} border ${dk?'border-gray-600':'border-gray-200'}`}>
+            <p className="font-semibold uppercase tracking-wide mb-1.5">How it works</p>
+            <p>• Tap <strong>Enable</strong> — your device will prompt for Face ID / fingerprint to register</p>
+            <p>• Next time you log in, tap <strong>Sign in with Biometrics</strong> on the login screen</p>
+            <p>• Each device (phone, tablet, laptop) must be registered separately</p>
+            <p>• Your biometric data never leaves your device — only a secure key ID is stored locally</p>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -1246,23 +1356,12 @@ function LoginPage({ login, dk, toggleTheme, colourKey, changeColour, logoUrl })
     return () => window.removeEventListener('resize', check);
   }, []);
 
-  // Pre-fill email from last biometric session
-  useEffect(() => {
-    if (!email) { const last = localStorage.getItem(_BIO_EMAIL_KEY); if (last) setEmail(last); }
-  }, []);
-
   const handleLogin = async () => {
     if (!email || !password) { setError('Please enter your credentials.'); return; }
     setLoading(true); setError('');
     const ok = await login(email, password);
     if (!ok) setError('Invalid email or password. Please try again.');
     setLoading(false);
-  };
-
-  const handleBioSuccess = async (em) => {
-    setError('');
-    const ok = await login(em, '__biometric__');
-    if (!ok) setError('Biometric verified, but account not found. Please sign in with password.');
   };
 
   // ── Shared inline form fields (NOT a sub-component — avoids remount-on-keystroke bug) ──
@@ -1314,10 +1413,57 @@ function LoginPage({ login, dk, toggleTheme, colourKey, changeColour, logoUrl })
           {loading ? '⏳ Verifying…' : 'Sign In →'}
         </button>
 
-        {/* Biometric — mobile only */}
-        {isMobile && (
-          <BiometricButton email={email} onSuccess={handleBioSuccess} onError={msg=>setError(msg)} />
-        )}
+        {/* Biometric sign-in — shown only when a passkey is already registered for this device */}
+        {(() => {
+          try {
+            const raw = localStorage.getItem(_BIO_CRED_KEY);
+            const map = raw ? JSON.parse(raw) : {};
+            if (!Object.keys(map).length) return null;
+          } catch { return null; }
+          return (
+            <button
+              onClick={async () => {
+                setError('');
+                // Determine email: from field → last stored → first key in map
+                let em = email.trim().toLowerCase();
+                if (!em) em = localStorage.getItem(_BIO_EMAIL_KEY) || '';
+                if (!em) {
+                  try { const m=JSON.parse(localStorage.getItem(_BIO_CRED_KEY)||'{}'); em=Object.keys(m)[0]||''; } catch {}
+                }
+                if (!em) { setError('Enter your email first, then tap biometric.'); return; }
+                const credId = _bioGetCred(em);
+                if (!credId) { setError('No biometric registered for ' + em + '. Go to Settings → Biometric Login.'); return; }
+                setLoading(true);
+                try {
+                  const challenge = crypto.getRandomValues(new Uint8Array(32));
+                  await navigator.credentials.get({
+                    publicKey: {
+                      rpId: _BIO_RP_ID, challenge,
+                      allowCredentials: [{ type:'public-key', id:_bioB642buf(credId), transports:['internal','hybrid'] }],
+                      userVerification: 'required', timeout: 60000,
+                    }
+                  });
+                  const ok = await login(em, '__biometric__');
+                  if (!ok) setError('Biometric verified but account not found. Sign in with password.');
+                } catch(e) {
+                  const msg = e.name==='NotAllowedError' ? 'Biometric cancelled or timed out.'
+                            : e.name==='SecurityError'   ? 'Biometrics require HTTPS.'
+                            : 'Biometric failed: '+e.message;
+                  setError(msg);
+                }
+                setLoading(false);
+              }}
+              disabled={loading}
+              style={{width:'100%',display:'flex',alignItems:'center',justifyContent:'center',gap:10,
+                padding:'13px 16px',borderRadius:12,border:'1.5px solid var(--p300)',
+                background:'rgba(99,102,241,.06)',color:'var(--p700)',
+                fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:700,
+                cursor:loading?'not-allowed':'pointer',opacity:loading?0.6:1,transition:'all .2s'}}>
+              <span style={{fontSize:20}}>🔒</span>
+              <span>Sign in with Biometrics</span>
+            </button>
+          );
+        })()}
       </div>
 
       {/* Colour theme picker */}
@@ -4613,7 +4759,7 @@ function AdminPlants({ dk, plants, updatePlants, currentUser }) {
 /* ═══════════════════════════════════════════
    ADMIN – SETTINGS
 ═══════════════════════════════════════════ */
-function AdminSettings({ dk, onLogoSave, onLogoRemove }) {
+function AdminSettings({ dk, onLogoSave, onLogoRemove, currentUser }) {
   const [settings, setSettings] = useState(() => {
     const defaults = {
       // Company Branding
@@ -5915,6 +6061,9 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove }) {
         );
       })()}
 
+      {/* ── Biometric Login ── */}
+      <BiometricSettings dk={dk} currentUser={currentUser} />
+
       <button onClick={save} disabled={logoSaving || logoDeleting} className="w-full py-3 text-white rounded-xl font-semibold transition-colors shadow-lg disabled:opacity-60" style={{background:"var(--p600)"}}>
         💾 Save All Settings
       </button>
@@ -7028,7 +7177,7 @@ function AdminDashboard({ dk, toggleTheme, colourKey, cycleColour, changeColour,
     users:           <AdminUsers dk={dk} plants={plants} users={users} updateUsers={updateUsers} />,
     plants:          <AdminPlants dk={dk} plants={plants} updatePlants={updatePlants} currentUser={currentUser} />,
     categories:      <AdminCategories dk={dk} categories={categories} updateCategories={updateCategories} />,
-    settings:        <AdminSettings dk={dk} onLogoSave={url => setLogoUrl(url)} onLogoRemove={() => setLogoUrl('')} />,
+    settings:        <AdminSettings dk={dk} onLogoSave={url => setLogoUrl(url)} onLogoRemove={() => setLogoUrl('')} currentUser={currentUser} />,
     changepassword:  <ChangePasswordPage dk={dk} currentUser={currentUser} users={users} updateUsers={updateUsers} />,
   };
 
@@ -7164,6 +7313,9 @@ function ChangePasswordPage({ dk, currentUser, users, updateUsers }) {
           <li>• Change your password periodically for security</li>
         </ul>
       </div>
+
+      {/* Biometric login — available on all roles from this page */}
+      <BiometricSettings dk={dk} currentUser={currentUser} />
     </div>
   );
 }
