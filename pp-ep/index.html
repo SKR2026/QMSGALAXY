@@ -488,6 +488,30 @@ tr:hover td{background:rgba(255,255,255,.012);color:var(--tx)}
   </div>
 </div>
 
+<!-- LICENSE LOCKED SCREEN — shown after login when license is expired or missing -->
+<div id="vLicLocked" class="h" style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);padding:24px">
+  <div style="background:var(--bg2);border:2px solid var(--rdbd);border-radius:16px;padding:36px 32px;max-width:440px;width:100%;text-align:center;position:relative;overflow:hidden">
+    <div style="position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--rd),rgba(248,113,113,0))"></div>
+    <div style="font-size:52px;margin-bottom:14px">🔒</div>
+    <div style="font-size:18px;font-weight:800;color:var(--rd);margin-bottom:8px" id="vLicLockedTitle">License Expired</div>
+    <div id="vLicLockedMsg" style="font-size:13px;color:var(--tx2);line-height:1.75;margin-bottom:22px">
+      Your license key has expired. Please contact your administrator to renew.
+    </div>
+    <!-- Expiry detail pill -->
+    <div id="vLicLockedDetail" style="display:inline-flex;align-items:center;gap:7px;padding:7px 16px;background:var(--rdbg);border:1px solid var(--rdbd);border-radius:30px;font-size:12px;font-weight:700;color:var(--rd);margin-bottom:24px"></div>
+    <!-- Superadmin: go to settings to update key -->
+    <div id="vLicLockedSAWrap" style="display:none;margin-bottom:14px">
+      <button class="b bp w" style="justify-content:center;margin-bottom:8px" onclick="licLockedGoSettings()">
+        ⚙️ Go to Settings → Update License Key
+      </button>
+      <div style="font-size:11px;color:var(--tx3)">You are signed in as Super Admin — you can update the license key directly.</div>
+    </div>
+    <!-- Non-superadmin: just sign out -->
+    <button class="b bg w" style="justify-content:center" onclick="doLogout()">Sign Out</button>
+    <div style="margin-top:16px;font-size:11px;color:var(--tx3)">Contact your Super Admin to obtain a valid license key.</div>
+  </div>
+</div>
+
 <!-- ADMIN SHELL -->
 <div id="vAdmShell" class="shell h">
   <aside class="side">
@@ -1621,7 +1645,7 @@ function hide(id)   { var e=G(id); if(e) e.classList.add('h'); }
 function val(id)    { var e=G(id); return e ? e.value.trim() : ''; }
 function setTx(id,v){ var e=G(id); if(e) e.textContent=v||''; }
 function setHtml(id,v){ var e=G(id); if(e) e.innerHTML=v||''; }
-function hideAll()  { ['vCfgErr','vAdmLog','vAdmShell','vEntry','vExam','vResult','vResultPortal'].forEach(hide); var ld=G('vLoader');if(ld)ld.style.display='none'; }
+function hideAll()  { ['vCfgErr','vAdmLog','vAdmShell','vLicLocked','vEntry','vExam','vResult','vResultPortal'].forEach(hide); var ld=G('vLoader');if(ld)ld.style.display='none'; }
 function esc(s)     { return (s||'').replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
 
 function toast(msg, type, ms) {
@@ -1867,8 +1891,17 @@ function settingsActivateLicense() {
       ).catch(function(){});
       renderLicBadge();
       setStatus('✅ License activated' + (expiryStr ? ' · Valid until ' + fmtD(expiryStr) : ' (no expiry)') + '.', 'var(--gn)');
-      // Re-render the card to show updated state
-      setTimeout(renderSettings, 600);
+      // If coming from the locked screen, re-enter the app
+      var lockedEl = G('vLicLocked');
+      if (lockedEl && !lockedEl.classList.contains('h')) {
+        setTimeout(function() {
+          var cu = AUTH().currentUser;
+          if (cu) resolveAdminUser(cu);
+        }, 800);
+      } else {
+        // Already in settings — just re-render the card to show new state
+        setTimeout(renderSettings, 600);
+      }
       toast('License key activated!', 'ok');
     })
     .catch(function(e) {
@@ -1914,7 +1947,7 @@ function boot() {
   var cached = getLicCache();
   if (cached && cached.expiry) CFG.licenseExpiry = cached.expiry;
 
-  // Re-verify stored key silently in background (badge only — no gate)
+  // Re-verify stored key silently in background; enforce expiry on active sessions
   if (cached && cached.key) {
     DB().collection('licenses').doc(cached.key).get()
       .then(function(snap) {
@@ -1928,6 +1961,12 @@ function boot() {
           CFG.licenseExpiry = '';
         }
         renderLicBadge();
+        // If the shell is currently visible and license is now expired/missing, lock it
+        var shell = G('vAdmShell');
+        if (shell && !shell.classList.contains('h')) {
+          var freshStatus = licCacheStatus();
+          if (freshStatus !== 'valid') { showLicLocked(); }
+        }
       })
       .catch(function() { renderLicBadge(); });
   }
@@ -2085,7 +2124,63 @@ function doLogout() {
 function showE(id, m) { var e=G(id); if(e){ e.textContent=m; show(id); } }
 
 // ── ADMIN SHELL ──────────────────────────────────────────────
+function showLicLocked() {
+  // Determine expiry from cache or CFG
+  var cached  = getLicCache();
+  var expiry  = (CFG && CFG.licenseExpiry) ? CFG.licenseExpiry
+              : (cached && cached.expiry)  ? cached.expiry
+              : '';
+  var hasKey  = !!(cached && cached.key);
+  var title   = document.getElementById('vLicLockedTitle');
+  var msg     = document.getElementById('vLicLockedMsg');
+  var detail  = document.getElementById('vLicLockedDetail');
+  var saWrap  = document.getElementById('vLicLockedSAWrap');
+
+  if (!hasKey) {
+    // No license at all
+    if (title)  title.textContent  = 'No License Activated';
+    if (msg)    msg.textContent    = 'This ExamPro installation does not have an active license key. Please contact your administrator.';
+    if (detail) detail.textContent = '🔑 License key required';
+  } else {
+    // Key exists but expired
+    var expStr = expiry ? fmtD(expiry) : '—';
+    var daysAgo = expiry ? Math.abs(Math.ceil((new Date(expiry) - new Date()) / 86400000)) : 0;
+    if (title)  title.textContent  = 'License Expired';
+    if (msg)    msg.textContent    = 'Your license key has expired. Access is locked until a valid license is activated by your Super Admin.';
+    if (detail) detail.innerHTML   = '🔴 Expired &middot; ' + expStr + (daysAgo ? ' &middot; ' + daysAgo + 'd ago' : '');
+  }
+
+  // Show settings shortcut only for superadmin
+  if (saWrap) saWrap.style.display = isSuperAdmin() ? 'block' : 'none';
+
+  hideAll();
+  show('vLicLocked');
+}
+
+function licLockedGoSettings() {
+  // Show shell but go directly to settings so they can update the key
+  hideAll(); show('vAdmShell');
+  goPage('settings');
+}
+
 function showAdmin(d) {
+  // ── LICENSE GUARD — block entry if expired or missing ────────
+  // Re-check every time showAdmin is called (login, page reload, tab switch back).
+  // Candidates and result portal are exempt — only admin path hits this.
+  // Superadmin sees Settings to fix the key; plant admins see sign-out only.
+  var licStatus = licCacheStatus();
+  if (licStatus !== 'valid') {
+    // Also check CFG.licenseExpiry directly in case cache just updated
+    if (CFG && CFG.licenseExpiry) {
+      var expD = new Date(CFG.licenseExpiry);
+      var tod  = new Date(); tod.setHours(0,0,0,0);
+      if (expD >= tod) { /* CFG says valid even if cache was stale — allow */ }
+      else { showLicLocked(); return; }
+    } else {
+      showLicLocked(); return;
+    }
+  }
+
   hideAll(); show('vAdmShell');
   var nm = (d.displayName||d.email||'A');
   var av = nm.split(' ').map(function(n){return n[0];}).join('').slice(0,2).toUpperCase();
