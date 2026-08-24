@@ -4172,7 +4172,7 @@ function renderTasks(){
   <div class="dash-header-row fade-in" style="margin-bottom:14px;">
     <div class="dash-header-left">
       <div class="panel-title" style="margin-bottom:0;">${taskFilters.teamAssignedToMe ? '👤 Assigned to Me by Team' : 'All Tasks'+_ymLabel}${_activeFilterBadge}</div>
-      <div class="panel-sub">${taskFilters.teamAssignedToMe ? 'Tasks assigned to you by your team members (plant owners + added members)' : tasks.filter(t=>(dashYearFilter==='All'||(t.due&&t.due.slice(0,4)===dashYearFilter))&&(dashMonthFilter==='All'||(t.due&&t.due.slice(5,7)===dashMonthFilter))).length+' total tasks in the system'}</div>
+      <div class="panel-sub">${taskFilters.teamAssignedToMe ? 'Tasks assigned to you by your team members (plant owners + added members)' : (adminAuthenticated&&!currentSession&&!plantOwnerAuthenticated?tasks:getScopedTasks()).filter(t=>(dashYearFilter==='All'||(t.due&&t.due.slice(0,4)===dashYearFilter))&&(dashMonthFilter==='All'||(t.due&&t.due.slice(5,7)===dashMonthFilter))).length+(adminAuthenticated&&!currentSession&&!plantOwnerAuthenticated?' total tasks in the system':' tasks visible to you')}</div>
     </div>
     <div class="dash-ym-inline" id="tasks-ym-bar">
       <div class="dash-tab-row" id="tasks-plant-row"><span class="dash-tab-label">Plant</span></div>
@@ -4200,7 +4200,7 @@ function renderTasks(){
     <button class="btn btn-ghost btn-sm" onclick="clearSelection()">✕ Clear Selection</button>
   </div>
   <div id="task-rows" class="fade-in"></div>`;
-  _buildFilterTabs('tasks', ()=>tasks, renderTasks);
+  _buildFilterTabs('tasks', ()=>(adminAuthenticated&&!currentSession&&!plantOwnerAuthenticated ? tasks : getScopedTasks()), renderTasks);
   renderTaskRows();
 }
 
@@ -4344,8 +4344,14 @@ function renderTaskRows(){
     // Team Overview stat click — show ALL tasks for that member regardless of scope
     baseList = tasks.filter(t=>(t.assignee||'').toLowerCase()===taskFilters._assigneeEmail.toLowerCase());
   } else {
-    // "All Tasks" nav click — show ALL tasks (every task in the system).
-    baseList = tasks;
+    // "All Tasks" nav click:
+    // — Superadmin sees every task in the system (full tasks array).
+    // — Plant owners, admins, and users see only their scoped tasks.
+    if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
+      baseList = tasks; // superadmin only
+    } else {
+      baseList = getScopedTasks();
+    }
   }
 
   const filtered=baseList.filter(t=>{
@@ -7524,10 +7530,18 @@ function getScopedTasks(){
   // Plant owner path — unchanged
   if(plantOwnerAuthenticated && currentPlantSession){
     const owners = (currentPlantSession.owners||[]).map(o=>o.toLowerCase());
-    return tasks.filter(t =>
-      owners.includes((t.assignee||'').toLowerCase()) ||
-      (t.plant && t.plant === currentPlantSession.id)
-    );
+    const plantId = currentPlantSession.id;
+    return tasks.filter(t => {
+      const assignee   = (t.assignee||'').toLowerCase();
+      const assignedBy = (t.assignedBy||'').toLowerCase();
+      // Only show tasks where this plant is explicitly involved:
+      // assignee is one of this plant's owners, OR task has this plant's tag
+      // AND the task was NOT assigned by a different superadmin/admin account
+      // (tasks tagged to this plant OR assigned to plant owners, regardless of who assigned)
+      if(owners.includes(assignee)) return true;
+      if(t.plant && t.plant === plantId) return true;
+      return false;
+    });
   }
 
   // Superadmin — own tasks (assigned to/by me) + accepted group members' tasks
@@ -7582,18 +7596,22 @@ function getScopedTasks(){
       });
     }
 
-    // role=admin: own tasks + accepted group members' tasks (admin OWNS the group)
-    const authorised = _getAuthorisedEmails();
+    // role=admin (e.g. Aniket): sees only:
+    //   (a) tasks assigned TO me
+    //   (b) tasks assigned BY me
+    //   (c) tasks I assigned to my own group members (assignedBy===me AND assignee is my member)
+    // NEVER sees: superadmin tasks, other plant tasks, or tasks assigned by superadmin
+    const myMembers = new Set((_myGroupMemberEmails||[]).map(e=>e.toLowerCase()));
     return tasks.filter(t => {
       const assignee   = (t.assignee||'').toLowerCase();
       const assignedBy = (t.assignedBy||'').toLowerCase();
+      // (a) assigned to me
       if(assignee === me) return true;
+      // (b) assigned by me
       if(assignedBy === me) return true;
-      // Group members' tasks — admin owns the group so they see all members' work
-      if(authorised.size > 1){
-        if(authorised.has(assignee)) return true;
-        if(authorised.has(assignedBy)) return true;
-      }
+      // (c) I assigned this task to one of my members
+      if(assignedBy === me && myMembers.has(assignee)) return true;
+      // Exclude everything else — including superadmin tasks
       return false;
     });
   }
@@ -12870,10 +12888,11 @@ function renderTeamTasks(){
   // Also gather from group member emails list
   if(_myGroupMemberEmails) _myGroupMemberEmails.forEach(e => { if(e.toLowerCase() !== myEmail) teamEmails.add(e.toLowerCase()); });
 
-  // Team Tasks = ALL tasks where assignee is a team member (plant owner or group member),
-  // EXCLUDING tasks where I (the logged-in user) am the assignee.
-  // Tasks I assigned TO team members are included (they show in the team's workload).
-  // Uses the full tasks array so nothing is missed.
+  // Team Tasks = tasks where assignee is a known team member (excl. me).
+  // — Superadmin: sees ALL team members across all plants (uses full tasks array).
+  // — Plant owner / admin / user: sees only tasks within their own scope.
+  const _isSuperAdmin = adminAuthenticated && !currentSession && !plantOwnerAuthenticated;
+  const _taskPool = _isSuperAdmin ? tasks : getScopedTasks();
   const adminEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
 
   // Build the full set of team member emails (plant owners + group members, excl. me)
@@ -12883,15 +12902,19 @@ function renderTeamTasks(){
     (p.owners||[]).forEach(o => { const l=(o||'').toLowerCase().trim(); if(l && l!==myEmail && l!==adminEmail) allTeamEmails.add(l); });
   });
 
-  let teamTasks = tasks.filter(t => {
+  let teamTasks = _taskPool.filter(t => {
     const assignee = (t.assignee||'').toLowerCase();
 
     // Must have an assignee and it must be a team member (not me)
     if(!assignee) return false;
     if(assignee === myEmail || (adminEmail && assignee === adminEmail)) return false;
 
-    // Assignee must be a known team member (plant owner or group member)
-    return allTeamEmails.has(assignee);
+    // For superadmin: any known team member; for others: already scoped by getScopedTasks
+    if(_isSuperAdmin) return allTeamEmails.has(assignee);
+
+    // For non-superadmin: task must be within their scope (getScopedTasks already filtered)
+    // Just exclude self
+    return true;
   });
 
   // All team member emails for the filter dropdown (not just those with tasks)
