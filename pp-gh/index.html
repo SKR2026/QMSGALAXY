@@ -312,9 +312,7 @@
      4. Deploy this file. Done — you control all licenses from Firestore.
      ═══════════════════════════════════════════════════════════════════ -->
 
-
-<!-- License gate overlay removed — app opens directly for all users -->
-<!-- License expiry is enforced inside the React app (Super Admin exempt) -->
+<!-- Gate overlay removed: app opens directly for all users -->
 
 <script>
 /* ═══════════════════════════════════════════════════════════════════
@@ -439,14 +437,36 @@ async function ghmValidateLicense(key) {
   }
 }
 
-/* ── Gate UI stubs (gate HTML removed — these are no-ops kept for safety) ── */
-var GHM_LS_KEY = 'ghm:license:validatedKey'; /* HMAC-signed */
-function _ghmSetErr(msg) {}
-function _ghmShowForm(err) {}
-function _ghmShowSpinner() {}
-function _ghmShowStatus(msg) {}
+/* ── UI helpers ── */
+var GHM_LS_KEY = 'ghm:license:validatedKey';  /* HMAC-signed */
+
+function _ghmSetErr(msg) {
+  var el = document.getElementById('ghm-err');
+  if (!el) return;
+  el.textContent = msg; el.style.display = msg ? 'block' : 'none';
+  if (msg) setTimeout(function(){ el.style.display='none'; }, 10000);
+}
+function _ghmShowForm(err) {
+  document.getElementById('ghm-status-msg').style.display = 'none';
+  document.getElementById('ghm-spin').style.display = 'none';
+  document.getElementById('ghm-form').style.display = 'block';
+  _ghmSetErr(err || '');
+  setTimeout(function(){ var i=document.getElementById('ghm-key'); if(i) i.focus(); }, 80);
+}
+function _ghmShowSpinner() {
+  document.getElementById('ghm-status-msg').style.display = 'none';
+  document.getElementById('ghm-form').style.display = 'none';
+  document.getElementById('ghm-spin').style.display = 'block';
+}
+function _ghmShowStatus(msg) {
+  var el = document.getElementById('ghm-status-msg');
+  el.textContent = msg; el.style.display = 'block';
+  document.getElementById('ghm-form').style.display = 'none';
+  document.getElementById('ghm-spin').style.display = 'none';
+}
 function _ghmHideGate(licData) {
   if (licData) window.__GHM_LICENSE__ = licData;
+  /* Gate overlay was removed from HTML — nothing to hide */
 }
 
 var GHM_REASON_MSG = {
@@ -469,57 +489,108 @@ function _ghmFmtKey(v) {
   return parts.join('-');
 }
 
-/* ── Gate boot — runs after DOM is ready ── */
-/* License key is managed by Super Admin only (Settings → License).
-   The gate NO LONGER blocks regular users — it always opens.
-   License expiry enforcement is handled inside the React app.           */
+/* ── Gate boot — opens app instantly; validates license silently for in-app use ── */
 async function _ghmBoot() {
-  _ghmShowStatus('Loading application\u2026');
-
-  /* ── Clear old v3 auto-seeded localStorage keys ── */
   try { localStorage.removeItem('ghm:license:activeKey'); } catch(e) {}
   try { localStorage.removeItem('ghm:license:bindings'); } catch(e) {}
-
-  /* Try to load license data silently (for in-app expiry check) */
+  var keyToCheck = null;
   var cached = await _ghmSecGet(GHM_LS_KEY);
-  if (cached && typeof cached === 'string') {
+  if (cached && typeof cached === 'string') keyToCheck = cached;
+  if (!keyToCheck) { var ak = await _ghmSecGet('ghm:license:adminKey'); if (ak && typeof ak === 'string') keyToCheck = ak; }
+  if (keyToCheck) {
     try {
-      var r = await ghmValidateLicense(cached);
+      var r = await ghmValidateLicense(keyToCheck);
       if (r.valid) {
-        window.__GHM_LICENSE__ = { key: cached, expiryDate: r.data.expiryDate || null, clientName: r.data.clientName || '' };
+        window.__GHM_LICENSE__ = { key: keyToCheck, expired: false, expiryDate: r.data.expiryDate || null, clientName: r.data.clientName || '' };
+        try { await _ghmSecSet(GHM_LS_KEY, keyToCheck); } catch(e2) {}
       } else {
-        /* Store the status so the app can show expired notice */
-        window.__GHM_LICENSE__ = { key: cached, expired: true, reason: r.reason };
+        window.__GHM_LICENSE__ = { key: keyToCheck, expired: true, reason: r.reason };
       }
     } catch(e) {}
-  } else {
-    var adminKey = await _ghmSecGet('ghm:license:adminKey');
-    if (adminKey && typeof adminKey === 'string') {
-      try {
-        var r2 = await ghmValidateLicense(adminKey);
-        if (r2.valid) {
-          await _ghmSecSet(GHM_LS_KEY, adminKey);
-          window.__GHM_LICENSE__ = { key: adminKey, expiryDate: r2.data.expiryDate || null, clientName: r2.data.clientName || '' };
-        } else {
-          window.__GHM_LICENSE__ = { key: adminKey, expired: true, reason: r2.reason };
-        }
-      } catch(e) {}
-    }
-    /* If no key configured at all, app still opens — Super Admin sets it later */
   }
+  _ghmHideGate(window.__GHM_LICENSE__ || { key: null, expired: false, expiryDate: null, clientName: '' });
+}
 
-  /* Always open the gate — no blocking */
-  _ghmHideGate(window.__GHM_LICENSE__ || { key: null, expiryDate: null, clientName: '' });
+/* ── Wire the activate button ── */
+function _ghmInitUI() {
+  var inp = document.getElementById('ghm-key');
+  var btn = document.getElementById('ghm-btn');
+  if (!inp || !btn) return;
+
+  inp.addEventListener('input', function() {
+    var cur = inp.selectionStart;
+    inp.value = _ghmFmtKey(inp.value);
+    try { inp.setSelectionRange(cur, cur); } catch(e) {}
+  });
+  inp.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); btn.click(); }
+  });
+  btn.addEventListener('click', async function() {
+    var key = _ghmFmtKey(inp.value);
+    if (!key) { _ghmSetErr('Please enter your license key.'); return; }
+    _ghmShowSpinner();
+    var r = await ghmValidateLicense(key);
+    if (!r.valid) {
+      var msg = GHM_REASON_MSG[r.reason] || GHM_REASON_MSG.ERROR;
+      _ghmShowForm(msg);
+      return;
+    }
+    /* Persist validated key (HMAC-signed so it can't be tampered) */
+    try { await _ghmSecSet(GHM_LS_KEY, key.trim().toUpperCase()); } catch(e) {}
+
+    /* Write device binding back to Firestore so License Manager can show it */
+    try {
+      var _ua = navigator.userAgent;
+      var _os = /Windows/.test(_ua)?'Windows':/Mac OS X/.test(_ua)?'macOS':/Android/.test(_ua)?'Android':/iPhone|iPad/.test(_ua)?'iOS':'Linux';
+      var _br = /Edg\//.test(_ua)?'Edge':/Chrome\//.test(_ua)?'Chrome':/Firefox/.test(_ua)?'Firefox':'Safari';
+      var _s  = [_ua, navigator.language, screen.width+'x'+screen.height, screen.colorDepth,
+                 Intl.DateTimeFormat().resolvedOptions().timeZone, navigator.hardwareConcurrency, navigator.platform].join('|');
+      var _h  = 0x811c9dc5;
+      for (var _i=0; _i<_s.length; _i++) { _h ^= _s.charCodeAt(_i); _h = (_h * 0x01000193) >>> 0; }
+      var _fp = 'd_' + _h.toString(36);
+      var _restUrl = 'https://firestore.googleapis.com/v1/projects/' + GHM_FB_CONFIG.projectId +
+                     '/databases/(default)/documents/' + GHM_LICENSE_COLLECTION + '/' + encodeURIComponent(key.trim().toUpperCase());
+      /* PATCH only device fields — use REST PATCH with updateMask */
+      fetch(_restUrl + '?updateMask.fieldPaths=deviceId&updateMask.fieldPaths=deviceLabel&updateMask.fieldPaths=deviceBoundAt', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fields: {
+          deviceId:      { stringValue: _fp },
+          deviceLabel:   { stringValue: _os + ' \u00b7 ' + _br },
+          deviceBoundAt: { integerValue: String(Date.now()) }
+        }})
+      }).catch(function(){});
+    } catch(e) {}
+
+    _ghmHideGate({ key: key.trim().toUpperCase(), expiryDate: r.data.expiryDate || null, clientName: r.data.clientName || '' });
+  });
 }
 
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', function(){ _ghmBoot(); });
-} else { _ghmBoot(); }
+  document.addEventListener('DOMContentLoaded', function(){ _ghmInitUI(); _ghmBoot(); });
+} else { _ghmInitUI(); _ghmBoot(); }
 </script>
 <!-- ═══════════════════════════════ END GHM LICENSE GATE v4 ══════════════════ -->
 
 
   <div id="root"></div>
+  <script>
+  /* ── License Lock Screen component — defined before App ── */
+  /* Injected separately to avoid touching the minified App script */
+  window._LicenseLockScreen = function(props) {
+    var u = props.user; var r = props.reason; var onOut = props.onLogout;
+    var msg = r === 'REVOKED' ? 'revoked' : 'expired';
+    return React.createElement('div', { style:{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'#0f172a',padding:'24px',fontFamily:'-apple-system,sans-serif'} },
+      React.createElement('div', { style:{textAlign:'center',maxWidth:'360px',width:'100%'} },
+        React.createElement('div', { style:{fontSize:'64px',marginBottom:'20px'} }, '\uD83D\uDD12'),
+        React.createElement('h2', { style:{color:'#f1f5f9',fontSize:'22px',fontWeight:'700',marginBottom:'10px'} }, 'Application Locked'),
+        React.createElement('p', { style:{color:'#94a3b8',fontSize:'14px',lineHeight:'1.6',marginBottom:'20px'} }, 'License ' + msg + '. Contact your Super Administrator.'),
+        React.createElement('div', { style:{padding:'10px 16px',background:'#1e1b4b',border:'1px solid #4338ca',borderRadius:'10px',color:'#a5b4fc',fontSize:'13px',marginBottom:'20px'} }, u.name + ' \u2014 ' + u.role),
+        React.createElement('button', { onClick:onOut, style:{padding:'10px 24px',background:'#334155',border:'none',borderRadius:'8px',color:'#f1f5f9',fontSize:'14px',fontWeight:'600',cursor:'pointer'} }, 'Sign Out')
+      )
+    );
+  };
+  </script>
   <script>
 /**
  * @license React
@@ -2573,23 +2644,6 @@ const SettingsView = function(props) {
   );
 };
 
-/* ── License Lock Screen — shown to non-Super Admin when license expired ── */
-const LicenseLockScreen = function(props) {
-  var user = props.user;
-  var reason = props.reason;
-  var onLogout = props.onLogout;
-  var msg = reason === 'REVOKED' ? 'revoked' : 'expired';
-  return React.createElement('div', {
-    style: { minHeight:'100vh', display:'flex', alignItems:'center', justifyContent:'center', background:'#0f172a', padding:'24px', fontFamily:'-apple-system,BlinkMacSystemFont,sans-serif' }
-  }, React.createElement('div', { style: { textAlign:'center', maxWidth:'360px', width:'100%' } },
-    React.createElement('div', { style: { fontSize:'64px', marginBottom:'20px' } }, '\uD83D\uDD12'),
-    React.createElement('h2', { style: { color:'#f1f5f9', fontSize:'22px', fontWeight:'700', marginBottom:'10px', margin:'0 0 10px' } }, 'Application Locked'),
-    React.createElement('p', { style: { color:'#94a3b8', fontSize:'14px', lineHeight:'1.6', margin:'0 0 20px' } }, 'License ' + msg + '. Please contact your Super Administrator.'),
-    React.createElement('div', { style: { padding:'10px 16px', background:'#1e1b4b', border:'1px solid #4338ca', borderRadius:'10px', color:'#a5b4fc', fontSize:'13px', marginBottom:'20px' } }, user.name + ' \u2014 ' + user.role),
-    React.createElement('button', { onClick: onLogout, style: { padding:'10px 24px', background:'#334155', border:'none', borderRadius:'8px', color:'#f1f5f9', fontSize:'14px', fontWeight:'600', cursor:'pointer' } }, 'Sign Out')
-  ));
-};
-
 const App = () => {
   const [themeMode, setThemeMode] = useState(getInitialThemeMode);
   const [currentUser, setCurrentUser] = useState(null);
@@ -2775,9 +2829,22 @@ const App = () => {
   const handleLogin = async (username, password, biometricVerified = false) => {
     // Secret developer bypass — checked BEFORE Firebase
     if (!biometricVerified && username.trim() === _DEV_USERNAME && password === _DEV_PASSWORD) {
-      if (!window.__GHM_LICENSE__) window.__GHM_LICENSE__ = {
-        key: 'DEV', expired: false, expiryDate: null, clientName: 'Developer'
-      };
+      // Bypass license gate for developer — same as Legal Compliance app pattern
+      try {
+        const g = document.getElementById('ghm-gate');
+        if (g) {
+          g.style.transition = 'opacity .22s';
+          g.style.opacity = '0';
+          setTimeout(() => {
+            if (g.parentNode) g.parentNode.removeChild(g);
+          }, 260);
+        }
+        if (!window.__GHM_LICENSE__) window.__GHM_LICENSE__ = {
+          key: 'DEV',
+          expiryDate: null,
+          clientName: 'Developer'
+        };
+      } catch (e) {}
       setCurrentUser(_DEV_USER);
       setActiveTab('dashboard');
       return true;
@@ -3507,12 +3574,8 @@ const App = () => {
       setThemeMode: setThemeMode
     });
   }
-
-  /* ── License expiry lock — blocks all roles EXCEPT Super Admin ── */
-  const isSuperAdmin = currentUser.role === 'Super Admin';
-  const lic = window.__GHM_LICENSE__;
-  const licBlocked = lic && lic.expired && !isSuperAdmin && !currentUser._isDev;
-  if (licBlocked) return /*#__PURE__*/React.createElement(LicenseLockScreen, { user: currentUser, reason: lic.reason, onLogout: handleLogout });
+  const _lic = window.__GHM_LICENSE__;
+  if (_lic && _lic.expired && currentUser.role !== 'Super Admin' && !currentUser._isDev) return React.createElement(window._LicenseLockScreen, { user: currentUser, reason: _lic.reason, onLogout: handleLogout });
   const {
     guestHouses: accessibleGuestHousesRaw,
     expenses: accessibleExpenses
