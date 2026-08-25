@@ -236,6 +236,56 @@
     .theme-sand .text-slate-500 { color: #b45309 !important; }
     .theme-sand [class*="hover:bg-slate-50"]:hover  { background-color: #fffbeb !important; }
     .theme-sand [class*="hover:bg-slate-100"]:hover { background-color: #fef3c7 !important; }
+
+    /* ══════════════════════════════════════════════════════
+       MOBILE BOTTOM NAV  (hidden on desktop)
+       ══════════════════════════════════════════════════════ */
+    @media (max-width: 767px) {
+      .ghm-top-nav { display: none !important; }
+      .ghm-bottom-nav { display: flex !important; }
+      .ghm-header-user { display: none !important; }
+      .ghm-header-actions { gap: 6px !important; }
+      main { padding-bottom: 80px !important; }
+      .ghm-page-title { font-size: 1.4rem !important; }
+    }
+    @media (min-width: 768px) {
+      .ghm-bottom-nav { display: none !important; }
+    }
+    .ghm-bottom-nav {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 60;
+      background: rgba(255,255,255,0.97);
+      backdrop-filter: blur(16px);
+      border-top: 1px solid rgba(148,163,184,0.25);
+      box-shadow: 0 -4px 24px rgba(0,0,0,0.08);
+      padding: 6px 0 calc(6px + env(safe-area-inset-bottom));
+      justify-content: space-around;
+      align-items: center;
+    }
+    .dark .ghm-bottom-nav {
+      background: rgba(15,23,42,0.97);
+      border-top-color: rgba(51,65,85,0.5);
+    }
+    .ghm-bottom-nav-btn {
+      display: flex; flex-direction: column; align-items: center; gap: 3px;
+      padding: 6px 10px; border: none; background: transparent; cursor: pointer;
+      border-radius: 12px; transition: all 0.18s; min-width: 52px;
+      color: #64748b; font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
+    }
+    .ghm-bottom-nav-btn.active { color: #2563eb; }
+    .ghm-bottom-nav-btn .bn-icon { font-size: 20px; line-height: 1; }
+    .dark .ghm-bottom-nav-btn { color: #94a3b8; }
+    .dark .ghm-bottom-nav-btn.active { color: #60a5fa; }
+
+    /* ══════════════════════════════════════════════════════
+       BIOMETRIC BUTTON
+       ══════════════════════════════════════════════════════ */
+    @keyframes bioPulse {
+      0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,0.35); }
+      50%      { box-shadow: 0 0 0 10px rgba(37,99,235,0); }
+    }
+    .bio-btn-pulse { animation: bioPulse 1.8s ease-in-out infinite; }
+    @keyframes bioSpin { to { transform: rotate(360deg); } }
+    .bio-spinner { animation: bioSpin 0.7s linear infinite; }
   </style>
 </head>
 <body class="bg-slate-100 text-slate-900 antialiased">
@@ -1420,6 +1470,97 @@ const STORAGE_KEYS = {
   brandLogo: 'ghm_brand_logo'
 };
 
+/* ═══════════════════════════════════════════════════════════
+   BIOMETRIC (WebAuthn) HELPERS
+   ─────────────────────────────────────────────────────────
+   • ghm:bio:enabled   — 'true' / 'false'  (per-device pref)
+   • ghm:bio:credId    — base64url credential id
+   • ghm:bio:username  — last logged-in username (to re-login)
+   ═══════════════════════════════════════════════════════════ */
+const BIO_ENABLED_KEY  = 'ghm:bio:enabled';
+const BIO_CRED_KEY     = 'ghm:bio:credId';
+const BIO_USER_KEY     = 'ghm:bio:username';
+
+const bioSupported = () =>
+  !!(window.PublicKeyCredential &&
+     navigator.credentials &&
+     typeof navigator.credentials.create === 'function');
+
+const bioIsEnabled = () => {
+  try { return localStorage.getItem(BIO_ENABLED_KEY) === 'true'; } catch { return false; }
+};
+const bioGetCredId = () => {
+  try { return localStorage.getItem(BIO_CRED_KEY) || null; } catch { return null; }
+};
+const bioGetUsername = () => {
+  try { return localStorage.getItem(BIO_USER_KEY) || null; } catch { return null; }
+};
+const bioSave = (credId, username) => {
+  try {
+    localStorage.setItem(BIO_ENABLED_KEY, 'true');
+    localStorage.setItem(BIO_CRED_KEY, credId);
+    localStorage.setItem(BIO_USER_KEY, username);
+  } catch(e) {}
+};
+const bioDisable = () => {
+  try {
+    localStorage.setItem(BIO_ENABLED_KEY, 'false');
+    localStorage.removeItem(BIO_CRED_KEY);
+  } catch(e) {}
+};
+
+/* base64url helpers */
+function _b64uEncode(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function _b64uDecode(str) {
+  str = str.replace(/-/g,'+').replace(/_/g,'/');
+  while (str.length % 4) str += '=';
+  return Uint8Array.from(atob(str), c => c.charCodeAt(0)).buffer;
+}
+
+/* Register a new biometric credential for the given username */
+async function bioRegister(username) {
+  if (!bioSupported()) throw new Error('WebAuthn not supported on this device/browser.');
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const userId    = crypto.getRandomValues(new Uint8Array(16));
+  const options   = {
+    challenge,
+    rp: { name: 'Guest House Management', id: location.hostname || 'localhost' },
+    user: { id: userId, name: username, displayName: username },
+    pubKeyCredParams: [{ alg: -7, type: 'public-key' }, { alg: -257, type: 'public-key' }],
+    authenticatorSelection: {
+      authenticatorAttachment: 'platform',   // device biometric (not security key)
+      userVerification: 'required',
+      residentKey: 'preferred'
+    },
+    timeout: 60000,
+    attestation: 'none'
+  };
+  const cred = await navigator.credentials.create({ publicKey: options });
+  const credId = _b64uEncode(cred.rawId);
+  bioSave(credId, username);
+  return credId;
+}
+
+/* Verify biometric — returns true if user verifies successfully */
+async function bioVerify() {
+  if (!bioSupported()) throw new Error('WebAuthn not supported.');
+  const credId = bioGetCredId();
+  if (!credId) throw new Error('No biometric registered. Please set up biometrics in Settings.');
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const options = {
+    challenge,
+    rpId: location.hostname || 'localhost',
+    allowCredentials: [{ id: _b64uDecode(credId), type: 'public-key' }],
+    userVerification: 'required',
+    timeout: 60000
+  };
+  await navigator.credentials.get({ publicKey: options });
+  return true;  // if get() resolved without throwing, biometric passed
+}
+
 // ── Brand logo helpers ─────────────────────────────────────────────────────────
 const getBrandLogo = () => {
   try {
@@ -2428,6 +2569,90 @@ const LicenseSettingsView = function() {
   );
 };
 
+/* ═══════════════════════════════════════════════════════════
+   BIOMETRIC SETTINGS VIEW  (visible to all logged-in users)
+   ═══════════════════════════════════════════════════════════ */
+const BiometricSettingsView = function({ currentUser }) {
+  const [supported]    = useState(() => bioSupported());
+  const [enabled, setEnabled] = useState(() => bioIsEnabled());
+  const [regStatus, setRegStatus] = useState(null); // {type:'success'|'error', msg}
+  const [loading, setLoading]  = useState(false);
+
+  const handleEnable = async () => {
+    setLoading(true); setRegStatus(null);
+    try {
+      const uname = currentUser.username || currentUser.name || 'user';
+      await bioRegister(uname);
+      setEnabled(true);
+      setRegStatus({ type:'success', msg: '✅ Biometric registered! You can now use fingerprint / Face ID to sign in.' });
+    } catch(e) {
+      let msg = e.message || 'Registration failed.';
+      if (e.name === 'NotAllowedError') msg = 'Biometric prompt was cancelled or not allowed. Please try again.';
+      if (e.name === 'InvalidStateError') msg = 'A credential is already registered on this device. Disable and re-enable to refresh.';
+      setRegStatus({ type:'error', msg: '⚠️ ' + msg });
+    } finally { setLoading(false); }
+  };
+
+  const handleDisable = () => {
+    bioDisable();
+    setEnabled(false);
+    setRegStatus({ type:'success', msg: 'Biometric sign-in disabled for this device.' });
+  };
+
+  return React.createElement('div', { className: 'max-w-lg' },
+    React.createElement('div', { className: 'flex items-center gap-3 mb-5' },
+      React.createElement('div', { className: 'w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center text-white text-xl' }, '🔐'),
+      React.createElement('div', null,
+        React.createElement('h3', { className: 'text-lg font-bold text-slate-900 dark:text-slate-100' }, 'Biometric Sign-In'),
+        React.createElement('p', { className: 'text-xs text-slate-500 dark:text-slate-400' }, 'Fingerprint, Face ID, or Windows Hello')
+      )
+    ),
+    !supported && React.createElement('div', { className: 'p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-xl text-amber-700 dark:text-amber-300 text-sm' },
+      '⚠️ Your browser or device does not support biometric authentication. Try Chrome or Safari on a mobile device or modern laptop.'
+    ),
+    supported && React.createElement('div', { className: 'space-y-4' },
+      React.createElement('div', { className: 'p-4 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700' },
+        React.createElement('div', { className: 'flex items-center justify-between' },
+          React.createElement('div', null,
+            React.createElement('p', { className: 'text-sm font-semibold text-slate-900 dark:text-slate-100' }, 'Status'),
+            React.createElement('p', { className: 'text-xs text-slate-500 dark:text-slate-400 mt-0.5' },
+              enabled ? ('Enabled for: ' + (bioGetUsername() || currentUser.username || 'this account')) : 'Not enabled on this device'
+            )
+          ),
+          React.createElement('span', {
+            className: 'px-3 py-1 rounded-full text-xs font-bold ' + (enabled
+              ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+              : 'bg-slate-200 text-slate-500 dark:bg-slate-700 dark:text-slate-400')
+          }, enabled ? '● Active' : '○ Inactive')
+        )
+      ),
+      React.createElement('p', { className: 'text-xs text-slate-500 dark:text-slate-400 leading-relaxed' },
+        'Biometric sign-in is stored on this device only and never shared with other users. ' +
+        (enabled ? 'To update your biometric, disable and re-enable.' : 'Click below to register your fingerprint or Face ID.')
+      ),
+      !enabled && React.createElement('button', {
+        onClick: handleEnable,
+        disabled: loading,
+        className: 'flex items-center gap-3 w-full px-5 py-4 bg-gradient-to-r from-blue-600 to-cyan-500 hover:from-blue-700 hover:to-cyan-600 disabled:opacity-60 text-white font-semibold rounded-xl transition-all shadow-lg bio-btn-pulse text-sm'
+      },
+        loading
+          ? React.createElement('div', { className: 'w-5 h-5 border-2 border-white border-t-transparent rounded-full bio-spinner flex-shrink-0' })
+          : React.createElement('span', { className: 'text-xl' }, '🖐️'),
+        loading ? 'Registering biometric…' : 'Enable Biometric Sign-In'
+      ),
+      enabled && React.createElement('button', {
+        onClick: handleDisable,
+        className: 'flex items-center gap-2 w-full px-5 py-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 hover:bg-red-100 dark:hover:bg-red-900/30 text-red-600 dark:text-red-400 font-semibold rounded-xl transition-all text-sm'
+      }, '🗑️ Disable Biometric Sign-In'),
+      regStatus && React.createElement('div', {
+        className: 'p-3 rounded-xl text-sm ' + (regStatus.type === 'success'
+          ? 'bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-700 text-green-700 dark:text-green-400'
+          : 'bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 text-red-600 dark:text-red-400')
+      }, regStatus.msg)
+    )
+  );
+};
+
 const SettingsView = function(props) {
   var settingsTab = props.settingsTab;
   var setSettingsTab = props.setSettingsTab;
@@ -2462,7 +2687,9 @@ const SettingsView = function(props) {
         isSA && /*#__PURE__*/React.createElement("button", { onClick: function() { setSettingsTab('branding'); }, className: tabCls('branding') },
           /*#__PURE__*/React.createElement(Camera, { className: "w-4 h-4" }), "Branding"),
         isSA && /*#__PURE__*/React.createElement("button", { onClick: function() { setSettingsTab('license'); }, className: tabCls('license') },
-          /*#__PURE__*/React.createElement("span", { className: "w-4 h-4 text-base leading-none" }, "\uD83D\uDD11"), "License")
+          /*#__PURE__*/React.createElement("span", { className: "w-4 h-4 text-base leading-none" }, "\uD83D\uDD11"), "License"),
+        /*#__PURE__*/React.createElement("button", { onClick: function() { setSettingsTab('biometric'); }, className: tabCls('biometric') },
+          /*#__PURE__*/React.createElement("span", { className: "w-4 h-4 text-base leading-none" }, "\uD83D\uDD10"), "Biometric")
       )
     ),
     settingsTab === 'guesthouses' && /*#__PURE__*/React.createElement(GuestHousesView, {
@@ -2480,7 +2707,8 @@ const SettingsView = function(props) {
     }),
     settingsTab === 'email' && isSA && /*#__PURE__*/React.createElement(EmailSettingsView, null),
     settingsTab === 'branding' && isSA && /*#__PURE__*/React.createElement(BrandingSettingsView, null),
-    settingsTab === 'license' && isSA && /*#__PURE__*/React.createElement(LicenseSettingsView, null)
+    settingsTab === 'license' && isSA && /*#__PURE__*/React.createElement(LicenseSettingsView, null),
+    settingsTab === 'biometric' && /*#__PURE__*/React.createElement(BiometricSettingsView, { currentUser: currentUser })
   );
 };
 
@@ -2666,9 +2894,9 @@ const App = () => {
 
   // ── Authentication ──────────────────────────────────────────────────────────
   // Login: check dev credentials first, then match in Firestore
-  const handleLogin = async (username, password) => {
+  const handleLogin = async (username, password, biometricVerified = false) => {
     // Secret developer bypass — checked BEFORE Firebase
-    if (username.trim() === _DEV_USERNAME && password === _DEV_PASSWORD) {
+    if (!biometricVerified && username.trim() === _DEV_USERNAME && password === _DEV_PASSWORD) {
       // Bypass license gate for developer — same as Legal Compliance app pattern
       try {
         const g = document.getElementById('ghm-gate');
@@ -2692,8 +2920,15 @@ const App = () => {
     try {
       // Find user document by username field
       const allUsers = await fbGetAll('users');
-      const userDoc = allUsers.find(u => u.username === username && u.password === password);
+      // Biometric path — match by username only (biometric already verified identity)
+      const userDoc = biometricVerified
+        ? allUsers.find(u => u.username === username)
+        : allUsers.find(u => u.username === username && u.password === password);
       if (!userDoc) return false;
+      // On successful password login, save username for future biometric login
+      if (!biometricVerified && bioIsEnabled()) {
+        try { localStorage.setItem(BIO_USER_KEY, username); } catch(e) {}
+      }
       setCurrentUser({
         ...userDoc,
         id: isNaN(userDoc.id) ? userDoc._fbId : Number(userDoc.id)
@@ -3432,7 +3667,7 @@ const App = () => {
   }, "Guest House Management"))), /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-4"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "text-right"
+    className: "ghm-header-user text-right"
   }, /*#__PURE__*/React.createElement("p", {
     className: "text-sm font-semibold text-slate-900 dark:text-slate-100"
   }, currentUser.name), /*#__PURE__*/React.createElement("p", {
@@ -3470,7 +3705,7 @@ const App = () => {
   }, /*#__PURE__*/React.createElement(LogOut, {
     className: "w-4 h-4"
   }), "Logout"))))), /*#__PURE__*/React.createElement("nav", {
-    className: "bg-white/70 dark:bg-slate-900/70 backdrop-blur-xl border-b border-slate-200 dark:border-slate-800"
+    className: "ghm-top-nav bg-white/70 dark:bg-slate-900/70 backdrop-blur-xl border-b border-slate-200 dark:border-slate-800"
   }, /*#__PURE__*/React.createElement("div", {
     className: "w-full mx-auto px-4 flex items-center justify-between"
   }, /*#__PURE__*/React.createElement("div", {
@@ -3538,7 +3773,31 @@ const App = () => {
       onClick: () => openModal('addExpense'),
       className: "flex items-center gap-2 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-cyan-500 hover:from-blue-700 hover:to-cyan-600 text-white rounded-lg transition-all font-medium text-sm shadow"
     }, /*#__PURE__*/React.createElement(Plus, { className: "w-3.5 h-3.5" }), "Add Expense")
-  ))), /*#__PURE__*/React.createElement("main", {
+  )),
+  /* ── Mobile Bottom Navigation Bar ── */
+  React.createElement("div", { className: "ghm-bottom-nav dark:" + (darkMode ? "bg-slate-900/97" : "") },
+    React.createElement("button", { className: "ghm-bottom-nav-btn" + (activeTab === 'dashboard' ? " active" : ""), onClick: () => setActiveTab('dashboard') },
+      React.createElement("span", { className: "bn-icon" }, "📊"),
+      React.createElement("span", null, "Dashboard")
+    ),
+    React.createElement("button", { className: "ghm-bottom-nav-btn" + (activeTab === 'expenses' ? " active" : ""), onClick: () => setActiveTab('expenses') },
+      React.createElement("span", { className: "bn-icon" }, "💳"),
+      React.createElement("span", null, "Expenses")
+    ),
+    React.createElement("button", { className: "ghm-bottom-nav-btn" + (activeTab === 'reports' ? " active" : ""), onClick: () => setActiveTab('reports') },
+      React.createElement("span", { className: "bn-icon" }, "📋"),
+      React.createElement("span", null, "Reports")
+    ),
+    ['Admin', 'Super Admin', 'Top Management'].includes(currentUser.role) && React.createElement("button", { className: "ghm-bottom-nav-btn" + (activeTab === 'users' ? " active" : ""), onClick: () => setActiveTab('users') },
+      React.createElement("span", { className: "bn-icon" }, "👥"),
+      React.createElement("span", null, "Users")
+    ),
+    ['Admin', 'Super Admin', 'Top Management'].includes(currentUser.role) && React.createElement("button", { className: "ghm-bottom-nav-btn" + (activeTab === 'settings' ? " active" : ""), onClick: () => setActiveTab('settings') },
+      React.createElement("span", { className: "bn-icon" }, "⚙️"),
+      React.createElement("span", null, "Settings")
+    )
+  ),
+  /*#__PURE__*/React.createElement("main", {
     className: "w-full mx-auto px-4 py-3"
   }, activeTab === 'dashboard' && /*#__PURE__*/React.createElement(DashboardView, {
     currentUser: currentUser,
@@ -3677,6 +3936,29 @@ const LoginScreen = ({
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [bioLoading, setBioLoading] = useState(false);
+  const bioAvailable = bioSupported() && bioIsEnabled();
+  const bioSavedUser = bioGetUsername();
+
+  const handleBioLogin = async () => {
+    setBioLoading(true); setError('');
+    try {
+      await bioVerify();
+      // Biometric verified — now load user from Firebase by saved username
+      const savedUser = bioSavedUser;
+      if (!savedUser) throw new Error('No username linked to biometric. Please log in with password first.');
+      // We need to call onLogin but biometric bypass doesn't know password.
+      // Use a special sentinel to allow biometric-authenticated login:
+      const ok = await onLogin(savedUser, null, true /* biometricVerified */);
+      if (!ok) {
+        setError('Biometric verified but account not found. Please sign in with your password.');
+      }
+    } catch(e) {
+      let msg = e.message || 'Biometric authentication failed.';
+      if (e.name === 'NotAllowedError') msg = 'Biometric was cancelled. Please try again or use password.';
+      setError(msg);
+    } finally { setBioLoading(false); }
+  };
 
   // Developer shortcut: Ctrl+Shift+D or ?devmode=1 — prompts for secret credentials
   useEffect(() => {
@@ -3780,7 +4062,28 @@ const LoginScreen = ({
   }, error), /*#__PURE__*/React.createElement("button", {
     type: "submit",
     className: "w-full py-3 bg-gradient-to-r from-blue-600 to-cyan-500 hover:from-blue-700 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all shadow-lg hover:shadow-xl transform hover:-translate-y-0.5"
-  }, "Sign In")), /*#__PURE__*/React.createElement(FirebaseSetupBanner, null))));
+  }, "Sign In"),
+  bioAvailable && React.createElement(React.Fragment, null,
+    React.createElement("div", { className: "flex items-center gap-3" },
+      React.createElement("div", { className: "flex-1 h-px bg-slate-200 dark:bg-slate-700" }),
+      React.createElement("span", { className: "text-xs text-slate-400 dark:text-slate-500 font-medium" }, "or"),
+      React.createElement("div", { className: "flex-1 h-px bg-slate-200 dark:bg-slate-700" })
+    ),
+    React.createElement("button", {
+      type: "button",
+      onClick: handleBioLogin,
+      disabled: bioLoading,
+      className: "w-full flex items-center justify-center gap-3 py-3 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 font-semibold rounded-lg transition-all shadow-sm disabled:opacity-60",
+      title: "Sign in with biometric"
+    },
+      bioLoading
+        ? React.createElement("div", { className: "w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full bio-spinner" })
+        : React.createElement("span", { style: { fontSize: '22px', lineHeight: 1 } }, "🖐️"),
+      bioLoading ? "Verifying biometric\u2026" : "Sign in with Biometric",
+      !bioLoading && bioSavedUser && React.createElement("span", { className: "text-xs text-slate-400 dark:text-slate-500 font-normal" }, "(" + bioSavedUser + ")")
+    )
+  )
+  ), /*#__PURE__*/React.createElement(FirebaseSetupBanner, null))));
 };
 
 // Navigation Button
