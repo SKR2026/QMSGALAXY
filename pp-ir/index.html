@@ -705,6 +705,7 @@ const _DEFAULTS = {
     emailDomain: '',
     reminderHours: 24,
     escalationEmail: '',
+    hrEmail: '',
     smtpConfigured: false,
     gmailWebAppUrl: '',
     gmailSecret: '',
@@ -773,6 +774,7 @@ if(!DB.settings.reminderHours) DB.settings.reminderHours = 24;
 if(!DB.settings.gmailWebAppUrl) DB.settings.gmailWebAppUrl = '';
 if(!DB.settings.gmailSecret)   DB.settings.gmailSecret   = '';
 if(DB.settings.emailEnabled===undefined) DB.settings.emailEnabled = false;
+if(!DB.settings.hrEmail) DB.settings.hrEmail = '';
 if(!DB.escalationRules)   DB.escalationRules = _DEFAULTS.escalationRules;
 if(!DB.reminderRules)     DB.reminderRules   = _DEFAULTS.reminderRules;
 if(!DB.auditLog)          DB.auditLog        = [];
@@ -3993,6 +3995,69 @@ async function notifyIncidentCreated(incident){
   saveDB();
   auditLog('Notification Sent', `New incident ${incident.incidentNo} → ${recipients.length} recipients`);
   dispatchAllEmails(buildEmailList(incident, recipients));
+
+  // ── HR Auto-Intimation: send for every Major or Minor accident ──
+  const hrCats = ['major','minor'];
+  if(hrCats.includes(incident.accidentCategory)){
+    const hrEmails = (DB.settings.hrEmail||'').split(',').map(e=>e.trim()).filter(Boolean);
+    if(hrEmails.length){
+      const catLabel = incident.accidentCategory==='major' ? 'MAJOR' : 'MINOR';
+      const hrSubject = `[IncidentPro] ${catLabel} Accident Intimation — ${incident.incidentNo}`;
+      const company  = DB.settings.companyName || 'Your Company';
+      const plant    = plantName(incident.plantId);
+      const logoHtml = DB.settings.logoUrl
+        ? `<img src="${DB.settings.logoUrl}" style="max-height:40px;object-fit:contain;margin-bottom:10px;">`
+        : '';
+      const accentColor = incident.accidentCategory==='major' ? '#c0291a' : '#c07a10';
+      const hrBody = `
+        <div style="font-family:Inter,sans-serif;max-width:600px;margin:0 auto;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden">
+          <div style="background:#0d1f33;padding:20px 24px;border-bottom:3px solid ${accentColor}">
+            ${logoHtml}
+            <div style="font-size:17px;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px">
+              ⚠ HR Intimation — ${catLabel} Accident
+            </div>
+            <div style="font-size:12px;color:#90c0e0;margin-top:4px">${xe(plant)} · ${xe(company)}</div>
+          </div>
+          <div style="background:#fff;padding:22px 24px">
+            <p style="font-size:14px;color:#0d1f33;margin-bottom:16px">
+              This is an automatic intimation. A <strong style="color:${accentColor}">${catLabel}</strong> accident has been reported and requires your attention.
+            </p>
+            <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:18px">
+              <tbody>
+                ${[
+                  ['Incident No.',   incident.incidentNo],
+                  ['Title',          incident.title],
+                  ['Plant',          plant],
+                  ['Department',     incident.department||'—'],
+                  ['Accident Category', catLabel],
+                  ['Severity',       (incident.severity||'').toUpperCase()],
+                  ['Reported By',    incident.reportedBy||'—'],
+                  ['Location',       incident.location||'—'],
+                  ['Date & Time',    incident.incidentDt ? new Date(incident.incidentDt).toLocaleString('en-IN') : new Date(incident.createdAt).toLocaleString('en-IN')],
+                  ['Immediate Action', incident.immediateAction||'—'],
+                ].map(([k,v],i)=>`
+                  <tr style="background:${i%2===0?'#f8fafc':'#fff'}">
+                    <td style="padding:8px 12px;font-weight:600;color:#3a5472;white-space:nowrap;width:36%">${k}</td>
+                    <td style="padding:8px 12px;color:#0d1f33">${xe(v)}</td>
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+            <a href="${DB.settings.appUrl||window.location.href}" style="display:inline-block;background:${accentColor};color:#fff;padding:10px 22px;border-radius:7px;font-size:13px;font-weight:600;text-decoration:none;margin-bottom:18px">
+              Open IncidentPro →
+            </a>
+            <p style="font-size:11px;color:#94a3b8;margin-top:12px;padding-top:10px;border-top:1px solid #e2e8f0">
+              ${xe(company)} · IncidentPro · ${new Date().toLocaleString('en-IN')} · This is an automated intimation.
+            </p>
+          </div>
+        </div>`;
+
+      hrEmails.forEach(email=>{
+        sendGmailViaAppsScript(email, 'HR Team', hrSubject, hrBody);
+      });
+      auditLog('HR Intimation Sent', `${catLabel} accident ${incident.incidentNo} → HR: ${hrEmails.join(', ')}`);
+      showToast(`👥 HR intimation sent (${catLabel} accident)`, 'info');
+    }
+  }
 }
 
 // HOD assigned → HOD gets magic-link email (no login needed)
@@ -5264,6 +5329,11 @@ function renderSettings(){
         <div class="fg"><label>Reminder Interval (hours)</label>
           <input type="number" id="s-rem-hrs" value="${s.reminderHours||24}" min="1">
         </div>
+        <div class="fg">
+          <label>👥 HR Intimation Email(s) <span style="font-weight:400;color:var(--t3)">— auto-notified on every Major / Minor accident</span></label>
+          <input id="s-hr-email" value="${xe(s.hrEmail||'')}" placeholder="hr@company.com, hrbp@company.com">
+          <small style="color:var(--t3)">Comma-separated. HR receives an automatic email whenever a Major or Minor accident is reported.</small>
+        </div>
         <button class="btn bp bs" onclick="saveNotifSettings()">Save</button>
       </div>
 
@@ -5352,6 +5422,7 @@ function saveBioSettings(){
 function saveNotifSettings(){
   DB.settings.escalationEmail = document.getElementById('s-esc-email').value.trim();
   DB.settings.reminderHours   = parseInt(document.getElementById('s-rem-hrs').value)||24;
+  DB.settings.hrEmail         = document.getElementById('s-hr-email').value.trim();
   saveDB(); showToast('Notification settings saved.','ok');
 }
 
