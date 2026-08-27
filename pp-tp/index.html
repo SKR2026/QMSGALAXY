@@ -2615,6 +2615,8 @@ function _updateMyTasksCard(allTasks){
   if(_isSA && saEm && !_memberViewActive){
     const assignedToMe = tasks.filter(t=>(t.assignee||'').toLowerCase()===saEm);
     const assignedByMe = tasks.filter(t=>{
+      const assignee=(t.assignee||'').toLowerCase().trim();
+      if(assignee===saEm) return false; // self-assigned, already in assignedToMe
       const ab=(t.assignedBy||'').toLowerCase().trim();
       return ab===saEm||ab==='superadmin';
     });
@@ -3152,10 +3154,11 @@ function _renderDashCharts(_dashTasksRaw){
   }
 
   // ── Dept-wise Analytics (stat cards + charts) ────────────────────
-  // Use _dashTasks for BOTH the dept list AND counts so that:
-  //   - Only depts that have tasks in the current view appear
-  //   - Counts match exactly what the task list shows when clicked
-  _renderDeptSection('ch-dept', _dashTasks, 'goToTasksByDept', 'dept-analytics-row', 'dept-stat-cards-wrap', _dashTasks);
+  // Dept cards show tasks assigned BY superadmin to others (_chartTasks).
+  // This matches the user requirement: "exclude team member tasks in that dept".
+  // _chartTaskIds is stored so clicking a dept card navigates to the SAME tasks.
+  window._lastChartTaskIds = new Set(_chartTasks.map(t=>t.id));
+  _renderDeptSection('ch-dept', _chartTasks, 'goToTasksByDept', 'dept-analytics-row', 'dept-stat-cards-wrap', _chartTasks);
 
   // team table
   const byPerson=[...new Set(_dashTasks.map(t=>t.assignee))].map(e=>({email:e,total:_dashTasks.filter(t=>t.assignee===e).length,done:_dashTasks.filter(t=>t.assignee===e&&t.status==='Done').length}));
@@ -3401,6 +3404,8 @@ function _rebuildDashStats(){
         const _rSaEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
         const _rAssignedTo=tasks.filter(t=>(t.assignee||'').toLowerCase()===_rSaEm).length;
         const _rAssignedBy=tasks.filter(t=>{
+          const ae=(t.assignee||'').toLowerCase().trim();
+          if(ae===_rSaEm) return false; // self-assigned, already counted
           const ab=(t.assignedBy||'').toLowerCase().trim();
           return ab===_rSaEm||ab==='superadmin';
         }).length;
@@ -3431,7 +3436,20 @@ function _rebuildDashStats(){
   // Re-render all charts and tables with the filtered dataset
   // Also store scoped IDs for dept drill-down (goToTasksByDept)
   const _rbDDSeen = new Set();
-  window._lastDashTaskIds = new Set(filtered.filter(t=>{ if(_rbDDSeen.has(t.id)) return false; _rbDDSeen.add(t.id); return true; }).map(t=>t.id));
+  const _rbDeduped = filtered.filter(t=>{ if(_rbDDSeen.has(t.id)) return false; _rbDDSeen.add(t.id); return true; });
+  window._lastDashTaskIds = new Set(_rbDeduped.map(t=>t.id));
+  // Also update _lastChartTaskIds for dept nav consistency
+  if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
+    const _rbSaEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    const _rbChart=_rbDeduped.filter(t=>{
+      const ab=(t.assignedBy||'').toLowerCase().trim();
+      const ae=(t.assignee||'').toLowerCase().trim();
+      return ((_rbSaEm&&ab===_rbSaEm)||ab==='superadmin') && ae!==_rbSaEm;
+    });
+    window._lastChartTaskIds=new Set(_rbChart.map(t=>t.id));
+  } else {
+    window._lastChartTaskIds=window._lastDashTaskIds;
+  }
   _renderDashCharts(filtered);
 }
 
@@ -3441,8 +3459,22 @@ function renderDashboard(){
   const _rawScoped = getDashScopedTasks();
   const _seenRdb = new Set();
   const scopedTasks = _rawScoped.filter(t => { if(_seenRdb.has(t.id)) return false; _seenRdb.add(t.id); return true; });
-  // Set _lastDashTaskIds synchronously so dept cards work immediately on click
+  // Set _lastDashTaskIds synchronously so dept/stat cards work immediately on click
   window._lastDashTaskIds = new Set(scopedTasks.map(t=>t.id));
+  // _lastChartTaskIds will be set by _renderDashCharts (async) — pre-populate with
+  // superadmin-assigned-out subset so dept cards work even before charts render
+  if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
+    const _saPreEmail=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    const _preChart=scopedTasks.filter(t=>{
+      const ab=(t.assignedBy||'').toLowerCase().trim();
+      const ae=(t.assignee||'').toLowerCase().trim();
+      const bySA=(_saPreEmail && ab===_saPreEmail)||ab==='superadmin';
+      return bySA && ae!==_saPreEmail;
+    });
+    window._lastChartTaskIds = new Set(_preChart.map(t=>t.id));
+  } else {
+    window._lastChartTaskIds = window._lastDashTaskIds;
+  }
   const total=scopedTasks.length;
   const done=scopedTasks.filter(t=>t.status==='Done').length;
   const inprog=scopedTasks.filter(t=>t.status==='In Progress').length;
@@ -3494,15 +3526,18 @@ function renderDashboard(){
             return teamEmails.has(ab)||ab==='superadmin'||(_saEmailInline&&ab===_saEmailInline&&!currentSession);
           }).length;
         }
-        // My Tasks = assigned TO me + assigned BY me (e.g. 129 + 82 = 211, may overlap)
+        // My Tasks = 129 (assigned TO me) + 82 (assigned BY me to OTHERS) = 211
+        // "by me to others" excludes self-assigned tasks (already counted in "to me")
         const saEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
         if(adminAuthenticated && !currentSession && saEm){
           const assignedToMe=tasks.filter(t=>(t.assignee||'').toLowerCase()===saEm).length;
-          const assignedByMe=tasks.filter(t=>{
+          const assignedByMeToOthers=tasks.filter(t=>{
+            const assignee=(t.assignee||'').toLowerCase().trim();
+            if(assignee===saEm) return false; // self-assigned — already in "to me"
             const ab=(t.assignedBy||'').toLowerCase().trim();
             return ab===saEm||ab==='superadmin';
           }).length;
-          return assignedToMe + assignedByMe; // 129 + 82 = 211
+          return assignedToMe + assignedByMeToOthers; // e.g. 129 + 82 = 211
         }
         return scopedTasks.filter(t=>(t.assignee||'').toLowerCase()===me).length;
       })()}</div>
@@ -8065,18 +8100,14 @@ function getDashScopedTasks(forceMine){
 
   if(myEmail || saEmail){
     const assignedToMe = tasks.filter(t => selfEmails.has((t.assignee||'').toLowerCase().trim()));
-    const assignedByMe = tasks.filter(t => {
+    const assignedByMeToOthers = tasks.filter(t => {
+      const assignee = (t.assignee||'').toLowerCase().trim();
+      if(selfEmails.has(assignee)) return false; // self-assigned, in assignedToMe
       const ab = (t.assignedBy||'').toLowerCase().trim();
       return selfEmails.has(ab) || (_isSuperAdmin && ab === 'superadmin');
     });
-    // Return union (with duplicates) — renderDashboard dedupes for Total Tasks card
-    // My Tasks stat card reads BOTH counts separately to show 129+82=211
-    const combined = [...assignedToMe];
-    const seenIds = new Set(assignedToMe.map(t=>t.id));
-    assignedByMe.forEach(t => { if(!seenIds.has(t.id)){ seenIds.add(t.id); combined.push(t); } });
-    // Attach metadata for My Tasks card to read
-    combined._assignedToMeCount = assignedToMe.length;
-    combined._assignedByMeCount = assignedByMe.length;
+    // Union (deduped) — total unique tasks for Total Tasks card = 175
+    const combined = [...assignedToMe, ...assignedByMeToOthers];
     return combined;
   }
   return getScopedTasks();
@@ -15067,10 +15098,11 @@ function goToPlantTasksByDept(dept){
 
 // ── Navigate: dept card/chart in Plant Panel (superadmin view) → All Tasks ──
 function goToTasksByDept(dept){
-  // Use the same task scope as the current dashboard view (_dashTasks)
-  // so the count in the task list matches what the dept card shows.
-  // _lastDashTasks is set by _renderDashCharts each time charts are drawn.
-  const scopeIds = window._lastDashTaskIds instanceof Set ? window._lastDashTaskIds : null;
+  // Use _lastChartTaskIds (tasks assigned BY superadmin to others) so task list
+  // count exactly matches the dept stat card count.
+  const scopeIds = (window._lastChartTaskIds instanceof Set && window._lastChartTaskIds.size)
+    ? window._lastChartTaskIds
+    : (window._lastDashTaskIds instanceof Set ? window._lastDashTaskIds : null);
   taskFilters = {status:'All', priority:'All', search:'', overdue:false, _dept: dept,
     ...(scopeIds ? {_ids: scopeIds} : {})};
   currentPanel = 'tasks';
