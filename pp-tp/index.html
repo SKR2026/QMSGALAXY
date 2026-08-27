@@ -2613,18 +2613,10 @@ function _updateMyTasksCard(allTasks){
   const saEm = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
   const _isSA = adminAuthenticated && !currentSession && !plantOwnerAuthenticated;
   if(_isSA && saEm && !_memberViewActive){
-    const assignedToMe = tasks.filter(t=>(t.assignee||'').toLowerCase()===saEm);
-    const assignedByMe = tasks.filter(t=>{
-      const assignee=(t.assignee||'').toLowerCase().trim();
-      if(assignee===saEm) return false; // self-assigned, already in assignedToMe
-      const ab=(t.assignedBy||'').toLowerCase().trim();
-      return ab===saEm||ab==='superadmin';
-    });
-    const total = assignedToMe.length + assignedByMe.length; // 129 + 82 = 211
-    // For open/overdue: use deduped union
-    const allMineIds = new Set(assignedToMe.map(t=>t.id));
-    assignedByMe.forEach(t=>allMineIds.add(t.id));
-    const allMine = tasks.filter(t=>allMineIds.has(t.id));
+    // Use getDashScopedTasks() to get the exact same task set as the dashboard shows
+    const _myScoped = getDashScopedTasks();
+    const allMine = _myScoped;
+    const total = allMine.length;
     const myOpen  = allMine.filter(t=>t.status!=='Done').length;
     const myOver  = allMine.filter(t=>isOverdue(t)).length;
     valEl.textContent = total;
@@ -3402,14 +3394,8 @@ function _rebuildDashStats(){
       if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated && !_memberViewActive && _rebuildMe){
         // Superadmin: My Tasks = assigned TO me + assigned BY me (211 = 129+82, may overlap)
         const _rSaEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-        const _rAssignedTo=tasks.filter(t=>(t.assignee||'').toLowerCase()===_rSaEm).length;
-        const _rAssignedBy=tasks.filter(t=>{
-          const ae=(t.assignee||'').toLowerCase().trim();
-          if(ae===_rSaEm) return false; // self-assigned, already counted
-          const ab=(t.assignedBy||'').toLowerCase().trim();
-          return ab===_rSaEm||ab==='superadmin';
-        }).length;
-        cards[1].querySelector('.stat-value').textContent = _rAssignedTo + _rAssignedBy; // 129+82=211
+        // My Tasks = filtered.length (scopedTasks year/month filtered = same as Total Tasks)
+        cards[1].querySelector('.stat-value').textContent = filtered.length;
       } else {
         cards[1].querySelector('.stat-value').textContent = filtered.filter(t=>{
           if(plantOwnerAuthenticated&&currentPlantSession&&!_memberViewActive){
@@ -3530,14 +3516,9 @@ function renderDashboard(){
         // "by me to others" excludes self-assigned tasks (already counted in "to me")
         const saEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
         if(adminAuthenticated && !currentSession && saEm){
-          const assignedToMe=tasks.filter(t=>(t.assignee||'').toLowerCase()===saEm).length;
-          const assignedByMeToOthers=tasks.filter(t=>{
-            const assignee=(t.assignee||'').toLowerCase().trim();
-            if(assignee===saEm) return false; // self-assigned — already in "to me"
-            const ab=(t.assignedBy||'').toLowerCase().trim();
-            return ab===saEm||ab==='superadmin';
-          }).length;
-          return assignedToMe + assignedByMeToOthers; // e.g. 129 + 82 = 211
+          // My Tasks = scopedTasks.length (getDashScopedTasks already returns
+          // the exact union of assignedToMe + assignedByMeToOthers, deduped)
+          return scopedTasks.length;
         }
         return scopedTasks.filter(t=>(t.assignee||'').toLowerCase()===me).length;
       })()}</div>
@@ -4373,6 +4354,14 @@ function selectAllAssignedBy(){
   const allChk=cbs.length>0&&[...cbs].every(cb=>cb.checked);
   cbs.forEach(cb=>{ cb.checked=!allChk; if(!allChk) _myAssignedBySelected.add(cb.dataset.id); else _myAssignedBySelected.delete(cb.dataset.id); });
   _updateAssignedByBulkBar();
+  // Update the "N assigned to others" label to show selection count
+  const lbl=document.querySelector('#mytasks-assignedby-section [style*="assigned to others"]');
+  if(lbl){
+    if(!allChk && _myAssignedBySelected.size>0)
+      lbl.textContent=_myAssignedBySelected.size+' selected of '+cbs.length+' tasks';
+    else
+      lbl.textContent=cbs.length+' assigned to others';
+  }
 }
 function clearAssignedBySelection(){
   _myAssignedBySelected.clear();
@@ -8102,13 +8091,15 @@ function getDashScopedTasks(forceMine){
     const assignedToMe = tasks.filter(t => selfEmails.has((t.assignee||'').toLowerCase().trim()));
     const assignedByMeToOthers = tasks.filter(t => {
       const assignee = (t.assignee||'').toLowerCase().trim();
-      if(selfEmails.has(assignee)) return false; // self-assigned, in assignedToMe
+      if(selfEmails.has(assignee)) return false; // self-assigned, already in assignedToMe
       const ab = (t.assignedBy||'').toLowerCase().trim();
+      // Only explicitly assigned BY me — saEmail OR 'superadmin' flag
+      // Do NOT include ab==='' (tasks from other users with no assignedBy set)
       return selfEmails.has(ab) || (_isSuperAdmin && ab === 'superadmin');
     });
-    // Union (deduped) — total unique tasks for Total Tasks card = 175
-    const combined = [...assignedToMe, ...assignedByMeToOthers];
-    return combined;
+    // These sets are disjoint (no overlap): assignedToMe has assignee=sa,
+    // assignedByMeToOthers has assignee≠sa. Total = their sum = My Tasks total.
+    return [...assignedToMe, ...assignedByMeToOthers];
   }
   return getScopedTasks();
 }
@@ -13046,10 +13037,12 @@ function renderMyTasks(){
   // Also include tasks where assignedBy='superadmin' when logged in as superadmin
   const _isSA = adminAuthenticated && !currentSession;
   const assignedByMeT = tasks.filter(t => {
-    const ab = (t.assignedBy||'').toLowerCase();
-    const ae = (t.assignee||'').toLowerCase();
-    const matchesMe = ab === selfEmail.toLowerCase() || (_isSA && (ab === 'superadmin' || ab === ''));
-    return matchesMe && ae !== selfEmail.toLowerCase();
+    const ab = (t.assignedBy||'').toLowerCase().trim();
+    const ae = (t.assignee||'').toLowerCase().trim();
+    if(ae === selfEmail.toLowerCase()) return false; // self-assigned — shown in Me tab
+    // Only tasks explicitly assigned BY me: saEmail or 'superadmin' flag
+    // Do NOT include ab==='' (tasks from other users with no assignedBy stored)
+    return ab === selfEmail.toLowerCase() || (_isSA && ab === 'superadmin');
   }).filter(t=>{
     if(dashYearFilter!=='All' && (!t.due||t.due.slice(0,4)!==dashYearFilter)) return false;
     if(dashMonthFilter!=='All' && (!t.due||t.due.slice(5,7)!==dashMonthFilter)) return false;
