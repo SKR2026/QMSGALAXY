@@ -2609,20 +2609,20 @@ function _updateMyTasksCard(allTasks){
     return;
   }
 
-  // Mine mode: My Tasks = assigned TO me + assigned BY me to others (211 = 129 + 82)
+  // Mine mode: My Tasks = assigned TO me + assigned BY me (211 = 129+82, may overlap)
   const saEm = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
   const _isSA = adminAuthenticated && !currentSession && !plantOwnerAuthenticated;
   if(_isSA && saEm && !_memberViewActive){
-    // Use full tasks[] to count (not filtered by year/month for the stat number)
-    const assignedToMe  = tasks.filter(t=>(t.assignee||'').toLowerCase()===saEm);
-    const assignedByMe  = tasks.filter(t=>{
-      const ae=(t.assignee||'').toLowerCase().trim();
-      if(ae===saEm) return false;
+    const assignedToMe = tasks.filter(t=>(t.assignee||'').toLowerCase()===saEm);
+    const assignedByMe = tasks.filter(t=>{
       const ab=(t.assignedBy||'').toLowerCase().trim();
       return ab===saEm||ab==='superadmin';
     });
-    const total = assignedToMe.length + assignedByMe.length;
-    const allMine = [...assignedToMe, ...assignedByMe];
+    const total = assignedToMe.length + assignedByMe.length; // 129 + 82 = 211
+    // For open/overdue: use deduped union
+    const allMineIds = new Set(assignedToMe.map(t=>t.id));
+    assignedByMe.forEach(t=>allMineIds.add(t.id));
+    const allMine = tasks.filter(t=>allMineIds.has(t.id));
     const myOpen  = allMine.filter(t=>t.status!=='Done').length;
     const myOver  = allMine.filter(t=>isOverdue(t)).length;
     valEl.textContent = total;
@@ -3397,16 +3397,14 @@ function _rebuildDashStats(){
     } else {
       // Mine mode or member viewer: show tasks assigned TO the active person
       if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated && !_memberViewActive && _rebuildMe){
-        // Superadmin: My Tasks = assigned-to-me (from ALL tasks) + assigned-by-me-to-others (from ALL tasks)
+        // Superadmin: My Tasks = assigned TO me + assigned BY me (211 = 129+82, may overlap)
         const _rSaEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
         const _rAssignedTo=tasks.filter(t=>(t.assignee||'').toLowerCase()===_rSaEm).length;
         const _rAssignedBy=tasks.filter(t=>{
-          const ae=(t.assignee||'').toLowerCase().trim();
-          if(ae===_rSaEm) return false;
           const ab=(t.assignedBy||'').toLowerCase().trim();
           return ab===_rSaEm||ab==='superadmin';
         }).length;
-        cards[1].querySelector('.stat-value').textContent = _rAssignedTo + _rAssignedBy;
+        cards[1].querySelector('.stat-value').textContent = _rAssignedTo + _rAssignedBy; // 129+82=211
       } else {
         cards[1].querySelector('.stat-value').textContent = filtered.filter(t=>{
           if(plantOwnerAuthenticated&&currentPlantSession&&!_memberViewActive){
@@ -3443,6 +3441,8 @@ function renderDashboard(){
   const _rawScoped = getDashScopedTasks();
   const _seenRdb = new Set();
   const scopedTasks = _rawScoped.filter(t => { if(_seenRdb.has(t.id)) return false; _seenRdb.add(t.id); return true; });
+  // Set _lastDashTaskIds synchronously so dept cards work immediately on click
+  window._lastDashTaskIds = new Set(scopedTasks.map(t=>t.id));
   const total=scopedTasks.length;
   const done=scopedTasks.filter(t=>t.status==='Done').length;
   const inprog=scopedTasks.filter(t=>t.status==='In Progress').length;
@@ -3494,18 +3494,15 @@ function renderDashboard(){
             return teamEmails.has(ab)||ab==='superadmin'||(_saEmailInline&&ab===_saEmailInline&&!currentSession);
           }).length;
         }
-        // My Tasks = assigned TO me (from all tasks) + assigned BY me to others (from all tasks)
-        // Matches the My Tasks panel total exactly (e.g. 129 + 82 = 211)
+        // My Tasks = assigned TO me + assigned BY me (e.g. 129 + 82 = 211, may overlap)
         const saEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
         if(adminAuthenticated && !currentSession && saEm){
           const assignedToMe=tasks.filter(t=>(t.assignee||'').toLowerCase()===saEm).length;
           const assignedByMe=tasks.filter(t=>{
-            const assignee=(t.assignee||'').toLowerCase().trim();
-            if(assignee===saEm) return false; // already in assignedToMe
             const ab=(t.assignedBy||'').toLowerCase().trim();
             return ab===saEm||ab==='superadmin';
           }).length;
-          return assignedToMe + assignedByMe;
+          return assignedToMe + assignedByMe; // 129 + 82 = 211
         }
         return scopedTasks.filter(t=>(t.assignee||'').toLowerCase()===me).length;
       })()}</div>
@@ -7961,12 +7958,12 @@ function _getAllTeamMemberEmails(){
 }
 
 function getTeamOnlyTasks(){
-  // Team Tasks must EXACTLY mirror the per-plant task definition used by
-  // renderPlantPanel (the source of the plant-wise numbers, e.g. 8+6+7+2+37+32+42+8+4+27=173):
-  //   plantTasks = tasks.filter(t => owners.includes(assignee) || (t.plant && t.plant===plant.id))
-  // Team Tasks = union of every plant's plantTasks, PLUS tasks assigned to
-  // accepted group members (individuals not tied to a specific plant),
-  // MINUS anything assigned to the superadmin.
+  // Team Tasks = EXACT union of every plant's task list (as shown in each plant panel)
+  // renderPlantPanel counts: owners.includes(assignee) || (t.plant && t.plant===plant.id)
+  // Sum of all plants = 173 (user's expected number). No exclusions — even tasks
+  // where a plant owner assigned work to superadmin are counted as "team tasks"
+  // because the plant owner created them.
+  // Group members not tied to a specific plant are also included.
   const saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
   const groups = getPlantGroups();
   const result = [];
@@ -7977,7 +7974,6 @@ function getTeamOnlyTasks(){
     tasks.forEach(t => {
       if(seen.has(t.id)) return;
       const assignee = (t.assignee||'').toLowerCase().trim();
-      if(saEmail && assignee === saEmail) return; // never include superadmin's own tasks
       const matchesOwner = assignee && owners.includes(assignee);
       const matchesPlantTag = t.plant && t.plant === plant.id;
       if(matchesOwner || matchesPlantTag){
@@ -7990,7 +7986,7 @@ function getTeamOnlyTasks(){
   // Also include tasks assigned to accepted group members not covered by any plant
   (_myGroupMemberEmails||[]).forEach(e => {
     const low = (e||'').toLowerCase().trim();
-    if(!low || low === saEmail) return;
+    if(!low) return;
     tasks.forEach(t => {
       if(seen.has(t.id)) return;
       const assignee = (t.assignee||'').toLowerCase().trim();
@@ -8058,27 +8054,30 @@ function getDashScopedTasks(forceMine){
     return _filterByDashPlant(getScopedTasks());
   }
 
-  // ── MINE mode (Sushil chip): tasks assigned TO or BY Sushil ────────────
-  // My Tasks = assigned TO me (129) + assigned BY me to others (82) = 211
-  // These sets are disjoint so no dedup needed.
+  // ── MINE mode (Sushil chip): tasks assigned TO me + tasks assigned BY me ────
+  // My Tasks panel shows: 129 (Me tab) + 82 (By Me tab) = 211
+  // These can overlap (self-assigned tasks counted in both), so we build
+  // two separate arrays and concat — renderDashboard dedupes for Total Tasks.
   const myEmail = _getMyEmail();
   const saEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
   const selfEmails = new Set([myEmail, saEmail].filter(Boolean));
   const _isSuperAdmin = adminAuthenticated && !currentSession;
 
   if(myEmail || saEmail){
-    return tasks.filter(t => {
-      const assignee   = (t.assignee||'').toLowerCase().trim();
-      const assignedBy = (t.assignedBy||'').toLowerCase().trim();
-      // SET A: assigned TO me (by anyone, including self)
-      if(selfEmails.has(assignee)) return true;
-      // SET B: assigned BY me to someone else
-      if(!selfEmails.has(assignee)){
-        if(selfEmails.has(assignedBy)) return true;
-        if(_isSuperAdmin && assignedBy === 'superadmin') return true;
-      }
-      return false;
+    const assignedToMe = tasks.filter(t => selfEmails.has((t.assignee||'').toLowerCase().trim()));
+    const assignedByMe = tasks.filter(t => {
+      const ab = (t.assignedBy||'').toLowerCase().trim();
+      return selfEmails.has(ab) || (_isSuperAdmin && ab === 'superadmin');
     });
+    // Return union (with duplicates) — renderDashboard dedupes for Total Tasks card
+    // My Tasks stat card reads BOTH counts separately to show 129+82=211
+    const combined = [...assignedToMe];
+    const seenIds = new Set(assignedToMe.map(t=>t.id));
+    assignedByMe.forEach(t => { if(!seenIds.has(t.id)){ seenIds.add(t.id); combined.push(t); } });
+    // Attach metadata for My Tasks card to read
+    combined._assignedToMeCount = assignedToMe.length;
+    combined._assignedByMeCount = assignedByMe.length;
+    return combined;
   }
   return getScopedTasks();
 }
