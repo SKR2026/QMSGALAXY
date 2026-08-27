@@ -6342,14 +6342,14 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       { key:'category',           label:'category',             width:20, note:`One of: ${cats.join(', ')}` },
       { key:'priority',           label:'priority',             width:14, note:`One of: ${PRIORITIES.join(', ')}` },
       { key:'status',             label:'status',               width:14, note:`One of: ${STATUSES.join(', ')}` },
-      { key:'plant_id',           label:'plant_id',             width:14, note:'Plant ID from the directory below (e.g. P001). Use this OR state.' },
+      { key:'plant_id',           label:'plant_id',             width:22, note:'Plant ID from the directory below (e.g. P001). For MULTI-PLANT: comma-separate IDs, e.g. P001,P002,P003 — one requirement per plant will be created.' },
       { key:'state',              label:'state',                width:18, note:'State name (e.g. Maharashtra). Used if plant_id is blank.' },
       { key:'due_date',           label:'due_date *',           width:14, note:'Required. Format: YYYY-MM-DD (e.g. 2025-12-31).' },
       { key:'compliance_frequency',label:'compliance_frequency', width:22, note:`One of: ${COMPLIANCE_FREQS.map(f=>f.value).join(', ')} — controls how often the requirement recurs after completion.` },
       { key:'reminder_frequency', label:'reminder_frequency',   width:20, note:`One of: ${REM_FREQS.join(', ')}` },
       { key:'escalation_level',   label:'escalation_level',     width:18, note:'1, 2 or 3.' },
       { key:'escalation_email',   label:'escalation_email',     width:28, note:'Email address for escalation alerts.' },
-      { key:'assigned_email',     label:'assigned_email',        width:28, note:'Email of the user to assign this to (must exist in the system).' },
+      { key:'assigned_email',     label:'assigned_email',        width:36, note:'Email of the user to assign this to. For MULTI-PLANT: comma-separate emails matching plant_id order, e.g. ravi@co.com,suresh@co.com,anand@co.com — if fewer emails than plants, the last email repeats.' },
       { key:'applicable_rule',    label:'applicable_rule',      width:36, note:'Legal reference, e.g. Factories Act 1948 – Section 6.' },
       { key:'legal_clause',       label:'legal_clause',         width:44, note:'Specific clause text or obligation description.' },
     ];
@@ -6387,6 +6387,29 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         sampleClauses[i],
       ]);
     });
+
+    // Row 5: Multi-plant sample (if 2+ plants exist)
+    if (plants.length >= 2) {
+      const mpIds    = plants.slice(0, Math.min(plants.length, 3)).map(p => p.id).join(',');
+      const mpEmails = plants.slice(0, Math.min(plants.length, 3)).map(() => 'responsible@plant.com').join(',');
+      wsData.push([
+        'Annual Environment Compliance Audit',
+        'Conduct mandatory annual environment audit as per EPA. Assign plant-wise responsible person.',
+        cats[0] || 'Environment',
+        'High',
+        'Pending',
+        mpIds,          // e.g.  P001,P002,P003
+        '',             // state not needed when plant_id is given
+        new Date(Date.now() + 90 * 86400000).toISOString().split('T')[0],
+        'annual',
+        'Monthly',
+        1,
+        'ceo@legalcomp.com',
+        mpEmails,       // e.g.  ram@p1.com,shyam@p2.com,hari@p3.com
+        'Environment Protection Act 1986 – Rule 5',
+        'Annual audit mandatory for all manufacturing units.',
+      ]);
+    }
 
     // If no plants loaded yet, add one blank sample row
     if (!plants.length) {
@@ -6465,6 +6488,15 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       ['   e.g. shiksha@polyplasticsindia.com — must match a registered user.', ''],
       ['5. You can upload this .xlsx directly — no need to save as CSV.', ''],
       ['', ''],
+      ['🏭 MULTI-PLANT UPLOAD (same requirement, different responsible persons)', ''],
+      ['   Put comma-separated Plant IDs in plant_id column:', ''],
+      ['   e.g.  P001,P002,P003', ''],
+      ['   Put matching comma-separated emails in assigned_email column:', ''],
+      ['   e.g.  ravi@p1.com,suresh@p2.com,anand@p3.com', ''],
+      ['   The system will create one separate requirement per plant,', ''],
+      ['   each assigned to the corresponding person.', ''],
+      ['   If you supply fewer emails than plants, the last email is reused.', ''],
+      ['', ''],
       ['── PLANT DIRECTORY ──────────────────────────────', ''],
       ['Plant ID', 'Plant Name', 'State'],
       ...plants.map(p => [p.id, p.name, p.state]),
@@ -6488,6 +6520,75 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
     XL.utils.book_append_sheet(wb, wsNotes,'Guide & Directory');
 
     XL.writeFile(wb, 'bulk_requirements_template.xlsx');
+  };
+
+  /* ── Multi-plant row expander (shared by CSV + Excel parsers) ──────────
+     One source row whose plant_id = "P001,P002,P003" and
+     assigned_email = "a@x.com,b@x.com,c@x.com" is exploded into 3 rows,
+     each tied to one plant and one responsible person.
+     If fewer emails are supplied than plants, the last email is reused.
+  ────────────────────────────────────────────────────────────────────── */
+  const expandMultiPlantRow = (obj, li, errs, rows) => {
+    const rawPids    = String(obj.plant_id || '').split(',').map(s => s.trim()).filter(Boolean);
+    const rawEmails  = String(obj.assigned_email || obj.assigned_user_email || obj.assignee_email || obj.assigned_to || '').split(',').map(s => s.trim());
+    const plantIds   = rawPids.length ? rawPids : [''];  // at least one iteration for state-based lookup
+    const isMulti    = plantIds.length > 1;
+
+    const category  = cats.includes(obj.category) ? obj.category : (cats[0] || 'Other');
+    const priority  = PRIORITIES.includes(obj.priority) ? obj.priority : 'Medium';
+    const status    = STATUSES.includes(obj.status) ? obj.status : 'Pending';
+    const escLvl    = [1, 2, 3].includes(+obj.escalation_level) ? +obj.escalation_level : 1;
+    const compFreq  = normalizeFrequency(obj.compliance_frequency);
+    const remFreq   = normalizeReminderFreq(obj.reminder_frequency);
+
+    plantIds.forEach((pid, idx) => {
+      const rowErrs = [];
+      if (!obj.title)    rowErrs.push('title missing');
+      if (!obj.due_date) rowErrs.push('due_date missing');
+
+      // Resolve plant — by ID first, then by state fallback
+      let plant = null;
+      if (pid) plant = plants.find(p => p.id === pid);
+      if (!plant && obj.state) plant = plants.find(p => p.state.toLowerCase() === obj.state.toLowerCase());
+      if (!plant) rowErrs.push(`plant not found (plant_id="${pid || obj.plant_id}", state="${obj.state}")`);
+
+      // Resolve assigned user — pick email at matching index, fall back to last
+      const emailForPlant = (rawEmails[idx] || rawEmails[rawEmails.length - 1] || '').trim();
+      let assignedTo = null, assignedEmailRaw = emailForPlant;
+      if (emailForPlant) {
+        const u = users.find(u => u.email.toLowerCase() === emailForPlant.toLowerCase());
+        if (u) { assignedTo = u.id; assignedEmailRaw = u.email; }
+        // Unknown email — warning only, row stays valid; will import as unassigned
+      }
+
+      if (rowErrs.length) errs.push({ row: li + 2, errs: rowErrs, plantId: pid });
+
+      rows.push({
+        _rowNum:           li + 2,
+        _valid:            rowErrs.length === 0,
+        _plant:            plant,
+        _assignedTo:       assignedTo,
+        _assignedEmailRaw: assignedTo ? '' : assignedEmailRaw,
+        _multiPlant:       isMulti,
+        _multiIdx:         isMulti ? idx : null,
+        _multiTotal:       isMulti ? plantIds.length : null,
+        title:             obj.title,
+        description:       obj.description || '',
+        category,
+        priority,
+        status,
+        plantId:           plant?.id || '',
+        state:             plant?.state || obj.state,
+        dueDate:           obj.due_date,
+        complianceFrequency: compFreq,
+        reminderFrequency: remFreq,
+        escalationLevel:   escLvl,
+        escalationEmail:   obj.escalation_email || '',
+        assignedTo:        assignedTo ? [assignedTo] : [],
+        applicableRule:    obj.applicable_rule || '',
+        legalClause:       obj.legal_clause || '',
+      });
+    });
   };
 
   /* ── Parse CSV text ── */
@@ -6519,59 +6620,9 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         else cur+=ch;
       }
       cols.push(cur.trim());
-
       const obj = {};
       headers.forEach((h,i) => { obj[h] = (cols[i]||'').replace(/^"|"$/g,'').trim(); });
-
-      const rowErrs = [];
-      if (!obj.title)    rowErrs.push('title missing');
-      if (!obj.due_date) rowErrs.push('due_date missing');
-
-      // Resolve plant
-      let plant = null;
-      if (obj.plant_id) plant = plants.find(p=>p.id===obj.plant_id);
-      if (!plant && obj.state) plant = plants.find(p=>p.state.toLowerCase()===obj.state.toLowerCase());
-      if (!plant) rowErrs.push(`plant not found (plant_id="${obj.plant_id}", state="${obj.state}")`);
-
-      // Resolve user
-      let assignedTo = null;
-      const rawEmailCSV = (obj.assigned_email || obj.assigned_user_email || obj.assignee_email || obj.assigned_to || '').trim();
-      let assignedEmailRaw = rawEmailCSV;
-      if (assignedEmailRaw) {
-        const u = users.find(u=>u.email.toLowerCase()===assignedEmailRaw.toLowerCase());
-        if (u) { assignedTo = u.id; assignedEmailRaw = u.email; }
-        // Unknown email is a WARNING only — row stays valid and importable.
-      }
-
-      const category = cats.includes(obj.category) ? obj.category : (cats[0]||'Other');
-      const priority = PRIORITIES.includes(obj.priority) ? obj.priority : 'Medium';
-      const status   = STATUSES.includes(obj.status)     ? obj.status   : 'Pending';
-      const escLvl   = [1,2,3].includes(+obj.escalation_level) ? +obj.escalation_level : 1;
-
-      if (rowErrs.length) errs.push({ row: li+2, errs: rowErrs });
-
-      rows.push({
-        _rowNum: li+2,
-        _valid:  rowErrs.length === 0,
-        _plant:  plant,
-        _assignedTo: assignedTo,
-        title:            obj.title,
-        description:      obj.description || '',
-        category,
-        priority,
-        status,
-        plantId:          plant?.id || '',
-        state:            plant?.state || obj.state,
-        dueDate:          obj.due_date,
-        complianceFrequency: normalizeFrequency(obj.compliance_frequency),
-        reminderFrequency: normalizeReminderFreq(obj.reminder_frequency),
-        escalationLevel:  escLvl,
-        escalationEmail:  obj.escalation_email || '',
-        assignedTo:       assignedTo ? [assignedTo] : [],
-        _assignedEmailRaw: assignedTo ? '' : assignedEmailRaw, // unmatched email for display
-        applicableRule:   obj.applicable_rule || '',
-        legalClause:      obj.legal_clause || '',
-      });
+      expandMultiPlantRow(obj, li, errs, rows);
     });
     return { rows, errs };
   };
@@ -6603,36 +6654,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         const v = rawRow[k];
         obj[norm(k)] = v instanceof Date ? v.toISOString().split('T')[0] : String(v ?? '').trim();
       });
-      const rowErrs = [];
-      if (!obj.title)    rowErrs.push('title missing');
-      if (!obj.due_date) rowErrs.push('due_date missing');
-      let plant = null;
-      if (obj.plant_id) plant = plants.find(p=>p.id===obj.plant_id);
-      if (!plant && obj.state) plant = plants.find(p=>p.state.toLowerCase()===obj.state.toLowerCase());
-      if (!plant) rowErrs.push('plant not found (plant_id="'+obj.plant_id+'", state="'+obj.state+'")');
-      let assignedTo = null;
-      // Fallback: check variant column names in case alias map missed them
-      const rawEmail = (obj.assigned_email || obj.assigned_user_email || obj.assignee_email || obj.assigned_to || '').trim();
-      let assignedEmailRaw = rawEmail;
-      if (assignedEmailRaw) {
-        const u = users.find(u=>u.email.toLowerCase()===assignedEmailRaw.toLowerCase());
-        if (u) { assignedTo = u.id; assignedEmailRaw = u.email; }
-        // Unknown email → warning only, row stays valid
-      }
-      const category = cats.includes(obj.category)?obj.category:(cats[0]||'Other');
-      const priority = PRIORITIES.includes(obj.priority)?obj.priority:'Medium';
-      const status   = STATUSES.includes(obj.status)?obj.status:'Pending';
-      const escLvl   = [1,2,3].includes(+obj.escalation_level)?+obj.escalation_level:1;
-      const compFreq = normalizeFrequency(obj.compliance_frequency);
-      if (rowErrs.length) errs.push({ row:li+2, errs:rowErrs });
-      rows.push({ _rowNum:li+2, _valid:rowErrs.length===0, _plant:plant, _assignedTo:assignedTo,
-        title:obj.title, description:obj.description||'', category, priority, status,
-        plantId:plant?.id||'', state:plant?.state||obj.state, dueDate:obj.due_date,
-        complianceFrequency:compFreq,
-        reminderFrequency:normalizeReminderFreq(obj.reminder_frequency),
-        escalationLevel:escLvl, escalationEmail:obj.escalation_email||'',
-        assignedTo:assignedTo?[assignedTo]:[], _assignedEmailRaw:assignedTo?'':assignedEmailRaw,
-        applicableRule:obj.applicable_rule||'', legalClause:obj.legal_clause||'' });
+      expandMultiPlantRow(obj, li, errs, rows);
     });
     return { rows, errs };
   };
@@ -6743,9 +6765,10 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
     setRawRows([]); setErrors([]); setSelRows(new Set()); setTab('upload');
   };
 
-  const validCount   = rawRows.filter(r=>r._valid).length;
-  const invalidCount = rawRows.length - validCount;
-  const selectedValid= rawRows.filter(r=>selRows.has(r._rowNum) && r._valid).length;
+  const validCount      = rawRows.filter(r=>r._valid).length;
+  const invalidCount    = rawRows.length - validCount;
+  const selectedValid   = rawRows.filter(r=>selRows.has(r._rowNum) && r._valid).length;
+  const multiPlantCount = rawRows.filter(r=>r._multiPlant).length;
 
   return (
     <div className="space-y-5">
@@ -6832,14 +6855,14 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
                     ['category','Enum','No',cats.join(', ')],
                     ['priority','Enum','No','Critical / High / Medium / Low'],
                     ['status','Enum','No','Pending / In Progress / Completed / Overdue'],
-                    ['plant_id','ID','⚡ Or state','Plant ID (e.g. p1, p2…)'],
-                    ['state','Text','⚡ Or plant_id','State name — auto-matches plant'],
+                    ['plant_id','ID / CSV','⚡ Or state','Single plant ID (e.g. P001) OR comma-separated for multi-plant: P001,P002,P003'],
+                    ['state','Text','⚡ Or plant_id','State name — auto-matches plant (single plant only)'],
                     ['due_date','YYYY-MM-DD','✅ Yes','e.g. 2025-09-30'],
                     ['compliance_frequency','Enum','No','monthly / quarterly / half_yearly / annual / one_time — also accepts: Monthly, Quarterly, Half-Yearly, Yearly, Bi-Annual etc.'],
                     ['reminder_frequency','Enum','No','Daily / Weekly / Fortnightly / Monthly — also accepts: daily, bi-weekly etc.'],
                     ['escalation_level','1/2/3','No','1=Plant Head, 2=Regional, 3=Top Mgmt'],
                     ['escalation_email','Email','No','Override escalation email'],
-                    ['assigned_email','Email','No','Must match an existing user email'],
+                    ['assigned_email','Email / CSV','No','Single email OR comma-separated per plant: ram@p1.com,shyam@p2.com — matches plant_id order; last email repeats if fewer'],
                     ['applicable_rule','Text','No','e.g. Factories Act 1948 – Section 6'],
                     ['legal_clause','Text','No','Specific clause or provision mandating compliance'],
                   ].map(([col,type,req,notes])=>(
@@ -6854,7 +6877,9 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
               </table>
             </div>
             <div className={`mt-4 p-3 rounded-xl text-xs ${dk?'bg-blue-900/20 border border-blue-800 text-blue-300':'bg-blue-50 border border-blue-100 text-blue-700'}`}>
-              💡 <strong>Tip:</strong> You can target a plant by <code>plant_id</code> OR by <code>state</code> name — the system will auto-match. One row = one requirement.
+              💡 <strong>Tip:</strong> You can target a plant by <code>plant_id</code> OR by <code>state</code> name — the system will auto-match.<br/>
+              🏭 <strong>Multi-Plant Upload:</strong> Put comma-separated plant IDs in <code>plant_id</code> and matching emails in <code>assigned_email</code>
+              (e.g. <code>P001,P002,P003</code> and <code>ravi@p1.com,suresh@p2.com,anand@p3.com</code>) — one requirement per plant will be created automatically.
             </div>
           </div>
 
@@ -6951,12 +6976,13 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       {tab==='preview' && (
         <div className="space-y-4">
           {/* Summary strip */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
             {[
-              { label:'Total Rows',   value:rawRows.length,   color:'#6366f1', icon:'📄' },
-              { label:'Valid',        value:validCount,        color:'#22c55e', icon:'✅' },
-              { label:'Errors',       value:invalidCount,      color:'#ef4444', icon:'❌' },
-              { label:'Selected',     value:selectedValid,     color:'#f59e0b', icon:'☑️' },
+              { label:'Total Rows',     value:rawRows.length,    color:'#6366f1', icon:'📄' },
+              { label:'Valid',          value:validCount,         color:'#22c55e', icon:'✅' },
+              { label:'Errors',         value:invalidCount,       color:'#ef4444', icon:'❌' },
+              { label:'Multi-Plant',    value:multiPlantCount,    color:'#8b5cf6', icon:'🏭' },
+              { label:'Selected',       value:selectedValid,      color:'#f59e0b', icon:'☑️' },
             ].map(s=>(
               <div key={s.label} className={`${card} p-4 flex items-center gap-3`}>
                 <span className="text-2xl">{s.icon}</span>
@@ -7052,14 +7078,14 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
                         checked={visibleRows.filter(r=>r._valid).length>0 && visibleRows.filter(r=>r._valid).every(r=>selRows.has(r._rowNum))}
                         onChange={toggleAll} className="rounded" />
                     </th>
-                    {['Row','Title','Plant','State','Category','Priority','Status','Due Date','Compliance Freq','Reminder','Assigned To','⚖️ Rule','Valid'].map(h=>(
+                    {['Row','Title','Plant','State','Category','Priority','Status','Due Date','Compliance Freq','Reminder','Assigned To','⚖️ Rule','🏭 Multi','Valid'].map(h=>(
                       <th key={h} className="px-3 py-3 text-left whitespace-nowrap">{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody className={`divide-y ${dk?'divide-gray-700':'divide-gray-100'}`}>
                   {visibleRows.length === 0 && (
-                    <tr><td colSpan={14} className="text-center py-10 text-gray-400">No rows match filters</td></tr>
+                    <tr><td colSpan={15} className="text-center py-10 text-gray-400">No rows match filters</td></tr>
                   )}
                   {visibleRows.map(row => {
                     const isSelected = selRows.has(row._rowNum);
@@ -7105,6 +7131,14 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
                           {row.applicableRule
                             ? <span className="text-[color:var(--p500)] text-xs truncate block" title={row.applicableRule}>⚖️ {row.applicableRule}</span>
                             : <span className={`text-xs ${sub}`}>—</span>}
+                        </td>
+                        <td className="px-3 py-2 text-center whitespace-nowrap">
+                          {row._multiPlant
+                            ? <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${dk?'bg-purple-900/40 text-purple-300':'bg-purple-100 text-purple-700'}`}
+                                title={`Expanded from multi-plant row — plant ${(row._multiIdx||0)+1} of ${row._multiTotal}`}>
+                                🏭 {(row._multiIdx||0)+1}/{row._multiTotal}
+                              </span>
+                            : <span className={`text-[10px] ${dk?'text-gray-600':'text-gray-300'}`}>—</span>}
                         </td>
                         <td className="px-3 py-2 text-center">
                           {row._valid
