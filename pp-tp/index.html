@@ -2649,8 +2649,11 @@ function _buildDeptCardHTML(dept, tasksArr, col, onClickFn) {
   let avgDays = '—';
   const doneWithCreated = doneT.filter(t => t.created);
   if (doneWithCreated.length) {
+    // Fix v206: use same field resolution order as avg-days chart — completedDate first,
+    // fall back to closedAt/doneAt/due so numbers match across both sections.
     const tot = doneWithCreated.reduce((sum, t) => {
-      const end = t.closedAt||t.doneAt ? new Date(t.closedAt||t.doneAt) : new Date();
+      const endStr = t.completedDate||t.closedAt||t.doneAt||t.due||'';
+      const end = endStr ? new Date(endStr) : new Date();
       return sum + Math.max(0, Math.round((end - new Date(t.created)) / 86400000));
     }, 0);
     avgDays = Math.round(tot / doneWithCreated.length) + 'd';
@@ -2739,8 +2742,10 @@ function _renderDeptSection(prefix, tasksArr, onClickFn, rowElId, statsWrapId, f
   const deptAvg = depts.map(dept => {
     const done = fullTasksArr.filter(t => t.department === dept && t.status === 'Done' && t.created);
     if (!done.length) return null;
+    // Fix v206: use same field resolution order as avg-days name chart
     const tot = done.reduce((sum, t) => {
-      const end = t.closedAt||t.doneAt ? new Date(t.closedAt||t.doneAt) : new Date();
+      const endStr = t.completedDate||t.closedAt||t.doneAt||t.due||'';
+      const end = endStr ? new Date(endStr) : new Date();
       return sum + Math.max(0, Math.round((end - new Date(t.created)) / 86400000));
     }, 0);
     return Math.round(tot / done.length);
@@ -3091,8 +3096,11 @@ function _renderDashCharts(_dashTasksRaw){
       const allForEmail=tasksByEmail2.get(email)||[];
       const doneTasks=allForEmail.filter(t=>t.status==='Done');
       if(!doneTasks.length) return null; // no Done tasks → hide from axis
+      // Fix v206: resolve close date from multiple possible fields.
+      // Many tasks have no completedDate/closedAt/doneAt stored (older records).
+      // Fall back to due date so Parul, Kiruba etc. still appear rather than disappearing.
       const daysArr=doneTasks.map(t=>{
-        const endStr=t.completedDate||t.closedAt||t.doneAt||'';
+        const endStr=t.completedDate||t.closedAt||t.doneAt||t.due||'';
         const startStr=t.created||'';
         if(!endStr||!startStr) return null;
         const diff=Math.max(0,Math.round((new Date(endStr)-new Date(startStr))/(1000*60*60*24)));
@@ -3475,15 +3483,14 @@ function _rebuildDashStats(){
   // Also update _lastChartTaskIds for dept nav consistency
   if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
     const _rbSaEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-    // Fix v206: mirror _chartTasks filter exactly — include blank-assignee exclusion
-    // so _lastChartTaskIds always matches what dept cards show.
+    // Fix v206: mirror _chartTasks filter exactly — blank assignee excluded
     const _rbChart=_rbDeduped.filter(t=>{
       const ab=(t.assignedBy||'').toLowerCase().trim();
       const ae=(t.assignee||'').toLowerCase().trim();
       const bySA=(_rbSaEm&&ab===_rbSaEm)||ab==='superadmin';
       if(!bySA) return false;
-      if(_rbSaEm && ae===_rbSaEm) return false; // self-assigned
-      if(!ae) return false;                       // blank assignee
+      if(_rbSaEm && ae===_rbSaEm) return false;
+      if(!ae) return false;
       return true;
     });
     window._lastChartTaskIds=new Set(_rbChart.map(t=>t.id));
@@ -3505,14 +3512,14 @@ function renderDashboard(){
   // superadmin-assigned-out subset so dept cards work even before charts render
   if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
     const _saPreEmail=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-    // Fix v206: mirror _chartTasks filter exactly — include blank-assignee exclusion
+    // Fix v206: mirror _chartTasks filter exactly — blank assignee excluded
     const _preChart=scopedTasks.filter(t=>{
       const ab=(t.assignedBy||'').toLowerCase().trim();
       const ae=(t.assignee||'').toLowerCase().trim();
       const bySA=(_saPreEmail && ab===_saPreEmail)||ab==='superadmin';
       if(!bySA) return false;
-      if(_saPreEmail && ae===_saPreEmail) return false; // self-assigned
-      if(!ae) return false;                              // blank assignee
+      if(_saPreEmail && ae===_saPreEmail) return false;
+      if(!ae) return false;
       return true;
     });
     window._lastChartTaskIds = new Set(_preChart.map(t=>t.id));
@@ -4750,10 +4757,12 @@ function renderTaskRows(){
     // Dept filter: match task.department
     // Dept filter: always apply if set (even when _ids is also set)
     const sdept = !taskFilters._dept || (t.department||'')===(taskFilters._dept||'');
-    // Name filter: match assigneeName or email prefix
+    // Name filter: match assigneeName or email prefix — case-insensitive
+    // Fix v206: chart labels are capitalised (rawName.charAt(0).toUpperCase()) but
+    // stored assigneeName may be any case; lowercase both sides to avoid zero results.
     const sname = !taskFilters._assigneeName || (() => {
-      const n = (t.assigneeName&&t.assigneeName.trim()) || (t.assignee||'').split('@')[0];
-      return n === taskFilters._assigneeName;
+      const n = ((t.assigneeName&&t.assigneeName.trim()) || (t.assignee||'').split('@')[0]).toLowerCase();
+      return n === taskFilters._assigneeName.toLowerCase();
     })();
     // Created-date range filter (weekly trend click)
     const screated = (!taskFilters._createdFrom && !taskFilters._createdTo) ||
@@ -5323,10 +5332,7 @@ function pushReminderLog(entry){
 function startReminderLogListener(){
   if(!_fbReady || !_db) return;
   if(_reminderLogUnsub) return; // already listening
-  // ── Fix v206: Don't subscribe while still in anonymous auth state ────────
-  // Anonymous users lack read permission on reminderRuns, causing the
-  // "Missing or insufficient permissions" Firestore error on every page load.
-  // Wait until a real identity (superadmin, admin, or plant owner) is confirmed.
+  // ── Fix v206: Don't subscribe while still in anonymous auth state ──
   if(!adminAuthenticated && !currentSession && !plantOwnerAuthenticated) return;
 
   // Listen to last 200 runs, newest first
@@ -8447,9 +8453,6 @@ async function overlayAdminLogin(){
       adminAuthenticated = true;
       localStorage.setItem('admin_password', stored);
       // ── Fix v206: Bootstrap self_name from admin_notify_email if never set ──
-      // self_name is required for superadmin exclusion in compliance/avg-days charts.
-      // It is only written when the user explicitly saves the Display Name in Settings,
-      // so on a fresh install it is null and the name-based exclusion silently fails.
       if (!localStorage.getItem('self_name')) {
         const _bootstrapEmail = (localStorage.getItem('admin_notify_email') || '').trim().toLowerCase();
         if (_bootstrapEmail) {
@@ -8482,8 +8485,7 @@ async function overlayAdminLogin(){
           _loadGroupMemberEmails(_saKey).then(() => { refreshOverdueBadge(); });
         });
       }
-      // ── Fix v206: Start reminder log listener now that auth is confirmed ──
-      startReminderLogListener();
+      startReminderLogListener(); // Fix v206: now auth is confirmed
       toast('Welcome back, Super Admin! 👋');
       showPanel('dashboard');
     };
@@ -15196,24 +15198,21 @@ function goToPlantTasksByDept(dept){
 // ── Navigate: dept card/chart in Plant Panel (superadmin view) → All Tasks ──
 function goToTasksByDept(dept){
   // Navigate to dept-filtered task list scoped to "tasks assigned BY superadmin to others".
-  // Fix v206: mirror _chartTasks filter exactly (same as _renderDashCharts) so the task
-  // list count always matches the dept stat card — including the blank-assignee exclusion
-  // and the self-assignment exclusion that the old code was missing.
+  // Fix v206: mirror _chartTasks filter exactly — blank assignee excluded.
   let scopeIds = null;
   if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
     const _saGo=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
     const _chartIds = tasks.filter(t=>{
-      const ab      = (t.assignedBy||'').toLowerCase().trim();
-      const ae      = (t.assignee||'').toLowerCase().trim();
-      const bySA    = (_saGo && ab === _saGo) || ab === 'superadmin';
-      if (!bySA) return false;                     // not assigned by SA
-      if (_saGo && ae === _saGo) return false;     // self-assigned — excluded from card
-      if (!ae) return false;                        // blank assignee — excluded from card
+      const ab=(t.assignedBy||'').toLowerCase().trim();
+      const ae=(t.assignee||'').toLowerCase().trim();
+      const bySA=(_saGo && ab===_saGo)||ab==='superadmin';
+      if(!bySA) return false;
+      if(_saGo && ae===_saGo) return false;
+      if(!ae) return false;
       return true;
     }).map(t=>t.id);
     scopeIds = new Set(_chartIds);
   } else if(window._lastChartTaskIds instanceof Set){
-    // Use the IDs captured at render time for non-SA views
     scopeIds = window._lastChartTaskIds;
   } else if(window._lastDashTaskIds instanceof Set){
     scopeIds = window._lastDashTaskIds;
@@ -15234,7 +15233,25 @@ function goToTasksByDept(dept){
 
 // ── Navigate: name chart bar → All Tasks filtered by assignee name ──
 function goToTasksByName(name){
-  taskFilters = {status:'All', priority:'All', search:'', overdue:false, _assigneeName: name};
+  // Fix v206: scope task list to SA-assigned tasks only (same as _chartTasks)
+  // so clicking a compliance/avgdays bar shows only the tasks that were counted,
+  // not ALL tasks for that person across the entire system.
+  let _nameIds = null;
+  if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
+    const _saGN = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    _nameIds = new Set(tasks.filter(t=>{
+      const ab = (t.assignedBy||'').toLowerCase().trim();
+      const ae = (t.assignee||'').toLowerCase().trim();
+      const bySA = (_saGN && ab===_saGN) || ab==='superadmin';
+      if(!bySA) return false;
+      if(_saGN && ae===_saGN) return false;
+      if(!ae) return false;
+      return true;
+    }).map(t=>t.id));
+  }
+  taskFilters = {status:'All', priority:'All', search:'', overdue:false,
+    _assigneeName: name, ...(_nameIds ? {_ids: _nameIds} : {})};
+  window._fromDashStat = true;
   currentPanel = 'tasks';
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const hit=document.querySelector('.nav-item[onclick*="tasks"]');
