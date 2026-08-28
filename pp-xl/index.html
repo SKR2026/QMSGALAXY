@@ -868,6 +868,7 @@ button{cursor:pointer;border:none;border-radius:7px;padding:8px 16px;font-weight
           <select id="eu-role">
             <option value="plant_user">Plant User</option>
             <option value="viewer">Viewer</option>
+            <option value="plantadmin">Plant Admin</option>
             <option value="superadmin">Super Admin</option>
           </select></div>
         <div class="form-group"><label class="form-label">Mobile</label><input id="eu-mobile"/></div>
@@ -876,6 +877,7 @@ button{cursor:pointer;border:none;border-radius:7px;padding:8px 16px;font-weight
       </div>
     </div>
     <div class="modal-footer">
+      <button class="btn-cancel" onclick="resetUserPasswordFromModal()" style="margin-right:auto;background:#FAEEDA;color:#854F0B;border:1px solid #FAC775">🔑 Reset password</button>
       <button class="btn-cancel" onclick="closeEditUser()">Cancel</button>
       <button class="btn-save" onclick="saveEditUser()">Save changes</button>
     </div>
@@ -1035,6 +1037,12 @@ function initApp() {
 
   // Populate dropdowns
   populateSelects();
+  if (currentProfile?.role === 'plantadmin') {
+    const ap = document.getElementById('new-user-plant');
+    if (ap) { ap.value = currentProfile.plant || ''; ap.disabled = true; }
+    const ar = document.getElementById('new-user-role');
+    if (ar) ar.innerHTML = '<option value="plant_user">Plant User</option><option value="viewer">Viewer</option>';
+  }
 
   // Subscribe to lessons
   db.collection('lessons').orderBy('createdAt','desc').onSnapshot(snap => {
@@ -1640,19 +1648,22 @@ async function renderAdminUsers() {
   if (currentProfile?.role === 'plantadmin') users = users.filter(u => u.plant === currentProfile.plant);
   document.getElementById('admin-users-list').innerHTML = users.map(u => {
     const init = (u.name||'?').split(' ').map(w=>w[0]).join('').toUpperCase();
-    return `<div class="card flex gap12" style="margin-bottom:8px;cursor:default">
+    const canManage = currentProfile?.role === 'superadmin' ||
+      (currentProfile?.role === 'plantadmin' && u.plant === currentProfile.plant && u.role !== 'superadmin' && u.role !== 'plantadmin');
+    return `<div class="card flex gap12 wrap" style="margin-bottom:8px;cursor:default">
       <div class="avatar">${init}</div>
-      <div style="flex:1"><div style="font-size:14px;font-weight:600">${u.name}</div><div class="muted">${u.email} · ${u.plant}</div></div>
-      <span class="badge ${u.role==='superadmin'?'badge-purple':u.role==='plantadmin'?'badge-blue':'badge-gray'}">${u.role}</span>
+      <div style="flex:1;min-width:220px"><div style="font-size:14px;font-weight:600">${escHtml(u.name||'')}</div><div class="muted">${escHtml(u.email||'')} · ${escHtml(u.plant||'')}</div></div>
+      <span class="badge ${u.role==='superadmin'?'badge-purple':u.role==='plantadmin'?'badge-blue':'badge-gray'}">${escHtml(u.role||'')}</span>
+      ${canManage ? `<div class="flex gap8">
+        <button onclick="openEditUser('${u.id}')" style="background:#E6F1FB;color:#185FA5;border:1px solid #B5D4F4;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer">Edit</button>
+        <button onclick="resetUserPassword('${u.id}')" style="background:#FAEEDA;color:#854F0B;border:1px solid #FAC775;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer">🔑 Password</button>
+      </div>` : ''}
     </div>`;
   }).join('') || '<div class="empty-state">No users found.</div>';
 }
 
 async function createNewUser() {
   const name = document.getElementById('new-user-name').value.trim();
-  // Normalize email before checking/creating the Firebase Authentication account.
-  // Firebase Authentication is the source of truth for whether an email is registered;
-  // a Firestore users document may be absent even when the Auth account still exists.
   const email = document.getElementById('new-user-email').value.trim().toLowerCase();
   const pass = document.getElementById('new-user-pass').value;
   const plant = document.getElementById('new-user-plant').value;
@@ -1665,16 +1676,6 @@ async function createNewUser() {
     if (!['plant_user','viewer'].includes(role)) { showToast('Plant Admin can create only Plant User or Viewer accounts.','error'); return; }
   }
   try {
-    // Check Firebase Authentication first. This avoids showing a generic
-    // 'already registered' message when the real problem is elsewhere.
-    // NOTE: a user deleted from Firestore is NOT deleted from Firebase Authentication.
-    const signInMethods = await secondaryAuth.fetchSignInMethodsForEmail(email);
-    if (signInMethods && signInMethods.length > 0) {
-      throw Object.assign(new Error('Firebase Authentication already contains this email.'), {
-        code: 'auth/email-already-in-use'
-      });
-    }
-
     // IMPORTANT: create the Auth account in the secondary Firebase app.
     // The primary app remains signed in as the Super Admin.
     const cred = await secondaryAuth.createUserWithEmailAndPassword(email, pass);
@@ -1695,7 +1696,7 @@ async function createNewUser() {
     try { await secondaryAuth.signOut(); } catch (_) {}
     console.error('User creation error:', e);
     const msg = e.code === 'auth/email-already-in-use'
-      ? 'This email already exists in Firebase Authentication (not necessarily in Firestore). Check Firebase Console → Authentication → Users, including disabled/deleted/recently removed accounts.'
+      ? 'This email address is already registered.'
       : (e.code === 'permission-denied' || /insufficient permissions/i.test(e.message)
         ? 'Permission denied. Please make sure you are logged in as Super Admin.'
         : e.message);
@@ -2188,7 +2189,11 @@ function openEditUser(uid) {
   document.getElementById('eu-name').value = u.name||'';
   document.getElementById('eu-empid').value = u.empId||'';
   document.getElementById('eu-mobile').value = u.mobile||'';
-  document.getElementById('eu-role').value = u.role||'plant_user';
+  const roleEl = document.getElementById('eu-role');
+  roleEl.innerHTML = currentProfile?.role === 'plantadmin'
+    ? '<option value="plant_user">Plant User</option><option value="viewer">Viewer</option>'
+    : '<option value="plant_user">Plant User</option><option value="viewer">Viewer</option><option value="plantadmin">Plant Admin</option><option value="superadmin">Super Admin</option>';
+  roleEl.value = u.role||'plant_user';
   document.getElementById('eu-status').value = u.status||'active';
   // populate plant/dept in modal
   ['eu-plant','eu-dept'].forEach(id => {
@@ -2201,24 +2206,62 @@ function openEditUser(uid) {
   });
   document.getElementById('eu-plant').value = u.plant||'';
   document.getElementById('eu-dept').value = u.dept||'';
+  const plantEl = document.getElementById('eu-plant');
+  if (currentProfile?.role === 'plantadmin') {
+    plantEl.value = currentProfile.plant || u.plant || '';
+    plantEl.disabled = true;
+  } else {
+    plantEl.disabled = false;
+  }
   document.getElementById('edit-user-modal').classList.remove('hidden');
 }
 
 async function saveEditUser() {
   const uid = document.getElementById('eu-uid').value;
-  await db.collection('users').doc(uid).update({
-    name: document.getElementById('eu-name').value.trim(),
-    empId: document.getElementById('eu-empid').value.trim(),
-    plant: document.getElementById('eu-plant').value,
-    dept: document.getElementById('eu-dept').value,
-    role: document.getElementById('eu-role').value,
-    mobile: document.getElementById('eu-mobile').value.trim(),
-    status: document.getElementById('eu-status').value,
-    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-  });
-  closeEditUser();
-  showToast('User updated!');
-  loadSettingsUsers();
+  const u = allSettingsUsers.find(x=>x.id===uid);
+  // In Admin panel, allSettingsUsers may not be loaded for Plant Admin; retrieve the target profile.
+  let target = u;
+  if (!target) {
+    try { const d = await db.collection('users').doc(uid).get(); target = d.exists ? {id:d.id,...d.data()} : null; } catch(e) {}
+  }
+  if (!target) return showToast('User record not found','error');
+  if (currentProfile?.role === 'plantadmin') {
+    if (target.plant !== currentProfile.plant || ['superadmin','plantadmin'].includes(target.role)) return showToast('Plant Admin can edit only Plant User or Viewer accounts in their own plant.','error');
+  } else if (currentProfile?.role !== 'superadmin') {
+    return showToast('Only Super Admin or Plant Admin can edit users.','error');
+  }
+  const role = document.getElementById('eu-role').value;
+  if (currentProfile?.role === 'plantadmin' && !['plant_user','viewer'].includes(role)) return showToast('Plant Admin can assign only Plant User or Viewer.','error');
+  try {
+    await db.collection('users').doc(uid).update({
+      name: document.getElementById('eu-name').value.trim(),
+      empId: document.getElementById('eu-empid').value.trim(),
+      plant: currentProfile?.role === 'plantadmin' ? currentProfile.plant : document.getElementById('eu-plant').value,
+      dept: document.getElementById('eu-dept').value,
+      role,
+      mobile: document.getElementById('eu-mobile').value.trim(),
+      status: document.getElementById('eu-status').value,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    closeEditUser();
+    showToast('User updated!');
+    if (currentProfile?.role === 'superadmin') loadSettingsUsers(); else renderAdminUsers();
+  } catch(e) { console.error(e); showToast(e.message||'Unable to update user','error'); }
+}
+
+async function resetUserPassword(uid) {
+  let target = allSettingsUsers.find(x=>x.id===uid);
+  if (!target) { try { const d=await db.collection('users').doc(uid).get(); target=d.exists?{id:d.id,...d.data()}:null; } catch(e){} }
+  if (!target?.email) return showToast('User email not found','error');
+  if (currentProfile?.role === 'plantadmin' && (target.plant !== currentProfile.plant || ['superadmin','plantadmin'].includes(target.role))) return showToast('Plant Admin can reset passwords only for Plant User or Viewer in their own plant.','error');
+  if (!['superadmin','plantadmin'].includes(currentProfile?.role)) return showToast('Not authorized','error');
+  if (!confirm(`Send a password reset link to ${target.email}?`)) return;
+  try { await auth.sendPasswordResetEmail(target.email); showToast('Password reset link sent.'); } catch(e) { console.error(e); showToast(e.message||'Unable to send password reset email','error'); }
+}
+
+async function resetUserPasswordFromModal() {
+  const uid=document.getElementById('eu-uid').value;
+  await resetUserPassword(uid);
 }
 
 function closeEditUser() { document.getElementById('edit-user-modal').classList.add('hidden'); }
