@@ -2649,8 +2649,7 @@ function _buildDeptCardHTML(dept, tasksArr, col, onClickFn) {
   let avgDays = '—';
   const doneWithCreated = doneT.filter(t => t.created);
   if (doneWithCreated.length) {
-    // Fix v206: use same field resolution order as avg-days chart — completedDate first,
-    // fall back to closedAt/doneAt/due so numbers match across both sections.
+    // v206: unified field order — completedDate first, fall back to closedAt/doneAt/due
     const tot = doneWithCreated.reduce((sum, t) => {
       const endStr = t.completedDate||t.closedAt||t.doneAt||t.due||'';
       const end = endStr ? new Date(endStr) : new Date();
@@ -2742,7 +2741,7 @@ function _renderDeptSection(prefix, tasksArr, onClickFn, rowElId, statsWrapId, f
   const deptAvg = depts.map(dept => {
     const done = fullTasksArr.filter(t => t.department === dept && t.status === 'Done' && t.created);
     if (!done.length) return null;
-    // Fix v206: use same field resolution order as avg-days name chart
+    // v206: unified field order — completedDate first, fall back to closedAt/doneAt/due
     const tot = done.reduce((sum, t) => {
       const endStr = t.completedDate||t.closedAt||t.doneAt||t.due||'';
       const end = endStr ? new Date(endStr) : new Date();
@@ -2958,199 +2957,151 @@ function _renderDashCharts(_dashTasksRaw){
     }
   });
 
-  // ── Compliance by Name (assigneeName or email prefix) ──────
-  (()=>{
-    // Superadmin identity — match by email AND self_name to reliably exclude Sushil
-    // even if admin_notify_email is unset or the task's assignee field differs slightly.
-    const _saName = (localStorage.getItem('self_name')||'').trim().toLowerCase();
-    const _isSA = (email, rawName) =>
-      (_saChartEmail && email === _saChartEmail) ||
-      (_saName && (rawName||'').toLowerCase().trim() === _saName);
+  // ── Shared helper: resolve display name from a task (capitalised, email-prefix fallback) ──
+  // Used by both compliance and avg-days charts so the name shown is always consistent.
+  const _resolveName = t => {
+    const raw = (t.assigneeName && t.assigneeName.trim()) || (t.assignee||'').split('@')[0] || '';
+    return raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : '';
+  };
 
-    // WHO appears: people superadmin assigned tasks to (_chartTasks — strict filter above).
-    // HOW compliance calculated: _chartTasks only (superadmin-assigned tasks).
-    // Sushil excluded by email OR name. People with 0 total assigned tasks hidden.
-    const emailToName=new Map();
-    _chartTasks.forEach(t=>{
-      const email=(t.assignee||'').toLowerCase().trim();
-      if(!email) return;
-      const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
-      if(_isSA(email, rawName)) return; // exclude superadmin by email or name
-      const name=rawName?rawName.charAt(0).toUpperCase()+rawName.slice(1):'';
-      if(!emailToName.has(email) || name.length > emailToName.get(email).length) emailToName.set(email, name);
+  // ── Shared helper: resolve close date from a task ──
+  // Priority: completedDate → closedAt → doneAt → due (due is last-resort so
+  // older tasks without any close-date field still get an approximate number).
+  const _resolveCloseDate = t =>
+    t.completedDate || t.closedAt || t.doneAt || t.due || '';
+
+  // ── Shared helper: build a per-email task map from _chartTasks ──
+  // Excludes SA by email. Returns Map<email, {name, tasks[]}>.
+  const _buildEmailMap = () => {
+    const map = new Map(); // email → { name, tasks[] }
+    _chartTasks.forEach(t => {
+      const email = (t.assignee||'').toLowerCase().trim();
+      if (!email) return;
+      if (_saChartEmail && email === _saChartEmail) return; // exclude SA
+      const name = _resolveName(t);
+      if (!name) return;
+      if (!map.has(email)) map.set(email, { name, tasks: [] });
+      // Always keep the longest name seen (more complete display name wins)
+      if (name.length > map.get(email).name.length) map.get(email).name = name;
+      map.get(email).tasks.push(t);
     });
-    // Build task lookup from _chartTasks (superadmin-assigned scope only)
-    const tasksByEmail=new Map();
-    _chartTasks.forEach(t=>{
-      const email=(t.assignee||'').toLowerCase().trim();
-      if(!email) return;
-      const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
-      if(_isSA(email, rawName)) return;
-      if(!tasksByEmail.has(email)) tasksByEmail.set(email,[]);
-      tasksByEmail.get(email).push(t);
+    return map;
+  };
+
+  // ── Shared helper: SA-scoped _ids set for goToTasksByName click-through ──
+  // Scopes the task list to exactly the same tasks that appear in _chartTasks,
+  // so clicking a bar shows the correct count — not ALL tasks for that person.
+  const _chartTaskIdSet = new Set(_chartTasks.map(t => t.id));
+
+  // ── Compliance by Name ──────────────────────────────────────────────────
+  (()=>{
+    const emailMap = _buildEmailMap();
+    // Build sorted list — everyone in _chartTasks, ordered by email insertion
+    const rows = [...emailMap.entries()].map(([email, {name, tasks}]) => {
+      const total  = tasks.length;
+      const closed = tasks.filter(t => t.status === 'Done').length;
+      const pct    = total ? Math.round(closed / total * 100) : 0;
+      return { email, name, pct, total, closed };
     });
-    // Build list — include everyone with ≥1 task assigned; show zero compliance as red bar
-    const allEmails=[...emailToName.keys()];
-    // DEBUG: show who made it onto the axis
-    console.log('📊 COMPLIANCE AXIS emails:', allEmails, 'names:', allEmails.map(e=>emailToName.get(e)));
-    console.log('📊 _saName for exclusion:', (localStorage.getItem('self_name')||'').trim().toLowerCase(), '| _saChartEmail:', _saChartEmail);
-    const complianceData = allEmails.map(email=>{
-      const allForEmail=tasksByEmail.get(email)||[];
-      const totalAssigned=allForEmail.length;
-      if(!totalAssigned) return null;
-      const totalClosed=allForEmail.filter(t=>t.status==='Done').length;
-      const pct=Math.round(totalClosed/totalAssigned*100);
-      return {email, name:emailToName.get(email), pct, totalAssigned};
-    }).filter(Boolean);
-    const names=complianceData.map(d=>d.name);
-    const complianceVals=complianceData.map(d=>d.pct);
-    const compColors=complianceVals.map(v=>v>=80?'#22c55e':v>=50?'#f59e0b':'#ef4444');
+    // Sort: highest compliance first
+    rows.sort((a, b) => b.pct - a.pct);
+
+    const names          = rows.map(r => r.name);
+    const complianceVals = rows.map(r => r.pct);
+    const compColors     = complianceVals.map(v => v >= 80 ? '#22c55e' : v >= 50 ? '#f59e0b' : '#ef4444');
+
     destroyChart('ch-compliance');
-    // Dynamically size chart height to the number of rows so labels don't get
-    // cramped into fractional pixel positions (which makes canvas text render
-    // blurry/dim on some rows while others stay crisp).
-    (()=>{ const wrap=document.getElementById('ch-compliance')?.parentElement; if(wrap) wrap.style.height=Math.max(220,names.length*32)+'px'; })();
-    chartInstances['ch-compliance']=new Chart(document.getElementById('ch-compliance'),{
-      type:'bar',
-      data:{
-        labels:names,
-        datasets:[{
-          label:'Compliance %',
-          data:complianceVals,
-          backgroundColor:compColors,
-          borderRadius:6,
-          borderWidth:0
-        }]
+    const _cwrap = document.getElementById('ch-compliance')?.parentElement;
+    if (_cwrap) _cwrap.style.height = Math.max(220, names.length * 36) + 'px';
+
+    chartInstances['ch-compliance'] = new Chart(document.getElementById('ch-compliance'), {
+      type: 'bar',
+      data: {
+        labels: names,
+        datasets: [{ label: 'Compliance %', data: complianceVals, backgroundColor: compColors, borderRadius: 6, borderWidth: 0 }]
       },
-      options:{
-        indexAxis:'y',
-        plugins:{
-          legend:{display:false},
-          tooltip:{callbacks:{label:ctx=>' '+ctx.raw+'% compliance'}}
+      options: {
+        indexAxis: 'y',
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => {
+            const r = rows[ctx.dataIndex];
+            return ` ${ctx.raw}%  (${r.closed} of ${r.total} closed)`;
+          }}}
         },
-        scales:{
-          x:{
-            min:0,max:100,
-            ticks:{color:tickCol,font:{size:10,weight:'600'},callback:v=>v+'%'},
-            grid:{color:gridCol}
-          },
-          y:{ticks:{color:tickCol,font:{size:10,weight:'600'}},grid:{display:false}}
+        scales: {
+          x: { min: 0, max: 100, ticks: { color: tickCol, font: { size: 10, weight: '600' }, callback: v => v + '%' }, grid: { color: gridCol } },
+          y: { ticks: { color: tickCol, font: { size: 10, weight: '600' } }, grid: { display: false } }
         },
-        maintainAspectRatio:false,
-        onClick:(evt,elements)=>{
-          if(elements&&elements.length){
-            const idx=elements[0].index;
-            const name=names[idx];
-            if(name) goToTasksByName(name);
+        maintainAspectRatio: false,
+        onClick: (evt, elements) => {
+          if (elements && elements.length) {
+            const r = rows[elements[0].index];
+            if (r) goToTasksByName(r.name, r.email, _chartTaskIdSet);
           }
         },
-        onHover:(evt,elements)=>{
-          evt.native.target.style.cursor=elements&&elements.length?'pointer':'default';
-        }
+        onHover: (evt, elements) => { evt.native.target.style.cursor = elements && elements.length ? 'pointer' : 'default'; }
       }
     });
   })();
 
-  // ── Avg Days to Close by Name (assigneeName or email prefix) ───────
-  // WHO appears: people superadmin assigned tasks to (_chartTasks — strict filter).
-  // HOW calculated: _chartTasks only. Sushil excluded by email+name.
-  // Uses completedDate (the actual field set when a task is marked Done).
-  // People with no Done tasks hidden from axis entirely.
+  // ── Avg Days to Close by Name ───────────────────────────────────────────
   (()=>{
-    // Reuse same SA identity helpers defined in compliance block above
-    const _saName2 = (localStorage.getItem('self_name')||'').trim().toLowerCase();
-    const _isSA2 = (email, rawName) =>
-      (_saChartEmail && email === _saChartEmail) ||
-      (_saName2 && (rawName||'').toLowerCase().trim() === _saName2);
+    const emailMap = _buildEmailMap();
+    const rows = [...emailMap.entries()].map(([email, {name, tasks}]) => {
+      const doneTasks = tasks.filter(t => t.status === 'Done');
+      if (!doneTasks.length) return null; // no Done tasks → hide entirely
 
-    const emailToName2=new Map();
-    _chartTasks.forEach(t=>{
-      const email=(t.assignee||'').toLowerCase().trim();
-      if(!email) return;
-      const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
-      if(_isSA2(email, rawName)) return; // exclude superadmin by email or name
-      const name=rawName?rawName.charAt(0).toUpperCase()+rawName.slice(1):'';
-      if(!emailToName2.has(email) || name.length > emailToName2.get(email).length) emailToName2.set(email, name);
-    });
-    const tasksByEmail2=new Map();
-    _chartTasks.forEach(t=>{
-      const email=(t.assignee||'').toLowerCase().trim();
-      if(!email) return;
-      const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
-      if(_isSA2(email, rawName)) return;
-      if(!tasksByEmail2.has(email)) tasksByEmail2.set(email,[]);
-      tasksByEmail2.get(email).push(t);
-    });
-    // Only show people with ≥1 Done task. Use completedDate as close date
-    // (tasks store completedDate when marked Done — closedAt/doneAt don't exist).
-    const allEmails2=[...emailToName2.keys()];
-    // DEBUG: show done task counts per person
-    console.log('📊 AVG DAYS - all emails on axis:', allEmails2.map(e=>emailToName2.get(e)));
-    allEmails2.forEach(email=>{
-      const tasks2=tasksByEmail2.get(email)||[];
-      const done2=tasks2.filter(t=>t.status==='Done');
-      console.log('  ', emailToName2.get(email), '| total:', tasks2.length, '| done:', done2.length,
-        '| done sample:', done2.slice(0,2).map(t=>({status:t.status,completedDate:t.completedDate,created:t.created,closedAt:t.closedAt})));
-    });
-    const avgData = allEmails2.map(email=>{
-      const allForEmail=tasksByEmail2.get(email)||[];
-      const doneTasks=allForEmail.filter(t=>t.status==='Done');
-      if(!doneTasks.length) return null; // no Done tasks → hide from axis
-      // Fix v206: resolve close date from multiple possible fields.
-      // Many tasks have no completedDate/closedAt/doneAt stored (older records).
-      // Fall back to due date so Parul, Kiruba etc. still appear rather than disappearing.
-      const daysArr=doneTasks.map(t=>{
-        const endStr=t.completedDate||t.closedAt||t.doneAt||t.due||'';
-        const startStr=t.created||'';
-        if(!endStr||!startStr) return null;
-        const diff=Math.max(0,Math.round((new Date(endStr)-new Date(startStr))/(1000*60*60*24)));
-        return diff;
-      }).filter(d=>d!==null);
-      if(!daysArr.length) return null;
-      const avgDays=Math.round(daysArr.reduce((s,d)=>s+d,0)/daysArr.length);
-      return {email, name:emailToName2.get(email), avgDays};
+      const daysArr = doneTasks.map(t => {
+        const startStr = t.created || '';
+        const endStr   = _resolveCloseDate(t);
+        if (!startStr || !endStr) return null;
+        return Math.max(0, Math.round((new Date(endStr) - new Date(startStr)) / 86400000));
+      }).filter(d => d !== null);
+
+      if (!daysArr.length) return null; // Done tasks exist but none have usable dates
+      const avgDays = Math.round(daysArr.reduce((s, d) => s + d, 0) / daysArr.length);
+      return { email, name, avgDays, doneCount: doneTasks.length };
     }).filter(Boolean);
-    const names=avgData.map(d=>d.name);
-    const avgDaysVals=avgData.map(d=>d.avgDays);
-    const acColors=['#3b82f6','#a855f7','#06b6d4','#f97316','#10b981','#f59e0b','#ef4444','#22c55e'];
+
+    // Sort: fastest (lowest avg days) first
+    rows.sort((a, b) => a.avgDays - b.avgDays);
+
+    const names       = rows.map(r => r.name);
+    const avgDaysVals = rows.map(r => r.avgDays);
+    const acColors    = ['#3b82f6','#a855f7','#06b6d4','#f97316','#10b981','#f59e0b','#ef4444','#22c55e'];
+
     destroyChart('ch-avgclose');
-    (()=>{ const wrap=document.getElementById('ch-avgclose')?.parentElement; if(wrap) wrap.style.height=Math.max(220,names.length*32)+'px'; })();
-    chartInstances['ch-avgclose']=new Chart(document.getElementById('ch-avgclose'),{
-      type:'bar',
-      data:{
-        labels:names,
-        datasets:[{
-          label:'Avg Days',
-          data:avgDaysVals,
-          backgroundColor:names.map((_,i)=>acColors[i%acColors.length]),
-          borderRadius:6,
-          borderWidth:0
-        }]
+    const _awrap = document.getElementById('ch-avgclose')?.parentElement;
+    if (_awrap) _awrap.style.height = Math.max(220, names.length * 36) + 'px';
+
+    chartInstances['ch-avgclose'] = new Chart(document.getElementById('ch-avgclose'), {
+      type: 'bar',
+      data: {
+        labels: names,
+        datasets: [{ label: 'Avg Days', data: avgDaysVals, backgroundColor: names.map((_, i) => acColors[i % acColors.length]), borderRadius: 6, borderWidth: 0 }]
       },
-      options:{
-        indexAxis:'y',
-        plugins:{
-          legend:{display:false},
-          tooltip:{callbacks:{label:ctx=>ctx.raw===null?' No data':' '+ctx.raw+' days avg'}}
+      options: {
+        indexAxis: 'y',
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => {
+            const r = rows[ctx.dataIndex];
+            return ` ${ctx.raw}d avg  (${r.doneCount} task${r.doneCount !== 1 ? 's' : ''} closed)`;
+          }}}
         },
-        scales:{
-          x:{
-            ticks:{color:tickCol,font:{size:10,weight:'600'},callback:v=>v+'d'},
-            grid:{color:gridCol}
-          },
-          y:{ticks:{color:tickCol,font:{size:10,weight:'600'}},grid:{display:false}}
+        scales: {
+          x: { ticks: { color: tickCol, font: { size: 10, weight: '600' }, callback: v => v + 'd' }, grid: { color: gridCol } },
+          y: { ticks: { color: tickCol, font: { size: 10, weight: '600' } }, grid: { display: false } }
         },
-        maintainAspectRatio:false,
-        onClick:(evt,elements)=>{
-          if(elements&&elements.length){
-            const idx=elements[0].index;
-            const name=names[idx];
-            if(name) goToTasksByName(name);
+        maintainAspectRatio: false,
+        onClick: (evt, elements) => {
+          if (elements && elements.length) {
+            const r = rows[elements[0].index];
+            if (r) goToTasksByName(r.name, r.email, _chartTaskIdSet);
           }
         },
-        onHover:(evt,elements)=>{
-          evt.native.target.style.cursor=elements&&elements.length?'pointer':'default';
-        }
+        onHover: (evt, elements) => { evt.native.target.style.cursor = elements && elements.length ? 'pointer' : 'default'; }
       }
     });
   })();
@@ -3165,7 +3116,9 @@ function _renderDashCharts(_dashTasksRaw){
     const _myComplPct = _myTotal ? Math.round(_myClosed / _myTotal * 100) : 0;
     const _myDone     = _myTasksAll.filter(t => t.status === 'Done' && t.created);
     const _myAvgDays  = _myDone.length ? Math.round(_myDone.reduce((s,t)=>{
-      const end = t.closedAt||t.doneAt ? new Date(t.closedAt||t.doneAt) : new Date();
+      // v206: unified field order
+      const endStr = t.completedDate||t.closedAt||t.doneAt||t.due||'';
+      const end = endStr ? new Date(endStr) : new Date();
       return s + Math.max(0, Math.round((end - new Date(t.created)) / 86400000));
     },0) / _myDone.length) : null;
     const _myComplCol = _myComplPct >= 80 ? '#22c55e' : _myComplPct >= 50 ? '#f59e0b' : '#ef4444';
@@ -3482,15 +3435,13 @@ function _rebuildDashStats(){
   window._lastDashTaskIds = new Set(_rbDeduped.map(t=>t.id));
   // Also update _lastChartTaskIds for dept nav consistency
   if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
-    const _rbSaEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-    // Fix v206: mirror _chartTasks filter exactly — blank assignee excluded
+    const _saEm2=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    // v206: mirror _chartTasks exactly — exclude blank assignee + self-assigned
     const _rbChart=_rbDeduped.filter(t=>{
       const ab=(t.assignedBy||'').toLowerCase().trim();
       const ae=(t.assignee||'').toLowerCase().trim();
-      const bySA=(_rbSaEm&&ab===_rbSaEm)||ab==='superadmin';
-      if(!bySA) return false;
-      if(_rbSaEm && ae===_rbSaEm) return false;
-      if(!ae) return false;
+      const bySA=(_saEm2&&ab===_saEm2)||ab==='superadmin';
+      if(!bySA||(_saEm2&&ae===_saEm2)||!ae) return false;
       return true;
     });
     window._lastChartTaskIds=new Set(_rbChart.map(t=>t.id));
@@ -3511,15 +3462,13 @@ function renderDashboard(){
   // _lastChartTaskIds will be set by _renderDashCharts (async) — pre-populate with
   // superadmin-assigned-out subset so dept cards work even before charts render
   if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
-    const _saPreEmail=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-    // Fix v206: mirror _chartTasks filter exactly — blank assignee excluded
+    const _saEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    // v206: mirror _chartTasks exactly — exclude blank assignee + self-assigned
     const _preChart=scopedTasks.filter(t=>{
       const ab=(t.assignedBy||'').toLowerCase().trim();
       const ae=(t.assignee||'').toLowerCase().trim();
-      const bySA=(_saPreEmail && ab===_saPreEmail)||ab==='superadmin';
-      if(!bySA) return false;
-      if(_saPreEmail && ae===_saPreEmail) return false;
-      if(!ae) return false;
+      const bySA=(_saEm&&ab===_saEm)||ab==='superadmin';
+      if(!bySA||(_saEm&&ae===_saEm)||!ae) return false;
       return true;
     });
     window._lastChartTaskIds = new Set(_preChart.map(t=>t.id));
@@ -4757,9 +4706,8 @@ function renderTaskRows(){
     // Dept filter: match task.department
     // Dept filter: always apply if set (even when _ids is also set)
     const sdept = !taskFilters._dept || (t.department||'')===(taskFilters._dept||'');
-    // Name filter: match assigneeName or email prefix — case-insensitive
-    // Fix v206: chart labels are capitalised (rawName.charAt(0).toUpperCase()) but
-    // stored assigneeName may be any case; lowercase both sides to avoid zero results.
+    // Name filter: case-insensitive match on assigneeName or email prefix
+    // v206: chart labels are capitalised but stored names may be any case
     const sname = !taskFilters._assigneeName || (() => {
       const n = ((t.assigneeName&&t.assigneeName.trim()) || (t.assignee||'').split('@')[0]).toLowerCase();
       return n === taskFilters._assigneeName.toLowerCase();
@@ -5332,7 +5280,7 @@ function pushReminderLog(entry){
 function startReminderLogListener(){
   if(!_fbReady || !_db) return;
   if(_reminderLogUnsub) return; // already listening
-  // ── Fix v206: Don't subscribe while still in anonymous auth state ──
+  // v206: skip if not yet authenticated — anonymous users lack Firestore read permission
   if(!adminAuthenticated && !currentSession && !plantOwnerAuthenticated) return;
 
   // Listen to last 200 runs, newest first
@@ -8452,13 +8400,10 @@ async function overlayAdminLogin(){
       currentSession = null;
       adminAuthenticated = true;
       localStorage.setItem('admin_password', stored);
-      // ── Fix v206: Bootstrap self_name from admin_notify_email if never set ──
+      // v206: Bootstrap self_name from email prefix if never set (needed for chart exclusion)
       if (!localStorage.getItem('self_name')) {
-        const _bootstrapEmail = (localStorage.getItem('admin_notify_email') || '').trim().toLowerCase();
-        if (_bootstrapEmail) {
-          const _bootstrapName = _bootstrapEmail.split('@')[0];
-          if (_bootstrapName) localStorage.setItem('self_name', _bootstrapName);
-        }
+        const _bsEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+        if (_bsEmail) { const _bsName = _bsEmail.split('@')[0]; if (_bsName) localStorage.setItem('self_name', _bsName); }
       }
       const overlay = document.getElementById('admin-pwd-overlay');
       if(overlay) overlay.remove();
@@ -8485,7 +8430,7 @@ async function overlayAdminLogin(){
           _loadGroupMemberEmails(_saKey).then(() => { refreshOverdueBadge(); });
         });
       }
-      startReminderLogListener(); // Fix v206: now auth is confirmed
+      startReminderLogListener(); // v206: call after auth confirmed, not on page load
       toast('Welcome back, Super Admin! 👋');
       showPanel('dashboard');
     };
@@ -15197,18 +15142,16 @@ function goToPlantTasksByDept(dept){
 
 // ── Navigate: dept card/chart in Plant Panel (superadmin view) → All Tasks ──
 function goToTasksByDept(dept){
-  // Navigate to dept-filtered task list scoped to "tasks assigned BY superadmin to others".
-  // Fix v206: mirror _chartTasks filter exactly — blank assignee excluded.
+  // Navigate to dept-filtered task list scoped to SA-assigned tasks only.
+  // v206: mirror _chartTasks exactly so card count = list count.
   let scopeIds = null;
   if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
     const _saGo=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
     const _chartIds = tasks.filter(t=>{
       const ab=(t.assignedBy||'').toLowerCase().trim();
       const ae=(t.assignee||'').toLowerCase().trim();
-      const bySA=(_saGo && ab===_saGo)||ab==='superadmin';
-      if(!bySA) return false;
-      if(_saGo && ae===_saGo) return false;
-      if(!ae) return false;
+      const bySA=(_saGo&&ab===_saGo)||ab==='superadmin';
+      if(!bySA||(_saGo&&ae===_saGo)||!ae) return false;
       return true;
     }).map(t=>t.id);
     scopeIds = new Set(_chartIds);
@@ -15231,35 +15174,29 @@ function goToTasksByDept(dept){
   renderTasks();
 }
 
-// ── Navigate: name chart bar → All Tasks filtered by assignee name ──
-function goToTasksByName(name){
-  // Fix v206: scope task list to SA-assigned tasks only (same as _chartTasks)
-  // so clicking a compliance/avgdays bar shows only the tasks that were counted,
-  // not ALL tasks for that person across the entire system.
-  let _nameIds = null;
-  if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
-    const _saGN = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-    _nameIds = new Set(tasks.filter(t=>{
-      const ab = (t.assignedBy||'').toLowerCase().trim();
-      const ae = (t.assignee||'').toLowerCase().trim();
-      const bySA = (_saGN && ab===_saGN) || ab==='superadmin';
-      if(!bySA) return false;
-      if(_saGN && ae===_saGN) return false;
-      if(!ae) return false;
-      return true;
-    }).map(t=>t.id));
-  }
-  taskFilters = {status:'All', priority:'All', search:'', overdue:false,
-    _assigneeName: name, ...(_nameIds ? {_ids: _nameIds} : {})};
+// ── Navigate: name chart bar → task list scoped to that person's SA-assigned tasks ──
+// name    — display label shown in topbar
+// email   — lowercase assignee email used for exact matching (preferred over name)
+// idScope — Set of task IDs from _chartTasks; restricts list to SA-assigned scope
+//           so the task-list count matches exactly what the chart bar counted.
+function goToTasksByName(name, email, idScope){
+  const _scopeIds = (idScope instanceof Set) ? idScope : null;
+  taskFilters = {
+    status: 'All', priority: 'All', search: '', overdue: false,
+    // Use email for exact matching; _assigneeName only when no email provided
+    _assigneeEmail: email || '',
+    _assigneeName:  email ? '' : name,
+    ...(_scopeIds ? { _ids: _scopeIds } : {})
+  };
   window._fromDashStat = true;
   currentPanel = 'tasks';
-  document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
-  const hit=document.querySelector('.nav-item[onclick*="tasks"]');
-  if(hit) hit.classList.add('active');
-  document.getElementById('btn-new-task').style.display='flex';
-  document.getElementById('btn-bulk-upload').style.display='flex';
-  document.getElementById('btn-export').style.display='flex';
-  document.getElementById('topbar-title').textContent='Tasks — 👤 '+name;
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  const hit = document.querySelector('.nav-item[onclick*="tasks"]');
+  if (hit) hit.classList.add('active');
+  document.getElementById('btn-new-task').style.display = 'flex';
+  document.getElementById('btn-bulk-upload').style.display = 'flex';
+  document.getElementById('btn-export').style.display = 'flex';
+  document.getElementById('topbar-title').textContent = 'Tasks — 👤 ' + name;
   renderTasks();
 }
 
