@@ -2777,24 +2777,26 @@ function _renderDashCharts(_dashTasksRaw){
   const legendCol= _liveText || (isLM ? '#000000' : '#ffffff');
 
   // ── Superadmin chart scope: only tasks ASSIGNED BY superadmin to others ──
-  // The 4 analytics charts (on-time by name, avg days by name, on-time by dept,
-  // avg days by dept) must show ONLY tasks the superadmin explicitly sent out.
-  // assignedBy can be stored as: saEmail, 'superadmin', OR '' (blank — older tasks
-  // created before the field was tracked, but already in _dashTasks so they are
-  // confirmed as superadmin-assigned via getDashScopedTasks logic).
-  // Excluded: tasks the superadmin assigned to themselves.
+  // Strict rule: assignedBy must be saEmail OR literal 'superadmin'.
+  // Excludes: tasks assigned TO superadmin (assignedToMe bucket), group-member
+  // tasks from other plant owners, tasks with blank assignedBy from other users.
+  // Also excludes tasks where superadmin assigned to themselves.
   let _chartTasks = _dashTasks;
   const _isSuperAdminView = adminAuthenticated && !currentSession && !plantOwnerAuthenticated;
+  let _saChartEmail = '';
   if (_isSuperAdminView) {
-    const _saChartEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    _saChartEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
     _chartTasks = _dashTasks.filter(t => {
       const ab       = (t.assignedBy||'').toLowerCase().trim();
       const assignee = (t.assignee||'').toLowerCase().trim();
-      // Accept: explicitly assigned BY superadmin (email or flag), OR blank assignedBy
-      // (older tasks — already confirmed as superadmin-scope by getDashScopedTasks).
-      // Reject: tasks assigned TO superadmin as assignee (those go to "My Tasks" bar).
+      // Must be explicitly assigned BY superadmin
+      const assignedBySA = (_saChartEmail && ab === _saChartEmail) || ab === 'superadmin';
+      if (!assignedBySA) return false;
+      // Exclude self-assigned tasks (superadmin assigned to themselves)
       if (_saChartEmail && assignee === _saChartEmail) return false;
-      return true; // all remaining _dashTasks are assigned by superadmin to others
+      // Also exclude if assignee is blank
+      if (!assignee) return false;
+      return true;
     });
   }
 
@@ -2882,18 +2884,17 @@ function _renderDashCharts(_dashTasksRaw){
     }
   });
 
-  // assignee chart — group by EMAIL to avoid split entries for same person
-  // For superadmin: use _chartTasks (tasks assigned BY superadmin to others only)
-  const _aSrcTasks = _isSuperAdminView ? _chartTasks : _dashTasks;
+  // assignee chart — group by EMAIL, use _chartTasks (strict superadmin-assigned scope)
+  // Superadmin excluded — shown in separate "My Tasks" section above the chart.
   const aEmailToName={};
   const aEmailCount={};
-  _aSrcTasks.forEach(t=>{
+  _chartTasks.forEach(t=>{
     const email=(t.assignee||'').toLowerCase().trim();
     if(!email) return;
+    if(_isSuperAdminView && _saChartEmail && email === _saChartEmail) return; // exclude superadmin
     const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0];
     if(!rawName) return;
     const name=rawName.charAt(0).toUpperCase()+rawName.slice(1);
-    // Keep the longer/better name for display
     if(!aEmailToName[email] || name.length > aEmailToName[email].length) aEmailToName[email]=name;
     aEmailCount[email]=(aEmailCount[email]||0)+1;
   });
@@ -2933,41 +2934,37 @@ function _renderDashCharts(_dashTasksRaw){
 
   // ── Compliance by Name (assigneeName or email prefix) ──────
   (()=>{
-    // Step 1: Determine WHO appears on the chart — only people superadmin assigned tasks to
-    //         (_chartTasks = tasks with assignedBy===saEmail or 'superadmin').
-    // Step 2: Calculate compliance using ALL their tasks visible to superadmin (_dashTasks)
-    //         so closed tasks they received from plant admins are also counted.
-    //         e.g. Kunal: 1 open task from superadmin + 3 closed tasks from plant admin
-    //              → totalAssigned=4, totalClosed=3 → 75%
-    const emailToName=new Map(); // email → best display name (built from _chartTasks for axis)
-    const _saExclude = _isSuperAdminView ? (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase() : '';
+    // WHO appears: people superadmin assigned tasks to (_chartTasks — strict filter above).
+    // HOW compliance calculated: _chartTasks only (superadmin-assigned tasks).
+    // Sushil excluded via _saChartEmail. Zero-done names hidden (no bar = no axis row).
+    const emailToName=new Map();
     _chartTasks.forEach(t=>{
       const email=(t.assignee||'').toLowerCase().trim();
       if(!email) return;
-      // Exclude superadmin's own tasks — shown in separate "My Tasks" bar above
-      if(_saExclude && email === _saExclude) return;
+      if(_saChartEmail && email === _saChartEmail) return; // exclude superadmin — shown separately
       const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
       const name=rawName?rawName.charAt(0).toUpperCase()+rawName.slice(1):'';
       if(!emailToName.has(email) || name.length > emailToName.get(email).length) emailToName.set(email, name);
     });
-    const emails=[...emailToName.keys()];
-    const names=emails.map(e=>emailToName.get(e));
-    // Build a lookup of ALL tasks per assignee from _dashTasks (full superadmin scope)
-    const allTasksByEmail=new Map();
-    _dashTasks.forEach(t=>{
+    // Build task lookup from _chartTasks (superadmin-assigned scope only)
+    const tasksByEmail=new Map();
+    _chartTasks.forEach(t=>{
       const email=(t.assignee||'').toLowerCase().trim();
-      if(!email) return;
-      if(!allTasksByEmail.has(email)) allTasksByEmail.set(email,[]);
-      allTasksByEmail.get(email).push(t);
+      if(!email || (_saChartEmail && email===_saChartEmail)) return;
+      if(!tasksByEmail.has(email)) tasksByEmail.set(email,[]);
+      tasksByEmail.get(email).push(t);
     });
-    const complianceVals=emails.map(email=>{
-      const allForEmail=allTasksByEmail.get(email)||[];
+    // Build filtered list: only include people who have at least 1 task assigned
+    const allEmails=[...emailToName.keys()];
+    const complianceData = allEmails.map(email=>{
+      const allForEmail=tasksByEmail.get(email)||[];
       const totalAssigned=allForEmail.length;
-      if(!totalAssigned) return 0;
-      // Compliance = tasks closed ÷ total assigned × 100
       const totalClosed=allForEmail.filter(t=>t.status==='Done').length;
-      return Math.round(totalClosed/totalAssigned*100);
-    });
+      const pct=totalAssigned?Math.round(totalClosed/totalAssigned*100):0;
+      return {email, name:emailToName.get(email), pct, totalAssigned};
+    }).filter(d => d.totalAssigned > 0); // hide people with 0 tasks assigned by superadmin
+    const names=complianceData.map(d=>d.name);
+    const complianceVals=complianceData.map(d=>d.pct);
     const compColors=complianceVals.map(v=>v>=80?'#22c55e':v>=50?'#f59e0b':'#ef4444');
     destroyChart('ch-compliance');
     // Dynamically size chart height to the number of rows so labels don't get
@@ -3016,34 +3013,32 @@ function _renderDashCharts(_dashTasksRaw){
   })();
 
   // ── Avg Days to Close by Name (assigneeName or email prefix) ───────
-  // Axis: only people superadmin assigned tasks to (_chartTasks for WHO)
-  // Calculation: all their tasks in superadmin scope (_dashTasks for HOW MANY days)
+  // WHO appears: people superadmin assigned tasks to (_chartTasks — strict filter).
+  // HOW calculated: _chartTasks only. Sushil excluded. People with no closed
+  // tasks (avgDays=null) are hidden from the axis entirely.
   (()=>{
     const emailToName2=new Map();
-    const _saExclude2 = _isSuperAdminView ? (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase() : '';
     _chartTasks.forEach(t=>{
       const email=(t.assignee||'').toLowerCase().trim();
       if(!email) return;
-      // Exclude superadmin's own tasks — shown in separate "My Tasks" bar above
-      if(_saExclude2 && email === _saExclude2) return;
+      if(_saChartEmail && email === _saChartEmail) return; // exclude superadmin
       const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
       const name=rawName?rawName.charAt(0).toUpperCase()+rawName.slice(1):'';
       if(!emailToName2.has(email) || name.length > emailToName2.get(email).length) emailToName2.set(email, name);
     });
-    const emails2=[...emailToName2.keys()];
-    const names=emails2.map(e=>emailToName2.get(e));
-    // Use all _dashTasks for avg days calculation so plant-admin-assigned closed tasks count
-    const allTasksByEmail2=new Map();
-    _dashTasks.forEach(t=>{
+    const tasksByEmail2=new Map();
+    _chartTasks.forEach(t=>{
       const email=(t.assignee||'').toLowerCase().trim();
-      if(!email) return;
-      if(!allTasksByEmail2.has(email)) allTasksByEmail2.set(email,[]);
-      allTasksByEmail2.get(email).push(t);
+      if(!email || (_saChartEmail && email===_saChartEmail)) return;
+      if(!tasksByEmail2.has(email)) tasksByEmail2.set(email,[]);
+      tasksByEmail2.get(email).push(t);
     });
-    const avgDaysVals=emails2.map(email=>{
-      const allForEmail=allTasksByEmail2.get(email)||[];
+    // Only include people who have at least 1 completed task (avgDays not null)
+    const allEmails2=[...emailToName2.keys()];
+    const avgData = allEmails2.map(email=>{
+      const allForEmail=tasksByEmail2.get(email)||[];
       const doneTasks=allForEmail.filter(t=>t.status==='Done'&&t.created);
-      if(!doneTasks.length) return null;
+      if(!doneTasks.length) return null; // no completed tasks → hide from axis
       const totalDays=doneTasks.reduce((sum,t)=>{
         const closeDate=t.closedAt||t.doneAt||null;
         const end=closeDate?new Date(closeDate):new Date();
@@ -3051,8 +3046,10 @@ function _renderDashCharts(_dashTasksRaw){
         const diff=Math.max(0,Math.round((end-start)/(1000*60*60*24)));
         return sum+diff;
       },0);
-      return Math.round(totalDays/doneTasks.length);
-    });
+      return {email, name:emailToName2.get(email), avgDays:Math.round(totalDays/doneTasks.length)};
+    }).filter(Boolean); // remove nulls (people with no completed tasks)
+    const names=avgData.map(d=>d.name);
+    const avgDaysVals=avgData.map(d=>d.avgDays);
     const acColors=['#3b82f6','#a855f7','#06b6d4','#f97316','#10b981','#f59e0b','#ef4444','#22c55e'];
     destroyChart('ch-avgclose');
     (()=>{ const wrap=document.getElementById('ch-avgclose')?.parentElement; if(wrap) wrap.style.height=Math.max(220,names.length*32)+'px'; })();
@@ -8108,10 +8105,9 @@ function getDashScopedTasks(forceMine){
       const assignee = (t.assignee||'').toLowerCase().trim();
       if(selfEmails.has(assignee)) return false; // self-assigned, already in assignedToMe
       const ab = (t.assignedBy||'').toLowerCase().trim();
-      // Superadmin tasks: assignedBy stored as saEmail, 'superadmin', OR '' (blank —
-      // older tasks created before the field was tracked).
-      // Include blank only for superadmin (not plant admin sessions).
-      return selfEmails.has(ab) || (_isSuperAdmin && (ab === 'superadmin' || ab === ''));
+      // Only explicitly assigned BY me — saEmail OR 'superadmin' flag
+      // Do NOT include ab==='' (tasks from other users with no assignedBy set)
+      return selfEmails.has(ab) || (_isSuperAdmin && ab === 'superadmin');
     });
     // These sets are disjoint (no overlap): assignedToMe has assignee=sa,
     // assignedByMeToOthers has assignee≠sa. Total = their sum = My Tasks total.
