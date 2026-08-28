@@ -804,6 +804,19 @@ firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
 
+// Secondary Firebase app used only for creating users.
+// This prevents createUserWithEmailAndPassword() from replacing the
+// currently signed-in Super Admin session. The Firestore user profile
+// is still written through the primary/admin session.
+let secondaryAuth = null;
+try {
+  const secondaryApp = firebase.app('userCreationApp');
+  secondaryAuth = secondaryApp.auth();
+} catch (e) {
+  const secondaryApp = firebase.initializeApp(firebaseConfig, 'userCreationApp');
+  secondaryAuth = secondaryApp.auth();
+}
+
 // ── Constants ──────────────────────────────────────────────────────────
 const PLANTS = ["Yamuna Nagar","Bhiwadi","Daslana","Chennai","Pune","Bawal","Kharkhoda","Faridabad","Noida"];
 const DEPARTMENTS = ["Quality","Production","Maintenance","Safety","Engineering","Stores","Logistics","HR","Finance"];
@@ -1455,20 +1468,34 @@ async function createNewUser() {
   const plant = document.getElementById('new-user-plant').value;
   const role = document.getElementById('new-user-role').value;
   if (!name||!email||!pass||!plant) { showToast('Fill all fields','error'); return; }
+  if (pass.length < 6) { showToast('Password must be at least 6 characters','error'); return; }
+  if (currentProfile?.role !== 'superadmin') { showToast('Only Super Admin can create users','error'); return; }
   try {
-    // Note: createUserWithEmailAndPassword logs in as new user.
-    // Use Firebase Admin SDK (Cloud Functions) for production user creation.
-    // This approach works but signs out current admin temporarily.
-    const cred = await auth.createUserWithEmailAndPassword(email, pass);
-    await db.collection('users').doc(cred.user.uid).set({ name, email, plant, role, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
-    // Re-sign in as admin
-    showToast('User created! Note: please re-login as admin.');
+    // IMPORTANT: create the Auth account in the secondary Firebase app.
+    // The primary app remains signed in as the Super Admin.
+    const cred = await secondaryAuth.createUserWithEmailAndPassword(email, pass);
+    const uid = cred.user.uid;
+
+    await db.collection('users').doc(uid).set({
+      name, email, plant, role, status: 'active',
+      createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+
+    await secondaryAuth.signOut();
+    showToast('User created successfully!');
     document.getElementById('new-user-name').value = '';
     document.getElementById('new-user-email').value = '';
     document.getElementById('new-user-pass').value = '';
     renderAdminUsers();
   } catch(e) {
-    showToast(e.message, 'error');
+    try { await secondaryAuth.signOut(); } catch (_) {}
+    console.error('User creation error:', e);
+    const msg = e.code === 'auth/email-already-in-use'
+      ? 'This email address is already registered.'
+      : (e.code === 'permission-denied' || /insufficient permissions/i.test(e.message)
+        ? 'Permission denied. Please make sure you are logged in as Super Admin.'
+        : e.message);
+    showToast(msg, 'error');
   }
 }
 
@@ -1568,53 +1595,101 @@ function submitStepBack() { submitStep--; updateSubmitStep(); }
 async function submitLesson() {
   const errEl = document.getElementById('submit-error');
   errEl.classList.add('hidden');
+
+  if (!currentUser || !currentProfile) {
+    errEl.textContent = 'Your user profile could not be loaded. Please sign out and sign in again.';
+    errEl.classList.remove('hidden');
+    return;
+  }
+  if (currentProfile.role === 'viewer') {
+    errEl.textContent = 'Viewer users cannot submit lessons.';
+    errEl.classList.remove('hidden');
+    return;
+  }
+
   const plant = document.getElementById('f-plant').value;
+  if (!plant) {
+    errEl.textContent = 'Please select a plant.';
+    errEl.classList.remove('hidden');
+    return;
+  }
 
-  // Generate Lesson ID
-  const yr = new Date().getFullYear();
-  const code = plant.substring(0,3).toUpperCase();
-  const counterRef = db.collection('counters').doc('lessons_'+yr);
-  let num = 1;
-  await db.runTransaction(async t => {
-    const snap = await t.get(counterRef);
-    num = snap.exists ? snap.data().count + 1 : 1;
-    t.set(counterRef, { count: num });
-  });
-  const lessonId = `LL-${code}-${yr}-${String(num).padStart(5,'0')}`;
+  const submitBtn = document.querySelector('#submit-modal button.btn-primary:last-of-type');
+  if (submitBtn) submitBtn.disabled = true;
 
-  const data = {
-    lessonId, plant,
-    title: document.getElementById('f-title').value,
-    dept: document.getElementById('f-dept').value,
-    category: document.getElementById('f-cat').value,
-    processArea: document.getElementById('f-process').value,
-    problem: document.getElementById('f-problem').value,
-    background: document.getElementById('f-background').value,
-    rootCause: document.getElementById('f-rootcause').value,
-    action: document.getElementById('f-action').value,
-    beforeCondition: document.getElementById('f-before').value,
-    afterCondition: document.getElementById('f-after').value,
-    lesson: document.getElementById('f-lesson').value,
-    benefits: document.getElementById('f-benefits').value,
-    recommendation: document.getElementById('f-rec').value,
-    impactArea: selectedImpact,
-    benefitType: selectedBenefit,
-    quantifiedBenefit: document.getElementById('f-quantified').value,
-    applicableProcesses: document.getElementById('f-applicable').value,
-    status: 'Published',
-    deleted: false,
-    createdBy: currentProfile.name,
-    createdByUid: currentUser.uid,
-    createdByPlant: plant,
-    adoptionCount: 0,
-    commentCount: 0,
-    createdAt: firebase.firestore.FieldValue.serverTimestamp()
-  };
+  try {
+    // Generate a unique Lesson ID. Rules permit authenticated non-viewers
+    // to update this counter.
+    const yr = new Date().getFullYear();
+    const code = plant.substring(0,3).toUpperCase();
+    const counterRef = db.collection('counters').doc('lessons_'+yr);
+    let num = 1;
 
-  const ref = await db.collection('lessons').add(data);
-  await logAudit(ref.id, 'LESSON_CREATED', { lessonId });
-  closeSubmitModal();
-  showToast('Lesson submitted successfully!');
+    await db.runTransaction(async t => {
+      const snap = await t.get(counterRef);
+      num = snap.exists ? Number(snap.data().count || 0) + 1 : 1;
+      t.set(counterRef, { count: num }, { merge: true });
+    });
+
+    const lessonId = `LL-${code}-${yr}-${String(num).padStart(5,'0')}`;
+    const data = {
+      lessonId, plant,
+      title: document.getElementById('f-title').value.trim(),
+      dept: document.getElementById('f-dept').value,
+      category: document.getElementById('f-cat').value,
+      processArea: document.getElementById('f-process').value.trim(),
+      problem: document.getElementById('f-problem').value.trim(),
+      background: document.getElementById('f-background').value.trim(),
+      rootCause: document.getElementById('f-rootcause').value.trim(),
+      action: document.getElementById('f-action').value.trim(),
+      beforeCondition: document.getElementById('f-before').value.trim(),
+      afterCondition: document.getElementById('f-after').value.trim(),
+      lesson: document.getElementById('f-lesson').value.trim(),
+      benefits: document.getElementById('f-benefits').value.trim(),
+      recommendation: document.getElementById('f-rec').value.trim(),
+      impactArea: selectedImpact || [],
+      benefitType: selectedBenefit || [],
+      quantifiedBenefit: document.getElementById('f-quantified').value.trim(),
+      applicableProcesses: document.getElementById('f-applicable').value.trim(),
+      status: 'Published',
+      deleted: false,
+      createdBy: currentProfile.name || '',
+      createdByUid: currentUser.uid,
+      createdByPlant: plant,
+      adoptionCount: 0,
+      commentCount: 0,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    };
+
+    // Save the lesson first. Audit logging must never make a successfully
+    // saved lesson appear to have failed.
+    const ref = await db.collection('lessons').add(data);
+
+    try {
+      await logAudit(ref.id, 'LESSON_CREATED', { lessonId });
+    } catch (auditError) {
+      console.warn('Lesson saved, but audit log failed:', auditError);
+    }
+
+    closeSubmitModal();
+    showToast(`Lesson ${lessonId} submitted successfully!`);
+
+    // Refresh the lesson list immediately.
+    if (typeof subscribeLessons === 'function') {
+      // onSnapshot is already active; no action required.
+    }
+  } catch(e) {
+    console.error('Lesson submission error:', e);
+    let msg = e.message || 'Unable to save lesson.';
+    if (e.code === 'permission-denied' || /insufficient permissions/i.test(msg)) {
+      msg = 'Permission denied while saving. Please verify that your user profile exists and your role is Plant User or Super Admin.';
+    }
+    errEl.textContent = msg;
+    errEl.classList.remove('hidden');
+    showToast(msg, 'error');
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
 }
 
 
@@ -1825,9 +1900,14 @@ async function createSettingsUser() {
   const plant = document.getElementById('su-plant').value;
   const role = document.getElementById('su-role').value;
   if (!name||!email||!pass||!plant) { showToast('Fill required fields','error'); return; }
+  if (pass.length < 6) { showToast('Password must be at least 6 characters','error'); return; }
+  if (currentProfile?.role !== 'superadmin') { showToast('Only Super Admin can create users','error'); return; }
   try {
-    const cred = await auth.createUserWithEmailAndPassword(email, pass);
-    await db.collection('users').doc(cred.user.uid).set({
+    // Create Auth account without changing the Super Admin session.
+    const cred = await secondaryAuth.createUserWithEmailAndPassword(email, pass);
+    const uid = cred.user.uid;
+
+    await db.collection('users').doc(uid).set({
       name, email, plant,
       dept: document.getElementById('su-dept').value,
       role,
@@ -1836,11 +1916,22 @@ async function createSettingsUser() {
       status: 'active',
       createdAt: firebase.firestore.FieldValue.serverTimestamp()
     });
-    showToast('User created! Re-login as admin if logged out.');
+
+    await secondaryAuth.signOut();
+    showToast('User created successfully!');
     ['su-name','su-email','su-pass','su-empid','su-mobile'].forEach(id => document.getElementById(id).value='');
     loadSettingsUsers();
     sendNotifEmail('user_created', { userName: name, userEmail: email, userPlant: plant, userRole: role });
-  } catch(e) { showToast(e.message,'error'); }
+  } catch(e) {
+    try { await secondaryAuth.signOut(); } catch (_) {}
+    console.error('Settings user creation error:', e);
+    const msg = e.code === 'auth/email-already-in-use'
+      ? 'This email address is already registered.'
+      : (e.code === 'permission-denied' || /insufficient permissions/i.test(e.message)
+        ? 'Permission denied. Please make sure you are logged in as Super Admin.'
+        : e.message);
+    showToast(msg,'error');
+  }
 }
 
 function openEditUser(uid) {
