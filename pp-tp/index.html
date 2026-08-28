@@ -2784,7 +2784,8 @@ function _renderDashCharts(_dashTasksRaw){
   // Excludes: tasks assigned TO superadmin (assignedToMe bucket), group-member
   // tasks from other plant owners, tasks with blank assignedBy from other users.
   // Also excludes tasks where superadmin assigned to themselves.
-  let _chartTasks = _dashTasks;
+  let _chartTasks = _dashTasks;         // used by status/prio/trend/assignee/dept charts (year-filtered)
+  let _allChartTasks = _dashTasks;      // used by compliance/avgdays — always all-time, never year-filtered
   const _isSuperAdminView = adminAuthenticated && !currentSession && !plantOwnerAuthenticated;
   let _saChartEmail = '';
   if (_isSuperAdminView) {
@@ -2793,7 +2794,7 @@ function _renderDashCharts(_dashTasksRaw){
     // v206: Build a set of ALL strings that mean "assigned by superadmin".
     // Older tasks may store assignedBy as the display name ("Sushil"), the email
     // prefix ("sushil"), the full email, or the canonical string "superadmin".
-    // We accept all of them so legacy tasks appear in charts.
+    // Tasks showing "Head Office" in UI have assignedBy='superadmin' — included via alias.
     const _saAliases = new Set(['superadmin']);
     if (_saChartEmail) {
       _saAliases.add(_saChartEmail);                    // full email
@@ -2803,15 +2804,24 @@ function _renderDashCharts(_dashTasksRaw){
     if (_selfName) _saAliases.add(_selfName);           // display name e.g. "sushil"
 
     const _isBySA = ab => _saAliases.has(ab);
-
-    _chartTasks = _dashTasks.filter(t => {
-      const ab      = (t.assignedBy||'').toLowerCase().trim();
+    const _saTaskFilter = t => {
+      const ab       = (t.assignedBy||'').toLowerCase().trim();
       const assignee = (t.assignee||'').toLowerCase().trim();
-      if (!_isBySA(ab)) return false;          // not assigned by SA in any known form
-      if (!assignee) return false;              // blank assignee — skip
-      if (assignee === _saChartEmail) return false; // SA assigned to themselves
+      if (!_isBySA(ab)) return false;
+      if (!assignee) return false;
+      if (assignee === _saChartEmail) return false;
       return true;
-    });
+    };
+
+    // Year-filtered scope — for charts that respect the dashboard date filter
+    _chartTasks = _dashTasks.filter(_saTaskFilter);
+
+    // All-time scope — compliance & avg-days always show lifetime totals, not just
+    // the selected year/month, so "1 of 3" vs "5 assigned" discrepancy never occurs.
+    const _rawAll = getDashScopedTasks();
+    const _seenAll = new Set();
+    const _dedupAll = _rawAll.filter(t => { if(_seenAll.has(t.id)) return false; _seenAll.add(t.id); return true; });
+    _allChartTasks = _dedupAll.filter(_saTaskFilter);
   }
 
   const statusData={
@@ -2898,14 +2908,13 @@ function _renderDashCharts(_dashTasksRaw){
     }
   });
 
-  // assignee chart — group by EMAIL, use _chartTasks (strict superadmin-assigned scope)
-  // Superadmin excluded — shown in separate "My Tasks" section above the chart.
+  // assignee chart — group by EMAIL, use _chartTasks (year-filtered SA scope)
   const aEmailToName={};
   const aEmailCount={};
   _chartTasks.forEach(t=>{
     const email=(t.assignee||'').toLowerCase().trim();
     if(!email) return;
-    if(_isSuperAdminView && _saChartEmail && email === _saChartEmail) return; // exclude superadmin
+    if(_isSuperAdminView && _saChartEmail && email === _saChartEmail) return;
     const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0];
     if(!rawName) return;
     const name=rawName.charAt(0).toUpperCase()+rawName.slice(1);
@@ -2938,8 +2947,11 @@ function _renderDashCharts(_dashTasksRaw){
       maintainAspectRatio:false,
       onClick:(evt,elements)=>{
         if(elements&&elements.length){
-          const name=aLabels[elements[0].index];
-          if(name) goToTasksByName(name);
+          const idx=elements[0].index;
+          const name=aLabels[idx];
+          const email=aEmailKeys[idx];
+          // Pass email + _chartTaskIdSet so click-through shows only SA-assigned tasks
+          if(name) goToTasksByName(name, email, _chartTaskIdSet);
         }
       },
       onHover:(evt,elements)=>{ evt.native.target.style.cursor=elements&&elements.length?'pointer':'default'; }
@@ -2956,11 +2968,11 @@ function _renderDashCharts(_dashTasksRaw){
   // so older tasks with no close-date field still produce a usable number).
   const _resolveCloseDate = t => t.completedDate||t.closedAt||t.doneAt||t.due||'';
 
-  // Build Map<email,{name,tasks[]}> from _chartTasks, excluding SA as assignee.
-  // _chartTasks already excludes tasks NOT assigned by SA — no extra check needed here.
+  // Build Map<email,{name,tasks[]}> from _allChartTasks (all-time, unfiltered by year/month).
+  // Compliance and avg-days always reflect lifetime totals regardless of dashboard date filter.
   const _buildEmailMap = () => {
     const map = new Map();
-    _chartTasks.forEach(t => {
+    _allChartTasks.forEach(t => {
       const email = (t.assignee||'').toLowerCase().trim();
       if (!email) return;
       if (_saChartEmail && email === _saChartEmail) return; // skip SA-to-self
@@ -2973,8 +2985,8 @@ function _renderDashCharts(_dashTasksRaw){
     return map;
   };
 
-  // ID set used by chart click-throughs to scope task list to SA-assigned only.
-  const _chartTaskIdSet = new Set(_chartTasks.map(t => t.id));
+  // ID set for click-through scoping — also all-time so clicked list matches chart totals.
+  const _chartTaskIdSet = new Set(_allChartTasks.map(t => t.id));
 
   // ── Compliance + Avg Days — one shared masterRows, same sort, same name order ──
   (()=>{
@@ -3026,12 +3038,7 @@ function _renderDashCharts(_dashTasksRaw){
           y: { ticks: { color: tickCol, font: { size: 10, weight: '600' } }, grid: { display: false } }
         },
         maintainAspectRatio: false,
-        onClick: (evt, el) => { if (el&&el.length) { const r=masterRows[el[0].index]; if(r) goToTasksByName(r.name, r.email, _chartTaskIdSet); } },
-        onHover: (evt, el) => { evt.native.target.style.cursor = el&&el.length ? 'pointer' : 'default'; }
-      }
-    });
-
-    // ── Avg Days chart — same name order, null = no bar (row still present) ──
+        onClick: (evt, el) => { if (el&&el.length) { const r=masterRows[el[0].index]; if(r) goToTasksByName(r.name, r.email, _chartTaskIdSet, true); } },
     const avgVals = masterRows.map(r => r.avgDays);
     destroyChart('ch-avgclose');
     const _aw = document.getElementById('ch-avgclose')?.parentElement;
@@ -3050,7 +3057,7 @@ function _renderDashCharts(_dashTasksRaw){
           y: { ticks: { color: tickCol, font: { size: 10, weight: '600' } }, grid: { display: false } }
         },
         maintainAspectRatio: false,
-        onClick: (evt, el) => { if (el&&el.length) { const r=masterRows[el[0].index]; if(r) goToTasksByName(r.name, r.email, _chartTaskIdSet); } },
+        onClick: (evt, el) => { if (el&&el.length) { const r=masterRows[el[0].index]; if(r) goToTasksByName(r.name, r.email, _chartTaskIdSet, true); } },
         onHover: (evt, el) => { evt.native.target.style.cursor = el&&el.length ? 'pointer' : 'default'; }
       }
     });
@@ -4654,8 +4661,9 @@ function renderTaskRows(){
         ? taskFilters._ids.has(t.id)
         : (!taskFilters.dueFrom && !taskFilters.dueTo) ||
           (t.due && (!taskFilters.dueFrom || t.due >= taskFilters.dueFrom) && (!taskFilters.dueTo || t.due <= taskFilters.dueTo));
-    const sy = (dashYearFilter==='All' || (t.due && t.due.slice(0,4)===dashYearFilter)) &&
-               (dashMonthFilter==='All' || (t.due && t.due.slice(5,7)===dashMonthFilter));
+    const sy = taskFilters._ignoreYM ? true :
+               ((dashYearFilter==='All' || (t.due && t.due.slice(0,4)===dashYearFilter)) &&
+               (dashMonthFilter==='All' || (t.due && t.due.slice(5,7)===dashMonthFilter)));
     // Dept filter: match task.department
     // Dept filter: always apply if set (even when _ids is also set)
     const sdept = !taskFilters._dept || (t.department||'')===(taskFilters._dept||'');
@@ -15133,12 +15141,14 @@ function goToTasksByDept(dept){
 
 // ── Navigate: name/compliance/avgdays bar → scoped task list ──
 // name    — display label; email — exact assignee email; idScope — Set of SA-scoped task IDs
-function goToTasksByName(name, email, idScope){
+// ignoreYM — when true, bypass dashboard year/month filter (compliance chart is all-time)
+function goToTasksByName(name, email, idScope, ignoreYM){
   const _scopeIds = (idScope instanceof Set) ? idScope : null;
   taskFilters = {
     status: 'All', priority: 'All', search: '', overdue: false,
     _assigneeEmail: email || '',
     _assigneeName:  email ? '' : name,
+    _ignoreYM: !!ignoreYM,
     ...(_scopeIds ? { _ids: _scopeIds } : {})
   };
   window._fromDashStat = true;
