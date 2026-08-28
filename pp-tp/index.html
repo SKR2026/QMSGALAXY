@@ -2649,7 +2649,6 @@ function _buildDeptCardHTML(dept, tasksArr, col, onClickFn) {
   let avgDays = '—';
   const doneWithCreated = doneT.filter(t => t.created);
   if (doneWithCreated.length) {
-    // v206: unified field order — completedDate first, fall back to closedAt/doneAt/due
     const tot = doneWithCreated.reduce((sum, t) => {
       const endStr = t.completedDate||t.closedAt||t.doneAt||t.due||'';
       const end = endStr ? new Date(endStr) : new Date();
@@ -2741,7 +2740,6 @@ function _renderDeptSection(prefix, tasksArr, onClickFn, rowElId, statsWrapId, f
   const deptAvg = depts.map(dept => {
     const done = fullTasksArr.filter(t => t.department === dept && t.status === 'Done' && t.created);
     if (!done.length) return null;
-    // v206: unified field order — completedDate first, fall back to closedAt/doneAt/due
     const tot = done.reduce((sum, t) => {
       const endStr = t.completedDate||t.closedAt||t.doneAt||t.due||'';
       const end = endStr ? new Date(endStr) : new Date();
@@ -2791,38 +2789,29 @@ function _renderDashCharts(_dashTasksRaw){
   let _saChartEmail = '';
   if (_isSuperAdminView) {
     _saChartEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+
+    // v206: Build a set of ALL strings that mean "assigned by superadmin".
+    // Older tasks may store assignedBy as the display name ("Sushil"), the email
+    // prefix ("sushil"), the full email, or the canonical string "superadmin".
+    // We accept all of them so legacy tasks appear in charts.
+    const _saAliases = new Set(['superadmin']);
+    if (_saChartEmail) {
+      _saAliases.add(_saChartEmail);                    // full email
+      _saAliases.add(_saChartEmail.split('@')[0]);      // email prefix e.g. "sushil"
+    }
+    const _selfName = (localStorage.getItem('self_name')||'').trim().toLowerCase();
+    if (_selfName) _saAliases.add(_selfName);           // display name e.g. "sushil"
+
+    const _isBySA = ab => _saAliases.has(ab);
+
     _chartTasks = _dashTasks.filter(t => {
-      const ab       = (t.assignedBy||'').toLowerCase().trim();
+      const ab      = (t.assignedBy||'').toLowerCase().trim();
       const assignee = (t.assignee||'').toLowerCase().trim();
-      // Must be explicitly assigned BY superadmin
-      const assignedBySA = (_saChartEmail && ab === _saChartEmail) || ab === 'superadmin';
-      if (!assignedBySA) return false;
-      // Exclude self-assigned tasks (superadmin assigned to themselves)
-      if (_saChartEmail && assignee === _saChartEmail) return false;
-      // Also exclude if assignee is blank
-      if (!assignee) return false;
+      if (!_isBySA(ab)) return false;          // not assigned by SA in any known form
+      if (!assignee) return false;              // blank assignee — skip
+      if (assignee === _saChartEmail) return false; // SA assigned to themselves
       return true;
     });
-
-    // ── DEBUG: log raw task data so we can see actual field values ──
-    console.group('🔍 CHART DEBUG');
-    console.log('admin_notify_email (saEmail):', _saChartEmail);
-    console.log('self_name:', localStorage.getItem('self_name'));
-    console.log('_dashTasks count:', _dashTasks.length);
-    console.log('_chartTasks count:', _chartTasks.length);
-    console.log('_dashTasks assignedBy values (unique):', [...new Set(_dashTasks.map(t=>t.assignedBy||'(blank)'))]);
-    console.log('_chartTasks assignee+assigneeName+assignedBy sample:',
-      _chartTasks.map(t=>({assignee:t.assignee, assigneeName:t.assigneeName, assignedBy:t.assignedBy, status:t.status, completedDate:t.completedDate, created:t.created}))
-    );
-    console.log('_dashTasks tasks where assignee looks like superadmin:',
-      _dashTasks.filter(t=>{
-        const e=(t.assignee||'').toLowerCase();
-        const n=(t.assigneeName||'').toLowerCase();
-        return e===_saChartEmail || n==='sushil' || n.includes('sushil');
-      }).map(t=>({assignee:t.assignee,assigneeName:t.assigneeName,assignedBy:t.assignedBy}))
-    );
-    console.groupEnd();
-    // ── END DEBUG ──
   }
 
   const statusData={
@@ -2957,88 +2946,75 @@ function _renderDashCharts(_dashTasksRaw){
     }
   });
 
-  // ── Shared helper: resolve display name from a task (capitalised, email-prefix fallback) ──
-  // Used by both compliance and avg-days charts so the name shown is always consistent.
+  // ── Shared helpers for Compliance + Avg Days charts ───────────────────
+  // Resolve display name — assigneeName wins, fallback to email prefix, capitalised.
   const _resolveName = t => {
-    const raw = (t.assigneeName && t.assigneeName.trim()) || (t.assignee||'').split('@')[0] || '';
+    const raw = (t.assigneeName&&t.assigneeName.trim()) || (t.assignee||'').split('@')[0] || '';
     return raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : '';
   };
+  // Resolve close date — completedDate → closedAt → doneAt → due (due as last resort
+  // so older tasks with no close-date field still produce a usable number).
+  const _resolveCloseDate = t => t.completedDate||t.closedAt||t.doneAt||t.due||'';
 
-  // ── Shared helper: resolve close date from a task ──
-  // Priority: completedDate → closedAt → doneAt → due (due is last-resort so
-  // older tasks without any close-date field still get an approximate number).
-  const _resolveCloseDate = t =>
-    t.completedDate || t.closedAt || t.doneAt || t.due || '';
-
-  // ── Shared helper: build a per-email task map from _chartTasks ──
-  // Excludes SA by email. Returns Map<email, {name, tasks[]}>.
+  // Build Map<email,{name,tasks[]}> from _chartTasks, excluding SA as assignee.
+  // _chartTasks already excludes tasks NOT assigned by SA — no extra check needed here.
   const _buildEmailMap = () => {
-    const map = new Map(); // email → { name, tasks[] }
+    const map = new Map();
     _chartTasks.forEach(t => {
       const email = (t.assignee||'').toLowerCase().trim();
       if (!email) return;
-      if (_saChartEmail && email === _saChartEmail) return; // exclude SA
+      if (_saChartEmail && email === _saChartEmail) return; // skip SA-to-self
       const name = _resolveName(t);
       if (!name) return;
       if (!map.has(email)) map.set(email, { name, tasks: [] });
-      // Always keep the longest name seen (more complete display name wins)
       if (name.length > map.get(email).name.length) map.get(email).name = name;
       map.get(email).tasks.push(t);
     });
     return map;
   };
 
-  // ── Shared helper: SA-scoped _ids set for goToTasksByName click-through ──
-  // Scopes the task list to exactly the same tasks that appear in _chartTasks,
-  // so clicking a bar shows the correct count — not ALL tasks for that person.
+  // ID set used by chart click-throughs to scope task list to SA-assigned only.
   const _chartTaskIdSet = new Set(_chartTasks.map(t => t.id));
 
-  // ── Compliance + Avg Days — built from one shared sorted row list ──────
-  // Both charts use IDENTICAL name order (compliance % desc, then name asc for ties).
-  // Avg Days shows null for people with no Done tasks so their row still appears
-  // at the same position, keeping the two charts visually aligned.
+  // ── Compliance + Avg Days — one shared masterRows, same sort, same name order ──
   (()=>{
     const emailMap = _buildEmailMap();
     const acColors = ['#3b82f6','#a855f7','#06b6d4','#f97316','#10b981','#f59e0b','#ef4444','#22c55e'];
 
-    // ── Build master row list — one entry per person ──
+    // Build one row per person covering both metrics
     const masterRows = [...emailMap.entries()].map(([email, {name, tasks}]) => {
       const total  = tasks.length;
       const closed = tasks.filter(t => t.status === 'Done').length;
       const pct    = total ? Math.round(closed / total * 100) : 0;
 
-      // Avg days — null when no Done tasks or no usable dates
       const doneTasks = tasks.filter(t => t.status === 'Done');
       const daysArr = doneTasks.map(t => {
-        const startStr = t.created || '';
-        const endStr   = _resolveCloseDate(t);
-        if (!startStr || !endStr) return null;
-        return Math.max(0, Math.round((new Date(endStr) - new Date(startStr)) / 86400000));
+        const s = t.created || '', e = _resolveCloseDate(t);
+        if (!s || !e) return null;
+        return Math.max(0, Math.round((new Date(e) - new Date(s)) / 86400000));
       }).filter(d => d !== null);
       const avgDays = daysArr.length
-        ? Math.round(daysArr.reduce((s, d) => s + d, 0) / daysArr.length)
+        ? Math.round(daysArr.reduce((a,d) => a+d, 0) / daysArr.length)
         : null;
 
       return { email, name, pct, total, closed, avgDays, doneCount: doneTasks.length };
     });
 
-    // ── Single sort: compliance % desc, then name asc for ties ──
-    // Both charts render in this same order — names always align.
+    // Sort: compliance % desc, then name A→Z for ties — BOTH charts use this order
     masterRows.sort((a, b) => b.pct - a.pct || a.name.localeCompare(b.name));
 
-    const names = masterRows.map(r => r.name);
-    const rowHeight = 36;
-    const chartH = Math.max(220, names.length * rowHeight);
+    const names  = masterRows.map(r => r.name);
+    const chartH = Math.max(220, names.length * 36);
 
-    // ── Compliance chart ──
-    const complianceVals = masterRows.map(r => r.pct);
-    const compColors     = complianceVals.map(v => v >= 80 ? '#22c55e' : v >= 50 ? '#f59e0b' : '#ef4444');
+    // ── Compliance chart ───────────────────────────────────────────
+    const compVals   = masterRows.map(r => r.pct);
+    const compColors = compVals.map(v => v >= 80 ? '#22c55e' : v >= 50 ? '#f59e0b' : '#ef4444');
     destroyChart('ch-compliance');
-    const _cwrap = document.getElementById('ch-compliance')?.parentElement;
-    if (_cwrap) _cwrap.style.height = chartH + 'px';
+    const _cw = document.getElementById('ch-compliance')?.parentElement;
+    if (_cw) _cw.style.height = chartH + 'px';
     chartInstances['ch-compliance'] = new Chart(document.getElementById('ch-compliance'), {
       type: 'bar',
-      data: { labels: names, datasets: [{ label: 'Compliance %', data: complianceVals, backgroundColor: compColors, borderRadius: 6, borderWidth: 0 }] },
+      data: { labels: names, datasets: [{ label: 'Compliance %', data: compVals, backgroundColor: compColors, borderRadius: 6, borderWidth: 0 }] },
       options: {
         indexAxis: 'y',
         plugins: {
@@ -3046,36 +3022,36 @@ function _renderDashCharts(_dashTasksRaw){
           tooltip: { callbacks: { label: ctx => { const r = masterRows[ctx.dataIndex]; return ` ${ctx.raw}%  (${r.closed} of ${r.total} closed)`; } }}
         },
         scales: {
-          x: { min: 0, max: 100, ticks: { color: tickCol, font: { size: 10, weight: '600' }, callback: v => v + '%' }, grid: { color: gridCol } },
+          x: { min: 0, max: 100, ticks: { color: tickCol, font: { size: 10, weight: '600' }, callback: v => v+'%' }, grid: { color: gridCol } },
           y: { ticks: { color: tickCol, font: { size: 10, weight: '600' } }, grid: { display: false } }
         },
         maintainAspectRatio: false,
-        onClick: (evt, elements) => { if (elements && elements.length) { const r = masterRows[elements[0].index]; if (r) goToTasksByName(r.name, r.email, _chartTaskIdSet); } },
-        onHover: (evt, elements) => { evt.native.target.style.cursor = elements && elements.length ? 'pointer' : 'default'; }
+        onClick: (evt, el) => { if (el&&el.length) { const r=masterRows[el[0].index]; if(r) goToTasksByName(r.name, r.email, _chartTaskIdSet); } },
+        onHover: (evt, el) => { evt.native.target.style.cursor = el&&el.length ? 'pointer' : 'default'; }
       }
     });
 
-    // ── Avg Days chart — same name order, null where no data ──
-    const avgDaysVals = masterRows.map(r => r.avgDays); // null entries render as no bar
+    // ── Avg Days chart — same name order, null = no bar (row still present) ──
+    const avgVals = masterRows.map(r => r.avgDays);
     destroyChart('ch-avgclose');
-    const _awrap = document.getElementById('ch-avgclose')?.parentElement;
-    if (_awrap) _awrap.style.height = chartH + 'px';
+    const _aw = document.getElementById('ch-avgclose')?.parentElement;
+    if (_aw) _aw.style.height = chartH + 'px';
     chartInstances['ch-avgclose'] = new Chart(document.getElementById('ch-avgclose'), {
       type: 'bar',
-      data: { labels: names, datasets: [{ label: 'Avg Days', data: avgDaysVals, backgroundColor: names.map((_, i) => acColors[i % acColors.length]), borderRadius: 6, borderWidth: 0 }] },
+      data: { labels: names, datasets: [{ label: 'Avg Days', data: avgVals, backgroundColor: names.map((_,i) => acColors[i%acColors.length]), borderRadius: 6, borderWidth: 0 }] },
       options: {
         indexAxis: 'y',
         plugins: {
           legend: { display: false },
-          tooltip: { callbacks: { label: ctx => { const r = masterRows[ctx.dataIndex]; return r.avgDays === null ? ' No completed tasks' : ` ${ctx.raw}d avg  (${r.doneCount} task${r.doneCount !== 1 ? 's' : ''} closed)`; } }}
+          tooltip: { callbacks: { label: ctx => { const r = masterRows[ctx.dataIndex]; return r.avgDays===null ? ' No completed tasks' : ` ${ctx.raw}d avg  (${r.doneCount} task${r.doneCount!==1?'s':''} closed)`; } }}
         },
         scales: {
-          x: { ticks: { color: tickCol, font: { size: 10, weight: '600' }, callback: v => v + 'd' }, grid: { color: gridCol } },
+          x: { ticks: { color: tickCol, font: { size: 10, weight: '600' }, callback: v => v+'d' }, grid: { color: gridCol } },
           y: { ticks: { color: tickCol, font: { size: 10, weight: '600' } }, grid: { display: false } }
         },
         maintainAspectRatio: false,
-        onClick: (evt, elements) => { if (elements && elements.length) { const r = masterRows[elements[0].index]; if (r) goToTasksByName(r.name, r.email, _chartTaskIdSet); } },
-        onHover: (evt, elements) => { evt.native.target.style.cursor = elements && elements.length ? 'pointer' : 'default'; }
+        onClick: (evt, el) => { if (el&&el.length) { const r=masterRows[el[0].index]; if(r) goToTasksByName(r.name, r.email, _chartTaskIdSet); } },
+        onHover: (evt, el) => { evt.native.target.style.cursor = el&&el.length ? 'pointer' : 'default'; }
       }
     });
   })();
@@ -3090,7 +3066,6 @@ function _renderDashCharts(_dashTasksRaw){
     const _myComplPct = _myTotal ? Math.round(_myClosed / _myTotal * 100) : 0;
     const _myDone     = _myTasksAll.filter(t => t.status === 'Done' && t.created);
     const _myAvgDays  = _myDone.length ? Math.round(_myDone.reduce((s,t)=>{
-      // v206: unified field order
       const endStr = t.completedDate||t.closedAt||t.doneAt||t.due||'';
       const end = endStr ? new Date(endStr) : new Date();
       return s + Math.max(0, Math.round((end - new Date(t.created)) / 86400000));
@@ -3409,16 +3384,18 @@ function _rebuildDashStats(){
   window._lastDashTaskIds = new Set(_rbDeduped.map(t=>t.id));
   // Also update _lastChartTaskIds for dept nav consistency
   if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
-    const _saEm2=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-    // v206: mirror _chartTasks exactly — exclude blank assignee + self-assigned
-    const _rbChart=_rbDeduped.filter(t=>{
-      const ab=(t.assignedBy||'').toLowerCase().trim();
-      const ae=(t.assignee||'').toLowerCase().trim();
-      const bySA=(_saEm2&&ab===_saEm2)||ab==='superadmin';
-      if(!bySA||(_saEm2&&ae===_saEm2)||!ae) return false;
-      return true;
+    // v206: match all SA identity forms
+    const _saEm2 = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    const _snm2  = (localStorage.getItem('self_name')||'').trim().toLowerCase();
+    const _saAl2 = new Set(['superadmin']);
+    if (_saEm2) { _saAl2.add(_saEm2); _saAl2.add(_saEm2.split('@')[0]); }
+    if (_snm2)  _saAl2.add(_snm2);
+    const _rbChart = _rbDeduped.filter(t => {
+      const ab = (t.assignedBy||'').toLowerCase().trim();
+      const ae = (t.assignee||'').toLowerCase().trim();
+      return _saAl2.has(ab) && ae && ae !== _saEm2;
     });
-    window._lastChartTaskIds=new Set(_rbChart.map(t=>t.id));
+    window._lastChartTaskIds = new Set(_rbChart.map(t=>t.id));
   } else {
     window._lastChartTaskIds=window._lastDashTaskIds;
   }
@@ -3436,14 +3413,16 @@ function renderDashboard(){
   // _lastChartTaskIds will be set by _renderDashCharts (async) — pre-populate with
   // superadmin-assigned-out subset so dept cards work even before charts render
   if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
-    const _saEm=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-    // v206: mirror _chartTasks exactly — exclude blank assignee + self-assigned
-    const _preChart=scopedTasks.filter(t=>{
-      const ab=(t.assignedBy||'').toLowerCase().trim();
-      const ae=(t.assignee||'').toLowerCase().trim();
-      const bySA=(_saEm&&ab===_saEm)||ab==='superadmin';
-      if(!bySA||(_saEm&&ae===_saEm)||!ae) return false;
-      return true;
+    // v206: match all SA identity forms (superadmin / email / prefix / display name)
+    const _saEm = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    const _snm  = (localStorage.getItem('self_name')||'').trim().toLowerCase();
+    const _saAl = new Set(['superadmin']);
+    if (_saEm) { _saAl.add(_saEm); _saAl.add(_saEm.split('@')[0]); }
+    if (_snm)  _saAl.add(_snm);
+    const _preChart = scopedTasks.filter(t => {
+      const ab = (t.assignedBy||'').toLowerCase().trim();
+      const ae = (t.assignee||'').toLowerCase().trim();
+      return _saAl.has(ab) && ae && ae !== _saEm;
     });
     window._lastChartTaskIds = new Set(_preChart.map(t=>t.id));
   } else {
@@ -4680,8 +4659,7 @@ function renderTaskRows(){
     // Dept filter: match task.department
     // Dept filter: always apply if set (even when _ids is also set)
     const sdept = !taskFilters._dept || (t.department||'')===(taskFilters._dept||'');
-    // Name filter: case-insensitive match on assigneeName or email prefix
-    // v206: chart labels are capitalised but stored names may be any case
+    // Name filter: case-insensitive match (chart labels are capitalised; stored names may differ)
     const sname = !taskFilters._assigneeName || (() => {
       const n = ((t.assigneeName&&t.assigneeName.trim()) || (t.assignee||'').split('@')[0]).toLowerCase();
       return n === taskFilters._assigneeName.toLowerCase();
@@ -5254,7 +5232,7 @@ function pushReminderLog(entry){
 function startReminderLogListener(){
   if(!_fbReady || !_db) return;
   if(_reminderLogUnsub) return; // already listening
-  // v206: skip if not yet authenticated — anonymous users lack Firestore read permission
+  // v206: don't subscribe while anonymous — lacks Firestore read permission
   if(!adminAuthenticated && !currentSession && !plantOwnerAuthenticated) return;
 
   // Listen to last 200 runs, newest first
@@ -8374,10 +8352,10 @@ async function overlayAdminLogin(){
       currentSession = null;
       adminAuthenticated = true;
       localStorage.setItem('admin_password', stored);
-      // v206: Bootstrap self_name from email prefix if never set (needed for chart exclusion)
+      // v206: bootstrap self_name from email prefix if never explicitly set
       if (!localStorage.getItem('self_name')) {
-        const _bsEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-        if (_bsEmail) { const _bsName = _bsEmail.split('@')[0]; if (_bsName) localStorage.setItem('self_name', _bsName); }
+        const _bsE = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+        if (_bsE) { const _bsN = _bsE.split('@')[0]; if (_bsN) localStorage.setItem('self_name', _bsN); }
       }
       const overlay = document.getElementById('admin-pwd-overlay');
       if(overlay) overlay.remove();
@@ -8404,7 +8382,7 @@ async function overlayAdminLogin(){
           _loadGroupMemberEmails(_saKey).then(() => { refreshOverdueBadge(); });
         });
       }
-      startReminderLogListener(); // v206: call after auth confirmed, not on page load
+      startReminderLogListener(); // v206: auth now confirmed
       toast('Welcome back, Super Admin! 👋');
       showPanel('dashboard');
     };
@@ -15116,17 +15094,18 @@ function goToPlantTasksByDept(dept){
 
 // ── Navigate: dept card/chart in Plant Panel (superadmin view) → All Tasks ──
 function goToTasksByDept(dept){
-  // Navigate to dept-filtered task list scoped to SA-assigned tasks only.
-  // v206: mirror _chartTasks exactly so card count = list count.
+  // v206: scope to SA-assigned tasks matching all known identity forms
   let scopeIds = null;
   if(adminAuthenticated && !currentSession && !plantOwnerAuthenticated){
-    const _saGo=(localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
-    const _chartIds = tasks.filter(t=>{
-      const ab=(t.assignedBy||'').toLowerCase().trim();
-      const ae=(t.assignee||'').toLowerCase().trim();
-      const bySA=(_saGo&&ab===_saGo)||ab==='superadmin';
-      if(!bySA||(_saGo&&ae===_saGo)||!ae) return false;
-      return true;
+    const _saGo  = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+    const _snmGo = (localStorage.getItem('self_name')||'').trim().toLowerCase();
+    const _saAlGo = new Set(['superadmin']);
+    if (_saGo)  { _saAlGo.add(_saGo); _saAlGo.add(_saGo.split('@')[0]); }
+    if (_snmGo) _saAlGo.add(_snmGo);
+    const _chartIds = tasks.filter(t => {
+      const ab = (t.assignedBy||'').toLowerCase().trim();
+      const ae = (t.assignee||'').toLowerCase().trim();
+      return _saAlGo.has(ab) && ae && ae !== _saGo;
     }).map(t=>t.id);
     scopeIds = new Set(_chartIds);
   } else if(window._lastChartTaskIds instanceof Set){
@@ -15148,16 +15127,12 @@ function goToTasksByDept(dept){
   renderTasks();
 }
 
-// ── Navigate: name chart bar → task list scoped to that person's SA-assigned tasks ──
-// name    — display label shown in topbar
-// email   — lowercase assignee email used for exact matching (preferred over name)
-// idScope — Set of task IDs from _chartTasks; restricts list to SA-assigned scope
-//           so the task-list count matches exactly what the chart bar counted.
+// ── Navigate: name/compliance/avgdays bar → scoped task list ──
+// name    — display label; email — exact assignee email; idScope — Set of SA-scoped task IDs
 function goToTasksByName(name, email, idScope){
   const _scopeIds = (idScope instanceof Set) ? idScope : null;
   taskFilters = {
     status: 'All', priority: 'All', search: '', overdue: false,
-    // Use email for exact matching; _assigneeName only when no email provided
     _assigneeEmail: email || '',
     _assigneeName:  email ? '' : name,
     ...(_scopeIds ? { _ids: _scopeIds } : {})
