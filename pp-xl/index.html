@@ -1745,12 +1745,26 @@ function switchSettingsTab(tab, btn) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async function loadDynamicPlants() {
-  const snap = await db.collection('plants').orderBy('name').get();
-  if (!snap.empty) {
-    dynamicPlants = snap.docs.map(d => d.data().name);
+  try {
+    const snap = await db.collection('plants').orderBy('name').get();
+    const rows = snap.docs.map(d => ({id:d.id,...d.data()}));
+    const names = rows.map(p => p.name).filter(Boolean);
+    // Keep the built-in plants available even if the database is empty.
+    dynamicPlants = names.length ? [...new Set(names)] : [...PLANTS];
     refreshAllPlantSelects();
+    renderPlantsList(rows);
+  } catch (e) {
+    console.error('Load plants error:', e);
+    // A permission/index problem must not break all plant dropdowns.
+    dynamicPlants = [...PLANTS];
+    refreshAllPlantSelects();
+    renderPlantsList([]);
+    if (e.code === 'permission-denied') {
+      showToast('Cannot load plants: Firestore rules do not allow access to plants.', 'error');
+    } else {
+      showToast('Unable to load plants: ' + (e.message || 'Unknown error'), 'error');
+    }
   }
-  renderPlantsList(snap.docs.map(d => ({id:d.id,...d.data()})));
 }
 
 function refreshAllPlantSelects() {
@@ -1789,25 +1803,42 @@ function renderPlantsList(plants) {
 async function savePlant() {
   const name = document.getElementById('sp-name').value.trim();
   if (!name) { showToast('Plant name is required','error'); return; }
+  if (currentProfile?.role !== 'superadmin') {
+    showToast('Only Super Admin can save plants.', 'error');
+    return;
+  }
   const data = {
     name,
     code: document.getElementById('sp-code').value.trim().toUpperCase(),
     location: document.getElementById('sp-location').value.trim(),
     head: document.getElementById('sp-head').value.trim(),
     email: document.getElementById('sp-email').value.trim(),
-    status: document.getElementById('sp-status').value,
+    status: document.getElementById('sp-status').value || 'active',
     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
   };
-  if (editingPlantId) {
-    await db.collection('plants').doc(editingPlantId).update(data);
-    showToast('Plant updated!');
-  } else {
-    data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
-    await db.collection('plants').add(data);
-    showToast('Plant added!');
+  const btn = document.querySelector('#settings-plants .btn-save');
+  if (btn) btn.disabled = true;
+  try {
+    if (editingPlantId) {
+      await db.collection('plants').doc(editingPlantId).update(data);
+      showToast('Plant updated successfully!');
+    } else {
+      data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+      await db.collection('plants').add(data);
+      showToast('Plant added successfully!');
+    }
+    cancelEditPlant();
+    await loadDynamicPlants();
+  } catch (e) {
+    console.error('Save plant error:', e);
+    if (e.code === 'permission-denied') {
+      showToast('Permission denied. Add plants permission to Firestore rules for Super Admin.', 'error');
+    } else {
+      showToast('Plant save failed: ' + (e.message || 'Unknown error'), 'error');
+    }
+  } finally {
+    if (btn) btn.disabled = false;
   }
-  cancelEditPlant();
-  loadDynamicPlants();
 }
 
 function editPlant(id, dataJson) {
@@ -1831,10 +1862,16 @@ function cancelEditPlant() {
 }
 
 async function deletePlant(id, name) {
+  if (currentProfile?.role !== 'superadmin') { showToast('Only Super Admin can delete plants.', 'error'); return; }
   if (!confirm(`Delete plant "${name}"? This cannot be undone.`)) return;
-  await db.collection('plants').doc(id).delete();
-  showToast('Plant deleted.');
-  loadDynamicPlants();
+  try {
+    await db.collection('plants').doc(id).delete();
+    showToast('Plant deleted.');
+    await loadDynamicPlants();
+  } catch (e) {
+    console.error('Delete plant error:', e);
+    showToast(e.code === 'permission-denied' ? 'Permission denied. Check Firestore rules for plants.' : 'Delete failed: ' + e.message, 'error');
+  }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2119,13 +2156,29 @@ async function loadBulkHistory() {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async function loadBranding() {
-  const snap = await db.collection('settings').doc('branding').get();
-  if (!snap.exists) return;
-  const b = snap.data();
-  document.getElementById('brand-org').value = b.orgName||'';
-  document.getElementById('brand-tagline').value = b.tagline||'';
-  if (b.color) { document.getElementById('brand-color').value = b.color; document.getElementById('brand-color-hex').value = b.color; }
-  if (b.logoUrl) applyLogo(b.logoUrl);
+  try {
+    const snap = await db.collection('settings').doc('branding').get();
+    if (!snap.exists) return;
+    const b = snap.data();
+    document.getElementById('brand-org').value = b.orgName||'';
+    document.getElementById('brand-tagline').value = b.tagline||'';
+    if (b.color && /^#[0-9A-Fa-f]{6}$/.test(b.color)) {
+      document.getElementById('brand-color').value = b.color;
+      document.getElementById('brand-color-hex').value = b.color;
+      applyBrandColor(b.color);
+    }
+    if (b.logoUrl) applyLogo(b.logoUrl);
+  } catch (e) {
+    console.error('Load branding error:', e);
+    if (e.code === 'permission-denied') showToast('Cannot load branding: Firestore rules do not allow settings/branding.', 'error');
+  }
+}
+
+function applyBrandColor(color) {
+  document.documentElement.style.setProperty('--brand-color', color);
+  document.querySelectorAll('.logo-mark').forEach(el => el.style.background = color);
+  document.querySelectorAll('.btn-primary').forEach(el => el.style.background = color);
+  document.querySelectorAll('.btn-save').forEach(el => el.style.background = color);
 }
 
 function applyLogo(url) {
@@ -2167,7 +2220,12 @@ async function uploadLogo() {
     await db.collection('settings').doc('branding').set({ logoUrl: url }, { merge: true });
     applyLogo(url);
     showToast('Logo uploaded!');
-  } catch(e) { showToast('Upload failed: ' + e.message,'error'); }
+  } catch(e) {
+    console.error('Logo upload error:', e);
+    showToast(e.code === 'storage/unauthorized' || e.code === 'storage/permission-denied'
+      ? 'Logo upload denied. Check Firebase Storage rules for Super Admin.'
+      : 'Upload failed: ' + e.message,'error');
+  }
 }
 
 function syncColor(hex) {
@@ -2175,19 +2233,42 @@ function syncColor(hex) {
 }
 
 async function saveBranding() {
+  if (currentProfile?.role !== 'superadmin') {
+    showToast('Only Super Admin can save branding.', 'error');
+    return;
+  }
   const color = document.getElementById('brand-color').value;
+  const hex = document.getElementById('brand-color-hex').value.trim();
+  if (!/^#[0-9A-Fa-f]{6}$/.test(color)) {
+    showToast('Please select a valid primary colour.', 'error');
+    return;
+  }
+  if (hex && !/^#[0-9A-Fa-f]{6}$/.test(hex)) {
+    showToast('Invalid colour hex code. Use format #1D9E75.', 'error');
+    return;
+  }
   const data = {
     orgName: document.getElementById('brand-org').value.trim(),
     tagline: document.getElementById('brand-tagline').value.trim(),
     color,
     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
   };
-  await db.collection('settings').doc('branding').set(data, { merge: true });
-  // Apply colour to CSS
-  document.documentElement.style.setProperty('--brand-color', color);
-  document.querySelectorAll('.logo-mark').forEach(el => el.style.background = color);
-  document.querySelectorAll('.btn-primary').forEach(el => el.style.background = color);
-  showToast('Branding saved!');
+  const btn = document.querySelector('#settings-branding .btn-save');
+  if (btn) btn.disabled = true;
+  try {
+    await db.collection('settings').doc('branding').set(data, { merge: true });
+    applyBrandColor(color);
+    showToast('Branding saved successfully!');
+  } catch (e) {
+    console.error('Save branding error:', e);
+    if (e.code === 'permission-denied') {
+      showToast('Permission denied. Add settings/branding write permission for Super Admin in Firestore rules.', 'error');
+    } else {
+      showToast('Branding save failed: ' + (e.message || 'Unknown error'), 'error');
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
