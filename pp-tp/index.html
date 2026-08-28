@@ -2934,15 +2934,22 @@ function _renderDashCharts(_dashTasksRaw){
 
   // ── Compliance by Name (assigneeName or email prefix) ──────
   (()=>{
+    // Superadmin identity — match by email AND self_name to reliably exclude Sushil
+    // even if admin_notify_email is unset or the task's assignee field differs slightly.
+    const _saName = (localStorage.getItem('self_name')||'').trim().toLowerCase();
+    const _isSA = (email, rawName) =>
+      (_saChartEmail && email === _saChartEmail) ||
+      (_saName && (rawName||'').toLowerCase().trim() === _saName);
+
     // WHO appears: people superadmin assigned tasks to (_chartTasks — strict filter above).
     // HOW compliance calculated: _chartTasks only (superadmin-assigned tasks).
-    // Sushil excluded via _saChartEmail. Zero-done names hidden (no bar = no axis row).
+    // Sushil excluded by email OR name. People with 0 total assigned tasks hidden.
     const emailToName=new Map();
     _chartTasks.forEach(t=>{
       const email=(t.assignee||'').toLowerCase().trim();
       if(!email) return;
-      if(_saChartEmail && email === _saChartEmail) return; // exclude superadmin — shown separately
       const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
+      if(_isSA(email, rawName)) return; // exclude superadmin by email or name
       const name=rawName?rawName.charAt(0).toUpperCase()+rawName.slice(1):'';
       if(!emailToName.has(email) || name.length > emailToName.get(email).length) emailToName.set(email, name);
     });
@@ -2950,19 +2957,22 @@ function _renderDashCharts(_dashTasksRaw){
     const tasksByEmail=new Map();
     _chartTasks.forEach(t=>{
       const email=(t.assignee||'').toLowerCase().trim();
-      if(!email || (_saChartEmail && email===_saChartEmail)) return;
+      if(!email) return;
+      const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
+      if(_isSA(email, rawName)) return;
       if(!tasksByEmail.has(email)) tasksByEmail.set(email,[]);
       tasksByEmail.get(email).push(t);
     });
-    // Build filtered list: only include people who have at least 1 task assigned
+    // Build list — include everyone with ≥1 task assigned; show zero compliance as red bar
     const allEmails=[...emailToName.keys()];
     const complianceData = allEmails.map(email=>{
       const allForEmail=tasksByEmail.get(email)||[];
       const totalAssigned=allForEmail.length;
+      if(!totalAssigned) return null;
       const totalClosed=allForEmail.filter(t=>t.status==='Done').length;
-      const pct=totalAssigned?Math.round(totalClosed/totalAssigned*100):0;
+      const pct=Math.round(totalClosed/totalAssigned*100);
       return {email, name:emailToName.get(email), pct, totalAssigned};
-    }).filter(d => d.totalAssigned > 0); // hide people with 0 tasks assigned by superadmin
+    }).filter(Boolean);
     const names=complianceData.map(d=>d.name);
     const complianceVals=complianceData.map(d=>d.pct);
     const compColors=complianceVals.map(v=>v>=80?'#22c55e':v>=50?'#f59e0b':'#ef4444');
@@ -3014,40 +3024,52 @@ function _renderDashCharts(_dashTasksRaw){
 
   // ── Avg Days to Close by Name (assigneeName or email prefix) ───────
   // WHO appears: people superadmin assigned tasks to (_chartTasks — strict filter).
-  // HOW calculated: _chartTasks only. Sushil excluded. People with no closed
-  // tasks (avgDays=null) are hidden from the axis entirely.
+  // HOW calculated: _chartTasks only. Sushil excluded by email+name.
+  // Uses completedDate (the actual field set when a task is marked Done).
+  // People with no Done tasks hidden from axis entirely.
   (()=>{
+    // Reuse same SA identity helpers defined in compliance block above
+    const _saName2 = (localStorage.getItem('self_name')||'').trim().toLowerCase();
+    const _isSA2 = (email, rawName) =>
+      (_saChartEmail && email === _saChartEmail) ||
+      (_saName2 && (rawName||'').toLowerCase().trim() === _saName2);
+
     const emailToName2=new Map();
     _chartTasks.forEach(t=>{
       const email=(t.assignee||'').toLowerCase().trim();
       if(!email) return;
-      if(_saChartEmail && email === _saChartEmail) return; // exclude superadmin
       const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
+      if(_isSA2(email, rawName)) return; // exclude superadmin by email or name
       const name=rawName?rawName.charAt(0).toUpperCase()+rawName.slice(1):'';
       if(!emailToName2.has(email) || name.length > emailToName2.get(email).length) emailToName2.set(email, name);
     });
     const tasksByEmail2=new Map();
     _chartTasks.forEach(t=>{
       const email=(t.assignee||'').toLowerCase().trim();
-      if(!email || (_saChartEmail && email===_saChartEmail)) return;
+      if(!email) return;
+      const rawName=(t.assigneeName&&t.assigneeName.trim())||email.split('@')[0]||email;
+      if(_isSA2(email, rawName)) return;
       if(!tasksByEmail2.has(email)) tasksByEmail2.set(email,[]);
       tasksByEmail2.get(email).push(t);
     });
-    // Only include people who have at least 1 completed task (avgDays not null)
+    // Only show people with ≥1 Done task. Use completedDate as close date
+    // (tasks store completedDate when marked Done — closedAt/doneAt don't exist).
     const allEmails2=[...emailToName2.keys()];
     const avgData = allEmails2.map(email=>{
       const allForEmail=tasksByEmail2.get(email)||[];
-      const doneTasks=allForEmail.filter(t=>t.status==='Done'&&t.created);
-      if(!doneTasks.length) return null; // no completed tasks → hide from axis
-      const totalDays=doneTasks.reduce((sum,t)=>{
-        const closeDate=t.closedAt||t.doneAt||null;
-        const end=closeDate?new Date(closeDate):new Date();
-        const start=new Date(t.created);
-        const diff=Math.max(0,Math.round((end-start)/(1000*60*60*24)));
-        return sum+diff;
-      },0);
-      return {email, name:emailToName2.get(email), avgDays:Math.round(totalDays/doneTasks.length)};
-    }).filter(Boolean); // remove nulls (people with no completed tasks)
+      const doneTasks=allForEmail.filter(t=>t.status==='Done');
+      if(!doneTasks.length) return null; // no Done tasks → hide from axis
+      const daysArr=doneTasks.map(t=>{
+        const endStr=t.completedDate||t.closedAt||t.doneAt||'';
+        const startStr=t.created||'';
+        if(!endStr||!startStr) return null;
+        const diff=Math.max(0,Math.round((new Date(endStr)-new Date(startStr))/(1000*60*60*24)));
+        return diff;
+      }).filter(d=>d!==null);
+      if(!daysArr.length) return null;
+      const avgDays=Math.round(daysArr.reduce((s,d)=>s+d,0)/daysArr.length);
+      return {email, name:emailToName2.get(email), avgDays};
+    }).filter(Boolean);
     const names=avgData.map(d=>d.name);
     const avgDaysVals=avgData.map(d=>d.avgDays);
     const acColors=['#3b82f6','#a855f7','#06b6d4','#f97316','#10b981','#f59e0b','#ef4444','#22c55e'];
