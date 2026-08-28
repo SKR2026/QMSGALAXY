@@ -167,7 +167,7 @@ button{cursor:pointer;border:none;border-radius:7px;padding:8px 16px;font-weight
     <div class="flex gap8" style="margin-bottom:18px">
       <div class="logo-mark">CL</div>
       <div>
-        <div style="font-weight:700;font-size:17px">CrossLearn</div>
+        <div class="brand-name" style="font-weight:700;font-size:17px">CrossLearn</div>
         <div class="muted" data-brand-tagline>Multi-Plant Learning Platform</div>
       </div>
     </div>
@@ -803,6 +803,10 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
+
+// Load shared branding before login as well. Firestore rules allow public read
+// only for settings/branding; all other data remains authenticated.
+loadBrandingForApp();
 
 // Secondary Firebase app used only for creating users.
 // This prevents createUserWithEmailAndPassword() from replacing the
@@ -2173,21 +2177,24 @@ function applyBranding(b) {
   if (!b) return;
   if (b.color && /^#[0-9A-Fa-f]{6}$/.test(b.color)) applyBrandColor(b.color);
 
-  // Apply organisation name/tagline wherever they are displayed.
   document.querySelectorAll('.brand-name').forEach(el => {
     el.textContent = b.orgName || 'CrossLearn';
   });
-  const tagline = document.querySelectorAll('[data-brand-tagline]');
-  tagline.forEach(el => el.textContent = b.tagline || 'Multi-Plant Learning Platform');
+  document.querySelectorAll('[data-brand-tagline]').forEach(el => {
+    el.textContent = b.tagline || 'Multi-Plant Learning Platform';
+  });
 
-  if (b.logoUrl) applyLogo(b.logoUrl);
+  // New format: logoData is stored directly in Firestore so the logo is
+  // independent of Firebase Storage rules/bucket configuration.
+  // Keep logoUrl support for logos saved by older versions.
+  const logo = b.logoData || b.logoUrl;
+  if (logo) applyLogo(logo);
 }
 
 function applyBrandColor(color) {
   if (!/^#[0-9A-Fa-f]{6}$/.test(color)) return;
   document.documentElement.style.setProperty('--brand-color', color);
   document.querySelectorAll('.logo-mark').forEach(el => {
-    // Do not overwrite an already-applied image with a background colour.
     if (!el.querySelector('img')) el.style.background = color;
   });
   document.querySelectorAll('.btn-primary,.btn-save').forEach(el => el.style.background = color);
@@ -2198,13 +2205,11 @@ function applyLogo(url) {
   const safeUrl = String(url).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
   const logoHtml = `<img src="${safeUrl}" alt="Company logo" style="width:100%;height:100%;object-fit:contain;border-radius:6px" onerror="this.style.display='none';this.parentElement.textContent='CL'"/>`;
 
-  // Apply to ALL logo marks, not just the first one returned by querySelector().
   document.querySelectorAll('.logo-mark').forEach(el => {
     el.innerHTML = logoHtml;
     el.style.background = 'transparent';
   });
 
-  // Preview in Settings, when that screen exists.
   const img = document.getElementById('logo-preview-img');
   const placeholder = document.getElementById('logo-preview-placeholder');
   if (img) { img.src = url; img.style.display = ''; }
@@ -2214,34 +2219,59 @@ function applyLogo(url) {
 function previewLogo() {
   const file = document.getElementById('logo-file').files[0];
   if (!file) return;
-  if (file.size > 2*1024*1024) { showToast('File too large. Max 2MB.','error'); return; }
+  if (!file.type.startsWith('image/')) { showToast('Please select an image file.','error'); return; }
+  if (file.size > 500*1024) { showToast('Logo must be 500 KB or smaller.','error'); return; }
   const reader = new FileReader();
   reader.onload = e => {
     const img = document.getElementById('logo-preview-img');
     img.src = e.target.result; img.style.display = '';
     document.getElementById('logo-preview-placeholder').style.display = 'none';
   };
+  reader.onerror = () => showToast('Could not read the logo file.','error');
   reader.readAsDataURL(file);
 }
 
 async function uploadLogo() {
   const file = document.getElementById('logo-file').files[0];
-  if (!file) { showToast('Select a file first','error'); return; }
-  if (file.size > 2*1024*1024) { showToast('File too large. Max 2MB.','error'); return; }
-  showToast('Uploading…');
+  if (!file) { showToast('Select a logo file first','error'); return; }
+  if (!file.type.startsWith('image/')) { showToast('Please select an image file.','error'); return; }
+  if (file.size > 500*1024) { showToast('Logo must be 500 KB or smaller.','error'); return; }
+
+  const btn = document.querySelector('#settings-branding .btn-save');
+  if (btn) btn.disabled = true;
+  showToast('Saving logo…');
+
   try {
-    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const ref = storage.ref('branding/logo_' + Date.now() + '_' + safeName);
-    await ref.put(file, { contentType: file.type || 'image/png', cacheControl: 'public,max-age=3600' });
-    const url = await ref.getDownloadURL();
-    await db.collection('settings').doc('branding').set({ logoUrl: url, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    applyLogo(url);
-    showToast('Logo uploaded and saved!');
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Could not read the selected logo.'));
+      reader.readAsDataURL(file);
+    });
+
+    // Firestore document limit is 1 MiB. The 500 KB source limit leaves
+    // enough room for the base64 expansion and the other branding fields.
+    if (String(dataUrl).length > 850000) {
+      throw new Error('Logo is too large after encoding. Please use a smaller image (about 400 KB or less).');
+    }
+
+    await db.collection('settings').doc('branding').set({
+      logoData: dataUrl,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    // Verify the write before reporting success.
+    const verify = await db.collection('settings').doc('branding').get();
+    const saved = verify.exists ? (verify.data() || {}) : {};
+    if (saved.logoData !== dataUrl) throw new Error('Logo verification failed. The saved logo could not be read back from Firestore.');
+
+    applyLogo(dataUrl);
+    showToast('Logo saved successfully and will remain after relogin.');
   } catch(e) {
-    console.error('Logo upload error:', e);
-    showToast(e.code === 'storage/unauthorized' || e.code === 'storage/permission-denied'
-      ? 'Logo upload denied. Check Firebase Storage rules for Super Admin.'
-      : 'Upload failed: ' + (e.message || 'Unknown error'),'error');
+    console.error('Logo save error:', e);
+    showToast('Logo save failed: ' + (e.message || 'Unknown error'),'error');
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -2277,11 +2307,13 @@ async function saveBranding() {
   if (btn) btn.disabled = true;
   try {
     await db.collection('settings').doc('branding').set(data, { merge: true });
-    applyBranding(data);
-    showToast('Branding saved successfully!');
+    const verify = await db.collection('settings').doc('branding').get();
+    if (!verify.exists) throw new Error('Branding verification failed.');
+    applyBranding(verify.data());
+    showToast('Branding saved successfully and verified!');
   } catch (e) {
     console.error('Save branding error:', e);
-    if (e.code === 'permission-denied') showToast('Permission denied. Check settings/branding write rule for Super Admin.', 'error');
+    if (e.code === 'permission-denied') showToast('Permission denied. Check the Super Admin rule for settings/branding.', 'error');
     else showToast('Branding save failed: ' + (e.message || 'Unknown error'), 'error');
   } finally {
     if (btn) btn.disabled = false;
