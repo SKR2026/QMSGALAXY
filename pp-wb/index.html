@@ -708,6 +708,21 @@
   <div class="login-back" onclick="goBack()">&#8592; <span data-i18n="login_back">Back</span></div>
   <div class="login-box">
     <div class="ltitle">&#128737; <span data-i18n="login_title">Staff Login</span></div>
+
+    <!-- Biometric login button — shown only when credential registered on this device -->
+    <div id="biometric-login-wrap" style="display:none;">
+      <button id="biometric-login-btn" onclick="loginWithBiometric()"
+        style="width:100%;padding:13px;background:linear-gradient(135deg,#1a3a5c,#234d7a);border:1.5px solid rgba(0,216,255,0.3);border-radius:5px;color:#e0f0ff;font-family:var(--mono);font-size:14px;font-weight:600;letter-spacing:0.03em;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:all .2s;">
+        <span style="font-size:22px;">&#128100;</span>
+        <span id="biometric-login-label">Sign in with Biometric</span>
+      </button>
+      <div style="display:flex;align-items:center;gap:8px;margin:10px 0;">
+        <div style="flex:1;height:1px;background:var(--border2);"></div>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;">or use password</span>
+        <div style="flex:1;height:1px;background:var(--border2);"></div>
+      </div>
+    </div>
+
     <div>
       <label data-i18n="login_user">Username</label>
       <input type="text" id="luser" placeholder="Enter username..." autocomplete="off" data-i18n-ph="login_user_ph" />
@@ -723,6 +738,7 @@
       <span class="rpill tm">Top Mgmt</span>&nbsp;
       <span class="rpill sio">SIO</span>
     </div>
+    <div id="biometric-login-msg" style="display:none;font-family:var(--mono);font-size:12px;text-align:center;margin-top:6px;padding:7px 10px;border-radius:3px;"></div>
     <div class="lerr" id="lerr" data-i18n="login_err">Invalid username or password. Access denied.</div>
   </div>
 </div>
@@ -3062,7 +3078,15 @@ function goLogin() {
   document.getElementById('lerr').style.display = 'none';
   document.getElementById('luser').value = '';
   document.getElementById('lpass').value = '';
-  setTimeout(()=>document.getElementById('luser').focus(), 50);
+  // Show biometric button if registered on this device
+  checkBiometricOnLogin();
+  // If biometric available, focus there; otherwise focus username
+  const bioWrap = document.getElementById('biometric-login-wrap');
+  if (bioWrap && bioWrap.style.display !== 'none') {
+    setTimeout(()=>document.getElementById('biometric-login-btn')?.focus(), 80);
+  } else {
+    setTimeout(()=>document.getElementById('luser').focus(), 50);
+  }
 }
 
 function goBack() {
@@ -6170,6 +6194,124 @@ function initAppearanceTab() {
 // ── Biometric tab ──────────────────────────────────────────────────────────
 const BIOMETRIC_KEY = 'sr_biometric_enabled';
 const BIOMETRIC_CRED_KEY = 'sr_biometric_cred_id';
+const BIOMETRIC_USER_KEY = 'sr_biometric_username'; // which user registered biometric
+
+// ── Show/hide biometric button on login screen ────────────────────────────
+function checkBiometricOnLogin() {
+  const enabled = localStorage.getItem(BIOMETRIC_KEY) === 'true';
+  const credId  = localStorage.getItem(BIOMETRIC_CRED_KEY);
+  const wrap    = document.getElementById('biometric-login-wrap');
+  if (!wrap) return;
+  if (enabled && credId && window.PublicKeyCredential) {
+    wrap.style.display = 'block';
+    // Pre-fill username if saved
+    const savedUser = localStorage.getItem(BIOMETRIC_USER_KEY);
+    if (savedUser) {
+      const luserEl = document.getElementById('luser');
+      if (luserEl && !luserEl.value) luserEl.value = savedUser;
+    }
+  } else {
+    wrap.style.display = 'none';
+  }
+}
+
+// ── Biometric login — uses WebAuthn get() to verify identity ─────────────
+async function loginWithBiometric() {
+  const btn   = document.getElementById('biometric-login-btn');
+  const label = document.getElementById('biometric-login-label');
+  const msg   = document.getElementById('biometric-login-msg');
+
+  const credIdB64 = localStorage.getItem(BIOMETRIC_CRED_KEY);
+  if (!credIdB64) {
+    _biometricLoginMsg('No biometric registered on this device. Please use your password.', 'err');
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  if (label) label.textContent = 'Verifying…';
+  if (msg) { msg.style.display = 'none'; }
+
+  try {
+    // Decode stored credential ID
+    const credIdBytes = Uint8Array.from(atob(credIdB64), c => c.charCodeAt(0));
+    const challenge   = crypto.getRandomValues(new Uint8Array(32));
+
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge,
+        allowCredentials: [{
+          type: 'public-key',
+          id:   credIdBytes,
+          transports: ['internal'] // device biometric only
+        }],
+        userVerification: 'required',
+        timeout: 60000
+      }
+    });
+
+    // WebAuthn assertion succeeded — user verified by device biometric
+    // Find the user associated with this device's biometric registration
+    const savedUsername = localStorage.getItem(BIOMETRIC_USER_KEY);
+    const users = getUsers();
+    let found = null;
+
+    if (savedUsername) {
+      found = users.find(u => u.username.toLowerCase() === savedUsername.toLowerCase());
+    }
+
+    if (!found) {
+      // Fallback: try the username field if typed
+      const typedUser = document.getElementById('luser')?.value.trim().toLowerCase();
+      if (typedUser) found = users.find(u => u.username.toLowerCase() === typedUser);
+    }
+
+    if (!found) {
+      _biometricLoginMsg('Biometric verified but no matching account found. Please log in with your password.', 'err');
+      return;
+    }
+
+    // Log in the user without password check — biometric is the authenticator
+    document.getElementById('loginScreen').style.display = 'none';
+    role        = found.role;
+    currentUser = found;
+    await loadReports();
+    await loadPlantsFromFirestore();
+    await loadCategoriesFromFirestore();
+    if (role !== 'superadmin') {
+      const licOk = await checkLicenseForUser();
+      if (!licOk) { role = null; currentUser = null; return; }
+    }
+    initApp(role);
+
+  } catch(e) {
+    if (e.name === 'NotAllowedError') {
+      _biometricLoginMsg('Biometric authentication cancelled or timed out.', 'warn');
+    } else if (e.name === 'SecurityError') {
+      _biometricLoginMsg('Biometric requires HTTPS. Please access the app over a secure connection.', 'err');
+    } else {
+      _biometricLoginMsg('Biometric failed: ' + e.message, 'err');
+    }
+  } finally {
+    if (btn)   btn.disabled = false;
+    if (label) label.textContent = 'Sign in with Biometric';
+  }
+}
+
+function _biometricLoginMsg(text, type) {
+  const el = document.getElementById('biometric-login-msg');
+  if (!el) return;
+  el.textContent = text;
+  el.style.display = 'block';
+  const styles = {
+    ok:   'rgba(16,185,129,.12);#34d399;rgba(16,185,129,.3)',
+    err:  'rgba(239,68,68,.12);#fca5a5;rgba(239,68,68,.3)',
+    warn: 'rgba(245,197,66,.1);var(--sa);rgba(245,197,66,.25)'
+  };
+  const [bg, color, border] = (styles[type] || styles.err).split(';');
+  el.style.background = bg;
+  el.style.color      = color;
+  el.style.border     = `1px solid ${border}`;
+}
 
 async function initBiometricTab() {
   const titleEl  = document.getElementById('biometric-status-title');
@@ -6252,9 +6394,10 @@ async function registerBiometric() {
         attestation: 'none'
       }
     });
-    // Store credential ID in localStorage
+    // Store credential ID and username in localStorage
     const credIdB64 = btoa(String.fromCharCode(...new Uint8Array(cred.rawId)));
     localStorage.setItem(BIOMETRIC_CRED_KEY, credIdB64);
+    localStorage.setItem(BIOMETRIC_USER_KEY, username); // link cred to this user
     localStorage.setItem(BIOMETRIC_KEY, 'true');
     const toggle = document.getElementById('biometric-global-toggle');
     if (toggle) toggle.checked = true;
@@ -6272,6 +6415,7 @@ async function registerBiometric() {
 
 function removeBiometric() {
   localStorage.removeItem(BIOMETRIC_CRED_KEY);
+  localStorage.removeItem(BIOMETRIC_USER_KEY);
   localStorage.setItem(BIOMETRIC_KEY, 'false');
   const toggle = document.getElementById('biometric-global-toggle');
   if (toggle) toggle.checked = false;
