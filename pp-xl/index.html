@@ -9,6 +9,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-storage-compat.js"></script>
 
 <style>
 /* ══════════════════════════════════════════════
@@ -1443,13 +1444,15 @@ const firebaseConfig = {
   apiKey: "AIzaSyBldBMbEy5mNH3exK53FdYxkIWblZUBQcc",
   authDomain: "skr-learn.firebaseapp.com",
   projectId: "skr-learn",
+  storageBucket: "skr-learn.firebasestorage.app",
   messagingSenderId: "693637343608",
   appId: "1:693637343608:web:380513c967b4f7c044408d"
 };
 
 firebase.initializeApp(firebaseConfig);
-const auth = firebase.auth();
-const db   = firebase.firestore();
+const auth    = firebase.auth();
+const db      = firebase.firestore();
+const storage = firebase.storage(); // used for lesson before/after photos
 
 // ── Loader removed immediately — landing is already visible in HTML ──────
 // IMPORTANT: async functions are NOT hoisted. Only simple DOM ops here.
@@ -2606,18 +2609,20 @@ function closeAdminConfirm() { document.getElementById('admin-confirm-modal').cl
 
 // ── SUBMIT LESSON MODAL ────────────────────────────────────────────────
 // ── Photo upload helpers ───────────────────────────────────────────────────
-const _photoData = { before: null, after: null }; // base64 strings
+// Photos are uploaded to Firebase Storage; only the download URL is stored in Firestore.
+// This avoids Firestore's 1MB document limit (base64 of a 2MB image = ~2.7MB — too large).
+const _photoFiles = { before: null, after: null }; // raw File objects
 
 function previewModalPhoto(side) {
   const input = document.getElementById(`f-${side}-photo`);
   const file  = input?.files[0];
   if (!file) return;
   if (!file.type.startsWith('image/')) { showToast('Please select an image file.','error'); return; }
-  if (file.size > 2 * 1024 * 1024) { showToast('Photo must be under 2 MB.','error'); input.value=''; return; }
+  if (file.size > 5 * 1024 * 1024) { showToast('Photo must be under 5 MB.','error'); input.value=''; return; }
+  _photoFiles[side] = file;
   const reader = new FileReader();
   reader.onload = e => {
-    _photoData[side] = e.target.result;
-    const imgEl = document.getElementById(`f-${side}-img`);
+    const imgEl   = document.getElementById(`f-${side}-img`);
     const preview = document.getElementById(`f-${side}-preview`);
     if (imgEl)   imgEl.src = e.target.result;
     if (preview) preview.classList.remove('hidden');
@@ -2626,7 +2631,7 @@ function previewModalPhoto(side) {
 }
 
 function removeModalPhoto(side) {
-  _photoData[side] = null;
+  _photoFiles[side] = null;
   const input   = document.getElementById(`f-${side}-photo`);
   const imgEl   = document.getElementById(`f-${side}-img`);
   const preview = document.getElementById(`f-${side}-preview`);
@@ -2638,6 +2643,21 @@ function removeModalPhoto(side) {
 function resetModalPhotos() {
   removeModalPhoto('before');
   removeModalPhoto('after');
+}
+
+// Upload a single photo file to Firebase Storage, return its download URL
+async function uploadPhotoToStorage(file, lessonId, side) {
+  if (!file) return null;
+  try {
+    const ext  = file.name.split('.').pop() || 'jpg';
+    const path = `lessons/${lessonId}/${side}_${Date.now()}.${ext}`;
+    const ref  = storage.ref(path);
+    const snap = await ref.put(file, { contentType: file.type });
+    return await snap.ref.getDownloadURL();
+  } catch(e) {
+    console.warn(`Photo upload failed (${side}):`, e.message);
+    return null; // non-fatal — lesson still saves without photo
+  }
 }
 
 function loadDetailPhotos(l) {
@@ -2766,8 +2786,8 @@ async function submitLesson() {
       action: document.getElementById('f-action').value.trim(),
       beforeCondition: document.getElementById('f-before').value.trim(),
       afterCondition: document.getElementById('f-after').value.trim(),
-      beforePhoto: _photoData.before || null,
-      afterPhoto:  _photoData.after  || null,
+      beforePhoto: null, // set after Storage upload below
+      afterPhoto:  null,
       lesson: document.getElementById('f-lesson').value.trim(),
       benefits: document.getElementById('f-benefits').value.trim(),
       recommendation: document.getElementById('f-rec').value.trim(),
@@ -2791,6 +2811,19 @@ async function submitLesson() {
     // Save the lesson first. Audit logging must never make a successfully
     // saved lesson appear to have failed.
     const ref = await db.collection('lessons').add(data);
+
+    // Upload photos to Firebase Storage (non-blocking — lesson is already saved)
+    // Store download URLs back into the lesson document.
+    const [beforeUrl, afterUrl] = await Promise.all([
+      uploadPhotoToStorage(_photoFiles.before, ref.id, 'before'),
+      uploadPhotoToStorage(_photoFiles.after,  ref.id, 'after'),
+    ]);
+    if (beforeUrl || afterUrl) {
+      await ref.update({
+        ...(beforeUrl ? { beforePhoto: beforeUrl } : {}),
+        ...(afterUrl  ? { afterPhoto:  afterUrl  } : {}),
+      });
+    }
 
     try {
       await logAudit(ref.id, 'LESSON_CREATED', { lessonId });
