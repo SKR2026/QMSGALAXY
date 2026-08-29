@@ -4411,53 +4411,95 @@ document.addEventListener('click', e => {
 
 
 // ── BIOMETRIC LOGIN (WebAuthn / FIDO2) ────────────────────────────────────
-const BIO_CRED_KEY  = 'cl_bio_cred_id';   // base64 credential ID
-const BIO_USER_KEY  = 'cl_bio_user_email'; // which account registered
+// Pattern matches working implementation — credentials keyed by email in JSON map,
+// URL-safe base64, explicit rpId, hybrid transport for Android.
+const BIO_CRED_KEY  = 'cl_bio_credmap';   // JSON map: { email: credIdBase64url }
+const BIO_USER_KEY  = 'cl_bio_last_email'; // last email that used biometric
 const BIO_ENABLED   = 'cl_bio_enabled';    // 'true'/'false'
+const BIO_RP_ID     = location.hostname || 'localhost';
+
+// ── ArrayBuffer ↔ base64url helpers (loop-based to avoid mobile stack overflow) ──
+function _bioBuf2b64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+function _bioB64toBuf(b64) {
+  const s = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+  return Uint8Array.from(s, c => c.charCodeAt(0)).buffer;
+}
+
+// ── Credential storage: keyed by email so multiple users work on same device ──
+function _bioGetCred(email) {
+  try {
+    const raw = localStorage.getItem(BIO_CRED_KEY);
+    if (!raw) return null;
+    const map = JSON.parse(raw);
+    return email ? (map[email.toLowerCase()] || null) : map;
+  } catch { return null; }
+}
+function _bioStoreCred(email, credIdB64url) {
+  try {
+    const raw = localStorage.getItem(BIO_CRED_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    map[email.toLowerCase()] = credIdB64url;
+    localStorage.setItem(BIO_CRED_KEY, JSON.stringify(map));
+    localStorage.setItem(BIO_USER_KEY, email.toLowerCase());
+    localStorage.setItem(BIO_ENABLED,  'true');
+  } catch {}
+}
+function _bioRemoveCred(email) {
+  try {
+    const raw = localStorage.getItem(BIO_CRED_KEY);
+    if (!raw) return;
+    const map = JSON.parse(raw);
+    if (email) delete map[email.toLowerCase()];
+    else { localStorage.removeItem(BIO_CRED_KEY); return; }
+    localStorage.setItem(BIO_CRED_KEY, JSON.stringify(map));
+  } catch {}
+}
 
 // ── Called when Biometric settings tab opens ──────────────────────────────
 async function initBiometricTab() {
-  const iconEl   = document.getElementById('bio-status-icon');
-  const titleEl  = document.getElementById('bio-status-title');
-  const subEl    = document.getElementById('bio-status-sub');
-  const regEl    = document.getElementById('bio-reg-status');
-  const regBtn   = document.getElementById('bio-register-btn');
-  const remBtn   = document.getElementById('bio-remove-btn');
-  const testBtn  = document.getElementById('bio-test-btn');
+  const iconEl  = document.getElementById('bio-status-icon');
+  const titleEl = document.getElementById('bio-status-title');
+  const subEl   = document.getElementById('bio-status-sub');
+  const regEl   = document.getElementById('bio-reg-status');
+  const regBtn  = document.getElementById('bio-register-btn');
+  const remBtn  = document.getElementById('bio-remove-btn');
+  const testBtn = document.getElementById('bio-test-btn');
 
-  // Check WebAuthn support
   if (!window.PublicKeyCredential) {
     if (iconEl)  iconEl.textContent  = '❌';
     if (titleEl) titleEl.textContent = 'Not supported on this browser';
-    if (subEl)   subEl.textContent   = 'Biometric login requires a modern browser over HTTPS (Chrome, Safari, Firefox 60+).';
+    if (subEl)   subEl.textContent   = 'Biometric login requires a modern browser over HTTPS.';
     if (regBtn)  regBtn.disabled = true;
     return;
   }
-
   let available = false;
   try { available = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable(); } catch(_) {}
 
   if (available) {
     if (iconEl)  iconEl.textContent  = '✅';
     if (titleEl) titleEl.textContent = 'Biometric supported on this device';
-    if (subEl)   subEl.textContent   = 'Fingerprint / Face ID is available. Register below.';
+    if (subEl)   subEl.textContent   = 'Fingerprint / Face ID available. Register below.';
   } else {
     if (iconEl)  iconEl.textContent  = '⚠️';
     if (titleEl) titleEl.textContent = 'No biometric sensor detected';
-    if (subEl)   subEl.textContent   = 'Try on a mobile device with fingerprint or Face ID sensor.';
+    if (subEl)   subEl.textContent   = 'Try on a mobile device with fingerprint or Face ID.';
     if (regBtn)  regBtn.disabled = true;
   }
 
-  // Registration status
-  const credId  = localStorage.getItem(BIO_CRED_KEY);
-  const bioUser = localStorage.getItem(BIO_USER_KEY);
-  if (credId && bioUser) {
-    if (regEl) regEl.textContent = `✅ Registered for: ${bioUser}`;
-    if (remBtn)  remBtn.style.display = '';
+  const bioEmail = currentUser?.email || localStorage.getItem(BIO_USER_KEY) || '';
+  const credId   = bioEmail ? _bioGetCred(bioEmail) : null;
+  if (credId && bioEmail) {
+    if (regEl) regEl.textContent = `✅ Registered for: ${bioEmail}`;
+    if (remBtn)  remBtn.style.display  = '';
     if (testBtn) testBtn.style.display = '';
   } else {
     if (regEl) regEl.textContent = 'Not registered on this device. Click "Register Biometric" to set up.';
-    if (remBtn)  remBtn.style.display = 'none';
+    if (remBtn)  remBtn.style.display  = 'none';
     if (testBtn) testBtn.style.display = 'none';
   }
 }
@@ -4471,17 +4513,18 @@ async function biometricRegister() {
   if (btn) btn.disabled = true;
   _bioMsg('Starting biometric registration…', 'info');
 
+  const email = currentUser.email;
   try {
     const uid       = new TextEncoder().encode(currentUser.uid);
     const challenge = crypto.getRandomValues(new Uint8Array(32));
     const cred = await navigator.credentials.create({
       publicKey: {
         challenge,
-        rp: { name: 'CrossLearn', id: location.hostname },
-        user: { id: uid, name: currentUser.email, displayName: currentProfile?.name || currentUser.email },
+        rp: { name: 'CrossLearn', id: BIO_RP_ID },
+        user: { id: uid, name: email, displayName: currentProfile?.name || email },
         pubKeyCredParams: [
-          { type: 'public-key', alg: -7 },    // ES256
-          { type: 'public-key', alg: -257 }   // RS256
+          { type: 'public-key', alg: -7 },
+          { type: 'public-key', alg: -257 }
         ],
         authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required' },
         timeout: 60000,
@@ -4489,51 +4532,50 @@ async function biometricRegister() {
       }
     });
 
-    // Store credential
-    const credIdB64 = btoa(String.fromCharCode(...new Uint8Array(cred.rawId)));
-    localStorage.setItem(BIO_CRED_KEY,  credIdB64);
-    localStorage.setItem(BIO_USER_KEY,  currentUser.email);
-    localStorage.setItem(BIO_ENABLED,   'true');
+    // Use URL-safe base64 + loop to avoid mobile stack overflow
+    const credIdB64url = _bioBuf2b64(cred.rawId);
+    _bioStoreCred(email, credIdB64url);
 
-    _bioMsg('✅ Biometric registered! The sign-in button will now appear on the login screen.', 'success');
+    _bioMsg('✅ Biometric registered! The sign-in button will appear on the login screen.', 'success');
     showToast('Biometric registered successfully!');
-    initBiometricTab(); // refresh status
-    checkBiometricOnLoginScreen(); // make button visible if login is showing
+    initBiometricTab();
+    checkBiometricOnLoginScreen();
 
   } catch(e) {
-    if (e.name === 'NotAllowedError')    _bioMsg('Registration cancelled or timed out.', 'warn');
-    else if (e.name === 'InvalidStateError') _bioMsg('Already registered on this device.', 'warn');
+    if (e.name === 'NotAllowedError')     _bioMsg('Registration cancelled or timed out.', 'warn');
+    else if (e.name === 'InvalidStateError') _bioMsg('A credential is already registered on this device.', 'warn');
     else _bioMsg('Registration failed: ' + e.message, 'error');
   } finally {
     if (btn) btn.disabled = false;
   }
 }
 
-// ── Remove registration from this device ─────────────────────────────────
+// ── Remove biometric registration ─────────────────────────────────────────
 function biometricRemove() {
-  if (!confirm('Remove biometric registration from this device?')) return;
-  localStorage.removeItem(BIO_CRED_KEY);
-  localStorage.removeItem(BIO_USER_KEY);
+  const email = currentUser?.email || localStorage.getItem(BIO_USER_KEY) || '';
+  if (!confirm('Remove biometric registration' + (email ? ' for ' + email : '') + ' from this device?')) return;
+  if (email) _bioRemoveCred(email);
   localStorage.setItem(BIO_ENABLED, 'false');
   _bioMsg('Biometric removed from this device.', 'info');
   initBiometricTab();
-  // Hide login button
   const wrap = document.getElementById('bio-login-wrap');
   if (wrap) wrap.style.display = 'none';
   showToast('Biometric registration removed.');
 }
 
-// ── Test biometric login from settings ───────────────────────────────────
+// ── Test biometric from settings ──────────────────────────────────────────
 async function biometricTest() {
-  _bioMsg('Testing biometric…', 'info');
+  const email  = currentUser?.email || localStorage.getItem(BIO_USER_KEY) || '';
+  const credId = email ? _bioGetCred(email) : null;
+  if (!credId) { _bioMsg('No credential registered for this account.', 'error'); return; }
+  _bioMsg('Waiting for biometric…', 'info');
   try {
-    const credIdB64  = localStorage.getItem(BIO_CRED_KEY);
-    const credIdBytes = Uint8Array.from(atob(credIdB64), c => c.charCodeAt(0));
-    const challenge   = crypto.getRandomValues(new Uint8Array(32));
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
     await navigator.credentials.get({
       publicKey: {
+        rpId: BIO_RP_ID,
         challenge,
-        allowCredentials: [{ type: 'public-key', id: credIdBytes, transports: ['internal'] }],
+        allowCredentials: [{ type: 'public-key', id: _bioB64toBuf(credId), transports: ['internal', 'hybrid'] }],
         userVerification: 'required',
         timeout: 60000
       }
@@ -4552,77 +4594,87 @@ function _bioMsg(text, type) {
   el.style.color = colors[type] || '#5F5E5A';
 }
 
-// ── Check for registered biometric and show/hide login button ─────────────
+// ── Show/hide biometric button on login screen ────────────────────────────
 function checkBiometricOnLoginScreen() {
-  const credId  = localStorage.getItem(BIO_CRED_KEY);
-  const enabled = localStorage.getItem(BIO_ENABLED) !== 'false';
-  const wrap    = document.getElementById('bio-login-wrap');
+  const lastEmail = localStorage.getItem(BIO_USER_KEY) || '';
+  const credId    = lastEmail ? _bioGetCred(lastEmail) : null;
+  const enabled   = localStorage.getItem(BIO_ENABLED) !== 'false';
+  const wrap      = document.getElementById('bio-login-wrap');
   if (wrap) wrap.style.display = (credId && enabled && window.PublicKeyCredential) ? '' : 'none';
 }
 
-// ── Biometric login — triggered from login screen button ──────────────────
+// ── Biometric login — triggered from login screen ─────────────────────────
 async function biometricLogin() {
   const btn = document.getElementById('bio-login-btn');
   const msg = document.getElementById('bio-login-msg');
-  const credIdB64 = localStorage.getItem(BIO_CRED_KEY);
+
+  // Get email — from pre-filled field or last stored email
+  const emailEl   = document.getElementById('login-email');
+  const email     = (emailEl?.value.trim() || localStorage.getItem(BIO_USER_KEY) || '').toLowerCase();
+  const credIdB64 = email ? _bioGetCred(email) : null;
+
   if (!credIdB64) {
-    if (msg) msg.textContent = 'No biometric registered on this device. Use password.';
+    if (msg) { msg.style.color='#A32D2D'; msg.textContent = 'No biometric registered. Use password to sign in.'; }
     return;
   }
+
   if (btn) { btn.disabled = true; btn.querySelector('span:last-child').textContent = 'Verifying…'; }
-  if (msg) { msg.style.color = 'var(--text-muted)'; msg.textContent = ''; }
+  if (msg) { msg.style.color='var(--text-muted)'; msg.textContent='⏳ Waiting for biometric…'; }
 
   try {
-    // Step 1: WebAuthn device assertion (biometric prompt)
-    const credIdBytes = Uint8Array.from(atob(credIdB64), c => c.charCodeAt(0));
-    const challenge   = crypto.getRandomValues(new Uint8Array(32));
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
     await navigator.credentials.get({
       publicKey: {
+        rpId: BIO_RP_ID,
         challenge,
-        allowCredentials: [{ type: 'public-key', id: credIdBytes, transports: ['internal'] }],
+        allowCredentials: [{
+          type: 'public-key',
+          id: _bioB64toBuf(credIdB64),
+          transports: ['internal', 'hybrid']  // hybrid needed for some Android
+        }],
         userVerification: 'required',
         timeout: 60000
       }
     });
 
-    // Step 2: Biometric passed — get current Firebase user via promise (not sync)
-    if (msg) { msg.style.color = '#0F6E56'; msg.textContent = '✅ Verified! Opening app…'; }
+    // ── Biometric verified by OS — complete sign-in via Firebase ─────────
+    if (msg) { msg.style.color='#0F6E56'; msg.textContent='✅ Verified! Signing you in…'; }
 
+    // Wait for Firebase Auth to resolve (async, not sync)
     const firebaseUser = await new Promise(resolve => {
       const unsub = firebase.auth().onAuthStateChanged(u => { unsub(); resolve(u); });
     });
 
     if (firebaseUser) {
-      // Firebase session active — load profile and open app
+      // Session alive — load profile and open app
       currentUser = firebaseUser;
-      const snap = await db.collection('users').doc(firebaseUser.uid).get();
+      const snap  = await db.collection('users').doc(firebaseUser.uid).get();
       if (!snap.exists) throw new Error('User profile not found. Please sign in with password once.');
       currentProfile = snap.data();
       await loadMasterDataForApp();
       document.getElementById('login-page').classList.add('hidden');
       document.getElementById('app').classList.remove('hidden');
       initApp();
-      showToast('Welcome back, ' + (currentProfile.name || firebaseUser.email) + '!');
+      showToast('Welcome back, ' + (currentProfile.name || email) + '! 👋');
     } else {
-      // No Firebase session — user must sign in once with password
-      // Pre-fill their email so they only need the password
-      if (msg) { msg.style.color = '#854F0B'; msg.textContent = 'First time after install: enter your password once to activate biometric login.'; }
-      const bioEmail = localStorage.getItem(BIO_USER_KEY);
-      const emailEl  = document.getElementById('login-email');
-      if (emailEl && bioEmail) emailEl.value = bioEmail;
+      // Session expired — try Firebase sign-in with email only (won't work without password)
+      // Best UX: pre-fill email and clearly ask for password ONCE
+      if (msg) { msg.style.color='#854F0B'; msg.textContent='✅ Biometric confirmed. Enter your password once to restore your session.'; }
+      if (emailEl) emailEl.value = email;
       document.getElementById('login-password')?.focus();
     }
 
   } catch(e) {
-    let m = 'Biometric failed: ' + e.message;
-    if (e.name === 'NotAllowedError')    m = 'Biometric cancelled or timed out. Try again.';
-    else if (e.name === 'SecurityError') m = 'Biometric requires HTTPS. Cannot use on plain HTTP.';
-    else if (e.name === 'InvalidStateError') m = 'Credential not found. Please re-register in Settings → Biometric.';
-    if (msg) { msg.style.color = '#A32D2D'; msg.textContent = m; }
+    let m = '❌ Biometric failed: ' + e.message;
+    if (e.name === 'NotAllowedError')     m = '❌ Biometric was cancelled or timed out. Try again.';
+    else if (e.name === 'SecurityError')  m = '❌ Biometric requires HTTPS.';
+    else if (e.name === 'InvalidStateError') m = '❌ Credential not found. Re-register in Settings → Biometric.';
+    if (msg) { msg.style.color='#A32D2D'; msg.textContent = m; }
   } finally {
     if (btn) { btn.disabled = false; btn.querySelector('span:last-child').textContent = 'Sign in with Biometric'; }
   }
 }
+
 
 // ── FRESH START ────────────────────────────────────────────────────────────
 async function loadFreshStartStatus() {
