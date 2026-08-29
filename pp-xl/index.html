@@ -1567,6 +1567,10 @@ const auth    = firebase.auth();
 const db      = firebase.firestore();
 const storage = firebase.storage(); // used for lesson before/after photos
 
+// Set persistence to LOCAL so Firebase session survives page reload
+// This is essential for biometric login to work — session stays until explicit logout
+auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(() => {});
+
 // ── Loader removed immediately — landing is already visible in HTML ──────
 // IMPORTANT: async functions are NOT hoisted. Only simple DOM ops here.
 // loadBrandingForApp() and loadPublicStats() are called at the END of this
@@ -4558,15 +4562,17 @@ async function biometricLogin() {
   const btn = document.getElementById('bio-login-btn');
   const msg = document.getElementById('bio-login-msg');
   const credIdB64 = localStorage.getItem(BIO_CRED_KEY);
-  if (!credIdB64) { if(msg) msg.textContent='No biometric registered. Use password.'; return; }
-
+  if (!credIdB64) {
+    if (msg) msg.textContent = 'No biometric registered on this device. Use password.';
+    return;
+  }
   if (btn) { btn.disabled = true; btn.querySelector('span:last-child').textContent = 'Verifying…'; }
-  if (msg) msg.textContent = '';
+  if (msg) { msg.style.color = 'var(--text-muted)'; msg.textContent = ''; }
 
   try {
+    // Step 1: WebAuthn device assertion (biometric prompt)
     const credIdBytes = Uint8Array.from(atob(credIdB64), c => c.charCodeAt(0));
     const challenge   = crypto.getRandomValues(new Uint8Array(32));
-
     await navigator.credentials.get({
       publicKey: {
         challenge,
@@ -4576,29 +4582,35 @@ async function biometricLogin() {
       }
     });
 
-    // Biometric verified — sign in with stored email using Firebase silent re-auth
-    // We use the email stored at registration time and sign them in via currentUser
-    // (if already signed in with Firebase Auth, biometric just confirms identity)
-    const bioEmail = localStorage.getItem(BIO_USER_KEY);
-    if (msg) msg.textContent = '✅ Verified! Signing you in…';
+    // Step 2: Biometric passed. Check Firebase Auth session.
+    if (msg) { msg.style.color = '#0F6E56'; msg.textContent = '✅ Verified! Opening app…'; }
+    const bioEmail       = localStorage.getItem(BIO_USER_KEY);
+    const firebaseUser   = firebase.auth().currentUser;
 
-    // Try to use Firebase Auth's current session or trigger email sign-in
-    // The biometric verifies the person at the device level; Firebase Auth session persists
-    const u = firebase.auth().currentUser;
-    if (u && u.email === bioEmail) {
-      // Already authenticated with Firebase — proceed to app
-      showLoginPage(); // hide login
-      await initAppForUser();
+    if (firebaseUser) {
+      // Firebase session active — load profile and open app directly
+      currentUser = firebaseUser;
+      const snap = await db.collection('users').doc(firebaseUser.uid).get();
+      if (!snap.exists) throw new Error('User profile not found. Please sign in with password once.');
+      currentProfile = snap.data();
+      document.getElementById('login-page').classList.add('hidden');
+      document.getElementById('app').classList.remove('hidden');
+      initApp();
+      showToast('Welcome back, ' + (currentProfile.name || bioEmail) + '!');
     } else {
-      // Firebase session expired — prompt user to enter password once, then biometric handles future logins
-      if (msg) msg.textContent = 'Biometric verified. Please enter your password once to refresh your session.';
+      // Firebase session expired — pre-fill email, ask for password once
+      if (msg) { msg.style.color = '#854F0B'; msg.textContent = '✅ Biometric confirmed — session expired. Enter your password once to continue.'; }
+      const emailEl = document.getElementById('login-email');
+      if (emailEl && bioEmail) emailEl.value = bioEmail;
+      document.getElementById('login-password')?.focus();
     }
 
   } catch(e) {
-    const m = e.name === 'NotAllowedError' ? 'Biometric cancelled or timed out.' :
-              e.name === 'SecurityError'   ? 'Requires HTTPS connection.' :
-              'Biometric failed: ' + e.message;
-    if (msg) msg.textContent = m;
+    let m = 'Biometric failed: ' + e.message;
+    if (e.name === 'NotAllowedError')    m = 'Biometric cancelled or timed out. Try again.';
+    else if (e.name === 'SecurityError') m = 'Biometric requires HTTPS. Cannot use on plain HTTP.';
+    else if (e.name === 'InvalidStateError') m = 'Credential not found. Please re-register in Settings → Biometric.';
+    if (msg) { msg.style.color = '#A32D2D'; msg.textContent = m; }
   } finally {
     if (btn) { btn.disabled = false; btn.querySelector('span:last-child').textContent = 'Sign in with Biometric'; }
   }
