@@ -4697,15 +4697,52 @@ submitLesson = async function() {
 const origSubmitAdoption = submitAdoption;
 submitAdoption = async function() {
   // Capture values BEFORE origSubmitAdoption runs (it closes the modal and clears fields)
-  const lessonTitle = currentDetailLesson?.title || adoptModalLessonId;
+  const lessonTitle   = currentDetailLesson?.title || adoptModalLessonId;
   const adoptingPlant = document.getElementById('af-plant').value;
+  const adoptingDept  = document.getElementById('af-dept').value;
+  const submitterName = document.getElementById('af-public-name')?.value.trim() || '';
   const isPublic = !currentUser;
   await origSubmitAdoption();
-  // Only send notification email for logged-in users (public submissions go to pending queue)
-  if (!isPublic && adoptingPlant) {
+
+  if (isPublic && adoptingPlant) {
+    // Public adoption — send a dedicated "pending verification" alert to admin
+    sendPublicAdoptionNotif({ lessonTitle, adoptingPlant, adoptingDept, submitterName });
+  } else if (!isPublic && adoptingPlant) {
+    // Logged-in adoption — standard notification
     sendNotifEmail('lesson_adopted', { lessonTitle, adoptingPlant });
   }
 };
+
+// ── Public adoption notification (no currentUser, reads settings from Firestore) ──
+async function sendPublicAdoptionNotif({ lessonTitle, adoptingPlant, adoptingDept, submitterName }) {
+  try {
+    const snap = await db.collection('settings').doc('notifications').get();
+    if (!snap.exists) return;
+    const cfg = snap.data();
+    if (!cfg.provider) return;
+    if (cfg.triggers && cfg.triggers['lesson_adopted'] === false) return;
+
+    const allEmails = [cfg.adminEmail, ...(cfg.recipients||[]).map(r=>r.email)].filter(Boolean);
+    if (!allEmails.length) return;
+
+    const subject = `[Cross-Learn] 🌐 Public Adoption Request — Pending Verification`;
+    const htmlBody = buildEmailHtml('Public Adoption Request — Pending Verification', {
+      event_type:    'Public Adoption Request',
+      platform_name: 'Cross-Learn',
+      performed_by:  submitterName || 'Public user',
+      plant:         adoptingPlant,
+      department:    adoptingDept,
+      lessonTitle,
+      adoptingPlant,
+      timestamp:     new Date().toLocaleString('en-IN'),
+      note:          `A public (unauthenticated) user has submitted an adoption request. Plant Admin for <strong>${adoptingPlant}</strong> must verify it before it becomes active.`
+    });
+
+    for (const toEmail of allEmails) {
+      await sendViaBackend(cfg, toEmail, subject, htmlBody);
+    }
+  } catch(e) { console.warn('Public adoption notification failed:', e.message); }
+}
 
 // ── Audit log helper ───────────────────────────────────────────────────
 async function logAudit(lessonId, action, meta={}) {
