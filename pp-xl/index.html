@@ -2441,6 +2441,9 @@ function closeAdoptModal() {
   const prd = document.getElementById('adopt-product-fields'); if(prd) prd.style.display='none';
   resetMemberTags('af-members-wrap','af-members-data');
   const al = document.getElementById('af-leader'); if(al) al.value='';
+  // Always reset submit button so it's ready for next open
+  const submitBtn = document.getElementById('adopt-submit-btn');
+  if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Register adoption'; }
 }
 
 async function submitAdoption() {
@@ -2455,44 +2458,58 @@ async function submitAdoption() {
     return;
   }
   const isPublic = !currentUser;
-  // For public submissions, require a name
   const publicName = (document.getElementById('af-public-name')?.value || '').trim();
   if (isPublic && !publicName) {
     errEl.textContent = 'Please enter your name.'; errEl.classList.remove('hidden'); return;
   }
   const submitterName = isPublic ? publicName : currentProfile.name;
-  const data = {
-    plant, dept,
-    adoptionType: currentAdoptType,
-    processName: currentAdoptType === 'process' ? (document.getElementById('af-process-name').value||'') : '',
-    specificArea: currentAdoptType === 'process' ? (document.getElementById('af-specific-area').value||'') : '',
-    partName:   currentAdoptType === 'product' ? (document.getElementById('af-part-name').value||'') : '',
-    partNo:     currentAdoptType === 'product' ? (document.getElementById('af-part-no').value||'') : '',
-    customer:   currentAdoptType === 'product' ? (document.getElementById('af-customer').value||'') : '',
-    leader: document.getElementById('af-leader').value.trim(),
-    teamMembers: _getMemberTags('af-members-data'),
-    plannedDate: document.getElementById('af-planned').value,
-    targetDate: document.getElementById('af-target').value,
-    status: document.getElementById('af-status').value,
-    actionPlan: document.getElementById('af-plan').value,
-    createdBy: submitterName,
-    createdByUid: currentUser ? currentUser.uid : null,
-    isPublicAdoption: isPublic,
-    verificationStatus: isPublic ? 'pending' : 'verified',
-    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-  };
-  await db.collection('lessons').doc(adoptModalLessonId).collection('adoptions').add(data);
-  // Only increment adoptionCount for verified (logged-in) adoptions
-  // Public adoptions increment only after Plant Admin approves
-  if (!isPublic) {
-    await db.collection('lessons').doc(adoptModalLessonId).update({ adoptionCount: firebase.firestore.FieldValue.increment(1) });
+
+  // Disable button to prevent double-submit
+  const submitBtn = document.getElementById('adopt-submit-btn');
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Submitting…'; }
+
+  try {
+    const data = {
+      plant, dept,
+      adoptionType: currentAdoptType,
+      processName: currentAdoptType === 'process' ? (document.getElementById('af-process-name').value||'') : '',
+      specificArea: currentAdoptType === 'process' ? (document.getElementById('af-specific-area').value||'') : '',
+      partName:   currentAdoptType === 'product' ? (document.getElementById('af-part-name').value||'') : '',
+      partNo:     currentAdoptType === 'product' ? (document.getElementById('af-part-no').value||'') : '',
+      customer:   currentAdoptType === 'product' ? (document.getElementById('af-customer').value||'') : '',
+      leader: document.getElementById('af-leader').value.trim(),
+      teamMembers: _getMemberTags('af-members-data'),
+      plannedDate: document.getElementById('af-planned').value,
+      targetDate: document.getElementById('af-target').value,
+      status: document.getElementById('af-status').value,
+      actionPlan: document.getElementById('af-plan').value,
+      createdBy: submitterName,
+      createdByUid: currentUser ? currentUser.uid : null,
+      isPublicAdoption: isPublic,
+      verificationStatus: isPublic ? 'pending' : 'verified',
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    };
+    await db.collection('lessons').doc(adoptModalLessonId).collection('adoptions').add(data);
+    if (!isPublic) {
+      await db.collection('lessons').doc(adoptModalLessonId).update({ adoptionCount: firebase.firestore.FieldValue.increment(1) });
+    }
+    // logAudit only for authenticated users (requires currentUser.uid)
+    if (currentUser) {
+      try { await logAudit(adoptModalLessonId, 'ADOPTION_CREATED', { plant }); } catch(e) { /* non-critical */ }
+    }
+    closeAdoptModal();
+    showToast(isPublic
+      ? '📨 Adoption submitted! Plant Admin will review and verify it.'
+      : 'Adoption registered!');
+  } catch(e) {
+    errEl.textContent = e.message || 'Failed to submit. Please try again.';
+    errEl.classList.remove('hidden');
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = isPublic ? '📨 Submit for Verification' : 'Register adoption';
+    }
   }
-  await logAudit(adoptModalLessonId, isPublic ? 'PUBLIC_ADOPTION_SUBMITTED' : 'ADOPTION_CREATED', { plant, isPublic });
-  closeAdoptModal();
-  showToast(isPublic
-    ? '📨 Adoption submitted! Plant Admin will review and verify it.'
-    : 'Adoption registered!');
 }
 
 // ── PUBLIC ADOPTION APPROVAL ──────────────────────────────────────────────────
@@ -4654,9 +4671,15 @@ submitLesson = async function() {
 
 const origSubmitAdoption = submitAdoption;
 submitAdoption = async function() {
+  // Capture values BEFORE origSubmitAdoption runs (it closes the modal and clears fields)
   const lessonTitle = currentDetailLesson?.title || adoptModalLessonId;
+  const adoptingPlant = document.getElementById('af-plant').value;
+  const isPublic = !currentUser;
   await origSubmitAdoption();
-  sendNotifEmail('lesson_adopted', { lessonTitle, adoptingPlant: document.getElementById('af-plant').value });
+  // Only send notification email for logged-in users (public submissions go to pending queue)
+  if (!isPublic && adoptingPlant) {
+    sendNotifEmail('lesson_adopted', { lessonTitle, adoptingPlant });
+  }
 };
 
 // ── Audit log helper ───────────────────────────────────────────────────
