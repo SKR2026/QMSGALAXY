@@ -794,6 +794,7 @@ button{cursor:pointer;border:none;border-radius:7px;padding:8px 16px;font-weight
       <button class="tab-btn active" onclick="switchAdoptTab('browse',this)">Browse lessons to adopt</button>
       <button class="tab-btn" onclick="switchAdoptTab('mine',this)">My plant's adoptions</button>
       <button class="tab-btn hidden" id="adopt-tab-public" onclick="switchAdoptTab('public',this)">🌐 Public Requests <span id="adopt-public-badge" style="background:#E24B4A;color:#fff;border-radius:999px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:3px;display:none">0</span></button>
+      <button class="tab-btn hidden" id="adopt-tab-history" onclick="switchAdoptTab('history',this)">📋 History</button>
     </div>
     <div id="adopt-browse">
       <div id="adopt-lessons-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px"></div>
@@ -809,6 +810,37 @@ button{cursor:pointer;border:none;border-radius:7px;padding:8px 16px;font-weight
         <button id="pub-filter-rejected" class="btn-cancel" style="font-size:12px;padding:5px 14px" onclick="renderPublicAdoptionsTab('rejected')">✕ Rejected</button>
       </div>
       <div id="public-adoptions-list"></div>
+    </div>
+    <div id="adopt-history" class="hidden">
+      <!-- Filters -->
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;align-items:center">
+        <input id="hist-search" placeholder="Search name, plant, lesson…" oninput="renderAdoptHistory()" style="flex:1;min-width:180px;max-width:280px"/>
+        <select id="hist-plant" onchange="renderAdoptHistory()" style="width:auto;min-width:130px">
+          <option value="">All plants</option>
+        </select>
+        <select id="hist-dept" onchange="renderAdoptHistory()" style="width:auto;min-width:130px">
+          <option value="">All depts</option>
+        </select>
+        <select id="hist-status" onchange="renderAdoptHistory()" style="width:auto;min-width:130px">
+          <option value="">All statuses</option>
+          <option value="verified">✅ Approved</option>
+          <option value="rejected">✕ Rejected</option>
+        </select>
+        <button class="btn-cancel" style="font-size:12px;padding:5px 12px" onclick="document.getElementById('hist-search').value='';document.getElementById('hist-plant').value='';document.getElementById('hist-dept').value='';document.getElementById('hist-status').value='';renderAdoptHistory()">Clear</button>
+      </div>
+      <!-- KPI row -->
+      <div id="hist-kpis" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px"></div>
+      <!-- Table -->
+      <div style="overflow-x:auto">
+        <table class="data-table" id="hist-table">
+          <thead><tr>
+            <th>Lesson ID</th><th>Lesson Title</th><th>Source Plant</th>
+            <th>Adopting Plant</th><th>Dept</th><th>Submitted By</th>
+            <th>Leader</th><th>Status</th><th>Decision</th><th>Decision By</th><th>Submitted</th>
+          </tr></thead>
+          <tbody id="hist-tbody"><tr><td colspan="11" class="empty-state">Loading…</td></tr></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -2312,15 +2344,25 @@ async function loadAuditLog() {
 function renderAdoptView(adoptedOnly) {
   const lessons = getFilteredLessonsGlobal();
 
-  // Show/hide Public Requests tab based on role, update badge from cache
+  // Show/hide Public Requests + History tabs based on role
   const publicTabBtn = document.getElementById('adopt-tab-public');
-  if (publicTabBtn) {
-    const canSeePending = ['superadmin','plantadmin'].includes(currentProfile?.role);
-    publicTabBtn.classList.toggle('hidden', !canSeePending);
-    if (canSeePending) {
-      const count = (_pendingAdoptionsCache || []).length;
-      const badge = document.getElementById('adopt-public-badge');
-      if (badge) { badge.textContent = count; badge.style.display = count > 0 ? '' : 'none'; }
+  const histTabBtn   = document.getElementById('adopt-tab-history');
+  const canSeePending = ['superadmin','plantadmin'].includes(currentProfile?.role);
+  if (publicTabBtn) publicTabBtn.classList.toggle('hidden', !canSeePending);
+  if (histTabBtn)   histTabBtn.classList.toggle('hidden', !canSeePending);
+  if (canSeePending) {
+    const count = (_pendingAdoptionsCache || []).length;
+    const badge = document.getElementById('adopt-public-badge');
+    if (badge) { badge.textContent = count; badge.style.display = count > 0 ? '' : 'none'; }
+    // Populate history dropdowns
+    const plantSel = document.getElementById('hist-plant');
+    const deptSel  = document.getElementById('hist-dept');
+    if (plantSel && plantSel.options.length <= 1) {
+      PLANTS.forEach(p => { const o = document.createElement('option'); o.value = p; o.textContent = p; plantSel.appendChild(o); });
+    }
+    if (deptSel && deptSel.options.length <= 1) {
+      const depts = [...new Set(allLessons.map(l=>l.dept).filter(Boolean))].sort();
+      depts.forEach(d => { const o = document.createElement('option'); o.value = d; o.textContent = d; deptSel.appendChild(o); });
     }
   }
 
@@ -2376,8 +2418,10 @@ function switchAdoptTab(tab, btn) {
   document.getElementById('adopt-browse').classList.toggle('hidden', tab !== 'browse');
   document.getElementById('adopt-mine').classList.toggle('hidden', tab !== 'mine');
   document.getElementById('adopt-public').classList.toggle('hidden', tab !== 'public');
+  document.getElementById('adopt-history').classList.toggle('hidden', tab !== 'history');
   if (tab === 'mine') renderMyAdoptions();
   if (tab === 'public') renderPublicAdoptionsTab();
+  if (tab === 'history') renderAdoptHistory();
 }
 
 async function renderPublicAdoptionsTab(statusFilter) {
@@ -2477,6 +2521,95 @@ async function renderPublicAdoptionsTab(statusFilter) {
     el.innerHTML = `<div class="empty-state">Error: ${e.message}</div>`;
   }
 }
+async function renderAdoptHistory() {
+  const tbody = document.getElementById('hist-tbody');
+  const kpiEl = document.getElementById('hist-kpis');
+  if (!tbody) return;
+  const search  = (document.getElementById('hist-search')?.value  || '').toLowerCase();
+  const fPlant  = document.getElementById('hist-plant')?.value  || '';
+  const fDept   = document.getElementById('hist-dept')?.value   || '';
+  const fStatus = document.getElementById('hist-status')?.value || '';
+
+  tbody.innerHTML = '<tr><td colspan="11" class="empty-state">Loading…</td></tr>';
+  try {
+    const isPA = currentProfile?.role === 'plantadmin';
+    let rows = [];
+    // Fetch all public adoptions (verified + rejected) in one go
+    const allSnap = await db.collectionGroup('adoptions').get();
+    const lessonMap = {};
+    allLessons.forEach(l => { lessonMap[l.id] = l; });
+    allSnap.forEach(d => {
+      const data = d.data();
+      if (!data.isPublicAdoption) return;
+      if (data.verificationStatus === 'pending') return; // pending shown in Public Requests tab
+      if (isPA && data.plant !== currentProfile.plant) return;
+      const lessonId = d.ref.parent.parent.id;
+      rows.push({ lessonId, a: { id: d.id, ...data }, l: lessonMap[lessonId] });
+    });
+
+    // Apply filters
+    rows = rows.filter(({ a, l }) => {
+      if (fPlant  && a.plant !== fPlant) return false;
+      if (fDept   && a.dept  !== fDept)  return false;
+      if (fStatus && a.verificationStatus !== fStatus) return false;
+      if (search) {
+        const haystack = [a.createdBy, a.plant, a.dept, l?.title, l?.lessonId].join(' ').toLowerCase();
+        if (!haystack.includes(search)) return false;
+      }
+      return true;
+    });
+
+    // Sort newest first
+    rows.sort((x,y) => {
+      const da = x.a.createdAt?.toDate?.() || new Date(0);
+      const db2 = y.a.createdAt?.toDate?.() || new Date(0);
+      return db2 - da;
+    });
+
+    // KPI summary
+    const approved = rows.filter(r => r.a.verificationStatus === 'verified').length;
+    const rejected = rows.filter(r => r.a.verificationStatus === 'rejected').length;
+    if (kpiEl) kpiEl.innerHTML = [
+      ['Total',    rows.length, '#EEEDFE','#534AB7'],
+      ['Approved', approved,    '#E1F5EE','#0F6E56'],
+      ['Rejected', rejected,    '#FCEBEB','#A32D2D'],
+    ].map(([l,v,bg,c]) => `<div class="kpi-card" style="background:${bg};min-width:90px"><div class="kpi-val" style="color:${c}">${v}</div><div class="kpi-label" style="color:${c}">${l}</div></div>`).join('');
+
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;padding:24px;color:var(--text-muted)">No records match the filters.</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = rows.map(({ lessonId, a, l }) => {
+      const submitted  = a.createdAt  ? (a.createdAt.toDate  ? a.createdAt.toDate()  : new Date(a.createdAt)).toLocaleDateString('en-IN')  : '—';
+      const isApproved = a.verificationStatus === 'verified';
+      const decisionDate = isApproved
+        ? (a.verifiedAt  ? (a.verifiedAt.toDate  ? a.verifiedAt.toDate()  : new Date(a.verifiedAt)).toLocaleDateString('en-IN')  : '—')
+        : (a.rejectedAt ? (a.rejectedAt.toDate ? a.rejectedAt.toDate() : new Date(a.rejectedAt)).toLocaleDateString('en-IN') : '—');
+      const decisionBy = isApproved ? (a.verifiedBy || '—') : (a.rejectedBy || '—');
+      const statusBadge = isApproved
+        ? `<span class="badge" style="background:#E8F5E9;color:#1B5E20">✅ Approved</span>`
+        : `<span class="badge" style="background:#FFEBEE;color:#B71C1C">✕ Rejected</span>`;
+      const reason = !isApproved && a.rejectionReason ? `<div style="font-size:11px;color:#B71C1C;margin-top:2px">${a.rejectionReason}</div>` : '';
+      return `<tr onclick="openDetail('${lessonId}')" style="cursor:pointer" title="Click to open lesson">
+        <td class="mono" style="color:var(--primary);font-weight:600;white-space:nowrap">${l?.lessonId||lessonId}</td>
+        <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500">${l?.title||'—'}</td>
+        <td>${l?.plant||'—'}</td>
+        <td style="font-weight:600">${a.plant}</td>
+        <td>${a.dept}</td>
+        <td>${a.createdBy}</td>
+        <td>${a.leader||'—'}</td>
+        <td>${statusBadge}${reason}</td>
+        <td style="white-space:nowrap">${decisionDate}</td>
+        <td>${decisionBy}</td>
+        <td style="white-space:nowrap">${submitted}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:20px;color:var(--text-muted)">Error: ${e.message}</td></tr>`;
+  }
+}
+
 async function renderMyAdoptions() {
   const isSA  = currentProfile?.role === 'superadmin';
   const plant = currentProfile?.plant;
@@ -5444,12 +5577,15 @@ function buildNotifs() {
   // Sort by timestamp descending
   _notifs.sort((a,b) => b.ts - a.ts);
 
-  // Update badge
+  // Update badge — unread notifications + pending public adoption requests
+  const pendingCount = (['superadmin','plantadmin'].includes(currentProfile?.role))
+    ? (_pendingAdoptionsCache || []).length : 0;
   const unread = _notifs.filter(n => n.unread).length;
-  const badge = document.getElementById('notif-badge');
+  const total  = unread + pendingCount;
+  const badge  = document.getElementById('notif-badge');
   if (badge) {
-    badge.textContent = unread > 9 ? '9+' : unread;
-    badge.classList.toggle('hidden', unread === 0);
+    badge.textContent = total > 9 ? '9+' : total;
+    badge.classList.toggle('hidden', total === 0);
   }
 }
 
