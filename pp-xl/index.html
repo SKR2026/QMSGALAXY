@@ -793,12 +793,17 @@ button{cursor:pointer;border:none;border-radius:7px;padding:8px 16px;font-weight
     <div class="tabs">
       <button class="tab-btn active" onclick="switchAdoptTab('browse',this)">Browse lessons to adopt</button>
       <button class="tab-btn" onclick="switchAdoptTab('mine',this)">My plant's adoptions</button>
+      <button class="tab-btn hidden" id="adopt-tab-public" onclick="switchAdoptTab('public',this)">🌐 Public Requests <span id="adopt-public-badge" style="background:#E24B4A;color:#fff;border-radius:999px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:3px;display:none">0</span></button>
     </div>
     <div id="adopt-browse">
       <div id="adopt-lessons-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px"></div>
     </div>
     <div id="adopt-mine" class="hidden">
       <div id="my-adoptions-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px"></div>
+    </div>
+    <div id="adopt-public" class="hidden">
+      <p class="muted" style="margin-bottom:14px;font-size:13px">🌐 Public adoption requests submitted without login — verify or reject each one. Approved adoptions become visible to all users.</p>
+      <div id="public-adoptions-list"></div>
     </div>
   </div>
 
@@ -1964,6 +1969,11 @@ function initApp() {
     renderCurrentView();
   });
 
+  // ── Real-time listener: pending public adoptions (superadmin + plantadmin only) ──
+  if (['superadmin','plantadmin'].includes(currentProfile?.role)) {
+    _startPendingAdoptionsListener();
+  }
+
   initHeaderFilterBar();
   showView('home');
 }
@@ -2296,6 +2306,19 @@ async function loadAuditLog() {
 // ── ADOPT VIEW ─────────────────────────────────────────────────────────
 function renderAdoptView(adoptedOnly) {
   const lessons = getFilteredLessonsGlobal();
+
+  // Show/hide Public Requests tab based on role, update badge from cache
+  const publicTabBtn = document.getElementById('adopt-tab-public');
+  if (publicTabBtn) {
+    const canSeePending = ['superadmin','plantadmin'].includes(currentProfile?.role);
+    publicTabBtn.classList.toggle('hidden', !canSeePending);
+    if (canSeePending) {
+      const count = (_pendingAdoptionsCache || []).length;
+      const badge = document.getElementById('adopt-public-badge');
+      if (badge) { badge.textContent = count; badge.style.display = count > 0 ? '' : 'none'; }
+    }
+  }
+
   let others = lessons.filter(l => l.plant !== currentProfile?.plant);
   if (adoptedOnly) others = others.filter(l => (l.adoptionCount||0) > 0);
   // Sort by adoption count descending when filtering adopted-only
@@ -2347,7 +2370,93 @@ function switchAdoptTab(tab, btn) {
   btn.classList.add('active');
   document.getElementById('adopt-browse').classList.toggle('hidden', tab !== 'browse');
   document.getElementById('adopt-mine').classList.toggle('hidden', tab !== 'mine');
+  document.getElementById('adopt-public').classList.toggle('hidden', tab !== 'public');
   if (tab === 'mine') renderMyAdoptions();
+  if (tab === 'public') renderPublicAdoptionsTab();
+}
+
+async function renderPublicAdoptionsTab() {
+  const el = document.getElementById('public-adoptions-list');
+  if (!el) return;
+  el.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const isPA = currentProfile?.role === 'plantadmin';
+    let rows = [];
+    try {
+      let query = db.collectionGroup('adoptions').where('verificationStatus','==','pending');
+      if (isPA) query = query.where('plant','==', currentProfile.plant);
+      const snap = await query.get();
+      const lessonMap = {};
+      allLessons.forEach(l => { lessonMap[l.id] = l; });
+      snap.forEach(d => {
+        const lessonId = d.ref.parent.parent.id;
+        rows.push({ lessonId, adoption: { id: d.id, ...d.data() }, lesson: lessonMap[lessonId] });
+      });
+    } catch(indexErr) {
+      if (/index/i.test(indexErr.message) || indexErr.code === 'failed-precondition') {
+        const allSnap = await db.collectionGroup('adoptions').get();
+        const lessonMap = {};
+        allLessons.forEach(l => { lessonMap[l.id] = l; });
+        allSnap.forEach(d => {
+          const data = d.data();
+          if (data.verificationStatus !== 'pending') return;
+          if (isPA && data.plant !== currentProfile.plant) return;
+          const lessonId = d.ref.parent.parent.id;
+          rows.push({ lessonId, adoption: { id: d.id, ...data }, lesson: lessonMap[lessonId] });
+        });
+        const urlMatch = indexErr.message.match(/https:\/\/console\.firebase\.google\.com[^\s]+/);
+        if (urlMatch && !document.getElementById('index-banner')) {
+          el.insertAdjacentHTML('beforebegin', `<div id="index-banner" style="background:#FFF8E1;border:1px solid #FFD54F;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px;color:#5F4700">
+            ⚠️ <strong>Firestore index missing.</strong> <a href="${urlMatch[0]}" target="_blank" style="color:#1a73e8;font-weight:600">👉 Click to create the index</a> — one-time setup, takes ~2 min.
+          </div>`);
+        }
+      } else { throw indexErr; }
+    }
+    // Update badge
+    const badge = document.getElementById('adopt-public-badge');
+    if (badge) { badge.textContent = rows.length; badge.style.display = rows.length > 0 ? '' : 'none'; }
+
+    if (rows.length === 0) {
+      el.innerHTML = '<div class="empty-state">🎉 No pending public adoption requests.</div>';
+      return;
+    }
+    rows.sort((a,b) => {
+      const da = a.adoption.createdAt?.toDate?.() || new Date(0);
+      const db2 = b.adoption.createdAt?.toDate?.() || new Date(0);
+      return db2 - da;
+    });
+    el.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px">` +
+      rows.map(({ lessonId, adoption: a, lesson: l }) => {
+        const date = a.createdAt ? (a.createdAt.toDate ? a.createdAt.toDate() : new Date(a.createdAt)).toLocaleString('en-IN') : '—';
+        return `<div class="lesson-card" style="border:1.5px dashed #FFD54F;background:#FFFDF0">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;gap:6px">
+            <div>
+              <div class="mono muted" style="font-size:11px;margin-bottom:3px">${l ? l.lessonId : lessonId}</div>
+              <div style="font-size:14px;font-weight:600;line-height:1.3">${l ? l.title : lessonId}</div>
+            </div>
+            <span style="background:#FFF3CD;color:#856404;border:1px solid #FFD54F;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:700;white-space:nowrap">⏳ Pending</span>
+          </div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">
+            <span>🏭 ${l ? l.plant : '—'} → <strong style="color:var(--text)">${a.plant}</strong></span>
+            <span style="margin-left:10px">🏢 ${a.dept}</span>
+          </div>
+          <p style="font-size:12px;margin-bottom:3px">👤 Submitted by: <strong>${a.createdBy}</strong></p>
+          ${a.leader ? `<p style="font-size:12px;margin-bottom:3px">🧑‍💼 Leader: ${a.leader}</p>` : ''}
+          ${a.status ? `<p style="font-size:12px;margin-bottom:3px">📊 Status: ${a.status}</p>` : ''}
+          ${a.actionPlan ? `<p style="font-size:12px;color:#5F5E5A;margin-bottom:8px;padding:7px;background:#fff;border-radius:6px;border:1px solid #FFD54F">${a.actionPlan}</p>` : ''}
+          <p class="muted" style="font-size:11px;margin-bottom:10px">🕐 ${date}</p>
+          <div style="display:flex;gap:8px">
+            <button class="btn-save" style="font-size:12px;padding:6px 14px;background:#1D9E75;flex:1"
+              onclick="approvePublicAdoption('${lessonId}','${a.id}','${a.plant}').then(()=>renderPublicAdoptionsTab())">✅ Approve</button>
+            <button class="btn-cancel" style="font-size:12px;padding:6px 14px;background:#E24B4A;color:#fff;border-color:#E24B4A;flex:1"
+              onclick="rejectPublicAdoption('${lessonId}','${a.id}').then(()=>renderPublicAdoptionsTab())">✕ Reject</button>
+            ${l ? `<button class="btn-cancel" style="font-size:12px;padding:6px 10px" onclick="openDetail('${lessonId}')">👁</button>` : ''}
+          </div>
+        </div>`;
+      }).join('') + `</div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="empty-state">Error: ${e.message}</div>`;
+  }
 }
 
 async function renderMyAdoptions() {
@@ -2554,6 +2663,7 @@ async function approvePublicAdoption(lessonId, adoptionId, plant) {
     await db.collection('lessons').doc(lessonId).update({ adoptionCount: firebase.firestore.FieldValue.increment(1) });
     await logAudit(lessonId, 'PUBLIC_ADOPTION_APPROVED', { adoptionId, plant, verifiedBy: currentProfile.name });
     showToast('✅ Adoption approved and now live!');
+    notifyAdoptionDecision(lessonId, adoptionId, 'approved'); // non-blocking
     renderPendingAdoptionsAdmin();
   } catch(e) { showToast(e.message || 'Approval failed', 'error'); }
 }
@@ -2573,6 +2683,7 @@ async function rejectPublicAdoption(lessonId, adoptionId) {
     });
     await logAudit(lessonId, 'PUBLIC_ADOPTION_REJECTED', { adoptionId, reason: reason.trim(), rejectedBy: currentProfile.name });
     showToast('Adoption rejected.');
+    notifyAdoptionDecision(lessonId, adoptionId, 'rejected', reason.trim()); // non-blocking
     renderPendingAdoptionsAdmin();
   } catch(e) { showToast(e.message || 'Rejection failed', 'error'); }
 }
@@ -2583,22 +2694,57 @@ async function renderPendingAdoptionsAdmin() {
   el.innerHTML = '<p class="muted">Loading…</p>';
   try {
     const isPA = currentProfile?.role === 'plantadmin';
-    let query = db.collectionGroup('adoptions').where('verificationStatus','==','pending');
-    if (isPA) query = query.where('plant','==', currentProfile.plant);
-    const snap = await query.get();
-    if (snap.empty) {
+    let rows = [];
+
+    try {
+      // Try the indexed query first
+      let query = db.collectionGroup('adoptions').where('verificationStatus','==','pending');
+      if (isPA) query = query.where('plant','==', currentProfile.plant);
+      const snap = await query.get();
+      const lessonMap = {};
+      allLessons.forEach(l => { lessonMap[l.id] = l; });
+      snap.forEach(d => {
+        const lessonId = d.ref.parent.parent.id;
+        rows.push({ lessonId, adoption: {id: d.id, ...d.data()}, lesson: lessonMap[lessonId] });
+      });
+    } catch(indexErr) {
+      // Index not yet created — fall back to fetch-all + filter in memory
+      if (/index/i.test(indexErr.message) || indexErr.code === 'failed-precondition') {
+        const allSnap = await db.collectionGroup('adoptions').get();
+        const lessonMap = {};
+        allLessons.forEach(l => { lessonMap[l.id] = l; });
+        allSnap.forEach(d => {
+          const data = d.data();
+          if (data.verificationStatus !== 'pending') return;
+          if (isPA && data.plant !== currentProfile.plant) return;
+          const lessonId = d.ref.parent.parent.id;
+          rows.push({ lessonId, adoption: {id: d.id, ...data}, lesson: lessonMap[lessonId] });
+        });
+        // Extract index creation URL from error message and show banner
+        const urlMatch = indexErr.message.match(/https:\/\/console\.firebase\.google\.com[^\s]+/);
+        if (urlMatch) {
+          el.insertAdjacentHTML('beforebegin', `
+            <div id="index-banner" style="background:#FFF8E1;border:1px solid #FFD54F;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px;color:#5F4700">
+              ⚠️ <strong>Firestore index missing</strong> — results are loaded via fallback (slower).
+              <a href="${urlMatch[0]}" target="_blank" style="color:#1a73e8;font-weight:600;margin-left:6px">👉 Click here to create the index (one-time setup)</a>
+              — takes ~2 minutes. Refresh after it's active.
+            </div>`);
+        }
+      } else {
+        throw indexErr; // rethrow non-index errors
+      }
+    }
+    if (rows.length === 0) {
       el.innerHTML = '<div class="empty-state">🎉 No pending adoptions — all clear!</div>';
-      // Update tab badge
       const tabBtn = document.getElementById('admin-tab-pending-adoptions');
       if (tabBtn) tabBtn.textContent = 'Pending Adoptions';
       return;
     }
-    const lessonMap = {};
-    allLessons.forEach(l => { lessonMap[l.id] = l; });
-    const rows = [];
-    snap.forEach(d => {
-      const lessonId = d.ref.parent.parent.id;
-      rows.push({ lessonId, adoption: {id: d.id, ...d.data()}, lesson: lessonMap[lessonId] });
+    // Sort newest first
+    rows.sort((a,b) => {
+      const da = a.adoption.createdAt?.toDate?.() || new Date(0);
+      const db2 = b.adoption.createdAt?.toDate?.() || new Date(0);
+      return db2 - da;
     });
     // Update tab badge
     const tabBtn = document.getElementById('admin-tab-pending-adoptions');
@@ -4722,7 +4868,20 @@ async function sendPublicAdoptionNotif({ lessonTitle, adoptingPlant, adoptingDep
     if (!cfg.provider) return;
     if (cfg.triggers && cfg.triggers['lesson_adopted'] === false) return;
 
-    const allEmails = [cfg.adminEmail, ...(cfg.recipients||[]).map(r=>r.email)].filter(Boolean);
+    // Get plant admin email(s) for the adopting plant
+    const paSnap = await db.collection('users')
+      .where('role', '==', 'plantadmin')
+      .where('plant', '==', adoptingPlant)
+      .get();
+    const plantAdminEmails = paSnap.docs.map(d => d.data().email).filter(Boolean);
+
+    // All recipients: superadmin + configured recipients + plant admin(s)
+    const allEmails = [
+      cfg.adminEmail,
+      ...(cfg.recipients||[]).map(r=>r.email),
+      ...plantAdminEmails
+    ].filter(Boolean).filter((e,i,a) => a.indexOf(e) === i); // deduplicate
+
     if (!allEmails.length) return;
 
     const subject = `[Cross-Learn] 🌐 Public Adoption Request — Pending Verification`;
@@ -4735,13 +4894,55 @@ async function sendPublicAdoptionNotif({ lessonTitle, adoptingPlant, adoptingDep
       lessonTitle,
       adoptingPlant,
       timestamp:     new Date().toLocaleString('en-IN'),
-      note:          `A public (unauthenticated) user has submitted an adoption request. Plant Admin for <strong>${adoptingPlant}</strong> must verify it before it becomes active.`
+      note:          `A public (unauthenticated) user has submitted an adoption request. Plant Admin for <strong>${adoptingPlant}</strong> must log in and verify it under Admin → Pending Adoptions before it becomes active.`
     });
 
     for (const toEmail of allEmails) {
       await sendViaBackend(cfg, toEmail, subject, htmlBody);
     }
   } catch(e) { console.warn('Public adoption notification failed:', e.message); }
+}
+
+// ── Notify after plant admin approves/rejects a public adoption ───────────────
+async function notifyAdoptionDecision(lessonId, adoptionId, decision, reason='') {
+  try {
+    const snap = await db.collection('settings').doc('notifications').get();
+    if (!snap.exists) return;
+    const cfg = snap.data();
+    if (!cfg.provider) return;
+
+    // Get the adoption doc to read submitter info
+    const adoptSnap = await db.collection('lessons').doc(lessonId).collection('adoptions').doc(adoptionId).get();
+    const a = adoptSnap.exists ? adoptSnap.data() : {};
+    const lessonSnap = await db.collection('lessons').doc(lessonId).get();
+    const lessonTitle = lessonSnap.exists ? lessonSnap.data().title : lessonId;
+
+    const allEmails = [cfg.adminEmail, ...(cfg.recipients||[]).map(r=>r.email)].filter(Boolean);
+    if (!allEmails.length) return;
+
+    const isApproved = decision === 'approved';
+    const subject = isApproved
+      ? `[Cross-Learn] ✅ Public Adoption Approved — ${a.plant}`
+      : `[Cross-Learn] ✕ Public Adoption Rejected — ${a.plant}`;
+
+    const htmlBody = buildEmailHtml(isApproved ? 'Public Adoption Approved' : 'Public Adoption Rejected', {
+      event_type:    isApproved ? 'Adoption Approved' : 'Adoption Rejected',
+      platform_name: 'Cross-Learn',
+      performed_by:  currentProfile?.name || '',
+      plant:         a.plant || '',
+      department:    a.dept || '',
+      lessonTitle,
+      adoptingPlant: a.plant || '',
+      timestamp:     new Date().toLocaleString('en-IN'),
+      note: isApproved
+        ? `Adoption by <strong>${a.createdBy}</strong> (${a.plant} / ${a.dept}) has been approved by <strong>${currentProfile?.name}</strong> and is now live.`
+        : `Adoption by <strong>${a.createdBy}</strong> (${a.plant} / ${a.dept}) was rejected by <strong>${currentProfile?.name}</strong>. Reason: ${reason || '—'}`
+    });
+
+    for (const toEmail of allEmails) {
+      await sendViaBackend(cfg, toEmail, subject, htmlBody);
+    }
+  } catch(e) { console.warn('Adoption decision notification failed:', e.message); }
 }
 
 // ── Audit log helper ───────────────────────────────────────────────────
@@ -5082,6 +5283,61 @@ document.addEventListener('click', e => {
 
 
 
+// ── PENDING ADOPTIONS REALTIME LISTENER ────────────────────────────────────
+let _pendingAdoptionsCache = [];
+let _pendingAdoptionsUnsub = null;
+
+function _startPendingAdoptionsListener() {
+  if (_pendingAdoptionsUnsub) _pendingAdoptionsUnsub(); // unsub any previous
+  const isPA = currentProfile?.role === 'plantadmin';
+  let query = db.collectionGroup('adoptions').where('verificationStatus', '==', 'pending');
+  if (isPA) query = query.where('plant', '==', currentProfile.plant);
+
+  _pendingAdoptionsUnsub = query.onSnapshot(snap => {
+    const lessonMap = {};
+    allLessons.forEach(l => { lessonMap[l.id] = l; });
+
+    _pendingAdoptionsCache = snap.docs.map(d => {
+      const data = d.data();
+      const lessonId = d.ref.parent.parent.id;
+      const lesson = lessonMap[lessonId];
+      const ts = data.createdAt ? (data.createdAt.toDate ? data.createdAt.toDate().getTime() : new Date(data.createdAt).getTime()) : 0;
+      return {
+        adoptionId: d.id,
+        lessonId,
+        lessonTitle: lesson?.title || lessonId,
+        plant:       data.plant || '',
+        dept:        data.dept  || '',
+        createdBy:   data.createdBy || 'Unknown',
+        ts
+      };
+    });
+
+    // Update nav Admin button badge
+    const navAdminBtn = document.getElementById('nav-admin');
+    if (navAdminBtn) {
+      const count = _pendingAdoptionsCache.length;
+      if (count > 0) {
+        navAdminBtn.innerHTML = `⚙️ Admin <span style="background:#E24B4A;color:#fff;border-radius:999px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px">${count}</span>`;
+      } else {
+        navAdminBtn.textContent = '⚙️ Admin';
+      }
+    }
+
+    // Update notification bell
+    buildNotifs();
+    // Also refresh adopt view public tab badge if visible
+    const adoptBadge = document.getElementById('adopt-public-badge');
+    if (adoptBadge) {
+      const count = _pendingAdoptionsCache.length;
+      adoptBadge.textContent = count;
+      adoptBadge.style.display = count > 0 ? '' : 'none';
+    }
+  }, err => {
+    if (err.code !== 'permission-denied') console.warn('Pending adoptions listener:', err.message);
+  });
+}
+
 // ── NOTIFICATION BELL ─────────────────────────────────────────────────────
 const NOTIF_KEY = 'cl_notif_lastSeen'; // timestamp of last seen
 let _notifs = []; // in-memory notification list
@@ -5151,6 +5407,22 @@ function buildNotifs() {
       });
     });
 
+  // Pending public adoptions — shown only to superadmin and plantadmin
+  if (['superadmin','plantadmin'].includes(currentProfile?.role)) {
+    (_pendingAdoptionsCache || []).forEach(p => {
+      _notifs.push({
+        id: 'pending-adopt-' + p.adoptionId,
+        type: 'pending_adoption',
+        title: `🌐 Pending Adoption: ${p.lessonTitle}`,
+        sub: `${p.plant} / ${p.dept} · by ${p.createdBy} · awaiting your verification`,
+        ts: p.ts,
+        lessonId: p.lessonId,
+        unread: p.ts > lastSeen,
+        isPending: true
+      });
+    });
+  }
+
   // Sort by timestamp descending
   _notifs.sort((a,b) => b.ts - a.ts);
 
@@ -5169,7 +5441,11 @@ function renderNotifList() {
   if (!el) return;
   if (!_notifs.length) { el.innerHTML = '<div class="notif-empty">No notifications yet.</div>'; return; }
   el.innerHTML = _notifs.map(n => `
-    <div class="notif-item ${n.unread ? 'notif-unread' : ''}" onclick="openDetail('${n.lessonId}');document.getElementById('notif-dropdown').classList.remove('open')">
+    <div class="notif-item ${n.unread ? 'notif-unread' : ''}" onclick="${
+      n.isPending
+        ? `showView('admin');setTimeout(()=>{const btn=document.getElementById('admin-tab-pending-adoptions');if(btn)switchAdminTab('pending-adoptions',btn);},200);document.getElementById('notif-dropdown').classList.remove('open')`
+        : `openDetail('${n.lessonId}');document.getElementById('notif-dropdown').classList.remove('open')`
+    }">
       <div class="notif-item-title">${n.title}</div>
       <div class="notif-item-sub">${n.sub}</div>
     </div>`).join('');
