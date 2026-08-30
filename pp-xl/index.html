@@ -4333,6 +4333,32 @@ async function saveNotifSettings() {
 }
 
 // ── Microsoft Graph API: get access token (client-credentials) ─────────
+// ── Email via Cloud Function backend (no OAuth needed) ────────────────────
+// POSTs to your backend URL /api/send-email — backend handles Gmail auth.
+// This avoids OAuth refresh token expiry completely.
+
+async function sendViaBackend(cfg, toEmail, subject, htmlBody) {
+  const backendUrl = (cfg.backendUrl || '').trim().replace(/\/+$/, '');
+  if (!backendUrl) throw new Error('Gmail Backend URL not configured. Add it in Settings → Notifications.');
+
+  const res = await fetch(`${backendUrl}/api/send-email`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      to:         toEmail,
+      subject,
+      htmlBody,
+      senderName: cfg.senderName || 'CrossLearn Notifications'
+    })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error('Backend email error: ' + (err.error || res.statusText));
+  }
+  return true;
+}
+
+// ── Microsoft Graph API: send one email ───────────────────────────────
 async function getMsAccessToken(cfg) {
   const url = `https://login.microsoftonline.com/${cfg.msTenantId}/oauth2/v2.0/token`;
   const body = new URLSearchParams({
@@ -4347,7 +4373,6 @@ async function getMsAccessToken(cfg) {
   return json.access_token;
 }
 
-// ── Microsoft Graph API: send one email ───────────────────────────────
 async function sendViaMicrosoft(cfg, toEmail, subject, htmlBody) {
   const token = await getMsAccessToken(cfg);
   const endpoint = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(cfg.msSender)}/sendMail`;
@@ -4370,44 +4395,6 @@ async function sendViaMicrosoft(cfg, toEmail, subject, htmlBody) {
     throw new Error(`MS Graph sendMail error ${res.status}: ${err}`);
   }
 }
-
-// ── Gmail API: exchange refresh token for access token ────────────────
-async function getGmailAccessToken(cfg) {
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id:     cfg.gmailClientId,
-      client_secret: cfg.gmailSecret,
-      refresh_token: cfg.gmailRefresh,
-      grant_type:    'refresh_token'
-    })
-  });
-  if (!res.ok) throw new Error(`Gmail token error: ${res.status}`);
-  const json = await res.json();
-  return json.access_token;
-}
-
-// ── Gmail API: encode RFC 2822 message and send ───────────────────────
-async function sendViaGmail(cfg, toEmail, subject, htmlBody) {
-  const token = await getGmailAccessToken(cfg);
-  const raw = [
-    `From: CrossLearn Notifications <${cfg.gmailSender}>`,
-    `To: ${toEmail}`,
-    `Subject: ${subject}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/html; charset=utf-8',
-    '',
-    htmlBody
-  ].join('\r\n');
-  const encoded = btoa(unescape(encodeURIComponent(raw)))
-    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-  const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/send`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ raw: encoded })
-  });
-  if (!res.ok) {
     const err = await res.text();
     throw new Error(`Gmail send error ${res.status}: ${err}`);
   }
@@ -4460,7 +4447,8 @@ async function sendNotifEmail(eventKey, params={}) {
       if (cfg.provider === 'microsoft') {
         await sendViaMicrosoft(cfg, toEmail, subject, htmlBody);
       } else if (cfg.provider === 'gmail') {
-        await sendViaGmail(cfg, toEmail, subject, htmlBody);
+        // Use Cloud Function backend — avoids OAuth token expiry
+        await sendViaBackend(cfg, toEmail, subject, htmlBody);
       }
     }
   } catch(e) { console.warn('Email notification failed:', e.message); }
@@ -4483,7 +4471,7 @@ async function testNotifEmail() {
       note: 'This is a test message to verify your email provider is configured correctly.'
     });
     if (cfg.provider === 'microsoft') await sendViaMicrosoft(cfg, toEmail, subject, htmlBody);
-    else if (cfg.provider === 'gmail')  await sendViaGmail(cfg, toEmail, subject, htmlBody);
+    else if (cfg.provider === 'gmail')  await sendViaBackend(cfg, toEmail, subject, htmlBody);
     showToast('Test email sent! Check your inbox.');
   } catch(e) { showToast('Test failed: ' + e.message, 'error'); }
 }
