@@ -254,7 +254,7 @@ tr:hover td{background:#fafbff}
 
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js';
-import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, createUserWithEmailAndPassword, sendPasswordResetEmail }
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, createUserWithEmailAndPassword, sendPasswordResetEmail, sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink }
   from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js';
 import { getFirestore, collection, getDocs, addDoc, updateDoc, deleteDoc, doc, query, where, orderBy, limit, serverTimestamp, getDoc, setDoc }
   from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js';
@@ -279,6 +279,12 @@ const storage = getStorage(app);
 
 // ── CONSTANTS ─────────────────────────────────────────────────────
 const SUPERADMIN_EMAIL = 'sushil@polyplasticsindia.com';
+const TOP_MGMT_EMAILS = JSON.parse(localStorage.getItem('vems_topmgmt')||'["md@polyplasticsindia.com","ceo@polyplasticsindia.com","director@polyplasticsindia.com"]');
+
+const ACTION_CODE_SETTINGS = {
+  url: window.location.origin + window.location.pathname,
+  handleCodeInApp: true,
+};
 
 const VEHICLE_TYPES = ['Car','SUV','Bus','Truck','Forklift','LCV','MUV','Van','Pickup','HCV','Other'];
 const FUEL_TYPES = ['Petrol','Diesel','CNG','LPG','Electric','Hybrid'];
@@ -348,6 +354,8 @@ let S = {
   modal: null, loading: false, notifications: [],
   companyLogo: localStorage.getItem('vems_logo') || '',
   orgName: localStorage.getItem('vems_orgname') || 'Polyplastics India Ltd',
+  schedulerCrons: JSON.parse(localStorage.getItem('vems_crons')||'{}'),
+  isTopMgmt: false,
 };
 
 // ── HELPERS ───────────────────────────────────────────────────────
@@ -420,19 +428,42 @@ function addAudit(action, oldVal='', newVal='', extra='') {
 }
 
 // ── AUTH ──────────────────────────────────────────────────────────
+// ── MAGIC LINK DETECTION ──────────────────────────────────────────
+async function handleMagicLink() {
+  if (!isSignInWithEmailLink(auth, window.location.href)) return false;
+  let email = localStorage.getItem('vems_magic_email');
+  if (!email) {
+    email = window.prompt('Please enter your email to confirm sign-in:');
+    if (!email) return false;
+  }
+  try {
+    await signInWithEmailLink(auth, email, window.location.href);
+    localStorage.removeItem('vems_magic_email');
+    window.history.replaceState({}, document.title, window.location.pathname);
+    return true;
+  } catch(e) {
+    showToast('Magic link expired or invalid. Please request a new one.', 'error');
+    return false;
+  }
+}
+
 onAuthStateChanged(auth, async user => {
   S.user = user;
   if (user) {
     S.isSuperAdmin = user.email === SUPERADMIN_EMAIL;
-    if (!S.isSuperAdmin) {
-      // load plant admin profile
+    S.isTopMgmt = TOP_MGMT_EMAILS.includes(user.email) && !S.isSuperAdmin;
+    if (!S.isSuperAdmin && !S.isTopMgmt) {
       try {
         const snap = await getDoc(doc(db,'users', user.uid));
-        S.userProfile = snap.exists() ? snap.data() : { plantId: '', role:'plant_admin' };
+        S.userProfile = snap.exists() ? snap.data() : { plantId:'plant-a', role:'plant_admin' };
       } catch { S.userProfile = { plantId:'plant-a', role:'plant_admin' }; }
     }
-    S.page = 'dashboard';
-  } else { S.page = 'login'; }
+    S.page = S.isTopMgmt ? 'topmgmt' : 'dashboard';
+  } else {
+    const handled = await handleMagicLink();
+    if (!handled) { S.page = 'login'; render(); }
+    return;
+  }
   render();
 });
 
@@ -517,6 +548,16 @@ window.removeLogo = function() {
   render();
 };
 
+window.updateCronPreview = function(type, istTime) {
+  const isWeekly = type === 'weekly';
+  const cron = cronFromTime(istTime, isWeekly ? 'weekly' : 'daily');
+  const el = document.getElementById(`cron-preview-${type}`);
+  if (el) {
+    el.textContent = cron;
+    el.nextElementSibling.textContent = `= ${istTime} IST ${isWeekly ? 'every Monday' : 'daily'}`;
+  }
+};
+
 window.switchReportTab = function(tab) {
   S.subPage = tab;
   Object.values(S.charts).forEach(c=>c?.destroy&&c.destroy());
@@ -551,6 +592,7 @@ function render() {
   `;
   bindAll();
   if (S.page==='dashboard') setTimeout(initCharts, 50);
+  if (S.page==='topmgmt') setTimeout(window.initTopMgmtCharts, 50);
   if (S.page==='co2') setTimeout(initCO2Charts, 50);
   if (S.page==='reports') setTimeout(initReportCharts, 50);
 }
@@ -619,7 +661,7 @@ function sidebarHTML() {
     </div>
     <div class="sidebar-user">
       <div class="user-avatar">${(S.user?.email||'U')[0].toUpperCase()}</div>
-      <div><div class="user-name">${S.user?.email?.split('@')[0]||'User'}</div><div class="user-role">${isSA()?'🛡️ Superadmin':'🏭 Plant Admin'}</div></div>
+      <div><div class="user-name">${S.user?.email?.split('@')[0]||'User'}</div><div class="user-role">${isSA()?'🛡️ Superadmin':S.isTopMgmt?'👁️ Top Management':'🏭 Plant Admin'}</div></div>
     </div>
     ${nav.map(s=>`<div class="sidebar-section">
       <div class="sidebar-section-label">${s.section}</div>
@@ -634,6 +676,7 @@ function sidebarHTML() {
 // ── PAGE ROUTER ───────────────────────────────────────────────────
 function pageHTML() {
   switch(S.page) {
+    case 'topmgmt':     return topMgmtHTML();
     case 'dashboard':   return dashboardHTML();
     case 'alerts':      return alertsHTML();
     case 'notifications': return notificationsHTML();
@@ -1480,12 +1523,13 @@ function auditHTML() {
 
 // ── SUPERADMIN PANEL ──────────────────────────────────────────────
 function superadminHTML() {
+  const sc = S.schedulerCrons || {};
   const cfg = S.notifConfig || {
     gmailUser: 'qmsgalaxy@gmail.com',
     superadminEmail: 'sushil@polyplasticsindia.com',
-    dailyTime: '08:00',
-    weeklyTime: '08:00',
-    invoiceTime: '09:00',
+    dailyTime:   istFromCron(sc.daily   || '0 2 * * *'),
+    weeklyTime:  istFromCron(sc.weekly  || '0 2 * * 1'),
+    invoiceTime: istFromCron(sc.invoice || '30 3 * * *'),
     alertThreshold: 60,
     highExpenseThreshold: 50000,
     poorMileageThreshold: 5,
@@ -1504,6 +1548,34 @@ function superadminHTML() {
       ${kpi('Total Vehicles',S.vehicles.length,'Registered','#0ea5e9','🚗')}
       ${kpi('Total Expenses',fmtR(S.expenses.reduce((s,e)=>s+e.amount,0)),'All time','#7c3aed','💰')}
       ${kpi('Total CO₂',S.expenses.reduce((s,e)=>s+(e.co2Emission||0),0).toFixed(0)+' kg','All plants','#dc2626','🌱')}
+    </div>
+
+    <!-- Top Management Magic Link -->
+    <div class="card mb-4">
+      <div class="card-title">👁️ Top Management — Magic Link Access
+        <span class="badge badge-purple">Passwordless</span>
+      </div>
+      <div class="alert alert-info mb-4">ℹ️ Top Management gets a <b>read-only executive dashboard</b> via a secure magic link in their email. No password needed. Link expires in <b>1 hour</b>.</div>
+      <div class="form-group">
+        <label class="form-label">Top Management Emails <span style="font-size:11px;color:var(--gray-400)">(one per line)</span></label>
+        <textarea id="topmgmt-emails" class="form-textarea" rows="4" placeholder="md@polyplasticsindia.com&#10;ceo@polyplasticsindia.com&#10;director@polyplasticsindia.com">${JSON.parse(localStorage.getItem('vems_topmgmt')||'[]').join('\n')}</textarea>
+      </div>
+      <div class="flex gap-2 flex-wrap mb-4">
+        <button class="btn btn-primary" onclick="saveTopMgmtEmails()">💾 Save Emails</button>
+        <button class="btn btn-success" onclick="sendMagicLinkToAll()">📧 Send Magic Link to All</button>
+      </div>
+      <div class="divider"></div>
+      <div class="card-title" style="font-size:13px;margin-bottom:8px">Send to individual</div>
+      <div class="flex gap-2">
+        <input type="email" id="single-magic-email" class="form-input" placeholder="specific@email.com" style="max-width:300px"/>
+        <button class="btn btn-secondary" onclick="sendMagicLink(document.getElementById('single-magic-email').value)">📨 Send Magic Link</button>
+      </div>
+      <div class="mt-4" style="background:var(--gray-50);border-radius:var(--radius);padding:14px;border:1px solid var(--gray-200)">
+        <div style="font-size:12px;font-weight:600;color:var(--gray-600);margin-bottom:8px">📋 What top management sees (read-only):</div>
+        <div style="font-size:12px;color:var(--gray-500);display:grid;grid-template-columns:1fr 1fr;gap:4px">
+          ${['✅ Total & monthly expenses','✅ Plant-wise breakdown','✅ Monthly expense trend','✅ CO₂ emissions summary','✅ Top 5 high-expense vehicles','✅ Document expiry alerts','❌ Cannot add/edit/delete','❌ Cannot access admin settings'].map(i=>`<div>${i}</div>`).join('')}
+        </div>
+      </div>
     </div>
 
     <!-- Gmail Notification Settings -->
@@ -1564,11 +1636,13 @@ function superadminHTML() {
         </div>
         <div class="flex items-center gap-3">
           <div class="form-group" style="margin:0">
-            <label class="form-label">Send Time (IST)</label>
-            <input type="time" id="sa-daily-time" class="form-input" value="${cfg.dailyTime}" style="width:140px"/>
+            <label class="form-label">Send Time <span style="color:#16a34a;font-weight:600">(IST — Indian Standard Time)</span></label>
+            <input type="time" id="sa-daily-time" class="form-input" value="${cfg.dailyTime}" style="width:140px" oninput="updateCronPreview('daily',this.value)"/>
           </div>
-          <div style="font-size:12px;color:var(--gray-400);padding-top:20px">
-            Current cron: <code style="background:var(--gray-100);padding:2px 6px;border-radius:4px">${cronFromTime(cfg.dailyTime,'daily')}</code>
+          <div style="padding-top:20px">
+            <div style="font-size:11px;color:var(--gray-400)">UTC Cron (Cloud Scheduler)</div>
+            <code id="cron-preview-daily" style="background:var(--gray-100);padding:3px 8px;border-radius:4px;font-size:12px">${cronFromTime(cfg.dailyTime,'daily')}</code>
+            <div style="font-size:11px;color:var(--gray-400);margin-top:2px">= ${cfg.dailyTime} IST daily</div>
           </div>
         </div>
       </div>
@@ -1588,11 +1662,13 @@ function superadminHTML() {
         </div>
         <div class="flex items-center gap-3">
           <div class="form-group" style="margin:0">
-            <label class="form-label">Send Time (IST) — Every Monday</label>
-            <input type="time" id="sa-weekly-time" class="form-input" value="${cfg.weeklyTime}" style="width:140px"/>
+            <label class="form-label">Send Time <span style="color:#16a34a;font-weight:600">(IST)</span> — Every Monday</label>
+            <input type="time" id="sa-weekly-time" class="form-input" value="${cfg.weeklyTime}" style="width:140px" oninput="updateCronPreview('weekly',this.value)"/>
           </div>
-          <div style="font-size:12px;color:var(--gray-400);padding-top:20px">
-            Current cron: <code style="background:var(--gray-100);padding:2px 6px;border-radius:4px">${cronFromTime(cfg.weeklyTime,'weekly')}</code>
+          <div style="padding-top:20px">
+            <div style="font-size:11px;color:var(--gray-400)">UTC Cron (Cloud Scheduler)</div>
+            <code id="cron-preview-weekly" style="background:var(--gray-100);padding:3px 8px;border-radius:4px;font-size:12px">${cronFromTime(cfg.weeklyTime,'weekly')}</code>
+            <div style="font-size:11px;color:var(--gray-400);margin-top:2px">= ${cfg.weeklyTime} IST every Monday</div>
           </div>
         </div>
       </div>
@@ -1612,11 +1688,13 @@ function superadminHTML() {
         </div>
         <div class="flex items-center gap-3">
           <div class="form-group" style="margin:0">
-            <label class="form-label">Send Time (IST)</label>
-            <input type="time" id="sa-invoice-time" class="form-input" value="${cfg.invoiceTime}" style="width:140px"/>
+            <label class="form-label">Send Time <span style="color:#16a34a;font-weight:600">(IST)</span></label>
+            <input type="time" id="sa-invoice-time" class="form-input" value="${cfg.invoiceTime}" style="width:140px" oninput="updateCronPreview('invoice',this.value)"/>
           </div>
-          <div style="font-size:12px;color:var(--gray-400);padding-top:20px">
-            Current cron: <code style="background:var(--gray-100);padding:2px 6px;border-radius:4px">${cronFromTime(cfg.invoiceTime,'daily')}</code>
+          <div style="padding-top:20px">
+            <div style="font-size:11px;color:var(--gray-400)">UTC Cron (Cloud Scheduler)</div>
+            <code id="cron-preview-invoice" style="background:var(--gray-100);padding:3px 8px;border-radius:4px;font-size:12px">${cronFromTime(cfg.invoiceTime,'daily')}</code>
+            <div style="font-size:11px;color:var(--gray-400);margin-top:2px">= ${cfg.invoiceTime} IST daily</div>
           </div>
         </div>
       </div>
@@ -1696,14 +1774,39 @@ function superadminHTML() {
 }
 
 function cronFromTime(timeStr, type) {
+  // Convert IST time → UTC cron (IST = UTC+5:30)
   const [h, m] = (timeStr||'08:00').split(':').map(Number);
-  // Convert IST to UTC (subtract 5:30)
   let utcH = h - 5;
   let utcM = m - 30;
   if (utcM < 0) { utcM += 60; utcH -= 1; }
   if (utcH < 0) utcH += 24;
-  return type === 'weekly' ? `${utcM} ${utcH} * * 1` : `${utcM} ${utcH} * * *`;
+  if (utcH >= 24) utcH -= 24;
+  const cronStr = type === 'weekly' ? `${utcM} ${utcH} * * 1` : `${utcM} ${utcH} * * *`;
+  return cronStr;
 }
+
+function istFromCron(cronStr) {
+  // Parse UTC cron → convert back to IST display time
+  if (!cronStr) return '08:00';
+  const parts = cronStr.trim().split(/\s+/);
+  if (parts.length < 2) return '08:00';
+  let utcM = parseInt(parts[0]);
+  let utcH = parseInt(parts[1]);
+  // Add 5:30 for IST
+  let istM = utcM + 30;
+  let istH = utcH + 5;
+  if (istM >= 60) { istM -= 60; istH += 1; }
+  if (istH >= 24) istH -= 24;
+  return `${String(istH).padStart(2,'0')}:${String(istM).padStart(2,'0')}`;
+}
+
+// Actual scheduler cron values from Cloud Scheduler (update these when cron changes)
+// Format: UTC cron → shown as IST in the app
+const SCHEDULER_STATE = {
+  daily:   S.schedulerCrons?.daily   || '0 2 * * *',    // 08:00 IST
+  weekly:  S.schedulerCrons?.weekly  || '0 2 * * 1',    // 08:00 IST Monday
+  invoice: S.schedulerCrons?.invoice || '30 3 * * *',   // 09:00 IST
+};
 
 window.saveAllSuperadminSettings = function() {
   const dailyTime = document.getElementById('sa-daily-time')?.value || '08:00';
@@ -1721,6 +1824,9 @@ window.saveAllSuperadminSettings = function() {
   S.notifConfig = { gmailUser, superadminEmail, dailyTime, weeklyTime, invoiceTime, alertThreshold, highExpenseThreshold, poorMileageThreshold, dailyEnabled, weeklyEnabled, invoiceEnabled };
   S.orgName = document.getElementById('sa-org')?.value || S.orgName;
   localStorage.setItem('vems_orgname', S.orgName);
+  // Persist cron values so IST times survive page reload
+  S.schedulerCrons = { daily: cronFromTime(dailyTime,'daily'), weekly: cronFromTime(weeklyTime,'weekly'), invoice: cronFromTime(invoiceTime,'daily') };
+  localStorage.setItem('vems_crons', JSON.stringify(S.schedulerCrons));
 
   // Generate Cloud Shell commands
   const dailyCron = cronFromTime(dailyTime, 'daily');
@@ -1770,6 +1876,170 @@ window.testNotification = function(type) {
   const cmd = `gcloud scheduler jobs run ${jobMap[type]} --location=asia-south1 --project=skr-mom`;
   const el = document.getElementById('test-result');
   if (el) el.innerHTML = `<div class="alert alert-info">Run this command in Cloud Shell to trigger the notification:<br/><pre style="background:#0f1724;color:#60a5fa;padding:10px;border-radius:6px;margin-top:8px;font-size:12px">${cmd}</pre><button class="btn btn-secondary btn-sm mt-2" onclick="navigator.clipboard.writeText('${cmd}');showToast('Copied!')">📋 Copy</button></div>`;
+};
+
+// ── TOP MANAGEMENT VIEW ───────────────────────────────────────────
+function topMgmtHTML() {
+  const exps = myExpenses();
+  const thisMonth = new Date().toISOString().slice(0,7);
+  const yearExp = exps.filter(e=>e.date.startsWith('2026')).reduce((s,e)=>s+e.amount,0);
+  const monthExp = exps.filter(e=>e.date.startsWith(thisMonth)).reduce((s,e)=>s+e.amount,0);
+  const fuel = exps.filter(e=>e.category==='Fuel').reduce((s,e)=>s+(e.fuelQty||0),0);
+  const co2 = exps.reduce((s,e)=>s+(e.co2Emission||0),0);
+  const alerts = getAlerts(30);
+  const critical = alerts.filter(a=>a.severity==='expired'||a.severity==='critical');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const monthKeys = MONTHS.map(m=>`2026-${m.val}`);
+  const byPlant = S.plants.map(p=>({...p, total:exps.filter(e=>e.plantId===p.id).reduce((s,e)=>s+e.amount,0), co2:exps.filter(e=>e.plantId===p.id).reduce((s,e)=>s+(e.co2Emission||0),0)}));
+  const topVehicles = S.vehicles.map(v=>({...v,total:getVehicleExpenses(v.id),co2:getCO2Total(v.id)})).sort((a,b)=>b.total-a.total).slice(0,5);
+  const maintCats = ['Maintenance','Repair','Tyres','Battery','Spare Parts','Breakdown'];
+  const maintTotal = exps.filter(e=>maintCats.includes(e.category)).reduce((s,e)=>s+e.amount,0);
+  const fuelTotal = exps.filter(e=>e.category==='Fuel').reduce((s,e)=>s+e.amount,0);
+
+  return `<div class="page">
+    <div class="page-header">
+      <div>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+          ${S.companyLogo?`<img src="${S.companyLogo}" style="height:36px;object-fit:contain"/>`:''}
+          <h1 class="page-title">📊 Executive Dashboard</h1>
+        </div>
+        <p class="page-subtitle">${S.orgName} · Fleet Overview · Read-only View · ${new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</p>
+      </div>
+      <div class="page-actions">
+        <span class="badge badge-purple" style="font-size:12px;padding:6px 12px">👁️ View Only Access</span>
+        <button class="btn btn-secondary" onclick="doLogout()">🚪 Sign Out</button>
+      </div>
+    </div>
+
+    ${critical.length?`<div class="alert alert-danger mb-4">🚨 <b>${critical.length} vehicles</b> have expired or critically overdue documents requiring immediate attention.</div>`:''}
+
+    <!-- KPIs -->
+    <div class="kpi-grid">
+      ${kpi('Total Plants',S.plants.length,'Active facilities','#1a56a0','🏭')}
+      ${kpi('Total Vehicles',S.vehicles.length,S.vehicles.filter(v=>v.status==='Active').length+' active','#0ea5e9','🚗')}
+      ${kpi('Annual Expense',fmtR(yearExp),'Year 2026','#7c3aed','💰')}
+      ${kpi('Monthly Expense',fmtR(monthExp),'Current month','#1a56a0','📅')}
+      ${kpi('Fuel Consumed',fuel.toFixed(0)+' L','All fleets','#d97706','⛽')}
+      ${kpi('CO₂ Emissions',co2.toFixed(0)+' kg','Estimated','#dc2626','🌱')}
+    </div>
+
+    <!-- Expense Breakdown -->
+    <div class="grid-2 mb-4">
+      <div class="card">
+        <div class="card-title">💰 Expense Split</div>
+        <div class="stat-mini"><span class="stat-mini-label">Fuel</span><span class="stat-mini-val">${fmtR(fuelTotal)} <span style="color:var(--gray-400);font-size:11px">(${yearExp?Math.round(fuelTotal/yearExp*100):0}%)</span></span></div>
+        <div class="stat-mini"><span class="stat-mini-label">Maintenance & Repair</span><span class="stat-mini-val" style="color:var(--warning)">${fmtR(maintTotal)} <span style="color:var(--gray-400);font-size:11px">(${yearExp?Math.round(maintTotal/yearExp*100):0}%)</span></span></div>
+        <div class="stat-mini"><span class="stat-mini-label">Other</span><span class="stat-mini-val">${fmtR(yearExp-fuelTotal-maintTotal)}</span></div>
+        <div class="stat-mini" style="border-top:2px solid var(--gray-200);margin-top:8px;padding-top:8px"><span class="stat-mini-label" style="font-weight:700">Total 2026</span><span class="stat-mini-val" style="color:var(--primary);font-size:16px">${fmtR(yearExp)}</span></div>
+      </div>
+      <div class="card">
+        <div class="card-title">🏭 Plant-wise Summary</div>
+        ${byPlant.map(p=>`
+          <div class="report-row">
+            <span>${p.name.split('—')[0].trim()}</span>
+            <div class="report-bar-wrap"><div class="report-bar" style="width:${yearExp?Math.round(p.total/yearExp*100):0}%;background:var(--primary)"></div></div>
+            <span class="font-semibold">${fmtR(p.total)}</span>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="chart-grid mb-4">
+      <div class="card"><div class="card-title">📈 Monthly Expense Trend 2026</div><canvas id="tm-monthly" height="200"></canvas></div>
+      <div class="card"><div class="card-title">🌱 Monthly CO₂ Trend 2026</div><canvas id="tm-co2" height="200"></canvas></div>
+    </div>
+
+    <!-- Top Vehicles & Alerts -->
+    <div class="grid-2 mb-4">
+      <div class="card">
+        <div class="card-title">🚗 Top 5 High-Expense Vehicles</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Vehicle</th><th>Plant</th><th>Total</th><th>CO₂</th></tr></thead>
+          <tbody>${topVehicles.map(v=>`<tr>
+            <td><b>${v.regNo}</b><br><span style="font-size:11px;color:var(--gray-400)">${v.make} ${v.model}</span></td>
+            <td>${S.plants.find(p=>p.id===v.plantId)?.code||'—'}</td>
+            <td class="font-semibold">${fmtR(v.total)}</td>
+            <td><span class="co2-badge">🌱 ${v.co2.toFixed(0)}kg</span></td>
+          </tr>`).join('')}</tbody>
+        </table></div>
+      </div>
+      <div class="card">
+        <div class="card-title">⚠️ Document Alerts <span class="badge ${critical.length?'badge-danger':'badge-success'}">${critical.length} critical</span></div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Vehicle</th><th>Document</th><th>Status</th></tr></thead>
+          <tbody>${alerts.slice(0,8).map(a=>`<tr>
+            <td><b>${a.regNo}</b></td>
+            <td>${a.docType}</td>
+            <td style="color:${sevColor(a.severity)};font-weight:700">${a.daysLeft<0?'EXPIRED':a.daysLeft+'d left'}</td>
+          </tr>`).join('')}
+          ${alerts.length===0?`<tr><td colspan="3" class="text-center text-muted">All documents up to date ✅</td></tr>`:''}
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <!-- CO2 Summary -->
+    <div class="card">
+      <div class="card-title">🌍 CO₂ Emissions Summary</div>
+      <div class="kpi-grid">
+        ${kpi('Total CO₂',co2.toFixed(0)+' kg','All fleets','#dc2626','🌱')}
+        ${kpi('CO₂ Tonnes',(co2/1000).toFixed(2)+' t','CO₂ equivalent','#d97706','🌍')}
+        ${kpi('CO₂ per km',(()=>{const d=exps.filter(e=>e.category==='Fuel').reduce((s,e)=>s+(e.distanceTravelled||0),0);return d>0?(co2/d).toFixed(3):'—';})()+ ' kg/km','Fleet avg','#7c3aed','📊')}
+        ${kpi('Trees Equivalent',Math.round(co2/21)+' trees','To offset CO₂','#16a34a','🌳')}
+      </div>
+    </div>
+
+    <div style="text-align:center;padding:20px;color:var(--gray-400);font-size:12px">
+      📧 This dashboard was accessed via a secure magic link · ${new Date().toLocaleString('en-IN')} · Read-only access · ${S.user?.email}
+    </div>
+  </div>`;
+}
+
+window.initTopMgmtCharts = function() {
+  const exps = myExpenses();
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const monthKeys = MONTHS.map(m=>`2026-${m.val}`);
+  const mc = document.getElementById('tm-monthly');
+  if(mc&&!S.charts.tmMonthly) S.charts.tmMonthly = new Chart(mc,{type:'bar',data:{labels:months,datasets:[{label:'Expenses (₹)',data:monthKeys.map(m=>exps.filter(e=>e.date.startsWith(m)).reduce((s,e)=>s+e.amount,0)),backgroundColor:'#1a56a0',borderRadius:4}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{y:{ticks:{callback:v=>'₹'+(v/1000).toFixed(0)+'k'}}}}});
+  const cc = document.getElementById('tm-co2');
+  if(cc&&!S.charts.tmCO2) S.charts.tmCO2 = new Chart(cc,{type:'line',data:{labels:months,datasets:[{label:'CO₂ (kg)',data:monthKeys.map(m=>exps.filter(e=>e.date.startsWith(m)).reduce((s,e)=>s+(e.co2Emission||0),0).toFixed(1)),borderColor:'#16a34a',backgroundColor:'rgba(22,163,74,.1)',fill:true,tension:.4}]},options:{responsive:true,plugins:{legend:{display:false}}}});
+};
+
+// ── MAGIC LINK SENDER ─────────────────────────────────────────────
+window.sendMagicLink = async function(email) {
+  if (!email) return showToast('Enter email address','error');
+  try {
+    await sendSignInLinkToEmail(auth, email, ACTION_CODE_SETTINGS);
+    localStorage.setItem('vems_magic_email', email);
+    showToast(`Magic link sent to ${email}! Valid for 1 hour.`, 'success');
+    addAudit('Magic Link Sent', '', email);
+  } catch(e) {
+    showToast(e.message.replace('Firebase: ','').replace(/\(.*\)/,''), 'error');
+  }
+};
+
+window.sendMagicLinkToAll = async function() {
+  const emails = JSON.parse(localStorage.getItem('vems_topmgmt')||'[]');
+  if (!emails.length) return showToast('No top management emails configured','error');
+  let sent = 0;
+  for (const email of emails) {
+    try {
+      await sendSignInLinkToEmail(auth, email, ACTION_CODE_SETTINGS);
+      sent++;
+    } catch(e) { console.error('Failed for', email, e); }
+  }
+  showToast(`Magic links sent to ${sent} recipient(s)!`, 'success');
+  addAudit('Magic Links Sent to All', '', emails.join(', '));
+};
+
+window.saveTopMgmtEmails = function() {
+  const raw = document.getElementById('topmgmt-emails')?.value || '';
+  const emails = raw.split('\n').map(e=>e.trim()).filter(e=>e.includes('@'));
+  localStorage.setItem('vems_topmgmt', JSON.stringify(emails));
+  TOP_MGMT_EMAILS.length = 0;
+  emails.forEach(e=>TOP_MGMT_EMAILS.push(e));
+  showToast(`${emails.length} top management email(s) saved!`, 'success');
+  addAudit('Top Management Emails Updated', '', emails.join(', '));
 };
 
 // ── MODALS ────────────────────────────────────────────────────────
