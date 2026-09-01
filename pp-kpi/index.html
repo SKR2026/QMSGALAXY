@@ -8629,6 +8629,7 @@ import { getAuth, signInWithEmailAndPassword,
          createUserWithEmailAndPassword,
          updatePassword, reauthenticateWithCredential,
          EmailAuthProvider,
+         signInAnonymously,
          signOut, onAuthStateChanged }              from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import { getFirestore, collection, doc,
          addDoc, setDoc, getDoc, getDocs,
@@ -8686,6 +8687,15 @@ export async function loginUser(email, password) {
 /** Sign the current user out. */
 export async function logoutUser() {
   await signOut(auth);
+}
+
+/**
+ * Sign in anonymously so Firestore rules can grant read-only access
+ * to guest / Top Management viewers without exposing credentials.
+ */
+export async function loginAnonymously() {
+  const cred = await signInAnonymously(auth);
+  return cred.user;
 }
 
 /**
@@ -9381,7 +9391,7 @@ function computeStatus(actual, target, direction, pct) {
 // ── Expose to global scope so existing inline handlers can call them ──
 window.FB = {
   _auth: auth,
-  loginUser, logoutUser, onAuthChange,
+  loginUser, logoutUser, loginAnonymously, onAuthChange,
   getUserProfile, getAllUsers, createUser, updateUser, registerUser, deleteUserDoc, repairOrphanProfile, changePassword, adminResetPassword,
   getPlants, addPlant, updatePlant, deletePlant,
   getKPIMaster, addKPI, updateKPI, deleteKPI,
@@ -9498,6 +9508,9 @@ onAuthChange(async user => {
   if (gate) gate.remove();
 
   if (user) {
+    // Anonymous sessions are managed by _guestLogin — skip normal profile flow
+    if (user.isAnonymous || window._isGuest) return;
+
     currentUser    = user;
 
     // Hide login overlay immediately — sign-in itself succeeded, regardless
@@ -10656,30 +10669,45 @@ window._switchLoginTab = function(tab) {
 };
 
 // ── Guest / View-Only login (Top Management, no credentials) ──────
-window._guestLogin = function() {
-  // Bypass Firebase auth — directly inject a read-only Top Management session
+window._guestLogin = async function() {
+  const btn = document.querySelector('#loginPanelGuest button');
+  if (btn) { btn.textContent = 'Loading…'; btn.disabled = true; }
+
+  // Step 1 — Sign into Firebase anonymously so Firestore security rules
+  // can grant read access. Without a Firebase auth token every Firestore
+  // read returns "Missing or insufficient permissions".
+  try {
+    if (window.FB && window.FB.loginAnonymously) {
+      await window.FB.loginAnonymously();
+    }
+  } catch (err) {
+    console.warn('Anonymous sign-in failed:', err);
+    // Continue anyway — data load will show individual errors if it fails
+  }
+
+  // Step 2 — Inject a read-only Top Management profile (no Firestore profile doc needed)
   const guestProfile = {
-    id:    '__guest__',
-    name:  'Guest Viewer',
-    email: '',
-    role:  'top management',
+    id:      '__guest__',
+    name:    'Guest Viewer',
+    email:   '',
+    role:    'top management',
     kpiRole: 'top management',
-    plant: 'All',
-    dept:  'All'
+    plant:   'All',
+    dept:    'All'
   };
   currentUser    = { uid: '__guest__', email: '' };
   currentProfile = guestProfile;
-  window._fbProfile  = guestProfile;
-  window._isGuest    = true;
+  window._fbProfile = guestProfile;
+  window._isGuest   = true;
 
-  // Hide login overlay
+  // Step 3 — Hide login overlay
   const overlay = document.getElementById('loginOverlay');
   if (overlay) overlay.style.display = 'none';
 
-  // Apply top-management role (read-only, all pages visible, no data entry)
+  // Step 4 — Apply Top Management role restrictions (read-only, no data entry)
   applyRoleRestrictions(guestProfile);
 
-  // Update sidebar footer for guest
+  // Step 5 — Update sidebar footer
   const av = document.querySelector('.avatar');
   if (av) av.textContent = '👁';
   const nm = document.querySelector('.user-name');
@@ -10687,13 +10715,14 @@ window._guestLogin = function() {
   const rl = document.querySelector('.user-role');
   if (rl) rl.textContent = 'View Only';
 
-  // Load data from Firebase (read-only — no write ops will be triggered)
-  loadFirebaseData().catch(err => {
+  // Step 6 — Load all Firebase data now that we have an auth token
+  try {
+    await loadFirebaseData();
+    showToast('Entered as Guest Viewer — read-only mode ✓');
+  } catch (err) {
     console.warn('Guest data load error:', err);
-    showToast('Some data could not be loaded');
-  });
-
-  showToast('Entered as Guest Viewer — read-only mode');
+    showToast('Entered as viewer — some data could not be loaded');
+  }
 };
 
 // ── Sign-out button in sidebar footer ───────────────────────────
@@ -10772,9 +10801,14 @@ if (typeof _origNavigate === 'function') {
 
 // Sign-out helper wired to both sidebar and bottom nav buttons
 window._kpiSignOut = async function() {
-  // Guest viewers have no Firebase session — just reload to show login screen
+  // Guest viewers used an anonymous Firebase session — sign it out then reload
   if (window._isGuest) {
     window._isGuest = false;
+    try {
+      if (window.FB && typeof window.FB.logoutUser === 'function') {
+        await window.FB.logoutUser();
+      }
+    } catch(e) { /* ignore */ }
     location.reload();
     return;
   }
