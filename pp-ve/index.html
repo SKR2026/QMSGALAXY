@@ -278,6 +278,7 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
+window._auth = auth;
 const db = getFirestore(app);
 const storage = getStorage(app);
 
@@ -1755,18 +1756,30 @@ function superadminHTML() {
         </div>
       </div>
 
-    <!-- Sync Status Banner — always visible -->
-    <div style="margin-top:16px;background:#0f1724;border-radius:10px;padding:16px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-        <div style="font-size:12px;font-weight:600;color:#60a5fa">
-          📋 Cloud Shell commands — run these to sync scheduler with app settings:
+    <!-- Direct Scheduler Sync -->
+    <div style="margin-top:16px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <div>
+          <div style="font-size:13px;font-weight:600;color:#16a34a">⚡ Apply Schedule Changes Directly</div>
+          <div style="font-size:12px;color:var(--gray-500);margin-top:2px">No Cloud Shell needed — updates scheduler automatically</div>
         </div>
-        <button onclick="copyAllScheduleCommands()" style="background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:5px 12px;font-size:11px;cursor:pointer">📋 Copy All</button>
+        <button onclick="saveAndSyncSchedules()" class="btn btn-success" style="font-size:13px;padding:10px 20px">
+          💾 Save & Sync Scheduler
+        </button>
       </div>
-      <div id="schedule-commands-list">
-        ${generateScheduleCommandsHTML(cfg)}
-      </div>
+      <div id="sync-status" style="margin-top:10px;font-size:12px"></div>
     </div>
+
+    <!-- Fallback Cloud Shell (collapsed) -->
+    <details style="margin-top:8px">
+      <summary style="font-size:12px;color:var(--gray-400);cursor:pointer;padding:4px">🔧 Manual Cloud Shell commands (fallback only)</summary>
+      <div style="background:#0f1724;border-radius:8px;padding:12px;margin-top:6px">
+        <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
+          <button onclick="copyAllScheduleCommands()" style="background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">📋 Copy All</button>
+        </div>
+        <div id="schedule-commands-list">${generateScheduleCommandsHTML(cfg)}</div>
+      </div>
+    </details>
     </div>
 
     <!-- Test Notifications -->
@@ -1900,6 +1913,63 @@ window.copyAllScheduleCommands = function() {
   ].join('\n');
   navigator.clipboard.writeText(lines);
   showToast('All 3 commands copied! Paste in Cloud Shell.', 'success');
+};
+
+window.saveAndSyncSchedules = async function() {
+  const statusEl = document.getElementById('sync-status');
+  if (statusEl) statusEl.innerHTML = `<span style="color:#d97706">⏳ Syncing schedules with Cloud Scheduler...</span>`;
+
+  // Read current form values
+  const dailyTime   = document.getElementById('sa-daily-time')?.value   || '08:00';
+  const weeklyTime  = document.getElementById('sa-weekly-time')?.value  || '08:00';
+  const invoiceTime = document.getElementById('sa-invoice-time')?.value || '09:00';
+  const dailyEnabled   = document.getElementById('sa-daily-enabled')?.checked ?? true;
+  const weeklyEnabled  = document.getElementById('sa-weekly-enabled')?.checked ?? true;
+  const invoiceEnabled = document.getElementById('sa-invoice-enabled')?.checked ?? true;
+
+  const jobs = [
+    { name:'dailyCriticalAlerts',    schedule:cronFromTime(dailyTime,'daily'),   enabled:dailyEnabled },
+    { name:'weeklySummaryReport',    schedule:cronFromTime(weeklyTime,'weekly'),  enabled:weeklyEnabled },
+    { name:'missingInvoiceReminder', schedule:cronFromTime(invoiceTime,'daily'),  enabled:invoiceEnabled },
+  ];
+
+  // Get Firebase ID token for auth
+  let idToken = '';
+  try {
+    const { getAuth } = await import('https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js');
+    // auth is already initialized globally
+    idToken = await window._auth?.currentUser?.getIdToken() || '';
+  } catch(e) { console.warn('Could not get ID token:', e); }
+
+  const FUNCTION_URL = 'https://asia-south1-skr-mom.cloudfunctions.net/updateSchedule';
+  let successCount = 0;
+  let errors = [];
+
+  for (const job of jobs) {
+    try {
+      const res = await fetch(FUNCTION_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobName: job.name, schedule: job.schedule, enabled: job.enabled, idToken }),
+      });
+      const data = await res.json();
+      if (data.success) successCount++;
+      else errors.push(`${job.name}: ${data.error}`);
+    } catch(e) {
+      errors.push(`${job.name}: ${e.message}`);
+    }
+  }
+
+  if (statusEl) {
+    if (errors.length === 0) {
+      statusEl.innerHTML = `<span style="color:#16a34a">✅ All ${successCount} schedules updated successfully in Cloud Scheduler!</span>`;
+      showToast('Scheduler synced successfully!', 'success');
+    } else {
+      statusEl.innerHTML = `<span style="color:#d97706">⚠️ ${successCount} updated · ${errors.length} failed: ${errors.join(', ')}<br/>Use the fallback commands below.</span>`;
+      showToast('Some schedules failed — use manual commands', 'warning');
+    }
+  }
+  addAudit('Scheduler Synced', '', jobs.map(j=>`${j.name}:${j.schedule}`).join(' · '));
 };
 
 window.saveAllSuperadminSettings = function() {
