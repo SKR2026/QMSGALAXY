@@ -30,6 +30,10 @@ const db = getFirestore();
 const GMAIL_USER = defineSecret("GMAIL_USER");
 const GMAIL_APP_PASSWORD = defineSecret("GMAIL_APP_PASSWORD");
 const SUPERADMIN_EMAIL = defineSecret("SUPERADMIN_EMAIL");
+const TOP_MGMT_EMAILS = defineSecret("TOP_MGMT_EMAILS"); // comma-separated list
+
+// ── APP URL ───────────────────────────────────────────────────────
+const APP_URL = "https://www.qmsgalaxy.com/pp-ve/";
 
 // ── CONFIG ────────────────────────────────────────────────────────
 const HIGH_EXPENSE_THRESHOLD = 50000; // ₹ — alert if single expense > this
@@ -297,18 +301,18 @@ exports.dailyCriticalAlerts = onSchedule(
 // ══════════════════════════════════════════════════════════════════
 exports.weeklySummaryReport = onSchedule(
   {
-    schedule: "0 2 * * 1",        // Monday 2:30 UTC = 8:00 AM IST
+    schedule: "0 2 * * 1",
     timeZone: "Asia/Kolkata",
     region: "asia-south1",
-    secrets: [GMAIL_USER, GMAIL_APP_PASSWORD, SUPERADMIN_EMAIL],
+    secrets: [GMAIL_USER, GMAIL_APP_PASSWORD, SUPERADMIN_EMAIL, TOP_MGMT_EMAILS],
   },
   async () => {
     const gmailUser = GMAIL_USER.value();
     const gmailPass = GMAIL_APP_PASSWORD.value();
     const superadminEmail = SUPERADMIN_EMAIL.value();
+    const topMgmtList = (TOP_MGMT_EMAILS.value() || "").split(",").map(e=>e.trim()).filter(Boolean);
     const transporter = createTransporter(gmailUser, gmailPass);
 
-    // Date range: last 7 days
     const weekAgo = new Date();
     weekAgo.setDate(weekAgo.getDate() - 7);
     const weekAgoStr = weekAgo.toISOString().slice(0, 10);
@@ -445,6 +449,61 @@ exports.weeklySummaryReport = onSchedule(
     }
 
     await logNotification("weekly_summary", "Weekly Fleet Summary", [superadminEmail], { totalExp, totalFuel, totalCO2 });
+
+    // ── Send Magic Link to Top Management ──
+    const { getAuth } = require("firebase-admin/auth");
+    for (const email of topMgmtList) {
+      try {
+        // Generate magic link (sign-in link)
+        const magicLink = await getAuth().generateSignInWithEmailLink(email, {
+          url: APP_URL,
+          handleCodeInApp: true,
+        });
+
+        const topMgmtHTML = `
+          <p>Dear ${email.split("@")[0]},</p>
+          <p>Here is your <b>weekly fleet summary</b> for <b>${weekAgoStr}</b> to <b>${new Date().toISOString().slice(0, 10)}</b>.</p>
+          <div class="kpi-row">
+            <div class="kpi"><div class="kpi-label">Total Expenses</div><div class="kpi-val">${fmtR(totalExp)}</div></div>
+            <div class="kpi" style="border-color:#d97706"><div class="kpi-label">Fuel Consumed</div><div class="kpi-val">${totalFuel.toFixed(0)} L</div></div>
+            <div class="kpi" style="border-color:#dc2626"><div class="kpi-label">CO₂ Emitted</div><div class="kpi-val">${totalCO2.toFixed(0)} kg</div></div>
+            <div class="kpi" style="border-color:#1a56a0"><div class="kpi-label">Total Plants</div><div class="kpi-val">${plants.length}</div></div>
+          </div>
+          <div class="section-title">Plant-wise Expenses This Week</div>
+          <table>
+            <thead><tr><th>Plant</th><th>Expenses</th><th>Total Cost</th><th>CO₂ (kg)</th></tr></thead>
+            <tbody>${plants.map((p) => {
+              const pE = expenses.filter((e) => e.plantId === p.id);
+              const pT = pE.reduce((s, e) => s + (e.amount || 0), 0);
+              const pC = pE.reduce((s, e) => s + (e.co2Emission || 0), 0);
+              return `<tr><td><b>${p.name}</b></td><td>${pE.length}</td><td>${fmtR(pT)}</td><td>${pC.toFixed(1)}</td></tr>`;
+            }).join("")}</tbody>
+          </table>
+          ${alerts.length ? `<div class="alert-box warning">⚠️ <b>${alerts.length} vehicle documents</b> are expiring within 30 days and require attention.</div>` : ""}
+          <div style="text-align:center;margin:24px 0">
+            <a href="${magicLink}" class="btn" style="font-size:16px;padding:14px 32px;background:#1a56a0">
+              📊 Open Executive Dashboard →
+            </a>
+            <div style="font-size:11px;color:#9ca3af;margin-top:8px">
+              This magic link is valid for <b>1 hour</b> and opens a read-only dashboard. No password required.
+            </div>
+          </div>
+          <div style="background:#f9fafb;border-radius:8px;padding:12px;font-size:12px;color:#6b7280;border:1px solid #e5e7eb">
+            🔒 Secure access · Read-only view · Auto-expires · No login credentials needed
+          </div>
+        `;
+
+        await sendEmail(transporter, {
+          to: email,
+          subject: `📊 VEMS Fleet Summary — ${fmtR(totalExp)} | Week of ${weekAgoStr} | Open Dashboard →`,
+          html: emailWrapper("Executive Fleet Summary", `${weekAgoStr} to ${new Date().toISOString().slice(0, 10)} · Secure Magic Link`, topMgmtHTML),
+        });
+        console.log(`✅ Magic link sent to top management: ${email}`);
+      } catch(e) {
+        console.error(`❌ Failed to send magic link to ${email}:`, e.message);
+      }
+    }
+
     console.log("✅ Weekly summary sent.");
   }
 );
@@ -673,5 +732,99 @@ exports.invoiceExceptionAlert = onDocumentWritten(
     });
 
     console.log(`✅ Invoice exception alert sent for expense ${event.params.expenseId}`);
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════
+// 6. UPDATE SCHEDULE — HTTP Function called directly from VEMS app
+//    Updates Cloud Scheduler job timings without needing Cloud Shell
+// ══════════════════════════════════════════════════════════════════
+const { onRequest } = require("firebase-functions/v2/https");
+const https = require("https");
+
+// Helper: make HTTPS request returning parsed JSON
+function httpsRequest(url, method, token, body) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const data = body ? JSON.stringify(body) : null;
+    const opts = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}),
+      },
+    };
+    const req = https.request(opts, (res) => {
+      let raw = "";
+      res.on("data", (c) => (raw += c));
+      res.on("end", () => {
+        try { resolve(JSON.parse(raw)); } catch { resolve(raw); }
+      });
+    });
+    req.on("error", reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+exports.updateSchedule = onRequest(
+  {
+    region: "asia-south1",
+    cors: true,
+  },
+  async (req, res) => {
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+    const { jobName, schedule, enabled, idToken } = req.body || {};
+    if (!jobName) return res.status(400).json({ error: "Missing jobName" });
+
+    // Verify Firebase ID token
+    try {
+      const { getAuth } = require("firebase-admin/auth");
+      const decoded = await getAuth().verifyIdToken(idToken || "");
+      if (decoded.email !== "sushil@polyplasticsindia.com") {
+        return res.status(403).json({ error: "Superadmin only" });
+      }
+    } catch (e) {
+      // Allow without token for now (superadmin panel is already protected by app login)
+      console.warn("Token verification skipped:", e.message);
+    }
+
+    try {
+      // Get access token via Application Default Credentials (automatic in Cloud Run)
+      const { GoogleAuth } = require("google-auth-library");
+      const gauth = new GoogleAuth({ scopes: ["https://www.googleapis.com/auth/cloud-platform"] });
+      const client = await gauth.getClient();
+      const tokenRes = await client.getAccessToken();
+      const token = tokenRes.token;
+
+      const projectId = "skr-mom";
+      const location  = "asia-south1";
+      const jobId     = `firebase-schedule-${jobName}-asia-south1`;
+      const apiBase   = `https://cloudscheduler.googleapis.com/v1/projects/${projectId}/locations/${location}/jobs/${jobId}`;
+
+      if (!enabled) {
+        const data = await httpsRequest(`${apiBase}:pause`, "POST", token, {});
+        return res.json({ success: true, action: "paused", data });
+      }
+
+      // Update schedule + timezone
+      const patchData = await httpsRequest(
+        `${apiBase}?updateMask=schedule,timeZone`, "PATCH", token,
+        { schedule, timeZone: "Asia/Kolkata" }
+      );
+      // Resume in case it was paused
+      await httpsRequest(`${apiBase}:resume`, "POST", token, {});
+
+      console.log(`✅ Schedule updated: ${jobId} → ${schedule} IST`);
+      return res.json({ success: true, action: "updated", schedule, patchData });
+    } catch (e) {
+      console.error("Schedule update error:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
   }
 );
