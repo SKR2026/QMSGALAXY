@@ -601,17 +601,47 @@ async function fsLoadUsers() {
   } catch(e) { console.error('Load users:', e); S.users = []; }
 }
 
-async function fsCreateUser(email, password, displayName, plantId) {
-  // Create Firebase Auth account
-  const cred = await createUserWithEmailAndPassword(auth, email, password);
-  const uid = cred.user.uid;
-  // Store profile in Firestore
-  const profile = { email, displayName, plantId, role:'plant_admin', status:'Active', createdAt:serverTimestamp(), createdBy:S.user?.email };
-  await setDoc(doc(db,'users', uid), profile);
-  S.users.push({ uid, ...profile, createdAt: new Date() });
+// Creates a user via Firebase Auth REST API (doesn't require Email/Password provider enabled
+// in the client SDK — uses the project's Web API key directly) then saves to Firestore.
+async function fsInviteUser(email, displayName, plantId, password) {
+  const apiKey = firebaseConfig.apiKey;
+  // Step 1: Create Firebase Auth user via REST API (port 443, no CORS issue)
+  const signUpRes = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, returnSecureToken: false }),
+    }
+  );
+  const signUpData = await signUpRes.json();
+  if (!signUpRes.ok) {
+    const errCode = signUpData?.error?.message || 'UNKNOWN_ERROR';
+    if (errCode === 'EMAIL_EXISTS') throw new Error('This email is already registered.');
+    if (errCode === 'WEAK_PASSWORD : Password should be at least 6 characters') throw new Error('Password must be at least 6 characters.');
+    throw new Error(errCode.replace(/_/g,' ').toLowerCase());
+  }
+  const newUid = signUpData.localId;
+
+  // Step 2: Write Firestore profile
+  const profile = {
+    email, displayName, plantId,
+    role: 'plant_admin', status: 'Active',
+    createdAt: serverTimestamp(), createdBy: S.user?.email,
+  };
+  await setDoc(doc(db,'users', newUid), profile);
+  S.users.push({ uid: newUid, ...profile, createdAt: new Date() });
+
+  // Step 3: Send password-reset email so the user can set their own password
+  // (works even if Email/Password provider is restricted — uses Admin action code)
+  try {
+    await sendPasswordResetEmail(auth, email);
+  } catch(e) {
+    console.warn('[fsInviteUser] Could not send password reset email:', e.message);
+    // Non-fatal — user record still created
+  }
+
   addAudit('User Created','', `${displayName} (${email}) → ${plantName(plantId)}`);
-  // Sign back in as superadmin (createUserWithEmailAndPassword signs in as new user)
-  await signInWithEmailAndPassword(auth, S.user.email, window._saPass || '');
 }
 
 async function fsUpdateUser(uid, data) {
@@ -650,51 +680,44 @@ window.showUserModal = function(uid='') {
         <button onclick="closeModal()">✕</button>
       </div>
       <div class="modal-body">
-        ${!isEdit ? `<div class="alert alert-info mb-4">👤 A new Firebase Authentication account will be created. The user can log in immediately with the password you set.</div>` : ''}
+        ${!isEdit ? `<div class="alert alert-info mb-4">📧 Firebase will send a welcome/setup email. The user sets their own password.</div>` : ''}
         <div class="form-grid">
           <div class="form-group form-full">
             <label class="form-label">Full Name <span class="req">*</span></label>
-            <input id="usr-name" class="form-input" placeholder="MNS Plant Admin" value="${user?.displayName||''}"/>
+            <input id="usr-name" class="form-input" placeholder="Plant Admin Name" value="${user?.displayName||''}"/>
           </div>
-          <div class="form-group">
+          <div class="form-group form-full">
             <label class="form-label">Email <span class="req">*</span></label>
-            <input id="usr-email" type="email" class="form-input" placeholder="admin.mns@polyplasticsindia.com" value="${user?.email||''}" ${isEdit?'readonly':''}/>
+            <input id="usr-email" type="email" class="form-input" placeholder="admin.plant@company.com" value="${user?.email||''}" ${isEdit?'readonly':''}/>
           </div>
-          <div class="form-group">
-            <label class="form-label">Assigned Plant <span class="req">*</span></label>
+          <div class="form-group form-full">
+            <label class="form-label">Assign Plant <span class="req">*</span></label>
             <select id="usr-plant" class="form-select">
               <option value="">— Select Plant —</option>
               ${plants.map(p=>`<option value="${p.id}" ${user?.plantId===p.id?'selected':''}>${p.name} (${p.code})</option>`).join('')}
             </select>
           </div>
           ${!isEdit ? `
-          <div class="form-group">
-            <label class="form-label">Temporary Password <span class="req">*</span></label>
-            <input id="usr-pass" type="password" class="form-input" placeholder="Min 8 characters" autocomplete="new-password"/>
-          </div>
-          <div class="form-group">
-            <label class="form-label">Confirm Password <span class="req">*</span></label>
-            <input id="usr-pass2" type="password" class="form-input" placeholder="Re-enter password" autocomplete="new-password"/>
-          </div>
           <div class="form-group form-full">
-            <label class="form-label">Your (Superadmin) Password <span class="req">*</span></label>
-            <input id="usr-sa-pass" type="password" class="form-input" placeholder="Enter your password to re-authenticate after creation" autocomplete="current-password"/>
-            <div style="font-size:11px;color:var(--gray-400);margin-top:4px">⚠️ Required to keep you logged in after creating the new user account.</div>
+            <label class="form-label">Temporary Password <span class="req">*</span></label>
+            <input id="usr-pass" type="password" class="form-input" placeholder="Min 6 characters" autocomplete="new-password"/>
+            <div style="font-size:11px;color:var(--gray-500);margin-top:4px">User can change this after first login.</div>
           </div>
-          ` : ''}
+          ` : `
           <div class="form-group form-full">
             <label class="form-label">Status</label>
             <select id="usr-status" class="form-select">
-              <option value="Active" ${!user||user.status==='Active'?'selected':''}>Active</option>
+              <option value="Active" ${!user||user.status==='Active'||user.status==='Pending'?'selected':''}>Active</option>
               <option value="Inactive" ${user?.status==='Inactive'?'selected':''}>Inactive</option>
             </select>
           </div>
+          `}
         </div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="saveUser('${uid}')">
-          ${isEdit ? '💾 Save Changes' : '🚀 Create User'}
+        <button class="btn btn-primary" id="usr-submit-btn" onclick="saveUser('${uid}')">
+          ${isEdit ? '💾 Save Changes' : 'Create User'}
         </button>
       </div>
     </div>
@@ -715,31 +738,30 @@ window.saveUser = async function(uid='') {
 
   if (!isEdit) {
     const pass = document.getElementById('usr-pass')?.value;
-    const pass2 = document.getElementById('usr-pass2')?.value;
-    const saPass = document.getElementById('usr-sa-pass')?.value;
-    if (!pass || pass.length < 8) return showToast('Password must be at least 8 characters', 'error');
-    if (pass !== pass2) return showToast('Passwords do not match', 'error');
-    if (!saPass) return showToast('Your password is required to re-authenticate', 'error');
-    window._saPass = saPass;
+    if (!pass || pass.length < 6) return showToast('Password must be at least 6 characters', 'error');
 
-    const btn = document.querySelector('.modal-footer .btn-primary');
+    const btn = document.getElementById('usr-submit-btn');
     if (btn) { btn.textContent = '⏳ Creating…'; btn.disabled = true; }
     try {
-      await fsCreateUser(email, pass, displayName, plantId);
-      window._saPass = '';
-      showToast(`User ${displayName} created successfully!`, 'success');
+      await fsInviteUser(email, displayName, plantId, pass);
+      showToast(`✅ User ${displayName} created! Setup email sent to ${email}.`, 'success');
       closeModal(); render();
     } catch(e) {
-      window._saPass = '';
-      if (btn) { btn.textContent = '🚀 Create User'; btn.disabled = false; }
-      showToast('Error: ' + e.message.replace('Firebase: ','').replace(/\(.*\)/,''), 'error');
+      if (btn) { btn.textContent = 'Create User'; btn.disabled = false; }
+      const msg = e.message.replace('Firebase: ','').replace(/\(auth\/([^)]+)\)/,'').trim();
+      showToast('Error: ' + msg, 'error');
     }
   } else {
+    const btn = document.getElementById('usr-submit-btn');
+    if (btn) { btn.textContent = '⏳ Saving…'; btn.disabled = true; }
     try {
       await fsUpdateUser(uid, { displayName, plantId, status });
       showToast('User updated!', 'success');
       closeModal(); render();
-    } catch(e) { showToast('Error: '+e.message, 'error'); }
+    } catch(e) {
+      if (btn) { btn.textContent = '💾 Save Changes'; btn.disabled = false; }
+      showToast('Error: '+e.message, 'error');
+    }
   }
 };
 
@@ -1903,7 +1925,7 @@ function usersHTML() {
             <td>${u.email}</td>
             <td><span class="badge badge-info">🏭 Plant Admin</span></td>
             <td>${plantName(u.plantId)||u.plantId||'—'}</td>
-            <td><span class="badge ${u.status==='Active'?'badge-success':'badge-danger'}">${u.status||'Active'}</span></td>
+            <td><span class="badge ${u.status==='Active'?'badge-success':u.status==='Pending'?'badge-warning':'badge-danger'}">${u.status||'Active'}</span></td>
             <td>${u.createdAt?fmtDate(u.createdAt.toDate?u.createdAt.toDate():u.createdAt):'—'}</td>
             <td style="white-space:nowrap">
               <button class="btn btn-ghost btn-xs" onclick="showUserModal('${u.uid}')">✏️ Edit</button>
@@ -2166,6 +2188,11 @@ function superadminHTML() {
     <!-- Test Notifications -->
     <div class="card mb-4">
       <div class="card-title">🧪 Test Email Notifications</div>
+      <div class="form-group mb-4">
+        <label class="form-label">VEMS Notification Cloud Function URL</label>
+        <input type="url" id="sa-notif-fn-url" class="form-input" placeholder="https://your-function-xxxxx.run.app" value="${cfg.notifFunctionUrl||''}"/>
+        <div style="font-size:11px;color:var(--gray-500);margin-top:4px">GCP Console → Cloud Functions → your VEMS notification function → copy the trigger URL. Required for in-app test emails.</div>
+      </div>
       <p style="font-size:13px;color:var(--gray-500);margin-bottom:16px">Trigger a notification email immediately to verify Gmail delivery. The email will be sent to <b>${cfg.superadminEmail||SUPERADMIN_EMAIL}</b>.</p>
       <div class="flex gap-2 flex-wrap">
         <button class="btn btn-primary" id="test-btn-daily" onclick="testNotification('daily')">🔔 Send Daily Alert Now</button>
@@ -2323,7 +2350,9 @@ window.saveAllSuperadminSettings = async function() {
   const weeklyEnabled  = document.getElementById('sa-weekly-enabled')?.checked ?? true;
   const invoiceEnabled = document.getElementById('sa-invoice-enabled')?.checked ?? true;
 
-  S.notifConfig = { gmailUser, superadminEmail, dailyTime, weeklyTime, invoiceTime, alertThreshold, highExpenseThreshold, poorMileageThreshold, dailyEnabled, weeklyEnabled, invoiceEnabled };
+  const notifFunctionUrl = document.getElementById('sa-notif-fn-url')?.value.trim() || '';
+
+  S.notifConfig = { gmailUser, superadminEmail, dailyTime, weeklyTime, invoiceTime, alertThreshold, highExpenseThreshold, poorMileageThreshold, dailyEnabled, weeklyEnabled, invoiceEnabled, notifFunctionUrl };
   S.orgName = document.getElementById('sa-org')?.value || S.orgName;
   localStorage.setItem('vems_orgname', S.orgName);
 
@@ -2341,11 +2370,6 @@ window.saveAllSuperadminSettings = async function() {
 };
 
 window.testNotification = async function(type) {
-  const jobMap = {
-    daily:   'firebase-schedule-dailyCriticalAlerts-asia-south1',
-    weekly:  'firebase-schedule-weeklySummaryReport-asia-south1',
-    invoice: 'firebase-schedule-missingInvoiceReminder-asia-south1',
-  };
   const labelMap = { daily:'Daily Alert', weekly:'Weekly Summary', invoice:'Invoice Reminder' };
   const el = document.getElementById('test-result');
   const btn = document.getElementById(`test-btn-${type}`);
@@ -2353,26 +2377,76 @@ window.testNotification = async function(type) {
   if (el) el.innerHTML = `<div class="alert alert-info">⏳ Sending ${labelMap[type]} email… please wait a moment.</div>`;
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }
 
+  const cfg = S.notifConfig || {};
+  const toEmail = cfg.superadminEmail || SUPERADMIN_EMAIL;
+
+  // The VEMS notification Cloud Function URL — saved in Superadmin Settings
+  // Falls back to the scheduler sync URL if a dedicated function URL isn't configured.
+  const notifUrl = (cfg.notifFunctionUrl || '').trim();
+
   try {
-    const TRIGGER_URL = 'https://updateschedule-pzzfbon7lq-el.a.run.app';
+    if (!notifUrl) {
+      // No dedicated notification function URL configured — show setup instructions
+      throw new Error('NO_URL');
+    }
+
     const idToken = await window._auth?.currentUser?.getIdToken() || '';
-    const res = await fetch(TRIGGER_URL, {
+    const res = await fetch(notifUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'trigger', jobName: jobMap[type], idToken }),
+      body: JSON.stringify({ action: 'trigger', type, to: toEmail, idToken }),
     });
-    const data = await res.json();
-    if (data.success || data.action === 'triggered') {
-      const cfg = S.notifConfig || {};
-      const toEmail = cfg.superadminEmail || SUPERADMIN_EMAIL;
-      if (el) el.innerHTML = `<div class="alert alert-success">✅ ${labelMap[type]} email dispatched! Check <b>${toEmail}</b> inbox in 1–2 minutes.</div>`;
+
+    // Handle non-JSON responses (e.g. HTML error page)
+    const contentType = res.headers.get('content-type') || '';
+    const data = contentType.includes('json') ? await res.json() : { ok: false, error: `HTTP ${res.status}` };
+
+    if (res.ok && (data.success || data.ok || data.action === 'triggered')) {
+      if (el) el.innerHTML = `<div class="alert alert-success">✅ ${labelMap[type]} email sent! Check <b>${toEmail}</b> inbox in 1–2 minutes.</div>`;
       showToast(`${labelMap[type]} email sent!`, 'success');
       addAudit(`Test ${labelMap[type]} Email Sent`,'',toEmail);
     } else {
-      throw new Error(data.error || 'Trigger returned an unexpected response');
+      throw new Error(data.error || `HTTP ${res.status}`);
     }
+
   } catch(e) {
-    if (el) el.innerHTML = `<div class="alert alert-danger">❌ Could not send ${labelMap[type]} email: ${e.message}.<br/><span style="font-size:12px">Check that the Cloud Function <code>updateschedule</code> is deployed and the scheduler jobs exist in Cloud Scheduler.</span></div>`;
+    const isCors = e.message === 'Failed to fetch' || e.message.includes('CORS') || e.message.includes('NetworkError');
+    const isNoUrl = e.message === 'NO_URL';
+
+    if (isCors || isNoUrl) {
+      // CORS or missing URL — show the gcloud trigger command as the reliable alternative
+      const jobMap = {
+        daily:   'firebase-schedule-dailyCriticalAlerts-asia-south1',
+        weekly:  'firebase-schedule-weeklySummaryReport-asia-south1',
+        invoice: 'firebase-schedule-missingInvoiceReminder-asia-south1',
+      };
+      const cmd = `gcloud scheduler jobs run ${jobMap[type]} --location=asia-south1 --project=skr-mom`;
+      if (el) el.innerHTML = `
+        <div class="alert alert-warning">
+          <div style="font-weight:600;margin-bottom:8px">
+            ${isNoUrl ? '⚙️ Notification Function URL not configured.' : '🔒 CORS blocked — browser cannot directly call the Cloud Function.'}
+          </div>
+          <div style="font-size:12px;margin-bottom:10px">
+            ${isNoUrl
+              ? 'Enter your VEMS Notification Cloud Function URL in the field below, then try again.'
+              : 'The Cloud Scheduler can trigger it directly. Run this command in <a href="https://console.cloud.google.com/cloudshell" target="_blank" style="color:inherit">Cloud Shell</a>:'}
+          </div>
+          ${!isNoUrl ? `
+          <div style="background:#0f1724;border-radius:6px;padding:10px 14px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:8px">
+            <code style="color:#60a5fa;font-size:11px;word-break:break-all">${cmd}</code>
+            <button onclick="navigator.clipboard.writeText('${cmd}');showToast('Copied!')" style="flex-shrink:0;background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">📋 Copy</button>
+          </div>` : ''}
+          <div style="margin-top:10px">
+            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:4px">VEMS Notification Function URL (optional):</label>
+            <div style="display:flex;gap:6px">
+              <input id="notif-fn-url" type="url" class="form-input" style="font-size:12px" placeholder="https://your-function.run.app" value="${notifUrl}"/>
+              <button onclick="saveNotifUrl()" style="flex-shrink:0;background:var(--primary);color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;white-space:nowrap">Save & Retry</button>
+            </div>
+          </div>
+        </div>`;
+    } else {
+      if (el) el.innerHTML = `<div class="alert alert-danger">❌ ${labelMap[type]} failed: ${e.message}</div>`;
+    }
     showToast('Email trigger failed', 'error');
   } finally {
     if (btn) {
@@ -2381,6 +2455,13 @@ window.testNotification = async function(type) {
       btn.textContent = icons[type];
     }
   }
+};
+
+window.saveNotifUrl = function() {
+  const url = document.getElementById('notif-fn-url')?.value.trim();
+  if (!url) return;
+  S.notifConfig = { ...(S.notifConfig||{}), notifFunctionUrl: url };
+  showToast('Function URL saved — click Send again to retry.', 'success');
 };
 
 // ── TOP MANAGEMENT SIDEBAR ────────────────────────────────────────
