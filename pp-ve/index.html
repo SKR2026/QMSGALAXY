@@ -354,6 +354,7 @@ let S = {
   companyLogo: localStorage.getItem('vems_logo') || '',
   orgName: localStorage.getItem('vems_orgname') || 'Polyplastics India Ltd',
   schedulerCrons: JSON.parse(localStorage.getItem('vems_crons')||'{"daily":"0 8 * * *","weekly":"0 8 * * 1","invoice":"0 9 * * *"}'),
+  notifConfig: JSON.parse(localStorage.getItem('vems_notif_config') || '{}'),
   isTopMgmt: false,
 };
 
@@ -592,8 +593,6 @@ async function fsSaveEmissionFactors(factors) {
 }
 
 // ── USER CRUD (Firestore profile + Firebase Auth) ─────────────────
-// VEMS uses its own 'vems_users' collection to avoid conflicts with
-// other apps (PlantVisit, Legal etc.) that share the same Firebase project.
 async function fsLoadUsers() {
   try {
     const snap = await getDocs(collection(db,'vems_users'));
@@ -603,16 +602,14 @@ async function fsLoadUsers() {
   } catch(e) { console.error('Load users:', e); S.users = []; }
 }
 
-// Creates a user via Firebase Auth REST API then saves to Firestore vems_users.
-// If email already exists in Firebase Auth (shared with other apps),
-// we skip Auth creation and just add/update the vems_users Firestore record.
+// Creates a user via Firebase Auth REST API then saves to Firestore.
 async function fsInviteUser(email, displayName, plantId, password) {
   const apiKey = firebaseConfig.apiKey;
-  let newUid = null;
 
-  // Step 1: Try to create Firebase Auth user via REST API
+  // Step 1: Create Firebase Auth user via REST API with 15s timeout
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000);
+
   let signUpRes, signUpData;
   try {
     signUpRes = await fetch(
@@ -634,79 +631,41 @@ async function fsInviteUser(email, displayName, plantId, password) {
 
   if (!signUpRes.ok) {
     const errCode = signUpData?.error?.message || 'UNKNOWN_ERROR';
-    if (errCode === 'EMAIL_EXISTS') {
-      // User already exists in Firebase Auth (possibly from another app).
-      // Look up their UID from vems_users or fetch via lookup API.
-      console.warn('[fsInviteUser] EMAIL_EXISTS — user exists in Auth, adding to vems_users only.');
-      // Try to find existing uid in vems_users
-      const existing = S.users.find(u => u.email === email);
-      if (existing) throw new Error(`${email} is already a VEMS user.`);
-      // Fetch UID via sign-in (using the provided password)
-      try {
-        const lookupRes = await fetch(
-          `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, password, returnSecureToken: true }),
-          }
-        );
-        const lookupData = await lookupRes.json();
-        if (lookupRes.ok && lookupData.localId) {
-          newUid = lookupData.localId;
-          console.log('[fsInviteUser] Got UID from sign-in:', newUid);
-        } else {
-          // Cannot get UID — use email as doc ID fallback
-          newUid = email.replace(/[^a-zA-Z0-9]/g, '_');
-          console.warn('[fsInviteUser] Could not sign in to get UID, using email-based ID');
-        }
-      } catch(_) {
-        newUid = email.replace(/[^a-zA-Z0-9]/g, '_');
-      }
-    } else if (errCode.includes('WEAK_PASSWORD')) {
-      throw new Error('Password must be at least 6 characters.');
-    } else if (errCode === 'INVALID_EMAIL') {
-      throw new Error('Invalid email address format.');
-    } else if (errCode === 'TOO_MANY_ATTEMPTS_TRY_LATER') {
-      throw new Error('Too many attempts. Please wait a few minutes and try again.');
-    } else if (errCode === 'OPERATION_NOT_ALLOWED') {
-      throw new Error('Email/Password sign-in is disabled in Firebase Console. Enable it under Authentication → Sign-in Methods.');
-    } else {
-      throw new Error(errCode.replace(/_/g,' ').toLowerCase());
-    }
-  } else {
-    newUid = signUpData.localId;
-    if (!newUid) throw new Error('Firebase did not return a user ID.');
+    if (errCode === 'EMAIL_EXISTS') throw new Error('This email is already registered in Firebase Auth.');
+    if (errCode.includes('WEAK_PASSWORD')) throw new Error('Password must be at least 6 characters.');
+    if (errCode === 'INVALID_EMAIL') throw new Error('Invalid email address format.');
+    if (errCode === 'TOO_MANY_ATTEMPTS_TRY_LATER') throw new Error('Too many attempts. Please wait a few minutes and try again.');
+    if (errCode === 'OPERATION_NOT_ALLOWED') throw new Error('Email/Password sign-in is disabled in Firebase Console. Enable it under Authentication → Sign-in Methods.');
+    throw new Error(errCode.replace(/_/g,' ').toLowerCase());
   }
+  const newUid = signUpData.localId;
+  if (!newUid) throw new Error('Firebase did not return a user ID. Ensure Email/Password is enabled in Firebase Console → Authentication → Sign-in Methods.');
 
-  // Step 2: Write to vems_users collection (separate from other apps)
+  // Step 2: Write Firestore profile
   const profile = {
     email, displayName, plantId,
     role: 'plant_admin', status: 'Active',
-    app: 'vems',
     createdAt: serverTimestamp(), createdBy: S.user?.email,
   };
   try {
-    await setDoc(doc(db, 'vems_users', newUid), profile);
+    await setDoc(doc(db,'vems_users', newUid), profile);
   } catch(e) {
-    throw new Error('User created in Auth but Firestore write failed: ' + e.message);
+    throw new Error('User created in Auth but Firestore write failed: ' + e.message + '. Contact admin to fix manually.');
   }
   S.users.push({ uid: newUid, ...profile, createdAt: new Date() });
 
-  // Step 3: Send styled HTML welcome email via VEMS cloud function
-  // Falls back to Firebase plain-text reset email if cloud function not configured
+  // Step 3: Send styled welcome email via VEMS cloud function
   try {
     await sendVemsWelcomeEmail(email, displayName);
   } catch(e) {
     console.warn('[fsInviteUser] Welcome email failed:', e.message);
   }
 
-  addAudit('User Created', '', `${displayName} (${email}) → ${plantName(plantId)}`);
+  addAudit('User Created','', `${displayName} (${email}) → ${plantName(plantId)}`);
 }
 
 // Send styled HTML welcome email via VEMS cloud function.
-// Cloud function generates reset link via Admin SDK + sends branded HTML email.
-// Browser just sends: email + displayName — no HTML built here.
+// Cloud function uses Admin SDK to generate reset link + sends branded HTML email.
 async function sendVemsWelcomeEmail(email, displayName) {
   const cfg    = S.notifConfig || {};
   const url    = (cfg.notifFunctionUrl || '').trim().replace(/\/$/, '');
@@ -724,7 +683,7 @@ async function sendVemsWelcomeEmail(email, displayName) {
   } else {
     // Fallback — Firebase plain text reset email
     await sendPasswordResetEmail(auth, email);
-    console.log('[sendVemsWelcomeEmail] Fallback: Firebase reset email sent to', email);
+    console.warn('[sendVemsWelcomeEmail] Fallback: Firebase reset email. Save URL+Secret in Superadmin Panel first.');
   }
 }
 
@@ -739,15 +698,12 @@ window.resetUserPassword = async function(email, displayName='') {
   try {
     await sendVemsWelcomeEmail(email, displayName || email.split('@')[0]);
     showToast(`Password reset email sent to ${email}`, 'success');
-    addAudit('Password Reset Sent', '', email);
+    addAudit('Password Reset Sent','', email);
   } catch(e) {
-    // Final fallback
     try {
       await sendPasswordResetEmail(auth, email);
       showToast(`Password reset email sent to ${email}`, 'success');
-    } catch(e2) {
-      showToast('Error: ' + e2.message, 'error');
-    }
+    } catch(e2) { showToast('Error: '+e2.message, 'error'); }
   }
 };
 
@@ -763,7 +719,7 @@ window.toggleUserStatus = async function(uid, currentStatus) {
 window.deleteUser = async function(uid, name) {
   if (!confirm(`Delete user "${name}"?\n\nThis removes their profile from Firestore. Their Firebase Authentication account remains but they will lose app access immediately.\n\nThis cannot be undone.`)) return;
   try {
-    await deleteDoc(doc(db, 'vems_users', uid));
+    await deleteDoc(doc(db,'vems_users', uid));
     S.users = S.users.filter(u => u.uid !== uid);
     addAudit('User Deleted', name, '');
     showToast(`User "${name}" deleted.`, 'warning');
@@ -785,7 +741,7 @@ window.showUserModal = function(uid='') {
         <button onclick="closeModal()">✕</button>
       </div>
       <div class="modal-body">
-        ${!isEdit ? `<div class="alert alert-info mb-4">📧 A password reset email will be sent to the user with a <b>"Click to set your password"</b> link. They use that to set their own password and log in.</div>` : ''}
+        ${!isEdit ? `<div class="alert alert-info mb-4">📧 Firebase will send a welcome/setup email. The user sets their own password.</div>` : ''}
         <div class="form-grid">
           <div class="form-group form-full">
             <label class="form-label">Full Name <span class="req">*</span></label>
@@ -2499,6 +2455,8 @@ window.saveAllSuperadminSettings = async function() {
     notifFunctionUrl:      form.notifFunctionUrl,
     vemsSecret:            form.vemsSecret,
   };
+  // Persist to localStorage so URL+secret survive page reloads
+  localStorage.setItem('vems_notif_config', JSON.stringify(S.notifConfig));
   S.orgName = document.getElementById('sa-org')?.value || S.orgName;
   localStorage.setItem('vems_orgname', S.orgName);
 
@@ -3216,35 +3174,29 @@ window.showUserModal = function(userId='') {
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="saveUserFromModal()">Create User</button>
+        <button class="btn btn-primary" id="modal-create-btn" onclick="saveUserFromModal()">Create User</button>
       </div>
     </div>
   </div>`;
   render();
 };
 
-// NOTE: saveUser is defined above (line ~761) using fsInviteUser (REST API).
-// That function uses field IDs: usr-name, usr-email, usr-plant, usr-pass.
-// This modal uses different IDs (u-name etc) — bridge them here.
 window.saveUserFromModal = async function() {
   const name    = document.getElementById('u-name')?.value.trim();
   const email   = document.getElementById('u-email')?.value.trim();
   const plantId = document.getElementById('u-plant')?.value;
   const pw      = document.getElementById('u-pw')?.value;
-  if (!name || !email || !plantId || !pw) return showToast('All fields are required', 'error');
-  if (pw.length < 6) return showToast('Password must be at least 6 characters', 'error');
-
-  const btn = document.querySelector('#modal-root .btn-primary');
-  if (btn) { btn.textContent = '⏳ Creating…'; btn.disabled = true; }
-
+  if (!name||!email||!plantId||!pw) return showToast('All fields are required','error');
+  if (pw.length < 6) return showToast('Password must be at least 6 characters','error');
+  const btn = document.getElementById('modal-create-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Creating…'; }
   try {
-    // Uses REST API — does NOT sign out the current superadmin
     await fsInviteUser(email, name, plantId, pw);
     closeModal();
-    showToast(`✅ Plant Admin ${name} created! Setup email sent to ${email}.`, 'success');
+    showToast(`✅ Plant Admin ${name} created! Welcome email sent.`, 'success');
     render();
   } catch(e) {
-    if (btn) { btn.textContent = 'Create User'; btn.disabled = false; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Create User'; }
     showToast('Error: ' + e.message.replace('Firebase: ','').replace(/\(.*\)/,'').trim(), 'error');
   }
 };
