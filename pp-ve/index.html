@@ -343,15 +343,14 @@ const MONTHS = [
 let S = {
   user: null, userProfile: null, isSuperAdmin: false,
   page: 'login', subPage: '',
-  plants: [...SAMPLE_PLANTS], vehicles: [...SAMPLE_VEHICLES],
-  expenses: genSampleExpenses(),
+  plants: [], vehicles: [], expenses: [],
   users: [], auditLog: [],
   emissionFactors: {...EMISSION_FACTORS_DEFAULT},
   charts: {}, toast: null,
-  filterPlant: '', filterYear: '2026', filterMonth: '', filterVehicle: '', filterCat: '',
+  filterPlant: '', filterYear: new Date().getFullYear().toString(), filterMonth: '', filterVehicle: '', filterCat: '',
   expVehicleSearch: '',
   selectedVehicleId: null, selectedExpenses: new Set(),
-  modal: null, loading: false, notifications: [],
+  modal: null, loading: false, dataLoaded: false, notifications: [],
   companyLogo: localStorage.getItem('vems_logo') || '',
   orgName: localStorage.getItem('vems_orgname') || 'Polyplastics India Ltd',
   schedulerCrons: JSON.parse(localStorage.getItem('vems_crons')||'{"daily":"0 8 * * *","weekly":"0 8 * * 1","invoice":"0 9 * * *"}'),
@@ -435,6 +434,160 @@ function addAudit(action, oldVal='', newVal='', extra='') {
 }
 
 // ── AUTH ──────────────────────────────────────────────────────────
+// ── FIRESTORE DATA LAYER ──────────────────────────────────────────
+async function loadFirestoreData() {
+  try {
+    S.loading = true;
+    const root = document.getElementById('root');
+    if (root) root.innerHTML = `<div style="display:flex;height:100vh;align-items:center;justify-content:center;flex-direction:column;gap:16px;color:var(--gray-500)">
+      ${S.companyLogo?`<img src="${S.companyLogo}" style="height:48px;object-fit:contain"/>`:'<div style="font-size:48px">🚛</div>'}
+      <div style="width:36px;height:36px;border:3px solid var(--gray-200);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite"></div>
+      <div style="font-size:14px;font-weight:500">${S.orgName} · Loading fleet data…</div>
+      <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+    </div>`;
+
+    // Load plants
+    const plantsSnap = await getDocs(collection(db, 'plants'));
+    S.plants = plantsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    // Load vehicles (all for SA, plant-filtered for admin)
+    const vehiclesSnap = await getDocs(
+      isSA() ? collection(db, 'vehicles')
+             : query(collection(db, 'vehicles'), where('plantId', '==', myPlantId()))
+    );
+    S.vehicles = vehiclesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    // Load expenses for current + previous year
+    const yearStart = `${parseInt(S.filterYear)-1}-01-01`;
+    const yearEnd   = `${S.filterYear}-12-31`;
+    const expSnap = await getDocs(
+      isSA()
+        ? query(collection(db,'expenses'), where('date','>=',yearStart), where('date','<=',yearEnd), orderBy('date','desc'))
+        : query(collection(db,'expenses'), where('plantId','==',myPlantId()), where('date','>=',yearStart), where('date','<=',yearEnd), orderBy('date','desc'))
+    );
+    S.expenses = expSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    // Load emission factors
+    try {
+      const efDoc = await getDoc(doc(db, 'settings', 'emissionFactors'));
+      if (efDoc.exists()) S.emissionFactors = { ...EMISSION_FACTORS_DEFAULT, ...efDoc.data() };
+    } catch {}
+
+    S.dataLoaded = true;
+    S.loading = false;
+
+    // If no data exists yet, seed with sample data for first-time setup
+    if (S.plants.length === 0 && isSA()) await seedSampleData();
+
+    render();
+  } catch(e) {
+    console.error('Firestore load error:', e);
+    S.loading = false; S.dataLoaded = true;
+    showToast('Error loading data: ' + e.message, 'error');
+    render();
+  }
+}
+
+// First-time setup: seed sample data into Firestore
+async function seedSampleData() {
+  showToast('First time setup — seeding sample data…', 'info');
+  const SAMPLE_PLANTS = [
+    { name:'Plant A — Manesar', code:'MNS', location:'Manesar', address:'IMT Manesar', state:'Haryana', status:'Active', plantAdminEmail:'' },
+    { name:'Plant B — Pune',    code:'PNE', location:'Chakan',  address:'MIDC Chakan', state:'Maharashtra', status:'Active', plantAdminEmail:'' },
+    { name:'Plant C — Chennai', code:'CHN', location:'Oragadam', address:'SIPCOT Oragadam', state:'Tamil Nadu', status:'Active', plantAdminEmail:'' },
+  ];
+  const plantIds = [];
+  for (const p of SAMPLE_PLANTS) {
+    const ref = await addDoc(collection(db,'plants'), { ...p, createdAt: serverTimestamp() });
+    plantIds.push(ref.id);
+    S.plants.push({ id: ref.id, ...p });
+  }
+  const SAMPLE_VEHICLES = [
+    { regNo:'HR26-BX-1234', type:'LCV', make:'Tata', model:'Ace', year:'2021', fuel:'Diesel', plantId:plantIds[0], ownerType:'Company Owned', driverName:'Ramesh Kumar', driverContact:'9876543210', status:'Active', insuranceExpiry:'2026-03-14', pucExpiry:'2025-09-30', odometer:84250 },
+    { regNo:'HR26-CY-5678', type:'SUV', make:'Mahindra', model:'Bolero', year:'2020', fuel:'Diesel', plantId:plantIds[0], ownerType:'Company Owned', driverName:'Suresh Singh', driverContact:'9876543211', status:'Active', insuranceExpiry:'2026-07-19', pucExpiry:'2026-01-15', odometer:112400 },
+    { regNo:'MH12-AB-9876', type:'MUV', make:'Toyota', model:'Innova', year:'2022', fuel:'Diesel', plantId:plantIds[1], ownerType:'Leased', driverName:'Vijay Patil', driverContact:'9876543212', status:'Active', insuranceExpiry:'2026-01-09', pucExpiry:'2026-04-20', odometer:54300 },
+    { regNo:'TN09-EF-7890', type:'LCV', make:'Ashok Leyland', model:'Dost', year:'2021', fuel:'Diesel', plantId:plantIds[2], ownerType:'Company Owned', driverName:'Murugan R', driverContact:'9876543214', status:'Active', insuranceExpiry:'2026-09-11', pucExpiry:'2026-03-10', odometer:73600 },
+  ];
+  for (const v of SAMPLE_VEHICLES) {
+    const ref = await addDoc(collection(db,'vehicles'), { ...v, createdAt: serverTimestamp() });
+    S.vehicles.push({ id: ref.id, ...v });
+  }
+  showToast('Sample data seeded! You can now add real vehicles and expenses.', 'success');
+}
+
+async function reloadExpenses() {
+  try {
+    const yearStart = `${S.filterYear}-01-01`;
+    const yearEnd   = `${S.filterYear}-12-31`;
+    const expSnap = await getDocs(
+      isSA()
+        ? query(collection(db,'expenses'), where('date','>=',yearStart), where('date','<=',yearEnd), orderBy('date','desc'))
+        : query(collection(db,'expenses'), where('plantId','==',myPlantId()), where('date','>=',yearStart), where('date','<=',yearEnd), orderBy('date','desc'))
+    );
+    S.expenses = expSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch(e) { console.error('Reload expenses error:', e); }
+}
+
+// ── FIRESTORE CRUD ────────────────────────────────────────────────
+async function fsAddPlant(data) {
+  const ref = await addDoc(collection(db,'plants'), { ...data, createdAt:serverTimestamp(), createdBy:S.user?.email });
+  S.plants.push({ id:ref.id, ...data });
+  addAudit('Plant Added','',data.name); return ref.id;
+}
+async function fsUpdatePlant(id, data) {
+  await updateDoc(doc(db,'plants',id), { ...data, updatedAt:serverTimestamp(), updatedBy:S.user?.email });
+  const idx = S.plants.findIndex(p=>p.id===id);
+  if (idx>=0) S.plants[idx] = { ...S.plants[idx], ...data };
+  addAudit('Plant Updated','',data.name);
+}
+async function fsDeletePlant(id) {
+  await deleteDoc(doc(db,'plants',id));
+  S.plants = S.plants.filter(p=>p.id!==id);
+  addAudit('Plant Deleted',id,'');
+}
+async function fsAddVehicle(data) {
+  const ref = await addDoc(collection(db,'vehicles'), { ...data, createdAt:serverTimestamp(), createdBy:S.user?.email });
+  S.vehicles.push({ id:ref.id, ...data });
+  addAudit('Vehicle Added','',data.regNo); return ref.id;
+}
+async function fsUpdateVehicle(id, data) {
+  await updateDoc(doc(db,'vehicles',id), { ...data, updatedAt:serverTimestamp(), updatedBy:S.user?.email });
+  const idx = S.vehicles.findIndex(v=>v.id===id);
+  if (idx>=0) S.vehicles[idx] = { ...S.vehicles[idx], ...data };
+  addAudit('Vehicle Updated','',data.regNo);
+}
+async function fsDeleteVehicle(id) {
+  const v = S.vehicles.find(x=>x.id===id);
+  await deleteDoc(doc(db,'vehicles',id));
+  const vExps = S.expenses.filter(e=>e.vehicleId===id);
+  await Promise.all(vExps.map(e=>deleteDoc(doc(db,'expenses',e.id))));
+  S.vehicles = S.vehicles.filter(x=>x.id!==id);
+  S.expenses = S.expenses.filter(e=>e.vehicleId!==id);
+  addAudit('Vehicle Deleted',v?.regNo,'');
+}
+async function fsAddExpense(data) {
+  const ref = await addDoc(collection(db,'expenses'), { ...data, createdAt:serverTimestamp(), createdBy:S.user?.email });
+  S.expenses.unshift({ id:ref.id, ...data });
+  addAudit('Expense Added','',`${vehicleReg(data.vehicleId)} · ${data.category} · ${fmtR(data.amount)}`);
+  return ref.id;
+}
+async function fsDeleteExpense(id) {
+  const e = S.expenses.find(x=>x.id===id);
+  await deleteDoc(doc(db,'expenses',id));
+  S.expenses = S.expenses.filter(x=>x.id!==id);
+  addAudit('Expense Deleted','',`${vehicleReg(e?.vehicleId||'')} · ${e?.category} · ${fmtR(e?.amount||0)}`);
+}
+async function fsBulkAddExpenses(expenses) {
+  const results = await Promise.allSettled(expenses.map(e=>addDoc(collection(db,'expenses'),{...e,createdAt:serverTimestamp(),createdBy:S.user?.email})));
+  const added = results.filter(r=>r.status==='fulfilled');
+  added.forEach((r,i)=>S.expenses.unshift({id:r.value.id,...expenses[i]}));
+  addAudit('Bulk Import','',`${added.length} expenses`);
+  return added.length;
+}
+async function fsSaveEmissionFactors(factors) {
+  await setDoc(doc(db,'settings','emissionFactors'),{...factors,updatedAt:serverTimestamp(),updatedBy:S.user?.email});
+}
+
 // ── MAGIC LINK DETECTION ──────────────────────────────────────────
 async function handleMagicLink() {
   if (!isSignInWithEmailLink(auth, window.location.href)) return false;
@@ -462,16 +615,17 @@ onAuthStateChanged(auth, async user => {
     if (!S.isSuperAdmin && !S.isTopMgmt) {
       try {
         const snap = await getDoc(doc(db,'users', user.uid));
-        S.userProfile = snap.exists() ? snap.data() : { plantId:'plant-a', role:'plant_admin' };
-      } catch { S.userProfile = { plantId:'plant-a', role:'plant_admin' }; }
+        S.userProfile = snap.exists() ? snap.data() : { plantId:'', role:'plant_admin' };
+      } catch { S.userProfile = { plantId:'', role:'plant_admin' }; }
     }
     S.page = S.isTopMgmt ? 'topmgmt' : 'dashboard';
+    S.dataLoaded = false;
+    await loadFirestoreData(); // Load real data from Firestore
   } else {
     const handled = await handleMagicLink();
     if (!handled) { S.page = 'login'; render(); }
     return;
   }
-  render();
 });
 
 async function doLogin(email, pw) {
@@ -1636,13 +1790,13 @@ function emFactorsHTML() {
   </div>`;
 }
 
-window.saveEmissionFactors = function() {
-  FUEL_TYPES.forEach(f=>{
-    const el = document.getElementById(`ef-${f}`);
-    if(el) S.emissionFactors[f] = parseFloat(el.value)||0;
-  });
-  addAudit('Updated Emission Factors');
-  showToast('Emission factors saved!');
+window.saveEmissionFactors = async function() {
+  FUEL_TYPES.forEach(f=>{ const el=document.getElementById(`ef-${f}`); if(el) S.emissionFactors[f]=parseFloat(el.value)||0; });
+  try {
+    await fsSaveEmissionFactors(S.emissionFactors);
+    addAudit('Updated Emission Factors');
+    showToast('Emission factors saved to Firestore!');
+  } catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
 // ── AUDIT TRAIL ───────────────────────────────────────────────────
@@ -2516,7 +2670,7 @@ window.showVehicleModal = function(vehicleId='') {
   render();
 };
 
-window.saveVehicle = function(vehicleId='') {
+window.saveVehicle = async function(vehicleId='') {
   const regNo = document.getElementById('v-reg').value.trim();
   const ins = document.getElementById('v-ins').value;
   const puc = document.getElementById('v-puc').value;
@@ -2532,27 +2686,19 @@ window.saveVehicle = function(vehicleId='') {
     status:document.getElementById('v-status').value, odometer:parseInt(document.getElementById('v-odo').value)||0,
     insuranceExpiry:ins, pucExpiry:puc,
   };
-  if(vehicleId) {
-    const idx = S.vehicles.findIndex(v=>v.id===vehicleId);
-    const old = S.vehicles[idx];
-    S.vehicles[idx] = {...old,...data};
-    addAudit('Vehicle Updated', old.regNo, data.regNo);
-    showToast('Vehicle updated!');
-  } else {
-    S.vehicles.push({id:uid(),...data});
-    addAudit('Vehicle Added','',data.regNo);
-    showToast('Vehicle added!');
-  }
-  closeModal(); render();
+  try {
+    if(vehicleId) { await fsUpdateVehicle(vehicleId, data); showToast('Vehicle updated!'); }
+    else { await fsAddVehicle(data); showToast('Vehicle added!'); }
+    closeModal(); render();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
-window.deleteVehicle = function(id) {
+window.deleteVehicle = async function(id) {
   if(!confirm('Delete this vehicle and all its expense records?')) return;
-  const v = S.vehicles.find(x=>x.id===id);
-  S.vehicles = S.vehicles.filter(x=>x.id!==id);
-  S.expenses = S.expenses.filter(e=>e.vehicleId!==id);
-  addAudit('Vehicle Deleted', v?.regNo, '');
-  showToast('Vehicle deleted','warning'); render();
+  try {
+    await fsDeleteVehicle(id);
+    showToast('Vehicle deleted','warning'); render();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
 window.showExpenseModal = function(vehicleId='', defaultCat='') {
@@ -2677,16 +2823,14 @@ window.handleBillUpload = function(input) {
   }
 };
 
-window.saveExpense = function() {
+window.saveExpense = async function() {
   const vehicleId = document.getElementById('exp-vehicle')?.value;
   const amount = parseFloat(document.getElementById('exp-amount')?.value);
   const noInv = document.getElementById('exp-no-invoice')?.checked;
   const hasBill = !!pendingBillFile || noInv;
-
   if(!vehicleId) return showToast('Select a vehicle','error');
   if(!amount) return showToast('Enter a valid amount','error');
   if(!hasBill && !noInv) return showToast('Invoice upload is mandatory. Please upload a bill or check "No Invoice Available".','error');
-
   const vehicle = S.vehicles.find(v=>v.id===vehicleId);
   const cat = document.getElementById('exp-cat')?.value||'Other';
   const fuelQty = parseFloat(document.getElementById('exp-fuelqty')?.value)||0;
@@ -2696,9 +2840,8 @@ window.saveExpense = function() {
   const dist = odo>prevOdo?odo-prevOdo:0;
   const ef = S.emissionFactors[vehicle?.fuel||'Diesel']||2.68;
   const co2 = cat==='Fuel'&&fuelQty>0?parseFloat((fuelQty*ef).toFixed(2)):0;
-
   const exp = {
-    id:uid(), vehicleId, plantId:vehicle?.plantId||'',
+    vehicleId, plantId:vehicle?.plantId||'',
     date:document.getElementById('exp-date')?.value||new Date().toISOString().slice(0,10),
     category:cat, vendor:document.getElementById('exp-vendor')?.value||'',
     invoiceNo:document.getElementById('exp-invno')?.value||'',
@@ -2708,12 +2851,13 @@ window.saveExpense = function() {
     fuelQty, fuelRate, co2Emission:co2, emissionFactor:ef,
     remarks:document.getElementById('exp-remarks')?.value||'',
     hasBill, invoiceException:noInv, billUrl:'',
-    enteredBy:S.user?.email||'', createdAt:new Date().toISOString(),
+    enteredBy:S.user?.email||'',
   };
-  S.expenses.unshift(exp);
-  pendingBillFile = null;
-  addAudit('Expense Added', '', `${vehicleReg(vehicleId)} · ${cat} · ${fmtR(amount)}`);
-  closeModal(); showToast('Expense saved successfully!'); render();
+  try {
+    await fsAddExpense(exp);
+    pendingBillFile = null;
+    closeModal(); showToast('Expense saved!'); render();
+  } catch(e) { showToast('Error saving expense: '+e.message,'error'); }
 };
 
 window.showEditExpenseModal = function(expId) {
@@ -2722,13 +2866,11 @@ window.showEditExpenseModal = function(expId) {
   showToast('Edit functionality: Update the form fields and save','info');
 };
 
-window.deleteExpense = function(expId) {
+window.deleteExpense = async function(expId) {
   if(!isSA()) return showToast('Only Superadmin can delete expenses','error');
-  if(!confirm('Delete this expense record? This action is logged in the audit trail.')) return;
-  const e = S.expenses.find(x=>x.id===expId);
-  S.expenses = S.expenses.filter(x=>x.id!==expId);
-  addAudit('Expense Deleted','',`${vehicleReg(e?.vehicleId||'')} · ${e?.category} · ${fmtR(e?.amount||0)}`);
-  showToast('Expense deleted','warning'); render();
+  if(!confirm('Delete this expense? This is permanent and logged.')) return;
+  try { await fsDeleteExpense(expId); showToast('Expense deleted','warning'); render(); }
+  catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
 window.showPlantModal = function(plantId='') {
@@ -2756,32 +2898,24 @@ window.showPlantModal = function(plantId='') {
   render();
 };
 
-window.savePlant = function(plantId='') {
+window.savePlant = async function(plantId='') {
   const name = document.getElementById('p-name')?.value.trim();
   const code = document.getElementById('p-code')?.value.trim().toUpperCase();
   if(!name||!code) return showToast('Plant name and code are required','error');
   const data = { name, code, location:document.getElementById('p-loc')?.value||'', address:document.getElementById('p-addr')?.value||'', state:document.getElementById('p-state')?.value||'', plantAdminEmail:document.getElementById('p-admin')?.value||'', status:document.getElementById('p-status')?.value||'Active' };
-  if(plantId) {
-    const idx = S.plants.findIndex(p=>p.id===plantId);
-    S.plants[idx] = {...S.plants[idx],...data};
-    addAudit('Plant Updated','',name);
-    showToast('Plant updated!');
-  } else {
-    S.plants.push({id:uid(),createdAt:new Date().toISOString(),...data});
-    addAudit('Plant Added','',name);
-    showToast('Plant added!');
-  }
-  closeModal(); render();
+  try {
+    if(plantId) { await fsUpdatePlant(plantId, data); showToast('Plant updated!'); }
+    else { await fsAddPlant(data); showToast('Plant added!'); }
+    closeModal(); render();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
-window.deletePlant = function(id) {
+window.deletePlant = async function(id) {
   const vCount = S.vehicles.filter(v=>v.plantId===id).length;
   if(vCount>0) return showToast(`Cannot delete: ${vCount} vehicles assigned to this plant`,'error');
   if(!confirm('Delete this plant?')) return;
-  const p = S.plants.find(x=>x.id===id);
-  S.plants = S.plants.filter(x=>x.id!==id);
-  addAudit('Plant Deleted',p?.name,'');
-  showToast('Plant deleted','warning'); render();
+  try { await fsDeletePlant(id); showToast('Plant deleted','warning'); render(); }
+  catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
 window.showUserModal = function(userId='') {
@@ -2934,14 +3068,19 @@ window.processBulkCSV = function(input) {
   reader.readAsText(file);
 };
 
-window.importBulkExpenses = function() {
+window.importBulkExpenses = async function() {
   const valid = bulkPendingData.filter(r=>r._valid);
-  valid.forEach(r => { const {_valid,_vehicleReg,...exp}=r; S.expenses.unshift(exp); });
-  addAudit('Bulk Import', '', `${valid.length} expenses imported`);
-  bulkPendingData = [];
-  closeModal();
-  showToast(`✅ ${valid.length} expenses imported successfully!`, 'success');
-  render();
+  if (!valid.length) return;
+  const btn = document.getElementById('bulk-import-btn');
+  if (btn) { btn.textContent='Importing…'; btn.disabled=true; }
+  try {
+    const cleaned = valid.map(({_valid,_vehicleReg,...exp})=>exp);
+    const count = await fsBulkAddExpenses(cleaned);
+    bulkPendingData = [];
+    closeModal();
+    showToast(`✅ ${count} expenses imported to Firestore!`, 'success');
+    render();
+  } catch(e) { showToast('Import error: '+e.message,'error'); }
 };
 
 window.closeModal = function() { S.modal = null; render(); };
@@ -3027,17 +3166,19 @@ window.toggleAllExpenses = function(checked) {
   else S.selectedExpenses.clear();
   render();
 };
-window.bulkDeleteExpenses = function() {
+window.bulkDeleteExpenses = async function() {
   const count = S.selectedExpenses.size;
   if (!count) return;
-  if (!confirm(`Delete ${count} selected expense record${count>1?'s':''}? This action is logged in the audit trail and cannot be undone.`)) return;
-  const ids = [...S.selectedExpenses];
-  const deleted = ids.map(id=>S.expenses.find(e=>e.id===id)).filter(Boolean);
-  S.expenses = S.expenses.filter(e=>!S.selectedExpenses.has(e.id));
-  S.selectedExpenses.clear();
-  addAudit(`Bulk Delete — ${count} expenses`, '', ids.join(', '));
-  showToast(`${count} expense${count>1?'s':''} deleted`, 'warning');
-  render();
+  if (!confirm(`Delete ${count} selected expense${count>1?'s':''}? This is permanent.`)) return;
+  try {
+    const ids = [...S.selectedExpenses];
+    await Promise.all(ids.map(id=>deleteDoc(doc(db,'expenses',id))));
+    S.expenses = S.expenses.filter(e=>!S.selectedExpenses.has(e.id));
+    S.selectedExpenses.clear();
+    addAudit(`Bulk Delete — ${count} expenses`,'','');
+    showToast(`${count} expense${count>1?'s':''} deleted`,'warning');
+    render();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
 // ── MAINTENANCE EXPORTS ───────────────────────────────────────────
