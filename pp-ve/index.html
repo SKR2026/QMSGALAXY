@@ -601,24 +601,40 @@ async function fsLoadUsers() {
   } catch(e) { console.error('Load users:', e); S.users = []; }
 }
 
-// Creates a user via Firebase Auth REST API (doesn't require Email/Password provider enabled
-// in the client SDK — uses the project's Web API key directly) then saves to Firestore.
+// Creates a user via Firebase Auth REST API then saves to Firestore.
 async function fsInviteUser(email, displayName, plantId, password) {
   const apiKey = firebaseConfig.apiKey;
-  // Step 1: Create Firebase Auth user via REST API (port 443, no CORS issue)
-  const signUpRes = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: false }),
-    }
-  );
-  const signUpData = await signUpRes.json();
+
+  // Step 1: Create Firebase Auth user via REST API with 15s timeout
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+  let signUpRes, signUpData;
+  try {
+    signUpRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, returnSecureToken: false }),
+        signal: controller.signal,
+      }
+    );
+    signUpData = await signUpRes.json();
+  } catch(e) {
+    if (e.name === 'AbortError') throw new Error('Request timed out. Check your internet connection and try again.');
+    throw new Error('Network error: ' + e.message);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
   if (!signUpRes.ok) {
     const errCode = signUpData?.error?.message || 'UNKNOWN_ERROR';
-    if (errCode === 'EMAIL_EXISTS') throw new Error('This email is already registered.');
-    if (errCode === 'WEAK_PASSWORD : Password should be at least 6 characters') throw new Error('Password must be at least 6 characters.');
+    if (errCode === 'EMAIL_EXISTS') throw new Error('This email is already registered in Firebase Auth.');
+    if (errCode.includes('WEAK_PASSWORD')) throw new Error('Password must be at least 6 characters.');
+    if (errCode === 'INVALID_EMAIL') throw new Error('Invalid email address format.');
+    if (errCode === 'TOO_MANY_ATTEMPTS_TRY_LATER') throw new Error('Too many attempts. Please wait a few minutes and try again.');
+    if (errCode === 'OPERATION_NOT_ALLOWED') throw new Error('Email/Password sign-in is disabled in Firebase Console. Enable it under Authentication → Sign-in Methods.');
     throw new Error(errCode.replace(/_/g,' ').toLowerCase());
   }
   const newUid = signUpData.localId;
@@ -629,11 +645,14 @@ async function fsInviteUser(email, displayName, plantId, password) {
     role: 'plant_admin', status: 'Active',
     createdAt: serverTimestamp(), createdBy: S.user?.email,
   };
-  await setDoc(doc(db,'users', newUid), profile);
+  try {
+    await setDoc(doc(db,'users', newUid), profile);
+  } catch(e) {
+    throw new Error('User created in Auth but Firestore write failed: ' + e.message + '. Contact admin to fix manually.');
+  }
   S.users.push({ uid: newUid, ...profile, createdAt: new Date() });
 
   // Step 3: Send password-reset email so the user can set their own password
-  // (works even if Email/Password provider is restricted — uses Admin action code)
   try {
     await sendPasswordResetEmail(auth, email);
   } catch(e) {
@@ -2204,8 +2223,8 @@ function superadminHTML() {
       <div class="card-title">🧪 Test Email Notifications</div>
       <div class="form-group mb-4">
         <label class="form-label">VEMS Notification Cloud Function URL</label>
-        <input type="url" id="sa-notif-fn-url" class="form-input" placeholder="https://your-function-xxxxx.run.app" value="${cfg.notifFunctionUrl||''}"/>
-        <div style="font-size:11px;color:var(--gray-500);margin-top:4px">GCP Console → Cloud Functions → your VEMS notification function → copy the trigger URL. Required for in-app test emails.</div>
+        <input type="url" id="sa-notif-fn-url" class="form-input" placeholder="https://your-function-xxxxx.run.app" value="${cfg.notifFunctionUrl || 'https://asia-south1-skr-mom.cloudfunctions.net/expenseAlertTrigger'}"/>
+        <div style="font-size:11px;color:var(--gray-500);margin-top:4px">Pre-filled with your deployed Cloud Function. Change only if you deploy a new function URL.</div>
       </div>
       <p style="font-size:13px;color:var(--gray-500);margin-bottom:16px">Trigger a notification email immediately to verify Gmail delivery. The email will be sent to <b>${cfg.superadminEmail||SUPERADMIN_EMAIL}</b>.</p>
       <div class="flex gap-2 flex-wrap">
@@ -2383,6 +2402,8 @@ window.saveAllSuperadminSettings = async function() {
   await saveAndSyncSchedules();
 };
 
+const DEFAULT_NOTIF_FUNCTION_URL = 'https://asia-south1-skr-mom.cloudfunctions.net/expenseAlertTrigger';
+
 window.testNotification = async function(type) {
   const labelMap = { daily:'Daily Alert', weekly:'Weekly Summary', invoice:'Invoice Reminder' };
   const el = document.getElementById('test-result');
@@ -2394,72 +2415,83 @@ window.testNotification = async function(type) {
   const cfg = S.notifConfig || {};
   const toEmail = cfg.superadminEmail || SUPERADMIN_EMAIL;
 
-  // The VEMS notification Cloud Function URL — saved in Superadmin Settings
-  // Falls back to the scheduler sync URL if a dedicated function URL isn't configured.
-  const notifUrl = (cfg.notifFunctionUrl || '').trim();
+  // Use saved URL, fall back to the known expenseAlertTrigger endpoint
+  const notifUrl = (cfg.notifFunctionUrl || '').trim() || DEFAULT_NOTIF_FUNCTION_URL;
+
+  // Auto-fill the URL field in UI if it was empty
+  const urlField = document.getElementById('sa-notif-fn-url');
+  if (urlField && !urlField.value.trim()) urlField.value = notifUrl;
 
   try {
-    if (!notifUrl) {
-      // No dedicated notification function URL configured — show setup instructions
-      throw new Error('NO_URL');
+    const idToken = await window._auth?.currentUser?.getIdToken(true).catch(()=>'') || '';
+
+    const controller = new AbortController();
+    const tId = setTimeout(() => controller.abort(), 20000);
+
+    let res;
+    try {
+      res = await fetch(notifUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'trigger', type, to: toEmail, idToken }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(tId);
     }
 
-    const idToken = await window._auth?.currentUser?.getIdToken() || '';
-    const res = await fetch(notifUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'trigger', type, to: toEmail, idToken }),
-    });
-
-    // Handle non-JSON responses (e.g. HTML error page)
+    // Handle non-JSON responses (e.g. HTML error page from GCP)
     const contentType = res.headers.get('content-type') || '';
-    const data = contentType.includes('json') ? await res.json() : { ok: false, error: `HTTP ${res.status}` };
+    let data = {};
+    try {
+      data = contentType.includes('json') ? await res.json() : { raw: await res.text() };
+    } catch(_) { data = {}; }
 
-    if (res.ok && (data.success || data.ok || data.action === 'triggered')) {
+    if (res.ok && (data.success || data.ok || data.action === 'triggered' || res.status === 200)) {
       if (el) el.innerHTML = `<div class="alert alert-success">✅ ${labelMap[type]} email sent! Check <b>${toEmail}</b> inbox in 1–2 minutes.</div>`;
       showToast(`${labelMap[type]} email sent!`, 'success');
       addAudit(`Test ${labelMap[type]} Email Sent`,'',toEmail);
     } else {
-      throw new Error(data.error || `HTTP ${res.status}`);
+      const errMsg = data.error || data.message || (data.raw ? data.raw.slice(0,120) : '') || `HTTP ${res.status}`;
+      throw new Error(errMsg);
     }
 
   } catch(e) {
-    const isCors = e.message === 'Failed to fetch' || e.message.includes('CORS') || e.message.includes('NetworkError');
-    const isNoUrl = e.message === 'NO_URL';
+    const isCors = e.message === 'Failed to fetch' || e.message.includes('CORS') || e.message.includes('NetworkError') || e.message.includes('net::');
+    const isTimeout = e.name === 'AbortError';
 
-    if (isCors || isNoUrl) {
-      // CORS or missing URL — show the gcloud trigger command as the reliable alternative
-      const jobMap = {
-        daily:   'firebase-schedule-dailyCriticalAlerts-asia-south1',
-        weekly:  'firebase-schedule-weeklySummaryReport-asia-south1',
-        invoice: 'firebase-schedule-missingInvoiceReminder-asia-south1',
-      };
-      const cmd = `gcloud scheduler jobs run ${jobMap[type]} --location=asia-south1 --project=skr-mom`;
+    const jobMap = {
+      daily:   'firebase-schedule-dailyCriticalAlerts-asia-south1',
+      weekly:  'firebase-schedule-weeklySummaryReport-asia-south1',
+      invoice: 'firebase-schedule-missingInvoiceReminder-asia-south1',
+    };
+    const cmd = `gcloud scheduler jobs run ${jobMap[type]} --location=asia-south1 --project=skr-mom`;
+
+    if (isCors || isTimeout) {
+      // CORS/timeout — Cloud Function is up but browser can't call it directly.
+      // Show both: gcloud command + direct Cloud Console link
       if (el) el.innerHTML = `
         <div class="alert alert-warning">
           <div style="font-weight:600;margin-bottom:8px">
-            ${isNoUrl ? '⚙️ Notification Function URL not configured.' : '🔒 CORS blocked — browser cannot directly call the Cloud Function.'}
+            ${isTimeout ? '⏱️ Request timed out.' : '🔒 CORS blocked — the browser cannot directly call the Cloud Function.'}
           </div>
           <div style="font-size:12px;margin-bottom:10px">
-            ${isNoUrl
-              ? 'Enter your VEMS Notification Cloud Function URL in the field below, then try again.'
-              : 'The Cloud Scheduler can trigger it directly. Run this command in <a href="https://console.cloud.google.com/cloudshell" target="_blank" style="color:inherit">Cloud Shell</a>:'}
+            The function is configured at <code style="font-size:11px">${notifUrl}</code>.<br>
+            Use one of these methods to trigger it instead:
           </div>
-          ${!isNoUrl ? `
-          <div style="background:#0f1724;border-radius:6px;padding:10px 14px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <div style="font-weight:600;font-size:12px;margin-bottom:6px">Option 1 — Cloud Shell command:</div>
+          <div style="background:#0f1724;border-radius:6px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:8px">
             <code style="color:#60a5fa;font-size:11px;word-break:break-all">${cmd}</code>
             <button onclick="navigator.clipboard.writeText('${cmd}');showToast('Copied!')" style="flex-shrink:0;background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">📋 Copy</button>
-          </div>` : ''}
-          <div style="margin-top:10px">
-            <label style="font-size:12px;font-weight:500;display:block;margin-bottom:4px">VEMS Notification Function URL (optional):</label>
-            <div style="display:flex;gap:6px">
-              <input id="notif-fn-url" type="url" class="form-input" style="font-size:12px" placeholder="https://your-function.run.app" value="${notifUrl}"/>
-              <button onclick="saveNotifUrl()" style="flex-shrink:0;background:var(--primary);color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;white-space:nowrap">Save & Retry</button>
-            </div>
+          </div>
+          <div style="font-weight:600;font-size:12px;margin-bottom:6px">Option 2 — Run directly in GCP Console:</div>
+          <a href="https://console.cloud.google.com/cloudscheduler?project=skr-mom" target="_blank" class="btn btn-secondary btn-sm" style="margin-bottom:10px">🔗 Open Cloud Scheduler</a>
+          <div style="font-size:11px;color:var(--gray-500);margin-top:6px">
+            To fix CORS permanently, add <b>AllowOrigin: *</b> (or your domain) in the Cloud Function HTTP headers and redeploy.
           </div>
         </div>`;
     } else {
-      if (el) el.innerHTML = `<div class="alert alert-danger">❌ ${labelMap[type]} failed: ${e.message}</div>`;
+      if (el) el.innerHTML = `<div class="alert alert-danger">❌ ${labelMap[type]} failed: ${e.message}<br><div style="font-size:11px;margin-top:6px">Function URL: ${notifUrl}</div></div>`;
     }
     showToast('Email trigger failed', 'error');
   } finally {
@@ -2472,8 +2504,7 @@ window.testNotification = async function(type) {
 };
 
 window.saveNotifUrl = function() {
-  const url = document.getElementById('notif-fn-url')?.value.trim();
-  if (!url) return;
+  const url = (document.getElementById('notif-fn-url')?.value.trim()) || DEFAULT_NOTIF_FUNCTION_URL;
   S.notifConfig = { ...(S.notifConfig||{}), notifFunctionUrl: url };
   showToast('Function URL saved — click Send again to retry.', 'success');
 };
