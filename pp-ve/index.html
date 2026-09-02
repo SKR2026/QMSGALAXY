@@ -616,7 +616,7 @@ async function fsInviteUser(email, displayName, plantId, password) {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, returnSecureToken: false }),
+        body: JSON.stringify({ email, password, returnSecureToken: true }),
         signal: controller.signal,
       }
     );
@@ -638,6 +638,7 @@ async function fsInviteUser(email, displayName, plantId, password) {
     throw new Error(errCode.replace(/_/g,' ').toLowerCase());
   }
   const newUid = signUpData.localId;
+  if (!newUid) throw new Error('Firebase did not return a user ID. Ensure Email/Password is enabled in Firebase Console → Authentication → Sign-in Methods.');
 
   // Step 2: Write Firestore profile
   const profile = {
@@ -2383,7 +2384,7 @@ window.saveAllSuperadminSettings = async function() {
   const weeklyEnabled  = document.getElementById('sa-weekly-enabled')?.checked ?? true;
   const invoiceEnabled = document.getElementById('sa-invoice-enabled')?.checked ?? true;
 
-  const notifFunctionUrl = document.getElementById('sa-notif-fn-url')?.value.trim() || '';
+  const notifFunctionUrl = document.getElementById('sa-notif-fn-url')?.value.trim() || DEFAULT_NOTIF_FUNCTION_URL;
 
   S.notifConfig = { gmailUser, superadminEmail, dailyTime, weeklyTime, invoiceTime, alertThreshold, highExpenseThreshold, poorMileageThreshold, dailyEnabled, weeklyEnabled, invoiceEnabled, notifFunctionUrl };
   S.orgName = document.getElementById('sa-org')?.value || S.orgName;
@@ -2414,85 +2415,110 @@ window.testNotification = async function(type) {
 
   const cfg = S.notifConfig || {};
   const toEmail = cfg.superadminEmail || SUPERADMIN_EMAIL;
-
-  // Use saved URL, fall back to the known expenseAlertTrigger endpoint
   const notifUrl = (cfg.notifFunctionUrl || '').trim() || DEFAULT_NOTIF_FUNCTION_URL;
 
   // Auto-fill the URL field in UI if it was empty
   const urlField = document.getElementById('sa-notif-fn-url');
   if (urlField && !urlField.value.trim()) urlField.value = notifUrl;
 
+  // gcloud fallback commands (always shown alongside errors)
+  const jobMap = {
+    daily:   'firebase-schedule-dailyCriticalAlerts-asia-south1',
+    weekly:  'firebase-schedule-weeklySummaryReport-asia-south1',
+    invoice: 'firebase-schedule-missingInvoiceReminder-asia-south1',
+  };
+  const cmd = `gcloud scheduler jobs run ${jobMap[type]} --location=asia-south1 --project=skr-mom`;
+
+  const showFallback = (heading, extra='') => {
+    if (el) el.innerHTML = `
+      <div class="alert alert-warning">
+        <div style="font-weight:600;margin-bottom:8px">${heading}</div>
+        ${extra ? `<div style="font-size:12px;margin-bottom:10px">${extra}</div>` : ''}
+        <div style="font-weight:600;font-size:12px;margin-bottom:6px">▶ Trigger via Cloud Shell:</div>
+        <div style="background:#0f1724;border-radius:6px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <code style="color:#60a5fa;font-size:11px;word-break:break-all">${cmd}</code>
+          <button onclick="navigator.clipboard.writeText('${cmd.replace(/'/g,"\\'")}');showToast('Copied!')" style="flex-shrink:0;background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">📋 Copy</button>
+        </div>
+        <a href="https://console.cloud.google.com/cloudscheduler?project=skr-mom" target="_blank" class="btn btn-secondary btn-sm">🔗 Open Cloud Scheduler</a>
+        <div style="font-size:11px;color:var(--gray-500);margin-top:10px">
+          To enable in-app sending: add <b>Access-Control-Allow-Origin: *</b> to your Cloud Function HTTP response headers, then redeploy.
+        </div>
+      </div>`;
+  };
+
   try {
     const idToken = await window._auth?.currentUser?.getIdToken(true).catch(()=>'') || '';
 
-    const controller = new AbortController();
-    const tId = setTimeout(() => controller.abort(), 20000);
+    // expenseAlertTrigger is a Cloud Scheduler HTTP target.
+    // Try multiple payload shapes — Cloud Scheduler sends empty body or JSON with schedulerType.
+    // We also send our custom fields so the function can use them if it supports test mode.
+    const payloads = [
+      { schedulerType: type, to: toEmail, testMode: true, idToken },   // preferred
+      { type, to: toEmail, idToken },                                   // alternate
+      {},                                                               // bare trigger
+    ];
 
-    let res;
-    try {
-      res = await fetch(notifUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'trigger', type, to: toEmail, idToken }),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(tId);
+    let lastErr = null;
+    let succeeded = false;
+
+    for (const payload of payloads) {
+      const controller = new AbortController();
+      const tId = setTimeout(() => controller.abort(), 20000);
+      try {
+        const res = await fetch(notifUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {}),
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        clearTimeout(tId);
+
+        const contentType = res.headers.get('content-type') || '';
+        let data = {};
+        try { data = contentType.includes('json') ? await res.json() : { _text: await res.text() }; } catch(_) {}
+
+        if (res.ok) {
+          // HTTP 200 — treat as success regardless of body
+          if (el) el.innerHTML = `<div class="alert alert-success">✅ ${labelMap[type]} triggered! Check <b>${toEmail}</b> inbox in 1–2 minutes.<br><div style="font-size:11px;margin-top:4px;opacity:.8">Function responded: HTTP ${res.status}</div></div>`;
+          showToast(`${labelMap[type]} email triggered!`, 'success');
+          addAudit(`Test ${labelMap[type]} Email Sent`, '', toEmail);
+          succeeded = true;
+          break;
+        } else {
+          lastErr = data.error || data.message || data._text?.slice(0,120) || `HTTP ${res.status}`;
+        }
+      } catch(e) {
+        clearTimeout(tId);
+        lastErr = e;
+        // CORS or network error — no point retrying other payloads
+        if (e.name === 'AbortError' || e.message === 'Failed to fetch' || e.message.includes('net::')) break;
+      }
     }
 
-    // Handle non-JSON responses (e.g. HTML error page from GCP)
-    const contentType = res.headers.get('content-type') || '';
-    let data = {};
-    try {
-      data = contentType.includes('json') ? await res.json() : { raw: await res.text() };
-    } catch(_) { data = {}; }
-
-    if (res.ok && (data.success || data.ok || data.action === 'triggered' || res.status === 200)) {
-      if (el) el.innerHTML = `<div class="alert alert-success">✅ ${labelMap[type]} email sent! Check <b>${toEmail}</b> inbox in 1–2 minutes.</div>`;
-      showToast(`${labelMap[type]} email sent!`, 'success');
-      addAudit(`Test ${labelMap[type]} Email Sent`,'',toEmail);
-    } else {
-      const errMsg = data.error || data.message || (data.raw ? data.raw.slice(0,120) : '') || `HTTP ${res.status}`;
-      throw new Error(errMsg);
+    if (!succeeded) {
+      const isCors = typeof lastErr === 'object' && (lastErr?.name === 'AbortError' || lastErr?.message === 'Failed to fetch' || lastErr?.message?.includes('net::') || lastErr?.message?.includes('CORS'));
+      if (isCors) {
+        showFallback(
+          '🔒 CORS blocked — browser cannot directly call this Cloud Function.',
+          `The function at <code style="font-size:11px">${notifUrl}</code> is working but rejects browser requests.<br>Use the options below to trigger it, or add CORS headers to the function.`
+        );
+      } else {
+        const msg = typeof lastErr === 'string' ? lastErr : lastErr?.message || 'Unknown error';
+        if (el) el.innerHTML = `<div class="alert alert-danger">❌ ${labelMap[type]} failed: ${msg}<br><div style="font-size:11px;margin-top:6px">URL: ${notifUrl}</div></div>
+          <div style="margin-top:10px">${el.innerHTML.includes('gcloud') ? '' : `<div style="font-size:12px;margin-bottom:6px;font-weight:600">▶ Try via Cloud Shell instead:</div>
+          <div style="background:#0f1724;border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:8px">
+            <code style="color:#60a5fa;font-size:11px;word-break:break-all">${cmd}</code>
+            <button onclick="navigator.clipboard.writeText('${cmd.replace(/'/g,"\\'")}');showToast('Copied!')" style="flex-shrink:0;background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">📋 Copy</button>
+          </div>`}</div>`;
+      }
+      showToast('Email trigger failed', 'error');
     }
 
   } catch(e) {
-    const isCors = e.message === 'Failed to fetch' || e.message.includes('CORS') || e.message.includes('NetworkError') || e.message.includes('net::');
-    const isTimeout = e.name === 'AbortError';
-
-    const jobMap = {
-      daily:   'firebase-schedule-dailyCriticalAlerts-asia-south1',
-      weekly:  'firebase-schedule-weeklySummaryReport-asia-south1',
-      invoice: 'firebase-schedule-missingInvoiceReminder-asia-south1',
-    };
-    const cmd = `gcloud scheduler jobs run ${jobMap[type]} --location=asia-south1 --project=skr-mom`;
-
-    if (isCors || isTimeout) {
-      // CORS/timeout — Cloud Function is up but browser can't call it directly.
-      // Show both: gcloud command + direct Cloud Console link
-      if (el) el.innerHTML = `
-        <div class="alert alert-warning">
-          <div style="font-weight:600;margin-bottom:8px">
-            ${isTimeout ? '⏱️ Request timed out.' : '🔒 CORS blocked — the browser cannot directly call the Cloud Function.'}
-          </div>
-          <div style="font-size:12px;margin-bottom:10px">
-            The function is configured at <code style="font-size:11px">${notifUrl}</code>.<br>
-            Use one of these methods to trigger it instead:
-          </div>
-          <div style="font-weight:600;font-size:12px;margin-bottom:6px">Option 1 — Cloud Shell command:</div>
-          <div style="background:#0f1724;border-radius:6px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:8px">
-            <code style="color:#60a5fa;font-size:11px;word-break:break-all">${cmd}</code>
-            <button onclick="navigator.clipboard.writeText('${cmd}');showToast('Copied!')" style="flex-shrink:0;background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">📋 Copy</button>
-          </div>
-          <div style="font-weight:600;font-size:12px;margin-bottom:6px">Option 2 — Run directly in GCP Console:</div>
-          <a href="https://console.cloud.google.com/cloudscheduler?project=skr-mom" target="_blank" class="btn btn-secondary btn-sm" style="margin-bottom:10px">🔗 Open Cloud Scheduler</a>
-          <div style="font-size:11px;color:var(--gray-500);margin-top:6px">
-            To fix CORS permanently, add <b>AllowOrigin: *</b> (or your domain) in the Cloud Function HTTP headers and redeploy.
-          </div>
-        </div>`;
-    } else {
-      if (el) el.innerHTML = `<div class="alert alert-danger">❌ ${labelMap[type]} failed: ${e.message}<br><div style="font-size:11px;margin-top:6px">Function URL: ${notifUrl}</div></div>`;
-    }
+    showFallback('⚠️ Unexpected error: ' + e.message);
     showToast('Email trigger failed', 'error');
   } finally {
     if (btn) {
