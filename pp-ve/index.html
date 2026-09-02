@@ -593,6 +593,8 @@ async function fsSaveEmissionFactors(factors) {
 }
 
 // ── USER CRUD (Firestore profile + Firebase Auth) ─────────────────
+// VEMS uses its own 'vems_users' collection to avoid conflicts with
+// other apps (PlantVisit, Legal etc.) that share the same Firebase project.
 async function fsLoadUsers() {
   try {
     const snap = await getDocs(collection(db,'vems_users'));
@@ -602,14 +604,16 @@ async function fsLoadUsers() {
   } catch(e) { console.error('Load users:', e); S.users = []; }
 }
 
-// Creates a user via Firebase Auth REST API then saves to Firestore.
+// Creates a user via Firebase Auth REST API then saves to Firestore vems_users.
+// If email already exists in Firebase Auth (shared with other apps),
+// we skip Auth creation and just add/update the vems_users Firestore record.
 async function fsInviteUser(email, displayName, plantId, password) {
   const apiKey = firebaseConfig.apiKey;
+  let newUid = null;
 
-  // Step 1: Create Firebase Auth user via REST API with 15s timeout
+  // Step 1: Try to create Firebase Auth user via REST API
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000);
-
   let signUpRes, signUpData;
   try {
     signUpRes = await fetch(
@@ -631,41 +635,79 @@ async function fsInviteUser(email, displayName, plantId, password) {
 
   if (!signUpRes.ok) {
     const errCode = signUpData?.error?.message || 'UNKNOWN_ERROR';
-    if (errCode === 'EMAIL_EXISTS') throw new Error('This email is already registered in Firebase Auth.');
-    if (errCode.includes('WEAK_PASSWORD')) throw new Error('Password must be at least 6 characters.');
-    if (errCode === 'INVALID_EMAIL') throw new Error('Invalid email address format.');
-    if (errCode === 'TOO_MANY_ATTEMPTS_TRY_LATER') throw new Error('Too many attempts. Please wait a few minutes and try again.');
-    if (errCode === 'OPERATION_NOT_ALLOWED') throw new Error('Email/Password sign-in is disabled in Firebase Console. Enable it under Authentication → Sign-in Methods.');
-    throw new Error(errCode.replace(/_/g,' ').toLowerCase());
+    if (errCode === 'EMAIL_EXISTS') {
+      // User already exists in Firebase Auth (possibly from another app).
+      // Look up their UID from vems_users or fetch via lookup API.
+      console.warn('[fsInviteUser] EMAIL_EXISTS — user exists in Auth, adding to vems_users only.');
+      // Try to find existing uid in vems_users
+      const existing = S.users.find(u => u.email === email);
+      if (existing) throw new Error(`${email} is already a VEMS user.`);
+      // Fetch UID via sign-in (using the provided password)
+      try {
+        const lookupRes = await fetch(
+          `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password, returnSecureToken: true }),
+          }
+        );
+        const lookupData = await lookupRes.json();
+        if (lookupRes.ok && lookupData.localId) {
+          newUid = lookupData.localId;
+          console.log('[fsInviteUser] Got UID from sign-in:', newUid);
+        } else {
+          // Cannot get UID — use email as doc ID fallback
+          newUid = email.replace(/[^a-zA-Z0-9]/g, '_');
+          console.warn('[fsInviteUser] Could not sign in to get UID, using email-based ID');
+        }
+      } catch(_) {
+        newUid = email.replace(/[^a-zA-Z0-9]/g, '_');
+      }
+    } else if (errCode.includes('WEAK_PASSWORD')) {
+      throw new Error('Password must be at least 6 characters.');
+    } else if (errCode === 'INVALID_EMAIL') {
+      throw new Error('Invalid email address format.');
+    } else if (errCode === 'TOO_MANY_ATTEMPTS_TRY_LATER') {
+      throw new Error('Too many attempts. Please wait a few minutes and try again.');
+    } else if (errCode === 'OPERATION_NOT_ALLOWED') {
+      throw new Error('Email/Password sign-in is disabled in Firebase Console. Enable it under Authentication → Sign-in Methods.');
+    } else {
+      throw new Error(errCode.replace(/_/g,' ').toLowerCase());
+    }
+  } else {
+    newUid = signUpData.localId;
+    if (!newUid) throw new Error('Firebase did not return a user ID.');
   }
-  const newUid = signUpData.localId;
-  if (!newUid) throw new Error('Firebase did not return a user ID. Ensure Email/Password is enabled in Firebase Console → Authentication → Sign-in Methods.');
 
-  // Step 2: Write Firestore profile
+  // Step 2: Write to vems_users collection (separate from other apps)
   const profile = {
     email, displayName, plantId,
     role: 'plant_admin', status: 'Active',
+    app: 'vems',
     createdAt: serverTimestamp(), createdBy: S.user?.email,
   };
   try {
-    await setDoc(doc(db,'vems_users', newUid), profile);
+    await setDoc(doc(db, 'vems_users', newUid), profile);
   } catch(e) {
-    throw new Error('User created in Auth but Firestore write failed: ' + e.message + '. Contact admin to fix manually.');
+    throw new Error('User created in Auth but Firestore write failed: ' + e.message);
   }
   S.users.push({ uid: newUid, ...profile, createdAt: new Date() });
 
-  // Step 3: Send styled welcome email via VEMS cloud function
+  // Step 3: Send styled HTML welcome email via VEMS cloud function
+  // Falls back to Firebase plain-text reset email if cloud function not configured
   try {
     await sendVemsWelcomeEmail(email, displayName);
   } catch(e) {
     console.warn('[fsInviteUser] Welcome email failed:', e.message);
   }
 
-  addAudit('User Created','', `${displayName} (${email}) → ${plantName(plantId)}`);
+  addAudit('User Created', '', `${displayName} (${email}) → ${plantName(plantId)}`);
 }
 
 // Send styled HTML welcome email via VEMS cloud function.
-// Cloud function uses Admin SDK to generate reset link + sends branded HTML email.
+// Cloud function generates reset link via Admin SDK + sends branded HTML email.
+// Browser just sends: email + displayName — no HTML built here.
 async function sendVemsWelcomeEmail(email, displayName) {
   const cfg    = S.notifConfig || {};
   const url    = (cfg.notifFunctionUrl || '').trim().replace(/\/$/, '');
@@ -683,7 +725,7 @@ async function sendVemsWelcomeEmail(email, displayName) {
   } else {
     // Fallback — Firebase plain text reset email
     await sendPasswordResetEmail(auth, email);
-    console.warn('[sendVemsWelcomeEmail] Fallback: Firebase reset email. Save URL+Secret in Superadmin Panel first.');
+    console.log('[sendVemsWelcomeEmail] Fallback: Firebase reset email sent to', email);
   }
 }
 
@@ -698,12 +740,15 @@ window.resetUserPassword = async function(email, displayName='') {
   try {
     await sendVemsWelcomeEmail(email, displayName || email.split('@')[0]);
     showToast(`Password reset email sent to ${email}`, 'success');
-    addAudit('Password Reset Sent','', email);
+    addAudit('Password Reset Sent', '', email);
   } catch(e) {
+    // Final fallback
     try {
       await sendPasswordResetEmail(auth, email);
       showToast(`Password reset email sent to ${email}`, 'success');
-    } catch(e2) { showToast('Error: '+e2.message, 'error'); }
+    } catch(e2) {
+      showToast('Error: ' + e2.message, 'error');
+    }
   }
 };
 
@@ -719,7 +764,7 @@ window.toggleUserStatus = async function(uid, currentStatus) {
 window.deleteUser = async function(uid, name) {
   if (!confirm(`Delete user "${name}"?\n\nThis removes their profile from Firestore. Their Firebase Authentication account remains but they will lose app access immediately.\n\nThis cannot be undone.`)) return;
   try {
-    await deleteDoc(doc(db,'vems_users', uid));
+    await deleteDoc(doc(db, 'vems_users', uid));
     S.users = S.users.filter(u => u.uid !== uid);
     addAudit('User Deleted', name, '');
     showToast(`User "${name}" deleted.`, 'warning');
@@ -741,7 +786,7 @@ window.showUserModal = function(uid='') {
         <button onclick="closeModal()">✕</button>
       </div>
       <div class="modal-body">
-        ${!isEdit ? `<div class="alert alert-info mb-4">📧 Firebase will send a welcome/setup email. The user sets their own password.</div>` : ''}
+        ${!isEdit ? `<div class="alert alert-info mb-4">📧 A password reset email will be sent to the user with a <b>"Click to set your password"</b> link. They use that to set their own password and log in.</div>` : ''}
         <div class="form-grid">
           <div class="form-group form-full">
             <label class="form-label">Full Name <span class="req">*</span></label>
@@ -2456,7 +2501,7 @@ window.saveAllSuperadminSettings = async function() {
     notifFunctionUrl:      form.notifFunctionUrl,
     vemsSecret:            form.vemsSecret,
   };
-  // Persist to localStorage so URL+secret survive page reloads
+  // Persist to localStorage — survives page reloads
   localStorage.setItem('vems_notif_config', JSON.stringify(S.notifConfig));
   S.orgName = document.getElementById('sa-org')?.value || S.orgName;
   localStorage.setItem('vems_orgname', S.orgName);
@@ -2944,13 +2989,14 @@ window.deleteVehicle = async function(id) {
   } catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
+// ── BULK VEHICLE UPLOAD ───────────────────────────────────────────
 window.showBulkVehicleUpload = function() {
   S.modal = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
     <div class="modal modal-lg">
       <div class="modal-header"><h2>📤 Bulk Upload Vehicles</h2><button onclick="closeModal()">✕</button></div>
       <div class="modal-body">
         <div class="alert alert-info mb-4">
-          Upload a CSV file to add multiple vehicles at once.
+          Upload a CSV to add multiple vehicles at once.
           <a href="#" onclick="downloadVehicleTemplate();return false;" style="color:#1a56a0;font-weight:600;margin-left:8px">⬇ Download Template</a>
         </div>
         <div class="form-group">
@@ -2959,27 +3005,27 @@ window.showBulkVehicleUpload = function() {
             regNo, type, make, model, year, fuel, ownerType, plantCode, driverName, driverContact, status, odometer, insuranceExpiry, pucExpiry
           </div>
           <div style="font-size:11px;color:var(--gray-500);margin-top:6px">
-            • <b>plantCode</b>: must match an existing plant code (e.g. YNR, DEL)<br/>
-            • <b>insuranceExpiry / pucExpiry</b>: format YYYY-MM-DD<br/>
+            • <b>plantCode</b>: must match existing plant code (e.g. YNR)<br/>
+            • <b>insuranceExpiry / pucExpiry</b>: YYYY-MM-DD format<br/>
             • <b>type</b>: Truck / Car / Pickup / Van / Two Wheeler / Three Wheeler / Other<br/>
             • <b>fuel</b>: Diesel / Petrol / CNG / Electric / Hybrid<br/>
             • <b>ownerType</b>: Owned / Leased / Hired<br/>
             • <b>status</b>: Active / Inactive / Under Maintenance
           </div>
         </div>
-        <div class="file-upload-area" onclick="document.getElementById('bulk-vehicle-input').click()" 
-             style="border:2px dashed var(--gray-300);border-radius:10px;padding:32px;text-align:center;cursor:pointer;background:var(--gray-50);transition:border .2s"
+        <div onclick="document.getElementById('bulk-veh-input').click()"
+             style="border:2px dashed var(--gray-300);border-radius:10px;padding:32px;text-align:center;cursor:pointer;background:var(--gray-50)"
              onmouseover="this.style.borderColor='var(--primary)'" onmouseout="this.style.borderColor='var(--gray-300)'">
-          <input type="file" id="bulk-vehicle-input" accept=".csv" style="display:none" onchange="processBulkVehicleCSV(this)"/>
+          <input type="file" id="bulk-veh-input" accept=".csv" style="display:none" onchange="processBulkVehicleCSV(this)"/>
           <div style="font-size:36px;margin-bottom:8px">🚛</div>
           <div style="font-weight:600;color:var(--gray-700)">Click to select CSV file</div>
           <div style="font-size:12px;color:var(--gray-400);margin-top:4px">Only .csv files supported</div>
         </div>
-        <div id="bulk-vehicle-preview" style="margin-top:16px"></div>
+        <div id="bulk-veh-preview" style="margin-top:16px"></div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" id="bulk-vehicle-submit" onclick="submitBulkVehicles()" style="display:none">📤 Upload Vehicles</button>
+        <button class="btn btn-primary" id="bulk-veh-submit" onclick="submitBulkVehicles()" style="display:none">📤 Upload Vehicles</button>
       </div>
     </div>
   </div>`;
@@ -2988,10 +3034,12 @@ window.showBulkVehicleUpload = function() {
 
 window.downloadVehicleTemplate = function() {
   const headers = 'regNo,type,make,model,year,fuel,ownerType,plantCode,driverName,driverContact,status,odometer,insuranceExpiry,pucExpiry';
-  const example = `HR26AB1234,Truck,Tata,Ace,2022,Diesel,Owned,${S.plants[0]?.code||'YNR'},John Doe,9876543210,Active,45000,2025-12-31,2025-06-30`;
-  const blob = new Blob([headers + '\n' + example], { type: 'text/csv' });
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-  a.download = 'vems_vehicle_template.csv'; a.click();
+  const eg = `HR26AB1234,Truck,Tata,Ace,2022,Diesel,Owned,${S.plants[0]?.code||'YNR'},John Doe,9876543210,Active,45000,2025-12-31,2025-06-30`;
+  const blob = new Blob([headers+'\n'+eg], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'vems_vehicle_template.csv';
+  a.click();
 };
 
 let _bulkVehicleRows = [];
@@ -3001,82 +3049,64 @@ window.processBulkVehicleCSV = function(input) {
   if (!file) return;
   const reader = new FileReader();
   reader.onload = function(e) {
-    const lines = e.target.result.split('\n').map(l => l.trim()).filter(Boolean);
+    const lines = e.target.result.split('\n').map(l=>l.trim()).filter(Boolean);
     if (lines.length < 2) {
-      document.getElementById('bulk-vehicle-preview').innerHTML =
-        `<div class="alert alert-danger">CSV is empty or has no data rows.</div>`; return;
+      document.getElementById('bulk-veh-preview').innerHTML = `<div class="alert alert-danger">CSV is empty or has no data rows.</div>`; return;
     }
-    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+    const headers = lines[0].split(',').map(h=>h.trim().toLowerCase());
     const required = ['regno','insuranceexpiry','pucexpiry','plantcode'];
-    const missing = required.filter(r => !headers.includes(r));
+    const missing = required.filter(r=>!headers.includes(r));
     if (missing.length) {
-      document.getElementById('bulk-vehicle-preview').innerHTML =
-        `<div class="alert alert-danger">Missing required columns: <b>${missing.join(', ')}</b></div>`; return;
+      document.getElementById('bulk-veh-preview').innerHTML =
+        `<div class="alert alert-danger">Missing columns: <b>${missing.join(', ')}</b></div>`; return;
     }
-
     _bulkVehicleRows = [];
     const errors = [];
     const col = k => headers.indexOf(k);
-
     for (let i = 1; i < lines.length; i++) {
-      const cells = lines[i].split(',').map(c => c.trim());
-      const regNo = cells[col('regno')] || '';
-      const plantCode = cells[col('plantcode')] || '';
-      const ins = cells[col('insuranceexpiry')] || '';
-      const puc = cells[col('pucexpiry')] || '';
-
+      const cells = lines[i].split(',').map(c=>c.trim());
+      const regNo = cells[col('regno')]||'';
+      const plantCode = cells[col('plantcode')]||'';
+      const ins = cells[col('insuranceexpiry')]||'';
+      const puc = cells[col('pucexpiry')]||'';
       if (!regNo) { errors.push(`Row ${i+1}: Missing regNo`); continue; }
-      const plant = S.plants.find(p => p.code?.toLowerCase() === plantCode.toLowerCase());
-      if (!plant) { errors.push(`Row ${i+1}: Plant code "${plantCode}" not found`); continue; }
+      const plant = S.plants.find(p=>p.code?.toLowerCase()===plantCode.toLowerCase());
+      if (!plant) { errors.push(`Row ${i+1}: Plant "${plantCode}" not found`); continue; }
       if (!/^\d{4}-\d{2}-\d{2}$/.test(ins)) { errors.push(`Row ${i+1}: Invalid insuranceExpiry (use YYYY-MM-DD)`); continue; }
       if (!/^\d{4}-\d{2}-\d{2}$/.test(puc)) { errors.push(`Row ${i+1}: Invalid pucExpiry (use YYYY-MM-DD)`); continue; }
-
       _bulkVehicleRows.push({
-        regNo,
-        type:            cells[col('type')]        || 'Truck',
-        make:            cells[col('make')]        || '',
-        model:           cells[col('model')]       || '',
-        year:            cells[col('year')]        || '',
-        fuel:            cells[col('fuel')]        || 'Diesel',
-        ownerType:       cells[col('ownertype')]   || 'Owned',
-        plantId:         plant.id,
-        driverName:      cells[col('drivername')]  || '',
-        driverContact:   cells[col('drivercontact')]|| '',
-        status:          cells[col('status')]      || 'Active',
-        odometer:        parseInt(cells[col('odometer')]) || 0,
-        insuranceExpiry: ins,
-        pucExpiry:       puc,
+        regNo, plantId: plant.id,
+        type:          cells[col('type')]||'Truck',
+        make:          cells[col('make')]||'',
+        model:         cells[col('model')]||'',
+        year:          cells[col('year')]||'',
+        fuel:          cells[col('fuel')]||'Diesel',
+        ownerType:     cells[col('ownertype')]||'Owned',
+        driverName:    cells[col('drivername')]||'',
+        driverContact: cells[col('drivercontact')]||'',
+        status:        cells[col('status')]||'Active',
+        odometer:      parseInt(cells[col('odometer')])||0,
+        insuranceExpiry: ins, pucExpiry: puc,
       });
     }
-
-    const preview = document.getElementById('bulk-vehicle-preview');
-    const submitBtn = document.getElementById('bulk-vehicle-submit');
-
+    const preview = document.getElementById('bulk-veh-preview');
+    const btn = document.getElementById('bulk-veh-submit');
     let html = '';
-    if (errors.length) {
-      html += `<div class="alert alert-warning mb-4">⚠️ ${errors.length} row(s) skipped:<br/><small>${errors.join('<br/>')}</small></div>`;
-    }
+    if (errors.length) html += `<div class="alert alert-warning mb-4">⚠️ ${errors.length} row(s) skipped:<br/><small>${errors.join('<br/>')}</small></div>`;
     if (_bulkVehicleRows.length) {
       html += `<div class="alert alert-success mb-4">✅ <b>${_bulkVehicleRows.length} vehicle(s)</b> ready to upload.</div>`;
-      html += `<div style="overflow-x:auto;max-height:240px;overflow-y:auto">
+      html += `<div style="overflow-x:auto;max-height:220px;overflow-y:auto">
         <table style="font-size:12px"><thead><tr>
-          <th>Reg No</th><th>Make/Model</th><th>Type</th><th>Fuel</th><th>Plant</th><th>Insurance Expiry</th><th>PUC Expiry</th>
+          <th>Reg No</th><th>Make/Model</th><th>Type</th><th>Plant</th><th>Insurance</th><th>PUC</th>
         </tr></thead><tbody>
-        ${_bulkVehicleRows.map(v => {
-          const plant = S.plants.find(p=>p.id===v.plantId);
-          return `<tr>
-            <td><b>${v.regNo}</b></td>
-            <td>${v.make} ${v.model} ${v.year}</td>
-            <td>${v.type}</td><td>${v.fuel}</td>
-            <td>${plant?.code||'—'}</td>
-            <td>${v.insuranceExpiry}</td>
-            <td>${v.pucExpiry}</td>
-          </tr>`;
+        ${_bulkVehicleRows.map(v=>{
+          const p = S.plants.find(x=>x.id===v.plantId);
+          return `<tr><td><b>${v.regNo}</b></td><td>${v.make} ${v.model} ${v.year}</td><td>${v.type}</td><td>${p?.code||'—'}</td><td>${v.insuranceExpiry}</td><td>${v.pucExpiry}</td></tr>`;
         }).join('')}
         </tbody></table></div>`;
-      if (submitBtn) submitBtn.style.display = '';
+      if (btn) btn.style.display = '';
     } else {
-      if (submitBtn) submitBtn.style.display = 'none';
+      if (btn) btn.style.display = 'none';
     }
     if (preview) preview.innerHTML = html;
   };
@@ -3085,24 +3115,17 @@ window.processBulkVehicleCSV = function(input) {
 
 window.submitBulkVehicles = async function() {
   if (!_bulkVehicleRows.length) return;
-  const btn = document.getElementById('bulk-vehicle-submit');
+  const btn = document.getElementById('bulk-veh-submit');
   if (btn) { btn.disabled = true; btn.textContent = `⏳ Uploading 0/${_bulkVehicleRows.length}…`; }
-
   let success = 0, failed = 0;
   for (let i = 0; i < _bulkVehicleRows.length; i++) {
-    try {
-      await fsAddVehicle(_bulkVehicleRows[i]);
-      success++;
-    } catch(e) {
-      console.error('Bulk vehicle error:', e.message);
-      failed++;
-    }
+    try { await fsAddVehicle(_bulkVehicleRows[i]); success++; }
+    catch(e) { console.error('Bulk vehicle error:', e.message); failed++; }
     if (btn) btn.textContent = `⏳ Uploading ${i+1}/${_bulkVehicleRows.length}…`;
   }
-
   _bulkVehicleRows = [];
   closeModal();
-  showToast(`✅ ${success} vehicle(s) uploaded${failed ? `, ${failed} failed` : ''}!`, success ? 'success' : 'error');
+  showToast(`✅ ${success} vehicle(s) uploaded${failed?`, ${failed} failed`:''}!`, success?'success':'error');
   render();
 };
 
@@ -3337,29 +3360,35 @@ window.showUserModal = function(userId='') {
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" id="modal-create-btn" onclick="saveUserFromModal()">Create User</button>
+        <button class="btn btn-primary" onclick="saveUserFromModal()">Create User</button>
       </div>
     </div>
   </div>`;
   render();
 };
 
+// NOTE: saveUser is defined above (line ~761) using fsInviteUser (REST API).
+// That function uses field IDs: usr-name, usr-email, usr-plant, usr-pass.
+// This modal uses different IDs (u-name etc) — bridge them here.
 window.saveUserFromModal = async function() {
   const name    = document.getElementById('u-name')?.value.trim();
   const email   = document.getElementById('u-email')?.value.trim();
   const plantId = document.getElementById('u-plant')?.value;
   const pw      = document.getElementById('u-pw')?.value;
-  if (!name||!email||!plantId||!pw) return showToast('All fields are required','error');
-  if (pw.length < 6) return showToast('Password must be at least 6 characters','error');
-  const btn = document.getElementById('modal-create-btn');
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ Creating…'; }
+  if (!name || !email || !plantId || !pw) return showToast('All fields are required', 'error');
+  if (pw.length < 6) return showToast('Password must be at least 6 characters', 'error');
+
+  const btn = document.querySelector('#modal-root .btn-primary');
+  if (btn) { btn.textContent = '⏳ Creating…'; btn.disabled = true; }
+
   try {
+    // Uses REST API — does NOT sign out the current superadmin
     await fsInviteUser(email, name, plantId, pw);
     closeModal();
-    showToast(`✅ Plant Admin ${name} created! Welcome email sent.`, 'success');
+    showToast(`✅ Plant Admin ${name} created! Setup email sent to ${email}.`, 'success');
     render();
   } catch(e) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Create User'; }
+    if (btn) { btn.textContent = 'Create User'; btn.disabled = false; }
     showToast('Error: ' + e.message.replace('Firebase: ','').replace(/\(.*\)/,'').trim(), 'error');
   }
 };
