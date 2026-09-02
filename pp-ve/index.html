@@ -592,23 +592,27 @@ async function fsSaveEmissionFactors(factors) {
 }
 
 // ── USER CRUD (Firestore profile + Firebase Auth) ─────────────────
+// VEMS uses its own 'vems_users' collection to avoid conflicts with
+// other apps (PlantVisit, Legal etc.) that share the same Firebase project.
 async function fsLoadUsers() {
   try {
-    const snap = await getDocs(collection(db,'users'));
+    const snap = await getDocs(collection(db,'vems_users'));
     S.users = snap.docs
       .map(d => ({ uid: d.id, ...d.data() }))
       .filter(u => u.email !== SUPERADMIN_EMAIL);
   } catch(e) { console.error('Load users:', e); S.users = []; }
 }
 
-// Creates a user via Firebase Auth REST API then saves to Firestore.
+// Creates a user via Firebase Auth REST API then saves to Firestore vems_users.
+// If email already exists in Firebase Auth (shared with other apps),
+// we skip Auth creation and just add/update the vems_users Firestore record.
 async function fsInviteUser(email, displayName, plantId, password) {
   const apiKey = firebaseConfig.apiKey;
+  let newUid = null;
 
-  // Step 1: Create Firebase Auth user via REST API with 15s timeout
+  // Step 1: Try to create Firebase Auth user via REST API
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000);
-
   let signUpRes, signUpData;
   try {
     signUpRes = await fetch(
@@ -630,42 +634,77 @@ async function fsInviteUser(email, displayName, plantId, password) {
 
   if (!signUpRes.ok) {
     const errCode = signUpData?.error?.message || 'UNKNOWN_ERROR';
-    if (errCode === 'EMAIL_EXISTS') throw new Error('This email is already registered in Firebase Auth.');
-    if (errCode.includes('WEAK_PASSWORD')) throw new Error('Password must be at least 6 characters.');
-    if (errCode === 'INVALID_EMAIL') throw new Error('Invalid email address format.');
-    if (errCode === 'TOO_MANY_ATTEMPTS_TRY_LATER') throw new Error('Too many attempts. Please wait a few minutes and try again.');
-    if (errCode === 'OPERATION_NOT_ALLOWED') throw new Error('Email/Password sign-in is disabled in Firebase Console. Enable it under Authentication → Sign-in Methods.');
-    throw new Error(errCode.replace(/_/g,' ').toLowerCase());
+    if (errCode === 'EMAIL_EXISTS') {
+      // User already exists in Firebase Auth (possibly from another app).
+      // Look up their UID from vems_users or fetch via lookup API.
+      console.warn('[fsInviteUser] EMAIL_EXISTS — user exists in Auth, adding to vems_users only.');
+      // Try to find existing uid in vems_users
+      const existing = S.users.find(u => u.email === email);
+      if (existing) throw new Error(`${email} is already a VEMS user.`);
+      // Fetch UID via sign-in (using the provided password)
+      try {
+        const lookupRes = await fetch(
+          `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password, returnSecureToken: true }),
+          }
+        );
+        const lookupData = await lookupRes.json();
+        if (lookupRes.ok && lookupData.localId) {
+          newUid = lookupData.localId;
+          console.log('[fsInviteUser] Got UID from sign-in:', newUid);
+        } else {
+          // Cannot get UID — use email as doc ID fallback
+          newUid = email.replace(/[^a-zA-Z0-9]/g, '_');
+          console.warn('[fsInviteUser] Could not sign in to get UID, using email-based ID');
+        }
+      } catch(_) {
+        newUid = email.replace(/[^a-zA-Z0-9]/g, '_');
+      }
+    } else if (errCode.includes('WEAK_PASSWORD')) {
+      throw new Error('Password must be at least 6 characters.');
+    } else if (errCode === 'INVALID_EMAIL') {
+      throw new Error('Invalid email address format.');
+    } else if (errCode === 'TOO_MANY_ATTEMPTS_TRY_LATER') {
+      throw new Error('Too many attempts. Please wait a few minutes and try again.');
+    } else if (errCode === 'OPERATION_NOT_ALLOWED') {
+      throw new Error('Email/Password sign-in is disabled in Firebase Console. Enable it under Authentication → Sign-in Methods.');
+    } else {
+      throw new Error(errCode.replace(/_/g,' ').toLowerCase());
+    }
+  } else {
+    newUid = signUpData.localId;
+    if (!newUid) throw new Error('Firebase did not return a user ID.');
   }
-  const newUid = signUpData.localId;
-  if (!newUid) throw new Error('Firebase did not return a user ID. Ensure Email/Password is enabled in Firebase Console → Authentication → Sign-in Methods.');
 
-  // Step 2: Write Firestore profile
+  // Step 2: Write to vems_users collection (separate from other apps)
   const profile = {
     email, displayName, plantId,
     role: 'plant_admin', status: 'Active',
+    app: 'vems',
     createdAt: serverTimestamp(), createdBy: S.user?.email,
   };
   try {
-    await setDoc(doc(db,'users', newUid), profile);
+    await setDoc(doc(db, 'vems_users', newUid), profile);
   } catch(e) {
-    throw new Error('User created in Auth but Firestore write failed: ' + e.message + '. Contact admin to fix manually.');
+    throw new Error('User created in Auth but Firestore write failed: ' + e.message);
   }
   S.users.push({ uid: newUid, ...profile, createdAt: new Date() });
 
-  // Step 3: Send password-reset email so the user can set their own password
+  // Step 3: Send password-reset email
   try {
     await sendPasswordResetEmail(auth, email);
   } catch(e) {
     console.warn('[fsInviteUser] Could not send password reset email:', e.message);
-    // Non-fatal — user record still created
   }
 
-  addAudit('User Created','', `${displayName} (${email}) → ${plantName(plantId)}`);
+  addAudit('User Created', '', `${displayName} (${email}) → ${plantName(plantId)}`);
 }
 
 async function fsUpdateUser(uid, data) {
-  await updateDoc(doc(db,'users', uid), { ...data, updatedAt:serverTimestamp(), updatedBy:S.user?.email });
+  await updateDoc(doc(db,'vems_users', uid), { ...data, updatedAt:serverTimestamp(), updatedBy:S.user?.email });
   const idx = S.users.findIndex(u=>u.uid===uid);
   if (idx>=0) S.users[idx] = { ...S.users[idx], ...data };
   addAudit('User Updated','', data.displayName||uid);
