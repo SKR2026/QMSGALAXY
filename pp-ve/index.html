@@ -1361,6 +1361,7 @@ function vehiclesHTML() {
     <div class="page-header">
       <div><h1 class="page-title">Vehicle Master</h1><p class="page-subtitle">${vehicles.length} vehicles registered</p></div>
       <div class="page-actions">
+        ${isSA()?`<button class="btn btn-secondary" onclick="showBulkVehicleUpload()">📤 Bulk Upload</button>`:''}
         <button class="btn btn-primary" onclick="showVehicleModal()">+ Add Vehicle</button>
       </div>
     </div>
@@ -2943,7 +2944,167 @@ window.deleteVehicle = async function(id) {
   } catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
-window.showExpenseModal = function(vehicleId='', defaultCat='') {
+window.showBulkVehicleUpload = function() {
+  S.modal = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+    <div class="modal modal-lg">
+      <div class="modal-header"><h2>📤 Bulk Upload Vehicles</h2><button onclick="closeModal()">✕</button></div>
+      <div class="modal-body">
+        <div class="alert alert-info mb-4">
+          Upload a CSV file to add multiple vehicles at once.
+          <a href="#" onclick="downloadVehicleTemplate();return false;" style="color:#1a56a0;font-weight:600;margin-left:8px">⬇ Download Template</a>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Required CSV Columns:</label>
+          <div style="background:var(--gray-50);border-radius:8px;padding:10px;font-size:12px;font-family:monospace;overflow-x:auto;line-height:1.8">
+            regNo, type, make, model, year, fuel, ownerType, plantCode, driverName, driverContact, status, odometer, insuranceExpiry, pucExpiry
+          </div>
+          <div style="font-size:11px;color:var(--gray-500);margin-top:6px">
+            • <b>plantCode</b>: must match an existing plant code (e.g. YNR, DEL)<br/>
+            • <b>insuranceExpiry / pucExpiry</b>: format YYYY-MM-DD<br/>
+            • <b>type</b>: Truck / Car / Pickup / Van / Two Wheeler / Three Wheeler / Other<br/>
+            • <b>fuel</b>: Diesel / Petrol / CNG / Electric / Hybrid<br/>
+            • <b>ownerType</b>: Owned / Leased / Hired<br/>
+            • <b>status</b>: Active / Inactive / Under Maintenance
+          </div>
+        </div>
+        <div class="file-upload-area" onclick="document.getElementById('bulk-vehicle-input').click()" 
+             style="border:2px dashed var(--gray-300);border-radius:10px;padding:32px;text-align:center;cursor:pointer;background:var(--gray-50);transition:border .2s"
+             onmouseover="this.style.borderColor='var(--primary)'" onmouseout="this.style.borderColor='var(--gray-300)'">
+          <input type="file" id="bulk-vehicle-input" accept=".csv" style="display:none" onchange="processBulkVehicleCSV(this)"/>
+          <div style="font-size:36px;margin-bottom:8px">🚛</div>
+          <div style="font-weight:600;color:var(--gray-700)">Click to select CSV file</div>
+          <div style="font-size:12px;color:var(--gray-400);margin-top:4px">Only .csv files supported</div>
+        </div>
+        <div id="bulk-vehicle-preview" style="margin-top:16px"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="bulk-vehicle-submit" onclick="submitBulkVehicles()" style="display:none">📤 Upload Vehicles</button>
+      </div>
+    </div>
+  </div>`;
+  render();
+};
+
+window.downloadVehicleTemplate = function() {
+  const headers = 'regNo,type,make,model,year,fuel,ownerType,plantCode,driverName,driverContact,status,odometer,insuranceExpiry,pucExpiry';
+  const example = `HR26AB1234,Truck,Tata,Ace,2022,Diesel,Owned,${S.plants[0]?.code||'YNR'},John Doe,9876543210,Active,45000,2025-12-31,2025-06-30`;
+  const blob = new Blob([headers + '\n' + example], { type: 'text/csv' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'vems_vehicle_template.csv'; a.click();
+};
+
+let _bulkVehicleRows = [];
+
+window.processBulkVehicleCSV = function(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const lines = e.target.result.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) {
+      document.getElementById('bulk-vehicle-preview').innerHTML =
+        `<div class="alert alert-danger">CSV is empty or has no data rows.</div>`; return;
+    }
+    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+    const required = ['regno','insuranceexpiry','pucexpiry','plantcode'];
+    const missing = required.filter(r => !headers.includes(r));
+    if (missing.length) {
+      document.getElementById('bulk-vehicle-preview').innerHTML =
+        `<div class="alert alert-danger">Missing required columns: <b>${missing.join(', ')}</b></div>`; return;
+    }
+
+    _bulkVehicleRows = [];
+    const errors = [];
+    const col = k => headers.indexOf(k);
+
+    for (let i = 1; i < lines.length; i++) {
+      const cells = lines[i].split(',').map(c => c.trim());
+      const regNo = cells[col('regno')] || '';
+      const plantCode = cells[col('plantcode')] || '';
+      const ins = cells[col('insuranceexpiry')] || '';
+      const puc = cells[col('pucexpiry')] || '';
+
+      if (!regNo) { errors.push(`Row ${i+1}: Missing regNo`); continue; }
+      const plant = S.plants.find(p => p.code?.toLowerCase() === plantCode.toLowerCase());
+      if (!plant) { errors.push(`Row ${i+1}: Plant code "${plantCode}" not found`); continue; }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(ins)) { errors.push(`Row ${i+1}: Invalid insuranceExpiry (use YYYY-MM-DD)`); continue; }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(puc)) { errors.push(`Row ${i+1}: Invalid pucExpiry (use YYYY-MM-DD)`); continue; }
+
+      _bulkVehicleRows.push({
+        regNo,
+        type:            cells[col('type')]        || 'Truck',
+        make:            cells[col('make')]        || '',
+        model:           cells[col('model')]       || '',
+        year:            cells[col('year')]        || '',
+        fuel:            cells[col('fuel')]        || 'Diesel',
+        ownerType:       cells[col('ownertype')]   || 'Owned',
+        plantId:         plant.id,
+        driverName:      cells[col('drivername')]  || '',
+        driverContact:   cells[col('drivercontact')]|| '',
+        status:          cells[col('status')]      || 'Active',
+        odometer:        parseInt(cells[col('odometer')]) || 0,
+        insuranceExpiry: ins,
+        pucExpiry:       puc,
+      });
+    }
+
+    const preview = document.getElementById('bulk-vehicle-preview');
+    const submitBtn = document.getElementById('bulk-vehicle-submit');
+
+    let html = '';
+    if (errors.length) {
+      html += `<div class="alert alert-warning mb-4">⚠️ ${errors.length} row(s) skipped:<br/><small>${errors.join('<br/>')}</small></div>`;
+    }
+    if (_bulkVehicleRows.length) {
+      html += `<div class="alert alert-success mb-4">✅ <b>${_bulkVehicleRows.length} vehicle(s)</b> ready to upload.</div>`;
+      html += `<div style="overflow-x:auto;max-height:240px;overflow-y:auto">
+        <table style="font-size:12px"><thead><tr>
+          <th>Reg No</th><th>Make/Model</th><th>Type</th><th>Fuel</th><th>Plant</th><th>Insurance Expiry</th><th>PUC Expiry</th>
+        </tr></thead><tbody>
+        ${_bulkVehicleRows.map(v => {
+          const plant = S.plants.find(p=>p.id===v.plantId);
+          return `<tr>
+            <td><b>${v.regNo}</b></td>
+            <td>${v.make} ${v.model} ${v.year}</td>
+            <td>${v.type}</td><td>${v.fuel}</td>
+            <td>${plant?.code||'—'}</td>
+            <td>${v.insuranceExpiry}</td>
+            <td>${v.pucExpiry}</td>
+          </tr>`;
+        }).join('')}
+        </tbody></table></div>`;
+      if (submitBtn) submitBtn.style.display = '';
+    } else {
+      if (submitBtn) submitBtn.style.display = 'none';
+    }
+    if (preview) preview.innerHTML = html;
+  };
+  reader.readAsText(file);
+};
+
+window.submitBulkVehicles = async function() {
+  if (!_bulkVehicleRows.length) return;
+  const btn = document.getElementById('bulk-vehicle-submit');
+  if (btn) { btn.disabled = true; btn.textContent = `⏳ Uploading 0/${_bulkVehicleRows.length}…`; }
+
+  let success = 0, failed = 0;
+  for (let i = 0; i < _bulkVehicleRows.length; i++) {
+    try {
+      await fsAddVehicle(_bulkVehicleRows[i]);
+      success++;
+    } catch(e) {
+      console.error('Bulk vehicle error:', e.message);
+      failed++;
+    }
+    if (btn) btn.textContent = `⏳ Uploading ${i+1}/${_bulkVehicleRows.length}…`;
+  }
+
+  _bulkVehicleRows = [];
+  closeModal();
+  showToast(`✅ ${success} vehicle(s) uploaded${failed ? `, ${failed} failed` : ''}!`, success ? 'success' : 'error');
+  render();
+};
   const plants = myPlants();
   const vehicles = myVehicles();
   S.modal = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
