@@ -473,6 +473,9 @@ async function loadFirestoreData() {
       if (efDoc.exists()) S.emissionFactors = { ...EMISSION_FACTORS_DEFAULT, ...efDoc.data() };
     } catch {}
 
+    // Load users list (superadmin only)
+    if (isSA()) await fsLoadUsers();
+
     S.dataLoaded = true;
     S.loading = false;
 
@@ -587,6 +590,158 @@ async function fsBulkAddExpenses(expenses) {
 async function fsSaveEmissionFactors(factors) {
   await setDoc(doc(db,'vems_settings','emissionFactors'),{...factors,updatedAt:serverTimestamp(),updatedBy:S.user?.email});
 }
+
+// ── USER CRUD (Firestore profile + Firebase Auth) ─────────────────
+async function fsLoadUsers() {
+  try {
+    const snap = await getDocs(collection(db,'users'));
+    S.users = snap.docs
+      .map(d => ({ uid: d.id, ...d.data() }))
+      .filter(u => u.email !== SUPERADMIN_EMAIL);
+  } catch(e) { console.error('Load users:', e); S.users = []; }
+}
+
+async function fsCreateUser(email, password, displayName, plantId) {
+  // Create Firebase Auth account
+  const cred = await createUserWithEmailAndPassword(auth, email, password);
+  const uid = cred.user.uid;
+  // Store profile in Firestore
+  const profile = { email, displayName, plantId, role:'plant_admin', status:'Active', createdAt:serverTimestamp(), createdBy:S.user?.email };
+  await setDoc(doc(db,'users', uid), profile);
+  S.users.push({ uid, ...profile, createdAt: new Date() });
+  addAudit('User Created','', `${displayName} (${email}) → ${plantName(plantId)}`);
+  // Sign back in as superadmin (createUserWithEmailAndPassword signs in as new user)
+  await signInWithEmailAndPassword(auth, S.user.email, window._saPass || '');
+}
+
+async function fsUpdateUser(uid, data) {
+  await updateDoc(doc(db,'users', uid), { ...data, updatedAt:serverTimestamp(), updatedBy:S.user?.email });
+  const idx = S.users.findIndex(u=>u.uid===uid);
+  if (idx>=0) S.users[idx] = { ...S.users[idx], ...data };
+  addAudit('User Updated','', data.displayName||uid);
+}
+
+window.resetUserPassword = async function(email) {
+  try {
+    await sendPasswordResetEmail(auth, email);
+    showToast(`Password reset email sent to ${email}`, 'success');
+    addAudit('Password Reset Sent','', email);
+  } catch(e) { showToast('Error: '+e.message, 'error'); }
+};
+
+window.toggleUserStatus = async function(uid, currentStatus) {
+  const newStatus = currentStatus === 'Active' ? 'Inactive' : 'Active';
+  try {
+    await fsUpdateUser(uid, { status: newStatus });
+    showToast(`User ${newStatus === 'Active' ? 'activated' : 'deactivated'}`, newStatus==='Active'?'success':'warning');
+    render();
+  } catch(e) { showToast('Error: '+e.message, 'error'); }
+};
+
+window.showUserModal = function(uid='') {
+  const user = uid ? S.users.find(u=>u.uid===uid) : null;
+  const isEdit = !!user;
+  const plants = S.plants;
+
+  S.modal = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>${isEdit ? '✏️ Edit Plant Admin' : '➕ Add Plant Admin'}</h2>
+        <button onclick="closeModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        ${!isEdit ? `<div class="alert alert-info mb-4">👤 A new Firebase Authentication account will be created. The user can log in immediately with the password you set.</div>` : ''}
+        <div class="form-grid">
+          <div class="form-group form-full">
+            <label class="form-label">Full Name <span class="req">*</span></label>
+            <input id="usr-name" class="form-input" placeholder="MNS Plant Admin" value="${user?.displayName||''}"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Email <span class="req">*</span></label>
+            <input id="usr-email" type="email" class="form-input" placeholder="admin.mns@polyplasticsindia.com" value="${user?.email||''}" ${isEdit?'readonly':''}/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Assigned Plant <span class="req">*</span></label>
+            <select id="usr-plant" class="form-select">
+              <option value="">— Select Plant —</option>
+              ${plants.map(p=>`<option value="${p.id}" ${user?.plantId===p.id?'selected':''}>${p.name} (${p.code})</option>`).join('')}
+            </select>
+          </div>
+          ${!isEdit ? `
+          <div class="form-group">
+            <label class="form-label">Temporary Password <span class="req">*</span></label>
+            <input id="usr-pass" type="password" class="form-input" placeholder="Min 8 characters" autocomplete="new-password"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Confirm Password <span class="req">*</span></label>
+            <input id="usr-pass2" type="password" class="form-input" placeholder="Re-enter password" autocomplete="new-password"/>
+          </div>
+          <div class="form-group form-full">
+            <label class="form-label">Your (Superadmin) Password <span class="req">*</span></label>
+            <input id="usr-sa-pass" type="password" class="form-input" placeholder="Enter your password to re-authenticate after creation" autocomplete="current-password"/>
+            <div style="font-size:11px;color:var(--gray-400);margin-top:4px">⚠️ Required to keep you logged in after creating the new user account.</div>
+          </div>
+          ` : ''}
+          <div class="form-group form-full">
+            <label class="form-label">Status</label>
+            <select id="usr-status" class="form-select">
+              <option value="Active" ${!user||user.status==='Active'?'selected':''}>Active</option>
+              <option value="Inactive" ${user?.status==='Inactive'?'selected':''}>Inactive</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveUser('${uid}')">
+          ${isEdit ? '💾 Save Changes' : '🚀 Create User'}
+        </button>
+      </div>
+    </div>
+  </div>`;
+  render();
+};
+
+window.saveUser = async function(uid='') {
+  const isEdit = !!uid;
+  const displayName = document.getElementById('usr-name')?.value.trim();
+  const email = document.getElementById('usr-email')?.value.trim();
+  const plantId = document.getElementById('usr-plant')?.value;
+  const status = document.getElementById('usr-status')?.value || 'Active';
+
+  if (!displayName) return showToast('Name is required', 'error');
+  if (!email) return showToast('Email is required', 'error');
+  if (!plantId) return showToast('Please select an assigned plant', 'error');
+
+  if (!isEdit) {
+    const pass = document.getElementById('usr-pass')?.value;
+    const pass2 = document.getElementById('usr-pass2')?.value;
+    const saPass = document.getElementById('usr-sa-pass')?.value;
+    if (!pass || pass.length < 8) return showToast('Password must be at least 8 characters', 'error');
+    if (pass !== pass2) return showToast('Passwords do not match', 'error');
+    if (!saPass) return showToast('Your password is required to re-authenticate', 'error');
+    window._saPass = saPass;
+
+    const btn = document.querySelector('.modal-footer .btn-primary');
+    if (btn) { btn.textContent = '⏳ Creating…'; btn.disabled = true; }
+    try {
+      await fsCreateUser(email, pass, displayName, plantId);
+      window._saPass = '';
+      showToast(`User ${displayName} created successfully!`, 'success');
+      closeModal(); render();
+    } catch(e) {
+      window._saPass = '';
+      if (btn) { btn.textContent = '🚀 Create User'; btn.disabled = false; }
+      showToast('Error: ' + e.message.replace('Firebase: ','').replace(/\(.*\)/,''), 'error');
+    }
+  } else {
+    try {
+      await fsUpdateUser(uid, { displayName, plantId, status });
+      showToast('User updated!', 'success');
+      closeModal(); render();
+    } catch(e) { showToast('Error: '+e.message, 'error'); }
+  }
+};
 
 // ── MAGIC LINK DETECTION ──────────────────────────────────────────
 async function handleMagicLink() {
@@ -1723,14 +1878,10 @@ function plantsHTML() {
 
 // ── USERS ─────────────────────────────────────────────────────────
 function usersHTML() {
-  const sampleUsers = [
-    { uid:'u1', email:'admin.mns@polyplasticsindia.com', displayName:'MNS Plant Admin', role:'plant_admin', plantId:'plant-a', status:'Active', createdAt:'2026-01-01' },
-    { uid:'u2', email:'admin.pne@polyplasticsindia.com', displayName:'PNE Plant Admin', role:'plant_admin', plantId:'plant-b', status:'Active', createdAt:'2026-01-01' },
-    { uid:'u3', email:'admin.chn@polyplasticsindia.com', displayName:'CHN Plant Admin', role:'plant_admin', plantId:'plant-c', status:'Active', createdAt:'2026-01-01' },
-  ];
+  const users = S.users || [];
   return `<div class="page">
     <div class="page-header">
-      <div><h1 class="page-title">👥 User Management</h1><p class="page-subtitle">Manage Plant Admin accounts</p></div>
+      <div><h1 class="page-title">👥 User Management</h1><p class="page-subtitle">Manage Plant Admin accounts · ${users.length} user${users.length!==1?'s':''}</p></div>
       <button class="btn btn-primary" onclick="showUserModal()">+ Add Plant Admin</button>
     </div>
     <div class="alert alert-info mb-4">ℹ️ Plant Admins can only access their assigned plant data. Superadmin has full access to all plants.</div>
@@ -1747,23 +1898,24 @@ function usersHTML() {
             <td>—</td>
             <td>—</td>
           </tr>
-          ${sampleUsers.map(u=>`<tr>
-            <td><b>${u.displayName}</b></td>
+          ${users.map(u=>`<tr>
+            <td><b>${u.displayName||u.email.split('@')[0]}</b></td>
             <td>${u.email}</td>
-            <td><span class="badge badge-info">Plant Admin</span></td>
-            <td>${plantName(u.plantId)}</td>
-            <td><span class="badge badge-success">${u.status}</span></td>
-            <td>${fmtDate(u.createdAt)}</td>
-            <td>
+            <td><span class="badge badge-info">🏭 Plant Admin</span></td>
+            <td>${plantName(u.plantId)||u.plantId||'—'}</td>
+            <td><span class="badge ${u.status==='Active'?'badge-success':'badge-danger'}">${u.status||'Active'}</span></td>
+            <td>${u.createdAt?fmtDate(u.createdAt.toDate?u.createdAt.toDate():u.createdAt):'—'}</td>
+            <td style="white-space:nowrap">
               <button class="btn btn-ghost btn-xs" onclick="showUserModal('${u.uid}')">✏️ Edit</button>
-              <button class="btn btn-ghost btn-xs text-warning" onclick="showToast('Password reset email sent!','success')">🔑 Reset PW</button>
-              <button class="btn btn-ghost btn-xs text-danger" onclick="showToast('User deactivated','warning')">🚫 Deactivate</button>
+              <button class="btn btn-ghost btn-xs text-warning" onclick="resetUserPassword('${u.email}')">🔑 Reset PW</button>
+              <button class="btn btn-ghost btn-xs text-danger" onclick="toggleUserStatus('${u.uid}','${u.status||'Active'}')">
+                ${u.status==='Inactive'?'✅ Activate':'🚫 Deactivate'}
+              </button>
             </td>
           </tr>`).join('')}
         </tbody>
       </table></div>
     </div>
-    <div class="alert alert-warning mt-4">⚠️ To create actual Firebase Authentication users, use Firebase Console → Authentication → Add User, then assign their plant in Firestore under the <code>users</code> collection.</div>
     <div id="modal-root"></div>
   </div>`;
 }
@@ -1837,8 +1989,8 @@ function superadminHTML() {
 
   return `<div class="page">
     <div class="page-header">
-      <div><h1 class="page-title">🛡️ Superadmin Panel</h1><p class="page-subtitle">System configuration · Gmail notifications · Cloud Scheduler</p></div>
-      <button class="btn btn-primary" onclick="saveAllSuperadminSettings()">💾 Save All Settings</button>
+      <div><h1 class="page-title">🛡️ Superadmin Panel</h1><p class="page-subtitle">System configuration · Gmail notifications · Schedule management</p></div>
+      <button class="btn btn-primary" onclick="saveAllSuperadminSettings()">💾 Save & Apply All Settings</button>
     </div>
     <div class="kpi-grid">
       ${kpi('Total Plants',S.plants.length,'Facilities','#1a56a0','🏭')}
@@ -2000,36 +2152,25 @@ function superadminHTML() {
     <div style="margin-top:16px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
         <div>
-          <div style="font-size:13px;font-weight:600;color:#16a34a">⚡ Apply Schedule Changes Directly</div>
-          <div style="font-size:12px;color:var(--gray-500);margin-top:2px">No Cloud Shell needed — updates scheduler automatically</div>
+          <div style="font-size:13px;font-weight:600;color:#16a34a">⚡ Apply Schedule Changes</div>
+          <div style="font-size:12px;color:var(--gray-500);margin-top:2px">Saves settings and updates Cloud Scheduler automatically — no console needed</div>
         </div>
         <button onclick="saveAndSyncSchedules()" class="btn btn-success" style="font-size:13px;padding:10px 20px">
-          💾 Save & Sync Scheduler
+          💾 Save & Apply Schedules
         </button>
       </div>
       <div id="sync-status" style="margin-top:10px;font-size:12px"></div>
     </div>
-
-    <!-- Fallback Cloud Shell (collapsed) -->
-    <details style="margin-top:8px">
-      <summary style="font-size:12px;color:var(--gray-400);cursor:pointer;padding:4px">🔧 Manual Cloud Shell commands (fallback only)</summary>
-      <div style="background:#0f1724;border-radius:8px;padding:12px;margin-top:6px">
-        <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
-          <button onclick="copyAllScheduleCommands()" style="background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">📋 Copy All</button>
-        </div>
-        <div id="schedule-commands-list">${generateScheduleCommandsHTML(cfg)}</div>
-      </div>
-    </details>
     </div>
 
     <!-- Test Notifications -->
     <div class="card mb-4">
-      <div class="card-title">🧪 Test Notifications</div>
-      <p style="font-size:13px;color:var(--gray-500);margin-bottom:16px">Trigger a notification immediately to test Gmail delivery.</p>
+      <div class="card-title">🧪 Test Email Notifications</div>
+      <p style="font-size:13px;color:var(--gray-500);margin-bottom:16px">Trigger a notification email immediately to verify Gmail delivery. The email will be sent to <b>${cfg.superadminEmail||SUPERADMIN_EMAIL}</b>.</p>
       <div class="flex gap-2 flex-wrap">
-        <button class="btn btn-secondary" onclick="testNotification('daily')">🔔 Test Daily Alert</button>
-        <button class="btn btn-secondary" onclick="testNotification('weekly')">📊 Test Weekly Summary</button>
-        <button class="btn btn-secondary" onclick="testNotification('invoice')">📎 Test Invoice Reminder</button>
+        <button class="btn btn-primary" id="test-btn-daily" onclick="testNotification('daily')">🔔 Send Daily Alert Now</button>
+        <button class="btn btn-secondary" id="test-btn-weekly" onclick="testNotification('weekly')">📊 Send Weekly Summary Now</button>
+        <button class="btn btn-secondary" id="test-btn-invoice" onclick="testNotification('invoice')">📎 Send Invoice Reminder Now</button>
       </div>
       <div id="test-result" style="margin-top:12px"></div>
     </div>
@@ -2067,12 +2208,11 @@ function superadminHTML() {
       </div>
       <div class="card">
         <div class="card-title">🔗 Firebase Console Links</div>
-        ${[['👥 Authentication','https://console.firebase.google.com/project/skr-mom/authentication/users'],
-           ['🗄️ Firestore','https://console.firebase.google.com/project/skr-mom/firestore'],
-           ['📦 Storage','https://console.firebase.google.com/project/skr-mom/storage'],
+        <p style="font-size:12px;color:var(--gray-400);margin-bottom:12px">For advanced debugging only. All routine operations are managed from within this app.</p>
+        ${[['🗄️ Firestore Database','https://console.firebase.google.com/project/skr-mom/firestore'],
+           ['📦 Storage Bucket','https://console.firebase.google.com/project/skr-mom/storage'],
            ['🌐 Hosting','https://console.firebase.google.com/project/skr-mom/hosting'],
-           ['⚡ Functions','https://console.firebase.google.com/project/skr-mom/functions'],
-           ['⏰ Cloud Scheduler','https://console.cloud.google.com/cloudscheduler?project=skr-mom']
+           ['⚡ Cloud Functions','https://console.firebase.google.com/project/skr-mom/functions'],
         ].map(([l,u])=>`<a href="${u}" target="_blank" class="btn btn-secondary w-full mb-4">${l}</a>`).join('')}
       </div>
     </div>
@@ -2111,49 +2251,7 @@ const SCHEDULER_STATE = {
   invoice: S.schedulerCrons?.invoice || '0 9 * * *',
 };
 
-function generateScheduleCommandsHTML(cfg) {
-  const jobs = [
-    { label:'🔔 Daily Critical Alerts',    ist:cfg.dailyTime,          cron:cronFromTime(cfg.dailyTime,'daily'),   enabled:cfg.dailyEnabled,   jobId:'firebase-schedule-dailyCriticalAlerts-asia-south1' },
-    { label:'📊 Weekly Summary Report',    ist:cfg.weeklyTime+' (Mon)', cron:cronFromTime(cfg.weeklyTime,'weekly'),  enabled:cfg.weeklyEnabled,  jobId:'firebase-schedule-weeklySummaryReport-asia-south1' },
-    { label:'📎 Missing Invoice Reminder', ist:cfg.invoiceTime,         cron:cronFromTime(cfg.invoiceTime,'daily'), enabled:cfg.invoiceEnabled, jobId:'firebase-schedule-missingInvoiceReminder-asia-south1' },
-  ];
-  return `<div style="display:flex;flex-direction:column;gap:8px">${jobs.map(j=>{
-    const cmd = j.enabled
-      ? `gcloud scheduler jobs update http ${j.jobId} --schedule="${j.cron}" --time-zone="Asia/Kolkata" --location=asia-south1 --project=skr-mom`
-      : `gcloud scheduler jobs pause ${j.jobId} --location=asia-south1 --project=skr-mom`;
-    return `<div style="background:#1e293b;border-radius:8px;padding:10px 12px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:6px">
-        <span style="color:#e2e8f0;font-size:12px;font-weight:600">${j.label}</span>
-        <div style="display:flex;align-items:center;gap:6px">
-          <span style="background:#0f3460;color:#60a5fa;font-size:11px;padding:2px 8px;border-radius:10px">
-            ⏰ ${j.ist} IST → <b>${j.cron}</b> (Asia/Kolkata)
-          </span>
-          <button onclick="navigator.clipboard.writeText(decodeURIComponent('${encodeURIComponent(cmd)}'));showToast('Copied!')"
-            style="background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;white-space:nowrap">
-            📋 Copy
-          </button>
-        </div>
-      </div>
-      <code style="color:#94a3b8;font-size:10px;word-break:break-all;display:block;line-height:1.5">${cmd}</code>
-    </div>`;
-  }).join('')}</div>`;
-}
-
-window.copyAllScheduleCommands = function() {
-  const cfg = S.notifConfig || {
-    dailyTime:'08:00', weeklyTime:'08:00', invoiceTime:'09:00',
-    dailyEnabled:true, weeklyEnabled:true, invoiceEnabled:true,
-  };
-  const lines = [
-    `# VEMS Cloud Scheduler Sync — run in Cloud Shell (project: skr-mom)`,
-    ``,
-    `gcloud scheduler jobs update http firebase-schedule-dailyCriticalAlerts-asia-south1 --schedule="${cronFromTime(cfg.dailyTime,'daily')}" --time-zone="Asia/Kolkata" --location=asia-south1 --project=skr-mom`,
-    `gcloud scheduler jobs update http firebase-schedule-weeklySummaryReport-asia-south1 --schedule="${cronFromTime(cfg.weeklyTime,'weekly')}" --time-zone="Asia/Kolkata" --location=asia-south1 --project=skr-mom`,
-    `gcloud scheduler jobs update http firebase-schedule-missingInvoiceReminder-asia-south1 --schedule="${cronFromTime(cfg.invoiceTime,'daily')}" --time-zone="Asia/Kolkata" --location=asia-south1 --project=skr-mom`,
-  ].join('\n');
-  navigator.clipboard.writeText(lines);
-  showToast('All 3 commands copied! Paste in Cloud Shell.', 'success');
-};
+// generateScheduleCommandsHTML removed — schedules are now synced directly from the app
 
 window.saveAndSyncSchedules = async function() {
   const statusEl = document.getElementById('sync-status');
@@ -2212,7 +2310,7 @@ window.saveAndSyncSchedules = async function() {
   addAudit('Scheduler Synced', '', jobs.map(j=>`${j.name}:${j.schedule}`).join(' · '));
 };
 
-window.saveAllSuperadminSettings = function() {
+window.saveAllSuperadminSettings = async function() {
   const dailyTime   = document.getElementById('sa-daily-time')?.value   || '08:00';
   const weeklyTime  = document.getElementById('sa-weekly-time')?.value  || '08:00';
   const invoiceTime = document.getElementById('sa-invoice-time')?.value || '09:00';
@@ -2221,31 +2319,25 @@ window.saveAllSuperadminSettings = function() {
   const alertThreshold     = parseInt(document.getElementById('sa-alert-days')?.value)  || 60;
   const highExpenseThreshold = parseInt(document.getElementById('sa-high-exp')?.value)  || 50000;
   const poorMileageThreshold = parseFloat(document.getElementById('sa-poor-mile')?.value) || 5;
-  const dailyEnabled   = document.getElementById('sa-daily-enabled')?.checked;
-  const weeklyEnabled  = document.getElementById('sa-weekly-enabled')?.checked;
-  const invoiceEnabled = document.getElementById('sa-invoice-enabled')?.checked;
+  const dailyEnabled   = document.getElementById('sa-daily-enabled')?.checked ?? true;
+  const weeklyEnabled  = document.getElementById('sa-weekly-enabled')?.checked ?? true;
+  const invoiceEnabled = document.getElementById('sa-invoice-enabled')?.checked ?? true;
 
   S.notifConfig = { gmailUser, superadminEmail, dailyTime, weeklyTime, invoiceTime, alertThreshold, highExpenseThreshold, poorMileageThreshold, dailyEnabled, weeklyEnabled, invoiceEnabled };
   S.orgName = document.getElementById('sa-org')?.value || S.orgName;
   localStorage.setItem('vems_orgname', S.orgName);
 
-  // Store crons derived from IST times
   const dailyCron   = cronFromTime(dailyTime,   'daily');
   const weeklyCron  = cronFromTime(weeklyTime,  'weekly');
   const invoiceCron = cronFromTime(invoiceTime, 'daily');
   S.schedulerCrons = { daily: dailyCron, weekly: weeklyCron, invoice: invoiceCron };
   localStorage.setItem('vems_crons', JSON.stringify(S.schedulerCrons));
 
-  const listEl = document.getElementById('schedule-commands-list');
-  if (listEl) listEl.innerHTML = generateScheduleCommandsHTML(S.notifConfig);
-
   addAudit('Superadmin Settings Updated', '', `Daily: ${dailyTime} IST · Weekly: ${weeklyTime} IST · Invoice: ${invoiceTime} IST`);
-  showToast('Settings saved! Run the Cloud Shell commands below to sync the scheduler.', 'success');
-};
+  showToast('Settings saved! Syncing schedules…', 'success');
 
-window.copyScheduleCommands = function() {
-  const text = document.getElementById('schedule-cmd-text')?.textContent;
-  if (text) { navigator.clipboard.writeText(text); showToast('Commands copied to clipboard!'); }
+  // Auto-sync schedules after saving
+  await saveAndSyncSchedules();
 };
 
 window.testNotification = async function(type) {
@@ -2256,30 +2348,38 @@ window.testNotification = async function(type) {
   };
   const labelMap = { daily:'Daily Alert', weekly:'Weekly Summary', invoice:'Invoice Reminder' };
   const el = document.getElementById('test-result');
-  if (el) el.innerHTML = `<div class="alert alert-info">⏳ Triggering ${labelMap[type]}... please wait</div>`;
+  const btn = document.getElementById(`test-btn-${type}`);
+
+  if (el) el.innerHTML = `<div class="alert alert-info">⏳ Sending ${labelMap[type]} email… please wait a moment.</div>`;
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }
 
   try {
-    // Trigger via updateSchedule function proxy
     const TRIGGER_URL = 'https://updateschedule-pzzfbon7lq-el.a.run.app';
+    const idToken = await window._auth?.currentUser?.getIdToken() || '';
     const res = await fetch(TRIGGER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'trigger', jobName: jobMap[type] }),
+      body: JSON.stringify({ action: 'trigger', jobName: jobMap[type], idToken }),
     });
     const data = await res.json();
     if (data.success || data.action === 'triggered') {
-      if (el) el.innerHTML = `<div class="alert alert-success">✅ ${labelMap[type]} triggered! Check <b>sushil@polyplasticsindia.com</b> inbox in 1-2 minutes.</div>`;
+      const cfg = S.notifConfig || {};
+      const toEmail = cfg.superadminEmail || SUPERADMIN_EMAIL;
+      if (el) el.innerHTML = `<div class="alert alert-success">✅ ${labelMap[type]} email dispatched! Check <b>${toEmail}</b> inbox in 1–2 minutes.</div>`;
       showToast(`${labelMap[type]} email sent!`, 'success');
+      addAudit(`Test ${labelMap[type]} Email Sent`,'',toEmail);
     } else {
-      throw new Error(data.error || 'Unknown error');
+      throw new Error(data.error || 'Trigger returned an unexpected response');
     }
   } catch(e) {
-    // Fallback: show gcloud command
-    const cmd = `gcloud scheduler jobs run ${jobMap[type]} --location=asia-south1 --project=skr-mom`;
-    if (el) el.innerHTML = `<div class="alert alert-warning">⚠️ Direct trigger failed. Run in Cloud Shell:<br/>
-      <code style="background:#0f1724;color:#60a5fa;padding:6px 10px;border-radius:6px;display:block;margin-top:6px;font-size:11px">${cmd}</code>
-      <button class="btn btn-secondary btn-sm mt-2" onclick="navigator.clipboard.writeText('${cmd}');showToast('Copied!')">📋 Copy</button>
-    </div>`;
+    if (el) el.innerHTML = `<div class="alert alert-danger">❌ Could not send ${labelMap[type]} email: ${e.message}.<br/><span style="font-size:12px">Check that the Cloud Function <code>updateschedule</code> is deployed and the scheduler jobs exist in Cloud Scheduler.</span></div>`;
+    showToast('Email trigger failed', 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      const icons = { daily:'🔔 Send Daily Alert Now', weekly:'📊 Send Weekly Summary Now', invoice:'📎 Send Invoice Reminder Now' };
+      btn.textContent = icons[type];
+    }
   }
 };
 
