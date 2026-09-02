@@ -219,41 +219,72 @@ window.fbForumRegister = async function(name, username, email, password){
     if(!uSnap.empty){
       return { success:false, error:"Username already taken. Choose another." };
     }
-    var cred = await createUserWithEmailAndPassword(auth, email, password);
+
+    var uid = null;
+    var emailVerified = false;
+    var verifySent = false;
+    var verifyError = null;
+
+    try {
+      // Try to create new Firebase Auth account
+      var cred = await createUserWithEmailAndPassword(auth, email, password);
+      uid = cred.user.uid;
+      emailVerified = cred.user.emailVerified;
+
+      // Send email verification
+      try{
+        _lastVerifySentAt = Date.now();
+        await sendEmailVerification(cred.user, verifyActionCodeSettings);
+        verifySent = true;
+      }catch(ve){
+        verifyError = ve.message || "Could not send verification email.";
+        console.warn("Verification email failed:", ve.code, ve.message);
+      }
+
+    } catch(authErr) {
+      if(authErr.code === "auth/email-already-in-use") {
+        // Email exists in Auth (possibly from another app in same project).
+        // Sign in with provided password to get their UID and add QMS profile.
+        try {
+          var loginCred = await signInWithEmailAndPassword(auth, email, password);
+          uid = loginCred.user.uid;
+          emailVerified = loginCred.user.emailVerified;
+          verifySent = false;
+          // Check if they already have a QMS forum profile
+          var existingProfile = await getDoc(doc(db,"qms_forum_profiles", uid));
+          if(existingProfile.exists()){
+            return { success:false, error:"This email is already registered in the forum. Please sign in." };
+          }
+          // No QMS profile yet — add one (user from another app joining QMS forum)
+        } catch(loginErr) {
+          // Wrong password for existing account
+          return { success:false, error:"This email is already registered. Please sign in with your existing password." };
+        }
+      } else if(authErr.code === "auth/weak-password") {
+        return { success:false, error:"Password must be at least 6 characters." };
+      } else if(authErr.code === "auth/invalid-email") {
+        return { success:false, error:"Please enter a valid email address." };
+      } else {
+        return { success:false, error: authErr.message || "Registration failed." };
+      }
+    }
+
+    // Save profile to qms_forum_profiles (QMS-specific, isolated from other apps)
     var profile = {
       name: name||"", username: username||"", role:"Member", email: email||"",
       joined: new Date().toLocaleString("en-IN",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})
     };
-    await setDoc(doc(db,"qms_forum_profiles", cred.user.uid), profile);
-
-    // BUG FIX: previously this error was swallowed entirely, so users saw
-    // "check your email" even when the verification email failed to send
-    // (e.g. rate limit). We now surface it via `verifySent`/`verifyError`
-    // so the UI can tell the user what actually happened, and we log it.
-    var verifySent = true, verifyError = null;
-    try{
-      _lastVerifySentAt = Date.now();
-      await sendEmailVerification(cred.user, verifyActionCodeSettings);
-    }catch(e){
-      verifySent = false;
-      verifyError = e.message || "Could not send verification email.";
-      console.warn("Verification email failed to send:", e.code, e.message);
-    }
+    await setDoc(doc(db,"qms_forum_profiles", uid), profile);
 
     fbStatus(true,"Account created");
     return {
       success:true,
       verifySent: verifySent,
       verifyError: verifyError,
-      profile: Object.assign({id:cred.user.uid, emailVerified:cred.user.emailVerified}, profile)
+      profile: Object.assign({id:uid, emailVerified:emailVerified}, profile)
     };
   } catch(e){
-    var map = {
-      "auth/email-already-in-use":"This email is already registered.",
-      "auth/weak-password":"Password must be at least 6 characters.",
-      "auth/invalid-email":"Please enter a valid email address."
-    };
-    return { success:false, error: map[e.code] || e.message || "Registration failed." };
+    return { success:false, error: e.message || "Registration failed." };
   }
 };
 
@@ -374,7 +405,30 @@ window.fbForumUpdateProfileEmail = async function(uid, email){
 };
 
 window.fbDeleteForumProfile = async function(uid){
-  try{ await deleteDoc(doc(db,"qms_forum_profiles",uid)); fbStatus(true,"Profile removed"); }
+  try{
+    // Step 1: Delete Firestore profile
+    await deleteDoc(doc(db,"qms_forum_profiles",uid));
+    fbStatus(true,"Profile removed");
+
+    // Step 2: Delete Firebase Auth account via QMS Cloud Function
+    var sd = window.siteData || {};
+    var fnUrl    = (sd.deleteUserFnUrl    || '').trim().replace(/\/$/, '');
+    var fnSecret = (sd.deleteUserFnSecret || '').trim();
+    if(fnUrl && fnSecret) {
+      try {
+        var r = await fetch(fnUrl + '/api/delete-auth-user', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-internal-secret': fnSecret },
+          body: JSON.stringify({ uid }),
+        });
+        var d = await r.json();
+        if(d.ok) fbStatus(true,"Auth account deleted");
+        else console.warn('[fbDeleteForumProfile] Auth delete failed:', d.error);
+      } catch(e) {
+        console.warn('[fbDeleteForumProfile] Auth delete request failed:', e.message);
+      }
+    }
+  }
   catch(e){ fbStatus(false,"Remove failed"); }
 };
 
