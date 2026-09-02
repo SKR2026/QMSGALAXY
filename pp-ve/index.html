@@ -900,16 +900,433 @@ onAuthStateChanged(auth, async user => {
         const snap = await getDoc(doc(db,'vems_users', user.uid));
         S.userProfile = snap.exists() ? snap.data() : { plantId:'', role:'plant_admin' };
       } catch { S.userProfile = { plantId:'', role:'plant_admin' }; }
+      // Check license for plant admins
+      const licOk = await checkVemsLicense();
+      if (!licOk) return; // lock screen shown inside checkVemsLicense
     }
     S.page = S.isTopMgmt ? 'topmgmt' : 'dashboard';
     S.dataLoaded = false;
-    await loadFirestoreData(); // Load real data from Firestore
+    await loadFirestoreData();
   } else {
     const handled = await handleMagicLink();
     if (!handled) { S.page = 'login'; render(); }
     return;
   }
 });
+
+// ══════════════════════════════════════════════════════════════════
+//  VEMS LICENSE SYSTEM
+//  Keys: vems-XXXX-XXXX-XXXX stored in Firestore vems_licenses collection
+//  Superadmin: can issue/revoke/extend keys
+//  Plant admins: blocked on login if license expired or revoked
+// ══════════════════════════════════════════════════════════════════
+
+// Generate a VEMS license key
+function generateVemsKey() {
+  const ALPHA = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+  const seg = () => { let s=''; for(let i=0;i<4;i++) s+=ALPHA[Math.floor(Math.random()*ALPHA.length)]; return s; };
+  return 'vems-' + seg() + '-' + seg() + '-' + seg();
+}
+
+function fmtLicDate(ts) {
+  if(!ts) return '—';
+  const d = new Date(ts);
+  const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return d.getDate() + ' ' + M[d.getMonth()] + ' ' + d.getFullYear();
+}
+
+function licDaysLeft(expiresAt) {
+  return Math.ceil((expiresAt - Date.now()) / 86400000);
+}
+
+function licStatus(l) {
+  if (l.status === 'revoked') return 'revoked';
+  const d = licDaysLeft(l.expiresAt);
+  if (d < 0)   return 'expired';
+  if (d <= 30) return 'expiring';
+  return 'active';
+}
+
+// Check license — called on every plant admin login
+async function checkVemsLicense() {
+  try {
+    const snap = await getDocs(collection(db, 'vems_licenses'));
+    const licenses = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Find active license
+    const active = licenses.find(l => l.status === 'active' && l.expiresAt > Date.now());
+    if (active) return true;
+    // Find most recent expired/revoked license to show reason
+    const any = licenses.sort((a,b) => (b.issuedAt||0) - (a.issuedAt||0))[0];
+    if (any) {
+      if (any.status === 'revoked') {
+        showVemsLockScreen('License Revoked', 'The VEMS license has been revoked. Contact your administrator.');
+      } else {
+        showVemsLockScreen('License Expired', `VEMS license expired on ${fmtLicDate(any.expiresAt)}. Contact your administrator to renew.`);
+      }
+    } else {
+      showVemsLockScreen('No License', 'No valid VEMS license found. Contact your administrator.');
+    }
+    return false;
+  } catch(e) {
+    console.warn('[License] Check failed — fail-open:', e.message);
+    return true; // fail-open on network error
+  }
+}
+
+function showVemsLockScreen(title, message) {
+  S.page = 'license_lock';
+  document.getElementById('app').innerHTML = `
+    <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;
+                background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);padding:32px">
+      <div style="background:#fff;border-radius:20px;padding:48px 40px;max-width:440px;width:100%;
+                  text-align:center;box-shadow:0 24px 64px rgba(0,0,0,.4)">
+        <div style="font-size:56px;margin-bottom:16px">🔒</div>
+        <div style="font-size:22px;font-weight:700;color:#dc2626;margin-bottom:8px">${title}</div>
+        <div style="font-size:14px;color:#6b7280;line-height:1.7;margin-bottom:32px">${message}</div>
+        <div style="background:#f9fafb;border-radius:10px;padding:16px;margin-bottom:24px;border:1px solid #e5e7eb">
+          <div style="font-size:11px;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Application</div>
+          <div style="font-size:15px;font-weight:700;color:#1a56a0">🚛 VEMS — Vehicle Expense Management System</div>
+          <div style="font-size:12px;color:#9ca3af;margin-top:2px">Polyplastics India Ltd</div>
+        </div>
+        <button onclick="doLogout()" style="width:100%;padding:12px;background:#1a56a0;color:#fff;
+                border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">
+          Sign Out
+        </button>
+      </div>
+    </div>`;
+}
+
+// ── LICENSE PAGE HTML (Superadmin only) ──────────────────────────
+function licenseHTML() {
+  return `<div class="page">
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">🔑 License Management</h1>
+        <p class="page-subtitle">Issue and manage VEMS license keys · vems-XXXX-XXXX-XXXX</p>
+      </div>
+      <button class="btn btn-primary" onclick="showNewLicenseModal()">+ Issue New License</button>
+    </div>
+
+    <!-- KPI cards -->
+    <div class="kpi-grid" id="lic-kpi-grid" style="margin-bottom:20px"></div>
+
+    <!-- License table -->
+    <div class="card">
+      <div class="card-title">
+        All Licenses
+        <button class="btn btn-secondary btn-sm" onclick="loadLicenses()">⟳ Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Key</th><th>Company</th><th>Customer</th><th>Email</th>
+            <th>Issued</th><th>Expires</th><th>Days Left</th><th>Status</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="lic-tbody"><tr><td colspan="9" style="text-align:center;padding:32px;color:var(--gray-400)">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Current license info shown to all roles via Settings -->
+    <div class="card" style="margin-top:0">
+      <div class="card-title">ℹ️ How License Works</div>
+      <div style="font-size:13px;color:var(--gray-600);line-height:1.8">
+        • Keys start with <code style="background:var(--gray-100);padding:2px 6px;border-radius:4px">vems-</code> and are stored in Firestore <code style="background:var(--gray-100);padding:2px 6px;border-radius:4px">vems_licenses</code> collection<br/>
+        • Plant admins are blocked on login if all licenses are expired or revoked<br/>
+        • Superadmin is never blocked — license applies to plant admin accounts only<br/>
+        • Multiple licenses can coexist — at least one active license allows access<br/>
+        • Expiring within 30 days shows a warning badge
+      </div>
+    </div>
+    <div id="lic-modal-root"></div>
+  </div>`;
+}
+
+// Load licenses from Firestore and render
+async function loadLicenses() {
+  const tbody = document.getElementById('lic-tbody');
+  const kpiGrid = document.getElementById('lic-kpi-grid');
+  if(!tbody) return;
+  tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:32px;color:var(--gray-400)">Loading…</td></tr>';
+  try {
+    const snap = await getDocs(collection(db, 'vems_licenses'));
+    const lics = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+                         .sort((a,b) => (b.issuedAt||0) - (a.issuedAt||0));
+
+    // KPIs
+    let active=0, expiring=0, expired=0, revoked=0;
+    lics.forEach(l => {
+      const s = licStatus(l);
+      if(s==='active') active++;
+      else if(s==='expiring'){active++;expiring++;}
+      else if(s==='expired') expired++;
+      else if(s==='revoked') revoked++;
+    });
+    if(kpiGrid) kpiGrid.innerHTML = [
+      {label:'Total',val:lics.length,color:'#1a56a0',icon:'🔑'},
+      {label:'Active',val:active,color:'#16a34a',icon:'✅'},
+      {label:'Expiring Soon',val:expiring,color:'#d97706',icon:'⚠️'},
+      {label:'Expired',val:expired,color:'#dc2626',icon:'❌'},
+      {label:'Revoked',val:revoked,color:'#6b7280',icon:'🚫'},
+    ].map(k=>`<div class="kpi-card" style="--kpi-color:${k.color}">
+      <div class="kpi-label">${k.label}</div>
+      <div class="kpi-value">${k.val}</div>
+      <div class="kpi-icon">${k.icon}</div>
+    </div>`).join('');
+
+    if(!lics.length) {
+      tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:32px;color:var(--gray-400)">No licenses yet. Click "+ Issue New License" to create one.</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = lics.map(l => {
+      const s = licStatus(l);
+      const d = licDaysLeft(l.expiresAt);
+      const statusColor = {active:'#16a34a',expiring:'#d97706',expired:'#dc2626',revoked:'#6b7280'}[s]||'#6b7280';
+      const statusBg    = {active:'#f0fdf4',expiring:'#fffbeb',expired:'#fef2f2',revoked:'#f9fafb'}[s]||'#f9fafb';
+      const daysStr     = s==='expired' ? Math.abs(d)+'d ago' : d+'d';
+      const daysColor   = s==='expired'?'#dc2626':s==='expiring'?'#d97706':'#16a34a';
+      return `<tr>
+        <td>
+          <span style="font-family:monospace;font-size:12px;font-weight:600;color:#1a56a0">${l.id}</span>
+          <button onclick="navigator.clipboard.writeText('${l.id}');showToast('Copied!','success')"
+                  style="margin-left:6px;background:none;border:none;cursor:pointer;color:#9ca3af;font-size:11px">📋</button>
+        </td>
+        <td style="font-weight:600">${l.company||'—'}</td>
+        <td>${l.customer||'—'}</td>
+        <td style="color:var(--gray-500);font-size:12px">${l.email||'—'}</td>
+        <td style="font-size:12px">${fmtLicDate(l.issuedAt)}</td>
+        <td style="font-size:12px">${fmtLicDate(l.expiresAt)}</td>
+        <td><span style="font-size:12px;font-weight:600;color:${daysColor}">${daysStr}</span></td>
+        <td><span style="padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;
+                         color:${statusColor};background:${statusBg};border:1px solid ${statusColor}40">
+          ${s.charAt(0).toUpperCase()+s.slice(1)}</span></td>
+        <td>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-secondary btn-sm" onclick="showEditLicenseModal('${l.id}')">✏️ Edit</button>
+            <button class="btn btn-secondary btn-sm" onclick="extendLicense('${l.id}')" title="+1 Year">+1y</button>
+            <button class="btn btn-sm" style="background:${l.status==='revoked'?'#f0fdf4':'#fef2f2'};color:${l.status==='revoked'?'#16a34a':'#dc2626'};border:1px solid ${l.status==='revoked'?'#bbf7d0':'#fecaca'}"
+                    onclick="toggleRevokeLicense('${l.id}','${l.status||'active'}')">
+              ${l.status==='revoked'?'✅ Reactivate':'🚫 Revoke'}
+            </button>
+            <button class="btn btn-sm" style="background:#fef2f2;color:#dc2626;border:1px solid #fecaca"
+                    onclick="deleteLicense('${l.id}')">🗑</button>
+          </div>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:32px;color:#dc2626">Error: ${e.message}</td></tr>`;
+  }
+}
+
+// Show New License modal
+window.showNewLicenseModal = function() {
+  const key = generateVemsKey();
+  const defExpiry = new Date(Date.now() + 365*86400000).toISOString().slice(0,10);
+  const html = `<div class="modal-overlay" onclick="if(event.target===this)closeLicModal()">
+    <div class="modal modal-lg">
+      <div class="modal-header"><h2>🔑 Issue New License</h2><button onclick="closeLicModal()">✕</button></div>
+      <div class="modal-body">
+        <div class="alert alert-info mb-4">Key auto-generated with <code>vems-</code> prefix. Keys are stored in Firestore <code>vems_licenses</code> collection.</div>
+        <div class="form-grid">
+          <div class="form-group form-full">
+            <label class="form-label">License Key (auto-generated)</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input id="lic-fld-key" class="form-input" value="${key}" readonly
+                     style="font-family:monospace;font-weight:600;color:#1a56a0;background:#f0f9ff"/>
+              <button class="btn btn-secondary btn-sm" onclick="document.getElementById('lic-fld-key').value=generateVemsKey()">🔄 Regen</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Company <span class="req">*</span></label>
+            <input id="lic-fld-company" class="form-input" placeholder="Polyplastics India Ltd"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Customer Name</label>
+            <input id="lic-fld-customer" class="form-input" placeholder="Mr. Sushil Kumar"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Email</label>
+            <input id="lic-fld-email" type="email" class="form-input" placeholder="sushil@polyplasticsindia.com"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Expires On <span class="req">*</span></label>
+            <input id="lic-fld-expiry" type="date" class="form-input" value="${defExpiry}"/>
+          </div>
+          <div class="form-group form-full">
+            <label class="form-label">Notes</label>
+            <textarea id="lic-fld-notes" class="form-textarea" rows="2" placeholder="Annual contract — renewal info…"></textarea>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeLicModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveLicenseModal()">🔑 Issue License</button>
+      </div>
+    </div>
+  </div>`;
+  document.getElementById('lic-modal-root').innerHTML = html;
+};
+
+// Show Edit License modal
+window.showEditLicenseModal = async function(id) {
+  const snap = await getDoc(doc(db, 'vems_licenses', id));
+  if(!snap.exists()) return;
+  const l = snap.data();
+  const expiryDate = new Date(l.expiresAt).toISOString().slice(0,10);
+  const html = `<div class="modal-overlay" onclick="if(event.target===this)closeLicModal()">
+    <div class="modal modal-lg">
+      <div class="modal-header"><h2>✏️ Edit License</h2><button onclick="closeLicModal()">✕</button></div>
+      <div class="modal-body">
+        <div class="form-grid">
+          <div class="form-group form-full">
+            <label class="form-label">License Key</label>
+            <input class="form-input" value="${id}" readonly style="font-family:monospace;font-weight:600;color:#1a56a0;background:#f0f9ff"/>
+            <input type="hidden" id="lic-edit-id" value="${id}"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Company <span class="req">*</span></label>
+            <input id="lic-fld-company" class="form-input" value="${l.company||''}"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Customer Name</label>
+            <input id="lic-fld-customer" class="form-input" value="${l.customer||''}"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Email</label>
+            <input id="lic-fld-email" type="email" class="form-input" value="${l.email||''}"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Expires On <span class="req">*</span></label>
+            <input id="lic-fld-expiry" type="date" class="form-input" value="${expiryDate}"/>
+          </div>
+          <div class="form-group form-full">
+            <label class="form-label">Notes</label>
+            <textarea id="lic-fld-notes" class="form-textarea" rows="2">${l.notes||''}</textarea>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeLicModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="updateLicenseModal()">💾 Save Changes</button>
+      </div>
+    </div>
+  </div>`;
+  document.getElementById('lic-modal-root').innerHTML = html;
+};
+
+function closeLicModal() {
+  const el = document.getElementById('lic-modal-root');
+  if(el) el.innerHTML = '';
+}
+
+window.saveLicenseModal = async function() {
+  const key     = document.getElementById('lic-fld-key').value.trim();
+  const company = document.getElementById('lic-fld-company').value.trim();
+  const customer= document.getElementById('lic-fld-customer').value.trim();
+  const email   = document.getElementById('lic-fld-email').value.trim();
+  const expiry  = document.getElementById('lic-fld-expiry').value;
+  const notes   = document.getElementById('lic-fld-notes').value.trim();
+  if(!company) { showToast('Company name is required','error'); return; }
+  if(!expiry)  { showToast('Expiry date is required','error'); return; }
+  const [y,m,d] = expiry.split('-').map(Number);
+  const expiresAt = new Date(y,m-1,d,23,59,59,999).getTime();
+  try {
+    await setDoc(doc(db,'vems_licenses', key), {
+      key, company, customer, email, notes,
+      issuedAt: Date.now(), expiresAt,
+      status: 'active',
+      issuedBy: S.user?.email,
+    });
+    showToast(`✅ License ${key} issued for ${company}`, 'success');
+    addAudit('License Issued', key, `${company} · Expires ${fmtLicDate(expiresAt)}`);
+    closeLicModal();
+    loadLicenses();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
+};
+
+window.updateLicenseModal = async function() {
+  const id      = document.getElementById('lic-edit-id').value;
+  const company = document.getElementById('lic-fld-company').value.trim();
+  const customer= document.getElementById('lic-fld-customer').value.trim();
+  const email   = document.getElementById('lic-fld-email').value.trim();
+  const expiry  = document.getElementById('lic-fld-expiry').value;
+  const notes   = document.getElementById('lic-fld-notes').value.trim();
+  if(!company) { showToast('Company name is required','error'); return; }
+  const [y,m,d] = expiry.split('-').map(Number);
+  const expiresAt = new Date(y,m-1,d,23,59,59,999).getTime();
+  try {
+    await updateDoc(doc(db,'vems_licenses', id), { company, customer, email, notes, expiresAt, updatedAt: Date.now(), updatedBy: S.user?.email });
+    showToast('License updated!', 'success');
+    addAudit('License Updated', id, company);
+    closeLicModal();
+    loadLicenses();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
+};
+
+window.extendLicense = async function(id) {
+  if(!confirm(`Extend license ${id} by 1 year?`)) return;
+  try {
+    const snap = await getDoc(doc(db,'vems_licenses', id));
+    if(!snap.exists()) return;
+    const current = snap.data().expiresAt || Date.now();
+    const newExpiry = current + 365*86400000;
+    await updateDoc(doc(db,'vems_licenses', id), { expiresAt: newExpiry, updatedAt: Date.now(), updatedBy: S.user?.email });
+    showToast(`✅ Extended to ${fmtLicDate(newExpiry)}`, 'success');
+    addAudit('License Extended +1y', id, fmtLicDate(newExpiry));
+    loadLicenses();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
+};
+
+window.toggleRevokeLicense = async function(id, currentStatus) {
+  const revoke = currentStatus !== 'revoked';
+  if(!confirm(`${revoke?'Revoke':'Reactivate'} license ${id}?`)) return;
+  try {
+    await updateDoc(doc(db,'vems_licenses', id), { status: revoke?'revoked':'active', updatedAt: Date.now(), updatedBy: S.user?.email });
+    showToast(revoke?'License revoked':'License reactivated', revoke?'warning':'success');
+    addAudit(revoke?'License Revoked':'License Reactivated', id, '');
+    loadLicenses();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
+};
+
+window.deleteLicense = async function(id) {
+  if(!confirm(`Permanently delete license ${id}? This cannot be undone.`)) return;
+  try {
+    await deleteDoc(doc(db,'vems_licenses', id));
+    showToast('License deleted', 'warning');
+    addAudit('License Deleted', id, '');
+    loadLicenses();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
+};
+
+// Update license status shown in sidebar for all users
+async function updateSidebarLicenseStatus() {
+  const el = document.getElementById('sidebar-lic-status');
+  if(!el) return;
+  try {
+    const snap = await getDocs(collection(db, 'vems_licenses'));
+    const lics = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if(!lics.length) {
+      el.innerHTML = `<span style="color:#dc2626">🔑 No license</span>`;
+      return;
+    }
+    const active = lics.find(l => l.status==='active' && l.expiresAt > Date.now());
+    if(active) {
+      const d = licDaysLeft(active.expiresAt);
+      const color = d <= 30 ? '#d97706' : '#16a34a';
+      const icon  = d <= 30 ? '⚠️' : '✅';
+      el.innerHTML = `<span style="color:${color}">${icon} Licensed · ${d}d left</span><br/>
+        <span style="font-size:10px;color:#475569;font-family:monospace">${active.id}</span>`;
+    } else {
+      const exp = lics.sort((a,b)=>b.expiresAt-a.expiresAt)[0];
+      el.innerHTML = `<span style="color:#dc2626">❌ License expired</span><br/>
+        <span style="font-size:10px;color:#475569">${fmtLicDate(exp?.expiresAt)}</span>`;
+    }
+  } catch(e) {
+    el.innerHTML = `<span style="color:#64748b">🔑 License unknown</span>`;
+  }
+}
 
 async function doLogin(email, pw) {
   try {
@@ -1079,6 +1496,8 @@ function render() {
   if (S.page==='dashboard') setTimeout(initCharts, 50);
   if (S.page==='co2') setTimeout(initCO2Charts, 50);
   if (S.page==='reports') setTimeout(initReportCharts, 50);
+  if (S.page==='license') setTimeout(loadLicenses, 50);
+  setTimeout(updateSidebarLicenseStatus, 100);
 }
 
 // ── LOGIN ─────────────────────────────────────────────────────────
@@ -1154,7 +1573,7 @@ function sidebarHTML() {
     ]},
     { section:'Admin', items:[
       {id:'plants',label:'Plants',icon:'🏭'},
-      ...(isSA()?[{id:'users',label:'User Management',icon:'👥'},{id:'emfactors',label:'Emission Factors',icon:'⚗️'},{id:'audit',label:'Audit Trail',icon:'📋'},{id:'superadmin',label:'Superadmin Panel',icon:'🛡️'}]:[]),
+      ...(isSA()?[{id:'users',label:'User Management',icon:'👥'},{id:'emfactors',label:'Emission Factors',icon:'⚗️'},{id:'audit',label:'Audit Trail',icon:'📋'},{id:'license',label:'License',icon:'🔑'},{id:'superadmin',label:'Superadmin Panel',icon:'🛡️'}]:[]),
     ]},
   ];
   return `<nav class="sidebar" id="sidebar">
@@ -1177,7 +1596,12 @@ function sidebarHTML() {
         <span>${item.icon}</span>${item.label}${item.badge?`<span class="nav-badge">${item.badge}</span>`:''}
       </button>`).join('')}
     </div>`).join('')}
-    <div class="sidebar-footer"><button class="nav-item" onclick="doLogout()" style="color:#ef4444">🚪 Sign Out</button></div>
+    <div class="sidebar-footer">
+      <div id="sidebar-lic-status" style="padding:8px 10px;margin-bottom:4px;font-size:11px;color:#64748b;border-top:1px solid rgba(255,255,255,.06);padding-top:10px">
+        🔑 Loading license…
+      </div>
+      <button class="nav-item" onclick="doLogout()" style="color:#ef4444">🚪 Sign Out</button>
+    </div>
   </nav>`;
 }
 
@@ -1198,6 +1622,7 @@ function pageHTML() {
     case 'emfactors':   return isSA()?emFactorsHTML():dashboardHTML();
     case 'audit':       return isSA()?auditHTML():dashboardHTML();
     case 'superadmin':  return isSA()?superadminHTML():dashboardHTML();
+    case 'license':     return isSA()?licenseHTML():dashboardHTML();
     case 'vehicle-detail': return vehicleDetailHTML();
     default:            return dashboardHTML();
   }
@@ -2202,7 +2627,7 @@ function superadminHTML() {
       <div class="card-title">⏰ Cloud Scheduler — Notification Timings
         <a href="https://console.cloud.google.com/cloudscheduler?project=skr-mom" target="_blank" class="btn btn-secondary btn-sm">🔗 View in GCP</a>
       </div>
-      <div class="alert alert-info mb-4">ℹ️ Schedule changes are applied automatically via the VEMS cloud function — updates the existing Firebase scheduler jobs to point to VEMS Cloud Run with IST timezone.</div>
+      <div class="alert alert-info mb-4">ℹ️ Schedule changes are applied automatically via the VEMS cloud function — no Cloud Shell needed. Set <b>VEMS_SCHEDULER_JOB_NAME</b> env var on Cloud Run to enable live cron updates.</div>
 
       <!-- Daily Critical Alerts -->
       <div class="emission-factor-row" style="flex-direction:column;align-items:flex-start;gap:10px">
@@ -2464,8 +2889,8 @@ window.saveAndSyncSchedules = async function() {
 
     if (res.ok && data.ok) {
       const schedMsg = data.schedulerUpdated
-        ? `✅ Settings saved & ${data.jobs?.length || 3} Cloud Scheduler jobs updated with IST timezone!`
-        : `✅ Settings saved to Firestore. ${data.note || 'Scheduler update pending.'}`;
+        ? `✅ Settings saved & ${data.jobs?.length || 3} Cloud Scheduler jobs updated!`
+        : `✅ Settings saved to Firestore. ${data.note || 'Scheduler not updated (set VEMS_SCHEDULER_JOB_NAME env var).'}`;
       if (statusEl) statusEl.innerHTML = `<span style="color:#16a34a">${schedMsg}</span>`;
       showToast('Settings saved!', 'success');
       addAudit('Superadmin Settings Saved', '', `Daily: ${form.dailyTime} · Weekly: ${form.weeklyTime} · Invoice: ${form.invoiceTime}`);
