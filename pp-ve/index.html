@@ -2449,70 +2449,69 @@ window.testNotification = async function(type) {
   try {
     const idToken = await window._auth?.currentUser?.getIdToken(true).catch(()=>'') || '';
 
-    // expenseAlertTrigger is a Cloud Scheduler HTTP target.
-    // Try multiple payload shapes — Cloud Scheduler sends empty body or JSON with schedulerType.
-    // We also send our custom fields so the function can use them if it supports test mode.
-    const payloads = [
-      { schedulerType: type, to: toEmail, testMode: true, idToken },   // preferred
-      { type, to: toEmail, idToken },                                   // alternate
-      {},                                                               // bare trigger
-    ];
-
-    let lastErr = null;
+    // Single POST attempt — multiple payloads were pointless since CORS blocks before payload is read.
+    // If CORS is the issue, we detect it on the first attempt and immediately show the fallback.
+    const controller = new AbortController();
+    const tId = setTimeout(() => controller.abort(), 20000);
     let succeeded = false;
+    let lastErr = null;
 
-    for (const payload of payloads) {
-      const controller = new AbortController();
-      const tId = setTimeout(() => controller.abort(), 20000);
-      try {
-        const res = await fetch(notifUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {}),
-          },
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-        clearTimeout(tId);
+    try {
+      const res = await fetch(notifUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {}),
+        },
+        body: JSON.stringify({ schedulerType: type, to: toEmail, testMode: true, idToken }),
+        signal: controller.signal,
+      });
+      clearTimeout(tId);
 
-        const contentType = res.headers.get('content-type') || '';
-        let data = {};
-        try { data = contentType.includes('json') ? await res.json() : { _text: await res.text() }; } catch(_) {}
+      const contentType = res.headers.get('content-type') || '';
+      let data = {};
+      try { data = contentType.includes('json') ? await res.json() : { _text: await res.text() }; } catch(_) {}
 
-        if (res.ok) {
-          // HTTP 200 — treat as success regardless of body
-          if (el) el.innerHTML = `<div class="alert alert-success">✅ ${labelMap[type]} triggered! Check <b>${toEmail}</b> inbox in 1–2 minutes.<br><div style="font-size:11px;margin-top:4px;opacity:.8">Function responded: HTTP ${res.status}</div></div>`;
-          showToast(`${labelMap[type]} email triggered!`, 'success');
-          addAudit(`Test ${labelMap[type]} Email Sent`, '', toEmail);
-          succeeded = true;
-          break;
-        } else {
-          lastErr = data.error || data.message || data._text?.slice(0,120) || `HTTP ${res.status}`;
-        }
-      } catch(e) {
-        clearTimeout(tId);
-        lastErr = e;
-        // CORS or network error — no point retrying other payloads
-        if (e.name === 'AbortError' || e.message === 'Failed to fetch' || e.message.includes('net::')) break;
+      if (res.ok) {
+        if (el) el.innerHTML = `<div class="alert alert-success">✅ ${labelMap[type]} triggered! Check <b>${toEmail}</b> inbox in 1–2 minutes.<br><div style="font-size:11px;margin-top:4px;opacity:.8">Function responded: HTTP ${res.status}</div></div>`;
+        showToast(`${labelMap[type]} email triggered!`, 'success');
+        addAudit(`Test ${labelMap[type]} Email Sent`, '', toEmail);
+        succeeded = true;
+      } else {
+        lastErr = data.error || data.message || data._text?.slice(0,120) || `HTTP ${res.status}`;
       }
+    } catch(e) {
+      clearTimeout(tId);
+      lastErr = e;
     }
 
     if (!succeeded) {
-      const isCors = typeof lastErr === 'object' && (lastErr?.name === 'AbortError' || lastErr?.message === 'Failed to fetch' || lastErr?.message?.includes('net::') || lastErr?.message?.includes('CORS'));
+      const isCors = typeof lastErr === 'object' && (
+        lastErr?.name === 'AbortError' ||
+        lastErr?.message === 'Failed to fetch' ||
+        lastErr?.message?.includes('net::') ||
+        lastErr?.message?.includes('CORS')
+      );
       if (isCors) {
         showFallback(
-          '🔒 CORS blocked — browser cannot directly call this Cloud Function.',
-          `The function at <code style="font-size:11px">${notifUrl}</code> is working but rejects browser requests.<br>Use the options below to trigger it, or add CORS headers to the function.`
+          '🔒 CORS not enabled on the Cloud Function — browser calls are blocked.',
+          `Add these lines to <b>expenseAlertTrigger</b> and redeploy:<br>
+          <div style="background:#0f1724;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:11px">
+            <code style="color:#86efac">res.set('Access-Control-Allow-Origin', '*');</code><br>
+            <code style="color:#86efac">res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');</code><br>
+            <code style="color:#86efac">res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');</code><br>
+            <code style="color:#fbbf24">if (req.method === 'OPTIONS') { res.status(204).send(''); return; }</code>
+          </div>
+          Until then, use Cloud Shell to trigger manually:`
         );
       } else {
         const msg = typeof lastErr === 'string' ? lastErr : lastErr?.message || 'Unknown error';
         if (el) el.innerHTML = `<div class="alert alert-danger">❌ ${labelMap[type]} failed: ${msg}<br><div style="font-size:11px;margin-top:6px">URL: ${notifUrl}</div></div>
-          <div style="margin-top:10px">${el.innerHTML.includes('gcloud') ? '' : `<div style="font-size:12px;margin-bottom:6px;font-weight:600">▶ Try via Cloud Shell instead:</div>
+          <div style="margin-top:10px"><div style="font-size:12px;margin-bottom:6px;font-weight:600">▶ Try via Cloud Shell instead:</div>
           <div style="background:#0f1724;border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:8px">
             <code style="color:#60a5fa;font-size:11px;word-break:break-all">${cmd}</code>
             <button onclick="navigator.clipboard.writeText('${cmd.replace(/'/g,"\\'")}');showToast('Copied!')" style="flex-shrink:0;background:#1a56a0;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">📋 Copy</button>
-          </div>`}</div>`;
+          </div></div>`;
       }
       showToast('Email trigger failed', 'error');
     }
