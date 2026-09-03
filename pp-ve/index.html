@@ -243,14 +243,26 @@ tr:hover td{background:#fafbff}
 .divider{border:none;border-top:1px solid var(--gray-200);margin:16px 0}
 
 /* ── PILL FILTER BAR ─────────────────────────────────────────── */
-/* filter pills now inline in page headers */
 .pill{display:inline-flex;align-items:center;gap:4px;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:500;cursor:pointer;border:1.5px solid var(--gray-200);background:#fff;color:var(--gray-600);white-space:nowrap;transition:all .15s;user-select:none;flex-shrink:0}
 .pill:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light)}
 .pill.active{background:var(--primary);color:#fff;border-color:var(--primary);font-weight:600}
 .pill.active-year{background:#0f3460;color:#fff;border-color:#0f3460}
 .pill.active-plant{background:#0ca678;color:#fff;border-color:#0ca678}
-@media(max-width:900px){
-}
+
+/* CY / FY toggle */
+.cy-fy-toggle{display:inline-flex;border-radius:20px;border:1.5px solid var(--gray-200);overflow:hidden;flex-shrink:0;background:#fff}
+.cy-fy-btn{padding:4px 12px;font-size:12px;font-weight:600;cursor:pointer;border:none;background:transparent;color:var(--gray-500);transition:all .15s;letter-spacing:.2px}
+.cy-fy-btn.active{background:#c0392b;color:#fff}
+.cy-fy-btn:not(.active):hover{background:var(--gray-100);color:var(--gray-800)}
+
+/* Unified filter bar */
+.filter-bar-wrap{background:#fff;border:1px solid var(--gray-200);border-radius:var(--radius-lg);padding:8px 12px;display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+.filter-bar-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.filter-divider-v{width:1px;height:18px;background:var(--gray-200);flex-shrink:0;margin:0 2px}
+.filter-bar-label{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;color:var(--gray-400);white-space:nowrap;letter-spacing:.3px;flex-shrink:0}
+.filter-bar-sep{height:1px;background:var(--gray-100);margin:2px 0}
+.export-pdf-btn{display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:500;cursor:pointer;border:1.5px solid var(--gray-200);background:#fff;color:var(--gray-600);transition:all .15s;white-space:nowrap;margin-left:auto}
+.export-pdf-btn:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light)}
 </style>
 </head>
 <body>
@@ -356,7 +368,7 @@ let S = {
   users: [], auditLog: [],
   emissionFactors: {...EMISSION_FACTORS_DEFAULT},
   charts: {}, toast: null,
-  filterPlant: '', filterYear: new Date().getFullYear().toString(), filterMonth: '', filterVehicle: '', filterCat: '',
+  filterMode: 'CY', filterPlant: '', filterYear: new Date().getFullYear().toString(), filterMonth: '', filterVehicle: '', filterCat: '',
   expVehicleSearch: '',
   selectedVehicleId: null, selectedExpenses: new Set(),
   modal: null, loading: false, dataLoaded: false, notifications: [],
@@ -388,12 +400,45 @@ function myVehicles() {
 function myExpenses() {
   return (isSA() || S.isTopMgmt) ? S.expenses : S.expenses.filter(e => e.plantId === myPlantId());
 }
+// Fiscal year helpers: FY runs Apr–Mar, so FY2026 = Apr 2025–Mar 2026
+function fyDateRange(fy) {
+  // fy is a string like '2026' meaning FY ending March 2026
+  const endYear = parseInt(fy);
+  return { start: `${endYear-1}-04-01`, end: `${endYear}-03-31` };
+}
+function inFY(date, fy) {
+  const { start, end } = fyDateRange(fy);
+  return date >= start && date <= end;
+}
+function getFYMonthsWithData(fy, exps) {
+  // FY months: Apr(04)–Mar(03)
+  const FY_MONTHS = [
+    {val:'04',label:'Apr'},{val:'05',label:'May'},{val:'06',label:'Jun'},
+    {val:'07',label:'Jul'},{val:'08',label:'Aug'},{val:'09',label:'Sep'},
+    {val:'10',label:'Oct'},{val:'11',label:'Nov'},{val:'12',label:'Dec'},
+    {val:'01',label:'Jan'},{val:'02',label:'Feb'},{val:'03',label:'Mar'},
+  ];
+  const endYear = parseInt(fy);
+  return FY_MONTHS.filter(m => {
+    const y = parseInt(m.val) >= 4 ? endYear-1 : endYear;
+    return exps.some(e => e.date.startsWith(`${y}-${m.val}`));
+  }).map(m => {
+    const y = parseInt(m.val) >= 4 ? endYear-1 : endYear;
+    return { ...m, yearVal: `${y}-${m.val}` };
+  });
+}
+
 function filteredExpenses() {
   const search = (S.expVehicleSearch||'').toLowerCase().trim();
   return myExpenses().filter(e => {
     if (S.filterPlant && e.plantId !== S.filterPlant) return false;
-    if (S.filterYear && !e.date.startsWith(S.filterYear)) return false;
-    if (S.filterMonth && !e.date.startsWith(S.filterYear + '-' + S.filterMonth)) return false;
+    if (S.filterMode === 'FY') {
+      if (!inFY(e.date, S.filterYear)) return false;
+      if (S.filterMonth && !e.date.startsWith(S.filterMonth)) return false;
+    } else {
+      if (S.filterYear && !e.date.startsWith(S.filterYear)) return false;
+      if (S.filterMonth && !e.date.startsWith(S.filterYear + '-' + S.filterMonth)) return false;
+    }
     if (S.filterVehicle && e.vehicleId !== S.filterVehicle) return false;
     if (S.filterCat && e.category !== S.filterCat) return false;
     if (search) {
@@ -1384,40 +1429,62 @@ function showToast(msg, type='success') {
 function filterBarHTML() {
   const plants = myPlants();
   const allExp = myExpenses();
+  const isFY = S.filterMode === 'FY';
 
   // Years that have data
-  const yearsWithData = YEARS.filter(y => allExp.some(e => e.date.startsWith(y)));
+  const yearsWithData = YEARS.filter(y => isFY
+    ? allExp.some(e => inFY(e.date, y))
+    : allExp.some(e => e.date.startsWith(y))
+  );
   if (!yearsWithData.includes(S.filterYear) && yearsWithData.length) S.filterYear = yearsWithData[yearsWithData.length-1];
 
-  // Months that have data in selected year
-  const monthsWithData = MONTHS.filter(m => allExp.some(e => e.date.startsWith(S.filterYear + '-' + m.val)));
-
-  return `<div class="filter-bar">
-    <!-- Row 1: Year + Month (only where data exists) -->
-    <div class="filter-row">
-      <span class="filter-row-label">📅 Year</span>
-      ${yearsWithData.map(y=>`<button class="pill ${S.filterYear===y?'active-year active':''}" onclick="setFilter('year','${y}')">${y}</button>`).join('')}
-      ${monthsWithData.length ? `
+  // Months that have data
+  let monthPills = '';
+  if (isFY) {
+    const fyMonths = getFYMonthsWithData(S.filterYear, allExp);
+    if (fyMonths.length) {
+      monthPills = `
         <div class="filter-divider-v"></div>
-        <span class="filter-row-label">🗓 Month</span>
+        <span class="filter-bar-label">📅 MONTH</span>
+        <button class="pill ${!S.filterMonth?'active':''}" onclick="setFilter('month','')">All</button>
+        ${fyMonths.map(m=>`<button class="pill ${S.filterMonth===m.yearVal?'active':''}" onclick="setFilter('month','${m.yearVal}')">${m.label}</button>`).join('')}
+      `;
+    }
+  } else {
+    const monthsWithData = MONTHS.filter(m => allExp.some(e => e.date.startsWith(S.filterYear + '-' + m.val)));
+    if (monthsWithData.length) {
+      monthPills = `
+        <div class="filter-divider-v"></div>
+        <span class="filter-bar-label">📅 MONTH</span>
         <button class="pill ${!S.filterMonth?'active':''}" onclick="setFilter('month','')">All</button>
         ${monthsWithData.map(m=>`<button class="pill ${S.filterMonth===m.val?'active':''}" onclick="setFilter('month','${m.val}')">${m.label}</button>`).join('')}
-      ` : ''}
+      `;
+    }
+  }
+
+  // Year label for FY display
+  const yearLabel = isFY ? y => `FY ${y}` : y => y;
+
+  return `<div class="filter-bar-wrap">
+    <!-- Row 1: CY/FY | Year | Month | Export PDF -->
+    <div class="filter-bar-row">
+      <div class="cy-fy-toggle">
+        <button class="cy-fy-btn ${!isFY?'active':''}" onclick="setFilter('mode','CY')">CY</button>
+        <button class="cy-fy-btn ${isFY?'active':''}" onclick="setFilter('mode','FY')">FY</button>
+      </div>
+      <div class="filter-divider-v"></div>
+      <span class="filter-bar-label">📅 YEAR</span>
+      ${yearsWithData.map(y=>`<button class="pill ${S.filterYear===y?'active-year active':''}" onclick="setFilter('year','${y}')">${yearLabel(y)}</button>`).join('')}
+      ${monthPills}
+      <button class="export-pdf-btn" onclick="exportFullPDF()">⬆ Export PDF</button>
     </div>
-    <!-- Row 2: Plant pills (Superadmin only, single click filter) -->
-    ${isSA() && plants.length > 1 ? `<div class="filter-row" style="padding-top:0;padding-bottom:8px">
-      <span class="filter-row-label">🏭 Plant</span>
-      <button class="pill ${!S.filterPlant?'active-plant active':''}" onclick="setFilter('plant','')">
-        🏭 All Plants
-      </button>
-      ${plants.map(p=>{
-        const pTotal = allExp.filter(e=>e.plantId===p.id&&e.date.startsWith(S.filterYear)).reduce((s,e)=>s+e.amount,0);
-        return `<button class="pill ${S.filterPlant===p.id?'active-plant active':''}" onclick="setFilter('plant','${p.id}')">
-          <span>${p.code}</span>
-          <span style="font-size:10px;opacity:.8;margin-left:2px">— ${p.name.split('—')[1]?.trim()||p.location||p.name}</span>
-          ${pTotal>0?`<span style="font-size:10px;font-weight:700;margin-left:4px;opacity:.9">${fmtR(pTotal)}</span>`:''}
-        </button>`;
-      }).join('')}
+    <!-- Row 2: Plant pills (Superadmin only) -->
+    ${isSA() && plants.length > 1 ? `
+    <div class="filter-bar-sep"></div>
+    <div class="filter-bar-row">
+      <span class="filter-bar-label">🏭 PLANT</span>
+      <button class="pill ${!S.filterPlant?'active-plant active':''}" onclick="setFilter('plant','')">All Plants</button>
+      ${plants.map(p=>`<button class="pill ${S.filterPlant===p.id?'active-plant active':''}" onclick="setFilter('plant','${p.id}')">${p.code}</button>`).join('')}
     </div>` : ''}
   </div>`;
 }
@@ -1475,6 +1542,7 @@ window.switchReportTab = function(tab) {
 };
 
 window.setFilter = function(type, val) {
+  if (type==='mode') { S.filterMode = val; S.filterMonth = ''; }
   if (type==='year') { S.filterYear = val; S.filterMonth = ''; }
   if (type==='month') S.filterMonth = val;
   if (type==='plant') S.filterPlant = val;
@@ -1700,11 +1768,6 @@ function pageHTML() {
 
 // ── DASHBOARD ─────────────────────────────────────────────────────
 function dashboardHTML() {
-  const allExp = myExpenses();
-  const yearsWithData = YEARS.filter(y => allExp.some(e => e.date.startsWith(y)));
-  if (!yearsWithData.includes(S.filterYear) && yearsWithData.length) S.filterYear = yearsWithData[yearsWithData.length-1];
-  const monthsWithData = MONTHS.filter(m => allExp.some(e => e.date.startsWith(S.filterYear + '-' + m.val)));
-
   const exps = filteredExpenses();
   const myV = myVehicles();
   const total = exps.reduce((s,e)=>s+e.amount,0);
@@ -1729,25 +1792,9 @@ function dashboardHTML() {
         </div>
         ${headerControlsHTML()}
       </div>
-      <!-- Row 2: Filter Pills -->
-      <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end;width:100%">
-        <!-- Year + Month -->
-        <div style="display:flex;align-items:center;gap:4px;flex-wrap:nowrap;overflow-x:auto">
-          ${yearsWithData.map(y=>`<button class="pill ${S.filterYear===y?'active-year active':''}" onclick="setFilter('year','${y}')" style="font-size:11px;padding:3px 10px">${y}</button>`).join('')}
-          ${monthsWithData.length?`<span style="width:1px;height:16px;background:var(--gray-200);margin:0 2px;flex-shrink:0"></span>
-          <button class="pill ${!S.filterMonth?'active':''}" onclick="setFilter('month','')" style="font-size:11px;padding:3px 10px">All</button>
-          ${monthsWithData.map(m=>`<button class="pill ${S.filterMonth===m.val?'active':''}" onclick="setFilter('month','${m.val}')" style="font-size:11px;padding:3px 10px">${m.label}</button>`).join('')}`:''}
-        </div>
-        <!-- Plant pills (Superadmin only) -->
-        ${isSA()&&myPlants().length>1?`<div style="display:flex;align-items:center;gap:4px;flex-wrap:nowrap">
-          <button class="pill ${!S.filterPlant?'active-plant active':''}" onclick="setFilter('plant','')" style="font-size:11px;padding:3px 10px">🏭 All</button>
-          ${myPlants().map(p=>{
-            const pAmt=myExpenses().filter(e=>e.plantId===p.id&&e.date.startsWith(S.filterYear)).reduce((s,e)=>s+e.amount,0);
-            return `<button class="pill ${S.filterPlant===p.id?'active-plant active':''}" onclick="setFilter('plant','${p.id}')" style="font-size:11px;padding:3px 10px">
-              ${p.code}${pAmt?` <span style="opacity:.75;font-size:10px">${fmtR(pAmt)}</span>`:''}
-            </button>`;
-          }).join('')}
-        </div>`:''}
+      <!-- Row 2: Filter Bar -->
+      <div style="width:100%">
+        ${filterBarHTML()}
       </div>
     </div>
     ${critical.length?`<div class="alert alert-danger mb-4">⚠️ <b>${critical.length} documents</b> are expired or critically due. <button class="btn-link" onclick="navigate('alerts')" style="background:none;border:none;color:#991b1b;font-weight:700;cursor:pointer;text-decoration:underline">View alerts →</button></div>`:''}
