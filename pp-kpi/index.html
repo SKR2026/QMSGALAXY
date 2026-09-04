@@ -1893,7 +1893,7 @@ tr:hover td{background:var(--surface2)}
         <div class="form-grid" style="max-width:560px;margin-bottom:14px">
           <div class="field" style="grid-column:1/-1">
             <label>Cloud Function URL</label>
-            <input type="url" id="cloudFnUrl" placeholder="e.g. https://incident-email-now-xxx.run.app  (same as IncidentPro's Cloud Run URL)">
+            <input type="url" id="cloudFnUrl" placeholder="https://mom-reminder-backend-378689064792.asia-south1.run.app">
           </div>
           <div class="field" style="grid-column:1/-1">
             <label>Internal secret (x-internal-secret header)</label>
@@ -2000,7 +2000,7 @@ tr:hover td{background:var(--surface2)}
         </div>
 
         <div style="margin-top:14px;border-top:0.5px solid var(--border);padding-top:12px;font-size:11px;color:var(--text3)">
-        💡 <strong>Uses existing IncidentPro credentials.</strong> Enter the same Cloud Run URL and secret from IncidentPro → Settings → Cloud Scheduler. The KPI dashboard uses the same <code>/api/send-email</code> endpoint. If Cloud Function is unavailable, emails fall back to the Gmail Apps Script relay automatically.
+        💡 <strong>Uses your existing <code>mom-reminder-backend</code> Cloud Run.</strong> Enter the URL <code>https://mom-reminder-backend-378689064792.asia-south1.run.app</code> and the same internal secret. The KPI dashboard calls <code>/api/trigger-reminder</code> — the same endpoint your Cloud Scheduler jobs use.
         </div>
       </div>
 
@@ -7681,8 +7681,10 @@ async function testCloudFnConnection(){
   if(btn){ btn.disabled=true; btn.textContent='Testing…'; }
   if(result) result.textContent = '⏳ Connecting…';
   try{
-    const res = await fetch(url.replace(/\/$/,'')+'/health', {
-      method:'GET', headers:{ 'x-internal-secret': secret||'' },
+    const res = await fetch(url.replace(/\/$/,'')+'/api/trigger-reminder', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-internal-secret': secret||''},
+      body: JSON.stringify({type:'test', dryRun:true}),
       signal: AbortSignal.timeout(8000)
     });
     const data = await res.json().catch(()=>({}));
@@ -7702,22 +7704,39 @@ async function kpiSendEmail(toEmail, toName, subject, htmlBody){
   const cfSecret = s.cloudFnSecret|| s.cloudFunctionSecret || '';
   const company  = s.companyName  || 'Polyplastics India';
 
-  // 1️⃣ Try Cloud Function /api/send-email (same endpoint as IncidentPro)
+  // 1️⃣ Try mom-reminder-backend /api/trigger-reminder (KPI dashboard's own Cloud Run)
   if(cfUrl && cfSecret){
     try{
       const ctrl = new AbortController();
       const t = setTimeout(()=>ctrl.abort(), 8000);
-      const res = await fetch(cfUrl.replace(/\/$/,'')+'/api/send-email',{
+      const res = await fetch(cfUrl.replace(/\/$/,'')+'/api/trigger-reminder',{
         method:'POST',
         headers:{'Content-Type':'application/json','x-internal-secret':cfSecret},
-        body: JSON.stringify({to:toEmail, subject, htmlBody, fromName:company}),
+        body: JSON.stringify({type:'directSend', to:toEmail, subject, htmlBody, fromName:company}),
         signal: ctrl.signal
       });
       clearTimeout(t);
       const data = await res.json().catch(()=>({}));
-      if(data.ok) return {ok:true};
-      if(res.status !== 404) return {ok:false, error:data.error||'CF error'};
-    } catch(e){ console.warn('[KPI email] CF failed, trying Apps Script:', e.message); }
+      if(res.ok && data.ok !== false) return {ok:true};
+      // If 404 or endpoint doesn't support directSend, fall through to send-email
+      if(res.status !== 404 && res.status !== 405) return {ok:false, error:data.error||'CF error'};
+    } catch(e){ console.warn('[KPI email] mom-backend failed, trying send-email:', e.message); }
+
+    // 1b️⃣ Try IncidentPro-style /api/send-email as secondary attempt on same URL
+    try{
+      const ctrl2 = new AbortController();
+      const t2 = setTimeout(()=>ctrl2.abort(), 8000);
+      const res2 = await fetch(cfUrl.replace(/\/$/,'')+'/api/send-email',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','x-internal-secret':cfSecret},
+        body: JSON.stringify({to:toEmail, subject, htmlBody, fromName:company}),
+        signal: ctrl2.signal
+      });
+      clearTimeout(t2);
+      const data2 = await res2.json().catch(()=>({}));
+      if(data2.ok) return {ok:true};
+      if(res2.status !== 404) return {ok:false, error:data2.error||'CF error'};
+    } catch(e){ console.warn('[KPI email] CF send-email failed, trying Apps Script:', e.message); }
   }
 
   // 2️⃣ Fallback: Gmail Apps Script relay (same secret as IncidentPro)
@@ -7745,41 +7764,31 @@ async function kpiSendEmail(toEmail, toName, subject, htmlBody){
 async function sendEscalationNow(){
   const result = document.getElementById('cloudFnTestResult');
   const btn    = document.getElementById('sendEscNowBtn');
-  const cfUrl  = escalationSettings.cloudFnUrl;
-  const cfSecret = escalationSettings.cloudFnSecret;
+  const cfUrl    = (escalationSettings.cloudFnUrl||'').trim();
+  const cfSecret = (escalationSettings.cloudFnSecret||'').trim();
 
   if(btn){ btn.disabled=true; btn.textContent='Sending…'; }
+  if(!cfUrl){ if(result) result.textContent='⚠ Save the Cloud Function URL first.'; if(btn){btn.disabled=false;btn.textContent='⚡ Send escalation now';} showToast('Enter the mom-reminder-backend URL first'); return; }
 
-  // If Cloud Function configured, use /trigger endpoint
-  if(cfUrl && cfSecret){
-    if(result) result.textContent='⏳ Triggering escalation via Cloud Function…';
-    try{
-      const res = await fetch(cfUrl.replace(/\/$/,'')+'/trigger',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','x-internal-secret':cfSecret},
-        body: JSON.stringify({type:'escalation', force:true}),
-        signal: AbortSignal.timeout(15000)
-      });
-      const data = await res.json().catch(()=>({}));
-      const msg = res.ok ? `✅ Escalation sent — ${data.sent||0} email(s)` : `❌ ${data.error||'HTTP '+res.status}`;
-      if(result) result.textContent=msg; showToast(msg);
-      addReminderNotif('Escalation sent','Escalation digest dispatched via Cloud Function.');
-    } catch(e){ const msg='❌ '+e.message; if(result) result.textContent=msg; showToast(msg); }
-  } else {
-    // Direct send via Gmail/Apps Script
-    if(result) result.textContent='⏳ Sending escalation emails directly…';
-    const recipients = escalationSettings.emails || [];
-    if(!recipients.length){ if(result) result.textContent='⚠ No recipient emails configured.'; if(btn){btn.disabled=false;btn.textContent='⚡ Send escalation now';} return; }
-    const html = buildEscalationEmailHtml();
-    const subj = `[KPI Dashboard] ⚡ Escalation Alert — Missed KPIs`;
-    let sent=0, failed=0;
-    for(const email of recipients){
-      const r = await kpiSendEmail(email, email.split('@')[0], subj, html);
-      r.ok ? sent++ : failed++;
-    }
-    const msg = `✅ ${sent} sent${failed?', ❌ '+failed+' failed':''}`;
-    if(result) result.textContent=msg; showToast(msg);
-    addReminderNotif('Escalation sent manually',`${sent} escalation email(s) sent.`);
+  if(result) result.textContent='⏳ Triggering escalation on Cloud Scheduler function…';
+  try{
+    const res = await fetch(cfUrl.replace(/\/$/,'')+'/api/trigger-reminder',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-internal-secret':cfSecret},
+      body: JSON.stringify({type:'escalation', force:true}),
+      signal: AbortSignal.timeout(20000)
+    });
+    const data = await res.json().catch(()=>({}));
+    const msg = res.ok
+      ? `✅ Escalation triggered — ${data.sent||data.count||'emails dispatched by Cloud Function'}`
+      : `❌ HTTP ${res.status}: ${data.error||data.message||'unknown error'}`;
+    if(result) result.textContent=msg;
+    showToast(msg);
+    if(res.ok) addReminderNotif('Escalation sent','Escalation digest triggered via Cloud Scheduler function.');
+  } catch(e){
+    const msg = '❌ '+(e.message||String(e));
+    if(result) result.textContent=msg;
+    showToast(msg);
   }
   if(btn){ btn.disabled=false; btn.textContent='⚡ Send escalation now'; }
 }
@@ -7788,39 +7797,31 @@ async function sendEscalationNow(){
 async function sendReminderNow(){
   const result = document.getElementById('cloudFnTestResult');
   const btn    = document.getElementById('sendRemNowBtn');
-  const cfUrl  = escalationSettings.cloudFnUrl;
-  const cfSecret = escalationSettings.cloudFnSecret;
+  const cfUrl    = (escalationSettings.cloudFnUrl||'').trim();
+  const cfSecret = (escalationSettings.cloudFnSecret||'').trim();
 
   if(btn){ btn.disabled=true; btn.textContent='Sending…'; }
+  if(!cfUrl){ if(result) result.textContent='⚠ Save the Cloud Function URL first.'; if(btn){btn.disabled=false;btn.textContent='🔔 Send reminder now';} showToast('Enter the mom-reminder-backend URL first'); return; }
 
-  if(cfUrl && cfSecret){
-    if(result) result.textContent='⏳ Triggering reminder via Cloud Function…';
-    try{
-      const res = await fetch(cfUrl.replace(/\/$/,'')+'/trigger',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','x-internal-secret':cfSecret},
-        body: JSON.stringify({type:'reminder', force:true}),
-        signal: AbortSignal.timeout(15000)
-      });
-      const data = await res.json().catch(()=>({}));
-      const msg = res.ok ? `✅ Reminder sent — ${data.sent||0} email(s)` : `❌ ${data.error||'HTTP '+res.status}`;
-      if(result) result.textContent=msg; showToast(msg);
-      addReminderNotif('Reminder sent','KPI submission reminder dispatched.');
-    } catch(e){ const msg='❌ '+e.message; if(result) result.textContent=msg; showToast(msg); }
-  } else {
-    if(result) result.textContent='⏳ Sending reminder emails directly…';
-    const recipients = escalationSettings.emails || [];
-    if(!recipients.length){ if(result) result.textContent='⚠ No recipient emails configured.'; if(btn){btn.disabled=false;btn.textContent='🔔 Send reminder now';} return; }
-    const html = buildReminderEmailHtml();
-    const subj = `[KPI Dashboard] 🔔 Reminder — Please submit KPI data`;
-    let sent=0, failed=0;
-    for(const email of recipients){
-      const r = await kpiSendEmail(email, email.split('@')[0], subj, html);
-      r.ok ? sent++ : failed++;
-    }
-    const msg = `✅ ${sent} sent${failed?', ❌ '+failed+' failed':''}`;
-    if(result) result.textContent=msg; showToast(msg);
-    addReminderNotif('Reminder sent manually',`${sent} reminder email(s) sent.`);
+  if(result) result.textContent='⏳ Triggering reminder on Cloud Scheduler function…';
+  try{
+    const res = await fetch(cfUrl.replace(/\/$/,'')+'/api/trigger-reminder',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-internal-secret':cfSecret},
+      body: JSON.stringify({type:'reminder', force:true}),
+      signal: AbortSignal.timeout(20000)
+    });
+    const data = await res.json().catch(()=>({}));
+    const msg = res.ok
+      ? `✅ Reminder triggered — ${data.sent||data.count||'emails dispatched by Cloud Function'}`
+      : `❌ HTTP ${res.status}: ${data.error||data.message||'unknown error'}`;
+    if(result) result.textContent=msg;
+    showToast(msg);
+    if(res.ok) addReminderNotif('Reminder sent','KPI submission reminder triggered via Cloud Scheduler function.');
+  } catch(e){
+    const msg = '❌ '+(e.message||String(e));
+    if(result) result.textContent=msg;
+    showToast(msg);
   }
   if(btn){ btn.disabled=false; btn.textContent='🔔 Send reminder now'; }
 }
