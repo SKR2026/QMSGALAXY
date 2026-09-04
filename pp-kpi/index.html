@@ -1893,7 +1893,7 @@ tr:hover td{background:var(--surface2)}
         <div class="form-grid" style="max-width:560px;margin-bottom:14px">
           <div class="field" style="grid-column:1/-1">
             <label>Cloud Function URL</label>
-            <input type="url" id="cloudFnUrl" placeholder="https://your-region-project.cloudfunctions.net/kpiAlertMailer">
+            <input type="url" id="cloudFnUrl" placeholder="e.g. https://incident-email-now-xxx.run.app  (same as IncidentPro's Cloud Run URL)">
           </div>
           <div class="field" style="grid-column:1/-1">
             <label>Internal secret (x-internal-secret header)</label>
@@ -2000,9 +2000,7 @@ tr:hover td{background:var(--surface2)}
         </div>
 
         <div style="margin-top:14px;border-top:0.5px solid var(--border);padding-top:12px;font-size:11px;color:var(--text3)">
-          💡 <strong>Setup:</strong> Deploy <code>kpiAlertMailer</code> Cloud Function that reads from
-          <code>kpiSettings/escalation</code> in Firestore and sends via your M365 / Gmail credentials.
-          Set the <code>INTERNAL_SECRET</code> env var to match the secret above.
+        💡 <strong>Uses existing IncidentPro credentials.</strong> Enter the same Cloud Run URL and secret from IncidentPro → Settings → Cloud Scheduler. The KPI dashboard uses the same <code>/api/send-email</code> endpoint. If Cloud Function is unavailable, emails fall back to the Gmail Apps Script relay automatically.
         </div>
       </div>
 
@@ -7697,60 +7695,188 @@ async function testCloudFnConnection(){
   if(btn){ btn.disabled=false; btn.textContent='🧪 Test connection'; }
 }
 
-// ── Cloud Function: send escalation digest now ─────────────────────
+// ── Shared Gmail sender — mirrors IncidentPro's sendGmailViaAppsScript ──
+async function kpiSendEmail(toEmail, toName, subject, htmlBody){
+  const s = escalationSettings;
+  const cfUrl    = s.cloudFnUrl   || s.cloudFunctionUrl || '';
+  const cfSecret = s.cloudFnSecret|| s.cloudFunctionSecret || '';
+  const company  = s.companyName  || 'Polyplastics India';
+
+  // 1️⃣ Try Cloud Function /api/send-email (same endpoint as IncidentPro)
+  if(cfUrl && cfSecret){
+    try{
+      const ctrl = new AbortController();
+      const t = setTimeout(()=>ctrl.abort(), 8000);
+      const res = await fetch(cfUrl.replace(/\/$/,'')+'/api/send-email',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','x-internal-secret':cfSecret},
+        body: JSON.stringify({to:toEmail, subject, htmlBody, fromName:company}),
+        signal: ctrl.signal
+      });
+      clearTimeout(t);
+      const data = await res.json().catch(()=>({}));
+      if(data.ok) return {ok:true};
+      if(res.status !== 404) return {ok:false, error:data.error||'CF error'};
+    } catch(e){ console.warn('[KPI email] CF failed, trying Apps Script:', e.message); }
+  }
+
+  // 2️⃣ Fallback: Gmail Apps Script relay (same secret as IncidentPro)
+  const webAppUrl = s.gmailWebAppUrl || s.m365?.webAppUrl || '';
+  const gmailSecret = s.gmailSecret || cfSecret || '';
+  if(!webAppUrl) return {ok:false, reason:'No email channel configured'};
+
+  const payload = JSON.stringify({secret:gmailSecret, to:toEmail, subject, htmlBody, fromName:company});
+  try{
+    const res = await fetch(webAppUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:payload,redirect:'follow'});
+    if(res.ok || res.status===200){
+      const d = await res.json().catch(()=>({ok:true}));
+      if(d.ok !== false) return {ok:true};
+    }
+  } catch(e){}
+
+  // 3️⃣ no-cors fallback
+  try{
+    await fetch(webAppUrl,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},body:payload});
+    return {ok:true, _viaNoCors:true};
+  } catch(e){ return {ok:false, reason:'fetch-error: '+e.message}; }
+}
+
+// ── Send escalation digest now ─────────────────────────────────────
 async function sendEscalationNow(){
-  const url    = escalationSettings.cloudFnUrl;
-  const secret = escalationSettings.cloudFnSecret;
   const result = document.getElementById('cloudFnTestResult');
   const btn    = document.getElementById('sendEscNowBtn');
-  if(!url){ showToast('Save Cloud Function URL first'); return; }
+  const cfUrl  = escalationSettings.cloudFnUrl;
+  const cfSecret = escalationSettings.cloudFnSecret;
+
   if(btn){ btn.disabled=true; btn.textContent='Sending…'; }
-  if(result) result.textContent='⏳ Sending escalation email…';
-  try{
-    const res = await fetch(url.replace(/\/$/,'')+'/trigger', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json','x-internal-secret':secret||'' },
-      body: JSON.stringify({ type:'escalation', force:true }),
-      signal: AbortSignal.timeout(15000)
-    });
-    const data = await res.json().catch(()=>({}));
-    const msg = res.ok ? '✅ Escalation sent — '+(data.sent||0)+' emails' : '❌ '+(data.error||'HTTP '+res.status);
-    if(result) result.textContent = msg;
-    showToast(msg);
-    addReminderNotif('Escalation sent manually', 'Escalation digest dispatched via Cloud Function.');
-  } catch(e){
-    const msg='❌ '+(e.message||String(e));
+
+  // If Cloud Function configured, use /trigger endpoint
+  if(cfUrl && cfSecret){
+    if(result) result.textContent='⏳ Triggering escalation via Cloud Function…';
+    try{
+      const res = await fetch(cfUrl.replace(/\/$/,'')+'/trigger',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','x-internal-secret':cfSecret},
+        body: JSON.stringify({type:'escalation', force:true}),
+        signal: AbortSignal.timeout(15000)
+      });
+      const data = await res.json().catch(()=>({}));
+      const msg = res.ok ? `✅ Escalation sent — ${data.sent||0} email(s)` : `❌ ${data.error||'HTTP '+res.status}`;
+      if(result) result.textContent=msg; showToast(msg);
+      addReminderNotif('Escalation sent','Escalation digest dispatched via Cloud Function.');
+    } catch(e){ const msg='❌ '+e.message; if(result) result.textContent=msg; showToast(msg); }
+  } else {
+    // Direct send via Gmail/Apps Script
+    if(result) result.textContent='⏳ Sending escalation emails directly…';
+    const recipients = escalationSettings.emails || [];
+    if(!recipients.length){ if(result) result.textContent='⚠ No recipient emails configured.'; if(btn){btn.disabled=false;btn.textContent='⚡ Send escalation now';} return; }
+    const html = buildEscalationEmailHtml();
+    const subj = `[KPI Dashboard] ⚡ Escalation Alert — Missed KPIs`;
+    let sent=0, failed=0;
+    for(const email of recipients){
+      const r = await kpiSendEmail(email, email.split('@')[0], subj, html);
+      r.ok ? sent++ : failed++;
+    }
+    const msg = `✅ ${sent} sent${failed?', ❌ '+failed+' failed':''}`;
     if(result) result.textContent=msg; showToast(msg);
+    addReminderNotif('Escalation sent manually',`${sent} escalation email(s) sent.`);
   }
   if(btn){ btn.disabled=false; btn.textContent='⚡ Send escalation now'; }
 }
 
-// ── Cloud Function: send reminder now ─────────────────────────────
+// ── Send reminder now ─────────────────────────────────────────────
 async function sendReminderNow(){
-  const url    = escalationSettings.cloudFnUrl;
-  const secret = escalationSettings.cloudFnSecret;
   const result = document.getElementById('cloudFnTestResult');
   const btn    = document.getElementById('sendRemNowBtn');
-  if(!url){ showToast('Save Cloud Function URL first'); return; }
+  const cfUrl  = escalationSettings.cloudFnUrl;
+  const cfSecret = escalationSettings.cloudFnSecret;
+
   if(btn){ btn.disabled=true; btn.textContent='Sending…'; }
-  if(result) result.textContent='⏳ Sending reminder email…';
-  try{
-    const res = await fetch(url.replace(/\/$/,'')+'/trigger', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json','x-internal-secret':secret||'' },
-      body: JSON.stringify({ type:'reminder', force:true }),
-      signal: AbortSignal.timeout(15000)
-    });
-    const data = await res.json().catch(()=>({}));
-    const msg = res.ok ? '✅ Reminder sent — '+(data.sent||0)+' emails' : '❌ '+(data.error||'HTTP '+res.status);
-    if(result) result.textContent = msg;
-    showToast(msg);
-    addReminderNotif('Reminder sent manually','KPI submission reminder dispatched via Cloud Function.');
-  } catch(e){
-    const msg='❌ '+(e.message||String(e));
+
+  if(cfUrl && cfSecret){
+    if(result) result.textContent='⏳ Triggering reminder via Cloud Function…';
+    try{
+      const res = await fetch(cfUrl.replace(/\/$/,'')+'/trigger',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','x-internal-secret':cfSecret},
+        body: JSON.stringify({type:'reminder', force:true}),
+        signal: AbortSignal.timeout(15000)
+      });
+      const data = await res.json().catch(()=>({}));
+      const msg = res.ok ? `✅ Reminder sent — ${data.sent||0} email(s)` : `❌ ${data.error||'HTTP '+res.status}`;
+      if(result) result.textContent=msg; showToast(msg);
+      addReminderNotif('Reminder sent','KPI submission reminder dispatched.');
+    } catch(e){ const msg='❌ '+e.message; if(result) result.textContent=msg; showToast(msg); }
+  } else {
+    if(result) result.textContent='⏳ Sending reminder emails directly…';
+    const recipients = escalationSettings.emails || [];
+    if(!recipients.length){ if(result) result.textContent='⚠ No recipient emails configured.'; if(btn){btn.disabled=false;btn.textContent='🔔 Send reminder now';} return; }
+    const html = buildReminderEmailHtml();
+    const subj = `[KPI Dashboard] 🔔 Reminder — Please submit KPI data`;
+    let sent=0, failed=0;
+    for(const email of recipients){
+      const r = await kpiSendEmail(email, email.split('@')[0], subj, html);
+      r.ok ? sent++ : failed++;
+    }
+    const msg = `✅ ${sent} sent${failed?', ❌ '+failed+' failed':''}`;
     if(result) result.textContent=msg; showToast(msg);
+    addReminderNotif('Reminder sent manually',`${sent} reminder email(s) sent.`);
   }
   if(btn){ btn.disabled=false; btn.textContent='🔔 Send reminder now'; }
+}
+
+// ── Build email HTML bodies ────────────────────────────────────────
+function buildEscalationEmailHtml(){
+  const alerts = window._kpiAlerts || [];
+  const co = escalationSettings.companyName || 'Polyplastics India';
+  const rows = alerts.slice(0,20).map(a=>`
+    <tr style="border-bottom:1px solid #eee">
+      <td style="padding:6px 10px;font-size:12px;font-weight:600;color:#A32D2D">${a.kpiName||'KPI'}</td>
+      <td style="padding:6px 10px;font-size:12px">${a.plant||'—'} / ${a.department||'—'}</td>
+      <td style="padding:6px 10px;font-size:12px">${a.month||''} ${a.year||''}</td>
+      <td style="padding:6px 10px;font-size:12px;color:#A32D2D">${a.actual}</td>
+      <td style="padding:6px 10px;font-size:12px">${a.target}</td>
+    </tr>`).join('');
+  return `<div style="font-family:Inter,Arial,sans-serif;max-width:640px;margin:0 auto;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden">
+    <div style="background:#1a1f2e;padding:20px 24px;border-bottom:3px solid #E24B4A">
+      <div style="font-size:18px;font-weight:700;color:#fff">⚡ KPI Escalation Alert</div>
+      <div style="font-size:12px;color:#90a0b0;margin-top:4px">${co} · KPI Dashboard</div>
+    </div>
+    <div style="padding:22px 24px;background:#fff">
+      <p style="font-size:14px;color:#1a1a18;margin-bottom:16px">${alerts.length} KPI${alerts.length!==1?'s':''} require attention:</p>
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <thead><tr style="background:#f5f5f3">
+          <th style="padding:8px 10px;text-align:left;font-size:11px;color:#5f5e5a">KPI</th>
+          <th style="padding:8px 10px;text-align:left;font-size:11px;color:#5f5e5a">Plant / Dept</th>
+          <th style="padding:8px 10px;text-align:left;font-size:11px;color:#5f5e5a">Period</th>
+          <th style="padding:8px 10px;text-align:left;font-size:11px;color:#5f5e5a">Actual</th>
+          <th style="padding:8px 10px;text-align:left;font-size:11px;color:#5f5e5a">Target</th>
+        </tr></thead>
+        <tbody>${rows||'<tr><td colspan="5" style="padding:10px;color:#888">No open alerts</td></tr>'}</tbody>
+      </table>
+      <a href="${window.location.href}" style="display:inline-block;margin-top:18px;background:#185FA5;color:#fff;padding:11px 24px;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none">Open KPI Dashboard →</a>
+      <p style="font-size:11px;color:#94a3b8;margin-top:16px;padding-top:12px;border-top:1px solid #eee">${co} · KPI Dashboard · ${new Date().toLocaleString('en-IN')}</p>
+    </div>
+  </div>`;
+}
+
+function buildReminderEmailHtml(){
+  const co = escalationSettings.companyName || 'Polyplastics India';
+  const freq = escalationSettings.reminderFrequency || 'monthly';
+  const day  = escalationSettings.reminderDay || '';
+  return `<div style="font-family:Inter,Arial,sans-serif;max-width:640px;margin:0 auto;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden">
+    <div style="background:#1a1f2e;padding:20px 24px;border-bottom:3px solid #378ADD">
+      <div style="font-size:18px;font-weight:700;color:#fff">🔔 KPI Submission Reminder</div>
+      <div style="font-size:12px;color:#90a0b0;margin-top:4px">${co} · KPI Dashboard</div>
+    </div>
+    <div style="padding:22px 24px;background:#fff">
+      <p style="font-size:14px;color:#1a1a18;margin-bottom:12px">This is your ${freq} reminder to submit KPI data.</p>
+      ${day ? `<p style="font-size:13px;color:#5f5e5a;margin-bottom:16px">📅 Submission deadline: <strong>day ${day} of this month</strong></p>` : ''}
+      <p style="font-size:13px;color:#5f5e5a;margin-bottom:18px">Please ensure all department KPI entries are submitted and up to date.</p>
+      <a href="${window.location.href}" style="display:inline-block;background:#185FA5;color:#fff;padding:11px 24px;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none">Open KPI Dashboard →</a>
+      <p style="font-size:11px;color:#94a3b8;margin-top:16px;padding-top:12px;border-top:1px solid #eee">${co} · KPI Dashboard · ${new Date().toLocaleString('en-IN')}</p>
+    </div>
+  </div>`;
 }
 
 // ── In-browser reminder engine (fallback when Cloud Scheduler not active) ──
@@ -7859,6 +7985,16 @@ async function loadEscalationSettingsUI(){
           ...escalationSettings, ...saved,
           m365: { ...escalationSettings.m365, ...(saved.m365 || {}) }
         };
+        // Auto-inherit IncidentPro Cloud Function + Gmail secrets if this doc has them
+        // (shared Firestore project means same credentials work for both apps)
+        if(!escalationSettings.cloudFnUrl && saved.cloudFnUrl)
+          escalationSettings.cloudFnUrl = saved.cloudFnUrl;
+        if(!escalationSettings.cloudFnSecret && saved.cloudFnSecret)
+          escalationSettings.cloudFnSecret = saved.cloudFnSecret;
+        if(!escalationSettings.gmailWebAppUrl && saved.gmailWebAppUrl)
+          escalationSettings.gmailWebAppUrl = saved.gmailWebAppUrl;
+        if(!escalationSettings.gmailSecret && saved.gmailSecret)
+          escalationSettings.gmailSecret = saved.gmailSecret;
         // Apply fyMode + yearFmt from Firebase so all users share the same setting
         if(saved.fyMode && ['jan','apr'].includes(saved.fyMode)){
           appSettings.fyMode  = saved.fyMode;
