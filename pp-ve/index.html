@@ -534,6 +534,16 @@ async function loadFirestoreData() {
       if (efDoc.exists()) S.emissionFactors = { ...EMISSION_FACTORS_DEFAULT, ...efDoc.data() };
     } catch {}
 
+    // Load branding (logo + org name) -- shared across all users/devices via Firestore
+    try {
+      const brandDoc = await getDoc(doc(db, 'vems_settings', 'branding'));
+      if (brandDoc.exists()) {
+        const b = brandDoc.data();
+        if (b.companyLogo) { S.companyLogo = b.companyLogo; localStorage.setItem('vems_logo', b.companyLogo); }
+        if (b.orgName)     { S.orgName = b.orgName;         localStorage.setItem('vems_orgname', b.orgName); }
+      }
+    } catch {}
+
     // Load users list (superadmin only)
     if (isSA()) await fsLoadUsers();
 
@@ -1499,28 +1509,47 @@ window.setQuickFilter = function(type, val) {
 window.clearSelection = function() { S.selectedExpenses = new Set(); render(); };
 
 // ── LOGO UPLOAD ───────────────────────────────────────────────────
-window.handleLogoUpload = function(input) {
+window.handleLogoUpload = async function(input) {
   const file = input.files[0];
   if (!file) return;
   if (file.size > 512000) return showToast('Logo must be under 500KB', 'error');
   const reader = new FileReader();
-  reader.onload = e => {
+  reader.onload = async e => {
     S.companyLogo = e.target.result;
     localStorage.setItem('vems_logo', e.target.result);
     // Update preview immediately
     const wrap = document.getElementById('logo-preview-wrap');
     if (wrap) wrap.innerHTML = `<img src="${e.target.result}" id="logo-preview-img" style="max-width:76px;max-height:76px;object-fit:contain"/>`;
-    showToast('Logo uploaded! Save settings to apply everywhere.', 'success');
+    // Save to Firestore so all devices/users get the logo
+    try {
+      await setDoc(doc(db, 'vems_settings', 'branding'), {
+        companyLogo: e.target.result,
+        orgName: S.orgName,
+        updatedAt: serverTimestamp(),
+        updatedBy: S.user?.email
+      });
+      showToast('Logo saved — visible to all users on all devices.', 'success');
+    } catch(err) {
+      showToast('Logo saved locally only — Firestore error: ' + err.message, 'warning');
+    }
     render();
   };
   reader.readAsDataURL(file);
 };
 
-window.removeLogo = function() {
+window.removeLogo = async function() {
   if (!confirm('Remove company logo?')) return;
   S.companyLogo = '';
   localStorage.removeItem('vems_logo');
-  showToast('Logo removed', 'warning');
+  try {
+    await setDoc(doc(db, 'vems_settings', 'branding'), {
+      companyLogo: '',
+      orgName: S.orgName,
+      updatedAt: serverTimestamp(),
+      updatedBy: S.user?.email
+    });
+    showToast('Logo removed for all users.', 'warning');
+  } catch { showToast('Logo removed locally.', 'warning'); }
   render();
 };
 
@@ -3073,6 +3102,16 @@ window.saveAllSuperadminSettings = async function() {
   localStorage.setItem('vems_notif_config', JSON.stringify(S.notifConfig));
   S.orgName = document.getElementById('sa-org')?.value || S.orgName;
   localStorage.setItem('vems_orgname', S.orgName);
+
+  // Save org name to Firestore branding doc so all users/devices get it
+  try {
+    await setDoc(doc(db, 'vems_settings', 'branding'), {
+      companyLogo: S.companyLogo || '',
+      orgName: S.orgName,
+      updatedAt: serverTimestamp(),
+      updatedBy: S.user?.email
+    });
+  } catch(err) { console.warn('Branding save error:', err); }
 
   // Sync to cloud + Firestore
   await saveAndSyncSchedules();
