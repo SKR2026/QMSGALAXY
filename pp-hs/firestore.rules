@@ -1,0 +1,140 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── HELPER FUNCTIONS ───
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function userRole() {
+      return userProfile().role;
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() && userRole() == 'Super Admin';
+    }
+
+    function isCorporateEHS() {
+      return isSignedIn() && userRole() in ['Super Admin', 'Corporate EHS'];
+    }
+
+    function isPlantAdmin() {
+      return isSignedIn() && userRole() in ['Super Admin', 'Corporate EHS', 'Plant Admin'];
+    }
+
+    function canEdit() {
+      return isSignedIn() && userRole() in ['Super Admin', 'Corporate EHS', 'Plant Admin', 'HIRA Assessor'];
+    }
+
+    function userPlants() {
+      return userProfile().plantIds;
+    }
+
+    function hasPlantAccess(plantId) {
+      // Super Admin and Corporate EHS have access to all plants
+      return isCorporateEHS() || (isSignedIn() && plantId in userPlants());
+    }
+
+    function isActiveUser() {
+      return isSignedIn() && userProfile().status == 'Active';
+    }
+
+    // ─── USERS ───
+    match /users/{userId} {
+      // Anyone signed in can read their own profile
+      allow read: if isSignedIn() && (request.auth.uid == userId || isCorporateEHS());
+      // Users can be created by themselves (on registration) or by Super Admin
+      allow create: if isSignedIn() && (request.auth.uid == userId || isSuperAdmin());
+      // Super Admin can update anyone. Users can update their own limited fields.
+      allow update: if isSuperAdmin() || (request.auth.uid == userId && 
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'plantIds', 'status']));
+      // Only Super Admin can delete
+      allow delete: if isSuperAdmin();
+    }
+
+    // ─── PLANTS ───
+    match /plants/{plantId} {
+      allow read: if isActiveUser();
+      allow create, update: if isSuperAdmin();
+      allow delete: if isSuperAdmin();
+    }
+
+    // ─── HIRAs ───
+    match /hiras/{hiraId} {
+      allow read: if isActiveUser() && hasPlantAccess(resource.data.plantId);
+      allow create: if canEdit() && isActiveUser() && hasPlantAccess(request.resource.data.plantId);
+      allow update: if canEdit() && isActiveUser() && hasPlantAccess(resource.data.plantId)
+        // Approved HIRAs: only Corp/SuperAdmin can change status
+        && !(resource.data.status == 'Approved' && !isCorporateEHS());
+      allow delete: if isSuperAdmin();
+
+      // Hazards (subcollection)
+      match /hazards/{hazardId} {
+        allow read: if isActiveUser() && hasPlantAccess(get(/databases/$(database)/documents/hiras/$(hiraId)).data.plantId);
+        allow write: if canEdit() && isActiveUser();
+      }
+
+      // Actions (subcollection on HIRA)
+      match /actions/{actionId} {
+        allow read: if isActiveUser();
+        allow write: if canEdit() && isActiveUser();
+      }
+
+      // Approvals (subcollection)
+      match /approvals/{approvalId} {
+        allow read: if isActiveUser() && hasPlantAccess(get(/databases/$(database)/documents/hiras/$(hiraId)).data.plantId);
+        // Only Corp/Super Admin can create approval records
+        allow create: if isCorporateEHS() && isActiveUser();
+        allow update, delete: if false; // Approvals are immutable
+      }
+    }
+
+    // ─── ACTIONS (top-level collection) ───
+    match /actions/{actionId} {
+      allow read: if isActiveUser() && hasPlantAccess(resource.data.plantId);
+      allow create: if canEdit() && isActiveUser() && hasPlantAccess(request.resource.data.plantId);
+      allow update: if canEdit() && isActiveUser() && hasPlantAccess(resource.data.plantId);
+      allow delete: if isSuperAdmin();
+    }
+
+    // ─── NOTIFICATIONS ───
+    match /notifications/{notifId} {
+      // Users can only read their own notifications
+      allow read: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isSignedIn(); // Cloud functions and users can create
+      allow update: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // ─── AUDIT LOGS ───
+    match /auditLogs/{logId} {
+      allow read: if isCorporateEHS();
+      allow create: if isSignedIn(); // System creates audit logs
+      allow update, delete: if false; // Audit logs are immutable
+    }
+
+    // ─── EMAIL LOGS ───
+    match /emailLogs/{logId} {
+      allow read: if isSuperAdmin();
+      allow create: if isSignedIn(); // Cloud functions create email logs
+      allow update: if false; // Immutable after creation (updated via Cloud Functions)
+      allow delete: if isSuperAdmin();
+    }
+
+    // ─── SETTINGS ───
+    match /settings/{settingId} {
+      allow read: if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── DENY ALL OTHER ───
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
