@@ -1136,7 +1136,7 @@ tbody tr:last-child td { border-bottom: none; }
         <div class="user-name" id="sidebar-user-name">User</div>
         <div class="user-role" id="sidebar-user-role">Viewer</div>
       </div>
-
+      <button class="btn-ghost btn btn-sm" onclick="logout()" title="Logout">↩</button>
     </div>
   </aside>
 
@@ -1154,8 +1154,7 @@ tbody tr:last-child td { border-bottom: none; }
         <button class="notif-btn" onclick="toggleNotifPanel()" title="Notifications">
           🔔 <span class="notif-count" id="notif-count" style="display:none">0</span>
         </button>
-        <div class="user-avatar" style="cursor:pointer" onclick="navigate('settings')" id="topbar-avatar" title="Profile & Settings">U</div>
-        <button class="notif-btn" onclick="logout()" title="Sign Out" style="font-size:14px">⏻</button>
+        <div class="user-avatar" style="cursor:pointer" onclick="navigate('settings')" id="topbar-avatar">U</div>
       </div>
     </div>
 
@@ -1534,10 +1533,8 @@ window.toggleTheme = () => {
 
 function applyTheme() {
   const saved = localStorage.getItem('hira-theme');
-  // Default is light; only go dark if explicitly saved as dark
-  const isLight = saved !== 'dark';
+  const isLight = saved === 'light';
   if (isLight) document.body.classList.add('light-theme');
-  else document.body.classList.remove('light-theme');
   const btn = document.getElementById('theme-toggle-btn');
   if (btn) btn.innerHTML = isLight ? '🌞 Light' : '🌙 Dark';
 }
@@ -3232,21 +3229,33 @@ window.saveUser = async () => {
   };
 
   if (uid) {
+    // ── Update existing user profile in Firestore ──
     await updateDoc(doc(db,'hira_users',uid), userData);
     toast('User updated','success');
   } else {
+    // ── Create new user via Cloud Function (Admin SDK) ──
+    // This avoids Firebase Auth conflicts with other apps on same project
     const pw = document.getElementById('uf-pw')?.value;
     if (!pw || pw.length < 6) { toast('Password must be at least 6 characters','error'); return; }
+
+    const saveBtn = document.querySelector('#main-modal .btn-primary');
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Creating...'; }
+
     try {
-      const cred = await createUserWithEmailAndPassword(auth, email, pw);
-      userData.uid = cred.user.uid;
-      userData.createdAt = serverTimestamp();
-      userData.createdBy = currentUser.uid;
-      await setDoc(doc(db,'hira_users',cred.user.uid), userData);
-      await signInWithEmailAndPassword(auth, currentUserProfile.email, ''); // re-auth would be needed; simplified
-      toast('User created. Note: Re-login may be needed.','info');
+      const res = await fetch('https://us-central1-skr-learn.cloudfunctions.net/createHiraUser', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, email, password: pw, role, plantIds,
+          mobile: userData.mobile, employeeId: userData.employeeId,
+          department: userData.department, designation: userData.designation,
+          createdBy: currentUser.uid })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'User creation failed');
+      toast(`User created! They can now log in with ${email}`, 'success');
     } catch(e) {
-      toast(e.message.replace('Firebase: ',''),'error');
+      toast('Error: ' + e.message, 'error');
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Create User'; }
       return;
     }
   }
@@ -3372,22 +3381,11 @@ window.saveCompanySettings = async () => {
 
 function renderEmailSettings() {
   const s = appSettings;
-  setTimeout(fetchEmailSettingsFromCF, 100);
   return `<div class="card">
     <h3 style="margin-bottom:8px">Email / Gmail Settings</h3>
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">
-      Gmail credentials stored securely in Cloud Functions. Used to send HIRA review and action reminders.
+      Gmail credentials stored securely in Firestore. Used by Cloud Functions to send HIRA review and action reminders.
     </p>
-
-    <div style="background:var(--accent-light);border:1px solid var(--accent);border-radius:var(--radius);padding:12px 16px;margin-bottom:20px;display:flex;align-items:center;gap:10px">
-      <span style="font-size:18px">☁️</span>
-      <div>
-        <div style="font-size:12px;font-weight:600;color:var(--accent)">Cloud Function Connected</div>
-        <div style="font-size:11px;color:var(--text-secondary)">skr-learn · us-central1 · Firebase Functions</div>
-      </div>
-      <div id="cf-status" style="margin-left:auto;font-size:11px;color:var(--text-muted)">⏳ Loading...</div>
-    </div>
-
     <div class="form-row form-col-2">
       <div class="form-group">
         <label>Gmail Address</label>
@@ -3395,23 +3393,13 @@ function renderEmailSettings() {
       </div>
       <div class="form-group">
         <label>Gmail App Password <span style="font-size:10px;color:var(--text-muted)">(not your real password)</span></label>
-        <input type="password" id="s-gmail-pass" placeholder="Enter to update">
-        <small id="s-gmail-pass-hint" style="color:var(--text-muted);font-size:11px">Loading...</small>
+        <input type="password" id="s-gmail-pass" value="${escAttr(s.gmailPass||'')}" placeholder="16-character app password">
       </div>
     </div>
-
-    <div class="form-row form-col-2">
-      <div class="form-group">
-        <label>🕐 Notification Time <span style="font-size:10px;color:var(--text-muted)">(IST, 24h format)</span></label>
-        <input type="time" id="s-notif-time" value="${escAttr(s.notificationTime||'08:00')}">
-        <small style="color:var(--text-muted);font-size:11px">Daily reminder emails sent at this time (IST)</small>
-      </div>
-      <div class="form-group">
-        <label>App URL <span style="font-size:10px;color:var(--text-muted)">(used in email links)</span></label>
-        <input type="url" id="s-app-url" value="${escAttr(s.appUrl||window.location.origin)}" placeholder="https://your-app.web.app">
-      </div>
+    <div class="form-group">
+      <label>App URL (for email links)</label>
+      <input type="url" id="s-app-url" value="${escAttr(s.appUrl||window.location.origin)}" placeholder="https://your-app.web.app">
     </div>
-
     <div style="background:var(--bg-base);border-radius:var(--radius);padding:16px;margin:16px 0">
       <div style="font-size:12px;font-weight:600;margin-bottom:8px">ℹ️ How to get Gmail App Password</div>
       <ol style="font-size:12px;color:var(--text-secondary);padding-left:16px;line-height:2">
@@ -3421,112 +3409,29 @@ function renderEmailSettings() {
         <li>Copy the 16-character password and paste above</li>
       </ol>
     </div>
-
-    <div style="background:var(--bg-base);border-radius:var(--radius);padding:16px;margin-bottom:20px">
-      <div style="font-size:12px;font-weight:600;margin-bottom:10px">📅 Reminder Schedule</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-        <div>
-          <div style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">HIRA Reviews</div>
-          <div style="font-size:11px;color:var(--text-muted);line-height:2">
-            30 days before · 15 days before · 7 days before<br>On due date · Every 7 days after overdue
-          </div>
-        </div>
-        <div>
-          <div style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Action Reminders</div>
-          <div style="font-size:11px;color:var(--text-muted);line-height:2">
-            7 days before · 3 days before · 1 day before<br>On due date · Every 3 days after overdue
-          </div>
-        </div>
+    <div style="background:var(--bg-base);border-radius:var(--radius);padding:16px;margin-bottom:16px">
+      <div style="font-size:12px;font-weight:600;margin-bottom:8px">Reminder Schedule</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:2">
+        HIRA Review: 30, 15, 7 days before · on due date · every 7 days after overdue<br>
+        Actions: 7, 3, 1 day before · on due date · every 3 days after overdue
       </div>
     </div>
-
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button class="btn btn-primary" onclick="saveEmailSettingsCF()">💾 Save Settings</button>
-      <button class="btn btn-secondary" onclick="testEmailConnection()">🔌 Test Connection</button>
-      <span id="email-save-status" style="font-size:12px;color:var(--text-muted)"></span>
-    </div>
+    <button class="btn btn-primary" onclick="saveEmailSettings()">Save Email Settings</button>
   </div>`;
 }
 
-
-// ─── CLOUD FUNCTION EMAIL SETTINGS ───
-const CF_BASE = 'https://us-central1-skr-learn.cloudfunctions.net';
-
-async function fetchEmailSettingsFromCF() {
-  const statusEl = document.getElementById('cf-status');
-  const hintEl = document.getElementById('s-gmail-pass-hint');
+window.saveEmailSettings = async () => {
+  const gmailUser = document.getElementById('s-gmail-user').value.trim();
+  const gmailPass = document.getElementById('s-gmail-pass').value.trim();
+  const appUrl = document.getElementById('s-app-url').value.trim();
+  if (!gmailUser || !gmailPass) { toast('Please fill Gmail address and App Password', 'warning'); return; }
   try {
-    const res = await fetch(CF_BASE + '/getEmailSettings');
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-low)">✓ Connected</span>';
-    // Fill fields with fetched values
-    const userEl = document.getElementById('s-gmail-user');
-    const timeEl = document.getElementById('s-notif-time');
-    const urlEl  = document.getElementById('s-app-url');
-    if (userEl && data.gmailUser)        userEl.value = data.gmailUser;
-    if (timeEl && data.notificationTime) timeEl.value = data.notificationTime;
-    if (urlEl  && data.appUrl)           urlEl.value  = data.appUrl;
-    if (hintEl) hintEl.textContent = data.gmailPassword === '••••••••' ? '✓ Password is saved (leave blank to keep)' : 'Not set yet';
-  } catch(e) {
-    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-critical)">✗ Unreachable</span>';
-    if (hintEl) hintEl.textContent = 'Could not load from Cloud Function';
-    console.warn('CF fetch failed:', e);
-  }
-}
-
-window.saveEmailSettingsCF = async () => {
-  const gmailUser      = document.getElementById('s-gmail-user')?.value.trim();
-  const gmailPassword  = document.getElementById('s-gmail-pass')?.value.trim();
-  const notificationTime = document.getElementById('s-notif-time')?.value.trim();
-  const appUrl         = document.getElementById('s-app-url')?.value.trim();
-  const statusEl       = document.getElementById('email-save-status');
-
-  if (!gmailUser) { toast('Gmail address is required', 'warning'); return; }
-
-  const body = { gmailUser, appUrl, notificationTime };
-  if (gmailPassword) body.gmailPassword = gmailPassword;  // only send if changed
-
-  if (statusEl) statusEl.textContent = 'Saving...';
-  try {
-    const res = await fetch(CF_BASE + '/saveEmailSettings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Save failed');
-
-    // Also save to Firestore for local state
-    await setDoc(doc(db,'hira_settings','email'), {
-      gmailUser, appUrl, notificationTime,
-      gmailPassSet: !!gmailPassword || true,
-      updatedAt: serverTimestamp(), updatedBy: currentUser.uid
-    }, { merge: true });
-
-    appSettings = { ...appSettings, gmailUser, appUrl, notificationTime };
-    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-low)">✓ Saved at ' + new Date().toLocaleTimeString() + '</span>';
-    toast('Email settings saved to Cloud Function!', 'success');
-  } catch(e) {
-    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-critical)">✗ ' + e.message + '</span>';
-    toast('Save failed: ' + e.message, 'error');
-  }
+    await setDoc(doc(db,'hira_settings','email'), { gmailUser, gmailPass, appUrl, updatedAt: serverTimestamp(), updatedBy: currentUser.uid }, { merge: true });
+    appSettings = { ...appSettings, gmailUser, gmailPass, appUrl };
+    toast('Email settings saved!', 'success');
+    await addAuditLog('Settings', 'Email Config Updated', 'email-settings', null, 'Gmail credentials updated');
+  } catch(e) { toast('Save failed: ' + e.message, 'error'); }
 };
-
-window.testEmailConnection = async () => {
-  toast('Testing Gmail connection...', 'info');
-  try {
-    const res = await fetch(CF_BASE + '/getEmailSettings');
-    if (res.ok) {
-      toast('✓ Cloud Function reachable! Gmail will send from configured address.', 'success');
-    } else {
-      toast('Cloud Function returned error: ' + res.status, 'error');
-    }
-  } catch(e) {
-    toast('Cannot reach Cloud Function: ' + e.message, 'error');
-  }
-};
-
 
 function renderSystemInfo() {
   return `<div class="card">
