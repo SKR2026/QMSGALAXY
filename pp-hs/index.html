@@ -1444,6 +1444,7 @@ let unreadCount = 0;
 let currentPage = 'dashboard';
 let hirasListener = null;
 let actionsListener = null;
+let eaisListener = null;
 let notifListener = null;
 let editingHiraId = null;
 let editingHazards = [];
@@ -1552,7 +1553,6 @@ onAuthStateChanged(auth, async (user) => {
     }
     showApp();
     checkLicenseOnLoad(); // Check license validity
-    loadEais();
     initSidebar();
     // Test Firestore write permission on login
     setTimeout(async () => {
@@ -1704,6 +1704,7 @@ window.markAllRead = async () => {
 async function loadInitialData() {
   await loadPlants();
   setupHiraListener();
+  setupEaisListener();
   setupActionsListener();
   setupNotifListener();
   if (isAdmin()) loadAllUsers();
@@ -1821,6 +1822,29 @@ function setupActionsListener() {
   }, (e) => console.warn('Action listener error:', e));
 }
 
+function setupEaisListener() {
+  if (eaisListener) eaisListener();
+  const plantIds = getUserPlantIds();
+  if (!plantIds.length) {
+    allEais = [];
+    if (currentPage === 'dashboard') renderDashboard(currentDashTab || 'hira');
+    if (currentPage === 'eais-register') renderEaisRegister();
+    return;
+  }
+  const q = plantIds.length <= 30
+    ? query(collection(db,'eais_studies'), where('plantId','in', plantIds))
+    : query(collection(db,'eais_studies'));
+  eaisListener = onSnapshot(q, (snap) => {
+    allEais = snap.docs.map(d => ({ id:d.id, ...d.data() }))
+      .sort((a,b) => toMillis(b.createdAt) - toMillis(a.createdAt));
+    if (currentPage === 'dashboard') renderDashboard(currentDashTab || 'hira');
+    if (currentPage === 'eais-register') renderEaisRegister();
+  }, (e) => {
+    console.error('EAIS listener error:', e.code, e.message);
+    toast('Unable to load EAIS data. Check Firestore rules and connection.', 'error');
+  });
+}
+
 async function loadAllUsers() {
   const snap = await getDocs(collection(db,'hira_users'));
   allUsers = snap.docs.map(d => ({ id:d.id, ...d.data() }));
@@ -1829,6 +1853,7 @@ async function loadAllUsers() {
 function cleanupListeners() {
   if (hirasListener) { hirasListener(); hirasListener = null; }
   if (actionsListener) { actionsListener(); actionsListener = null; }
+  if (eaisListener) { eaisListener(); eaisListener = null; }
   if (notifListener) { notifListener(); notifListener = null; }
 }
 
@@ -2331,6 +2356,15 @@ function renderHiraRegister() {
         <button class="btn btn-secondary" onclick="window.print()">🖨 Print</button>
       </div>
     </div>
+    <div class="stat-grid" style="grid-template-columns:repeat(5,minmax(0,1fr))">
+      ${[
+        {label:'Total HIRAs', value:allHiras.length, cls:'blue', key:'all'},
+        {label:'Draft', value:allHiras.filter(h=>h.status==='Draft').length, cls:'', key:'Draft'},
+        {label:'Under Review', value:allHiras.filter(h=>['Submitted','Under Review','Resubmitted'].includes(h.status)).length, cls:'purple', key:'Under Review'},
+        {label:'Approved', value:allHiras.filter(h=>h.status==='Approved').length, cls:'green', key:'Approved'},
+        {label:'High Risk Hazards', value:allHiras.reduce((n,h)=>n+(h.hazards||[]).filter(z=>['High','Extreme'].includes(z.residualRiskLevel||z.initialRiskLevel)).length,0), cls:'orange', key:'High'}
+      ].map(s=>`<div class="stat-card clickable-stat ${s.cls}" onclick="dashboardHiraOpen('${s.key}')" title="Open relevant HIRA list"><div class="stat-label">${s.label}</div><div class="stat-value">${s.value}</div></div>`).join('')}
+    </div>
     <div class="filter-bar">
       <input type="text" placeholder="Search HIRA ID, activity..." style="flex:1;min-width:200px" value="${hiraFilter.search}" oninput="hiraFilter.search=this.value;hiraPagination.page=1;renderHiraTable()">
       <select onchange="hiraFilter.plant=this.value;hiraPagination.page=1;renderHiraTable()">
@@ -2376,7 +2410,10 @@ function getFilteredHiras() {
     );
   }
   if (hiraFilter.plant) list = list.filter(h=>h.plantId===hiraFilter.plant);
-  if (hiraFilter.status) list = list.filter(h=>h.status===hiraFilter.status);
+  if (hiraFilter.status) {
+    if (hiraFilter.status === 'Under Review') list = list.filter(h=>['Submitted','Under Review','Resubmitted'].includes(h.status));
+    else list = list.filter(h=>h.status===hiraFilter.status);
+  }
   if (hiraFilter.risk) list = list.filter(h=>getHiraMaxRisk(h)===hiraFilter.risk);
   if (hiraFilter.special==='expired') list = list.filter(h=>h.reviewDate&&h.status==='Approved'&&toDate(h.reviewDate)<new Date());
   return list;
