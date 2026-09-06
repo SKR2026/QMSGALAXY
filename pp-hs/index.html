@@ -1755,7 +1755,7 @@ function setupHiraListener() {
   hirasListener = onSnapshot(q, (snap) => {
     allHiras = snap.docs.map(d => ({ id:d.id, ...d.data() }));
     updateActionBadge();
-    if (currentPage === 'dashboard') renderDashboard();
+    if (currentPage === 'dashboard') renderDashboard(currentDashTab||'hira');
     if (currentPage === 'hira-register') renderHiraRegister();
     if (currentPage === 'risk-register') renderRiskRegister();
   }, (e) => console.warn('HIRA listener error:', e));
@@ -1827,7 +1827,7 @@ window.navigate = (page) => {
 
   const content = document.getElementById('main-content');
   switch(page) {
-    case 'dashboard': renderDashboard(); break;
+    case 'dashboard': renderDashboard(currentDashTab||'hira'); break;
     case 'plants': renderPlants(); break;
     case 'hira-register': renderHiraRegister(); break;
     case 'create-hira': editingHiraId = null; editingHazards = []; renderCreateHira(); break;
@@ -1845,39 +1845,52 @@ window.navigate = (page) => {
 };
 
 // ─── DASHBOARD ───
-function renderDashboard() {
+let currentDashTab = 'hira';
+
+window.switchDashTab = (tab, el) => {
+  currentDashTab = tab;
+  document.querySelectorAll('.dash-subtab').forEach(b => b.classList.remove('active'));
+  if (el) el.classList.add('active');
+  const hiraTab = document.getElementById('dash-hira');
+  const eaisTab = document.getElementById('dash-eais');
+  if (hiraTab) hiraTab.style.display = tab === 'hira' ? '' : 'none';
+  if (eaisTab) eaisTab.style.display = tab === 'eais' ? '' : 'none';
+};
+
+function renderDashboard(tab) {
+  currentDashTab = tab || currentDashTab || 'hira';
   const today = new Date();
-  const totalHiras = allHiras.length;
-  const draft = allHiras.filter(h=>h.status==='Draft').length;
-  const approved = allHiras.filter(h=>h.status==='Approved').length;
-  const underReview = allHiras.filter(h=>['Submitted','Under Review','Resubmitted'].includes(h.status)).length;
 
-  // Check expiry (review date past)
-  const expired = allHiras.filter(h => h.reviewDate && h.status === 'Approved' && toDate(h.reviewDate) < today).length;
-  const dueSoon = allHiras.filter(h => h.reviewDate && h.status === 'Approved' && daysUntil(h.reviewDate) <= 30 && daysUntil(h.reviewDate) > 0).length;
-
-  const openActions = allActions.filter(a=>['Open','In Progress'].includes(a.status)).length;
-  const overdueActions = allActions.filter(a=>a.status==='Overdue' || (a.status==='Open' && isActionOverdue(a))).length;
-  const dueThisWeek = allActions.filter(a=>['Open','In Progress'].includes(a.status) && daysUntil(a.targetDate) <= 7 && daysUntil(a.targetDate) >= 0).length;
-
-  // Gather all hazards for risk counts
-  let highRisk = 0, critRisk = 0;
-  allHiras.forEach(h => {
-    (h.hazards || []).forEach(hz => {
-      const rl = hz.residualRiskLevel || hz.initialRiskLevel || '';
-      if (rl==='High') highRisk++;
-      if (rl==='Critical') critRisk++;
-    });
-  });
-
-  // Plant table data
-  const plantTableRows = plants.map(p => {
-    const ph = allHiras.filter(h=>h.plantId===p.id);
-    const pa = allActions.filter(a=>a.plantId===p.id);
-    let phigh=0, pcrit=0;
+  // ── HIRA stats ──
+  const totalHiras    = allHiras.length;
+  const draft         = allHiras.filter(h=>h.status==='Draft').length;
+  const approved      = allHiras.filter(h=>h.status==='Approved').length;
+  const underReview   = allHiras.filter(h=>['Submitted','Under Review','Resubmitted'].includes(h.status)).length;
+  const expired       = allHiras.filter(h=>h.reviewDate&&h.status==='Approved'&&toDate(h.reviewDate)<today).length;
+  const dueSoon       = allHiras.filter(h=>h.reviewDate&&h.status==='Approved'&&daysUntil(h.reviewDate)<=30&&daysUntil(h.reviewDate)>0).length;
+  const openActions   = allActions.filter(a=>['Open','In Progress'].includes(a.status)).length;
+  const overdueActions= allActions.filter(a=>a.status==='Overdue'||(a.status==='Open'&&isActionOverdue(a))).length;
+  const dueThisWeek   = allActions.filter(a=>['Open','In Progress'].includes(a.status)&&daysUntil(a.targetDate)<=7&&daysUntil(a.targetDate)>=0).length;
+  let highRisk=0,critRisk=0;
+  allHiras.forEach(h=>(h.hazards||[]).forEach(hz=>{
+    const rl=hz.residualRiskLevel||hz.initialRiskLevel||'';
+    if(rl==='High') highRisk++;
+    if(rl==='Extreme') critRisk++;
+  }));
+  const riskCounts={Acceptable:0,Moderate:0,High:0,Extreme:0};
+  allHiras.forEach(h=>(h.hazards||[]).forEach(hz=>{
+    const rl=hz.residualRiskLevel||hz.initialRiskLevel||'Acceptable';
+    if(riskCounts[rl]!==undefined) riskCounts[rl]++;
+  }));
+  const maxRisk=Math.max(...Object.values(riskCounts),1);
+  const recentHiras=allHiras.slice(0,5);
+  const plantTableRows=plants.map(p=>{
+    const ph=allHiras.filter(h=>h.plantId===p.id);
+    const pa=allActions.filter(a=>a.plantId===p.id);
+    let phigh=0,pcrit=0;
     ph.forEach(h=>(h.hazards||[]).forEach(hz=>{
-      if ((hz.residualRiskLevel||hz.initialRiskLevel)==='High') phigh++;
-      if ((hz.residualRiskLevel||hz.initialRiskLevel)==='Extreme') pcrit++;
+      if((hz.residualRiskLevel||hz.initialRiskLevel)==='High') phigh++;
+      if((hz.residualRiskLevel||hz.initialRiskLevel)==='Extreme') pcrit++;
     }));
     return `<tr>
       <td><strong>${escHtml(p.name)}</strong></td>
@@ -1891,114 +1904,204 @@ function renderDashboard() {
     </tr>`;
   }).join('');
 
-  // Risk distribution for bar chart
-  const riskCounts = {Low:0,Medium:0,High:0,Critical:0};
-  allHiras.forEach(h=>(h.hazards||[]).forEach(hz=>{
-    const rl = hz.residualRiskLevel || hz.initialRiskLevel || 'Low';
-    if(riskCounts[rl]!==undefined) riskCounts[rl]++;
-  }));
-  const maxRisk = Math.max(...Object.values(riskCounts), 1);
+  // ── EAIS stats ──
+  const totalEais      = allEais.length;
+  const eaisDraft      = allEais.filter(e=>e.status==='Draft').length;
+  const eaisApproved   = allEais.filter(e=>e.status==='Approved').length;
+  const eaisReview     = allEais.filter(e=>e.status==='Submitted').length;
+  const eaisHighSig    = allEais.filter(e=>(e.aspects||[]).some(a=>getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving)==='Highly Significant')).length;
+  const eaisLegal      = allEais.filter(e=>(e.aspects||[]).some(a=>a.isLegal)).length;
+  const eaisEmergency  = allEais.filter(e=>(e.aspects||[]).some(a=>a.isEmergency)).length;
+  const totalAspects   = allEais.reduce((s,e)=>s+(e.aspects||[]).length,0);
+  const highAspects    = allEais.reduce((s,e)=>s+(e.aspects||[]).filter(a=>getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving)==='Highly Significant').length,0);
+  const eaisPlantRows  = plants.map(p=>{
+    const pe=allEais.filter(e=>e.plantId===p.id);
+    const ha=pe.reduce((s,e)=>s+(e.aspects||[]).filter(a=>getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving)==='Highly Significant').length,0);
+    return `<tr>
+      <td><strong>${escHtml(p.name)}</strong></td>
+      <td>${pe.length}</td>
+      <td>${pe.filter(e=>e.status==='Approved').length}</td>
+      <td>${pe.reduce((s,e)=>s+(e.aspects||[]).length,0)}</td>
+      <td><span style="color:var(--risk-critical)">${ha}</span></td>
+      <td>${pe.filter(e=>(e.aspects||[]).some(a=>a.isLegal)).length}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="navigate('eais-register')">View →</button></td>
+    </tr>`;
+  }).join('');
 
-  // Recent HIRAs
-  const recentHiras = allHiras.slice(0,5);
+  const recentEais=allEais.slice(0,5);
+  const sigCounts={'Less Significant':0,'Highly Significant':0};
+  allEais.forEach(e=>(e.aspects||[]).forEach(a=>{
+    const lv=getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving);
+    if(sigCounts[lv]!==undefined) sigCounts[lv]++;
+  }));
+  const maxSig=Math.max(...Object.values(sigCounts),1);
 
   document.getElementById('main-content').innerHTML = `
-    <div class="stat-grid">
-      <div class="stat-card blue">
-        <div class="stat-label">Total HIRAs</div>
-        <div class="stat-value">${totalHiras}</div>
-        <div class="stat-change">${plants.length} plant(s)</div>
-      </div>
-      <div class="stat-card" style="--after-bg:var(--status-draft)">
-        <div class="stat-label">Draft</div>
-        <div class="stat-value" style="color:var(--text-secondary)">${draft}</div>
-        <div class="stat-change">Pending submission</div>
-      </div>
-      <div class="stat-card purple">
-        <div class="stat-label">Under Review</div>
-        <div class="stat-value" style="color:#a855f7">${underReview}</div>
-        <div class="stat-change">Awaiting decision</div>
-      </div>
-      <div class="stat-card green">
-        <div class="stat-label">Approved</div>
-        <div class="stat-value" style="color:var(--risk-low)">${approved}</div>
-        <div class="stat-change">Active HIRAs</div>
-      </div>
-      <div class="stat-card red">
-        <div class="stat-label">Expired</div>
-        <div class="stat-value" style="color:var(--risk-critical)">${expired}</div>
-        <div class="stat-change">${dueSoon} due within 30 days</div>
-      </div>
-      <div class="stat-card orange">
-        <div class="stat-label">High Risk</div>
-        <div class="stat-value" style="color:var(--risk-high)">${highRisk}</div>
-        <div class="stat-change"><span style="color:var(--risk-critical)">${critRisk} Critical</span></div>
-      </div>
-      <div class="stat-card blue">
-        <div class="stat-label">Open Actions</div>
-        <div class="stat-value">${openActions}</div>
-        <div class="stat-change">${dueThisWeek} due this week</div>
-      </div>
-      <div class="stat-card red">
-        <div class="stat-label">Overdue Actions</div>
-        <div class="stat-value" style="color:var(--risk-critical)">${overdueActions}</div>
-        <div class="stat-change">Require immediate attention</div>
-      </div>
-    </div>
-
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px" class="dash-charts">
-      <div class="card">
-        <div class="d-flex align-center gap-8 mb-16">
-          <strong>Hazard Risk Distribution</strong>
-        </div>
-        <div class="chart-area" style="padding-bottom:32px">
-          ${Object.entries(riskCounts).map(([lvl,cnt])=>`
-            <div class="chart-bar" style="height:${(cnt/maxRisk*100)||4}%;background:${getRiskColor(lvl)};position:relative">
-              <div class="chart-bar-value">${cnt}</div>
-              <div class="chart-bar-label">${lvl}</div>
-            </div>
-          `).join('')}
-        </div>
-      </div>
-      <div class="card">
-        <div class="d-flex align-center gap-8 mb-16">
-          <strong>Action Status</strong>
-        </div>
-        ${renderDonutLegend()}
-      </div>
-    </div>
-
-    <div class="card" style="margin-bottom:20px">
-      <div class="d-flex align-center gap-16 mb-16">
-        <strong>Plant-wise Summary</strong>
-        <span class="text-muted" style="font-size:12px">${plants.length} active plants</span>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr>
-            <th>Plant</th><th>Total HIRAs</th><th>Approved</th><th>High Risk</th><th>Critical Risk</th><th>Open Actions</th><th>Overdue</th><th></th>
-          </tr></thead>
-          <tbody>${plantTableRows || '<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No plants found. Create plants first.</td></tr>'}</tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="d-flex align-center gap-16 mb-16">
-        <strong>Recent HIRAs</strong>
-        <button class="btn btn-ghost btn-sm" onclick="navigate('hira-register')">View all →</button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>HIRA ID</th><th>Plant</th><th>Activity</th><th>Type</th><th>Risk Level</th><th>Status</th><th>Assessment Date</th><th></th></tr></thead>
-          <tbody>${recentHiras.map(h=>hiraTableRow(h)).join('') || '<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No HIRAs yet. Create your first HIRA.</td></tr>'}</tbody>
-        </table>
-      </div>
-    </div>
-
     <style>
+      .dash-subtabs{display:flex;gap:0;border-bottom:2px solid var(--border);margin-bottom:24px}
+      .dash-subtab{padding:10px 24px;background:transparent;border:none;border-bottom:3px solid transparent;margin-bottom:-2px;font-family:var(--font);font-size:13px;font-weight:600;cursor:pointer;color:var(--text-secondary);transition:all .15s;display:flex;align-items:center;gap:8px}
+      .dash-subtab:hover{color:var(--text-primary)}
+      .dash-subtab.active{color:var(--accent);border-bottom-color:var(--accent)}
+      .dash-subtab .sub-badge{font-size:10px;font-weight:700;padding:1px 6px;border-radius:10px;background:var(--accent-light);color:var(--accent)}
+      .dash-subtab.eais-tab.active{color:#16a34a;border-bottom-color:#16a34a}
+      .dash-subtab.eais-tab .sub-badge{background:rgba(22,163,74,0.1);color:#16a34a}
       @media(max-width:768px){.dash-charts{grid-template-columns:1fr!important}}
     </style>
+
+    <div class="dash-subtabs">
+      <button class="dash-subtab ${currentDashTab==='hira'?'active':''}" onclick="switchDashTab('hira',this)">
+        ⚠️ HIRA Dashboard <span class="sub-badge">${totalHiras}</span>
+      </button>
+      <button class="dash-subtab eais-tab ${currentDashTab==='eais'?'active':''}" onclick="switchDashTab('eais',this)">
+        🌿 EAIS Dashboard <span class="sub-badge">${totalEais}</span>
+      </button>
+    </div>
+
+    <!-- ═══ HIRA TAB ═══ -->
+    <div id="dash-hira" style="display:${currentDashTab==='hira'?'':'none'}">
+      <div class="stat-grid">
+        <div class="stat-card blue"><div class="stat-label">Total HIRAs</div><div class="stat-value">${totalHiras}</div><div class="stat-change">${plants.length} plant(s)</div></div>
+        <div class="stat-card"><div class="stat-label">Draft</div><div class="stat-value" style="color:var(--text-secondary)">${draft}</div><div class="stat-change">Pending submission</div></div>
+        <div class="stat-card purple"><div class="stat-label">Under Review</div><div class="stat-value" style="color:#a855f7">${underReview}</div><div class="stat-change">Awaiting decision</div></div>
+        <div class="stat-card green"><div class="stat-label">Approved</div><div class="stat-value" style="color:var(--risk-low)">${approved}</div><div class="stat-change">Active HIRAs</div></div>
+        <div class="stat-card red"><div class="stat-label">Expired</div><div class="stat-value" style="color:var(--risk-critical)">${expired}</div><div class="stat-change">${dueSoon} due within 30 days</div></div>
+        <div class="stat-card orange"><div class="stat-label">High Risk Hazards</div><div class="stat-value" style="color:var(--risk-high)">${highRisk}</div><div class="stat-change"><span style="color:var(--risk-critical)">${critRisk} Extreme</span></div></div>
+        <div class="stat-card blue"><div class="stat-label">Open Actions</div><div class="stat-value">${openActions}</div><div class="stat-change">${dueThisWeek} due this week</div></div>
+        <div class="stat-card red"><div class="stat-label">Overdue Actions</div><div class="stat-value" style="color:var(--risk-critical)">${overdueActions}</div><div class="stat-change">Require immediate attention</div></div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px" class="dash-charts">
+        <div class="card">
+          <div class="d-flex align-center gap-8 mb-16"><strong>Hazard Risk Distribution</strong></div>
+          <div class="chart-area" style="padding-bottom:32px">
+            ${Object.entries(riskCounts).map(([lvl,cnt])=>`
+              <div class="chart-bar" style="height:${(cnt/maxRisk*100)||4}%;background:${getRiskColor(lvl)};position:relative">
+                <div class="chart-bar-value">${cnt}</div>
+                <div class="chart-bar-label">${lvl}</div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+        <div class="card">
+          <div class="d-flex align-center gap-8 mb-16"><strong>Action Status</strong></div>
+          ${renderDonutLegend()}
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:20px">
+        <div class="d-flex align-center gap-16 mb-16">
+          <strong>Plant-wise HIRA Summary</strong>
+          <span style="font-size:12px;color:var(--text-muted)">${plants.length} plants</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Plant</th><th>Total HIRAs</th><th>Approved</th><th>High Risk</th><th>Extreme Risk</th><th>Open Actions</th><th>Overdue</th><th></th></tr></thead>
+            <tbody>${plantTableRows||'<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No plants found.</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="d-flex align-center gap-16 mb-16">
+          <strong>Recent HIRAs</strong>
+          <button class="btn btn-ghost btn-sm" onclick="navigate('hira-register')">View all →</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>HIRA ID</th><th>Plant</th><th>Activity</th><th>Type</th><th>Risk Level</th><th>Status</th><th>Date</th><th></th></tr></thead>
+            <tbody>${recentHiras.map(h=>hiraTableRow(h)).join('')||'<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No HIRAs yet.</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ EAIS TAB ═══ -->
+    <div id="dash-eais" style="display:${currentDashTab==='eais'?'':'none'}">
+      <div class="stat-grid">
+        <div class="stat-card" style="border-top:3px solid #16a34a"><div class="stat-label">Total Studies</div><div class="stat-value" style="color:#16a34a">${totalEais}</div><div class="stat-change">${totalAspects} total aspects</div></div>
+        <div class="stat-card"><div class="stat-label">Draft</div><div class="stat-value" style="color:var(--text-secondary)">${eaisDraft}</div><div class="stat-change">Pending submission</div></div>
+        <div class="stat-card purple"><div class="stat-label">Under Review</div><div class="stat-value" style="color:#a855f7">${eaisReview}</div><div class="stat-change">Awaiting decision</div></div>
+        <div class="stat-card green"><div class="stat-label">Approved</div><div class="stat-value" style="color:var(--risk-low)">${eaisApproved}</div><div class="stat-change">Active studies</div></div>
+        <div class="stat-card red"><div class="stat-label">Highly Significant</div><div class="stat-value" style="color:var(--risk-critical)">${highAspects}</div><div class="stat-change">${eaisHighSig} studies affected</div></div>
+        <div class="stat-card orange"><div class="stat-label">Legal Concerns</div><div class="stat-value" style="color:var(--risk-medium)">${eaisLegal}</div><div class="stat-change">Studies with LC aspects</div></div>
+        <div class="stat-card red"><div class="stat-label">Emergency Aspects</div><div class="stat-value" style="color:var(--risk-critical)">${eaisEmergency}</div><div class="stat-change">Studies with E condition</div></div>
+        <div class="stat-card blue"><div class="stat-label">Total Aspects</div><div class="stat-value">${totalAspects}</div><div class="stat-change">Across all studies</div></div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px" class="dash-charts">
+        <div class="card">
+          <div class="d-flex align-center gap-8 mb-16"><strong>Aspect Significance Distribution</strong></div>
+          <div class="chart-area" style="padding-bottom:32px">
+            ${Object.entries(sigCounts).map(([lvl,cnt])=>`
+              <div class="chart-bar" style="height:${(cnt/maxSig*100)||4}%;background:${getEaisLevelColor(lvl)};position:relative">
+                <div class="chart-bar-value">${cnt}</div>
+                <div class="chart-bar-label" style="font-size:9px;white-space:nowrap">${lvl==='Highly Significant'?'High Sig':'Less Sig'}</div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+        <div class="card">
+          <div class="d-flex align-center gap-8 mb-16"><strong>Override Criteria Breakdown</strong></div>
+          <div style="display:flex;flex-direction:column;gap:14px;padding:8px 0">
+            ${[
+              {label:'⚖️ Legal Concern (LC)', val:allEais.reduce((s,e)=>s+(e.aspects||[]).filter(a=>a.isLegal).length,0), color:'var(--risk-medium)'},
+              {label:'🚨 Emergency (E)', val:allEais.reduce((s,e)=>s+(e.aspects||[]).filter(a=>a.isEmergency).length,0), color:'var(--risk-critical)'},
+              {label:'💰 Resource Saving >₹50K', val:allEais.reduce((s,e)=>s+(e.aspects||[]).filter(a=>a.resourceSaving).length,0), color:'#16a34a'},
+            ].map(({label,val,color})=>{
+              const pct=totalAspects?Math.round(val/totalAspects*100):0;
+              return `<div>
+                <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+                  <span>${label}</span><span style="font-weight:700;color:${color}">${val} (${pct}%)</span>
+                </div>
+                <div style="height:6px;background:var(--bg-hover);border-radius:3px">
+                  <div style="height:6px;width:${pct}%;background:${color};border-radius:3px;transition:width .4s"></div>
+                </div>
+              </div>`;
+            }).join('')}
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:20px">
+        <div class="d-flex align-center gap-16 mb-16">
+          <strong>Plant-wise EAIS Summary</strong>
+          <span style="font-size:12px;color:var(--text-muted)">${plants.length} plants</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Plant</th><th>Total Studies</th><th>Approved</th><th>Total Aspects</th><th>Highly Significant</th><th>Legal Concerns</th><th></th></tr></thead>
+            <tbody>${eaisPlantRows||'<tr><td colspan="7" style="text-align:center;color:var(--text-muted)">No plants found.</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="d-flex align-center gap-16 mb-16">
+          <strong>Recent EAIS Studies</strong>
+          <button class="btn btn-ghost btn-sm" onclick="navigate('eais-register')">View all →</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>EAIS ID</th><th>Plant</th><th>Activity</th><th>Type</th><th>Aspects</th><th>Highly Sig</th><th>Status</th><th>Date</th><th></th></tr></thead>
+            <tbody>${recentEais.map(e=>{
+              const plant=plants.find(p=>p.id===e.plantId);
+              const hSig=(e.aspects||[]).filter(a=>getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving)==='Highly Significant').length;
+              return `<tr>
+                <td style="font-family:var(--font-mono);font-size:12px"><a href="#" onclick="viewEais('${e.id}')">${escHtml(e.eaisId||e.id.slice(0,8))}</a></td>
+                <td style="font-size:12px">${escHtml(plant?.name||'—')}</td>
+                <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(e.activity||'—')}</td>
+                <td style="font-size:12px">${escHtml(e.eaisType||'—')}</td>
+                <td style="text-align:center">${(e.aspects||[]).length}</td>
+                <td style="text-align:center">${hSig>0?`<span class="badge badge-critical">${hSig}</span>`:'<span style="color:var(--text-muted)">—</span>'}</td>
+                <td><span class="badge badge-${(e.status||'draft').toLowerCase()}">${e.status||'Draft'}</span></td>
+                <td style="font-size:12px">${formatDate(e.assessmentDate||e.createdAt)}</td>
+                <td><button class="btn btn-ghost btn-sm" onclick="viewEais('${e.id}')">View</button></td>
+              </tr>`;
+            }).join('')||'<tr><td colspan="9" style="text-align:center;color:var(--text-muted)">No EAIS studies yet.</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -3490,8 +3593,8 @@ window.toggleUserStatus = async (uid, currentStatus) => {
 // ─── SETTINGS ───
 function renderSettings() {
   const tabs = isSuperAdmin()
-    ? [['🎯','Risk Matrix'],['🏢','Company & Logo'],['📧','Email / Gmail'],['👥','User Management'],['🔑','License'],['ℹ️','System Info'],['👤','My Profile']]
-    : [['🎯','Risk Matrix'],['ℹ️','System Info'],['👤','My Profile']];
+    ? [['🎯','Risk Matrix'],['🌿','EAIS Matrix'],['🏢','Company & Logo'],['📧','Email / Gmail'],['👥','User Management'],['🔑','License'],['ℹ️','System Info'],['👤','My Profile']]
+    : [['🎯','Risk Matrix'],['🌿','EAIS Matrix'],['ℹ️','System Info'],['👤','My Profile']];
   document.getElementById('main-content').innerHTML = `
     <div class="page-header"><div class="page-header-left"><h1>Settings</h1><p>Configure system preferences</p></div></div>
     <div style="display:grid;grid-template-columns:220px 1fr;gap:20px">
@@ -3516,6 +3619,7 @@ window.switchSettingsTab = (el, tab) => {
   el.classList.add('active');
   const map = {
     RiskMatrix: renderRiskMatrixSettings,
+    EAISMatrix: renderEaisMatrixSettings,
     CompanyLogo: renderCompanySettings,
     EmailGmail: renderEmailSettings,
     UserManagement: () => { renderUsers(); return ''; },
@@ -3554,6 +3658,80 @@ function renderRiskMatrixSettings() {
       </div>
     </div>
   `;
+}
+
+function renderEaisMatrixSettings() {
+  return `<div class="card">
+    <h3 style="margin-bottom:4px;font-size:16px">🌿 EAIS Significance Matrix — SSPDC Method</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">
+      Environment Aspect & Impact Study significance rating based on SSPDC score.<br>
+      <strong>SSPDC = Scale × Severity(Consumption) × Severity(Release) × Probability × Detection × Control</strong>
+    </p>
+
+    <div style="overflow-x:auto;margin-bottom:20px">
+      <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:700px">
+        <thead>
+          <tr style="background:var(--accent);color:#fff">
+            <th style="padding:10px;text-align:center;border:1px solid var(--border)" rowspan="2">Rating</th>
+            <th style="padding:10px;text-align:center;border:1px solid var(--border)">Scale (S)</th>
+            <th style="padding:10px;text-align:center;border:1px solid var(--border)" colspan="2">Severity (S)</th>
+            <th style="padding:10px;text-align:center;border:1px solid var(--border)">Probability (P)</th>
+            <th style="padding:10px;text-align:center;border:1px solid var(--border)">Detection / Duration (D)</th>
+            <th style="padding:10px;text-align:center;border:1px solid var(--border)">Control (C)</th>
+          </tr>
+          <tr style="background:var(--accent-light)">
+            <th style="padding:8px;text-align:center;border:1px solid var(--border)"></th>
+            <th style="padding:8px;text-align:center;border:1px solid var(--border)">Consumption</th>
+            <th style="padding:8px;text-align:center;border:1px solid var(--border)">Releases</th>
+            <th style="padding:8px;text-align:center;border:1px solid var(--border)"></th>
+            <th style="padding:8px;text-align:center;border:1px solid var(--border)"></th>
+            <th style="padding:8px;text-align:center;border:1px solid var(--border)"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${[1,2,3,4].map(r=>`
+          <tr style="border:1px solid var(--border);${r%2===0?'background:var(--bg-hover)':''}">
+            <td style="padding:10px;text-align:center;font-weight:700;font-size:16px;border:1px solid var(--border);background:var(--accent-light);color:var(--accent)">${r}</td>
+            <td style="padding:8px;border:1px solid var(--border);font-size:11px">${SSPDC_LABELS.scale[r]}</td>
+            <td style="padding:8px;border:1px solid var(--border);font-size:11px">${SSPDC_LABELS.sev_cons[r]}</td>
+            <td style="padding:8px;border:1px solid var(--border);font-size:11px">${SSPDC_LABELS.sev_rel[r]}</td>
+            <td style="padding:8px;border:1px solid var(--border);font-size:11px">${SSPDC_LABELS.prob[r]}</td>
+            <td style="padding:8px;border:1px solid var(--border);font-size:11px">${SSPDC_LABELS.detection[r]}</td>
+            <td style="padding:8px;border:1px solid var(--border);font-size:11px">${SSPDC_LABELS.control[r]}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+      <div style="background:rgba(34,197,94,0.08);border:1px solid var(--risk-low);border-radius:var(--radius);padding:16px">
+        <div style="font-size:13px;font-weight:700;color:var(--risk-low);margin-bottom:8px">✅ Less Significant</div>
+        <div style="font-size:12px;color:var(--text-secondary)">SSPDC Score <strong>≤ 162</strong><br>No override criteria applies</div>
+      </div>
+      <div style="background:rgba(239,68,68,0.08);border:1px solid var(--risk-critical);border-radius:var(--radius);padding:16px">
+        <div style="font-size:13px;font-weight:700;color:var(--risk-critical);margin-bottom:8px">🔴 Highly Significant</div>
+        <div style="font-size:12px;color:var(--text-secondary)">SSPDC Score <strong>≥ 163</strong><br>OR any override criteria applies</div>
+      </div>
+    </div>
+
+    <div style="background:var(--bg-hover);border-radius:var(--radius);padding:16px">
+      <div style="font-size:12px;font-weight:700;margin-bottom:10px;color:var(--risk-critical)">⚡ Override Criteria — Always Highly Significant</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;font-size:12px">
+        <div style="background:var(--bg-card);border-radius:var(--radius);padding:12px;border-left:3px solid var(--risk-critical)">
+          <div style="font-weight:600;margin-bottom:4px">⚖️ Legal Concern (LC)</div>
+          <div style="color:var(--text-secondary)">If the aspect is a legal concern, it shall be treated as Highly Significant irrespective of SSPDC score.</div>
+        </div>
+        <div style="background:var(--bg-card);border-radius:var(--radius);padding:12px;border-left:3px solid var(--risk-critical)">
+          <div style="font-weight:600;margin-bottom:4px">🚨 Emergency (E)</div>
+          <div style="color:var(--text-secondary)">If 'E' appears in the N(normal)/A(abnormal)/E(emergency) column, it is Highly Significant.</div>
+        </div>
+        <div style="background:var(--bg-card);border-radius:var(--radius);padding:12px;border-left:3px solid var(--risk-critical)">
+          <div style="font-weight:600;margin-bottom:4px">💰 Resource Saving Potential</div>
+          <div style="color:var(--text-secondary)">If resource saving potential is &gt; ₹50,000 per annum, treat as Highly Significant.</div>
+        </div>
+      </div>
+    </div>
+  </div>`;
 }
 
 function renderCompanySettings() {
@@ -4764,22 +4942,33 @@ const ENVIRONMENTAL_IMPACTS = [
 const IMPACT_CONDITIONS = ['Normal','Abnormal','Emergency'];
 const LEGAL_REQUIREMENTS = ['Yes','No','Partially'];
 
-// ── Significance: Severity × Frequency × Legal × Scale (each 1-3) ──
-// Score: 1-27 | Low:<6 | Medium:6-12 | High:>12
-function calcEaisScore(severity, frequency, legal, scale) {
-  return severity * frequency * legal * scale;
+// ── SSPDC Significance: Scale × Severity × Probability × Detection × Control (each 1-4) ──
+// Max score: 4^5 = 1024 | ≤162 = Less Significant | ≥163 = Highly Significant
+// Override criteria (always Highly Significant): Legal Concern, Emergency condition, Resource Saving >₹50K
+const SSPDC_LABELS = {
+  scale:     ['','Low/Upto+3% of optimum/specified limit','Moderate/Upto+6% of optimum/specified limit','Medium/Upto+9% of optimum/specified limit','High/Upto+12% of optimum/specified limit'],
+  sev_cons:  ['','Easily renewed i.e. grass','Recycled i.e. paper/metal','Deplete able i.e. oil, water','Critically scarce i.e. uranium, gold'],
+  sev_rel:   ['','Causes nuisance or slight impact','Impact leads to risk (env/health) in long term','Impact leads to risk (env/health) in short term','Impact may lead to fatal injury/risk to life'],
+  prob:      ['','Event occurring less than once a year','Event occurring once every month','Event occurring once a week','Event occurring almost every day/shift'],
+  detection: ['','Immediate/within 2 Hrs','Within 8 Hrs','Within 24 Hrs','More than 24 hrs'],
+  control:   ['','Poka Yoke/Automatic Control','Manual Control','Control in place but not reliable','Absence or not effective control']
+};
+
+function calcEaisScore(scale, sevCons, sevRel, prob, detection, control) {
+  if (!scale||!sevCons||!sevRel||!prob||!detection||!control) return 0;
+  return scale * sevCons * sevRel * prob * detection * control;
 }
-function getEaisLevel(score) {
-  if (!score) return '';
-  if (score <= 5)  return 'Low';
-  if (score <= 12) return 'Medium';
-  return 'High';
+function getEaisLevel(score, isLegal, isEmergency, resourceSaving) {
+  if (!score && !isLegal && !isEmergency && !resourceSaving) return '';
+  // Override criteria — always Highly Significant
+  if (isLegal || isEmergency || resourceSaving) return 'Highly Significant';
+  return score >= 163 ? 'Highly Significant' : 'Less Significant';
 }
 function getEaisLevelColor(level) {
-  return { Low:'var(--risk-low)', Medium:'var(--risk-medium)', High:'var(--risk-critical)' }[level] || 'var(--text-muted)';
+  return { 'Less Significant':'var(--risk-low)', 'Highly Significant':'var(--risk-critical)' }[level] || 'var(--text-muted)';
 }
 function getEaisBadgeClass(level) {
-  return { Low:'badge-low', Medium:'badge-medium', High:'badge-high' }[level] || '';
+  return { 'Less Significant':'badge-low', 'Highly Significant':'badge-critical' }[level] || '';
 }
 function generateEaisId() {
   const y = new Date().getFullYear();
@@ -4822,7 +5011,7 @@ function renderEaisRegister() {
         {label:'Draft', value:allEais.filter(e=>e.status==='Draft').length, cls:''},
         {label:'Submitted', value:allEais.filter(e=>e.status==='Submitted').length, cls:'purple'},
         {label:'Approved', value:allEais.filter(e=>e.status==='Approved').length, cls:'green'},
-        {label:'High Significance', value:allEais.filter(e=>(e.aspects||[]).some(a=>getEaisLevel(a.significanceScore)==='High')).length, cls:'red'}
+        {label:'Highly Significant', value:allEais.filter(e=>(e.aspects||[]).some(a=>getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving)==='Highly Significant')).length, cls:'red'}
       ].map(s=>`<div class="stat-card ${s.cls}"><div class="stat-label">${s.label}</div><div class="stat-value">${s.value}</div></div>`).join('')}
     </div>
 
@@ -4876,7 +5065,7 @@ function renderEaisTable() {
 
   tbody.innerHTML = paged.map(e => {
     const plant = plants.find(p=>p.id===e.plantId);
-    const highCount = (e.aspects||[]).filter(a=>getEaisLevel(a.significanceScore)==='High').length;
+    const highCount = (e.aspects||[]).filter(a=>getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving)==='Highly Significant').length;
     return `<tr>
       <td style="font-family:var(--font-mono);font-size:12px">
         <a href="#" onclick="viewEais('${e.id}')">${escHtml(e.eaisId||e.id.slice(0,8))}</a>
@@ -5009,8 +5198,8 @@ function renderCreateEais() {
         <button class="btn btn-secondary btn-sm" onclick="downloadAspectTemplate()" style="margin-left:auto">⬇ Template</button>
       </div>
       <div style="background:var(--accent-light);border-radius:var(--radius);padding:10px 14px;margin-bottom:14px;font-size:12px;color:var(--text-secondary)">
-        💡 Score = <strong>Severity × Frequency × Legal × Scale</strong> (each 1–3) &nbsp;|&nbsp;
-        &lt;6 = Low &nbsp;|&nbsp; 6–12 = Medium &nbsp;|&nbsp; &gt;12 = High
+        💡 SSPDC = <strong>Scale × Severity (Consumption) × Severity (Release) × Probability × Detection × Control</strong> (each 1–4, max 1024) &nbsp;|&nbsp;
+        ≤162 = Less Significant &nbsp;|&nbsp; ≥163 = Highly Significant &nbsp;|&nbsp; Overrides: Legal / Emergency / Resource &gt;₹50K
       </div>
       <div id="aspect-list">${renderAspectCards()}</div>
     </div>
@@ -5042,31 +5231,35 @@ function renderAspectCards() {
       <p>Click "Add Aspect" to identify environmental aspects for this activity.</p>
     </div>`;
   return editingAspects.map((a,i) => {
-    const score = a.significanceScore;
-    const level = getEaisLevel(score);
+    const score = a.sspdc || 0;
+    const level = getEaisLevel(score, a.isLegal, a.isEmergency, a.resourceSaving);
     const color = getEaisLevelColor(level);
+    const overrides = [a.isLegal&&'⚖️ Legal',a.isEmergency&&'🚨 Emergency',a.resourceSaving&&'💰 Resource>₹50K'].filter(Boolean).join(' · ');
     return `<div class="card" style="margin-bottom:12px;border-left:3px solid ${color}">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
         <div>
           <div style="font-weight:600;font-size:14px">${escHtml(a.aspect||'—')}</div>
           <div style="font-size:12px;color:var(--text-secondary);margin-top:2px">
-            ${escHtml(a.impact||'—')} · ${escHtml(a.condition||'Normal')}
+            ${escHtml(a.impact||'—')} · <span style="font-weight:500">${escHtml(a.condition||'Normal')}</span>
+            ${overrides?`· <span style="color:var(--risk-critical)">${overrides}</span>`:''}
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:10px">
-          ${score?`<div style="text-align:center">
-            <div style="font-size:20px;font-weight:700;color:${color}">${score}</div>
-            <div style="font-size:10px;color:${color};font-weight:600">${level}</div>
+          ${level?`<div style="text-align:center;min-width:80px">
+            <div style="font-size:18px;font-weight:700;color:${color}">${score||'—'}</div>
+            <div style="font-size:10px;color:${color};font-weight:600;white-space:nowrap">${level}</div>
           </div>`:''}
           <button class="btn btn-ghost btn-sm" onclick="editAspect(${i})">✏️ Edit</button>
           <button class="btn btn-ghost btn-sm" style="color:var(--risk-critical)" onclick="removeAspect(${i})">✕</button>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px;font-size:11px">
-        <div><span style="color:var(--text-muted)">Severity</span><br><strong>${a.severity||'—'}/3</strong></div>
-        <div><span style="color:var(--text-muted)">Frequency</span><br><strong>${a.frequency||'—'}/3</strong></div>
-        <div><span style="color:var(--text-muted)">Legal</span><br><strong>${a.legal||'—'}/3</strong></div>
-        <div><span style="color:var(--text-muted)">Scale</span><br><strong>${a.scale||'—'}/3</strong></div>
+      <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-top:12px;font-size:10px">
+        <div><span style="color:var(--text-muted)">Scale</span><br><strong>${a.scale||'—'}/4</strong></div>
+        <div><span style="color:var(--text-muted)">Sev(Cons)</span><br><strong>${a.sevConsumption||'—'}/4</strong></div>
+        <div><span style="color:var(--text-muted)">Sev(Rel)</span><br><strong>${a.sevRelease||'—'}/4</strong></div>
+        <div><span style="color:var(--text-muted)">Probability</span><br><strong>${a.probability||'—'}/4</strong></div>
+        <div><span style="color:var(--text-muted)">Detection</span><br><strong>${a.detection||'—'}/4</strong></div>
+        <div><span style="color:var(--text-muted)">Control</span><br><strong>${a.control||'—'}/4</strong></div>
       </div>
       ${a.controlMeasure?`<div style="margin-top:8px;font-size:12px;color:var(--text-secondary)">🔧 ${escHtml(a.controlMeasure)}</div>`:''}
     </div>`;
@@ -5078,13 +5271,12 @@ window.addAspect = () => editAspect(-1);
 
 window.editAspect = (idx) => {
   const a = idx >= 0 ? { ...editingAspects[idx] } : {};
-  const sevOpts = (sel) => [1,2,3].map(v=>`<option value="${v}" ${a[sel]==v?'selected':''}>${v} – ${
-    sel==='severity'?['','Minor — local/short-term','Moderate — regional/medium-term','Severe — widespread/long-term'][v]:
-    sel==='frequency'?['','Rare — <once/year','Occasional — monthly/weekly','Frequent — daily'][v]:
-    sel==='legal'?['','No legal req.','Partial/indirect legal req.','Direct legal/permit req.'][v]:
-    ['','Local impact','Site-wide impact','Off-site/community impact'][v]}</option>`).join('');
+  const mkOpts = (key, val) => SSPDC_LABELS[key].slice(1).map((label,i)=>{
+    const v=i+1;
+    return `<option value="${v}" ${val==v?'selected':''}>${v} – ${label}</option>`;
+  }).join('');
 
-  openModal('aspectModal','🌿 Aspect & Impact Entry',`
+  openModal('aspectModal','🌿 SSPDC Aspect & Impact Entry',`
     <div class="form-row form-col-2">
       <div class="form-group">
         <label>Environmental Aspect *</label>
@@ -5101,64 +5293,98 @@ window.editAspect = (idx) => {
         </select>
       </div>
     </div>
+
     <div class="form-row form-col-3">
       <div class="form-group">
-        <label>Condition</label>
-        <select id="af-condition">
+        <label>Condition (N/A/E)</label>
+        <select id="af-condition" onchange="calcAspectScore()">
           ${IMPACT_CONDITIONS.map(x=>`<option value="${x}" ${a.condition===x?'selected':''}>${x}</option>`).join('')}
         </select>
+        <small style="color:var(--text-muted);font-size:10px">Emergency = auto Highly Significant</small>
       </div>
       <div class="form-group">
-        <label>Legal Requirement</label>
-        <select id="af-legal-req">
-          ${LEGAL_REQUIREMENTS.map(x=>`<option value="${x}" ${a.legalRequirement===x?'selected':''}>${x}</option>`).join('')}
+        <label>Legal Concern (LC)</label>
+        <select id="af-is-legal" onchange="calcAspectScore()">
+          <option value="0" ${!a.isLegal?'selected':''}>No</option>
+          <option value="1" ${a.isLegal?'selected':''}>Yes — Legal Concern</option>
         </select>
+        <small style="color:var(--text-muted);font-size:10px">LC = auto Highly Significant</small>
       </div>
       <div class="form-group">
-        <label>Applicable Regulation</label>
-        <input type="text" id="af-regulation" value="${escAttr(a.regulation||'')}" placeholder="e.g. EPA Act 1986">
+        <label>Resource Saving Potential</label>
+        <select id="af-resource" onchange="calcAspectScore()">
+          <option value="0" ${!a.resourceSaving?'selected':''}>No / &lt;₹50,000</option>
+          <option value="1" ${a.resourceSaving?'selected':''}>Yes — &gt;₹50,000 p.a.</option>
+        </select>
+        <small style="color:var(--text-muted);font-size:10px">&gt;₹50K = auto Highly Significant</small>
       </div>
     </div>
 
     <div style="background:var(--bg-hover);border-radius:var(--radius);padding:14px;margin:8px 0">
-      <div style="font-size:12px;font-weight:600;margin-bottom:10px">📊 Significance Scoring (each 1–3)</div>
-      <div class="form-row form-col-2">
+      <div style="font-size:12px;font-weight:700;margin-bottom:12px;color:var(--accent)">
+        📊 SSPDC Significance Scoring (each 1–4) · Score = S × S × P × D × C
+      </div>
+
+      <div class="form-row form-col-2" style="margin-bottom:8px">
         <div class="form-group">
-          <label>Severity (1–3)</label>
-          <select id="af-severity" onchange="calcAspectScore()">
-            <option value="">—</option>${sevOpts('severity')}
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Frequency (1–3)</label>
-          <select id="af-frequency" onchange="calcAspectScore()">
-            <option value="">—</option>${sevOpts('frequency')}
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Legal Significance (1–3)</label>
-          <select id="af-legal" onchange="calcAspectScore()">
-            <option value="">—</option>${sevOpts('legal')}
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Scale of Impact (1–3)</label>
+          <label>1. Scale (S)</label>
           <select id="af-scale" onchange="calcAspectScore()">
-            <option value="">—</option>${sevOpts('scale')}
+            <option value="">—</option>${mkOpts('scale', a.scale)}
+          </select>
+        </div>
+        <div class="form-group">
+          <label>2. Severity — Consumption (S)</label>
+          <select id="af-sev-cons" onchange="calcAspectScore()">
+            <option value="">—</option>${mkOpts('sev_cons', a.sevConsumption)}
+          </select>
+        </div>
+        <div class="form-group">
+          <label>3. Severity — Releases (S)</label>
+          <select id="af-sev-rel" onchange="calcAspectScore()">
+            <option value="">—</option>${mkOpts('sev_rel', a.sevRelease)}
+          </select>
+        </div>
+        <div class="form-group">
+          <label>4. Probability (P)</label>
+          <select id="af-prob" onchange="calcAspectScore()">
+            <option value="">—</option>${mkOpts('prob', a.probability)}
+          </select>
+        </div>
+        <div class="form-group">
+          <label>5. Detection / Duration (D)</label>
+          <select id="af-detection" onchange="calcAspectScore()">
+            <option value="">—</option>${mkOpts('detection', a.detection)}
+          </select>
+        </div>
+        <div class="form-group">
+          <label>6. Control (C)</label>
+          <select id="af-control-score" onchange="calcAspectScore()">
+            <option value="">—</option>${mkOpts('control', a.control)}
           </select>
         </div>
       </div>
-      <div style="margin-top:10px;padding:12px;background:var(--bg-card);border-radius:var(--radius);text-align:center">
-        <div id="af-score-display" style="font-size:22px;font-weight:700">
-          ${a.significanceScore ? `<span style="color:${getEaisLevelColor(getEaisLevel(a.significanceScore))}">${a.significanceScore} — ${getEaisLevel(a.significanceScore)}</span>` : '—'}
+
+      <div style="padding:14px;background:var(--bg-card);border-radius:var(--radius);text-align:center">
+        <div id="af-score-display" style="font-size:24px;font-weight:700">
+          ${a.sspdc ? `<span style="color:${getEaisLevelColor(getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving))}">${a.sspdc}</span>` : '—'}
         </div>
-        <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Score = Severity × Frequency × Legal × Scale (max 81)</div>
+        <div id="af-level-display" style="font-size:13px;font-weight:600;margin-top:4px;color:${getEaisLevelColor(getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving))}">
+          ${a.sspdc||a.isLegal||a.isEmergency||a.resourceSaving ? getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving) : ''}
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:4px">
+          SSPDC Score · ≤162 = Less Significant · ≥163 = Highly Significant
+        </div>
+        <div id="af-override-display" style="font-size:11px;margin-top:4px;color:var(--risk-critical)"></div>
       </div>
     </div>
 
     <div class="form-group">
+      <label>Applicable Regulation / Legal Reference</label>
+      <input type="text" id="af-regulation" value="${escAttr(a.regulation||'')}" placeholder="e.g. Environment Protection Act 1986, Rule 14">
+    </div>
+    <div class="form-group">
       <label>Control Measure / Mitigation</label>
-      <textarea id="af-control" placeholder="Describe existing or proposed control measures...">${escHtml(a.controlMeasure||'')}</textarea>
+      <textarea id="af-ctrl-measure" placeholder="Describe existing or proposed control measures...">${escHtml(a.controlMeasure||'')}</textarea>
     </div>
     <div class="form-row form-col-2">
       <div class="form-group">
@@ -5171,42 +5397,70 @@ window.editAspect = (idx) => {
       </div>
     </div>
     <input type="hidden" id="af-idx" value="${idx}">
-  `,[{label:'Save Aspect',cls:'btn-primary',action:'saveAspect()'}],'modal-lg');
+  `,[{label:'Save Aspect',cls:'btn-primary',action:'saveAspect()'}],'modal-xl');
 };
 
 window.calcAspectScore = () => {
-  const s = parseInt(document.getElementById('af-severity')?.value)||0;
-  const f = parseInt(document.getElementById('af-frequency')?.value)||0;
-  const l = parseInt(document.getElementById('af-legal')?.value)||0;
-  const sc= parseInt(document.getElementById('af-scale')?.value)||0;
-  const score = s&&f&&l&&sc ? s*f*l*sc : 0;
-  const level = score ? getEaisLevel(score) : '';
+  const scale   = parseInt(document.getElementById('af-scale')?.value)||0;
+  const sevCons = parseInt(document.getElementById('af-sev-cons')?.value)||0;
+  const sevRel  = parseInt(document.getElementById('af-sev-rel')?.value)||0;
+  const prob    = parseInt(document.getElementById('af-prob')?.value)||0;
+  const det     = parseInt(document.getElementById('af-detection')?.value)||0;
+  const ctrl    = parseInt(document.getElementById('af-control-score')?.value)||0;
+  const isLegal     = document.getElementById('af-is-legal')?.value === '1';
+  const isEmergency = document.getElementById('af-condition')?.value === 'Emergency';
+  const resourceSaving = document.getElementById('af-resource')?.value === '1';
+
+  const score = calcEaisScore(scale, sevCons, sevRel, prob, det, ctrl);
+  const level = getEaisLevel(score, isLegal, isEmergency, resourceSaving);
   const color = getEaisLevelColor(level);
-  const el = document.getElementById('af-score-display');
-  if(el) el.innerHTML = score ? `<span style="color:${color}">${score} — ${level}</span>` : '—';
+
+  const scoreEl   = document.getElementById('af-score-display');
+  const levelEl   = document.getElementById('af-level-display');
+  const overrideEl= document.getElementById('af-override-display');
+
+  if(scoreEl) scoreEl.innerHTML = score ? `<span style="color:${color};font-size:24px;font-weight:700">${score}</span>` : '<span style="color:var(--text-muted)">—</span>';
+  if(levelEl) { levelEl.textContent = level; levelEl.style.color = color; }
+
+  const overrides = [isLegal&&'⚖️ Legal Concern Override',isEmergency&&'🚨 Emergency Condition Override',resourceSaving&&'💰 Resource Saving >₹50K Override'].filter(Boolean).join(' · ');
+  if(overrideEl) overrideEl.textContent = overrides;
 };
 
 window.saveAspect = () => {
-  const idx = parseInt(document.getElementById('af-idx').value);
-  const aspect = document.getElementById('af-aspect').value;
-  const impact = document.getElementById('af-impact').value;
+  const idx         = parseInt(document.getElementById('af-idx').value);
+  const aspect      = document.getElementById('af-aspect').value;
+  const impact      = document.getElementById('af-impact').value;
   if (!aspect||!impact) { toast('Aspect and Impact are required','error'); return; }
-  const s=parseInt(document.getElementById('af-severity').value)||0;
-  const f=parseInt(document.getElementById('af-frequency').value)||0;
-  const l=parseInt(document.getElementById('af-legal').value)||0;
-  const sc=parseInt(document.getElementById('af-scale').value)||0;
-  const score = s&&f&&l&&sc ? s*f*l*sc : null;
+
+  const scale       = parseInt(document.getElementById('af-scale')?.value)||0;
+  const sevCons     = parseInt(document.getElementById('af-sev-cons')?.value)||0;
+  const sevRel      = parseInt(document.getElementById('af-sev-rel')?.value)||0;
+  const prob        = parseInt(document.getElementById('af-prob')?.value)||0;
+  const det         = parseInt(document.getElementById('af-detection')?.value)||0;
+  const ctrl        = parseInt(document.getElementById('af-control-score')?.value)||0;
+  const isLegal     = document.getElementById('af-is-legal')?.value === '1';
+  const isEmergency = document.getElementById('af-condition')?.value === 'Emergency';
+  const resourceSaving = document.getElementById('af-resource')?.value === '1';
+
+  const sspdc = calcEaisScore(scale, sevCons, sevRel, prob, det, ctrl);
+  const level = getEaisLevel(sspdc, isLegal, isEmergency, resourceSaving);
+
   const entry = {
     aspect, impact,
-    condition: document.getElementById('af-condition').value,
-    legalRequirement: document.getElementById('af-legal-req').value,
-    regulation: document.getElementById('af-regulation').value.trim(),
-    severity:s||null, frequency:f||null, legal:l||null, scale:sc||null,
-    significanceScore: score,
-    significanceLevel: score ? getEaisLevel(score) : null,
-    controlMeasure: document.getElementById('af-control').value.trim(),
-    responsible: document.getElementById('af-responsible').value.trim(),
-    targetDate: document.getElementById('af-targetdate').value
+    condition:    document.getElementById('af-condition').value,
+    isLegal, isEmergency, resourceSaving,
+    regulation:   document.getElementById('af-regulation').value.trim(),
+    scale:        scale||null,
+    sevConsumption: sevCons||null,
+    sevRelease:   sevRel||null,
+    probability:  prob||null,
+    detection:    det||null,
+    control:      ctrl||null,
+    sspdc:        sspdc||null,
+    significanceLevel: level,
+    controlMeasure: document.getElementById('af-ctrl-measure').value.trim(),
+    responsible:  document.getElementById('af-responsible').value.trim(),
+    targetDate:   document.getElementById('af-targetdate').value
   };
   if (idx >= 0) editingAspects[idx] = entry;
   else editingAspects.push(entry);
@@ -5286,22 +5540,35 @@ window.viewEais = async (id) => {
           <thead><tr style="background:var(--bg-hover)">
             <th style="padding:7px 10px;text-align:left">Aspect</th>
             <th style="padding:7px 10px;text-align:left">Impact</th>
-            <th style="padding:7px 10px;text-align:left">Condition</th>
-            <th style="padding:7px 10px;text-align:center">Score</th>
-            <th style="padding:7px 10px;text-align:center">Level</th>
-            <th style="padding:7px 10px;text-align:left">Control Measure</th>
+            <th style="padding:7px 10px;text-align:center">Cond</th>
+            <th style="padding:7px 10px;text-align:center">S</th>
+            <th style="padding:7px 10px;text-align:center">S(C)</th>
+            <th style="padding:7px 10px;text-align:center">S(R)</th>
+            <th style="padding:7px 10px;text-align:center">P</th>
+            <th style="padding:7px 10px;text-align:center">D</th>
+            <th style="padding:7px 10px;text-align:center">C</th>
+            <th style="padding:7px 10px;text-align:center">SSPDC</th>
+            <th style="padding:7px 10px;text-align:center">Significance</th>
+            <th style="padding:7px 10px;text-align:left">Overrides</th>
           </tr></thead>
           <tbody>
             ${(e.aspects||[]).map(a=>{
-              const lvl=getEaisLevel(a.significanceScore);
+              const lvl=getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving);
               const col=getEaisLevelColor(lvl);
+              const overrides=[a.isLegal&&'LC',a.isEmergency&&'E',a.resourceSaving&&'RS'].filter(Boolean).join(', ');
               return `<tr style="border-top:1px solid var(--border)">
                 <td style="padding:7px 10px">${escHtml(a.aspect||'—')}</td>
                 <td style="padding:7px 10px">${escHtml(a.impact||'—')}</td>
-                <td style="padding:7px 10px">${escHtml(a.condition||'Normal')}</td>
-                <td style="padding:7px 10px;text-align:center;font-weight:700;color:${col}">${a.significanceScore||'—'}</td>
-                <td style="padding:7px 10px;text-align:center"><span class="badge ${getEaisBadgeClass(lvl)}">${lvl||'—'}</span></td>
-                <td style="padding:7px 10px;font-size:10px">${escHtml(a.controlMeasure||'—')}</td>
+                <td style="padding:7px 10px;text-align:center">${escHtml(a.condition||'N')}</td>
+                <td style="padding:7px 10px;text-align:center">${a.scale||'—'}</td>
+                <td style="padding:7px 10px;text-align:center">${a.sevConsumption||'—'}</td>
+                <td style="padding:7px 10px;text-align:center">${a.sevRelease||'—'}</td>
+                <td style="padding:7px 10px;text-align:center">${a.probability||'—'}</td>
+                <td style="padding:7px 10px;text-align:center">${a.detection||'—'}</td>
+                <td style="padding:7px 10px;text-align:center">${a.control||'—'}</td>
+                <td style="padding:7px 10px;text-align:center;font-weight:700;color:${col}">${a.sspdc||'—'}</td>
+                <td style="padding:7px 10px;text-align:center"><span class="badge ${getEaisBadgeClass(lvl)}" style="font-size:10px;white-space:nowrap">${lvl||'—'}</span></td>
+                <td style="padding:7px 10px;font-size:11px;color:var(--risk-critical)">${overrides||'—'}</td>
               </tr>`;
             }).join('')}
           </tbody>
@@ -5338,37 +5605,46 @@ window.exportEaisExcel = () => {
   const rows = [];
   allEais.forEach(e => {
     const plant = plants.find(p=>p.id===e.plantId);
-    (e.aspects||[{aspect:'',impact:'',condition:'',significanceScore:'',significanceLevel:'',controlMeasure:''}]).forEach(a => {
+    (e.aspects||[{aspect:'',impact:'',condition:''}]).forEach(a => {
       rows.push([
         e.eaisId||e.id, plant?.name||'', e.activity||'', e.eaisType||'', e.status||'',
         formatDate(e.assessmentDate), e.preparedBy||'',
         a.aspect||'', a.impact||'', a.condition||'',
-        a.severity||'', a.frequency||'', a.legal||'', a.scale||'',
-        a.significanceScore||'', a.significanceLevel||'',
+        a.isLegal?'Yes':'No', a.isEmergency?'Yes':'No', a.resourceSaving?'Yes':'No',
+        a.scale||'', a.sevConsumption||'', a.sevRelease||'',
+        a.probability||'', a.detection||'', a.control||'',
+        a.sspdc||'', a.significanceLevel||'',
         a.controlMeasure||'', a.responsible||'', a.targetDate||''
       ]);
     });
   });
   downloadCsv(rows,
     ['EAIS ID','Plant','Activity','Type','Status','Assessment Date','Prepared By',
-     'Aspect','Impact','Condition','Severity','Frequency','Legal','Scale',
-     'Score','Level','Control Measure','Responsible','Target Date'],
+     'Aspect','Impact','Condition','Legal Concern','Emergency','Resource Saving >50K',
+     'Scale(S)','Sev-Consumption(S)','Sev-Release(S)','Probability(P)','Detection(D)','Control(C)',
+     'SSPDC Score','Significance','Control Measure','Responsible','Target Date'],
     'EAIS_Register');
 };
 
 // ── BULK ASPECT UPLOAD ──
 window.downloadAspectTemplate = () => {
   const hdr=['Environmental Aspect','Environmental Impact','Condition (Normal/Abnormal/Emergency)',
-    'Legal Requirement (Yes/No/Partially)','Applicable Regulation',
-    'Severity (1-3)','Frequency (1-3)','Legal Significance (1-3)','Scale of Impact (1-3)',
+    'Legal Concern (Yes/No)','Resource Saving >50K pa (Yes/No)','Applicable Regulation',
+    'Scale 1-4','Severity-Consumption 1-4','Severity-Release 1-4',
+    'Probability 1-4','Detection 1-4','Control 1-4',
     'Control Measure / Mitigation','Responsible Person','Target Date (YYYY-MM-DD)'];
-  const sample=['Air Emissions','Air Pollution','Normal','Yes','Environment Protection Act',
-    '2','2','3','2','Install emission control filters','EHS Manager','2026-12-31'];
+  const sample=['Air Emissions','Air Pollution','Normal','No','No','Environment Protection Act',
+    '2','2','3','2','2','3','Install emission control filters','EHS Manager','2026-12-31'];
   const notes=[
-    '# SEVERITY: 1=Minor (local/short-term)  2=Moderate (regional/medium)  3=Severe (widespread/long-term)',
-    '# FREQUENCY: 1=Rare (<once/year)  2=Occasional (monthly/weekly)  3=Frequent (daily)',
-    '# LEGAL: 1=No legal req  2=Partial/indirect  3=Direct legal/permit requirement',
-    '# SCALE: 1=Local impact  2=Site-wide  3=Off-site/community impact',
+    '# SSPDC SCORING GUIDE (1-4 each) — Score = Scale x Sev(C) x Sev(R) x Probability x Detection x Control',
+    '# SCALE: 1=Low +3%  2=Moderate +6%  3=Medium +9%  4=High +12% of optimum/specified limit',
+    '# SEVERITY-CONSUMPTION: 1=Easily renewed  2=Recycled  3=Depletable  4=Critically scarce',
+    '# SEVERITY-RELEASE: 1=Nuisance/slight  2=Long-term risk  3=Short-term risk  4=Fatal/life risk',
+    '# PROBABILITY: 1=<once/year  2=once/month  3=once/week  4=daily/shift',
+    '# DETECTION: 1=<2hrs  2=<8hrs  3=<24hrs  4=>24hrs',
+    '# CONTROL: 1=Poka Yoke/Auto  2=Manual  3=Unreliable control  4=No effective control',
+    '# Score ≤162 = Less Significant | ≥163 = Highly Significant',
+    '# OVERRIDES (always Highly Significant): Legal Concern=Yes OR Condition=Emergency OR Resource>50K=Yes',
     '# Score = S\u00d7F\u00d7L\u00d7Sc  |  <6=Low  6-12=Medium  >12=High', ''].join('\n');
   const csv = notes + [hdr,sample].map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
   const a=document.createElement('a'); a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);
@@ -5405,16 +5681,24 @@ window.previewBulkAspects = (input) => {
       const aspect=r['environmental aspect']||r['aspect'];
       const impact=r['environmental impact']||r['impact'];
       if(!aspect){errors.push(`Row ${i}: Aspect is required`);continue;}
-      const sv=parseInt(r['severity (1-3)']||r['severity'])||0;
-      const fr=parseInt(r['frequency (1-3)']||r['frequency'])||0;
-      const lg=parseInt(r['legal significance (1-3)']||r['legal significance']||r['legal'])||0;
-      const sc=parseInt(r['scale of impact (1-3)']||r['scale of impact']||r['scale'])||0;
-      const score=sv&&fr&&lg&&sc?sv*fr*lg*sc:null;
-      bulkAspectRows.push({aspect,impact:impact||'',condition:r['condition (normal/abnormal/emergency)']||r['condition']||'Normal',
-        legalRequirement:r['legal requirement (yes/no/partially)']||r['legal requirement']||'No',
+      const scale   = parseInt(r['scale 1-4']||r['scale'])||0;
+      const sevCons = parseInt(r['severity-consumption 1-4']||r['severity-consumption'])||0;
+      const sevRel  = parseInt(r['severity-release 1-4']||r['severity-release'])||0;
+      const prob    = parseInt(r['probability 1-4']||r['probability'])||0;
+      const det     = parseInt(r['detection 1-4']||r['detection'])||0;
+      const ctrl    = parseInt(r['control 1-4']||r['control'])||0;
+      const cond    = r['condition (normal/abnormal/emergency)']||r['condition']||'Normal';
+      const isLegal = (r['legal concern (yes/no)']||r['legal concern']||'').toLowerCase()==='yes';
+      const isEmergency = cond.toLowerCase()==='emergency';
+      const resourceSaving = (r['resource saving >50k pa (yes/no)']||r['resource saving']||'').toLowerCase()==='yes';
+      const sspdc = calcEaisScore(scale,sevCons,sevRel,prob,det,ctrl);
+      bulkAspectRows.push({
+        aspect, impact:impact||'', condition:cond,
+        isLegal, isEmergency, resourceSaving,
         regulation:r['applicable regulation']||r['regulation']||'',
-        severity:sv||null,frequency:fr||null,legal:lg||null,scale:sc||null,
-        significanceScore:score,significanceLevel:score?getEaisLevel(score):null,
+        scale:scale||null, sevConsumption:sevCons||null, sevRelease:sevRel||null,
+        probability:prob||null, detection:det||null, control:ctrl||null,
+        sspdc:sspdc||null, significanceLevel:getEaisLevel(sspdc,isLegal,isEmergency,resourceSaving),
         controlMeasure:r['control measure / mitigation']||r['control measure']||'',
         responsible:r['responsible person']||r['responsible']||'',
         targetDate:r['target date (yyyy-mm-dd)']||r['target date']||''});
