@@ -272,14 +272,14 @@ ul { list-style: none; }
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  overflow: hidden;
+  overflow: visible;
   transition: width 0.22s cubic-bezier(.4,0,.2,1), transform 0.2s;
   z-index: 100;
   position: relative;
 }
 .sidebar.collapsed {
   width: 56px;
-  overflow: hidden;
+  overflow: visible;
 }
 .sidebar.collapsed #sidebar-company-logo,
 .sidebar.collapsed #sidebar-company-logo,
@@ -380,7 +380,7 @@ ul { list-style: none; }
 .sidebar-logo-text { font-size: 13px; font-weight: 700; line-height: 1.2; }
 .sidebar-logo-sub { font-size: 10px; color: var(--text-secondary); font-weight: 400; }
 
-.sidebar-nav { flex: 1; overflow-y: auto; padding: 8px 0; }
+.sidebar-nav { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 8px 0; }
 .sidebar-section { padding: 16px 16px 4px; font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }
 .nav-item {
   display: flex;
@@ -1356,6 +1356,7 @@ tbody tr:last-child td { border-bottom: none; }
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-storage-compat.js"></script>
 <script>
 
 // ─── FIREBASE CONFIG ───
@@ -1374,6 +1375,7 @@ const firebaseConfig = {
 const app = firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
+const storage = firebase.storage();
 const _db = db; // alias for license panel compatibility
 
 // ─── Auth aliases ───
@@ -1581,6 +1583,7 @@ function showApp() {
   document.getElementById('app').classList.remove('hidden');
   updateSidebarUser();
   setupRoleVisibility();
+  loadAppSettings();
   loadInitialData();
   navigate('dashboard');
 }
@@ -1597,7 +1600,7 @@ function updateSidebarUser() {
 function setupRoleVisibility() {
   const superAdmin = isSuperAdmin();
   const admin = superAdmin || currentUserProfile.role === ROLES.CORPORATE_EHS;
-  document.getElementById('nav-users').style.display = '';
+  document.getElementById('nav-users').style.display = admin ? '' : 'none';
   document.getElementById('nav-settings').style.display = '';
   document.getElementById('nav-audit').style.display = admin ? '' : 'none';
 }
@@ -1780,10 +1783,11 @@ function setupHiraListener() {
   if (!plantIds.length) { allHiras = []; return; }
   // Firestore 'in' allows up to 30 values; for more, batch queries
   const q = plantIds.length <= 30
-    ? query(collection(db,'hira_hiras'), where('plantId','in', plantIds), orderBy('createdAt','desc'))
-    : query(collection(db,'hira_hiras'), orderBy('createdAt','desc'));
+    ? query(collection(db,'hira_hiras'), where('plantId','in', plantIds))
+    : query(collection(db,'hira_hiras'));
   hirasListener = onSnapshot(q, (snap) => {
-    allHiras = snap.docs.map(d => ({ id:d.id, ...d.data() }));
+    allHiras = snap.docs.map(d => ({ id:d.id, ...d.data() }))
+      .sort((a,b) => toMillis(b.createdAt) - toMillis(a.createdAt));
     updateActionBadge();
     if (currentPage === 'dashboard') renderDashboard(currentDashTab||'hira');
     if (currentPage === 'hira-register') renderHiraRegister();
@@ -1796,10 +1800,11 @@ function setupActionsListener() {
   const plantIds = getUserPlantIds();
   if (!plantIds.length) { allActions = []; return; }
   const q = plantIds.length <= 30
-    ? query(collection(db,'hira_actions'), where('plantId','in', plantIds), orderBy('createdAt','desc'))
-    : query(collection(db,'hira_actions'), orderBy('createdAt','desc'));
+    ? query(collection(db,'hira_actions'), where('plantId','in', plantIds))
+    : query(collection(db,'hira_actions'));
   actionsListener = onSnapshot(q, (snap) => {
-    allActions = snap.docs.map(d => ({ id:d.id, ...d.data() }));
+    allActions = snap.docs.map(d => ({ id:d.id, ...d.data() }))
+      .sort((a,b) => toMillis(b.createdAt) - toMillis(a.createdAt));
     // auto-flag overdue
     const today = new Date();
     allActions.forEach(a => {
@@ -1838,7 +1843,7 @@ function isActionOverdue(a) {
 }
 
 // ─── NAVIGATION ───
-window.navigate = (page) => {
+window.navigate = (page, preserveEditor = false) => {
   currentPage = page;
   document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.toggle('active', el.dataset.page === page);
@@ -1860,7 +1865,10 @@ window.navigate = (page) => {
     case 'dashboard': renderDashboard(currentDashTab||'hira'); break;
     case 'plants': renderPlants(); break;
     case 'hira-register': renderHiraRegister(); break;
-    case 'create-hira': editingHiraId = null; editingHazards = []; renderCreateHira(); break;
+    case 'create-hira':
+      if (!preserveEditor) { editingHiraId = null; editingHazards = []; }
+      renderCreateHira(preserveEditor && editingHiraId ? allHiras.find(x => x.id === editingHiraId) : undefined);
+      break;
     case 'risk-register': renderRiskRegister(); break;
     case 'action-tracker': renderActionTracker(); break;
     case 'reports': renderReports(); break;
@@ -1869,7 +1877,10 @@ window.navigate = (page) => {
     case 'settings': renderSettings(); break;
     case 'audit': renderAuditLogs(); break;
     case 'eais-register': renderEaisRegister(); break;
-    case 'create-eais': editingEaisId = null; editingAspects = []; renderCreateEais(); break;
+    case 'create-eais':
+      if (!preserveEditor) { editingEaisId = null; editingAspects = []; }
+      renderCreateEais();
+      break;
     default: content.innerHTML = '<div class="empty-state"><div class="empty-icon">🚧</div><h3>Coming Soon</h3></div>';
   }
 };
@@ -2416,7 +2427,7 @@ function renderCreateHira(hiraData) {
         ⚠️ Hazards & Risk (${editingHazards.length})
         ${editingHazards.length===0?'<span style="position:absolute;top:4px;right:4px;width:7px;height:7px;background:#ef4444;border-radius:50%;animation:pulse 1.5s infinite"></span>':''}
       </button>
-      <button class="tab" onclick="switchHiraTab('hira_actions',this)">✅ Action Plan</button>
+      <button class="tab" onclick="switchHiraTab('actions',this)">✅ Action Plan</button>
       <button class="tab" onclick="switchHiraTab('approvals',this)">📝 Approvals</button>
     </div>
 
@@ -2553,7 +2564,7 @@ function renderCreateHira(hiraData) {
     <div style="position:sticky;bottom:0;background:var(--bg-base);border-top:1px solid var(--border);padding:10px 0;margin-top:12px;display:flex;gap:10px;justify-content:flex-end;align-items:center;flex-wrap:wrap;z-index:10">
       <button class="btn btn-secondary" onclick="navigate('hira-register')">Cancel</button>
       <button class="btn btn-secondary" onclick="saveHira('Draft')">💾 Save Draft</button>
-      ${canEdit()?`<button class="btn btn-primary" onclick="saveHira('Submitted')">
+      ${canEdit()?`<button id="hira-submit-btn" class="btn btn-primary" onclick="saveHira('Submitted')" ${getHiraSubmissionError()?'disabled':''} title="${escAttr(getHiraSubmissionError() || 'Submit this completed HIRA for review')}">
         📤 Submit for Review ${editingHazards.length===0?'<small style=\'opacity:.7\'>(add hazards first)</small>':''}
       </button>`:''}
     </div>
@@ -2563,7 +2574,7 @@ function renderCreateHira(hiraData) {
 window.switchHiraTab = (tab, el) => {
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   el.classList.add('active');
-  ['basic','hazards','hira_actions','approvals'].forEach(t=>{
+  ['basic','hazards','actions','approvals'].forEach(t=>{
     const el2 = document.getElementById('tab-'+t);
     if(el2) el2.style.display = t===tab?'':'none';
   });
@@ -2850,14 +2861,42 @@ window.saveHazard = () => {
 
   closeModal();
   document.getElementById('hazard-list').innerHTML = renderHazardCards();
+  refreshHiraSubmitState();
   toast('Hazard saved','success');
 };
 
 window.removeHazard = (idx) => {
   editingHazards.splice(idx,1);
   document.getElementById('hazard-list').innerHTML = renderHazardCards();
+  refreshHiraSubmitState();
   toast('Hazard removed','info');
 };
+
+// ─── HIRA SUBMISSION VALIDATION ───
+function getHiraSubmissionError() {
+  if (!editingHazards.length) return 'Add at least one hazard before submitting for review.';
+  for (let i = 0; i < editingHazards.length; i++) {
+    const hz = editingHazards[i] || {};
+    if (!String(hz.hazard || '').trim()) return `Hazard #${i + 1}: Hazard description is required.`;
+    if (!hz.hazardCategory) return `Hazard #${i + 1}: Hazard category is required.`;
+    if (![hz.initialProbability, hz.initialSeverity, hz.initialFrequency, hz.initialControl].every(v => Number(v) >= 1 && Number(v) <= 4)) {
+      return `Hazard #${i + 1}: Complete all Initial Risk ratings (Probability, Severity, Frequency and Control).`;
+    }
+    if (![hz.residualProbability, hz.residualSeverity, hz.residualFrequency, hz.residualControl].every(v => Number(v) >= 1 && Number(v) <= 4)) {
+      return `Hazard #${i + 1}: Complete all Residual Risk ratings (Probability, Severity, Frequency and Control).`;
+    }
+    if (!hz.initialRiskScore || !hz.residualRiskScore) return `Hazard #${i + 1}: Risk scores could not be calculated. Recheck the risk ratings.`;
+  }
+  return '';
+}
+
+function refreshHiraSubmitState() {
+  const btn = document.getElementById('hira-submit-btn');
+  if (!btn) return;
+  const err = getHiraSubmissionError();
+  btn.disabled = !!err;
+  btn.title = err || 'Submit this completed HIRA for review';
+}
 
 // ─── SAVE HIRA ───
 window.saveHira = async (status) => {
@@ -2881,6 +2920,12 @@ window.saveHira = async (status) => {
   if (!dept)       { toast('Department is required','error'); return; }
   if (!assessDate) { toast('Assessment date is required','error'); return; }
   if (!reviewDate) { toast('Review date is required','error'); return; }
+  if (!document.getElementById('hf-prepby')?.value.trim()) { toast('Prepared By is required','error'); return; }
+
+  if (status === 'Submitted') {
+    const submissionError = getHiraSubmissionError();
+    if (submissionError) { toast(submissionError, 'warning'); refreshHiraSubmitState(); return; }
+  }
 
   const hiraData = {
     hiraId: document.getElementById('hf-hiraId').value.trim() || generateHiraId(),
@@ -2916,8 +2961,14 @@ window.saveHira = async (status) => {
       await logAudit('HIRA',ref.id,'Created',null,{status, activity});
       toast('HIRA created successfully','success');
 
-      // create actions from controls
-      await createActionsFromControls(ref.id, hiraData);
+      // Action creation is secondary to saving the HIRA itself. A failure here
+      // must never make the user think the HIRA was not saved.
+      try {
+        await createActionsFromControls(ref.id, hiraData);
+      } catch (actionErr) {
+        console.error('[saveHira] Action creation failed:', actionErr);
+        toast('HIRA saved, but one or more action records could not be created.', 'warning');
+      }
     }
 
     if (status === 'Submitted') {
@@ -3122,8 +3173,7 @@ window.editHira = async (id) => {
   if (!h) return;
   editingHiraId = id;
   editingHazards = JSON.parse(JSON.stringify(h.hazards||[]));
-  navigate('create-hira');
-  setTimeout(() => renderCreateHira(h), 100);
+  navigate('create-hira', true);
 };
 
 window.updateHiraStatus = async (hiraId, newStatus, comment) => {
@@ -3709,7 +3759,7 @@ function renderEaisMatrixSettings() {
     <h3 style="margin-bottom:4px;font-size:16px">🌿 EAIS Significance Matrix — SSPDC Method</h3>
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">
       Environment Aspect & Impact Study significance rating based on SSPDC score.<br>
-      <strong>SSPDC = Scale × Severity(Consumption) × Severity(Release) × Probability × Detection × Control</strong>
+      <strong>SSPDC = Scale × applicable Severity [max(Consumption, Release)] × Probability × Detection × Control</strong>
     </p>
 
     <div style="overflow-x:auto;margin-bottom:20px">
@@ -3853,24 +3903,30 @@ window.handleLogoFile = (file) => {
   const statusEl = document.getElementById('logo-upload-status');
   if (!file.type.startsWith('image/')) { toast('Please select an image file','error'); return; }
   if (file.size > 500*1024) { toast('Logo must be under 500 KB','error'); return; }
-  if (statusEl) statusEl.textContent = 'Reading file...';
-  const reader = new FileReader();
-  reader.onload = (ev) => {
-    const dataUrl = ev.target.result;
-    // Show preview immediately
-    const preview = document.getElementById('logo-preview-img');
-    if (preview) { preview.src = dataUrl; preview.style.maxHeight='60px'; preview.style.maxWidth='200px'; preview.style.objectFit='contain'; }
-    // Store in appSettings pending save
-    window._pendingLogoDataUrl = dataUrl;
-    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-low)">✓ Ready — click Save Branding to apply</span>';
-    toast('Logo loaded! Click Save Branding.','info');
-  };
-  reader.readAsDataURL(file);
+
+  // Keep the File object until Save Branding. The actual image is stored in
+  // Firebase Storage; only its download URL is stored in Firestore.
+  window._pendingLogoFile = file;
+  window._pendingLogoDataUrl = undefined;
+
+  const preview = document.getElementById('logo-preview-img');
+  if (preview) {
+    const objectUrl = URL.createObjectURL(file);
+    preview.src = objectUrl;
+    preview.onload = () => URL.revokeObjectURL(objectUrl);
+    preview.style.maxHeight='60px';
+    preview.style.maxWidth='200px';
+    preview.style.objectFit='contain';
+  }
+  if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-low)">✓ Ready — click Save Branding to upload</span>';
+  toast('Logo selected! Click Save Branding.','info');
 };
 
 window.applyLogoUrl = () => {
   const url = document.getElementById('s-logo-url')?.value.trim();
   if (!url) return;
+  if (!/^https?:\/\//i.test(url)) { toast('Please enter a valid http/https image URL','error'); return; }
+  window._pendingLogoFile = null;
   window._pendingLogoDataUrl = url;
   const preview = document.getElementById('logo-preview-img');
   if (preview) { preview.src = url; }
@@ -3878,6 +3934,7 @@ window.applyLogoUrl = () => {
 };
 
 window.removeLogo = async () => {
+  window._pendingLogoFile = null;
   window._pendingLogoDataUrl = '';
   try {
     await setDoc(doc(db,'hira_settings','app'), { logoUrl:'', updatedAt: serverTimestamp(), updatedBy: currentUser.uid }, {merge:true});
@@ -3892,23 +3949,44 @@ window.saveCompanySettings = async () => {
   const companyName = document.getElementById('s-cname').value.trim();
   const ehsEmail    = document.getElementById('s-ehsemail').value.trim();
   const statusEl    = document.getElementById('branding-save-status');
-  // Use pending upload, or existing saved URL
-  const logoUrl = (window._pendingLogoDataUrl !== undefined) ? window._pendingLogoDataUrl : (appSettings.logoUrl || '');
-  console.log('[saveCompanySettings] logoUrl length:', logoUrl?.length||0, 'hasLogo:', !!logoUrl);
 
   if (statusEl) statusEl.textContent = 'Saving...';
   try {
+    let logoUrl = appSettings.logoUrl || '';
+
+    // Upload a newly selected image to Firebase Storage, then persist only
+    // the download URL in Firestore. This avoids storing binary/base64 data
+    // inside the Firestore settings document.
+    if (window._pendingLogoFile instanceof File) {
+      if (statusEl) statusEl.textContent = 'Uploading logo...';
+      const file = window._pendingLogoFile;
+      const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const path = `company/logos/${currentUser.uid}/${Date.now()}-${safeName}`;
+      const ref = storage.ref().child(path);
+      const uploadTask = await ref.put(file, {
+        contentType: file.type,
+        customMetadata: { uploadedBy: currentUser.uid, purpose: 'company-logo' }
+      });
+      logoUrl = await uploadTask.ref.getDownloadURL();
+    } else if (window._pendingLogoDataUrl !== undefined) {
+      // Direct URL fallback
+      logoUrl = window._pendingLogoDataUrl || '';
+    }
+
     await setDoc(doc(db,'hira_settings','app'), {
       companyName, ehsEmail, logoUrl,
       updatedAt: serverTimestamp(), updatedBy: currentUser.uid
     }, { merge: true });
+
     appSettings = { ...appSettings, companyName, ehsEmail, logoUrl };
+    window._pendingLogoFile = null;
     window._pendingLogoDataUrl = undefined;
     applyCompanyBranding();
     if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-low)">✓ Saved at '+new Date().toLocaleTimeString()+'</span>';
     toast('Branding saved and applied to all users!', 'success');
     switchSettingsTab(document.querySelector('.settings-nav-item.active'), 'CompanyLogo');
   } catch(e) {
+    console.error('[saveCompanySettings] ERROR:', e.code, e.message, e);
     if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-critical)">✗ '+e.message+'</span>';
     toast('Save failed: ' + e.message, 'error');
   }
@@ -4504,6 +4582,16 @@ function escHtml(str) {
 }
 function escAttr(str) { return escHtml(str); }
 
+function toMillis(val) {
+  if (!val) return 0;
+  try {
+    if (typeof val.toMillis === 'function') return val.toMillis();
+    if (typeof val.toDate === 'function') return val.toDate().getTime();
+    const d = new Date(val);
+    return Number.isNaN(d.getTime()) ? 0 : d.getTime();
+  } catch(e) { return 0; }
+}
+
 function formatDate(val) {
   if (!val) return '—';
   try {
@@ -5000,8 +5088,10 @@ const SSPDC_LABELS = {
 };
 
 function calcEaisScore(scale, sevCons, sevRel, prob, detection, control) {
-  if (!scale||!sevCons||!sevRel||!prob||!detection||!control) return 0;
-  return scale * sevCons * sevRel * prob * detection * control;
+  // SSPDC uses the applicable severity: max(Consumption, Release) × Scale × P × D × C.
+  const severity = Math.max(Number(sevCons)||0, Number(sevRel)||0);
+  if (!scale || !severity || !prob || !detection || !control) return 0;
+  return scale * severity * prob * detection * control;
 }
 function getEaisLevel(score, isLegal, isEmergency, resourceSaving) {
   if (!score && !isLegal && !isEmergency && !resourceSaving) return '';
@@ -5025,11 +5115,13 @@ function generateEaisId() {
 async function loadEais() {
   try {
     const plantIds = getUserPlantIds();
-    const q = plantIds.length < 30
-      ? query(collection(db,'eais_studies'), where('plantId','in', plantIds), orderBy('createdAt','desc'))
-      : query(collection(db,'eais_studies'), orderBy('createdAt','desc'));
+    if (!plantIds.length) { allEais = []; return; }
+    const q = plantIds.length <= 30
+      ? query(collection(db,'eais_studies'), where('plantId','in', plantIds))
+      : query(collection(db,'eais_studies'));
     const snap = await getDocs(q);
-    allEais = snap.docs.map(d => ({ id:d.id, ...d.data() }));
+    allEais = snap.docs.map(d => ({ id:d.id, ...d.data() }))
+      .sort((a,b) => toMillis(b.createdAt) - toMillis(a.createdAt));
   } catch(e) {
     console.error('loadEais error:', e);
     allEais = [];
@@ -5243,7 +5335,7 @@ function renderCreateEais() {
         <button class="btn btn-secondary btn-sm" onclick="downloadAspectTemplate()" style="margin-left:auto">⬇ Template</button>
       </div>
       <div style="background:var(--accent-light);border-radius:var(--radius);padding:10px 14px;margin-bottom:14px;font-size:12px;color:var(--text-secondary)">
-        💡 SSPDC = <strong>Scale × Severity (Consumption) × Severity (Release) × Probability × Detection × Control</strong> (each 1–4, max 1024) &nbsp;|&nbsp;
+        💡 SSPDC = <strong>Scale × max(Severity Consumption, Severity Release) × Probability × Detection × Control</strong> (each 1–4, max 1024) &nbsp;|&nbsp;
         ≤162 = Less Significant &nbsp;|&nbsp; ≥163 = Highly Significant &nbsp;|&nbsp; Overrides: Legal / Emergency / Resource &gt;₹50K
       </div>
       <div id="aspect-list">${renderAspectCards()}</div>
@@ -5252,7 +5344,7 @@ function renderCreateEais() {
     <div style="position:sticky;bottom:0;background:var(--bg-base);border-top:1px solid var(--border);padding:10px 0;margin-top:12px;display:flex;gap:10px;justify-content:flex-end;align-items:center;flex-wrap:wrap;z-index:10">
       <button class="btn btn-secondary" onclick="navigate('eais-register')">Cancel</button>
       <button class="btn btn-secondary" onclick="saveEais('Draft')">💾 Save Draft</button>
-      ${canEdit()?`<button class="btn btn-primary" onclick="saveEais('Submitted')">
+      ${canEdit()?`<button id="eais-submit-btn" class="btn btn-primary" onclick="saveEais('Submitted')" ${getEaisSubmissionError()?'disabled':''} title="${escAttr(getEaisSubmissionError() || 'Submit this completed EAIS for review')}">
         📤 Submit for Review ${editingAspects.length===0?'<small style=\'opacity:.7\'>(add aspects first)</small>':''}
       </button>`:''}
     </div>
@@ -5577,13 +5669,38 @@ window.saveAspect = () => {
   else editingAspects.push(entry);
   closeModal();
   document.getElementById('aspect-list').innerHTML = renderAspectCards();
+  refreshEaisSubmitState();
   toast('Aspect saved','success');
 };
 
 window.removeAspect = (idx) => {
   editingAspects.splice(idx,1);
   document.getElementById('aspect-list').innerHTML = renderAspectCards();
+  refreshEaisSubmitState();
 };
+
+// ── EAIS SUBMISSION VALIDATION ──
+function getEaisSubmissionError() {
+  if (!editingAspects.length) return 'Add at least one aspect before submitting for review.';
+  for (let i = 0; i < editingAspects.length; i++) {
+    const a = editingAspects[i] || {};
+    if (!a.aspect) return `Aspect #${i + 1}: Environmental Aspect is required.`;
+    if (!a.impact) return `Aspect #${i + 1}: Environmental Impact is required.`;
+    if (!Number(a.scale)) return `Aspect #${i + 1}: Scale is required.`;
+    if (!Number(a.sevConsumption) && !Number(a.sevRelease)) return `Aspect #${i + 1}: Enter Severity for Consumption or Releases.`;
+    if (!Number(a.probability) || !Number(a.detection) || !Number(a.control)) return `Aspect #${i + 1}: Complete Probability, Detection and Control ratings.`;
+    if (!a.sspdc && !a.isLegal && !a.isEmergency && !a.resourceSaving) return `Aspect #${i + 1}: Significance score could not be calculated.`;
+  }
+  return '';
+}
+
+function refreshEaisSubmitState() {
+  const btn = document.getElementById('eais-submit-btn');
+  if (!btn) return;
+  const err = getEaisSubmissionError();
+  btn.disabled = !!err;
+  btn.title = err || 'Submit this completed EAIS for review';
+}
 
 // ── SAVE EAIS ──
 window.saveEais = async (status) => {
@@ -5607,8 +5724,9 @@ window.saveEais = async (status) => {
   if (!assessmentDate){ toast('Assessment Date is required','error'); return; }
   if (!reviewDate)    { toast('Review Date is required','error'); return; }
   if (!preparedBy)    { toast('Prepared By is required','error'); return; }
-  if (status === 'Submitted' && editingAspects.length === 0) {
-    toast('Add at least one aspect before submitting for review','warning'); return;
+  if (status === 'Submitted') {
+    const submissionError = getEaisSubmissionError();
+    if (submissionError) { toast(submissionError, 'warning'); refreshEaisSubmitState(); return; }
   }
   const plant = plants.find(p=>p.id===plantId);
   const data = {
@@ -5651,7 +5769,7 @@ window.saveEais = async (status) => {
 window.viewEais = async (id) => {
   const e = allEais.find(x=>x.id===id); if(!e) return;
   const plant = plants.find(p=>p.id===e.plantId);
-  const highAspects = (e.aspects||[]).filter(a=>getEaisLevel(a.significanceScore)==='High');
+  const highAspects = (e.aspects||[]).filter(a=>getEaisLevel(a.sspdc,a.isLegal,a.isEmergency,a.resourceSaving)==='Highly Significant');
   openModal('viewEais',`${e.eaisId||id}`,`
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px;font-size:12px">
       <div><label style="color:var(--text-muted);font-size:10px;text-transform:uppercase">Plant</label><p style="font-weight:600">${escHtml(plant?.name||'—')}</p></div>
@@ -5718,7 +5836,7 @@ window.editEais = (id) => {
   editingEaisId = id;
   const e = allEais.find(x=>x.id===id);
   editingAspects = e?.aspects ? JSON.parse(JSON.stringify(e.aspects)) : [];
-  navigate('create-eais');
+  navigate('create-eais', true);
 };
 
 window.approveEais = async (id) => {
@@ -5850,6 +5968,7 @@ window.executeBulkAspects = () => {
   const count=bulkAspectRows.length; bulkAspectRows=[];
   closeModal();
   document.getElementById('aspect-list').innerHTML=renderAspectCards();
+  refreshEaisSubmitState();
   toast(`✅ ${count} aspects added! Save Draft to keep.`,'success');
 };
 
