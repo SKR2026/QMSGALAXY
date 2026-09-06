@@ -279,6 +279,7 @@ ul { list-style: none; }
 }
 .sidebar.collapsed {
   width: 56px;
+  overflow: hidden;
 }
 .sidebar.collapsed #sidebar-company-logo,
 .sidebar.collapsed #sidebar-company-logo,
@@ -286,6 +287,7 @@ ul { list-style: none; }
 .sidebar.collapsed .sidebar-logo-sub,
 .sidebar.collapsed .sidebar-section,
 .sidebar.collapsed .nav-item span:not(.nav-icon),
+.sidebar.collapsed .nav-item .nav-badge,
 .sidebar.collapsed .nav-badge,
 .sidebar.collapsed .sidebar-user .user-info {
   display: none !important;
@@ -1547,6 +1549,20 @@ onAuthStateChanged(auth, async (user) => {
     checkLicenseOnLoad(); // Check license validity
     loadEais();
     initSidebar();
+    // Test Firestore write permission on login
+    setTimeout(async () => {
+      try {
+        await addDoc(collection(db,'hira_auditLogs'), {
+          test: true, userId: user.uid, ts: serverTimestamp(), action: 'login_test'
+        });
+        console.log('[Firestore] Write test: OK ✅');
+      } catch(e) {
+        console.error('[Firestore] Write test FAILED:', e.code, e.message);
+        if (e.code === 'permission-denied') {
+          toast('⚠️ Firestore rules need deployment. Run: firebase deploy --only firestore:rules', 'warning');
+        }
+      }
+    }, 2000);
   } else {
     currentUser = null;
     currentUserProfile = null;
@@ -2534,10 +2550,12 @@ function renderCreateHira(hiraData) {
       </div>
     </div>
 
-    <div style="position:sticky;bottom:0;background:var(--bg-base);border-top:1px solid var(--border);padding:10px 0;margin-top:12px;display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;z-index:10">
+    <div style="position:sticky;bottom:0;background:var(--bg-base);border-top:1px solid var(--border);padding:10px 0;margin-top:12px;display:flex;gap:10px;justify-content:flex-end;align-items:center;flex-wrap:wrap;z-index:10">
       <button class="btn btn-secondary" onclick="navigate('hira-register')">Cancel</button>
       <button class="btn btn-secondary" onclick="saveHira('Draft')">💾 Save Draft</button>
-      ${canEdit()?`<button class="btn btn-primary" onclick="saveHira('Submitted')">📤 Submit for Review</button>`:''}
+      ${canEdit()?`<button class="btn btn-primary" onclick="saveHira('Submitted')">
+        📤 Submit for Review ${editingHazards.length===0?'<small style=\'opacity:.7\'>(add hazards first)</small>':''}
+      </button>`:''}
     </div>
   `;
 }
@@ -2913,8 +2931,11 @@ window.saveHira = async (status) => {
 
     navigate('hira-register');
   } catch(e) {
-    console.error(e);
-    toast('Error saving HIRA: ' + e.message, 'error');
+    console.error('[saveHira] ERROR:', e.code, e.message, e);
+    let msg = e.message;
+    if (e.code === 'permission-denied') msg = 'Permission denied — run: firebase deploy --only firestore:rules';
+    if (e.code === 'not-found') msg = 'Document not found. Try creating instead of updating.';
+    toast('Error saving HIRA: ' + msg, 'error');
   }
 };
 
@@ -3872,8 +3893,8 @@ window.saveCompanySettings = async () => {
   const ehsEmail    = document.getElementById('s-ehsemail').value.trim();
   const statusEl    = document.getElementById('branding-save-status');
   // Use pending upload, or existing saved URL
-  const logoUrl = window._pendingLogoDataUrl !== undefined ? window._pendingLogoDataUrl : (appSettings.logoUrl||'');
-  console.log('[saveCompanySettings] logoUrl length:', logoUrl?.length, 'companyName:', companyName);
+  const logoUrl = (window._pendingLogoDataUrl !== undefined) ? window._pendingLogoDataUrl : (appSettings.logoUrl || '');
+  console.log('[saveCompanySettings] logoUrl length:', logoUrl?.length||0, 'hasLogo:', !!logoUrl);
 
   if (statusEl) statusEl.textContent = 'Saving...';
   try {
@@ -5228,10 +5249,12 @@ function renderCreateEais() {
       <div id="aspect-list">${renderAspectCards()}</div>
     </div>
 
-    <div style="position:sticky;bottom:0;background:var(--bg-base);border-top:1px solid var(--border);padding:10px 0;margin-top:12px;display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;z-index:10">
+    <div style="position:sticky;bottom:0;background:var(--bg-base);border-top:1px solid var(--border);padding:10px 0;margin-top:12px;display:flex;gap:10px;justify-content:flex-end;align-items:center;flex-wrap:wrap;z-index:10">
       <button class="btn btn-secondary" onclick="navigate('eais-register')">Cancel</button>
       <button class="btn btn-secondary" onclick="saveEais('Draft')">💾 Save Draft</button>
-      ${canEdit()?`<button class="btn btn-primary" onclick="saveEais('Submitted')">📤 Submit for Review</button>`:''}
+      ${canEdit()?`<button class="btn btn-primary" onclick="saveEais('Submitted')">
+        📤 Submit for Review ${editingAspects.length===0?'<small style=\'opacity:.7\'>(add aspects first)</small>':''}
+      </button>`:''}
     </div>
   `;
 }
@@ -5584,6 +5607,9 @@ window.saveEais = async (status) => {
   if (!assessmentDate){ toast('Assessment Date is required','error'); return; }
   if (!reviewDate)    { toast('Review Date is required','error'); return; }
   if (!preparedBy)    { toast('Prepared By is required','error'); return; }
+  if (status === 'Submitted' && editingAspects.length === 0) {
+    toast('Add at least one aspect before submitting for review','warning'); return;
+  }
   const plant = plants.find(p=>p.id===plantId);
   const data = {
     eaisId: document.getElementById('ef-eaisId').value.trim() || generateEaisId(),
@@ -5612,7 +5638,13 @@ window.saveEais = async (status) => {
     }
     editingEaisId = null; editingAspects = [];
     navigate('eais-register');
-  } catch(e) { toast('Save failed: '+e.message,'error'); }
+  } catch(e) {
+    console.error('[saveEais] ERROR:', e.code, e.message, e);
+    let msg = e.message;
+    if (e.code === 'permission-denied') msg = 'Permission denied. Make sure Firestore rules are deployed: firebase deploy --only firestore:rules';
+    if (e.code === 'unavailable') msg = 'Firestore unavailable. Check internet connection.';
+    toast('Save failed: ' + msg, 'error');
+  }
 };
 
 // ── VIEW EAIS ──
