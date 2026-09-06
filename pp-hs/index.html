@@ -1198,6 +1198,9 @@ tbody tr:last-child td { border-bottom: none; }
     <div class="topbar">
       <button class="mobile-menu-btn" onclick="openSidebar()">☰</button>
       <div class="topbar-title" id="page-title">Dashboard</div>
+      <div id="license-topbar-warning" style="display:none;font-size:11px;padding:4px 12px;border-radius:20px;background:rgba(239,68,68,0.15);color:var(--risk-critical);border:1px solid var(--risk-critical);cursor:pointer" onclick="navigate('settings')">
+        ⛔ License Expired — Read Only Mode
+      </div>
       <div class="topbar-search">
         <span>🔍</span>
         <input type="text" id="global-search" placeholder="Search HIRA, hazards, actions..." oninput="globalSearch(this.value)">
@@ -1279,6 +1282,7 @@ const firebaseConfig = {
 const app = firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
+const _db = db; // alias for license panel compatibility
 
 // ─── Auth aliases ───
 function signInWithEmailAndPassword(a, email, pw) { return auth.signInWithEmailAndPassword(email, pw); }
@@ -1444,6 +1448,7 @@ onAuthStateChanged(auth, async (user) => {
       currentUserProfile = profileDoc.data();
     }
     showApp();
+    checkLicenseOnLoad(); // Check license validity
   } else {
     currentUser = null;
     currentUserProfile = null;
@@ -1484,7 +1489,15 @@ function setupRoleVisibility() {
 }
 
 function canEdit() {
-  return isSuperAdmin() || [ROLES.CORPORATE_EHS, ROLES.PLANT_ADMIN, ROLES.ASSESSOR].includes(currentUserProfile?.role);
+  // SuperAdmin can always edit regardless of license
+  if (isSuperAdmin()) return true;
+  // Non-superadmins locked out if license expired/invalid
+  if (window._licenseState && (window._licenseState.expired || window._licenseState.revoked || window._licenseState.invalid)) {
+    const w = document.getElementById('license-topbar-warning');
+    if (w) w.style.display='';
+    return false;
+  }
+  return [ROLES.CORPORATE_EHS, ROLES.PLANT_ADMIN, ROLES.ASSESSOR].includes(currentUserProfile?.role);
 }
 function canApprove() {
   return isSuperAdmin() || currentUserProfile?.role === ROLES.CORPORATE_EHS;
@@ -3373,7 +3386,7 @@ window.toggleUserStatus = async (uid, currentStatus) => {
 // ─── SETTINGS ───
 function renderSettings() {
   const tabs = isSuperAdmin()
-    ? [['🎯','Risk Matrix'],['🏢','Company & Logo'],['📧','Email / Gmail'],['👥','User Management'],['ℹ️','System Info'],['👤','My Profile']]
+    ? [['🎯','Risk Matrix'],['🏢','Company & Logo'],['📧','Email / Gmail'],['👥','User Management'],['🔑','License'],['ℹ️','System Info'],['👤','My Profile']]
     : [['🎯','Risk Matrix'],['ℹ️','System Info'],['👤','My Profile']];
   document.getElementById('main-content').innerHTML = `
     <div class="page-header"><div class="page-header-left"><h1>Settings</h1><p>Configure system preferences</p></div></div>
@@ -3403,6 +3416,7 @@ window.switchSettingsTab = (el, tab) => {
     EmailGmail: renderEmailSettings,
     UserManagement: () => { renderUsers(); return ''; },
     SystemInfo: renderSystemInfo,
+    License: renderLicenseSettings,
     MyProfile: renderMyProfile
   };
   const fn = map[tab];
@@ -3441,40 +3455,136 @@ function renderRiskMatrixSettings() {
 function renderCompanySettings() {
   const s = appSettings;
   return `<div class="card">
-    <h3 style="margin-bottom:16px">Company Branding</h3>
-    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">These settings apply across all devices for all users.</p>
-    <div class="form-group">
-      <label>Company Name</label>
-      <input type="text" id="s-cname" value="${escAttr(s.companyName||'')}" placeholder="Poly Plastics India">
+    <h3 style="margin-bottom:4px">Company Branding</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">Settings apply instantly across all devices for all users.</p>
+
+    <div class="form-row form-col-2">
+      <div class="form-group">
+        <label>Company Name</label>
+        <input type="text" id="s-cname" value="${escAttr(s.companyName||'')}" placeholder="Poly Plastics India">
+      </div>
+      <div class="form-group">
+        <label>EHS Contact Email</label>
+        <input type="email" id="s-ehsemail" value="${escAttr(s.ehsEmail||'')}" placeholder="ehs@company.com">
+      </div>
     </div>
-    <div class="form-group">
-      <label>Company Logo URL</label>
-      <input type="url" id="s-logo-url" value="${escAttr(s.logoUrl||'')}" placeholder="https://your-cdn.com/logo.png">
-      <small style="color:var(--text-muted);font-size:11px">Host your logo on Google Drive, Dropbox, or any public CDN and paste the direct image URL here. It will appear in the sidebar for all users.</small>
+
+    <div class="form-group" style="margin-top:8px">
+      <label>Company Logo</label>
+      <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+
+        <!-- Upload box -->
+        <div id="logo-drop-zone" onclick="document.getElementById('logo-file-input').click()"
+          style="width:180px;height:120px;border:2px dashed var(--border);border-radius:var(--radius-lg);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;cursor:pointer;transition:all .2s;flex-shrink:0;background:var(--bg-input)"
+          ondragover="event.preventDefault();this.style.borderColor='var(--accent)'"
+          ondragleave="this.style.borderColor='var(--border)'"
+          ondrop="handleLogoDrop(event)">
+          <span style="font-size:28px">🖼️</span>
+          <span style="font-size:11px;color:var(--text-muted);text-align:center">Click or drag & drop<br>PNG / JPG / SVG / WebP<br>Max 500 KB</span>
+        </div>
+        <input type="file" id="logo-file-input" accept="image/png,image/jpeg,image/svg+xml,image/webp" style="display:none" onchange="handleLogoFile(this.files[0])">
+
+        <!-- Preview -->
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px;font-weight:600">Current Logo</div>
+          <div style="padding:16px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);min-height:80px;display:flex;align-items:center;justify-content:center;margin-bottom:10px">
+            ${s.logoUrl
+              ? `<img id="logo-preview-img" src="${escAttr(s.logoUrl)}" style="max-height:60px;max-width:200px;object-fit:contain">`
+              : `<span id="logo-preview-img" style="font-size:12px;color:var(--text-muted)">No logo uploaded</span>`}
+          </div>
+          ${s.logoUrl ? `<button class="btn btn-secondary btn-sm" onclick="removeLogo()" style="color:var(--risk-critical);border-color:var(--risk-critical)">🗑 Remove Logo</button>` : ''}
+          <div id="logo-upload-status" style="font-size:11px;color:var(--text-muted);margin-top:6px"></div>
+        </div>
+      </div>
+
+      <!-- URL fallback -->
+      <div style="margin-top:12px">
+        <label style="font-size:11px;color:var(--text-muted)">Or paste a direct image URL</label>
+        <div style="display:flex;gap:8px;margin-top:4px">
+          <input type="url" id="s-logo-url" value="" placeholder="https://example.com/logo.png" style="flex:1">
+          <button class="btn btn-secondary btn-sm" onclick="applyLogoUrl()">Apply URL</button>
+        </div>
+      </div>
     </div>
-    ${s.logoUrl ? `<div style="margin:12px 0;padding:12px;background:var(--bg-base);border-radius:var(--radius)">
-      <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">Current Logo Preview:</div>
-      <img src="${escAttr(s.logoUrl)}" style="max-height:60px;max-width:200px;object-fit:contain">
-    </div>` : ''}
-    <div class="form-group">
-      <label>EHS Contact Email</label>
-      <input type="email" id="s-ehsemail" value="${escAttr(s.ehsEmail||'')}" placeholder="ehs@company.com">
+
+    <div style="margin-top:20px;display:flex;gap:10px;align-items:center">
+      <button class="btn btn-primary" onclick="saveCompanySettings()">💾 Save Branding</button>
+      <span id="branding-save-status" style="font-size:12px;color:var(--text-muted)"></span>
     </div>
-    <button class="btn btn-primary mt-16" onclick="saveCompanySettings()">Save Branding</button>
   </div>`;
 }
 
+// ── LOGO HANDLERS ──
+window.handleLogoDrop = (e) => {
+  e.preventDefault();
+  document.getElementById('logo-drop-zone').style.borderColor = 'var(--border)';
+  const file = e.dataTransfer.files[0];
+  if (file) handleLogoFile(file);
+};
+
+window.handleLogoFile = (file) => {
+  if (!file) return;
+  const statusEl = document.getElementById('logo-upload-status');
+  if (!file.type.startsWith('image/')) { toast('Please select an image file','error'); return; }
+  if (file.size > 500*1024) { toast('Logo must be under 500 KB','error'); return; }
+  if (statusEl) statusEl.textContent = 'Reading file...';
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const dataUrl = ev.target.result;
+    // Show preview immediately
+    const preview = document.getElementById('logo-preview-img');
+    if (preview) { preview.src = dataUrl; preview.style.maxHeight='60px'; preview.style.maxWidth='200px'; preview.style.objectFit='contain'; }
+    // Store in appSettings pending save
+    window._pendingLogoDataUrl = dataUrl;
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-low)">✓ Ready — click Save Branding to apply</span>';
+    toast('Logo loaded! Click Save Branding.','info');
+  };
+  reader.readAsDataURL(file);
+};
+
+window.applyLogoUrl = () => {
+  const url = document.getElementById('s-logo-url')?.value.trim();
+  if (!url) return;
+  window._pendingLogoDataUrl = url;
+  const preview = document.getElementById('logo-preview-img');
+  if (preview) { preview.src = url; }
+  toast('URL applied — click Save Branding','info');
+};
+
+window.removeLogo = async () => {
+  window._pendingLogoDataUrl = '';
+  try {
+    await setDoc(doc(db,'hira_settings','app'), { logoUrl:'', updatedAt: serverTimestamp(), updatedBy: currentUser.uid }, {merge:true});
+    appSettings.logoUrl = '';
+    applyCompanyBranding();
+    toast('Logo removed','success');
+    switchSettingsTab(document.querySelector('.settings-nav-item.active'),'CompanyLogo');
+  } catch(e) { toast('Remove failed: '+e.message,'error'); }
+};
+
 window.saveCompanySettings = async () => {
   const companyName = document.getElementById('s-cname').value.trim();
-  const logoUrl = document.getElementById('s-logo-url').value.trim();
-  const ehsEmail = document.getElementById('s-ehsemail').value.trim();
+  const ehsEmail    = document.getElementById('s-ehsemail').value.trim();
+  const statusEl    = document.getElementById('branding-save-status');
+  // Use pending upload, or existing saved URL
+  const logoUrl = window._pendingLogoDataUrl !== undefined ? window._pendingLogoDataUrl : (appSettings.logoUrl||''  );
+
+  if (statusEl) statusEl.textContent = 'Saving...';
   try {
-    await setDoc(doc(db,'hira_settings','app'), { companyName, logoUrl, ehsEmail, updatedAt: serverTimestamp(), updatedBy: currentUser.uid }, { merge: true });
-    appSettings = { ...appSettings, companyName, logoUrl, ehsEmail };
+    await setDoc(doc(db,'hira_settings','app'), {
+      companyName, ehsEmail, logoUrl,
+      updatedAt: serverTimestamp(), updatedBy: currentUser.uid
+    }, { merge: true });
+    appSettings = { ...appSettings, companyName, ehsEmail, logoUrl };
+    window._pendingLogoDataUrl = undefined;
     applyCompanyBranding();
-    toast('Branding saved and applied to all devices!', 'success');
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-low)">✓ Saved at '+new Date().toLocaleTimeString()+'</span>';
+    toast('Branding saved and applied to all users!', 'success');
     switchSettingsTab(document.querySelector('.settings-nav-item.active'), 'CompanyLogo');
-  } catch(e) { toast('Save failed: ' + e.message, 'error'); }
+  } catch(e) {
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-critical)">✗ '+e.message+'</span>';
+    toast('Save failed: ' + e.message, 'error');
+  }
 };
 
 function renderEmailSettings() {
@@ -3607,6 +3717,177 @@ window.testEmailConnection = async () => {
     else toast('Cloud Function error: ' + res.status, 'error');
   } catch(e) { toast('Cannot reach Cloud Function: ' + e.message, 'error'); }
 };
+
+function renderLicenseSettings() {
+  const s = appSettings;
+  setTimeout(loadCurrentLicense, 100);
+  return `<div class="card">
+    <h3 style="margin-bottom:8px">🔑 License Management</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">
+      Manage your HIRA System license key. Only SuperAdmin can enter or update the license.
+    </p>
+
+    <div id="license-status-banner" style="border-radius:var(--radius);padding:14px 16px;margin-bottom:20px;display:flex;align-items:center;gap:12px;background:var(--bg-hover);border:1px solid var(--border)">
+      <span style="font-size:24px">⏳</span>
+      <div><div style="font-weight:600;font-size:13px">Checking license...</div><div style="font-size:12px;color:var(--text-secondary)">Validating with server</div></div>
+    </div>
+
+    <div class="form-row form-col-2">
+      <div class="form-group">
+        <label>License Key</label>
+        <input type="text" id="lic-key-input" value="${escAttr(s.licenseKey||'')}"
+          placeholder="HIRA-XXXX-XXXX-XXXX"
+          style="font-family:var(--font-mono);letter-spacing:2px;text-transform:uppercase"
+          oninput="this.value=this.value.toUpperCase()">
+      </div>
+      <div class="form-group">
+        <label>Company Name (on license)</label>
+        <input type="text" id="lic-company-display" readonly
+          style="background:var(--bg-hover);color:var(--text-muted)" placeholder="Auto-filled after validation">
+      </div>
+    </div>
+
+    <div id="license-details" style="display:none;background:var(--bg-hover);border-radius:var(--radius);padding:16px;margin-bottom:20px">
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;font-size:12px">
+        <div><label style="color:var(--text-muted);font-size:11px;text-transform:uppercase">Customer</label><div id="ld-customer" style="font-weight:600;margin-top:2px">—</div></div>
+        <div><label style="color:var(--text-muted);font-size:11px;text-transform:uppercase">Issued</label><div id="ld-issued" style="font-weight:600;margin-top:2px">—</div></div>
+        <div><label style="color:var(--text-muted);font-size:11px;text-transform:uppercase">Expires</label><div id="ld-expires" style="font-weight:600;margin-top:2px">—</div></div>
+        <div><label style="color:var(--text-muted);font-size:11px;text-transform:uppercase">Days Left</label><div id="ld-days" style="font-weight:600;margin-top:2px">—</div></div>
+        <div><label style="color:var(--text-muted);font-size:11px;text-transform:uppercase">Max Users</label><div id="ld-users" style="font-weight:600;margin-top:2px">—</div></div>
+        <div><label style="color:var(--text-muted);font-size:11px;text-transform:uppercase">Modules</label><div id="ld-modules" style="font-weight:600;margin-top:2px;font-size:11px">—</div></div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="saveLicenseKey()">🔑 Validate & Save</button>
+      <button class="btn btn-secondary" onclick="loadCurrentLicense()">↻ Refresh Status</button>
+      <span id="lic-save-status" style="font-size:12px;color:var(--text-muted)"></span>
+    </div>
+
+    <div style="margin-top:24px;background:var(--bg-hover);border-radius:var(--radius);padding:14px;font-size:12px;color:var(--text-secondary)">
+      <strong>ℹ️ License Behaviour</strong><br>
+      • <strong>Valid license:</strong> Full access for all users<br>
+      • <strong>Expired license:</strong> SuperAdmin retains full access; all other users are in read-only mode<br>
+      • <strong>No license:</strong> App runs in trial/read-only mode — SuperAdmin can enter key anytime<br>
+      • Contact <strong>QMS Galaxy</strong> to purchase or renew your license
+    </div>
+  </div>`;
+}
+
+async function loadCurrentLicense() {
+  const banner = document.getElementById('license-status-banner');
+  const details = document.getElementById('license-details');
+  if (!banner) return;
+
+  try {
+    const snap = await getDoc(doc(db,'hira_settings','app'));
+    const savedKey = snap.exists() ? (snap.data().licenseKey||'') : '';
+    if (savedKey) {
+      const el = document.getElementById('lic-key-input');
+      if (el) el.value = savedKey;
+    }
+    if (!savedKey) {
+      banner.style.cssText = 'border-radius:var(--radius);padding:14px 16px;margin-bottom:20px;display:flex;align-items:center;gap:12px;background:rgba(245,158,11,0.1);border:1px solid var(--risk-medium)';
+      banner.innerHTML = '<span style="font-size:24px">⚠️</span><div><div style="font-weight:600;font-size:13px;color:var(--risk-medium)">No License Key</div><div style="font-size:12px;color:var(--text-secondary)">Enter a license key below to activate the system</div></div>';
+      if (details) details.style.display='none';
+      return;
+    }
+    // Validate against Firestore
+    const licDoc = await getDoc(doc(db,'hira_licenses',savedKey));
+    if (!licDoc.exists()) {
+      banner.style.cssText = 'border-radius:var(--radius);padding:14px 16px;margin-bottom:20px;display:flex;align-items:center;gap:12px;background:rgba(239,68,68,0.1);border:1px solid var(--risk-critical)';
+      banner.innerHTML = '<span style="font-size:24px">❌</span><div><div style="font-weight:600;font-size:13px;color:var(--risk-critical)">Invalid License Key</div><div style="font-size:12px;color:var(--text-secondary)">This key was not found. Contact QMS Galaxy.</div></div>';
+      if (details) details.style.display='none';
+      return;
+    }
+    const l = licDoc.data();
+    const exp = l.expiryDate?.toDate ? l.expiryDate.toDate() : new Date(l.expiryDate);
+    const dl = Math.ceil((exp-new Date())/86400000);
+    const isExpired = dl < 0;
+    const isExpiringSoon = dl >= 0 && dl <= 30;
+
+    if (!l.isActive) {
+      banner.style.cssText = 'border-radius:var(--radius);padding:14px 16px;margin-bottom:20px;display:flex;align-items:center;gap:12px;background:rgba(239,68,68,0.1);border:1px solid var(--risk-critical)';
+      banner.innerHTML = '<span style="font-size:24px">🚫</span><div><div style="font-weight:600;font-size:13px;color:var(--risk-critical)">License Revoked</div><div style="font-size:12px;color:var(--text-secondary)">Contact QMS Galaxy to restore access.</div></div>';
+    } else if (isExpired) {
+      banner.style.cssText = 'border-radius:var(--radius);padding:14px 16px;margin-bottom:20px;display:flex;align-items:center;gap:12px;background:rgba(239,68,68,0.1);border:1px solid var(--risk-critical)';
+      banner.innerHTML = `<span style="font-size:24px">⛔</span><div><div style="font-weight:600;font-size:13px;color:var(--risk-critical)">License Expired — ${Math.abs(dl)} days ago</div><div style="font-size:12px;color:var(--text-secondary)">Non-SuperAdmin users are in read-only mode. Renew to restore full access.</div></div>`;
+    } else if (isExpiringSoon) {
+      banner.style.cssText = 'border-radius:var(--radius);padding:14px 16px;margin-bottom:20px;display:flex;align-items:center;gap:12px;background:rgba(245,158,11,0.1);border:1px solid var(--risk-medium)';
+      banner.innerHTML = `<span style="font-size:24px">⚡</span><div><div style="font-weight:600;font-size:13px;color:var(--risk-medium)">Expiring in ${dl} days</div><div style="font-size:12px;color:var(--text-secondary)">Renew soon to avoid service interruption.</div></div>`;
+    } else {
+      banner.style.cssText = 'border-radius:var(--radius);padding:14px 16px;margin-bottom:20px;display:flex;align-items:center;gap:12px;background:rgba(34,197,94,0.1);border:1px solid var(--risk-low)';
+      banner.innerHTML = `<span style="font-size:24px">✅</span><div><div style="font-weight:600;font-size:13px;color:var(--risk-low)">License Active — ${dl} days remaining</div><div style="font-size:12px;color:var(--text-secondary)">${l.company} · Valid until ${exp.toLocaleDateString('en-IN')}</div></div>`;
+    }
+
+    if (details) {
+      details.style.display='block';
+      document.getElementById('ld-customer').textContent = l.customerName||'—';
+      document.getElementById('ld-issued').textContent = l.issuedDate?new Date(l.issuedDate).toLocaleDateString('en-IN'):'—';
+      document.getElementById('ld-expires').textContent = exp.toLocaleDateString('en-IN');
+      document.getElementById('ld-days').innerHTML = `<span style="color:${isExpired?'var(--risk-critical)':isExpiringSoon?'var(--risk-medium)':'var(--risk-low)'}">${isExpired?'EXPIRED':dl+' days'}</span>`;
+      document.getElementById('ld-users').textContent = l.maxActivations||'Unlimited';
+      document.getElementById('ld-modules').textContent = (l.features||['All']).join(', ');
+      const co = document.getElementById('lic-company-display');
+      if (co) co.value = l.company||'';
+    }
+
+    // Store license state globally for app-wide checks
+    window._licenseState = { valid: l.isActive && !isExpired, expired: isExpired, revoked: !l.isActive, daysLeft: dl, data: l };
+  } catch(e) {
+    if (banner) banner.innerHTML = '<span>⚠️</span><div style="font-size:13px;color:var(--risk-medium)">Could not check license: '+e.message+'</div>';
+  }
+}
+
+window.saveLicenseKey = async () => {
+  const key = document.getElementById('lic-key-input')?.value.trim().toUpperCase();
+  const statusEl = document.getElementById('lic-save-status');
+  if (!key) { toast('Enter a license key','warning'); return; }
+  if (statusEl) statusEl.textContent = 'Validating...';
+
+  try {
+    const licDoc = await getDoc(doc(db,'hira_licenses',key));
+    if (!licDoc.exists()) {
+      if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-critical)">✗ Invalid key — not found</span>';
+      toast('Invalid license key','error'); return;
+    }
+    const l = licDoc.data();
+    if (!l.isActive) {
+      if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-critical)">✗ License is revoked</span>';
+      toast('License is revoked. Contact QMS Galaxy.','error'); return;
+    }
+    // Save to app settings
+    await setDoc(doc(db,'hira_settings','app'), { licenseKey: key, licenseCompany: l.company, updatedAt: serverTimestamp(), updatedBy: currentUser.uid }, {merge:true});
+    appSettings.licenseKey = key;
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-low)">✓ Saved at '+new Date().toLocaleTimeString()+'</span>';
+    toast('License key saved and validated!','success');
+    await loadCurrentLicense();
+    // Increment activation count
+    try { await _db.collection('hira_licenses').doc(key).update({ activationCount: firebase.firestore.FieldValue.increment(1) }); } catch(e){}
+  } catch(e) {
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--risk-critical)">✗ '+e.message+'</span>';
+    toast('Error: '+e.message,'error');
+  }
+};
+
+// ── LICENSE GUARD ── runs on app load to set read-only for non-superadmins if expired
+async function checkLicenseOnLoad() {
+  try {
+    const snap = await getDoc(doc(db,'hira_settings','app'));
+    const key = snap.exists() ? snap.data().licenseKey : null;
+    if (!key) { window._licenseState = { valid:false, expired:false, noKey:true }; return; }
+    const licDoc = await getDoc(doc(db,'hira_licenses',key));
+    if (!licDoc.exists()) { window._licenseState = { valid:false, invalid:true }; return; }
+    const l = licDoc.data();
+    const exp = l.expiryDate?.toDate?l.expiryDate.toDate():new Date(l.expiryDate);
+    const dl = Math.ceil((exp-new Date())/86400000);
+    window._licenseState = { valid: l.isActive && dl >= 0, expired: dl < 0, revoked: !l.isActive, daysLeft: dl, data: l };
+  } catch(e) { window._licenseState = { valid:true, error:true }; } // fail open
+}
+
+window._licenseState = { valid:true }; // default until checked
+
+
 
 function renderSystemInfo() {
   return `<div class="card">
