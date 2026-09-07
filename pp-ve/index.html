@@ -781,12 +781,15 @@ async function fsInviteUser(email, displayName, plantId, password) {
           newUid = lookupData.localId;
           console.log('[fsInviteUser] Got UID from sign-in:', newUid);
         } else {
-          // Cannot get UID — use email as doc ID fallback
-          newUid = email.replace(/[^a-zA-Z0-9]/g, '_');
-          console.warn('[fsInviteUser] Could not sign in to get UID, using email-based ID');
+          // Cannot sign in — the password provided by SA doesn't match the existing Auth account.
+          // Do NOT fall back to an email-derived ID; that creates an orphaned Firestore doc
+          // which the user can never retrieve (their real UID won't match it).
+          const errCode = lookupData?.error?.message || 'UNKNOWN';
+          throw new Error(`User already exists in Firebase Auth but sign-in failed (${errCode}). Either the user exists with a different password, or use the existing account's correct password to link them to VEMS.`);
         }
-      } catch(_) {
-        newUid = email.replace(/[^a-zA-Z0-9]/g, '_');
+      } catch(e) {
+        if (e.message.includes('already exists') || e.message.includes('sign-in failed')) throw e;
+        throw new Error('Network error while looking up existing user UID: ' + e.message);
       }
     } else if (errCode.includes('WEAK_PASSWORD')) {
       throw new Error('Password must be at least 6 characters.');
@@ -1022,7 +1025,24 @@ onAuthStateChanged(auth, async user => {
     if (!S.isSuperAdmin && !S.isTopMgmt) {
       try {
         const snap = await getDoc(doc(db,'vems_users', user.uid));
-        S.userProfile = snap.exists() ? snap.data() : { plantId:'', role:'plant_admin' };
+        if (snap.exists()) {
+          S.userProfile = snap.data();
+        } else {
+          // Fallback: doc may have been saved under email-derived ID (EMAIL_EXISTS path).
+          // Search by email field instead.
+          const emailSnap = await getDocs(query(collection(db,'vems_users'), where('email','==',user.email)));
+          if (!emailSnap.empty) {
+            const profileData = emailSnap.docs[0].data();
+            S.userProfile = profileData;
+            // Silently migrate the doc to the correct UID so future logins work instantly.
+            try {
+              await setDoc(doc(db,'vems_users', user.uid), profileData);
+              await deleteDoc(emailSnap.docs[0].ref);
+            } catch(migErr) { console.warn('[vems_users migration]', migErr); }
+          } else {
+            S.userProfile = { plantId:'', role:'plant_admin' };
+          }
+        }
       } catch { S.userProfile = { plantId:'', role:'plant_admin' }; }
       // Check license for plant admins
       const licOk = await checkVemsLicense();
