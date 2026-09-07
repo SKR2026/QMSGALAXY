@@ -5914,6 +5914,7 @@ let allIsms = [];
 let ismsListener = null;
 let editingIsmsId = null;
 let editingIsmsRisks = [];
+let ismsSaveBusy = false;
 let ismsFilter = { search:'', plant:'', status:'', riskLevel:'' };
 let ismsPagination = { page:1, perPage:20 };
 
@@ -5922,6 +5923,7 @@ let allEnms = [];
 let enmsListener = null;
 let editingEnmsId = null;
 let editingEnmsItems = [];
+let enmsSaveBusy = false;
 let enmsFilter = { search:'', plant:'', status:'', significance:'' };
 let enmsPagination = { page:1, perPage:20 };
 
@@ -7392,48 +7394,74 @@ window.removeIsmsRisk = (idx) => {
 };
 
 window.saveIsmsDraft = async () => {
+  if (ismsSaveBusy) return false;
   const ismsId = document.getElementById('if-ismsId')?.value.trim();
   const plantId = document.getElementById('if-plant')?.value;
   const assetProcess = document.getElementById('if-asset')?.value.trim();
   const preparedBy = document.getElementById('if-prepby')?.value.trim();
   const assessmentDate = document.getElementById('if-assessdate')?.value;
   const reviewDate = document.getElementById('if-reviewdate')?.value;
-  if (!plantId||!assetProcess||!preparedBy||!assessmentDate) { toast('Plant, Asset/Process, Prepared By and Assessment Date are required.','warning'); return; }
+  if (!plantId||!assetProcess||!preparedBy||!assessmentDate) { toast('Plant, Asset/Process, Prepared By and Assessment Date are required.','warning'); return false; }
+
+  // Clone the complete risk array so Firestore receives the current scoring,
+  // residual scoring and treatment data, not a live UI reference.
+  const risks = JSON.parse(JSON.stringify(editingIsmsRisks || []));
   const data = {
-    ismsId, plantId, assetProcess, department:document.getElementById('if-dept')?.value,
-    assetType:document.getElementById('if-assettype')?.value,
-    scope:document.getElementById('if-scope')?.value,
+    ismsId, plantId, assetProcess,
+    department:document.getElementById('if-dept')?.value || '',
+    assetType:document.getElementById('if-assettype')?.value || '',
+    scope:document.getElementById('if-scope')?.value || '',
     assessmentDate, reviewDate, preparedBy,
-    reviewedBy:document.getElementById('if-revby')?.value,
-    approvedBy:document.getElementById('if-appby')?.value,
-    risks: editingIsmsRisks,
-    updatedAt: serverTimestamp()
+    reviewedBy:document.getElementById('if-revby')?.value || '',
+    approvedBy:document.getElementById('if-appby')?.value || '',
+    risks,
+    updatedAt:serverTimestamp()
   };
+
+  ismsSaveBusy = true;
   try {
+    let action = 'Updated';
     if (editingIsmsId) {
       await updateDoc(doc(db,'isms_studies',editingIsmsId), data);
-      toast('ISMS study updated!','success');
     } else {
-      data.status='Draft'; data.createdAt=serverTimestamp(); data.createdBy=currentUser.uid;
+      action = 'Created';
+      data.status='Draft';
+      data.createdAt=serverTimestamp();
+      data.createdBy=currentUser.uid;
       const ref = await addDoc(collection(db,'isms_studies'), data);
       editingIsmsId = ref.id;
-      toast('ISMS study saved as draft!','success');
     }
-    await logAudit('ISMS', editingIsmsId, editingIsmsId?'Updated':'Created', null, {ismsId,assetProcess});
-  } catch(e) { toast('Save failed: '+e.message,'error'); console.error(e); }
+    toast(`ISMS study ${action==='Created'?'saved as draft':'updated'} successfully!`,'success');
+    // Audit failure must not make a successful Firestore save look like a failure.
+    try { await logAudit('ISMS', editingIsmsId, action, null, {ismsId,assetProcess, riskCount:risks.length}); }
+    catch (auditErr) { console.warn('ISMS audit log failed after successful save:', auditErr); }
+    return true;
+  } catch(e) {
+    console.error('saveIsmsDraft:', e);
+    toast('ISMS save failed: '+(e?.message||e),'error');
+    return false;
+  } finally { ismsSaveBusy = false; }
 };
 
 window.submitIsms = async () => {
-  await saveIsmsDraft();
-  if (!editingIsmsId) return;
-  await updateDoc(doc(db,'isms_studies',editingIsmsId), {status:'Submitted', updatedAt:serverTimestamp()});
-  toast('ISMS study submitted for review!','success');
-  navigate('isms-register');
+  const saved = await saveIsmsDraft();
+  if (!saved || !editingIsmsId) return;
+  try {
+    await updateDoc(doc(db,'isms_studies',editingIsmsId), {status:'Submitted', updatedAt:serverTimestamp()});
+    toast('ISMS study submitted for review!','success');
+    navigate('isms-register');
+  } catch(e) {
+    console.error('submitIsms:', e);
+    toast('Submission failed: '+(e?.message||e),'error');
+  }
 };
 
 window.editIsms = (id) => {
+  const source = allIsms.find(s=>s.id===id);
+  if (!source) { toast('ISMS study not found.','error'); return; }
   editingIsmsId = id;
-  editingIsmsRisks = [];
+  // Load the complete risk/scoring dataset BEFORE rendering the editor.
+  editingIsmsRisks = JSON.parse(JSON.stringify(source.risks || []));
   navigate('create-isms', true);
 };
 
@@ -7858,93 +7886,75 @@ window.removeEnmsItem = (idx) => {
 };
 
 window.saveEnmsDraft = async () => {
+  if (enmsSaveBusy) return false;
   const enmsId = document.getElementById('enf-enmsId')?.value.trim();
   const plantId = document.getElementById('enf-plant')?.value;
   const energySource = document.getElementById('enf-energysource')?.value;
   const preparedBy = document.getElementById('enf-prepby')?.value.trim();
   const assessmentDate = document.getElementById('enf-assessdate')?.value;
   const reviewDate = document.getElementById('enf-reviewdate')?.value;
-  if (!plantId||!energySource||!preparedBy||!assessmentDate) { toast('Plant, Energy Source, Prepared By and Assessment Date are required.','warning'); return; }
+  if (!plantId||!energySource||!preparedBy||!assessmentDate) { toast('Plant, Energy Source, Prepared By and Assessment Date are required.','warning'); return false; }
+
+  // Clone the complete energy-review dataset before writing it.
+  const items = JSON.parse(JSON.stringify(editingEnmsItems || []));
   const data = {
-    enmsId, plantId, energySource, department:document.getElementById('enf-dept')?.value,
-    baselineMethod:document.getElementById('enf-baseline')?.value,
-    baselinePeriod:document.getElementById('enf-baselineperiod')?.value,
+    enmsId, plantId, energySource,
+    department:document.getElementById('enf-dept')?.value || '',
+    baselineMethod:document.getElementById('enf-baseline')?.value || '',
+    baselinePeriod:document.getElementById('enf-baselineperiod')?.value || '',
     totalConsumption:parseFloat(document.getElementById('enf-consumption')?.value)||0,
-    scope:document.getElementById('enf-scope')?.value,
+    scope:document.getElementById('enf-scope')?.value || '',
     assessmentDate, reviewDate, preparedBy,
-    reviewedBy:document.getElementById('enf-revby')?.value,
-    approvedBy:document.getElementById('enf-appby')?.value,
-    items: editingEnmsItems,
-    updatedAt: serverTimestamp()
+    reviewedBy:document.getElementById('enf-revby')?.value || '',
+    approvedBy:document.getElementById('enf-appby')?.value || '',
+    items,
+    updatedAt:serverTimestamp()
   };
+
+  enmsSaveBusy = true;
   try {
+    let action = 'Updated';
     if (editingEnmsId) {
       await updateDoc(doc(db,'enms_studies',editingEnmsId), data);
-      toast('EnMS study updated!','success');
     } else {
-      data.status='Draft'; data.createdAt=serverTimestamp(); data.createdBy=currentUser.uid;
+      action = 'Created';
+      data.status='Draft';
+      data.createdAt=serverTimestamp();
+      data.createdBy=currentUser.uid;
       const ref = await addDoc(collection(db,'enms_studies'), data);
       editingEnmsId = ref.id;
-      toast('EnMS study saved as draft!','success');
     }
-    await logAudit('EnMS', editingEnmsId, editingEnmsId?'Updated':'Created', null, {enmsId,energySource});
-  } catch(e) { toast('Save failed: '+e.message,'error'); console.error(e); }
+    toast(`EnMS study ${action==='Created'?'saved as draft':'updated'} successfully!`,'success');
+    try { await logAudit('EnMS', editingEnmsId, action, null, {enmsId,energySource,itemCount:items.length}); }
+    catch (auditErr) { console.warn('EnMS audit log failed after successful save:', auditErr); }
+    return true;
+  } catch(e) {
+    console.error('saveEnmsDraft:', e);
+    toast('EnMS save failed: '+(e?.message||e),'error');
+    return false;
+  } finally { enmsSaveBusy = false; }
 };
 
 window.submitEnms = async () => {
-  await saveEnmsDraft();
-  if (!editingEnmsId) return;
-  await updateDoc(doc(db,'enms_studies',editingEnmsId), {status:'Submitted', updatedAt:serverTimestamp()});
-  toast('EnMS study submitted for review!','success');
-  navigate('enms-register');
+  const saved = await saveEnmsDraft();
+  if (!saved || !editingEnmsId) return;
+  try {
+    await updateDoc(doc(db,'enms_studies',editingEnmsId), {status:'Submitted', updatedAt:serverTimestamp()});
+    toast('EnMS study submitted for review!','success');
+    navigate('enms-register');
+  } catch(e) {
+    console.error('submitEnms:', e);
+    toast('Submission failed: '+(e?.message||e),'error');
+  }
 };
 
-window.editEnms = (id) => { editingEnmsId = id; editingEnmsItems = []; navigate('create-enms', true); };
-
-window.viewEnms = (id) => {
-  const x = allEnms.find(s=>s.id===id);
-  if (!x) return;
-  const plant = plants.find(p=>p.id===x.plantId);
-  const totalSaving = (x.items||[]).reduce((s,i)=>s+(parseFloat(i.estimatedSaving)||0),0);
-  openModal('viewEnms','⚡ ' + (x.enmsId||'EnMS Study'), `
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:20px">
-      <div><div class="text-muted" style="font-size:11px;text-transform:uppercase">EnMS ID</div><div style="font-weight:600;font-family:var(--font-mono)">${escHtml(x.enmsId||'—')}</div></div>
-      <div><div class="text-muted" style="font-size:11px;text-transform:uppercase">Plant</div><div style="font-weight:600">${escHtml(plant?.name||'—')}</div></div>
-      <div><div class="text-muted" style="font-size:11px;text-transform:uppercase">Status</div><span class="badge badge-${(x.status||'draft').toLowerCase()}">${x.status||'Draft'}</span></div>
-      <div><div class="text-muted" style="font-size:11px;text-transform:uppercase">Energy Source</div><div style="font-weight:600">${escHtml(x.energySource||'—')}</div></div>
-      <div><div class="text-muted" style="font-size:11px;text-transform:uppercase">Total Consumption</div><div>${x.totalConsumption?x.totalConsumption.toLocaleString('en-IN')+' kWh':'—'}</div></div>
-      <div><div class="text-muted" style="font-size:11px;text-transform:uppercase">Est. Annual Saving</div><div style="font-weight:600;color:var(--risk-low)">${totalSaving?'₹'+totalSaving.toLocaleString('en-IN'):'—'}</div></div>
-      <div><div class="text-muted" style="font-size:11px;text-transform:uppercase">Assessment Date</div><div>${formatDate(x.assessmentDate)}</div></div>
-      <div><div class="text-muted" style="font-size:11px;text-transform:uppercase">Review Date</div><div>${formatDate(x.reviewDate)}</div></div>
-      <div><div class="text-muted" style="font-size:11px;text-transform:uppercase">Prepared By</div><div>${escHtml(x.preparedBy||'—')}</div></div>
-    </div>
-    ${x.scope?`<div style="background:var(--bg-hover);border-radius:var(--radius);padding:12px;margin-bottom:16px;font-size:13px">${escHtml(x.scope)}</div>`:''}
-    <h3 style="margin-bottom:12px">Energy Review Items (${(x.items||[]).length})</h3>
-    ${(x.items||[]).map((item,i)=>`
-      <div style="background:var(--bg-base);border:1px solid var(--border);border-left:4px solid ${item.significance==='Significant'?'var(--risk-critical)':'var(--risk-low)'};border-radius:var(--radius-lg);padding:14px;margin-bottom:10px">
-        <div class="d-flex align-center gap-8 mb-8">
-          <span class="hazard-number">#${i+1}</span>
-          <strong>${escHtml(item.energyUse||'—')}</strong>
-          <span class="badge ${item.significance==='Significant'?'badge-critical':'badge-low'}" style="margin-left:auto">${item.significance||'—'}</span>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;font-size:12px">
-          <div><span class="text-muted">Type:</span> ${escHtml(item.energyUseType||'—')}</div>
-          <div><span class="text-muted">Consumption:</span> ${item.consumption?item.consumption.toLocaleString('en-IN')+' kWh':'—'}</div>
-          <div><span class="text-muted">% of Total:</span> ${item.percentTotal||'—'}%</div>
-          <div><span class="text-muted">Opportunity:</span> ${escHtml(item.opportunityType||'—')}</div>
-          <div style="grid-column:1/-1"><span class="text-muted">Improvement:</span> ${escHtml(item.opportunity||'—')}</div>
-          <div><span class="text-muted">Est. Saving:</span> <strong style="color:var(--risk-low)">${item.estimatedSaving?'₹'+parseFloat(item.estimatedSaving).toLocaleString('en-IN'):'—'}</strong></div>
-          <div><span class="text-muted">EnPI:</span> ${escHtml(item.enpi||'—')}</div>
-          <div><span class="text-muted">Target EnPI:</span> ${escHtml(item.enpiTarget||'—')}</div>
-          <div><span class="text-muted">Responsible:</span> ${escHtml(item.responsible||'—')}</div>
-        </div>
-      </div>
-    `).join('')||'<p style="color:var(--text-muted)">No energy review items recorded.</p>'}
-  `, [
-    ...(canEdit()&&['Draft','Rejected'].includes(x.status)?[{label:'Edit',cls:'btn-secondary',action:`editEnms('${id}')`}]:[]),
-    ...(canEdit()&&x.status==='Draft'?[{label:'Submit for Review',cls:'btn-primary',action:`updateEnmsStatus('${id}','Submitted')`}]:[]),
-    ...(canApprove()&&x.status==='Submitted'?[{label:'Approve ✓',cls:'btn-success',action:`updateEnmsStatus('${id}','Approved')`},{label:'Reject ✗',cls:'btn-danger',action:`updateEnmsStatus('${id}','Rejected')`}]:[])
-  ], 'modal-xl');
+window.editEnms = (id) => {
+  const source = allEnms.find(s=>s.id===id);
+  if (!source) { toast('EnMS study not found.','error'); return; }
+  editingEnmsId = id;
+  // Load the complete energy-review dataset BEFORE rendering the editor.
+  editingEnmsItems = JSON.parse(JSON.stringify(source.items || []));
+  navigate('create-enms', true);
 };
 
 window.updateEnmsStatus = async (id, status) => {
@@ -7977,7 +7987,6 @@ window.openCopyAssessmentModal = (moduleType, sourceId) => {
   const moduleLabels = { hira:'HIRA', eais:'EAIS', isms:'ISMS', enms:'EnMS' };
   const label = moduleLabels[moduleType] || moduleType.toUpperCase();
 
-  // Build source options depending on module
   let sourceList = [];
   if (moduleType === 'hira') sourceList = allHiras.map(h=>({ id:h.id, label:`${h.hiraId||h.id.slice(0,8)} — ${plants.find(p=>p.id===h.plantId)?.name||'?'} — ${h.activity||'Unnamed'}`, plantId:h.plantId }));
   else if (moduleType === 'eais') sourceList = allEais.map(e=>({ id:e.id, label:`${e.eaisId||e.id.slice(0,8)} — ${plants.find(p=>p.id===e.plantId)?.name||'?'} — ${e.activity||'Unnamed'}`, plantId:e.plantId }));
@@ -7985,61 +7994,56 @@ window.openCopyAssessmentModal = (moduleType, sourceId) => {
   else if (moduleType === 'enms') sourceList = allEnms.map(x=>({ id:x.id, label:`${x.enmsId||x.id.slice(0,8)} — ${plants.find(p=>p.id===x.plantId)?.name||'?'} — ${x.energySource||'Unnamed'}`, plantId:x.plantId }));
 
   const preselect = sourceId || '';
+  const src = preselect ? sourceList.find(s=>s.id===preselect) : null;
+  const sourcePlant = src ? plants.find(p=>p.id===src.plantId) : null;
 
   openModal('copyAssessment', `📋 Copy ${label} Assessment to Another Plant`, `
-    <div style="background:var(--accent-light);border:1px solid var(--accent);border-radius:var(--radius);padding:12px 16px;margin-bottom:20px;font-size:13px">
-      <strong>ℹ️ Reference Copy:</strong> This creates a new <em>Draft</em> in the target plant, pre-filled with all data from the source study.
-      You can then edit it before submitting. Original record is <strong>not modified</strong>.
-    </div>
-    <div class="form-row form-col-2">
-      <div class="form-group">
-        <label>Source ${label} (copy from) *</label>
-        <select id="copy-source-id" onchange="updateCopySourcePreview('${moduleType}')">
-          <option value="">— Select source —</option>
-          ${sourceList.map(s=>`<option value="${s.id}" data-plant="${s.plantId}" ${s.id===preselect?'selected':''}>${escHtml(s.label)}</option>`).join('')}
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Target Plant (copy to) *</label>
-        <select id="copy-target-plant">
-          <option value="">— Select target plant —</option>
-          ${plants.map(p=>`<option value="${p.id}">${escHtml(p.name)}</option>`).join('')}
-        </select>
-      </div>
+    <div style="background:var(--accent-light);border:1px solid var(--accent);border-radius:var(--radius);padding:14px 16px;margin-bottom:18px;font-size:13px">
+      <strong>Copy as New Draft</strong><br>
+      The complete assessment data, including ${moduleType==='isms'?'risk scoring, residual risk and controls':moduleType==='enms'?'energy review items, significance and savings':'assessment details'}, will be copied.
+      The original assessment will not be changed.
     </div>
 
-    <div id="copy-source-preview" style="display:none;background:var(--bg-base);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px;margin:12px 0">
-      <div style="font-size:12px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;margin-bottom:10px">Source Preview</div>
-      <div id="copy-preview-content" style="font-size:13px"></div>
+    ${preselect ? `
+      <div style="background:var(--bg-base);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:16px">
+        <div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);margin-bottom:5px">Copy From</div>
+        <div style="font-weight:700">${escHtml(src?.label||preselect)}</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:3px">Source Plant: ${escHtml(sourcePlant?.name||'—')}</div>
+      </div>
+      <input type="hidden" id="copy-source-id" value="${escAttr(preselect)}">
+    ` : `
+      <div class="form-group">
+        <label>Source ${label} *</label>
+        <select id="copy-source-id" onchange="updateCopySourcePreview('${moduleType}')">
+          <option value="">— Select source assessment —</option>
+          ${sourceList.map(s=>`<option value="${s.id}">${escHtml(s.label)}</option>`).join('')}
+        </select>
+      </div>
+    `}
+
+    <div class="form-group">
+      <label>Copy To Plant *</label>
+      <select id="copy-target-plant">
+        <option value="">— Select target plant —</option>
+        ${plants.map(p=>`<option value="${p.id}" ${preselect && src?.plantId===p.id?'disabled':''}>${escHtml(p.name)}${preselect && src?.plantId===p.id?' (Source plant)':''}</option>`).join('')}
+      </select>
     </div>
 
     <div class="form-group">
-      <label>New ID for copy (optional — auto-generated if blank)</label>
+      <label>New ${label} ID <span style="font-weight:400;color:var(--text-muted)">(optional)</span></label>
       <input type="text" id="copy-new-id" placeholder="Leave blank to auto-generate" style="font-family:var(--font-mono)">
     </div>
+
     <div class="form-group">
-      <label>Copy Options</label>
-      <div style="display:flex;flex-direction:column;gap:8px;padding:12px;background:var(--bg-base);border-radius:var(--radius)">
-        <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
-          <input type="checkbox" id="copy-opt-data" checked> Copy all assessment data (hazards/risks/aspects/items)
-        </label>
-        <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
-          <input type="checkbox" id="copy-opt-controls" checked> Copy control measures
-        </label>
-        <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
-          <input type="checkbox" id="copy-opt-persons"> Copy responsible persons (Prepared By / Reviewed By / Approved By)
-        </label>
-        <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
-          <input type="checkbox" id="copy-opt-dates"> Keep original assessment dates
-        </label>
-      </div>
+      <label>Copy Note / Reason <span style="font-weight:400;color:var(--text-muted)">(optional)</span></label>
+      <input type="text" id="copy-note" placeholder="e.g. Common assessment framework for Plant B">
     </div>
-    <div class="form-group">
-      <label>Copy Note / Reason (optional)</label>
-      <input type="text" id="copy-note" placeholder="e.g. Extending assessment to Plant B as reference baseline">
+
+    <div style="background:var(--bg-hover);border-radius:var(--radius);padding:12px 14px;font-size:12px;color:var(--text-secondary)">
+      <strong>New copy will:</strong> get a new ID, status <strong>Draft</strong>, current creator and current date. Original approval history/person-specific approval fields are not carried forward.
     </div>
     <input type="hidden" id="copy-module-type" value="${moduleType}">
-  `, [{label:'📋 Create Copy as Draft', cls:'btn-primary', action:'executeCopyAssessment()'}], 'modal-xl');
+  `, [{label:'📋 Create Draft Copy', cls:'btn-primary', action:'executeCopyAssessment()'}], 'modal-xl');
 
   if (preselect) setTimeout(()=>updateCopySourcePreview(moduleType), 100);
 };
@@ -8108,10 +8112,11 @@ window.executeCopyAssessment = async () => {
   const sourceId = document.getElementById('copy-source-id')?.value;
   const targetPlantId = document.getElementById('copy-target-plant')?.value;
   const newId = (document.getElementById('copy-new-id')?.value||'').trim();
-  const copyData = document.getElementById('copy-opt-data')?.checked;
-  const copyControls = document.getElementById('copy-opt-controls')?.checked;
-  const copyPersons = document.getElementById('copy-opt-persons')?.checked;
-  const keepDates = document.getElementById('copy-opt-dates')?.checked;
+  // ISMS/EnMS copies always carry the complete assessment dataset.
+  const copyData = true;
+  const copyControls = true;
+  const copyPersons = false;
+  const keepDates = false;
   const copyNote = document.getElementById('copy-note')?.value?.trim();
 
   if (!sourceId) { toast('Please select a source assessment.','warning'); return; }
@@ -8169,7 +8174,7 @@ window.executeCopyAssessment = async () => {
   try {
     const colRef = collection(db, collection_name);
     const ref = await addDoc(colRef, copy);
-    await logAudit(moduleType.toUpperCase(), ref.id, 'Copied', sourceId, { targetPlant: targetPlant?.name, note: copyNote });
+    try { await logAudit(moduleType.toUpperCase(), ref.id, 'Copied', sourceId, { targetPlant: targetPlant?.name, note: copyNote }); } catch (auditErr) { console.warn('Copy audit log failed after successful copy:', auditErr); }
     toast(`✅ ${moduleType.toUpperCase()} copied to ${targetPlant?.name} as Draft!`, 'success');
     closeModal();
     // Refresh current register
