@@ -288,7 +288,7 @@ import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, creat
   from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js';
 import { getFirestore, collection, getDocs, addDoc, updateDoc, deleteDoc, doc, query, where, orderBy, limit, serverTimestamp, getDoc, setDoc }
   from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js';
-import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject }
+import { getStorage, ref, uploadBytes, getDownloadURL, getBlob, deleteObject }
   from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-storage.js';
 
 const firebaseConfig = {
@@ -2288,7 +2288,7 @@ function expensesHTML() {
       <div class="table-wrap"><table>
         <thead><tr>
           <th style="width:36px;padding-left:14px"><input type="checkbox" ${allChecked?'checked':''} onchange="toggleAllExpenses(this.checked)" style="cursor:pointer"/></th>
-          <th>Date</th><th>Vehicle</th><th>Plant</th><th>Category</th><th>Vendor</th><th>Invoice No</th><th>Amount</th><th>GST</th><th>Total</th><th>Odometer</th><th>CO₂</th><th>Bill</th><th>By</th><th>Actions</th>
+          <th>Date</th><th>Vehicle</th><th>Plant</th><th>Category</th><th>Vendor</th><th>Invoice No</th><th>Amount</th><th>GST</th><th>Total</th><th>Odometer</th><th>CO₂</th><th>Invoice</th><th>By</th><th>Actions</th>
         </tr></thead>
         <tbody>${exps.slice(0,200).map(e=>{
           const checked = S.selectedExpenses.has(e.id);
@@ -2305,7 +2305,12 @@ function expensesHTML() {
             <td class="font-semibold">${fmtR((e.amount||0)+(e.gst||0))}</td>
             <td>${e.odometer?fmt(e.odometer)+' km':'—'}</td>
             <td>${e.co2Emission?`<span class="co2-badge">🌱 ${e.co2Emission}kg</span>`:'—'}</td>
-            <td>${e.hasBill?'✅':'<span class="text-danger">❌</span>'}</td>
+            <td>
+              ${e.billUrl ? `<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
+                <button class="btn btn-secondary btn-xs" title="View invoice" onclick="viewInvoice('${e.id}')">👁 View</button>
+                <button class="btn btn-primary btn-xs" title="Download invoice" onclick="downloadInvoice('${e.id}')">⬇ Download</button>
+              </div>` : (e.hasBill ? '<span class="badge badge-success">Uploaded</span>' : '<span class="text-danger">No invoice</span>')}
+            </td>
             <td style="font-size:11px">${e.enteredBy||'—'}</td>
             <td>
               <button class="btn btn-ghost btn-xs" onclick="showEditExpenseModal('${e.id}')">✏️</button>
@@ -4024,11 +4029,13 @@ window.saveExpense = async function(expenseId='') {
 
   try {
     let billUrl = old?.billUrl || '';
+    let dataBillStoragePath = old?.billStoragePath || '';
     if(pendingBillFile){
       const safeName = pendingBillFile.name.replace(/[^a-zA-Z0-9._-]/g,'_');
       const storageRef = ref(storage, `vems_expenses/${expenseId||'new'}/${Date.now()}_${safeName}`);
       const uploadSnap = await uploadBytes(storageRef, pendingBillFile);
       billUrl = await getDownloadURL(uploadSnap.ref);
+      dataBillStoragePath = storageRef.fullPath;
     }
 
     const cat = document.getElementById('exp-cat')?.value||'Other';
@@ -4061,6 +4068,7 @@ window.saveExpense = async function(expenseId='') {
       invoiceException:noInv,
       invoiceReason:noInv?(document.getElementById('exp-reason')?.value||''):'',
       billUrl,
+      billStoragePath: dataBillStoragePath,
       enteredBy:old?.enteredBy||S.user?.email||''
     };
 
@@ -4083,6 +4091,55 @@ window.saveExpense = async function(expenseId='') {
       ? 'Permission denied by Firebase. Check vems_expenses Firestore rules for this user.'
       : 'Error saving expense: '+(e?.message||e);
     showToast(msg,'error');
+  }
+};
+
+window.viewInvoice = function(expId) {
+  const e = S.expenses.find(x=>x.id===expId);
+  const url = e?.billUrl || '';
+  if (!url) return showToast('Invoice file is not available for this expense','error');
+  const w = window.open(url, '_blank', 'noopener,noreferrer');
+  if (!w) showToast('Please allow pop-ups to view the invoice','warning');
+};
+
+window.downloadInvoice = async function(expId) {
+  const e = S.expenses.find(x=>x.id===expId);
+  const url = e?.billUrl || '';
+  if (!url) return showToast('Invoice file is not available for this expense','error');
+  const nameBase = (e.invoiceNo || `invoice_${e.id}`).replace(/[^a-zA-Z0-9._-]/g,'_');
+  try {
+    showToast('Preparing invoice download…','info');
+    let blob = null;
+    // Preferred: use Firebase Storage SDK so browser CORS/download restrictions are avoided.
+    if (e.billStoragePath) {
+      blob = await getBlob(ref(storage, e.billStoragePath));
+    } else {
+      // Backward compatibility: recover the Storage object path from a Firebase download URL.
+      const m = url.match(/\/o\/([^?]+)/);
+      if (m) {
+        const storagePath = decodeURIComponent(m[1]);
+        blob = await getBlob(ref(storage, storagePath));
+      }
+    }
+    if (!blob) throw new Error('Storage path could not be determined');
+    const objectUrl = URL.createObjectURL(blob);
+    const ext = blob.type.includes('pdf') ? '.pdf' : blob.type.includes('png') ? '.png' : (blob.type.includes('jpeg') || blob.type.includes('jpg')) ? '.jpg' : '';
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = nameBase + ext;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(objectUrl),2000);
+    showToast('Invoice downloaded','success');
+  } catch(err) {
+    console.error('Invoice download failed:', err);
+    // Last fallback: open the actual Firebase URL. This is more reliable than pretending
+    // the cross-origin download attribute can force a download.
+    const w = window.open(url, '_blank', 'noopener,noreferrer');
+    if (w) showToast('Invoice opened. Use the browser download icon to save it.','warning');
+    else showToast('Unable to open invoice. Please allow pop-ups.','error');
   }
 };
 
