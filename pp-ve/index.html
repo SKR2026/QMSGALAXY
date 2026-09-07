@@ -151,6 +151,17 @@ tr:hover td{background:#fafbff}
 .toast-info{background:#1a56a0;color:#fff}
 @keyframes slideup{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
 
+/* OPERATION PROGRESS */
+.vems-progress-overlay{position:fixed;inset:0;background:rgba(15,23,36,.42);display:flex;align-items:center;justify-content:center;z-index:10050;padding:20px}
+.vems-progress-card{width:min(460px,94vw);background:#fff;border-radius:14px;padding:22px;box-shadow:0 24px 70px rgba(0,0,0,.25)}
+.vems-progress-title{font-size:15px;font-weight:700;color:var(--gray-900);margin-bottom:6px}
+.vems-progress-text{font-size:12px;color:var(--gray-500);margin-bottom:12px}
+.vems-progress-track{height:10px;background:var(--gray-200);border-radius:999px;overflow:hidden}
+.vems-progress-fill{height:100%;width:0;background:var(--primary);border-radius:999px;transition:width .2s ease}
+.vems-progress-percent{font-size:11px;color:var(--gray-500);text-align:right;margin-top:6px}
+.exp-selection-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border:1px solid var(--gray-200);background:var(--gray-50);border-radius:8px;margin-bottom:10px}
+.exp-selection-bar .selection-count{font-size:12px;font-weight:600;color:var(--gray-700);margin-right:auto}
+
 /* VEHICLE CARD */
 .vehicle-card{background:#fff;border:1px solid var(--gray-200);border-radius:var(--radius-lg);padding:20px;position:relative;overflow:hidden;transition:box-shadow .15s}
 .vehicle-card:hover{box-shadow:var(--shadow-md)}
@@ -646,10 +657,27 @@ async function fsDeleteVehicle(id) {
   addAudit('Vehicle Deleted',v?.regNo,'');
 }
 async function fsAddExpense(data) {
-  const ref = await addDoc(collection(db,'vems_expenses'), { ...data, createdAt:serverTimestamp(), createdBy:S.user?.email });
+  const ref = await addDoc(collection(db,'vems_expenses'), {
+    ...data,
+    createdAt:serverTimestamp(),
+    createdBy:S.user?.email||''
+  });
   S.expenses.unshift({ id:ref.id, ...data });
   addAudit('Expense Added','',`${vehicleReg(data.vehicleId)} · ${data.category} · ${fmtR(data.amount)}`);
   return ref.id;
+}
+async function fsUpdateExpense(id, data) {
+  const existing = S.expenses.find(x=>x.id===id) || {};
+  await updateDoc(doc(db,'vems_expenses',id), {
+    ...data,
+    updatedAt:serverTimestamp(),
+    updatedBy:S.user?.email||''
+  });
+  const idx = S.expenses.findIndex(x=>x.id===id);
+  if (idx>=0) S.expenses[idx] = { ...S.expenses[idx], ...data };
+  addAudit('Expense Updated',
+    `${vehicleReg(existing.vehicleId)} · ${existing.category} · ${fmtR(existing.amount)}`,
+    `${vehicleReg(data.vehicleId)} · ${data.category} · ${fmtR(data.amount)}`);
 }
 async function fsDeleteExpense(id) {
   const e = S.expenses.find(x=>x.id===id);
@@ -657,12 +685,30 @@ async function fsDeleteExpense(id) {
   S.expenses = S.expenses.filter(x=>x.id!==id);
   addAudit('Expense Deleted','',`${vehicleReg(e?.vehicleId||'')} · ${e?.category} · ${fmtR(e?.amount||0)}`);
 }
-async function fsBulkAddExpenses(expenses) {
-  const results = await Promise.allSettled(expenses.map(e=>addDoc(collection(db,'vems_expenses'),{...e,createdAt:serverTimestamp(),createdBy:S.user?.email})));
-  const added = results.filter(r=>r.status==='fulfilled');
-  added.forEach((r,i)=>S.expenses.unshift({id:r.value.id,...expenses[i]}));
-  addAudit('Bulk Import','',`${added.length} expenses`);
-  return added.length;
+async function fsBulkAddExpenses(expenses, onProgress) {
+  let addedCount = 0;
+  const chunkSize = 10;
+  for (let start=0; start<expenses.length; start+=chunkSize) {
+    const chunk = expenses.slice(start,start+chunkSize);
+    const results = await Promise.allSettled(chunk.map(e =>
+      addDoc(collection(db,'vems_expenses'), {
+        ...e,
+        createdAt:serverTimestamp(),
+        createdBy:S.user?.email||''
+      })
+    ));
+    results.forEach((r,i)=>{
+      if(r.status==='fulfilled'){
+        S.expenses.unshift({id:r.value.id,...chunk[i]});
+        addedCount++;
+      } else {
+        console.error('Bulk expense row failed:', r.reason);
+      }
+    });
+    if(onProgress) onProgress(Math.min(start+chunk.length, expenses.length), expenses.length, addedCount);
+  }
+  addAudit('Bulk Import','',`${addedCount} expenses`);
+  return addedCount;
 }
 async function fsSaveEmissionFactors(factors) {
   await setDoc(doc(db,'vems_settings','emissionFactors'),{...factors,updatedAt:serverTimestamp(),updatedBy:S.user?.email});
@@ -2226,6 +2272,11 @@ function expensesHTML() {
       </div>
     </div>
     ${withoutBill>0?`<div class="alert alert-warning mb-4">⚠️ <b>${withoutBill} expenses</b> are missing invoices. Invoices are mandatory for all expense entries.</div>`:''}
+    ${!S.isTopMgmt?`<div class="exp-selection-bar">
+      <button class="btn btn-secondary btn-sm" onclick="toggleAllExpenses(${!allChecked})">${allChecked?'☐ Clear All':'☑ Select All'}</button>
+      <span class="selection-count">${selCount} selected · ${exps.length} visible records</span>
+      ${selCount?`<button class="btn btn-danger btn-sm" onclick="bulkDeleteExpenses()">🗑 Delete Selected (${selCount})</button>`:''}
+    </div>`:''}
     ${selCount>0?`<div style="display:flex;align-items:center;gap:10px;background:#fef2f2;border:1px solid #fecaca;border-radius:var(--radius);padding:10px 16px;margin-bottom:12px">
       <span style="font-weight:600;color:#dc2626">🗂 ${selCount} record${selCount>1?'s':''} selected</span>
       <button class="btn btn-danger btn-sm" onclick="bulkDeleteExpenses()">🗑 Delete Selected</button>
@@ -3722,86 +3773,173 @@ window.processBulkVehicleCSV = function(input) {
 
 window.submitBulkVehicles = async function() {
   if (!_bulkVehicleRows.length) return;
+  const rows=[..._bulkVehicleRows];
   const btn = document.getElementById('bulk-veh-submit');
-  if (btn) { btn.disabled = true; btn.textContent = `⏳ Uploading 0/${_bulkVehicleRows.length}…`; }
-  let success = 0, failed = 0;
-  for (let i = 0; i < _bulkVehicleRows.length; i++) {
-    try { await fsAddVehicle(_bulkVehicleRows[i]); success++; }
-    catch(e) { console.error('Bulk vehicle error:', e.message); failed++; }
-    if (btn) btn.textContent = `⏳ Uploading ${i+1}/${_bulkVehicleRows.length}…`;
+  if (btn) { btn.disabled = true; btn.textContent = `⏳ Uploading 0/${rows.length}…`; }
+  showOperationProgress('Uploading vehicles',0,rows.length,`0 of ${rows.length} uploaded`);
+  let success=0, failed=0;
+  for(let i=0;i<rows.length;i++){
+    try { await fsAddVehicle(rows[i]); success++; }
+    catch(e) { console.error('Bulk vehicle error:',e?.message||e); failed++; }
+    if(btn) btn.textContent=`⏳ Uploading ${i+1}/${rows.length}…`;
+    showOperationProgress('Uploading vehicles',i+1,rows.length,`${success} uploaded · ${failed} failed`);
   }
-  _bulkVehicleRows = [];
+  _bulkVehicleRows=[];
+  hideOperationProgress();
   closeModal();
   showToast(`✅ ${success} vehicle(s) uploaded${failed?`, ${failed} failed`:''}!`, success?'success':'error');
   render();
 };
 
-window.showExpenseModal = function(vehicleId='', defaultCat='') {
+function showOperationProgress(title, current=0, total=1, detail='Processing…') {
+  let el = document.getElementById('vems-progress-overlay');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'vems-progress-overlay';
+    el.className = 'vems-progress-overlay';
+    el.innerHTML = `<div class="vems-progress-card">
+      <div class="vems-progress-title" id="vems-progress-title"></div>
+      <div class="vems-progress-text" id="vems-progress-text"></div>
+      <div class="vems-progress-track"><div class="vems-progress-fill" id="vems-progress-fill"></div></div>
+      <div class="vems-progress-percent" id="vems-progress-percent">0%</div>
+    </div>`;
+    document.body.appendChild(el);
+  }
+  const pct = total ? Math.min(100, Math.round((current/total)*100)) : 0;
+  document.getElementById('vems-progress-title').textContent = title;
+  document.getElementById('vems-progress-text').textContent = detail;
+  document.getElementById('vems-progress-fill').style.width = pct + '%';
+  document.getElementById('vems-progress-percent').textContent = pct + '%';
+}
+function hideOperationProgress() {
+  document.getElementById('vems-progress-overlay')?.remove();
+}
+
+window.showExpenseModal = function(vehicleId='', defaultCat='', expenseId='') {
   const plants = myPlants();
   const vehicles = myVehicles();
+  const editing = !!expenseId;
+  const existing = editing ? S.expenses.find(x=>x.id===expenseId) : null;
+  if(editing && !existing) return showToast('Expense record not found','error');
+
+  // Always initialise with the first vehicle when no vehicle was supplied.
+  // This also fixes the first-vehicle/blank-plant issue.
+  const selectedVehicleId = existing?.vehicleId || vehicleId || vehicles[0]?.id || '';
+  const selectedVehicle = vehicles.find(v=>v.id===selectedVehicleId);
+  const selectedCat = existing?.category || defaultCat || 'Fuel';
+  pendingBillFile = null;
+
   S.modal = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
     <div class="modal modal-lg">
-      <div class="modal-header"><h2>Add Expense Entry</h2><button onclick="closeModal()">✕</button></div>
+      <div class="modal-header"><h2>${editing?'Edit Expense':'Add Expense Entry'}</h2><button onclick="closeModal()">✕</button></div>
       <div class="modal-body">
-        <div class="alert alert-warning mb-4">⚠️ Invoice/Bill upload is <b>mandatory</b> for every expense entry.</div>
+        <div class="alert ${editing?'alert-info':'alert-warning'} mb-4">
+          ${editing?'✏️ Update the expense details below. Existing invoice/bill will be retained unless replaced.':'⚠️ Invoice/Bill upload is mandatory for every expense entry.'}
+        </div>
         <div class="form-grid">
           <div class="form-group"><label class="form-label">Vehicle <span class="req">*</span></label>
-            <select id="exp-vehicle" class="form-select" onchange="updateExpPlant()">${vehicles.map(v=>`<option value="${v.id}" ${v.id===vehicleId?'selected':''}>${v.regNo} — ${v.make} ${v.model}</option>`).join('')}</select></div>
-          <div class="form-group"><label class="form-label">Plant</label><input id="exp-plant-show" class="form-input" readonly value="${vehicleId?plantName(vehicles.find(v=>v.id===vehicleId)?.plantId||''):''}"/></div>
-          <div class="form-group"><label class="form-label">Expense Date <span class="req">*</span></label><input id="exp-date" type="date" class="form-input" value="${new Date().toISOString().slice(0,10)}"/></div>
-          <div class="form-group"><label class="form-label">Category <span class="req">*</span></label>
-            <select id="exp-cat" class="form-select" onchange="toggleFuelFields()">${EXPENSE_CATEGORIES.map(c=>`<option ${c===defaultCat?'selected':''}>${c}</option>`).join('')}</select></div>
-          <div class="form-group"><label class="form-label">Vendor / Service Provider</label><input id="exp-vendor" class="form-input" placeholder="HP Petroleum"/></div>
-          <div class="form-group"><label class="form-label">Invoice Number</label><input id="exp-invno" class="form-input" placeholder="INV-2026-001"/></div>
-          <div class="form-group"><label class="form-label">Invoice Date</label><input id="exp-invdate" type="date" class="form-input"/></div>
-          <div class="form-group"><label class="form-label">Amount (₹) <span class="req">*</span></label><input id="exp-amount" type="number" class="form-input" placeholder="5000" oninput="calcTotal()"/></div>
-          <div class="form-group"><label class="form-label">GST Amount (₹)</label><input id="exp-gst" type="number" class="form-input" placeholder="0" oninput="calcTotal()"/></div>
-          <div class="form-group"><label class="form-label">Total Amount</label><input id="exp-total" class="form-input" readonly placeholder="Auto-calculated"/></div>
-          <div class="form-group"><label class="form-label">Odometer Reading (km)</label><input id="exp-odo" type="number" class="form-input" placeholder="84500"/></div>
-          <div class="form-group"><label class="form-label">Previous Odometer (km)</label><input id="exp-prevodo" type="number" class="form-input" placeholder="84000" oninput="calcDist()"/></div>
-          <div id="fuel-fields" style="display:${defaultCat==='Fuel'?'contents':'none'}">
-            <div class="form-group"><label class="form-label">Fuel Quantity (L/KG/kWh)</label><input id="exp-fuelqty" type="number" step="0.1" class="form-input" placeholder="50" oninput="calcCO2()"/></div>
-            <div class="form-group"><label class="form-label">Fuel Rate (₹/L)</label><input id="exp-fuelrate" type="number" class="form-input" placeholder="93"/></div>
+            <select id="exp-vehicle" class="form-select" onchange="updateExpPlant()">
+              ${vehicles.map(v=>`<option value="${v.id}" ${v.id===selectedVehicleId?'selected':''}>${v.regNo} — ${v.make} ${v.model}</option>`).join('')}
+            </select>
           </div>
-          <div class="form-group"><label class="form-label">Distance Travelled (km)</label><input id="exp-dist" class="form-input" readonly placeholder="Auto-calculated"/></div>
-          <div class="form-group"><label class="form-label">CO₂ Emission (kg)</label><input id="exp-co2" class="form-input" readonly placeholder="Auto-calculated"/></div>
-          <div class="form-group form-full"><label class="form-label">Remarks</label><textarea id="exp-remarks" class="form-textarea" placeholder="Additional notes…"></textarea></div>
+          <div class="form-group"><label class="form-label">Plant</label>
+            <input id="exp-plant-show" class="form-input" readonly value="${selectedVehicle?plantName(selectedVehicle.plantId):''}"/>
+          </div>
+          <div class="form-group"><label class="form-label">Expense Date <span class="req">*</span></label>
+            <input id="exp-date" type="date" class="form-input" value="${existing?.date||new Date().toISOString().slice(0,10)}"/>
+          </div>
+          <div class="form-group"><label class="form-label">Category <span class="req">*</span></label>
+            <select id="exp-cat" class="form-select" onchange="toggleFuelFields()">
+              ${EXPENSE_CATEGORIES.map(c=>`<option value="${c}" ${c===selectedCat?'selected':''}>${c}</option>`).join('')}
+            </select>
+          </div>
+          <div class="form-group"><label class="form-label">Vendor / Service Provider</label>
+            <input id="exp-vendor" class="form-input" value="${existing?.vendor||''}" placeholder="HP Petroleum"/>
+          </div>
+          <div class="form-group"><label class="form-label">Invoice Number</label>
+            <input id="exp-invno" class="form-input" value="${existing?.invoiceNo||''}" placeholder="INV-2026-001"/>
+          </div>
+          <div class="form-group"><label class="form-label">Invoice Date</label>
+            <input id="exp-invdate" type="date" class="form-input" value="${existing?.invoiceDate||''}"/>
+          </div>
+          <div class="form-group"><label class="form-label">Amount (₹) <span class="req">*</span></label>
+            <input id="exp-amount" type="number" min="0.01" step="0.01" class="form-input" value="${existing?.amount??''}" placeholder="5000" oninput="calcTotal()"/>
+          </div>
+          <div class="form-group"><label class="form-label">GST Amount (₹)</label>
+            <input id="exp-gst" type="number" min="0" step="0.01" class="form-input" value="${existing?.gst??0}" placeholder="0" oninput="calcTotal()"/>
+          </div>
+          <div class="form-group"><label class="form-label">Total Amount</label>
+            <input id="exp-total" class="form-input" readonly value="₹${((existing?.amount||0)+(existing?.gst||0)).toFixed(2)}"/>
+          </div>
+          <div class="form-group"><label class="form-label">Odometer Reading (km)</label>
+            <input id="exp-odo" type="number" min="0" class="form-input" value="${existing?.odometer||''}" placeholder="84500" oninput="calcDist()"/>
+          </div>
+          <div class="form-group"><label class="form-label">Previous Odometer (km)</label>
+            <input id="exp-prevodo" type="number" min="0" class="form-input" value="${existing?.prevOdometer||''}" placeholder="84000" oninput="calcDist()"/>
+          </div>
+          <div id="fuel-fields" style="display:${selectedCat==='Fuel'?'contents':'none'}">
+            <div class="form-group"><label class="form-label">Fuel Quantity (L/KG/kWh)</label>
+              <input id="exp-fuelqty" type="number" min="0" step="0.1" class="form-input" value="${existing?.fuelQty||''}" placeholder="50" oninput="calcCO2()"/>
+            </div>
+            <div class="form-group"><label class="form-label">Fuel Rate (₹/L)</label>
+              <input id="exp-fuelrate" type="number" min="0" step="0.01" class="form-input" value="${existing?.fuelRate||''}" placeholder="93"/>
+            </div>
+          </div>
+          <div class="form-group"><label class="form-label">Distance Travelled (km)</label>
+            <input id="exp-dist" class="form-input" readonly value="${existing?.distanceTravelled?existing.distanceTravelled+' km':''}" placeholder="Auto-calculated"/>
+          </div>
+          <div class="form-group"><label class="form-label">CO₂ Emission (kg)</label>
+            <input id="exp-co2" class="form-input" readonly value="${existing?.co2Emission?existing.co2Emission+' kg CO₂':''}" placeholder="Auto-calculated"/>
+          </div>
+          <div class="form-group form-full"><label class="form-label">Remarks</label>
+            <textarea id="exp-remarks" class="form-textarea" placeholder="Additional notes…">${existing?.remarks||''}</textarea>
+          </div>
         </div>
+
         <div class="form-group">
-          <label class="form-label">Invoice / Bill Upload <span class="req">*</span></label>
+          <label class="form-label">Invoice / Bill ${editing?'(optional — existing bill retained)':'Upload'} ${!editing?'<span class="req">*</span>':''}</label>
           <div class="file-upload-area" onclick="document.getElementById('exp-bill').click()">
             <input type="file" id="exp-bill" accept=".pdf,.jpg,.jpeg,.png" onchange="handleBillUpload(this)"/>
             <div style="font-size:32px;margin-bottom:8px">📎</div>
-            <div style="font-weight:500">Click to upload invoice</div>
+            <div style="font-weight:500">Click to upload ${editing?'replacement invoice':'invoice'}</div>
             <div style="font-size:12px;color:var(--gray-400);margin-top:4px">PDF, JPG, JPEG, PNG supported</div>
           </div>
-          <div id="bill-preview"></div>
+          <div id="bill-preview">
+            ${existing?.hasBill?`<div class="file-preview"><span style="font-size:28px">📄</span><div><div style="font-weight:500">Existing invoice/bill attached</div><div style="font-size:11px;color:var(--gray-400)">${existing.billUrl?'Openable attachment retained':'Attachment recorded'}</div></div></div>`:''}
+          </div>
         </div>
+
         <div class="form-group">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-            <input type="checkbox" id="exp-no-invoice"/> No Invoice Available (Exception Request)
+            <input type="checkbox" id="exp-no-invoice" ${existing?.invoiceException?'checked':''}/>
+            No Invoice Available (Exception Request)
           </label>
-          <div id="no-invoice-fields" style="display:none;margin-top:12px">
+          <div id="no-invoice-fields" style="display:${existing?.invoiceException?'block':'none'};margin-top:12px">
             <div class="alert alert-warning">⚠️ Exception requests require Superadmin approval.</div>
             <div class="form-group"><label class="form-label">Reason for Missing Invoice <span class="req">*</span></label>
-              <textarea id="exp-reason" class="form-textarea" placeholder="Explain why invoice is unavailable…"></textarea></div>
+              <textarea id="exp-reason" class="form-textarea" placeholder="Explain why invoice is unavailable…">${existing?.invoiceReason||''}</textarea>
+            </div>
           </div>
         </div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="saveExpense()">Save Expense</button>
+        <button class="btn btn-primary" id="save-expense-btn" onclick="saveExpense('${expenseId}')">${editing?'Update Expense':'Save Expense'}</button>
       </div>
     </div>
   </div>`;
   render();
-  // bind checkbox
+
   setTimeout(()=>{
     document.getElementById('exp-no-invoice')?.addEventListener('change',function(){
-      document.getElementById('no-invoice-fields').style.display=this.checked?'block':'none';
+      const f=document.getElementById('no-invoice-fields');
+      if(f) f.style.display=this.checked?'block':'none';
     });
-    document.getElementById('exp-cat')?.addEventListener('change',()=>toggleFuelFields());
-    if(vehicleId) updateExpPlant();
+    updateExpPlant();
+    toggleFuelFields();
+    calcTotal();
+    calcDist();
+    calcCO2();
   },50);
 };
 
@@ -3812,100 +3950,103 @@ window.updateExpPlant = function() {
   const el = document.getElementById('exp-plant-show');
   if(el) el.value = v ? plantName(v.plantId) : '';
 };
-window.toggleFuelFields = function() {
-  const cat = document.getElementById('exp-cat')?.value;
-  const ff = document.getElementById('fuel-fields');
-  if(ff) ff.style.display = cat==='Fuel'?'contents':'none';
-};
-window.calcTotal = function() {
-  const a = parseFloat(document.getElementById('exp-amount')?.value)||0;
-  const g = parseFloat(document.getElementById('exp-gst')?.value)||0;
-  const el = document.getElementById('exp-total');
-  if(el) el.value = '₹' + (a+g).toFixed(2);
-};
-window.calcDist = function() {
-  const odo = parseFloat(document.getElementById('exp-odo')?.value)||0;
-  const prev = parseFloat(document.getElementById('exp-prevodo')?.value)||0;
-  const dist = odo>prev?odo-prev:0;
-  const el = document.getElementById('exp-dist');
-  if(el) el.value = dist > 0 ? dist + ' km' : '';
-  calcCO2();
-};
-window.calcCO2 = function() {
-  const vehicleId = document.getElementById('exp-vehicle')?.value;
-  const v = S.vehicles.find(x=>x.id===vehicleId);
-  const fuel = v?.fuel||'Diesel';
-  const ef = S.emissionFactors[fuel]||2.68;
-  const qty = parseFloat(document.getElementById('exp-fuelqty')?.value)||0;
-  const co2 = (qty*ef).toFixed(2);
-  const el = document.getElementById('exp-co2');
-  if(el) el.value = qty > 0 ? co2 + ' kg CO₂' : '';
-};
 
-let pendingBillFile = null;
-window.handleBillUpload = function(input) {
-  const file = input.files[0];
-  if(!file) return;
-  pendingBillFile = file;
-  const preview = document.getElementById('bill-preview');
-  if(!preview) return;
-  if(file.type.startsWith('image/')) {
-    const reader = new FileReader();
-    reader.onload = e => { preview.innerHTML = `<div class="file-preview"><img src="${e.target.result}" alt="Invoice"/><div><div style="font-weight:500">${file.name}</div><div style="font-size:12px;color:var(--gray-400)">${(file.size/1024).toFixed(0)} KB</div></div><button class="btn btn-ghost btn-sm text-danger" onclick="pendingBillFile=null;document.getElementById('bill-preview').innerHTML='';document.getElementById('exp-bill').value=''">✕</button></div>`; };
-    reader.readAsDataURL(file);
-  } else {
-    preview.innerHTML = `<div class="file-preview"><span style="font-size:32px">📄</span><div><div style="font-weight:500">${file.name}</div><div style="font-size:12px;color:var(--gray-400)">${(file.size/1024).toFixed(0)} KB</div></div><button class="btn btn-ghost btn-sm text-danger" onclick="pendingBillFile=null;document.getElementById('bill-preview').innerHTML='';document.getElementById('exp-bill').value=''">✕</button></div>`;
-  }
-};
-
-window.saveExpense = async function() {
-  const vehicleId = document.getElementById('exp-vehicle')?.value;
-  const amount = parseFloat(document.getElementById('exp-amount')?.value);
-  const noInv = document.getElementById('exp-no-invoice')?.checked;
-  const hasBill = !!pendingBillFile || noInv;
-  if(!vehicleId) return showToast('Select a vehicle','error');
-  if(!amount) return showToast('Enter a valid amount','error');
-  if(!hasBill && !noInv) return showToast('Invoice upload is mandatory. Please upload a bill or check "No Invoice Available".','error');
+window.saveExpense = async function(expenseId='') {
+  const vehicleId = document.getElementById('exp-vehicle')?.value||'';
   const vehicle = S.vehicles.find(v=>v.id===vehicleId);
-  const cat = document.getElementById('exp-cat')?.value||'Other';
-  const fuelQty = parseFloat(document.getElementById('exp-fuelqty')?.value)||0;
-  const fuelRate = parseFloat(document.getElementById('exp-fuelrate')?.value)||0;
-  const odo = parseInt(document.getElementById('exp-odo')?.value)||0;
-  const prevOdo = parseInt(document.getElementById('exp-prevodo')?.value)||0;
-  const dist = odo>prevOdo?odo-prevOdo:0;
-  const ef = S.emissionFactors[vehicle?.fuel||'Diesel']||2.68;
-  const co2 = cat==='Fuel'&&fuelQty>0?parseFloat((fuelQty*ef).toFixed(2)):0;
-  const exp = {
-    vehicleId, plantId:vehicle?.plantId||'',
-    date:document.getElementById('exp-date')?.value||new Date().toISOString().slice(0,10),
-    category:cat, vendor:document.getElementById('exp-vendor')?.value||'',
-    invoiceNo:document.getElementById('exp-invno')?.value||'',
-    invoiceDate:document.getElementById('exp-invdate')?.value||'',
-    amount, gst:parseFloat(document.getElementById('exp-gst')?.value)||0,
-    odometer:odo, prevOdometer:prevOdo, distanceTravelled:dist,
-    fuelQty, fuelRate, co2Emission:co2, emissionFactor:ef,
-    remarks:document.getElementById('exp-remarks')?.value||'',
-    hasBill, invoiceException:noInv, billUrl:'',
-    enteredBy:S.user?.email||'',
-  };
+  const amount = parseFloat(document.getElementById('exp-amount')?.value);
+  const noInv = !!document.getElementById('exp-no-invoice')?.checked;
+  const old = expenseId ? S.expenses.find(x=>x.id===expenseId) : null;
+  const hasExistingBill = !!old?.hasBill;
+  const hasBill = !!pendingBillFile || hasExistingBill || noInv;
+
+  if(!vehicleId || !vehicle) return showToast('Select a valid vehicle','error');
+  if(!Number.isFinite(amount) || amount<=0) return showToast('Enter a valid amount greater than zero','error');
+  if(!document.getElementById('exp-date')?.value) return showToast('Expense date is required','error');
+  if(!hasBill) return showToast('Invoice upload is mandatory. Please upload a bill or check "No Invoice Available".','error');
+  if(noInv && !document.getElementById('exp-reason')?.value.trim()) return showToast('Enter the reason for missing invoice','error');
+
+  const btn=document.getElementById('save-expense-btn');
+  if(btn){btn.disabled=true;btn.textContent=expenseId?'Updating…':'Saving…';}
+
   try {
-    await fsAddExpense(exp);
-    pendingBillFile = null;
-    closeModal(); showToast('Expense saved!'); render();
-  } catch(e) { showToast('Error saving expense: '+e.message,'error'); }
+    let billUrl = old?.billUrl || '';
+    if(pendingBillFile){
+      const safeName = pendingBillFile.name.replace(/[^a-zA-Z0-9._-]/g,'_');
+      const storageRef = ref(storage, `vems_expenses/${expenseId||'new'}/${Date.now()}_${safeName}`);
+      const uploadSnap = await uploadBytes(storageRef, pendingBillFile);
+      billUrl = await getDownloadURL(uploadSnap.ref);
+    }
+
+    const cat = document.getElementById('exp-cat')?.value||'Other';
+    const fuelQty = parseFloat(document.getElementById('exp-fuelqty')?.value)||0;
+    const fuelRate = parseFloat(document.getElementById('exp-fuelrate')?.value)||0;
+    const odo = parseInt(document.getElementById('exp-odo')?.value)||0;
+    const prevOdo = parseInt(document.getElementById('exp-prevodo')?.value)||0;
+    const dist = odo>prevOdo?odo-prevOdo:0;
+    const ef = S.emissionFactors[vehicle.fuel||'Diesel']||2.68;
+    const co2 = cat==='Fuel'&&fuelQty>0?parseFloat((fuelQty*ef).toFixed(2)):0;
+    const data = {
+      vehicleId,
+      plantId:vehicle.plantId||'',
+      date:document.getElementById('exp-date')?.value||'',
+      category:cat,
+      vendor:document.getElementById('exp-vendor')?.value||'',
+      invoiceNo:document.getElementById('exp-invno')?.value||'',
+      invoiceDate:document.getElementById('exp-invdate')?.value||'',
+      amount,
+      gst:parseFloat(document.getElementById('exp-gst')?.value)||0,
+      odometer:odo,
+      prevOdometer:prevOdo,
+      distanceTravelled:dist,
+      fuelQty,
+      fuelRate,
+      co2Emission:co2,
+      emissionFactor:ef,
+      remarks:document.getElementById('exp-remarks')?.value||'',
+      hasBill,
+      invoiceException:noInv,
+      invoiceReason:noInv?(document.getElementById('exp-reason')?.value||''):'',
+      billUrl,
+      enteredBy:old?.enteredBy||S.user?.email||''
+    };
+
+    if(expenseId){
+      await fsUpdateExpense(expenseId,data);
+      pendingBillFile=null;
+      closeModal();
+      showToast('Expense updated successfully','success');
+    } else {
+      await fsAddExpense(data);
+      pendingBillFile=null;
+      closeModal();
+      showToast('Expense saved successfully','success');
+    }
+    render();
+  } catch(e) {
+    console.error('Expense save/update error:',e);
+    if(btn){btn.disabled=false;btn.textContent=expenseId?'Update Expense':'Save Expense';}
+    const msg = e?.code==='permission-denied' || /permission/i.test(e?.message||'')
+      ? 'Permission denied by Firebase. Check vems_expenses Firestore rules for this user.'
+      : 'Error saving expense: '+(e?.message||e);
+    showToast(msg,'error');
+  }
 };
 
 window.showEditExpenseModal = function(expId) {
   const e = S.expenses.find(x=>x.id===expId);
-  if(!e) return;
-  showToast('Edit functionality: Update the form fields and save','info');
+  if(!e) return showToast('Expense record not found','error');
+  showExpenseModal(e.vehicleId,e.category,e.id);
 };
 
 window.deleteExpense = async function(expId) {
   if(!isSA()) return showToast('Only Superadmin can delete expenses','error');
   if(!confirm('Delete this expense? This is permanent and logged.')) return;
-  try { await fsDeleteExpense(expId); showToast('Expense deleted','warning'); render(); }
-  catch(e) { showToast('Error: '+e.message,'error'); }
+  try {
+    await fsDeleteExpense(expId);
+    showToast('Expense deleted','warning');
+    render();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
 };
 
 window.showPlantModal = function(plantId='') {
@@ -4028,6 +4169,11 @@ window.showBulkUploadModal = function() {
           <div style="font-weight:600">Click to select CSV file</div>
           <div style="font-size:12px;color:var(--gray-400);margin-top:4px">Only .csv files supported</div>
         </div>
+        <div id="bulk-progress" style="display:none;margin-top:16px;padding:12px;background:var(--gray-50);border:1px solid var(--gray-200);border-radius:8px">
+          <div style="font-size:12px;font-weight:600;margin-bottom:7px">Upload Progress</div>
+          <div class="vems-progress-track"><div id="bulk-progress-fill" class="vems-progress-fill"></div></div>
+          <div id="bulk-progress-text" style="font-size:11px;color:var(--gray-500);margin-top:6px">Preparing…</div>
+        </div>
         <div id="bulk-preview" style="margin-top:16px"></div>
       </div>
       <div class="modal-footer">
@@ -4112,17 +4258,35 @@ window.processBulkCSV = function(input) {
 
 window.importBulkExpenses = async function() {
   const valid = bulkPendingData.filter(r=>r._valid);
-  if (!valid.length) return;
+  if (!valid.length) return showToast('No valid rows to import','error');
   const btn = document.getElementById('bulk-import-btn');
   if (btn) { btn.textContent='Importing…'; btn.disabled=true; }
+
+  const progress = document.getElementById('bulk-progress');
+  if(progress) progress.style.display='block';
+  const fill = document.getElementById('bulk-progress-fill');
+  const textEl = document.getElementById('bulk-progress-text');
+  const setProgress = (current,total,added) => {
+    const pct = total ? Math.round(current/total*100) : 0;
+    if(fill) fill.style.width=pct+'%';
+    if(textEl) textEl.textContent=`Uploading ${current} of ${total} rows · ${added} saved`;
+  };
+
   try {
     const cleaned = valid.map(({_valid,_vehicleReg,...exp})=>exp);
-    const count = await fsBulkAddExpenses(cleaned);
+    const count = await fsBulkAddExpenses(cleaned,setProgress);
+    if(fill) fill.style.width='100%';
+    if(textEl) textEl.textContent=`Completed · ${count} expenses saved`;
     bulkPendingData = [];
-    closeModal();
-    showToast(`✅ ${count} expenses imported to Firestore!`, 'success');
-    render();
-  } catch(e) { showToast('Import error: '+e.message,'error'); }
+    setTimeout(()=>{
+      closeModal();
+      showToast(`✅ ${count} expenses imported to Firestore!`, 'success');
+      render();
+    },300);
+  } catch(e) {
+    if(btn){btn.disabled=false;btn.textContent='Import Expenses';}
+    showToast('Import error: '+(e?.message||e),'error');
+  }
 };
 
 window.closeModal = function() { S.modal = null; render(); };
@@ -4209,18 +4373,35 @@ window.toggleAllExpenses = function(checked) {
   render();
 };
 window.bulkDeleteExpenses = async function() {
-  const count = S.selectedExpenses.size;
-  if (!count) return;
+  const ids = [...S.selectedExpenses];
+  const count = ids.length;
+  if (!count) return showToast('Select at least one expense','warning');
   if (!confirm(`Delete ${count} selected expense${count>1?'s':''}? This is permanent.`)) return;
+
+  showOperationProgress('Deleting selected expenses',0,count,`0 of ${count} deleted`);
+  let deleted=0, failed=0;
+  const chunkSize=10;
   try {
-    const ids = [...S.selectedExpenses];
-    await Promise.all(ids.map(id=>deleteDoc(doc(db,'vems_expenses',id))));
-    S.expenses = S.expenses.filter(e=>!S.selectedExpenses.has(e.id));
+    for(let start=0; start<ids.length; start+=chunkSize){
+      const chunk=ids.slice(start,start+chunkSize);
+      const results=await Promise.allSettled(chunk.map(id=>deleteDoc(doc(db,'vems_expenses',id))));
+      results.forEach((r,i)=>{
+        if(r.status==='fulfilled') deleted++;
+        else { failed++; console.error('Bulk delete failed:',chunk[i],r.reason); }
+      });
+      showOperationProgress('Deleting selected expenses',deleted+failed,count,`${deleted} deleted · ${failed} failed`);
+    }
+    // Reload to guarantee local state matches Firestore even if some rows failed.
+    await reloadExpenses();
     S.selectedExpenses.clear();
-    addAudit(`Bulk Delete — ${count} expenses`,'','');
-    showToast(`${count} expense${count>1?'s':''} deleted`,'warning');
+    addAudit(`Bulk Delete — ${deleted} expenses`,'','');
+    hideOperationProgress();
+    showToast(`${deleted} expense${deleted>1?'s':''} deleted${failed?`, ${failed} failed`:''}`,failed?'warning':'success');
     render();
-  } catch(e) { showToast('Error: '+e.message,'error'); }
+  } catch(e) {
+    hideOperationProgress();
+    showToast('Bulk delete error: '+(e?.message||e),'error');
+  }
 };
 
 // ── MAINTENANCE EXPORTS ───────────────────────────────────────────
