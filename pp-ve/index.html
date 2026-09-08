@@ -737,7 +737,7 @@ async function fsLoadUsers() {
 // Creates a user via Firebase Auth REST API then saves to Firestore vems_users.
 // If email already exists in Firebase Auth (shared with other apps),
 // we skip Auth creation and just add/update the vems_users Firestore record.
-async function fsInviteUser(email, displayName, plantId, password) {
+async function fsInviteUser(email, displayName, plantId, password, allowedVehicles=[]) {
   const apiKey = firebaseConfig.apiKey;
   let newUid = null;
 
@@ -818,6 +818,7 @@ async function fsInviteUser(email, displayName, plantId, password) {
     email, displayName, plantId,
     role: 'plant_admin', status: 'Active',
     app: 'vems',
+    allowedVehicles,
     createdAt: serverTimestamp(), createdBy: S.user?.email,
   };
   try {
@@ -912,14 +913,17 @@ window.showUserModal = function(uid='') {
   const isEdit = !!user;
   const plants = S.plants;
 
+  // For edit mode, pre-render vehicle rights section for assigned plant
+  const editVehicleRights = isEdit ? _buildVehicleRightsHTML(user.plantId, user.allowedVehicles||[]) : '';
+
   S.modal = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
     <div class="modal">
       <div class="modal-header">
-        <h2>${isEdit ? '✏️ Edit Plant Admin' : '➕ Add Plant Admin'}</h2>
-        <button onclick="closeModal()">✕</button>
+        <h2>${isEdit ? '&#x270F;&#xFE0F; Edit Plant Admin' : '&#x2795; Add Plant Admin'}</h2>
+        <button onclick="closeModal()">&#x2715;</button>
       </div>
       <div class="modal-body">
-        ${!isEdit ? `<div class="alert alert-info mb-4">📧 A password reset email will be sent to the user with a <b>"Click to set your password"</b> link. They use that to set their own password and log in.</div>` : ''}
+        ${!isEdit ? '<div class="alert alert-info mb-4">&#x1F4E7; A temporary password will be set. User can change it after first login.</div>' : ''}
         <div class="form-grid">
           <div class="form-group form-full">
             <label class="form-label">Full Name <span class="req">*</span></label>
@@ -931,8 +935,8 @@ window.showUserModal = function(uid='') {
           </div>
           <div class="form-group form-full">
             <label class="form-label">Assign Plant <span class="req">*</span></label>
-            <select id="usr-plant" class="form-select">
-              <option value="">— Select Plant —</option>
+            <select id="usr-plant" class="form-select" onchange="renderModalVehicleRights(this.value)">
+              <option value="">&#x2014; Select Plant &#x2014;</option>
               ${plants.map(p=>`<option value="${p.id}" ${user?.plantId===p.id?'selected':''}>${p.name} (${p.code})</option>`).join('')}
             </select>
           </div>
@@ -952,16 +956,49 @@ window.showUserModal = function(uid='') {
           </div>
           `}
         </div>
+        <div id="usr-vehicle-rights">${editVehicleRights}</div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
         <button class="btn btn-primary" id="usr-submit-btn" onclick="saveUser('${uid}')">
-          ${isEdit ? '💾 Save Changes' : 'Create User'}
+          ${isEdit ? '&#x1F4BE; Save Changes' : 'Create User'}
         </button>
       </div>
     </div>
   </div>`;
   render();
+};
+
+function _buildVehicleRightsHTML(plantId, allowed) {
+  if (!plantId) return '';
+  const vehicles = S.vehicles.filter(v => v.plantId === plantId);
+  if (!vehicles.length) return '<p style="font-size:13px;color:var(--gray-400);margin-top:12px">No vehicles found for this plant.</p>';
+  const allGranted = allowed.length === 0;
+  const rows = vehicles.map(v => {
+    const chk = allGranted || allowed.includes(v.id) ? 'checked' : '';
+    const badgeCls = v.status === 'Active' ? 'badge-success' : 'badge-warning';
+    return `<label style="display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--gray-200);border-radius:8px;cursor:pointer;background:#fff;margin-bottom:6px">
+      <input type="checkbox" class="vr-cb" value="${v.id}" ${chk}/>
+      <div style="flex:1">
+        <div style="font-weight:600;font-size:13px">${v.regNo}</div>
+        <div style="font-size:11px;color:var(--gray-500)">${v.make} ${v.model} &middot; ${v.type} &middot; ${v.fuel}</div>
+      </div>
+      <span class="badge ${badgeCls}">${v.status}</span>
+    </label>`;
+  }).join('');
+  return `<div style="margin-top:16px;border-top:1px solid var(--gray-200);padding-top:14px">
+    <div style="font-weight:600;font-size:13px;margin-bottom:10px">&#x1F697; Vehicle Access Rights</div>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;padding:9px 12px;background:var(--gray-50);border:1px solid var(--gray-200);border-radius:8px;cursor:pointer">
+      <input type="checkbox" id="vr-all" ${allGranted?'checked':''} onchange="toggleVehicleRightsAll(this.checked)"/>
+      <span style="font-weight:600;font-size:13px">All Vehicles (Full Plant Access)</span>
+    </label>
+    <div id="vr-list">${rows}</div>
+  </div>`;
+}
+
+window.renderModalVehicleRights = function(plantId) {
+  const el = document.getElementById('usr-vehicle-rights');
+  if (el) el.innerHTML = _buildVehicleRightsHTML(plantId, []);
 };
 
 window.saveUser = async function(uid='') {
@@ -975,6 +1012,13 @@ window.saveUser = async function(uid='') {
   if (!email) return showToast('Email is required', 'error');
   if (!plantId) return showToast('Please select an assigned plant', 'error');
 
+  // Read vehicle rights from modal checkboxes
+  const vrAllCb = document.getElementById('vr-all');
+  let allowedVehicles = [];
+  if (vrAllCb && !vrAllCb.checked) {
+    allowedVehicles = [...document.querySelectorAll('.vr-cb:checked')].map(cb => cb.value);
+  }
+
   if (!isEdit) {
     const pass = document.getElementById('usr-pass')?.value;
     if (!pass || pass.length < 6) return showToast('Password must be at least 6 characters', 'error');
@@ -982,8 +1026,9 @@ window.saveUser = async function(uid='') {
     const btn = document.getElementById('usr-submit-btn');
     if (btn) { btn.textContent = '⏳ Creating…'; btn.disabled = true; }
     try {
-      await fsInviteUser(email, displayName, plantId, pass);
-      showToast(`✅ User ${displayName} created! Setup email sent to ${email}.`, 'success');
+      await fsInviteUser(email, displayName, plantId, pass, allowedVehicles);
+      const vLabel = allowedVehicles.length === 0 ? 'all vehicles' : allowedVehicles.length + ' vehicle(s)';
+      showToast('User ' + displayName + ' created with access to ' + vLabel + '.', 'success');
       closeModal(); render();
     } catch(e) {
       if (btn) { btn.textContent = 'Create User'; btn.disabled = false; }
@@ -994,7 +1039,7 @@ window.saveUser = async function(uid='') {
     const btn = document.getElementById('usr-submit-btn');
     if (btn) { btn.textContent = '⏳ Saving…'; btn.disabled = true; }
     try {
-      await fsUpdateUser(uid, { displayName, plantId, status });
+      await fsUpdateUser(uid, { displayName, plantId, status, allowedVehicles });
       showToast('User updated!', 'success');
       closeModal(); render();
     } catch(e) {
