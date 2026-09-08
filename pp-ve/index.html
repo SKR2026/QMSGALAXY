@@ -321,7 +321,8 @@ const VEHICLE_TYPES = ['Car','SUV','Bus','Truck','Forklift','LCV','MUV','Van','P
 const FUEL_TYPES = ['Petrol','Diesel','CNG','LPG','Electric','Hybrid'];
 const OWNER_TYPES = ['Company Owned','Leased','Employee Owned','Transporter / Vendor'];
 const VEHICLE_STATUSES = ['Active','Inactive','Under Maintenance'];
-const EXPENSE_CATEGORIES = ['Fuel','Maintenance','Repair','Tyres','Battery','Insurance','Toll','Parking','Driver Expense','Washing','Pollution Certificate','Registration / Permit','Spare Parts','Breakdown','Other'];
+let EXPENSE_CATEGORIES = ['Fuel','Maintenance','Repair','Tyres','Battery','Insurance','Toll','Parking','Driver Expense','Washing','Pollution Certificate','Registration / Permit','Spare Parts','Breakdown','Other'];
+const EXPENSE_CATEGORIES_DEFAULT = [...EXPENSE_CATEGORIES]; // fallback defaults
 
 const EMISSION_FACTORS_DEFAULT = {
   Diesel: 2.68, Petrol: 2.31, CNG: 2.04, LPG: 1.61, Electric: 0.82, Hybrid: 1.60
@@ -551,6 +552,14 @@ async function loadFirestoreData() {
     try {
       const efDoc = await getDoc(doc(db, 'vems_settings', 'emissionFactors'));
       if (efDoc.exists()) S.emissionFactors = { ...EMISSION_FACTORS_DEFAULT, ...efDoc.data() };
+    } catch {}
+
+    // Load custom expense categories (superadmin-managed)
+    try {
+      const catDoc = await getDoc(doc(db, 'vems_settings', 'expenseCategories'));
+      if (catDoc.exists() && Array.isArray(catDoc.data().categories) && catDoc.data().categories.length > 0) {
+        EXPENSE_CATEGORIES = catDoc.data().categories;
+      }
     } catch {}
 
     // Load branding (logo + org name) -- shared across all users/devices via Firestore
@@ -3301,6 +3310,37 @@ function superadminHTML() {
         <span class="badge badge-purple">🛡️ You · Active</span>
       </div>
     </div>
+
+    <!-- Expense Categories Management -->
+    <div class="card mb-4">
+      <div class="card-title">🏷️ Expense Categories
+        <span class="badge badge-info">Superadmin Only</span>
+      </div>
+      <div class="alert alert-info mb-4">ℹ️ Add, rename, reorder, or remove expense categories. Changes apply system-wide — all plants and expense forms will reflect the updated list immediately after saving.</div>
+
+      <div id="exp-cat-list" style="margin-bottom:14px">
+        ${EXPENSE_CATEGORIES.map((cat,i) => `
+          <div class="emission-factor-row" id="exp-cat-row-${i}" style="margin-bottom:6px;gap:8px">
+            <span style="font-size:12px;color:var(--gray-400);width:22px;text-align:center;flex-shrink:0">${i+1}</span>
+            <input type="text" class="form-input" id="exp-cat-input-${i}" value="${cat.replace(/"/g,'&quot;')}"
+              style="flex:1;padding:6px 10px;font-size:13px"
+              onkeydown="if(event.key==='Enter'){window.saveExpenseCategories()}"
+              placeholder="Category name"/>
+            <button class="btn btn-ghost btn-xs text-danger" title="Remove" onclick="window.removeExpenseCategory(${i})" style="flex-shrink:0;font-size:16px;padding:4px 8px">✕</button>
+          </div>`).join('')}
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
+        <button class="btn btn-secondary btn-sm" onclick="window.addExpenseCategory()">＋ Add Category</button>
+        <button class="btn btn-ghost btn-sm" onclick="window.resetExpenseCategories()" title="Restore factory defaults">↺ Reset to Defaults</button>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-primary" onclick="window.saveExpenseCategories()">💾 Save Categories</button>
+        <span id="exp-cat-status" style="font-size:12px;color:var(--gray-500)"></span>
+      </div>
+    </div>
+
     <div id="modal-root"></div>
   </div>`;
 }
@@ -3469,6 +3509,99 @@ window.saveAllSuperadminSettings = async function() {
 
   // Sync to cloud + Firestore
   await saveAndSyncSchedules();
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+//  EXPENSE CATEGORIES — Superadmin Management
+// ════════════════════════════════════════════════════════════════════════════
+
+// Read current inputs from the rendered category list
+function readCategoryInputs() {
+  const cats = [];
+  let i = 0;
+  while (true) {
+    const el = document.getElementById(`exp-cat-input-${i}`);
+    if (!el) break;
+    const v = el.value.trim();
+    if (v) cats.push(v);
+    i++;
+  }
+  return cats;
+}
+
+// Re-render the category list in-place (without full page render)
+function refreshCatList() {
+  const container = document.getElementById('exp-cat-list');
+  if (!container) return;
+  container.innerHTML = EXPENSE_CATEGORIES.map((cat, i) => `
+    <div class="emission-factor-row" id="exp-cat-row-${i}" style="margin-bottom:6px;gap:8px">
+      <span style="font-size:12px;color:var(--gray-400);width:22px;text-align:center;flex-shrink:0">${i+1}</span>
+      <input type="text" class="form-input" id="exp-cat-input-${i}" value="${cat.replace(/"/g,'&quot;')}"
+        style="flex:1;padding:6px 10px;font-size:13px"
+        onkeydown="if(event.key==='Enter'){window.saveExpenseCategories()}"
+        placeholder="Category name"/>
+      <button class="btn btn-ghost btn-xs text-danger" title="Remove" onclick="window.removeExpenseCategory(${i})" style="flex-shrink:0;font-size:16px;padding:4px 8px">✕</button>
+    </div>`).join('');
+}
+
+window.addExpenseCategory = function() {
+  // Sync any edits the user has already made before adding a row
+  const current = readCategoryInputs();
+  EXPENSE_CATEGORIES = [...current, ''];
+  refreshCatList();
+  // Focus the new empty input
+  const last = document.getElementById(`exp-cat-input-${EXPENSE_CATEGORIES.length - 1}`);
+  if (last) last.focus();
+};
+
+window.removeExpenseCategory = function(idx) {
+  const current = readCategoryInputs();
+  // Re-read to include any typed-but-not-yet-submitted names
+  const all = [];
+  let i = 0;
+  while (true) {
+    const el = document.getElementById(`exp-cat-input-${i}`);
+    if (!el) break;
+    all.push(el.value.trim());
+    i++;
+  }
+  all.splice(idx, 1);
+  EXPENSE_CATEGORIES = all.filter(c => c.length > 0);
+  refreshCatList();
+};
+
+window.resetExpenseCategories = function() {
+  if (!confirm('Reset to default categories? Any custom categories will be removed.')) return;
+  EXPENSE_CATEGORIES = [...EXPENSE_CATEGORIES_DEFAULT];
+  refreshCatList();
+  const st = document.getElementById('exp-cat-status');
+  if (st) st.textContent = 'Reset to defaults — click Save to apply.';
+};
+
+window.saveExpenseCategories = async function() {
+  const cats = readCategoryInputs().filter(c => c.length > 0);
+  if (cats.length === 0) { showToast('Add at least one category.', 'error'); return; }
+
+  // Remove any blank entries that may have been added via addExpenseCategory
+  EXPENSE_CATEGORIES = cats;
+
+  const st = document.getElementById('exp-cat-status');
+  if (st) st.textContent = '⏳ Saving…';
+
+  try {
+    await setDoc(doc(db, 'vems_settings', 'expenseCategories'), {
+      categories: cats,
+      updatedAt: serverTimestamp(),
+      updatedBy: S.user?.email || ''
+    });
+    addAudit('Expense Categories Updated', '', cats.join(', '));
+    if (st) st.innerHTML = '<span style="color:#16a34a">✅ Saved!</span>';
+    showToast('Expense categories saved!', 'success');
+    refreshCatList();
+  } catch(e) {
+    if (st) st.innerHTML = `<span style="color:#dc2626">❌ ${e.message}</span>`;
+    showToast('Save failed: ' + e.message, 'error');
+  }
 };
 
 // ── Test notification — calls /api/test on the VEMS cloud function ─────────────
