@@ -1653,7 +1653,7 @@ async function doRegister() {
     const cred = await auth.createUserWithEmailAndPassword(email, pw);
     await cred.user.updateProfile({ displayName: name });
     // Create user profile doc (role=Viewer by default — Super Admin must upgrade)
-    await db.collection('users').doc(cred.user.uid).set({
+    await db.collection('pp_users').doc(cred.user.uid).set({
       uid: cred.user.uid, name, email,
       role: 'Viewer', plantIds: [], department: '',
       status: 'Active', createdAt: firebase.firestore.FieldValue.serverTimestamp()
@@ -1676,20 +1676,24 @@ async function doLogout() {
 auth.onAuthStateChanged(async user => {
   if (user) {
     currentUser = user;
+    // Ensure the Firestore client is using the current Firebase Auth token
+    // before any pp_* reads are started. This prevents transient
+    // PERMISSION_DENIED errors immediately after sign-in/token refresh.
+    try { await user.getIdToken(true); } catch (tokenErr) { console.warn('Auth token refresh', tokenErr); }
     try {
-      const snap = await db.collection('users').doc(user.uid).get();
+      const snap = await db.collection('pp_users').doc(user.uid).get();
       if (snap.exists) {
         currentProfile = { uid: user.uid, ...snap.data() };
       } else {
         // First-time user — check if they're the very first (auto Super Admin)
-        const usersSnap = await db.collection('users').limit(2).get();
+        const usersSnap = await db.collection('pp_users').limit(2).get();
         const isFirst   = usersSnap.docs.filter(d=>d.id!==user.uid).length === 0;
         currentProfile = {
           uid: user.uid, name: user.displayName || user.email.split('@')[0],
           email: user.email, role: isFirst ? 'Super Admin' : 'Viewer',
           plantIds: [], status: 'Active'
         };
-        await db.collection('users').doc(user.uid).set({
+        await db.collection('pp_users').doc(user.uid).set({
           ...currentProfile, createdAt: firebase.firestore.FieldValue.serverTimestamp()
         });
       }
@@ -1706,7 +1710,7 @@ auth.onAuthStateChanged(async user => {
     document.getElementById('loading-screen').classList.add('hidden');
     document.getElementById('magic-link-screen').classList.remove('active');
     document.getElementById('auth-screen').style.display = 'none';
-    showApp();
+    await showApp();
 
     if (savedToken && savedProposalId) {
       sessionStorage.removeItem('magic_token');
@@ -1795,7 +1799,7 @@ function navigate(page, extraData) {
     'audit-logs':      loadAuditLogs,
     settings:          loadSettings,
   };
-  if (loaders[page]) loaders[page]();
+  if (loaders[page]) Promise.resolve(loaders[page]()).catch(e=>{ console.error('Page loader',page,e); toast('Unable to load '+page+': '+(e.code||e.message||'Firestore error'),'error',6000); });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1820,7 +1824,7 @@ function closeMobileSidebar() {
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadSettings() {
   try {
-    const snap = await db.collection('settings').doc('app').get();
+    const snap = await db.collection('pp_settings').doc('app').get();
     if (snap.exists) {
       appSettings = snap.data();
       applyBranding();
@@ -1848,7 +1852,7 @@ function applyBranding() {
 
 async function loadPlants() {
   try {
-    const snap = await db.collection('plants').where('status','==','Active').get();
+    const snap = await db.collection('pp_plants').where('status','==','Active').get();
     allPlants = snap.docs.map(d=>({id:d.id,...d.data()}));
     // Populate plant dropdowns
     const plantOptions = allPlants.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
@@ -1867,8 +1871,8 @@ async function loadPlants() {
 async function loadUsers() {
   try {
     const q = currentProfile?.role==='Super Admin'
-      ? db.collection('users')
-      : db.collection('users').where('plantIds','array-contains-any', currentProfile?.plantIds||['_none']);
+      ? db.collection('pp_users')
+      : db.collection('pp_users').where('plantIds','array-contains-any', currentProfile?.plantIds||['_none']);
     const snap = await q.get();
     allUsers = snap.docs.map(d=>({id:d.id,...d.data()}));
   } catch(e) { console.error('loadUsers', e); }
@@ -1876,8 +1880,9 @@ async function loadUsers() {
 
 async function loadMatrixRules() {
   try {
-    const snap = await db.collection('approvalMatrices').orderBy('level').get();
+    const snap = await db.collection('pp_approvalMatrices').get();
     allMatrixRules = snap.docs.map(d=>({id:d.id,...d.data()}));
+    allMatrixRules.sort((a,b)=>(Number(a.level)||0)-(Number(b.level)||0));
   } catch(e) { console.error('loadMatrixRules', e); }
 }
 
@@ -1887,13 +1892,13 @@ async function loadMatrixRules() {
 async function loadDashboard() {
   try {
     // Stats
-    let baseQ = db.collection('proposals');
+    let baseQ = db.collection('pp_proposals');
     if (!isSuperAdmin()) {
       baseQ = currentProfile.role === 'Approver'
         ? baseQ.where('currentApproverId','==',currentUser.uid)
         : baseQ.where('createdBy','==',currentUser.uid);
     }
-    const snap = await baseQ.orderBy('createdAt','desc').limit(100).get();
+    const snap = await baseQ.limit(100).get();
     const props = snap.docs.map(d=>({id:d.id,...d.data()}));
 
     const total     = props.length;
@@ -1935,7 +1940,10 @@ async function loadDashboard() {
         <span class="badge badge-${(p.status||'draft').toLowerCase().replace(/\s/g,'')}">${p.status||'Draft'}</span>
       </div>`).join('') || '<div class="empty-state" style="padding:24px"><p>No proposals yet</p></div>';
 
-  } catch(e) { console.error('loadDashboard', e); }
+  } catch(e) {
+    console.error('loadDashboard', e);
+    toast('Dashboard data could not be loaded: '+(e.code||e.message||'Firestore error'),'error',6000);
+  }
 }
 
 function statCard(label,cls,value,sub) {
@@ -1948,12 +1956,17 @@ function isSuperAdmin() { return currentProfile?.role === 'Super Admin'; }
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadProposals() {
   try {
-    let q = db.collection('proposals').orderBy('createdAt','desc');
+    let q = db.collection('pp_proposals');
     if (!isSuperAdmin() && currentProfile?.role !== 'Plant Admin') {
-      q = db.collection('proposals').where('createdBy','==',currentUser.uid).orderBy('createdAt','desc');
+      q = q.where('createdBy','==',currentUser.uid);
     }
     const snap = await q.limit(200).get();
     allProposals = snap.docs.map(d=>({id:d.id,...d.data()}));
+    allProposals.sort((a,b)=>{
+      const ta=a.createdAt?.toMillis?a.createdAt.toMillis():new Date(a.createdAt||0).getTime();
+      const tb=b.createdAt?.toMillis?b.createdAt.toMillis():new Date(b.createdAt||0).getTime();
+      return tb-ta;
+    });
     filterProposals();
   } catch(e) { console.error('loadProposals',e); toast('Failed to load proposals','error'); }
 }
@@ -2116,7 +2129,7 @@ async function saveProposal(action) {
     // Upload files
     const attachments = [];
     for (const file of uploadedFiles) {
-      const ref = storage.ref(`proposals/${editingId||'new'}/${Date.now()}_${file.name}`);
+      const ref = storage.ref(`pp_proposals/${editingId||'new'}/${Date.now()}_${file.name}`);
       await ref.put(file);
       const url = await ref.getDownloadURL();
       attachments.push({ name: file.name, url, size: file.size, type: file.type });
@@ -2151,7 +2164,7 @@ async function saveProposal(action) {
     } else {
       // Save as draft locally
       if (editingId) {
-        await db.collection('proposals').doc(editingId).update({ ...data, status:'Draft' });
+        await db.collection('pp_proposals').doc(editingId).update({ ...data, status:'Draft' });
         toast('Draft updated','success');
         await logAudit(editingId,'Edited','Draft updated');
       } else {
@@ -2161,7 +2174,7 @@ async function saveProposal(action) {
         data.createdByEmail= currentUser.email;
         data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
         data.currentApprovalLevel = 0;
-        const ref = await db.collection('proposals').add(data);
+        const ref = await db.collection('pp_proposals').add(data);
         toast('Draft saved','success');
         await logAudit(ref.id,'Created','Draft created');
       }
@@ -2189,7 +2202,7 @@ async function viewProposal(id) {
   navigate('view-proposal');
   document.getElementById('vp-content').innerHTML = '<div style="text-align:center;padding:40px"><div class="spinner dark"></div></div>';
   try {
-    const snap   = await db.collection('proposals').doc(id).get();
+    const snap   = await db.collection('pp_proposals').doc(id).get();
     if (!snap.exists) { toast('Proposal not found','error'); return; }
     const p      = { id: snap.id, ...snap.data() };
     const plant  = allPlants.find(pl=>pl.id===p.plantId);
@@ -2198,7 +2211,7 @@ async function viewProposal(id) {
     const isMyPending = p.status==='Pending Approval' && p.currentApproverId===currentUser?.uid;
 
     // Fetch history
-    const histSnap   = await db.collection('proposals').doc(id).collection('approvalHistory').orderBy('timestamp','asc').get();
+    const histSnap   = await db.collection('pp_proposals').doc(id).collection('approvalHistory').orderBy('timestamp','asc').get();
     const history    = histSnap.docs.map(d=>({id:d.id,...d.data()}));
 
     document.getElementById('vp-title').textContent = p.proposalNumber||'Draft Proposal';
@@ -2398,10 +2411,10 @@ async function loadMyApprovals() {
   try {
     let q;
     if (filter === 'pending') {
-      q = db.collection('proposals').where('currentApproverId','==',currentUser.uid).where('status','==','Pending Approval');
+      q = db.collection('pp_proposals').where('currentApproverId','==',currentUser.uid).where('status','==','Pending Approval');
     } else {
       // Load from approval history via audit logs / index
-      q = db.collection('proposals').where('createdBy','==',currentUser.uid); // fallback — server function handles this properly
+      q = db.collection('pp_proposals').where('createdBy','==',currentUser.uid); // fallback — server function handles this properly
     }
     const snap  = await q.orderBy('updatedAt','desc').limit(50).get();
     const props = snap.docs.map(d=>({id:d.id,...d.data()}));
@@ -2518,7 +2531,7 @@ async function saveUser() {
 
   try {
     if (id) {
-      await db.collection('users').doc(id).update(data);
+      await db.collection('pp_users').doc(id).update(data);
       const idx = allUsers.findIndex(u=>u.id===id||u.uid===id);
       if (idx>=0) allUsers[idx] = {...allUsers[idx],...data};
       toast('User updated','success');
@@ -2545,7 +2558,7 @@ async function saveUser() {
 async function toggleUserStatus(id, currentStatus) {
   const newStatus = currentStatus==='Active' ? 'Inactive' : 'Active';
   window.confirm(`${newStatus==='Inactive'?'Disable':'Enable'} this user?`, `This will ${newStatus==='Inactive'?'disable':'enable'} the user's access.`, async ()=>{
-    await db.collection('users').doc(id).update({ status:newStatus, updatedAt:firebase.firestore.FieldValue.serverTimestamp() });
+    await db.collection('pp_users').doc(id).update({ status:newStatus, updatedAt:firebase.firestore.FieldValue.serverTimestamp() });
     const idx = allUsers.findIndex(u=>u.id===id);
     if (idx>=0) allUsers[idx].status = newStatus;
     toast(`User ${newStatus.toLowerCase()}`,'success');
@@ -2559,7 +2572,7 @@ async function toggleUserStatus(id, currentStatus) {
 function loadPlantsPage() { renderPlantsTable(); }
 
 async function renderPlantsTable() {
-  const snap = await db.collection('plants').orderBy('name').get();
+  const snap = await db.collection('pp_plants').get();
   const plants = snap.docs.map(d=>({id:d.id,...d.data()}));
   document.getElementById('plants-tbody').innerHTML = plants.length
     ? plants.map(p=>`<tr>
@@ -2580,7 +2593,7 @@ function openPlantModal(editingId) {
   document.getElementById('plant-modal-title').textContent = editingId ? 'Edit Plant' : 'Add Plant';
   document.getElementById('pm-editing-id').value = editingId||'';
   if (editingId) {
-    db.collection('plants').doc(editingId).get().then(snap=>{
+    db.collection('pp_plants').doc(editingId).get().then(snap=>{
       const p=snap.data()||{};
       document.getElementById('pm-code').value         = p.code||'';
       document.getElementById('pm-name').value         = p.name||'';
@@ -2610,11 +2623,11 @@ async function savePlant() {
     updatedAt:    firebase.firestore.FieldValue.serverTimestamp()
   };
   if (id) {
-    await db.collection('plants').doc(id).update(data);
+    await db.collection('pp_plants').doc(id).update(data);
     toast('Plant updated','success');
   } else {
     data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
-    await db.collection('plants').add(data);
+    await db.collection('pp_plants').add(data);
     toast('Plant added','success');
   }
   closeModal('plant-modal-overlay');
@@ -2625,7 +2638,7 @@ async function savePlant() {
 
 async function deletePlant(id) {
   window.confirm('Delete Plant?', 'This cannot be undone. Proposals for this plant will be unaffected.', async ()=>{
-    await db.collection('plants').doc(id).delete();
+    await db.collection('pp_plants').doc(id).delete();
     toast('Plant deleted','success');
     await loadPlants(); renderPlantsTable();
   },'Delete');
@@ -2715,11 +2728,11 @@ async function saveMatrixRule() {
   };
 
   if (id) {
-    await db.collection('approvalMatrices').doc(id).update(data);
+    await db.collection('pp_approvalMatrices').doc(id).update(data);
     toast('Approval rule updated','success');
   } else {
     data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
-    await db.collection('approvalMatrices').add(data);
+    await db.collection('pp_approvalMatrices').add(data);
     toast('Approval rule added','success');
   }
   closeModal('matrix-modal-overlay');
@@ -2730,7 +2743,7 @@ async function saveMatrixRule() {
 
 async function deleteMatrixRule(id) {
   window.confirm('Delete Rule?','This will remove this approval level from future proposals.',async()=>{
-    await db.collection('approvalMatrices').doc(id).delete();
+    await db.collection('pp_approvalMatrices').doc(id).delete();
     toast('Rule deleted','success');
     await loadMatrixRules(); renderMatrixTable();
   },'Delete');
@@ -2741,8 +2754,13 @@ async function deleteMatrixRule(id) {
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadReports() {
   try {
-    const snap = await db.collection('proposals').orderBy('createdAt','desc').limit(500).get();
+    const snap = await db.collection('pp_proposals').limit(500).get();
     const all  = snap.docs.map(d=>({id:d.id,...d.data()}));
+    all.sort((a,b)=>{
+      const ta=a.createdAt?.toMillis?a.createdAt.toMillis():new Date(a.createdAt||0).getTime();
+      const tb=b.createdAt?.toMillis?b.createdAt.toMillis():new Date(b.createdAt||0).getTime();
+      return tb-ta;
+    });
 
     const byStatus = {};
     const byPlant  = {};
@@ -2808,7 +2826,7 @@ function exportReport() { toast('Export feature requires Cloud Functions PDF gen
 //  AUDIT LOGS
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadAuditLogs() {
-  let q = db.collection('auditLogs').orderBy('timestamp','desc').limit(200);
+  let q = db.collection('pp_auditLogs').orderBy('timestamp','desc').limit(200);
   try {
     const snap = await q.get();
     allAuditLogs = snap.docs.map(d=>({id:d.id,...d.data()}));
@@ -2870,7 +2888,7 @@ async function saveCompanySettings() {
     footerText:   document.getElementById('s-footer-text').value.trim(),
     updatedAt:    firebase.firestore.FieldValue.serverTimestamp()
   };
-  await db.collection('settings').doc('app').set(data, {merge:true});
+  await db.collection('pp_settings').doc('app').set(data, {merge:true});
   appSettings = {...appSettings,...data};
   applyBranding();
   toast('Company settings saved','success');
@@ -2885,12 +2903,12 @@ async function saveApprovalSettings() {
     reminderFreq:  parseInt(document.getElementById('s-reminder-freq').value)||24,
     updatedAt:     firebase.firestore.FieldValue.serverTimestamp()
   };
-  await db.collection('settings').doc('approval').set(data, {merge:true});
+  await db.collection('pp_settings').doc('approval').set(data, {merge:true});
   toast('Approval settings saved','success');
 }
 
 async function saveNumberingSettings() {
-  await db.collection('settings').doc('numbering').set({
+  await db.collection('pp_settings').doc('numbering').set({
     format:   document.getElementById('s-number-format').value.trim(),
     currency: document.getElementById('s-currency').value.trim(),
     dateFormat:document.getElementById('s-date-format').value,
@@ -2902,7 +2920,7 @@ async function saveNumberingSettings() {
 async function saveProfile() {
   const name = document.getElementById('s-my-name').value.trim();
   const dept = document.getElementById('s-my-dept').value.trim();
-  await db.collection('users').doc(currentUser.uid).update({ name, department:dept, updatedAt:firebase.firestore.FieldValue.serverTimestamp() });
+  await db.collection('pp_users').doc(currentUser.uid).update({ name, department:dept, updatedAt:firebase.firestore.FieldValue.serverTimestamp() });
   await currentUser.updateProfile({ displayName: name });
   currentProfile = {...currentProfile, name, department:dept};
   updateSidebarUser();
@@ -2922,7 +2940,7 @@ let currentEmailTemplateType = 'submission';
 async function loadEmailTemplate() {
   currentEmailTemplateType = document.getElementById('email-template-type').value;
   try {
-    const snap = await db.collection('emailTemplates').doc(currentEmailTemplateType).get();
+    const snap = await db.collection('pp_emailTemplates').doc(currentEmailTemplateType).get();
     const defaults = getDefaultTemplate(currentEmailTemplateType);
     const t = snap.exists ? snap.data() : defaults;
     document.getElementById('email-template-subject').value = t.subject||defaults.subject;
@@ -2931,7 +2949,7 @@ async function loadEmailTemplate() {
 }
 
 async function saveEmailTemplate() {
-  await db.collection('emailTemplates').doc(currentEmailTemplateType).set({
+  await db.collection('pp_emailTemplates').doc(currentEmailTemplateType).set({
     subject:   document.getElementById('email-template-subject').value,
     body:      document.getElementById('email-template-body').value,
     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
@@ -2958,10 +2976,10 @@ async function uploadLogo(event) {
   if (!file.type.startsWith('image/')) { toast('Please upload an image file','warning'); return; }
   if (file.size > 5*1024*1024) { toast('Logo must be under 5MB','warning'); return; }
   try {
-    const ref = storage.ref(`company/logo_${Date.now()}`);
+    const ref = storage.ref(`pp_company/logo_${Date.now()}`);
     await ref.put(file);
     const url = await ref.getDownloadURL();
-    await db.collection('settings').doc('app').set({ logoUrl:url, updatedAt:firebase.firestore.FieldValue.serverTimestamp() },{merge:true});
+    await db.collection('pp_settings').doc('app').set({ logoUrl:url, updatedAt:firebase.firestore.FieldValue.serverTimestamp() },{merge:true});
     appSettings.logoUrl = url;
     applyBranding();
     toast('Logo uploaded and applied','success');
@@ -2973,12 +2991,16 @@ async function uploadLogo(event) {
 // ═══════════════════════════════════════════════════════════════════════════
 function setupNotifications() {
   if (notifUnsubscribe) notifUnsubscribe();
-  notifUnsubscribe = db.collection('notifications')
+  notifUnsubscribe = db.collection('pp_notifications')
     .where('userId','==',currentUser.uid)
-    .orderBy('createdAt','desc')
-    .limit(30)
+    .limit(50)
     .onSnapshot(snap=>{
       const notifs   = snap.docs.map(d=>({id:d.id,...d.data()}));
+      notifs.sort((a,b)=>{
+        const ta=a.createdAt?.toMillis?a.createdAt.toMillis():new Date(a.createdAt||0).getTime();
+        const tb=b.createdAt?.toMillis?b.createdAt.toMillis():new Date(b.createdAt||0).getTime();
+        return tb-ta;
+      });
       const unread   = notifs.filter(n=>!n.read).length;
       const countEl  = document.getElementById('notif-count');
       countEl.textContent = unread;
@@ -2992,18 +3014,21 @@ function setupNotifications() {
             <div class="notif-time">${fmtDateTime(n.createdAt)}</div>
           </div>`).join('')
         : '<div class="empty-state" style="padding:40px"><div class="empty-icon">🔔</div><p>No notifications</p></div>';
-    }, e=>console.warn('notif listener',e));
+    }, e=>{
+      console.warn('notif listener',e);
+      toast('Notifications unavailable: '+(e.code||e.message||'Firestore error'),'warning',6000);
+    });
 }
 
 function toggleNotifPanel() { document.getElementById('notif-panel').classList.toggle('open'); }
 
 async function markNotifRead(id, proposalId) {
-  await db.collection('notifications').doc(id).update({ read:true, readAt:firebase.firestore.FieldValue.serverTimestamp() });
+  await db.collection('pp_notifications').doc(id).update({ read:true, readAt:firebase.firestore.FieldValue.serverTimestamp() });
   if (proposalId) { toggleNotifPanel(); viewProposal(proposalId); }
 }
 
 async function markAllNotificationsRead() {
-  const snap = await db.collection('notifications').where('userId','==',currentUser.uid).where('read','==',false).get();
+  const snap = await db.collection('pp_notifications').where('userId','==',currentUser.uid).where('read','==',false).get();
   const batch= db.batch();
   snap.docs.forEach(d=>batch.update(d.ref,{read:true}));
   await batch.commit();
@@ -3033,7 +3058,7 @@ async function downloadPDF(proposalId) {
 // ═══════════════════════════════════════════════════════════════════════════
 async function cancelProposal(id) {
   window.confirm('Cancel Proposal?','This proposal will be marked as Cancelled and cannot be submitted again.',async()=>{
-    await db.collection('proposals').doc(id).update({ status:'Cancelled', updatedAt:firebase.firestore.FieldValue.serverTimestamp() });
+    await db.collection('pp_proposals').doc(id).update({ status:'Cancelled', updatedAt:firebase.firestore.FieldValue.serverTimestamp() });
     toast('Proposal cancelled','info');
     await logAudit(id,'Cancelled','Proposal cancelled by creator');
     navigate('proposals');
@@ -3056,7 +3081,7 @@ async function globalSearch(val) {
 async function logAudit(proposalId, action, details) {
   try {
     const p = proposalId ? allProposals.find(x=>x.id===proposalId) : null;
-    await db.collection('auditLogs').add({
+    await db.collection('pp_auditLogs').add({
       userId:        currentUser?.uid,
       userName:      currentProfile?.name||currentUser?.email,
       userEmail:     currentUser?.email,
@@ -3124,7 +3149,7 @@ window.confirm = function(title, msg, onOk, btnLabel) {
 // ═══════════════════════════════════════════════════════════════════════════
 function setupApprovalBadge() {
   if (!currentUser) return;
-  db.collection('proposals')
+  db.collection('pp_proposals')
     .where('currentApproverId', '==', currentUser.uid)
     .where('status', '==', 'Pending Approval')
     .onSnapshot(snap => {
@@ -3161,7 +3186,7 @@ async function loadSettingsPage() {
 
   // Approval tab
   try {
-    const aSnap = await db.collection('settings').doc('approval').get();
+    const aSnap = await db.collection('pp_settings').doc('approval').get();
     const a = aSnap.exists ? aSnap.data() : {};
     setVal('s-reminder1',       a.reminder1Hrs  || 24);
     setVal('s-reminder2',       a.reminder2Hrs  || 48);
@@ -3172,7 +3197,7 @@ async function loadSettingsPage() {
 
   // Numbering tab
   try {
-    const nSnap = await db.collection('settings').doc('numbering').get();
+    const nSnap = await db.collection('pp_settings').doc('numbering').get();
     const n = nSnap.exists ? nSnap.data() : {};
     setVal('s-number-format', n.format    || 'PP-{YEAR}-{SEQ6}');
     setVal('s-currency',      n.currency  || '₹');
