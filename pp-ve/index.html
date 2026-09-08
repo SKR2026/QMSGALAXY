@@ -383,7 +383,7 @@ let S = {
   charts: {}, toast: null,
   filterMode: 'CY', filterPlant: '', filterYear: new Date().getFullYear().toString(), filterMonth: '', filterVehicle: '', filterCat: '',
   expVehicleSearch: '',
-  selectedVehicleId: null, selectedExpenses: new Set(),
+  selectedVehicleId: null, selectedExpenses: new Set(), _selectedVehicleBar: null,
   modal: null, loading: false, dataLoaded: false, notifications: [],
   companyLogo: localStorage.getItem('vems_logo') || '',
   orgName: localStorage.getItem('vems_orgname') || 'Polyplastics India Ltd',
@@ -1958,6 +1958,19 @@ function dashboardHTML() {
       <div class="card"><div class="card-title">Monthly Expenses</div><div class="chart-wrap"><canvas id="chart-monthly"></canvas></div></div>
       <div class="card"><div class="card-title">By Category</div><div class="chart-wrap" style="display:flex;align-items:center;justify-content:center"><canvas id="chart-category"></canvas></div></div>
     </div>
+    <div class="chart-grid" style="margin-top:16px">
+      <div class="card">
+        <div class="card-title" id="chart-vehicle-title" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Vehicle-wise Expenses</span>
+          <button id="chart-vehicle-reset" class="btn btn-ghost btn-xs" style="display:none;color:var(--primary)" onclick="resetVehicleChart()">&#x2715; Clear Selection</button>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-vehicle"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title" id="chart-catbar-title">Category-wise Expenses <span style="font-size:11px;font-weight:400;color:var(--gray-400)">(All Vehicles)</span></div>
+        <div class="chart-wrap"><canvas id="chart-catbar"></canvas></div>
+      </div>
+    </div>
     ${isSA()?`<div class="chart-grid">
       <div class="card"><div class="card-title">Plant-wise Expenses</div><div class="chart-wrap"><canvas id="chart-plant"></canvas></div></div>
       <div class="card"><div class="card-title">Monthly CO₂ Trend</div><div class="chart-wrap"><canvas id="chart-co2"></canvas></div></div>
@@ -2071,7 +2084,119 @@ function initCharts() {
     const co2c = document.getElementById('chart-co2');
     if (co2c && !S.charts.co2) S.charts.co2 = new Chart(co2c,{type:'line',data:{labels:months,datasets:[{label:'CO₂ (kg)',data:monthKeys.map(m=>exps.filter(e=>e.date.startsWith(m)).reduce((s,e)=>s+(e.co2Emission||0),0).toFixed(1)),borderColor:'#16a34a',backgroundColor:'rgba(22,163,74,.08)',fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#16a34a'}]},options:{...commonOpts,plugins:{legend:{display:false}},scales:{y:{grid:{color:'#f3f4f6'}},x:{grid:{display:false}}}}});
   }
+
+  // ── Vehicle-wise bar chart ──────────────────────────────────────────
+  const vc = document.getElementById('chart-vehicle');
+  if (vc) {
+    if (S.charts.vehicle) { S.charts.vehicle.destroy(); S.charts.vehicle = null; }
+    const vehicles = myVehicles();
+    const vLabels = vehicles.map(v => v.regNo);
+    const vData   = vehicles.map(v => exps.filter(e => e.vehicleId === v.id).reduce((s,e) => s+e.amount, 0));
+    const baseColor = '#1a56a0';
+    const vColors   = vData.map(() => baseColor);
+    S.charts.vehicle = new Chart(vc, {
+      type: 'bar',
+      data: { labels: vLabels, datasets: [{ label: 'Total Expenses (₹)', data: vData, backgroundColor: vColors, borderRadius: 4, borderSkipped: false }] },
+      options: {
+        ...commonOpts,
+        onClick(evt, els) {
+          if (!els.length) return;
+          const idx = els[0].index;
+          const vid = vehicles[idx]?.id;
+          if (!vid) return;
+          // Toggle selection
+          if (S._selectedVehicleBar === vid) {
+            S._selectedVehicleBar = null;
+            resetVehicleChart();
+          } else {
+            S._selectedVehicleBar = vid;
+            // Highlight selected bar
+            S.charts.vehicle.data.datasets[0].backgroundColor = vData.map((_,i) => i===idx ? '#dc2626' : '#d1d5db');
+            S.charts.vehicle.update();
+            // Update title
+            const regNo = vehicles[idx].regNo;
+            const titleEl = document.getElementById('chart-vehicle-title');
+            if (titleEl) titleEl.querySelector('span').textContent = 'Vehicle-wise Expenses — ' + regNo + ' selected';
+            const resetBtn = document.getElementById('chart-vehicle-reset');
+            if (resetBtn) resetBtn.style.display = '';
+            // Redraw category chart for selected vehicle
+            updateCatBarChart(vid, regNo);
+          }
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => '₹' + ctx.parsed.y.toLocaleString('en-IN') } }
+        },
+        scales: {
+          y: { ticks: { callback: v => '₹'+(v/1000).toFixed(0)+'k' }, grid: { color: '#f3f4f6' } },
+          x: { grid: { display: false }, ticks: { maxRotation: 45, minRotation: 30, font: { size: 10 } } }
+        }
+      }
+    });
+  }
+
+  // ── Category-wise horizontal bar chart ─────────────────────────────
+  const cb = document.getElementById('chart-catbar');
+  if (cb) {
+    if (S.charts.catbar) { S.charts.catbar.destroy(); S.charts.catbar = null; }
+    const cats = EXPENSE_CATEGORIES;
+    const catData = cats.map(cat => exps.filter(e => e.category === cat).reduce((s,e) => s+e.amount, 0));
+    const catColors = ['#1a56a0','#0ea5e9','#d97706','#dc2626','#16a34a','#7c3aed','#f59e0b','#6b7280'];
+    S.charts.catbar = new Chart(cb, {
+      type: 'bar',
+      data: { labels: cats, datasets: [{ label: 'Amount (₹)', data: catData, backgroundColor: catColors.slice(0,cats.length), borderRadius: 4, borderSkipped: false }] },
+      options: {
+        ...commonOpts,
+        indexAxis: 'y',
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => '₹' + ctx.parsed.x.toLocaleString('en-IN') } }
+        },
+        scales: {
+          x: { ticks: { callback: v => '₹'+(v/1000).toFixed(0)+'k' }, grid: { color: '#f3f4f6' } },
+          y: { grid: { display: false }, ticks: { font: { size: 11 } } }
+        }
+      }
+    });
+  }
 }
+
+function updateCatBarChart(vehicleId, regNo) {
+  const exps = filteredExpenses().filter(e => e.vehicleId === vehicleId);
+  const cats = EXPENSE_CATEGORIES;
+  const catColors = ['#1a56a0','#0ea5e9','#d97706','#dc2626','#16a34a','#7c3aed','#f59e0b','#6b7280'];
+  const catData = cats.map(cat => exps.filter(e => e.category === cat).reduce((s,e) => s+e.amount, 0));
+  if (S.charts.catbar) {
+    S.charts.catbar.data.datasets[0].data = catData;
+    S.charts.catbar.update();
+  }
+  const titleEl = document.getElementById('chart-catbar-title');
+  if (titleEl) titleEl.innerHTML = 'Category-wise Expenses <span style="font-size:11px;font-weight:400;color:#dc2626">(' + regNo + ')</span>';
+}
+
+window.resetVehicleChart = function() {
+  S._selectedVehicleBar = null;
+  const exps = filteredExpenses();
+  const vehicles = myVehicles();
+  if (S.charts.vehicle) {
+    S.charts.vehicle.data.datasets[0].backgroundColor = vehicles.map(() => '#1a56a0');
+    S.charts.vehicle.update();
+  }
+  const titleEl = document.getElementById('chart-vehicle-title');
+  if (titleEl) titleEl.querySelector('span').textContent = 'Vehicle-wise Expenses';
+  const resetBtn = document.getElementById('chart-vehicle-reset');
+  if (resetBtn) resetBtn.style.display = 'none';
+  // Reset catbar to all vehicles
+  const cats = EXPENSE_CATEGORIES;
+  const catColors = ['#1a56a0','#0ea5e9','#d97706','#dc2626','#16a34a','#7c3aed','#f59e0b','#6b7280'];
+  const catData = cats.map(cat => exps.filter(e => e.category === cat).reduce((s,e) => s+e.amount, 0));
+  if (S.charts.catbar) {
+    S.charts.catbar.data.datasets[0].data = catData;
+    S.charts.catbar.update();
+  }
+  const catTitleEl = document.getElementById('chart-catbar-title');
+  if (catTitleEl) catTitleEl.innerHTML = 'Category-wise Expenses <span style="font-size:11px;font-weight:400;color:var(--gray-400)">(All Vehicles)</span>';
+};
 
 // ── ALERTS ────────────────────────────────────────────────────────
 function alertsHTML() {
