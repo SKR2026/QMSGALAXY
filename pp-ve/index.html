@@ -1796,9 +1796,10 @@ async function updateSidebarLicenseStatus() {
 async function doLogin(email, pw) {
   try {
     await signInWithEmailAndPassword(auth, email, pw);
-    // Cache pw in sessionStorage for biometric re-auth if registered
+    // Keep the cached biometric password in sync if this device has biometric
+    // registered for this email (e.g. after a password change).
     const stored = JSON.parse(localStorage.getItem('vems_biometric_uid')||'null');
-    if (stored && stored.email === email) sessionStorage.setItem('vems_bio_pw', pw);
+    if (stored && stored.email === email) await bioStorePassword(pw);
   } catch(e) {
     showToast(e.message.replace('Firebase: ','').replace(/\(.*\)/,''), 'error');
   }
@@ -2155,6 +2156,9 @@ function sidebarHTML() {
       {id:'plants',label:'Plants',icon:'🏭'},
       ...(isSA()?[{id:'users',label:'User Management',icon:'👥'},{id:'emfactors',label:'Emission Factors',icon:'⚗️'},{id:'expensecategories',label:'Expense Categories',icon:'🏷️'},{id:'audit',label:'Audit Trail',icon:'📋'},{id:'license',label:'License',icon:'🔑'},{id:'superadmin',label:'Superadmin Panel',icon:'🛡️'}]:[]),
     ]},
+    { section:'Account', items:[
+      {id:'settings',label:'Settings',icon:'⚙️'},
+    ]},
   ];
   return `<nav class="sidebar" id="sidebar">
     <div class="sidebar-logo">
@@ -2204,9 +2208,61 @@ function pageHTML() {
     case 'audit':       return isSA()?auditHTML():dashboardHTML();
     case 'superadmin':  return isSA()?superadminHTML():dashboardHTML();
     case 'license':     return isSA()?licenseHTML():dashboardHTML();
+    case 'settings':    return settingsHTML();
     case 'vehicle-detail': return vehicleDetailHTML();
     default:            return dashboardHTML();
   }
+}
+
+// ── DASHBOARD ─────────────────────────────────────────────────────
+function settingsHTML() {
+  const hasBio = !!localStorage.getItem('vems_biometric_uid');
+  const bio = hasBio ? JSON.parse(localStorage.getItem('vems_biometric_uid')) : null;
+  const bioSupported = webAuthnSupported();
+  return `<div class="page">
+    <div class="page-header" style="margin-bottom:16px"><h1>⚙️ Settings</h1></div>
+
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header"><h3>Account</h3></div>
+      <div class="card-body">
+        <div style="display:flex;align-items:center;gap:12px">
+          <div class="user-avatar" style="width:44px;height:44px;font-size:18px">${(S.user?.email||'U')[0].toUpperCase()}</div>
+          <div>
+            <div style="font-weight:600">${(()=>{const n=S.user?.email?.split('@')[0]||'User';return n.charAt(0).toUpperCase()+n.slice(1);})()}</div>
+            <div style="font-size:13px;color:var(--gray-500)">${S.user?.email||''}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h3>🔐 Biometric Login</h3></div>
+      <div class="card-body">
+        ${!bioSupported ? `
+          <div class="alert alert-warning">Biometric login (Touch ID / Face ID / fingerprint) isn't supported on this device or browser.</div>
+        ` : hasBio ? `
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+            <div>
+              <div style="display:flex;align-items:center;gap:8px;font-weight:600;color:#16a34a">
+                <span>✅</span> Enabled on this device
+              </div>
+              <div style="font-size:13px;color:var(--gray-500);margin-top:4px">Signed-in email: ${bio.email}</div>
+              <div style="font-size:12px;color:var(--gray-400);margin-top:2px">No password required to sign in on this device.</div>
+            </div>
+            <button class="btn btn-secondary" style="color:#dc2626;border-color:#fecaca" onclick="disableBiometricFromSettings()">🗑 Disable</button>
+          </div>
+        ` : `
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+            <div>
+              <div style="font-weight:600">Not enabled on this device</div>
+              <div style="font-size:13px;color:var(--gray-500);margin-top:4px">Turn this on to sign in with Touch ID / Face ID / fingerprint — no password needed afterwards.</div>
+            </div>
+            <button class="btn btn-primary" onclick="openEnableBiometricModal()">🔐 Enable Biometric Login</button>
+          </div>
+        `}
+      </div>
+    </div>
+  </div>`;
 }
 
 // ── DASHBOARD ─────────────────────────────────────────────────────
@@ -5827,6 +5883,70 @@ function fromB64url(str) {
   return buf.buffer;
 }
 
+// ── LOCAL ENCRYPTION FOR CACHED PASSWORD ─────────────────────────────────────
+// NOTE ON SECURITY MODEL: WebAuthn assertions don't hand back a secret we can
+// use as a decryption key (no backend here to verify the assertion and mint a
+// Firebase custom token), so a fully server-verified "passwordless" flow isn't
+// possible in a client-only app. Instead we encrypt the password at rest with
+// a per-device AES-GCM key and gate its use behind the OS biometric prompt —
+// the browser will only reach the decrypt/sign-in step after Touch ID/Face ID/
+// fingerprint succeeds. This means no password is ever typed again on this
+// device once biometric login is enabled.
+async function bioDeriveKey() {
+  let jwk = JSON.parse(localStorage.getItem('vems_bio_key')||'null');
+  if (jwk) {
+    return crypto.subtle.importKey('jwk', jwk, {name:'AES-GCM'}, true, ['encrypt','decrypt']);
+  }
+  const key = await crypto.subtle.generateKey({name:'AES-GCM', length:256}, true, ['encrypt','decrypt']);
+  jwk = await crypto.subtle.exportKey('jwk', key);
+  localStorage.setItem('vems_bio_key', JSON.stringify(jwk));
+  return key;
+}
+async function bioEncryptPw(pw) {
+  const key = await bioDeriveKey();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, new TextEncoder().encode(pw));
+  return { iv: b64url(iv), data: b64url(cipher) };
+}
+async function bioDecryptPw(payload) {
+  const key = await bioDeriveKey();
+  const iv = new Uint8Array(fromB64url(payload.iv));
+  const plainBuf = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, fromB64url(payload.data));
+  return new TextDecoder().decode(plainBuf);
+}
+function bioStorePassword(pw) {
+  return bioEncryptPw(pw).then(enc => localStorage.setItem('vems_bio_pw_enc', JSON.stringify(enc)));
+}
+function bioClearStoredPassword() {
+  localStorage.removeItem('vems_bio_pw_enc');
+  localStorage.removeItem('vems_bio_key');
+  sessionStorage.removeItem('vems_bio_pw'); // cleanup from the old session-only cache
+}
+
+// ── SHARED: register a passkey + cache the password for this uid/email ──────
+async function registerBiometricCredential(email, password, uid) {
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const userId = new TextEncoder().encode(uid);
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge,
+      rp: { name: 'VEMS', id: window.location.hostname || 'localhost' },
+      user: { id: userId, name: email, displayName: email.split('@')[0] },
+      pubKeyCredParams: [{ alg:-7, type:'public-key' }, { alg:-257, type:'public-key' }],
+      authenticatorSelection: {
+        authenticatorAttachment: 'platform',
+        requireResidentKey: false,
+        userVerification: 'required',
+      },
+      timeout: 60000,
+      attestation: 'none',
+    }
+  });
+  const credData = { id: b64url(cred.rawId), email, uid };
+  localStorage.setItem('vems_biometric_uid', JSON.stringify(credData));
+  await bioStorePassword(password);
+}
+
 // ── SETUP: register passkey after successful password login ─────────────────
 window.setupBiometricLogin = async function() {
   if (!webAuthnSupported()) {
@@ -5844,29 +5964,9 @@ window.setupBiometricLogin = async function() {
   try {
     // First verify credentials via Firebase
     const { user } = await signInWithEmailAndPassword(auth, email, password);
-    // Now create a passkey
     if (btn) btn.textContent = '🔐 Touch sensor / Face ID…';
-    const challenge = crypto.getRandomValues(new Uint8Array(32));
-    const userId = new TextEncoder().encode(user.uid);
-    const cred = await navigator.credentials.create({
-      publicKey: {
-        challenge,
-        rp: { name: 'VEMS', id: window.location.hostname || 'localhost' },
-        user: { id: userId, name: email, displayName: email.split('@')[0] },
-        pubKeyCredParams: [{ alg:-7, type:'public-key' }, { alg:-257, type:'public-key' }],
-        authenticatorSelection: {
-          authenticatorAttachment: 'platform',
-          requireResidentKey: false,
-          userVerification: 'required',
-        },
-        timeout: 60000,
-        attestation: 'none',
-      }
-    });
-    // Store credential id + email
-    const credData = { id: b64url(cred.rawId), email, uid: user.uid };
-    localStorage.setItem('vems_biometric_uid', JSON.stringify(credData));
-    showToast('✅ Biometric login set up! You can now use Touch ID / Face ID to sign in.', 'success');
+    await registerBiometricCredential(email, password, user.uid);
+    showToast('✅ Biometric login set up! You can now use Touch ID / Face ID to sign in — no password needed.', 'success');
     render(); // re-render login page to show biometric button
   } catch(e) {
     if (e.name === 'NotAllowedError') {
@@ -5882,11 +5982,93 @@ window.setupBiometricLogin = async function() {
   }
 };
 
-// ── LOGIN: assert passkey → retrieve stored email → Firebase sign-in ─────────
+window.removeBiometric = function() {
+  if (!confirm('Remove biometric login from this device?')) return;
+  localStorage.removeItem('vems_biometric_uid');
+  bioClearStoredPassword();
+  showToast('Biometric login removed.', 'info');
+  render();
+};
+
+// ── SETTINGS PAGE: enable/disable biometric while already signed in ─────────
+window.openEnableBiometricModal = function() {
+  if (!webAuthnSupported()) {
+    showToast('Biometric login is not supported on this device/browser.', 'warning');
+    return;
+  }
+  S.modal = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+    <div class="modal" style="max-width:420px">
+      <div class="modal-header">
+        <h2>🔐 Enable Biometric Login</h2>
+        <button onclick="closeModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="alert alert-info mb-4">Confirm your password once. After this, Touch ID / Face ID / fingerprint will sign you in on this device — no password required.</div>
+        <div class="form-group">
+          <label class="form-label">Password for ${S.user?.email||''}</label>
+          <input id="settings-bio-pw" type="password" class="form-input" placeholder="••••••••" autocomplete="current-password"/>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="settings-bio-confirm-btn" onclick="enableBiometricFromSettings()">🔐 Confirm &amp; Set Up</button>
+      </div>
+    </div>
+  </div>`;
+  render();
+  setTimeout(()=>document.getElementById('settings-bio-pw')?.focus(), 50);
+};
+
+window.enableBiometricFromSettings = async function() {
+  const password = document.getElementById('settings-bio-pw')?.value;
+  const email = S.user?.email;
+  if (!password) { showToast('Enter your password to continue.', 'warning'); return; }
+  const btn = document.getElementById('settings-bio-confirm-btn');
+  if (btn) { btn.textContent = '⏳ Verifying…'; btn.disabled = true; }
+  try {
+    // Re-authenticate to confirm the password is correct before caching it.
+    await signInWithEmailAndPassword(auth, email, password);
+    if (btn) btn.textContent = '🔐 Touch sensor / Face ID…';
+    await registerBiometricCredential(email, password, S.user.uid);
+    closeModal();
+    showToast('✅ Biometric login enabled! No password needed next time on this device.', 'success');
+    render();
+  } catch(e) {
+    if (e.name === 'NotAllowedError') {
+      showToast('Biometric setup cancelled.', 'warning');
+    } else if (e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password') {
+      showToast('Incorrect password.', 'error');
+    } else {
+      showToast('Could not enable biometric login: ' + (e.message||e.name), 'error');
+    }
+    console.error('[Settings Biometric Enable]', e);
+    if (btn) { btn.textContent = '🔐 Confirm & Set Up'; btn.disabled = false; }
+  }
+};
+
+window.disableBiometricFromSettings = function() {
+  if (!confirm('Turn off biometric login on this device? You will need your password to sign in next time.')) return;
+  localStorage.removeItem('vems_biometric_uid');
+  bioClearStoredPassword();
+  showToast('Biometric login disabled on this device.', 'info');
+  render();
+};
+// Once biometric is enabled, the password is never asked for again on this
+// device: the WebAuthn prompt (Touch ID/Face ID/fingerprint) is the only gate.
 window.doBiometricLogin = async function() {
   if (!webAuthnSupported()) { showToast('Biometric not supported on this device.','warning'); return; }
   const stored = JSON.parse(localStorage.getItem('vems_biometric_uid')||'null');
   if (!stored) { showToast('No biometric credential found. Set it up first.','warning'); return; }
+  const encPw = JSON.parse(localStorage.getItem('vems_bio_pw_enc')||'null');
+  if (!encPw) {
+    // Credential exists but the cached password is missing (e.g. imported from
+    // another device, or cleared). Fall back to one manual password entry to
+    // re-establish the local cache, then never ask again.
+    showToast('Please sign in with your password once to re-enable one-tap biometric login.', 'info');
+    document.getElementById('login-email').value = stored.email;
+    document.getElementById('login-password')?.focus();
+    return;
+  }
   const btn = document.getElementById('biometric-login-btn');
   if (btn) { btn.textContent = '🔐 Touch sensor / Face ID…'; btn.disabled = true; }
   try {
@@ -5900,24 +6082,17 @@ window.doBiometricLogin = async function() {
         timeout: 60000,
       }
     });
-    // Assertion passed — the user's biometric matched the registered key.
-    // We still need a Firebase token. VEMS uses a cached credential approach:
-    // on first biometric setup we save email; biometric merely re-confirms identity.
-    // Show email pre-filled; ask password only on first-time or token expiry.
-    const cachedPw = sessionStorage.getItem('vems_bio_pw');
-    if (cachedPw) {
-      await signInWithEmailAndPassword(auth, stored.email, cachedPw);
-    } else {
-      // Biometric confirmed but we need password for Firebase token once.
-      // Pre-fill email and show password prompt.
-      const emailEl = document.getElementById('login-email');
-      if (emailEl) emailEl.value = stored.email;
-      showToast('✅ Biometric verified! Enter your password once to complete sign-in.','info');
-      document.getElementById('login-password')?.focus();
-    }
+    // Assertion passed — decrypt the cached password and sign straight in.
+    const password = await bioDecryptPw(encPw);
+    await signInWithEmailAndPassword(auth, stored.email, password);
   } catch(e) {
     if (e.name === 'NotAllowedError') {
       showToast('Biometric not recognised or cancelled.','warning');
+    } else if (e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password') {
+      // Password on file is stale (changed elsewhere) — ask once, then re-cache it.
+      showToast('Your password changed recently. Please sign in once to refresh biometric login.', 'warning');
+      document.getElementById('login-email').value = stored.email;
+      document.getElementById('login-password')?.focus();
     } else {
       showToast('Biometric login failed: ' + (e.message||e.name),'error');
     }
@@ -5925,16 +6100,6 @@ window.doBiometricLogin = async function() {
   } finally {
     if (btn) { btn.textContent = '🔐 Sign In with Biometrics'; btn.disabled = false; }
   }
-};
-
-// Biometric pw caching is handled inside doLogin directly.
-
-window.removeBiometric = function() {
-  if (!confirm('Remove biometric login from this device?')) return;
-  localStorage.removeItem('vems_biometric_uid');
-  sessionStorage.removeItem('vems_bio_pw');
-  showToast('Biometric login removed.', 'info');
-  render();
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
