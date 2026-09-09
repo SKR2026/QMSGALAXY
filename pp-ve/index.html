@@ -547,7 +547,7 @@ tr:hover td{background:#fafbff}
 
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js';
-import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, createUserWithEmailAndPassword, sendPasswordResetEmail, sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink }
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, createUserWithEmailAndPassword, sendPasswordResetEmail, sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink, signInAnonymously }
   from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js';
 import { getFirestore, collection, getDocs, addDoc, updateDoc, deleteDoc, doc, query, where, orderBy, limit, serverTimestamp, getDoc, setDoc }
   from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js';
@@ -788,9 +788,9 @@ async function loadFirestoreData() {
     const plantsSnap = await getDocs(collection(db, 'vems_plants'));
     S.plants = plantsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
-    // Load vehicles (all for SA, plant-filtered for admin)
+    // Load vehicles — SA and Top Management get all vehicles; Plant Admin gets own plant only
     const vehiclesSnap = await getDocs(
-      isSA() ? collection(db, 'vems_vehicles')
+      (isSA() || S.isTopMgmt) ? collection(db, 'vems_vehicles')
              : query(collection(db, 'vems_vehicles'), where('plantId', '==', myPlantId()))
     );
     S.vehicles = vehiclesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -798,17 +798,15 @@ async function loadFirestoreData() {
     // Load expenses for current + previous year
     const yearStart = `${parseInt(S.filterYear)-1}-01-01`;
     const yearEnd   = `${S.filterYear}-12-31`;
-    // Plant Admin: query only by plantId to avoid requiring a composite
-    // Firestore index on (plantId + date). Filter the selected year locally.
-    // Superadmin keeps the date-range query because it does not combine
-    // plantId with the date range.
+    // Top Management + SA: full date-range query (no plantId filter, no composite index needed)
+    // Plant Admin: query only by plantId to avoid requiring a composite index
     const expSnap = await getDocs(
-      isSA()
+      (isSA() || S.isTopMgmt)
         ? query(collection(db,'vems_expenses'), where('date','>=',yearStart), where('date','<=',yearEnd), orderBy('date','desc'))
         : query(collection(db,'vems_expenses'), where('plantId','==',myPlantId()))
     );
     S.expenses = expSnap.docs.map(d => ({ id: d.id, ...d.data() }))
-      .filter(e => isSA() || (e.date >= yearStart && e.date <= yearEnd))
+      .filter(e => (isSA() || S.isTopMgmt) || (e.date >= yearStart && e.date <= yearEnd))
       .sort((a,b) => (b.date || '').localeCompare(a.date || ''));
 
     // Load emission factors
@@ -1343,6 +1341,13 @@ async function handleMagicLink() {
 onAuthStateChanged(auth, async user => {
   S.user = user;
   if (user) {
+    // Anonymous users (guest top-mgmt view) are already handled by the button click handler.
+    // Prevent onAuthStateChanged from overwriting S.isTopMgmt or routing them to login.
+    if (user.isAnonymous) {
+      // State is already set (S.isTopMgmt=true, S.page='topmgmt') by the button handler.
+      // loadFirestoreData() is also called there — nothing to do here.
+      return;
+    }
     S.isSuperAdmin = user.email === SUPERADMIN_EMAIL;
     S.isTopMgmt = TOP_MGMT_EMAILS.includes(user.email) && !S.isSuperAdmin;
     if (!S.isSuperAdmin && !S.isTopMgmt) {
@@ -1808,7 +1813,10 @@ async function doLogin(email, pw) {
 }
 async function doLogout() {
   if (S.isTopMgmt) {
-    S.user = null; S.isTopMgmt = false; S.page = 'login'; render(); return;
+    S.user = null; S.isTopMgmt = false; S.isSuperAdmin = false; S.dataLoaded = false; S.page = 'login';
+    // Sign out the anonymous Firebase session
+    try { await signOut(auth); } catch(_) {}
+    render(); return;
   }
   await signOut(auth); S.page='login'; render();
 }
@@ -2133,11 +2141,20 @@ function bindLogin() {
   btn?.addEventListener('click', go);
   document.getElementById('login-password')?.addEventListener('keydown', e=>{ if(e.key==='Enter') go(); });
 
-  // Direct Top Management View — no login needed
+  // Direct Top Management View — uses anonymous Firebase Auth so Firestore rules allow reads
   document.getElementById('topmgmt-view-btn')?.addEventListener('click', async () => {
     S.page = 'topmgmt';
     S.isTopMgmt = true;
-    S.user = { email: 'guest@topmgmt', displayName: 'Top Management' };
+    // Sign in anonymously to get a real Firebase Auth token — Firestore rules require request.auth != null
+    try {
+      const anonResult = await signInAnonymously(auth);
+      S.user = { email: 'guest@topmgmt', displayName: 'Top Management', uid: anonResult.user.uid };
+      S.isSuperAdmin = false;
+    } catch(e) {
+      console.warn('Anonymous sign-in failed (enable it in Firebase Console → Auth → Sign-in methods):', e.message);
+      S.user = { email: 'guest@topmgmt', displayName: 'Top Management' };
+      showToast('Enable Anonymous Auth in Firebase Console to load live data.', 'error');
+    }
     if (!S.dataLoaded) {
       S.loading = true;
       render();
