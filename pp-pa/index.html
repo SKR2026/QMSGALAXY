@@ -267,7 +267,7 @@ nav.sidebar-nav { flex: 1; overflow-y: auto; padding: 12px 0; }
   position: absolute; top: -4px; right: -4px; background: #ef4444; color: #fff;
   font-size: 9px; font-weight: 700; padding: 1px 4px; border-radius: 10px; min-width: 16px; text-align: center;
 }
-.content { flex: 1; overflow-y: auto; padding: 16px; }
+.content { flex: 1; overflow-y: auto; padding: 16px; scroll-behavior: auto; }
 .page { display: none !important; }
 .page.active { display: block !important; }
 
@@ -2420,12 +2420,12 @@ function navigate(page, extraData) {
 
   // Step 1: hide all pages so .content has zero height — scroll resets cleanly
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  if (pageContent) pageContent.scrollTop = 0;
+  if (pageContent) { pageContent.style.scrollBehavior = 'auto'; pageContent.scrollTop = 0; }
 
   // Step 2: show target page
   const el = document.getElementById('page-' + page);
   if (el) el.classList.add('active');
-  if (pageContent) pageContent.scrollTop = 0;
+  if (pageContent) { pageContent.scrollTop = 0; }
 
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.page === page));
   document.getElementById('topbar-title').textContent = pageTitles[page] || page;
@@ -2445,7 +2445,11 @@ function navigate(page, extraData) {
     'audit-logs':        loadAuditLogs,
     settings:            loadSettings,
   };
-  const snapTop = () => { if (pageContent) pageContent.scrollTop = 0; };
+  const snapTop = () => {
+    if (!pageContent) return;
+    pageContent.scrollTop = 0;
+    requestAnimationFrame(() => { pageContent.scrollTop = 0; });
+  };
   if (loaders[page]) {
     Promise.resolve(loaders[page]())
       .then(snapTop)
@@ -3090,49 +3094,94 @@ async function executeApprovalAction() {
 async function loadMyApprovals() {
   const filter = document.getElementById('approvals-filter')?.value || 'pending';
   const tbody  = document.getElementById('approvals-tbody');
+  const contentEl = document.querySelector('.content');
+
+  // Show spinner — keep scroll pinned at 0 before and after
   tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:24px"><div class="spinner dark"></div></td></tr>';
+  if (contentEl) contentEl.scrollTop = 0;
 
   try {
     let q;
     if (filter === 'pending') {
-      q = db.collection('pp_proposals').where('currentApproverId','==',currentUser.uid).where('status','==','Pending Approval');
+      // NOTE: This query requires a Firestore composite index on (currentApproverId + status + updatedAt).
+      // Create it at: https://console.firebase.google.com → Firestore → Indexes → Composite → Add
+      // Fields: currentApproverId ASC, status ASC, updatedAt DESC
+      // Until the index is created, we fall back to a client-side filter.
+      try {
+        q = db.collection('pp_proposals')
+          .where('currentApproverId','==',currentUser.uid)
+          .where('status','==','Pending Approval')
+          .orderBy('updatedAt','desc')
+          .limit(50);
+        const snap = await q.get();
+        const props = snap.docs.map(d=>({id:d.id,...d.data()}));
+        renderApprovalsTable(props);
+      } catch(indexErr) {
+        // Index not yet created — fall back: fetch by approverId only, filter+sort client-side
+        console.warn('loadMyApprovals: composite index missing, using client-side filter', indexErr.message);
+        const fallbackSnap = await db.collection('pp_proposals')
+          .where('currentApproverId','==',currentUser.uid)
+          .limit(200)
+          .get();
+        const props = fallbackSnap.docs
+          .map(d=>({id:d.id,...d.data()}))
+          .filter(p => p.status === 'Pending Approval')
+          .sort((a,b) => {
+            const ta = a.updatedAt?.toMillis?.() || a.updatedAt || 0;
+            const tb = b.updatedAt?.toMillis?.() || b.updatedAt || 0;
+            return tb - ta;
+          })
+          .slice(0,50);
+        renderApprovalsTable(props);
+      }
     } else {
-      // Load from approval history via audit logs / index
-      q = db.collection('pp_proposals').where('createdBy','==',currentUser.uid); // fallback — server function handles this properly
+      const fallbackSnap = await db.collection('pp_proposals')
+        .where('createdBy','==',currentUser.uid)
+        .limit(200)
+        .get();
+      const props = fallbackSnap.docs.map(d=>({id:d.id,...d.data()}));
+      renderApprovalsTable(props);
     }
-    const snap  = await q.orderBy('updatedAt','desc').limit(50).get();
-    const props = snap.docs.map(d=>({id:d.id,...d.data()}));
-    const badge = document.getElementById('approvals-badge');
-    badge.textContent = props.length||'';
-    badge.style.display = props.length ? '' : 'none';
-
-    tbody.innerHTML = props.length
-      ? props.map(p=>{
-          const plant = allPlants.find(pl=>pl.id===p.plantId);
-          const hrs   = hoursSince(p.submittedAt||p.createdAt);
-          const slaOk = hrs < 48;
-          return `<tr onclick="viewProposal('${p.id}')" style="cursor:pointer">
-            <td><strong>${esc(p.proposalNumber||'—')}</strong></td>
-            <td>${esc(plant?.name||'—')}</td>
-            <td>${esc(p.partyName||'—')}</td>
-            <td>₹${fmt(p.proposedPrice)}</td>
-            <td style="color:${p.diffPercent>=0?'var(--success)':'var(--danger)'}">${p.diffPercent>=0?'+':''}${(p.diffPercent||0).toFixed(1)}%</td>
-            <td>${fmtDate(p.submittedAt)}</td>
-            <td style="color:${slaOk?'var(--success)':'var(--danger)'}">${hrs.toFixed(0)}h ${slaOk?'✅':'⚠️'}</td>
-            <td>Level ${p.currentApprovalLevel||1}</td>
-            <td><span class="badge badge-${(p.status||'draft').toLowerCase().replace(/\s/g,'')}">${p.status}</span></td>
-            <td onclick="event.stopPropagation()">
-              ${p.status==='Pending Approval'&&p.currentApproverId===currentUser?.uid?`
-                <button class="btn btn-success btn-sm" onclick="openApprovalModal('${p.id}','approve')">Approve</button>
-              `:'—'}
-            </td>
-          </tr>`;
-        }).join('')
-      : '<tr><td colspan="10"><div class="empty-state" style="padding:32px"><div class="empty-icon">✅</div><p>No proposals found</p></div></td></tr>';
   } catch(e) {
     console.error('loadMyApprovals',e);
-    tbody.innerHTML = '<tr><td colspan="10">Failed to load</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:20px;color:var(--danger)">⚠️ Failed to load — ' + (e.code||e.message||'Firestore error') + '</td></tr>';
+  } finally {
+    // Always snap scroll to top after any DOM change — catches both success and error paths
+    if (contentEl) contentEl.scrollTop = 0;
+    requestAnimationFrame(() => { if (contentEl) contentEl.scrollTop = 0; });
   }
+}
+
+function renderApprovalsTable(props) {
+  const tbody  = document.getElementById('approvals-tbody');
+  const badge  = document.getElementById('approvals-badge');
+  const contentEl = document.querySelector('.content');
+  if (badge) { badge.textContent = props.length||''; badge.style.display = props.length ? '' : 'none'; }
+  tbody.innerHTML = props.length
+    ? props.map(p=>{
+        const plant = allPlants.find(pl=>pl.id===p.plantId);
+        const hrs   = hoursSince(p.submittedAt||p.createdAt);
+        const slaOk = hrs < 48;
+        return `<tr onclick="viewProposal('${p.id}')" style="cursor:pointer">
+          <td><strong>${esc(p.proposalNumber||'—')}</strong></td>
+          <td>${esc(plant?.name||'—')}</td>
+          <td>${esc(p.partyName||'—')}</td>
+          <td>₹${fmt(p.proposedPrice)}</td>
+          <td style="color:${p.diffPercent>=0?'var(--success)':'var(--danger)'}">${p.diffPercent>=0?'+':''}${(p.diffPercent||0).toFixed(1)}%</td>
+          <td>${fmtDate(p.submittedAt)}</td>
+          <td style="color:${slaOk?'var(--success)':'var(--danger)'}">${hrs.toFixed(0)}h ${slaOk?'✅':'⚠️'}</td>
+          <td>Level ${p.currentApprovalLevel||1}</td>
+          <td><span class="badge badge-${(p.status||'draft').toLowerCase().replace(/\s/g,'')}">${p.status}</span></td>
+          <td onclick="event.stopPropagation()">
+            ${p.status==='Pending Approval'&&p.currentApproverId===currentUser?.uid?`
+              <button class="btn btn-success btn-sm" onclick="openApprovalModal('${p.id}','approve')">Approve</button>
+            `:'—'}
+          </td>
+        </tr>`;
+      }).join('')
+    : '<tr><td colspan="10"><div class="empty-state" style="padding:32px"><div class="empty-icon">✅</div><p>No proposals pending your action</p></div></td></tr>';
+  // Final scroll snap after content is written
+  if (contentEl) contentEl.scrollTop = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
