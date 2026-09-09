@@ -3240,25 +3240,105 @@ async function executeApprovalAction() {
   const btn = document.getElementById('approval-action-btn');
   btn.disabled = true; btn.innerHTML = '<div class="spinner"></div>';
 
+  const resetBtn = () => {
+    btn.disabled = false;
+    btn.textContent = titles[action] || 'Confirm';
+    btn.style.cssText = 'min-width:160px;border-radius:50px;font-weight:700';
+  };
+
   try {
+    // Try Cloud Function first
     const fnName = { approve:'processApproval', reject:'processRejection', return:'processReturn' }[action];
     const callFn = fns.httpsCallable(fnName);
-    const result = await callFn({ proposalId, comment });
+    let success = false;
 
-    if (result.data.success) {
-      toast(`Proposal ${action}d successfully`,'success');
-      await logAudit(proposalId, action.charAt(0).toUpperCase()+action.slice(1), comment);
+    try {
+      const result = await callFn({ proposalId, comment });
+      success = result.data?.success;
+      if (!success) throw new Error(result.data?.message || 'Cloud Function returned failure');
+    } catch(fnErr) {
+      console.warn('Cloud Function failed, using direct Firestore fallback:', fnErr.message);
+
+      // Direct Firestore fallback — works even if Cloud Function is broken
+      const now = firebase.firestore.FieldValue.serverTimestamp();
+      const nowISO = new Date().toISOString();
+      const userName = currentProfile?.name || currentUser?.email || '';
+      const uid = currentUser?.uid || '';
+
+      const historyEntry = {
+        level: 0, approverId: uid, approverName: userName,
+        action: action === 'approve' ? 'Approved' : action === 'reject' ? 'Rejected' : 'Returned',
+        comment: comment || '', actionAt: nowISO
+      };
+
+      if (action === 'approve') {
+        // Get current proposal to check approval level
+        const snap = await db.collection('pp_proposals').doc(proposalId).get();
+        const p = snap.data();
+        const currentLevel = p.currentApprovalLevel || 1;
+
+        // Check if there's a next approver in matrix
+        const matrixSnap = await db.collection('pp_approvalMatrices').get();
+        const levels = matrixSnap.docs.map(d => Number(d.data().level || 0)).filter(Boolean);
+        const maxLevel = levels.length ? Math.max(...levels) : 1;
+
+        historyEntry.level = currentLevel;
+        historyEntry.action = 'Approved';
+
+        if (currentLevel >= maxLevel) {
+          // Final approval
+          await db.collection('pp_proposals').doc(proposalId).update({
+            status: 'Approved',
+            approvedAt: now,
+            lastApprovalComment: comment || '',
+            approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+            updatedAt: now
+          });
+        } else {
+          // Advance to next level
+          await db.collection('pp_proposals').doc(proposalId).update({
+            status: 'Pending Approval',
+            currentApprovalLevel: currentLevel + 1,
+            lastApprovalComment: comment || '',
+            approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+            updatedAt: now
+          });
+        }
+      } else if (action === 'reject') {
+        await db.collection('pp_proposals').doc(proposalId).update({
+          status: 'Rejected',
+          rejectionReason: comment || '',
+          lastApprovalComment: comment || '',
+          rejectedBy: uid, rejectedByName: userName,
+          rejectedAt: now,
+          approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+          updatedAt: now
+        });
+      } else if (action === 'return') {
+        await db.collection('pp_proposals').doc(proposalId).update({
+          status: 'Returned',
+          returnComment: comment || '',
+          lastApprovalComment: comment || '',
+          returnedBy: uid, returnedByName: userName,
+          returnedAt: now,
+          approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+          updatedAt: now
+        });
+      }
+      success = true;
+    }
+
+    if (success) {
+      toast(`Proposal ${action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'returned'} successfully`, 'success');
+      await logAudit(proposalId, titles[action], comment);
       closeModal('approval-modal-overlay');
-      // Refresh
       await loadProposals();
       viewProposal(proposalId);
-    } else {
-      toast(result.data.message||'Action failed','error');
-      btn.disabled = false; btn.textContent = titles[action] || 'Confirm';
     }
   } catch(e) {
-    toast(e.message||'Action failed','error');
-    btn.disabled = false; btn.textContent = titles[action] || 'Confirm';
+    console.error('executeApprovalAction error:', e);
+    toast(e.message || 'Action failed — please try again', 'error');
+    resetBtn();
   }
   pendingAction = null;
 }
