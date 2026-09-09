@@ -3816,7 +3816,7 @@ window.saveAllSuperadminSettings = async function() {
   S.orgName = document.getElementById('sa-org')?.value || S.orgName;
   localStorage.setItem('vems_orgname', S.orgName);
 
-  // Save org name to Firestore branding doc so all users/devices get it
+  // Save org name + notifFunctionUrl to Firestore so all users/devices (incl. magic-link top-mgmt) get it
   try {
     await setDoc(doc(db, 'vems_settings', 'branding'), {
       companyLogo: S.companyLogo || '',
@@ -3825,6 +3825,14 @@ window.saveAllSuperadminSettings = async function() {
       updatedBy: S.user?.email
     });
   } catch(err) { console.warn('Branding save error:', err); }
+  // Store function URL in Firestore so top-mgmt magic-link users can submit escalation requests
+  try {
+    await setDoc(doc(db, 'vems_settings', 'data'), {
+      notifFunctionUrl: form.notifFunctionUrl || '',
+      updatedAt: serverTimestamp(),
+      updatedBy: S.user?.email,
+    }, { merge: true });
+  } catch(err) { console.warn('Settings (notifFunctionUrl) save error:', err); }
 
   // Sync to cloud + Firestore
   await saveAndSyncSchedules();
@@ -4419,10 +4427,18 @@ window.loadEscalationRequests = async function() {
   if (!el) return;
   el.innerHTML = `<div class="alert alert-info">⏳ Loading escalation requests…</div>`;
   try {
-    const snap = await getDocs(
-      query(collection(db,'vems_escalations'), orderBy('requestedAt','desc'), limit(20))
-    );
-    const requests = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Use a simple collection fetch + client-side sort to avoid requiring a Firestore composite index.
+    // (A bare orderBy on a single field still needs an index when combined with limit in some SDK versions.)
+    const snap = await getDocs(collection(db,'vems_escalations'));
+    const requests = snap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => {
+        // Sort descending by requestedAt (Firestore Timestamp or null)
+        const ta = a.requestedAt?.toMillis ? a.requestedAt.toMillis() : 0;
+        const tb = b.requestedAt?.toMillis ? b.requestedAt.toMillis() : 0;
+        return tb - ta;
+      })
+      .slice(0, 20);
     if (!requests.length) {
       el.innerHTML = `<div class="alert alert-success">✅ No escalation requests from top management.</div>`;
       return;
@@ -4505,22 +4521,56 @@ window.submitTopMgmtEscalation = async function() {
   const yearExp  = myExpenses().filter(e=>e.date.startsWith(new Date().getFullYear())).reduce((s,e)=>s+e.amount,0);
   const missingInv = myExpenses().filter(e=>!e.hasBill).length;
 
-  // Log to Firestore as an escalation request
+  // Submit escalation request via backend (Admin SDK bypasses Firestore security rules)
   try {
-    await addDoc(collection(db,'vems_escalations'), {
-      requestedBy:  S.user?.email || 'Top Management',
-      remarks,
-      priority,
-      expiredDocs:  expired,
-      criticalDocs: critical,
-      ytdExpenses:  yearExp,
-      missingInvoices: missingInv,
-      requestedAt:  serverTimestamp(),
-      status:       'pending',
+    // Try localStorage first, then fall back to Firestore vems_settings/data
+    let url = (S.notifConfig?.notifFunctionUrl || '').replace(/\/$/, '');
+    if (!url) {
+      try {
+        const { getFirestore, doc: fsDoc, getDoc } = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js');
+        const settingsSnap = await getDoc(fsDoc(getFirestore(), 'vems_settings', 'data'));
+        url = (settingsSnap.data()?.notifFunctionUrl || '').replace(/\/$/, '');
+      } catch (_) {}
+    }
+    if (!url) {
+      showToast('VEMS Cloud Function URL not configured. Ask your Fleet Administrator.', 'error');
+      return;
+    }
+
+    // Get Firebase ID token so backend can verify the caller
+    let idToken = '';
+    try {
+      const { getAuth } = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js');
+      const currentUser = getAuth().currentUser;
+      if (currentUser) idToken = await currentUser.getIdToken();
+    } catch (_) { /* token is optional — backend allows top-mgmt magic-link users */ }
+
+    const res = await fetch(`${url}/api/submit-escalation-request`, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {}),
+      },
+      body: JSON.stringify({
+        remarks,
+        priority,
+        expiredDocs:     expired,
+        criticalDocs:    critical,
+        ytdExpenses:     yearExp,
+        missingInvoices: missingInv,
+      }),
     });
-    closeModal();
-    showToast(`Escalation request (${priorityLabel[priority]}) submitted to Fleet Administrator!`, 'success');
-    addAudit('Top Mgmt Escalation Request', priorityLabel[priority], remarks);
+
+    let data = {};
+    try { data = await res.json(); } catch(_) {}
+
+    if (res.ok && data.ok) {
+      closeModal();
+      showToast(`Escalation request (${priorityLabel[priority]}) submitted to Fleet Administrator!`, 'success');
+      addAudit('Top Mgmt Escalation Request', priorityLabel[priority], remarks);
+    } else {
+      showToast('Failed to submit escalation: ' + (data.error || `HTTP ${res.status}`), 'error');
+    }
   } catch(e) {
     showToast('Failed to submit escalation: ' + e.message, 'error');
   }
