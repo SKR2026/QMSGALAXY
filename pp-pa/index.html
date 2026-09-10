@@ -3731,16 +3731,31 @@ async function executeApprovalAction() {
         }
         const currentLevel = p.currentApprovalLevel || 1;
 
-        // Check if there's a next approver in matrix
+        // Load matrix and compute eligible next levels for THIS proposal's amount.
+        // minValue = activation threshold for a level (amount must be >= minValue).
+        // maxValue = optional upper cap (leave blank for no limit).
         const matrixSnap = await db.collection('pp_approvalMatrices').get();
-        const levels = matrixSnap.docs.map(d => Number(d.data().level || 0)).filter(Boolean);
-        const maxLevel = levels.length ? Math.max(...levels) : 1;
+        const amount = Number(p.proposedPrice ?? p.newPrice ?? p.proposedAmount ?? 0);
+
+        // The proposal's max level = highest level whose minValue <= amount
+        const proposalMaxLevel = Math.max(...[1, ...matrixSnap.docs
+          .map(d => ({...d.data()}))
+          .filter(r => (!r.plantId || r.plantId===p.plantId))
+          .filter(r => (!r.category || r.category===p.category))
+          .filter(r => {
+            const min = Number(r.minValue||0);
+            const max = r.maxValue==null||r.maxValue==='' ? Infinity : Number(r.maxValue);
+            return amount >= min && amount <= max;
+          })
+          .map(r => Number(r.level||0))
+          .filter(Boolean)
+        ]);
 
         historyEntry.level = currentLevel;
         historyEntry.action = 'Approved';
 
-        if (currentLevel >= maxLevel) {
-          // Final approval
+        if (currentLevel >= proposalMaxLevel) {
+          // This is the final level for this proposal's amount — mark approved
           await db.collection('pp_proposals').doc(proposalId).update({
             status: 'Approved',
             approvedAt: now,
@@ -3749,26 +3764,50 @@ async function executeApprovalAction() {
             updatedAt: now
           });
         } else {
-          // Advance to the next CONFIGURED matrix level, not simply +1.
-          const nextLevels = [...new Set(
+          // Find next level > currentLevel that also applies to this amount
+          const eligibleNextLevels = [...new Set(
             matrixSnap.docs
-              .map(d => Number(d.data().level || 0))
-              .filter(n => n > currentLevel)
+              .map(d => ({...d.data()}))
+              .filter(r => Number(r.level||0) > currentLevel)
+              .filter(r => (!r.plantId || r.plantId===p.plantId))
+              .filter(r => (!r.category || r.category===p.category))
+              .filter(r => {
+                const min = Number(r.minValue||0);
+                const max = r.maxValue==null||r.maxValue==='' ? Infinity : Number(r.maxValue);
+                return amount >= min && amount <= max;
+              })
+              .map(r => Number(r.level||0))
+              .filter(Boolean)
           )].sort((a,b)=>a-b);
-          const nextLevel = nextLevels[0];
+
+          const nextLevel = eligibleNextLevels[0];
 
           if (!nextLevel) {
-            throw new Error(`No approval matrix level exists after Level ${currentLevel}.`);
+            // No further levels apply — mark approved now
+            await db.collection('pp_proposals').doc(proposalId).update({
+              status: 'Approved', approvedAt: now,
+              lastApprovalComment: comment || '',
+              approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+              updatedAt: now
+            });
+            closeModal('approval-modal-overlay');
+            toast('Proposal finally approved!','success');
+            navigate('proposals');
+            return;
           }
 
           const amount = Number(p.proposedPrice ?? p.newPrice ?? p.proposedAmount ?? 0);
+          // minValue = activation threshold; maxValue = optional upper cap
           const rules = matrixSnap.docs
             .map(d => ({id:d.id,...d.data()}))
             .filter(r => (!r.plantId || r.plantId===p.plantId))
             .filter(r => (!r.category || r.category===p.category))
             .filter(r => Number(r.level||0)===nextLevel)
-            .filter(r => amount >= Number(r.minValue||0) &&
-                         (r.maxValue==null || r.maxValue==='' || amount <= Number(r.maxValue)))
+            .filter(r => {
+              const min = Number(r.minValue||0);
+              const max = r.maxValue==null || r.maxValue==='' ? Infinity : Number(r.maxValue);
+              return amount >= min && amount <= max;
+            })
             .sort((a,b)=>(Number(a.order)||0)-(Number(b.order)||0));
 
           const eligibleRules = rules.filter(r=>{
