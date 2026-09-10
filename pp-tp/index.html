@@ -17015,70 +17015,104 @@ function biometricManage() { biometricSettingsRemove(); }
 //  Mirrors the cloud email log UI from the price-proposals app.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-let _elTypeFilter   = 'all';
-let _elStatusFilter = 'all';
-let _elLiveUnsub    = null;
-let _elLogs         = [];   // cached from Firestore / localStorage
+let _elLiveUnsub = null; // reserved for future dedicated listener
 
 // ── Fetch logs (from localStorage / Firestore already synced by startReminderLogListener) ──
 function _elGetLogs() {
-  return getReminderLog(); // reuse the existing synced cache
+  return getReminderLog(); // reuse the existing Firestore-synced cache
 }
 
-// ── Type label + badge class map ─────────────────────────────────────────────
-function _elTypeMeta(type, transport) {
+// ── Type badge meta ────────────────────────────────────────────────────────────
+function _elTypeMeta(type) {
   const t = (type || '').toLowerCase();
-  const tr = (transport || 'cloud').toLowerCase();
-  // Determine icon + label + class
-  if (t === 'assigned')  return { icon:'📋', label:'assigned',  cls:'el-type-assigned'  };
-  if (t === 'reminder')  return { icon:'🔔', label:'reminder',  cls:'el-type-reminder'  };
-  if (t === 'batch')     return { icon:'☁️', label:'batch',     cls:'el-type-batch'     };
-  if (t === 'test')      return { icon:'🧪', label:'test',      cls:'el-type-test'      };
-  if (t === 'overdue')   return { icon:'⚠️', label:'overdue',   cls:'el-type-overdue'   };
-  if (t === 'completed') return { icon:'✅', label:'completed', cls:'el-type-completed' };
+  if (t === 'assigned')    return { icon:'📋', label:'assigned',    cls:'el-type-assigned'   };
+  if (t === 'reminder')    return { icon:'🔔', label:'reminder',    cls:'el-type-reminder'   };
+  if (t === 'batch')       return { icon:'🔔', label:'reminder',    cls:'el-type-reminder'   }; // cloud batches = reminder type visually
+  if (t === 'test')        return { icon:'🧪', label:'test',        cls:'el-type-test'       };
+  if (t === 'overdue')     return { icon:'⚠️', label:'overdue',     cls:'el-type-overdue'    };
+  if (t === 'completed')   return { icon:'✅', label:'completed',   cls:'el-type-completed'  };
+  if (t === 'status_change') return { icon:'🔄', label:'status_change', cls:'el-type-reminder' };
+  if (t === 'updated')     return { icon:'✏️', label:'updated',     cls:'el-type-assigned'   };
   return { icon:'📧', label: t || 'email', cls:'el-type-default' };
 }
 
 function _elTransportLabel(transport) {
-  return {
-    cloud:    '☁️ Cloud',
-    msgraph:  '📨 MS Graph',
-    emailjs:  '📧 EmailJS',
-    mailto:   '🔗 Mailto',
-  }[transport || 'cloud'] || '☁️ Cloud';
+  const map = { cloud:'☁️ Cloud', msgraph:'📨 MS Graph', emailjs:'📧 EmailJS', mailto:'🔗 Mailto' };
+  return map[transport || 'cloud'] || '☁️ Cloud';
 }
 
-// ── Subject builder (derive from log entry) ──────────────────────────────────
-function _elSubject(e) {
+// ── Expand raw log entries: cloud batch → one row per recipient+task ──────────
+// A cloud batch has: type='batch', transport='cloud', details=[{to, tasks, titles[]}]
+// We explode each detail recipient × each task title into its own row so the
+// table looks identical to the MS Graph rows (one email per row).
+function _elExpand(raw) {
+  const rows = [];
+  raw.forEach(e => {
+    const isBatch = (e.type || '').toLowerCase() === 'batch' && (e.transport || '') === 'cloud';
+
+    if (isBatch && Array.isArray(e.details) && e.details.length) {
+      // Expand: one row per recipient per task title
+      e.details.forEach(r => {
+        const titles = Array.isArray(r.titles) && r.titles.length ? r.titles : ['Reminder'];
+        titles.forEach(title => {
+          rows.push({
+            ts:        e.ts,
+            type:      'reminder',          // show as "reminder" not "batch"
+            transport: 'cloud',
+            to:        r.to || '',
+            taskTitle: title,
+            _subject:  '🔔 Task Reminder: ' + title,
+            _status:   'sent',
+            _isBatchRow: true,
+          });
+        });
+      });
+    } else if (isBatch) {
+      // Batch without details[] — show as a single summary row
+      rows.push({
+        ...e,
+        _subject: '🔔 Cloud Reminder Batch — ' + (e.taskTitle || ''),
+        _status:  'sent',
+      });
+    } else {
+      // MS Graph / EmailJS / manual single email
+      rows.push({
+        ...e,
+        _status:  'sent',
+        _subject: _elBuildSubject(e),
+      });
+    }
+  });
+  return rows;
+}
+
+function _elBuildSubject(e) {
   const t = (e.type || '').toLowerCase();
   const title = e.taskTitle || '';
-  if (t === 'assigned')  return '📋 Task Assigned: ' + title;
-  if (t === 'reminder')  return '🔔 Reminder: ' + title;
-  if (t === 'batch')     return '☁️ Reminder Batch — ' + title;
-  if (t === 'test')      return '🧪 Test Email — ' + title;
-  if (t === 'overdue')   return '⚠️ Overdue Alert: ' + title;
-  if (t === 'completed') return '✅ Task Completed: ' + title;
+  if (t === 'assigned')     return '📋 Task Assigned: ' + title;
+  if (t === 'reminder')     return '🔔 Task Reminder: ' + title;
+  if (t === 'completed')    return '✅ Task Completed: ' + title;
+  if (t === 'status_change')return '🔄 Status Update: ' + title;
+  if (t === 'updated')      return '✏️ Task Updated: ' + title;
+  if (t === 'test')         return '🧪 Test Email: ' + title;
+  if (t === 'overdue')      return '⚠️ Overdue Alert: ' + title;
   return title || '📧 Email';
 }
 
-// ── Stats calculator ──────────────────────────────────────────────────────────
-function _elCalcStats(logs) {
-  const total  = logs.length;
-  // Batch entries may have stats.sent count; singles count as 1
-  const sent   = logs.reduce((s, e) => s + (e.stats?.sent ?? (e.stats ? 0 : 1)), 0);
-  const failed = logs.reduce((s, e) => s + (e.stats?.failed ?? 0), 0);
-  // Escalations: batch entries with no individual task (generic title)
-  const escalations = logs.filter(e => (e.type||'').toLowerCase() === 'overdue' || (e.taskTitle||'').toLowerCase().includes('escalat')).length;
-  return { total, sent, failed, escalations };
+// ── Stats (counts individual emails, not raw log entries) ────────────────────
+function _elCalcStats(rows) {
+  const sent   = rows.filter(r => r._status === 'sent').length;
+  const failed = rows.filter(r => r._status === 'failed').length;
+  const cloud  = rows.filter(r => (r.transport||'cloud') === 'cloud').length;
+  return { total: rows.length, sent, failed, cloud };
 }
 
-// ── Render the full Email Logs panel ─────────────────────────────────────────
+// ── Main panel renderer ───────────────────────────────────────────────────────
 function renderEmailLog() {
   if(mode === 'user') { showPanel('user'); return; }
   const c = document.getElementById('content');
 
-  // Start Firestore listener if not already (reuses reminder log listener)
-  startReminderLogListener();
+  startReminderLogListener(); // ensure Firestore sync is active
 
   c.innerHTML = `
   <div class="panel-title fade-in">📨 Email &amp; Escalation Logs</div>
@@ -17086,12 +17120,19 @@ function renderEmailLog() {
   <div class="el-filter-bar">
     <select id="el-filter-type" onchange="elApplyFilter()">
       <option value="all">All Types</option>
+      <option value="reminder">Reminder (Cloud)</option>
       <option value="assigned">Assigned</option>
-      <option value="reminder">Reminder</option>
-      <option value="batch">Batch</option>
+      <option value="completed">Completed</option>
+      <option value="updated">Updated</option>
+      <option value="status_change">Status Change</option>
       <option value="test">Test</option>
       <option value="overdue">Overdue</option>
-      <option value="completed">Completed</option>
+    </select>
+    <select id="el-filter-transport" onchange="elApplyFilter()">
+      <option value="all">All Transports</option>
+      <option value="cloud">☁️ Cloud (Gmail)</option>
+      <option value="msgraph">📨 MS Graph</option>
+      <option value="emailjs">📧 EmailJS</option>
     </select>
     <select id="el-filter-status" onchange="elApplyFilter()">
       <option value="all">All Status</option>
@@ -17103,21 +17144,21 @@ function renderEmailLog() {
   </div>
 
   <div class="el-stat-grid" id="el-stat-grid">
-    <div class="el-stat-card" style="--el-bar:var(--accent);cursor:pointer" onclick="elStatClick('all')">
+    <div class="el-stat-card" style="--el-bar:var(--accent);cursor:pointer" onclick="elStatFilter('transport','all')">
       <div class="el-stat-label">Total Emails</div>
       <div class="el-stat-val" id="el-stat-total">—</div>
     </div>
-    <div class="el-stat-card" style="--el-bar:var(--green);cursor:pointer" onclick="elStatClick('sent')">
-      <div class="el-stat-label">Sent</div>
-      <div class="el-stat-val" id="el-stat-sent">—</div>
+    <div class="el-stat-card" style="--el-bar:var(--green);cursor:pointer" onclick="elStatFilter('transport','cloud')">
+      <div class="el-stat-label">Cloud (Gmail)</div>
+      <div class="el-stat-val" id="el-stat-cloud">—</div>
     </div>
-    <div class="el-stat-card" style="--el-bar:var(--red);cursor:pointer" onclick="elStatClick('failed')">
+    <div class="el-stat-card" style="--el-bar:#5b8dee;cursor:pointer" onclick="elStatFilter('transport','msgraph')">
+      <div class="el-stat-label">MS Graph</div>
+      <div class="el-stat-val" id="el-stat-ms">—</div>
+    </div>
+    <div class="el-stat-card" style="--el-bar:var(--red)">
       <div class="el-stat-label">Failed</div>
       <div class="el-stat-val" id="el-stat-failed">—</div>
-    </div>
-    <div class="el-stat-card" style="--el-bar:var(--purple)">
-      <div class="el-stat-label">Escalations</div>
-      <div class="el-stat-val" id="el-stat-esc">—</div>
     </div>
   </div>
 
@@ -17127,7 +17168,7 @@ function renderEmailLog() {
         <tr>
           <th>TIME</th>
           <th>TYPE</th>
-          <th>TASK / BATCH</th>
+          <th>TASK</th>
           <th>RECIPIENT</th>
           <th>SUBJECT</th>
           <th>TRANSPORT</th>
@@ -17138,113 +17179,105 @@ function renderEmailLog() {
     </table>
   </div>`;
 
-  // Restore filter selectors to last state
-  const typeEl   = document.getElementById('el-filter-type');
-  const statusEl = document.getElementById('el-filter-status');
-  if(typeEl)   typeEl.value   = _elTypeFilter;
-  if(statusEl) statusEl.value = _elStatusFilter;
+  // Restore last-used filter state
+  const typeEl  = document.getElementById('el-filter-type');
+  const trEl    = document.getElementById('el-filter-transport');
+  const statEl  = document.getElementById('el-filter-status');
+  if(typeEl)  typeEl.value  = _elTypeFilter;
+  if(trEl)    trEl.value    = _elTransFilter;
+  if(statEl)  statEl.value  = _elStatusFilter;
 
   _elRender();
 }
 
+let _elTypeFilter   = 'all';
+let _elTransFilter  = 'all';
+let _elStatusFilter = 'all';
+
 function _elRender() {
-  const raw = _elGetLogs();
-  // Expand batch entries with details[] into individual rows
-  const expanded = [];
-  raw.forEach(e => {
-    if (e.details && e.details.length) {
-      // One row per recipient in the batch
-      e.details.forEach(r => {
-        expanded.push({
-          ...e,
-          _isBatchChild: true,
-          to:        r.to,
-          taskTitle: r.titles && r.titles.length ? r.titles[0] + (r.titles.length > 1 ? ` +${r.titles.length-1}` : '') : (e.taskTitle || 'Batch'),
-          _status:   'sent',
-        });
-      });
-    } else {
-      expanded.push({ ...e, _status: 'sent' }); // all logged = sent (failures rarely reach log)
-    }
-  });
+  const raw      = _elGetLogs();
+  const expanded = _elExpand(raw);
+
+  // Stats from all expanded rows
+  const allCloud  = expanded.filter(r => (r.transport||'cloud') === 'cloud').length;
+  const allMs     = expanded.filter(r => (r.transport||'cloud') === 'msgraph').length;
+  const allFailed = expanded.filter(r => r._status === 'failed').length;
+  const elTotal   = document.getElementById('el-stat-total');
+  const elCloud   = document.getElementById('el-stat-cloud');
+  const elMs      = document.getElementById('el-stat-ms');
+  const elFailed  = document.getElementById('el-stat-failed');
+  if(elTotal)  elTotal.textContent  = expanded.length;
+  if(elCloud)  elCloud.textContent  = allCloud;
+  if(elMs)     elMs.textContent     = allMs;
+  if(elFailed) elFailed.textContent = allFailed;
 
   // Apply filters
-  const typeF   = _elTypeFilter;
-  const statusF = _elStatusFilter;
-  const filtered = expanded.filter(e => {
-    const typeMatch   = typeF   === 'all' || (e.type||'').toLowerCase() === typeF;
-    const statusMatch = statusF === 'all' || e._status === statusF;
-    return typeMatch && statusMatch;
+  const filtered = expanded.filter(r => {
+    const typeOk   = _elTypeFilter   === 'all' || (r.type||'').toLowerCase() === _elTypeFilter;
+    const transOk  = _elTransFilter  === 'all' || (r.transport||'cloud')     === _elTransFilter;
+    const statusOk = _elStatusFilter === 'all' || r._status                  === _elStatusFilter;
+    return typeOk && transOk && statusOk;
   });
-
-  // Stats (from raw, not expanded)
-  const stats = _elCalcStats(raw);
-  const statTotal = document.getElementById('el-stat-total');
-  const statSent  = document.getElementById('el-stat-sent');
-  const statFail  = document.getElementById('el-stat-failed');
-  const statEsc   = document.getElementById('el-stat-esc');
-  if(statTotal) statTotal.textContent = stats.total;
-  if(statSent)  statSent.textContent  = stats.sent;
-  if(statFail)  statFail.textContent  = stats.failed;
-  if(statEsc)   statEsc.textContent   = stats.escalations;
 
   const tbody = document.getElementById('el-tbody');
   if(!tbody) return;
 
   if(!filtered.length) {
-    tbody.innerHTML = `<tr><td colspan="7"><div class="el-empty"><div>📭</div><div>No emails logged yet.<br><span style="font-size:11px">Emails sent via Cloud, MS Graph, or EmailJS will appear here.</span></div></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7"><div class="el-empty">
+      <div>📭</div>
+      <div>No emails match the current filter.<br>
+      <span style="font-size:11px;color:var(--text3)">Cloud reminder emails appear here once the scheduler runs.<br>MS Graph emails appear instantly when sent from browser.</span>
+      </div></div></td></tr>`;
     return;
   }
 
-  tbody.innerHTML = filtered.map(e => {
-    const dt      = new Date(e.ts);
-    const dateStr = dt.toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' });
-    const timeStr = dt.toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
-    const meta    = _elTypeMeta(e.type, e.transport);
-    const subj    = _elSubject(e);
-    const transp  = _elTransportLabel(e.transport);
-    const isBatch = (e.type||'').toLowerCase() === 'batch' || e._isBatchChild;
-    // Shorten task title for display
-    const taskDisplay = (e.taskTitle||'—').length > 32 ? (e.taskTitle||'').slice(0,30)+'…' : (e.taskTitle||'—');
+  tbody.innerHTML = filtered.map(r => {
+    const dt      = new Date(r.ts);
+    const timeStr = dt.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})
+                  + ', ' + dt.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
+    const meta    = _elTypeMeta(r.type);
+    const subj    = r._subject || _elBuildSubject(r);
+    const transp  = _elTransportLabel(r.transport);
+    const task    = (r.taskTitle||'—');
+    const taskShort = task.length > 30 ? task.slice(0,28)+'…' : task;
+    const subjShort = subj.length > 40 ? subj.slice(0,38)+'…' : subj;
 
     return `<tr>
-      <td style="white-space:nowrap;color:var(--text3);font-size:11px">${dateStr}, ${timeStr}</td>
+      <td style="white-space:nowrap;color:var(--text3);font-size:11px">${timeStr}</td>
       <td><span class="el-type-badge ${meta.cls}">${meta.icon} ${esc(meta.label)}</span></td>
-      <td title="${esc(e.taskTitle||'')}">
-        <span class="el-proposal-id">${esc(taskDisplay)}</span>
-        ${isBatch && !e._isBatchChild ? `<span style="font-size:10px;color:var(--text3);margin-left:4px">(${(e.count||0)} emails)</span>` : ''}
+      <td title="${esc(task)}"><span class="el-proposal-id" style="max-width:160px">${esc(taskShort)}</span></td>
+      <td style="max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)" title="${esc(r.to||'')}">
+        ${esc(r.to||'—')}
       </td>
-      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)" title="${esc(e.to||'')}">
-        ${esc(e.to||'—')}
+      <td style="max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)" title="${esc(subj)}">
+        ${esc(subjShort)}
       </td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(subj)}">
-        ${esc(subj.length > 38 ? subj.slice(0,36)+'…' : subj)}
-      </td>
-      <td><span class="el-transport-badge">${transp}</span></td>
-      <td><span class="el-status-sent">sent</span></td>
+      <td style="white-space:nowrap"><span class="el-transport-badge">${transp}</span></td>
+      <td><span class="${r._status === 'failed' ? 'el-status-failed' : 'el-status-sent'}">${r._status}</span></td>
     </tr>`;
   }).join('');
 }
 
 function elApplyFilter() {
-  const typeEl   = document.getElementById('el-filter-type');
-  const statusEl = document.getElementById('el-filter-status');
-  _elTypeFilter   = typeEl   ? typeEl.value   : 'all';
-  _elStatusFilter = statusEl ? statusEl.value : 'all';
+  const typeEl  = document.getElementById('el-filter-type');
+  const trEl    = document.getElementById('el-filter-transport');
+  const statEl  = document.getElementById('el-filter-status');
+  _elTypeFilter   = typeEl  ? typeEl.value  : 'all';
+  _elTransFilter  = trEl    ? trEl.value    : 'all';
+  _elStatusFilter = statEl  ? statEl.value  : 'all';
   _elRender();
 }
 
-function elStatClick(stat) {
-  const statusEl = document.getElementById('el-filter-status');
-  if (stat === 'all')    { _elStatusFilter = 'all';    }
-  else if (stat === 'sent')   { _elStatusFilter = 'sent';   }
-  else if (stat === 'failed') { _elStatusFilter = 'failed'; }
-  if (statusEl) statusEl.value = _elStatusFilter;
+function elStatFilter(field, value) {
+  if (field === 'transport') {
+    _elTransFilter = value;
+    const trEl = document.getElementById('el-filter-transport');
+    if(trEl) trEl.value = value;
+  }
   _elRender();
 }
 
 function elRefresh() {
-  // Force a re-read from Firestore by re-rendering with latest localStorage data
   _elRender();
   toast('Email log refreshed', 'var(--green)');
 }
@@ -17252,7 +17285,6 @@ function elRefresh() {
 function elClearLogs() {
   if(!confirm('Clear all email log entries? This also clears the Reminder Log.')) return;
   clearReminderLog();
-  // clearReminderLog re-renders reminders panel; re-render ours
   setTimeout(() => { if(currentPanel === 'emaillog') renderEmailLog(); }, 80);
 }
 
