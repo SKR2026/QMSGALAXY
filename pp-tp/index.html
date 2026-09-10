@@ -2189,8 +2189,7 @@ function startFirestoreListeners() {
                 if(isAdminMode || (myEmail && assignedBy === myEmail)){
                   if((r.author||'').toLowerCase() !== (isAdminMode ? 'admin' : myEmail)){
                     addNotification(newT.id, newT.title, r.author, r.text || '(attachment)');
-                    const cfg = getEmailConfig();
-                    if(adminAuthenticated && cfg.clientId && cfg.tenantId){
+                    if(adminAuthenticated && emailTransport() !== 'mailto'){
                       sendReplyNotificationEmail(newT, r);
                     }
                   }
@@ -11346,16 +11345,18 @@ function sendMailtoEmail(taskId){
   const t=getTask(taskId);
   if(!t){toast('Task not found','var(--red)');return;}
   const taskLink=window.location.href.split('?')[0]+'?email='+encodeURIComponent(t.assignee);
-  const cfg=getEmailConfig();
-  // Try Microsoft Graph first if configured
-  if(cfg.clientId&&cfg.tenantId){
+  const transport=emailTransport();
+  // Use any configured transport (Gmail Cloud, MS Graph, EmailJS)
+  if(transport !== 'mailto'){
     sendTaskEmail(t,'assigned').then(ok=>{
-      if(ok) toast('📧 Email sent via Microsoft to '+t.assignee+'!');
+      if(ok) toast('📧 Email sent to '+t.assignee+'!');
       else openMailtoFallback(t,taskLink);
     }).catch(e=>{
       const msg=e.message||'';
       if(msg.includes('MS_NOT_SIGNED_IN')){
         toast('⚠ Not signed in to Microsoft — go to Settings → Email Integration → Sign In','var(--amber)');
+      } else if(msg.includes('GMAIL_CLOUD_NOT_CONFIGURED')){
+        toast('⚠ Cloud Function URL not set — configure in Settings → Cloud Reminder Service','var(--amber)');
       } else {
         openMailtoFallback(t,taskLink);
       }
@@ -12097,8 +12098,9 @@ function sendUserTaskEmail(taskId){
   if(!t){toast('Task not found','var(--red)');return;}
   const cfg=getEmailConfig();
   const taskLink=window.location.href.split('?')[0]+'?email='+encodeURIComponent(t.assignee);
-  // Try Microsoft Graph if configured
-  if(cfg.clientId&&cfg.tenantId){
+  // Use any configured transport (Gmail Cloud, MS Graph, EmailJS)
+  const transport=emailTransport();
+  if(transport !== 'mailto'){
     sendTaskEmail(t,'reminder').then(ok=>{
       if(ok) toast('📧 Task details emailed to '+t.assignee+'!');
       else openUserMailtoFallback(t,taskLink);
@@ -12107,6 +12109,8 @@ function sendUserTaskEmail(taskId){
       if(msg.includes('MS_NOT_SIGNED_IN')){
         toast('⚠ Microsoft not signed in — opening mail client instead','var(--amber)');
         openUserMailtoFallback(t,taskLink);
+      } else if(msg.includes('GMAIL_CLOUD_NOT_CONFIGURED')){
+        toast('⚠ Cloud Function URL not set — configure in Settings → Cloud Reminder Service','var(--amber)');
       } else {
         openUserMailtoFallback(t,taskLink);
       }
@@ -12884,7 +12888,8 @@ function saveTask(){
 
       setTimeout(()=>{
         const cfg=getEmailConfig();
-        if(cfg.clientId&&cfg.tenantId){
+        const _newTaskTransport = emailTransport();
+        if(_newTaskTransport !== 'mailto'){
           // Send to assignee (fire and forget — no await)
           sendTaskEmail(nt,'assigned').then(ok=>{
             if(ok) toast('\u2705 Task created & email sent to '+assignee+'!');
@@ -12895,6 +12900,8 @@ function saveTask(){
               toast('Task created! ⚠ Sign in to Microsoft (Settings → Email Integration) to send emails.','var(--amber)');
             } else if(msg.includes('MS_NOT_CONFIGURED')){
               toast('Task created! ⚠ Configure Microsoft credentials in Settings to send emails.','var(--amber)');
+            } else if(msg.includes('GMAIL_CLOUD_NOT_CONFIGURED')){
+              toast('Task created! ⚠ Cloud Function URL not set — configure in Settings.','var(--amber)');
             } else {
               console.warn('sendTaskEmail error:',e);
               toast('Task created! Email error: '+msg.slice(0,60),'var(--amber)');
@@ -12911,9 +12918,13 @@ function saveTask(){
             const taskLink2=window.location.href.split('?')[0]+'?token='+nt.token;
             const ccBody=buildEmailHtml(nt,'assigned',taskLink2,'');
             const ccSubj=buildEmailSubject('assigned',nt.title,nt);
-            // Send one email to all CC recipients at once via ccRecipients
-            sendViaMsGraph(ccAddresses[0], ccSubj, ccBody, ccAddresses.slice(1))
-              .catch(e=>console.warn('CC email error:',e));
+            // Route CC through active transport
+            if(_newTaskTransport === 'gmail_cloud'){
+              ccAddresses.forEach(ccAddr => sendViaGmailCloud(ccAddr, ccSubj, ccBody, {taskTitle: nt.title, type: 'assigned'}).catch(e=>console.warn('CC email error:',e)));
+            } else {
+              sendViaMsGraph(ccAddresses[0], ccSubj, ccBody, ccAddresses.slice(1))
+                .catch(e=>console.warn('CC email error:',e));
+            }
           }
         } else {
           toast('\u2705 Task created for '+assignee+'!');
