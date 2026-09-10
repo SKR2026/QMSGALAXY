@@ -2199,12 +2199,29 @@ function startFirestoreListeners() {
           }
 
           // ── 3. Admin/assigner: notify when user replies to your task ──
+          // v216 FIX: push to Firestore so the bell badge updates even when
+          // the admin is on a different browser tab / device.
           if(oldT && !currentSession && isAdminMode){
             const newReplies = (newT.replies || []);
             const oldReplies = (oldT.replies || []);
             if(newReplies.length > oldReplies.length){
               newReplies.slice(oldReplies.length).forEach(r => {
-                if(r.author !== 'Admin'){
+                const _rAuthor = (r.author||'').toLowerCase();
+                // Skip replies the admin posted themselves
+                if(_rAuthor === 'admin') return;
+                const _saEmail2 = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+                // Route via Firestore so real-time listener triggers the badge
+                if(_saEmail2){
+                  pushUserNotification({
+                    type: 'reply',
+                    taskId: newT.id,
+                    taskTitle: newT.title,
+                    author: r.author,
+                    text: r.text || '(attachment)',
+                    targetEmail: _saEmail2
+                  });
+                } else {
+                  // Fallback: localStorage (no email configured)
                   addNotification(newT.id, newT.title, r.author, r.text || '(attachment)');
                 }
               });
@@ -2212,13 +2229,21 @@ function startFirestoreListeners() {
           }
 
           // ── 4. Task assigner (currentSession admin): notify when their assigned task gets a reply ──
+          // v216 FIX: use pushUserNotification so the bell badge updates in real-time.
           if(oldT && currentSession && assignedBy === myEmail){
             const newReplies = (newT.replies || []);
             const oldReplies = (oldT.replies || []);
             if(newReplies.length > oldReplies.length){
               newReplies.slice(oldReplies.length).forEach(r => {
                 if((r.author||'').toLowerCase() !== myEmail){
-                  addNotification(newT.id, newT.title, r.author || assignee, r.text || '(attachment)');
+                  pushUserNotification({
+                    type: 'reply',
+                    taskId: newT.id,
+                    taskTitle: newT.title,
+                    author: r.author || assignee,
+                    text: r.text || '(attachment)',
+                    targetEmail: myEmail
+                  });
                 }
               });
             }
@@ -12331,7 +12356,33 @@ async function submitUserReply(){
   };
   userTask={...userTask,replies:[...userTask.replies,reply]};
   updateTask(userTask);
-  addNotification(userTask.id, userTask.title, reply.author, reply.text||'(attachment)');
+
+  // ── v216 FIX: Notify the ASSIGNER (admin/plant-owner) when user replies ──
+  // Determine who assigned this task so the bell goes to the right person.
+  const _replyAssignedBy = (userTask.assignedBy||'').toLowerCase();
+  const _adminNotifyEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
+  // The assigner target: explicit assignedBy email, 'superadmin' → admin_notify_email,
+  // or fall back to admin_notify_email when assignedBy is empty (legacy tasks).
+  const _notifyTarget = (_replyAssignedBy && _replyAssignedBy !== 'superadmin')
+    ? _replyAssignedBy
+    : _adminNotifyEmail;
+
+  if(_notifyTarget && _notifyTarget !== (userTask.assignee||'').toLowerCase()){
+    // Push bell notification to assigner via Firestore
+    pushUserNotification({
+      type: 'reply',
+      taskId: userTask.id,
+      taskTitle: userTask.title,
+      author: userTask.assignee,
+      text: text || '(attachment)',
+      targetEmail: _notifyTarget
+    });
+    // Also send reply notification email (existing behaviour)
+    if(adminAuthenticated && emailTransport() !== 'mailto'){
+      sendReplyNotificationEmail(userTask, reply);
+    }
+  }
+
   pendingFiles=[];
   toast('Reply submitted successfully!');
   renderUserTask(document.getElementById('content'));
