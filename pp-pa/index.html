@@ -3079,7 +3079,7 @@ async function loadDashboard() {
     `;
 
     // Pending approvals
-    const myPending = props.filter(p=>p.status==='Pending Approval' && (p.currentApproverId===currentUser.uid || isSuperAdmin()));
+    const myPending = props.filter(p=>p.status==='Pending Approval' && (isCurrentApprover(p) || isSuperAdmin()));
     document.getElementById('dash-pending-list').innerHTML = myPending.length
       ? myPending.map(p=>`
         <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)" onclick="viewProposal('${p.id}')" style="cursor:pointer">
@@ -3125,14 +3125,29 @@ function dashboardStatClick(status) {
 
 function isSuperAdmin() { return currentProfile?.role === 'Super Admin'; }
 
+function isCurrentApprover(proposal) {
+  if (!proposal || proposal.status !== 'Pending Approval' || !currentUser) return false;
+  const uid = String(currentUser.uid || '').trim();
+  const email = String(currentUser.email || currentProfile?.email || '').trim().toLowerCase();
+  const assignedId = String(proposal.currentApproverId || '').trim();
+  const assignedEmail = String(proposal.currentApproverEmail || '').trim().toLowerCase();
+  return assignedId === uid || (!!email && assignedEmail === email);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  PROPOSALS LIST
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadProposals() {
   try {
     let q = db.collection('pp_proposals');
-    if (!isSuperAdmin() && currentProfile?.role !== 'Plant Admin') {
-      q = q.where('createdBy','==',currentUser.uid);
+    const role = currentProfile?.role || '';
+    if (!isSuperAdmin() && role !== 'Plant Admin') {
+      // Proposal Creators/regular users see their own proposals; Approvers see
+      // proposals currently assigned to them. This is the key visibility rule
+      // for the hierarchical approval workflow.
+      q = role === 'Approver'
+        ? q.where('currentApproverId','==',currentUser.uid)
+        : q.where('createdBy','==',currentUser.uid);
     }
     const snap = await q.limit(200).get();
     allProposals = snap.docs.map(d=>({id:d.id,...d.data()}));
@@ -3178,7 +3193,7 @@ function filterProposals() {
         const plant = allPlants.find(pl=>pl.id===p.plantId);
         const diff  = p.proposedPrice - p.currentPrice;
         const pct   = p.currentPrice ? (diff/p.currentPrice*100) : 0;
-        const isMyTurn = p.status==='Pending Approval' && (p.currentApproverId===currentUser?.uid || isSuperAdmin());
+        const isMyTurn = p.status==='Pending Approval' && (isCurrentApprover(p) || isSuperAdmin());
         return `<tr onclick="viewProposal('${p.id}')" style="cursor:pointer${isMyTurn ? ';background:#eff6ff;border-left:3px solid #1a56db' : ''}">
           <td><strong>${esc(p.proposalNumber||'—')}</strong>${isMyTurn ? ' <span class="badge badge-myaction">🔔 My Turn</span>' : ''}</td>
           <td>${esc(plant?.name||'—')}</td>
@@ -3397,7 +3412,7 @@ async function viewProposal(id) {
     const plant  = allPlants.find(pl=>pl.id===p.plantId);
     const diff   = p.proposedPrice - p.currentPrice;
     const pct    = p.currentPrice ? (diff/p.currentPrice*100) : 0;
-    const isMyPending = p.status==='Pending Approval' && (p.currentApproverId===currentUser?.uid || isSuperAdmin());
+    const isMyPending = p.status==='Pending Approval' && (isCurrentApprover(p) || isSuperAdmin());
 
     // Fetch history
     const histSnap   = await db.collection('pp_proposals').doc(id).collection('approvalHistory').orderBy('timestamp','asc').get();
@@ -3699,58 +3714,58 @@ async function loadMyApprovals() {
   const filter = document.getElementById('approvals-filter')?.value || 'pending';
   const tbody  = document.getElementById('approvals-tbody');
   const contentEl = document.querySelector('.content');
-
-  // Show spinner — keep scroll pinned at 0 before and after
   tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:24px"><div class="spinner dark"></div></td></tr>';
   if (contentEl) contentEl.scrollTop = 0;
 
   try {
-    let q;
     if (filter === 'pending') {
-      // NOTE: This query requires a Firestore composite index on (currentApproverId + status + updatedAt).
-      // Create it at: https://console.firebase.google.com → Firestore → Indexes → Composite → Add
-      // Fields: currentApproverId ASC, status ASC, updatedAt DESC
-      // Until the index is created, we fall back to a client-side filter.
-      try {
-        q = db.collection('pp_proposals')
-          .where('currentApproverId','==',currentUser.uid)
-          .where('status','==','Pending Approval')
-          .orderBy('updatedAt','desc')
-          .limit(50);
-        const snap = await q.get();
-        const props = snap.docs.map(d=>({id:d.id,...d.data()}));
-        renderApprovalsTable(props);
-      } catch(indexErr) {
-        // Index not yet created — fall back: fetch by approverId only, filter+sort client-side
-        console.warn('loadMyApprovals: composite index missing, using client-side filter', indexErr.message);
-        const fallbackSnap = await db.collection('pp_proposals')
-          .where('currentApproverId','==',currentUser.uid)
-          .limit(200)
-          .get();
-        const props = fallbackSnap.docs
-          .map(d=>({id:d.id,...d.data()}))
-          .filter(p => p.status === 'Pending Approval')
-          .sort((a,b) => {
-            const ta = a.updatedAt?.toMillis?.() || a.updatedAt || 0;
-            const tb = b.updatedAt?.toMillis?.() || b.updatedAt || 0;
-            return tb - ta;
-          })
-          .slice(0,50);
-        renderApprovalsTable(props);
+      const uid = currentUser?.uid || '';
+      const email = String(currentUser?.email || currentProfile?.email || '').trim().toLowerCase();
+      let docs = [];
+
+      // Primary path: canonical Firebase Auth UID.
+      if (uid) {
+        try {
+          const snap = await db.collection('pp_proposals')
+            .where('currentApproverId','==',uid)
+            .where('status','==','Pending Approval')
+            .limit(100).get();
+          docs.push(...snap.docs);
+        } catch (e) {
+          console.warn('UID approval query failed; trying client-side fallback', e.message);
+        }
       }
-    } else {
-      const fallbackSnap = await db.collection('pp_proposals')
-        .where('createdBy','==',currentUser.uid)
-        .limit(200)
-        .get();
-      const props = fallbackSnap.docs.map(d=>({id:d.id,...d.data()}));
+
+      // Legacy-data compatibility: some older matrix rules may have stored the
+      // pp_users document ID instead of the Firebase Auth UID. Match by email.
+      if (email) {
+        try {
+          const snap = await db.collection('pp_proposals')
+            .where('currentApproverEmail','==',email)
+            .where('status','==','Pending Approval')
+            .limit(100).get();
+          docs.push(...snap.docs);
+        } catch (e) {
+          console.warn('Email approval query failed', e.message);
+        }
+      }
+
+      const unique = new Map(docs.map(d => [d.id, {id:d.id,...d.data()}]));
+      const props = [...unique.values()].sort((a,b) => {
+        const ta = a.updatedAt?.toMillis?.() || new Date(a.updatedAt||0).getTime() || 0;
+        const tb = b.updatedAt?.toMillis?.() || new Date(b.updatedAt||0).getTime() || 0;
+        return tb-ta;
+      }).slice(0,50);
       renderApprovalsTable(props);
+    } else {
+      const snap = await db.collection('pp_proposals')
+        .where('createdBy','==',currentUser.uid).limit(200).get();
+      renderApprovalsTable(snap.docs.map(d=>({id:d.id,...d.data()})));
     }
   } catch(e) {
     console.error('loadMyApprovals',e);
     tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:20px;color:var(--danger)">⚠️ Failed to load — ' + (e.code||e.message||'Firestore error') + '</td></tr>';
   } finally {
-    // Always snap scroll to top after any DOM change — catches both success and error paths
     if (contentEl) contentEl.scrollTop = 0;
     requestAnimationFrame(() => { if (contentEl) contentEl.scrollTop = 0; });
   }
@@ -3777,7 +3792,7 @@ function renderApprovalsTable(props) {
           <td>Level ${p.currentApprovalLevel||1}</td>
           <td><span class="badge badge-${(p.status||'draft').toLowerCase().replace(/\s/g,'')}">${p.status}</span></td>
           <td onclick="event.stopPropagation()">
-            ${p.status==='Pending Approval'&&p.currentApproverId===currentUser?.uid?`
+            ${p.status==='Pending Approval'&&isCurrentApprover(p)?`
               <button class="btn btn-success btn-sm" onclick="openApprovalModal('${p.id}','approve')">Approve</button>
             `:'—'}
           </td>
@@ -5055,17 +5070,26 @@ window.confirm = function(title, msg, onOk, btnLabel) {
 // ═══════════════════════════════════════════════════════════════════════════
 function setupApprovalBadge() {
   if (!currentUser) return;
+  const badge = document.getElementById('approvals-badge');
+  let uidCount = 0, emailCount = 0;
+  const paint = () => {
+    const count = Math.max(uidCount, emailCount);
+    if (badge) {
+      badge.textContent = count;
+      badge.style.display = count > 0 ? '' : 'none';
+    }
+  };
   db.collection('pp_proposals')
     .where('currentApproverId', '==', currentUser.uid)
     .where('status', '==', 'Pending Approval')
-    .onSnapshot(snap => {
-      const count = snap.size;
-      const badge = document.getElementById('approvals-badge');
-      if (badge) {
-        badge.textContent    = count;
-        badge.style.display  = count > 0 ? '' : 'none';
-      }
-    }, () => {});
+    .onSnapshot(snap => { uidCount = snap.size; paint(); }, () => {});
+  const email = String(currentUser.email || currentProfile?.email || '').trim().toLowerCase();
+  if (email) {
+    db.collection('pp_proposals')
+      .where('currentApproverEmail', '==', email)
+      .where('status', '==', 'Pending Approval')
+      .onSnapshot(snap => { emailCount = snap.size; paint(); }, () => {});
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
