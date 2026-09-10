@@ -9418,13 +9418,32 @@ function App() {
         if (ck && COLOUR_THEMES[ck.value]) { setColourKey(ck.value); applyThemeCSSVars(ck.value); }
       } catch(_) {}
 
+      // ── FAST PATH: seed from localStorage immediately so login shows at once ──
+      let usedCache = false;
+      try {
+        const lsP = storage.get('plants');
+        const lsU = storage.get('users');
+        const lsR = storage.get('requirements');
+        if (lsP) { setPlants(JSON.parse(lsP.value)); usedCache = true; }
+        if (lsU) { setUsers(JSON.parse(lsU.value));  usedCache = true; }
+        if (lsR) { setRequirements(JSON.parse(lsR.value)); usedCache = true; }
+        const lsS = localStorage.getItem('adminSettings');
+        if (lsS) {
+          const s = JSON.parse(lsS);
+          if (s.companyLogoUrl) setLogoUrl(s.companyLogoUrl);
+          else if (s.companyLogo) setLogoUrl(s.companyLogo);
+        }
+      } catch(_) {}
+
+      // Show login immediately — don't wait for Firebase
+      setReady(true);
+
+      // ── BACKGROUND SYNC: fetch Firebase and update state silently ──
       setSyncStatus('syncing');
       try {
-        // Step 1: Authenticate anonymously so Firestore rules pass on all devices
         await fbEnsureAuth();
         console.log('✅ Auth user:', window.fbAuth.currentUser?.uid || 'none');
 
-        // Step 2: Load all data from Firestore
         console.log('⏳ Loading data from Firestore…');
         const [fbP, fbU, fbR] = await Promise.all([
           fbLoad(FB_PLANTS),
@@ -9432,6 +9451,79 @@ function App() {
           fbLoad(FB_REQS),
         ]);
         console.log(`📦 Firestore: ${fbP?.length||0} plants, ${fbU?.length||0} users, ${fbR?.length||0} requirements`);
+
+        // Plants
+        if (fbP && fbP.length > 0) {
+          setPlants(fbP);
+          storage.set('plants', JSON.stringify(fbP));
+        } else if (!usedCache) {
+          const p = mkPlants(); setPlants(p); await fbSave(FB_PLANTS, p);
+        }
+
+        // Users — always prefer Firebase over seed/cache on new devices
+        if (fbU && fbU.length > 0) {
+          setUsers(fbU);
+          storage.set('users', JSON.stringify(fbU));
+        } else if (!usedCache) {
+          const u = mkUsers(); setUsers(u); await fbSave(FB_USERS, u);
+        }
+
+        // Requirements
+        if (fbR && fbR.length > 0) {
+          setRequirements(fbR);
+          storage.set('requirements', JSON.stringify(fbR));
+        } else if (!usedCache) {
+          const lsR = storage.get('requirements');
+          if (lsR) {
+            const r = JSON.parse(lsR.value);
+            setRequirements(r);
+            await fbSave(FB_REQS, r);
+          } else {
+            const r = mkRequirements(plants, users);
+            setRequirements(r);
+            storage.set('requirements', JSON.stringify(r));
+            fbSave(FB_REQS, r).catch(()=>{});
+          }
+        }
+
+        // Settings
+        const fbS = await fbLoad(FB_SETTINGS);
+        if (fbS && fbS.length > 0) {
+          const s = fbS[0];
+          storage.set('adminSettings', JSON.stringify(s));
+          localStorage.setItem('adminSettings', JSON.stringify(s));
+          if (s.companyLogoUrl) setLogoUrl(s.companyLogoUrl);
+          else if (s.companyLogo) setLogoUrl(s.companyLogo);
+        } else {
+          try {
+            const localS = localStorage.getItem('adminSettings');
+            if (localS) await fbSave(FB_SETTINGS, [JSON.parse(localS)]);
+          } catch(_) {}
+        }
+
+        setSyncStatus('synced');
+      } catch(err) {
+        console.error('Boot sync failed, falling back to localStorage', err);
+        setSyncStatus('error');
+        if (!usedCache) {
+          try {
+            const lsP = storage.get('plants');       if (lsP) setPlants(JSON.parse(lsP.value));
+            const lsU = storage.get('users');        if (lsU) setUsers(JSON.parse(lsU.value));
+            const lsR = storage.get('requirements');
+            if (lsR) {
+              setRequirements(JSON.parse(lsR.value));
+            } else {
+              const p = (() => { try { const s=storage.get('plants'); return s?JSON.parse(s.value):mkPlants(); } catch(_){ return mkPlants(); } })();
+              const u = (() => { try { const s=storage.get('users');  return s?JSON.parse(s.value):mkUsers();  } catch(_){ return mkUsers();  } })();
+              const r = mkRequirements(p, u);
+              setRequirements(r);
+            }
+          } catch(_) {}
+        }
+      }
+    }
+    boot();
+  }, []);
 
         // Plants
         if (fbP && fbP.length > 0) {
@@ -9516,8 +9608,6 @@ function App() {
           }
         } catch(_) {}
       }
-
-      setReady(true);  // ← login screen only shown AFTER this
     }
     boot();
   }, []);
