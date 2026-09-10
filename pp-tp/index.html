@@ -6259,6 +6259,48 @@ function renderSettings(){
         <div style="font-size:11px;color:var(--text3);margin-top:4px">Set <code style="background:var(--card2);padding:1px 5px;border-radius:3px">GCF_SECRET</code> env var on your Cloud Function to match — protects the endpoint from unauthorized calls</div>
       </div>
 
+      <!-- ══ Gmail Cloud Auto-Notifications ══ -->
+      <div style="border-top:1px solid var(--border);margin:4px 0 16px;"></div>
+      <div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:4px">📬 Gmail Auto-Notifications (Cloud)</div>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:12px;line-height:1.7">
+        Enable this to route <strong>all task notification emails</strong> (assignments, updates, replies) through your
+        Cloud Function Gmail sender — no browser sign-in, no SMTP block, works even when the app is closed.
+        Requires your Cloud Function to expose a <code style="background:var(--card2);padding:1px 5px;border-radius:3px">/api/send-notification</code> endpoint.
+      </div>
+      <div style="background:rgba(91,141,238,.06);border:1px solid rgba(91,141,238,.2);border-radius:10px;padding:14px 16px;margin-bottom:14px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+          <div>
+            <div style="font-size:13px;font-weight:700;color:var(--text)">☁️ Use Gmail Cloud for All Task Emails</div>
+            <div style="font-size:11px;color:var(--text3);margin-top:3px">
+              Overrides Microsoft 365 / EmailJS for notifications — schedules, assignments, updates, replies all go via Gmail.
+              The Cloud Reminder scheduler is always separate and unaffected.
+            </div>
+          </div>
+          <label class="switch" style="flex-shrink:0" title="Enable Gmail Cloud Notifications">
+            <input type="checkbox" id="gcf-gmail-notifications-toggle"
+              ${localStorage.getItem('gcf_gmail_notifications')==='true' ? 'checked' : ''}
+              onchange="toggleGmailCloudNotifications(this.checked)"/>
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+        <div id="gcf-gmail-notif-status" style="margin-top:10px;font-size:12px;min-height:16px;color:var(--text3)">
+          ${(()=>{
+            const on = localStorage.getItem('gcf_gmail_notifications')==='true';
+            const url = localStorage.getItem('gcf_url')||'';
+            if(on && url) return '<span style="color:var(--green);font-weight:700">✅ Gmail Cloud notifications active — task emails route via '+url.replace(/\/$/,'')+'</span>';
+            if(on && !url) return '<span style="color:var(--amber);font-weight:700">⚠ Enabled but no Cloud Function URL set — save the URL above first</span>';
+            return '<span style="color:var(--text3)">○ Disabled — using Microsoft 365 / EmailJS / mailto as configured above</span>';
+          })()}
+        </div>
+      </div>
+      <div style="background:rgba(52,211,153,.05);border:1px solid rgba(52,211,153,.18);border-radius:8px;padding:11px 14px;margin-bottom:16px;font-size:12px;color:var(--text2);line-height:1.8">
+        <strong style="color:var(--green)">📡 Cloud Function endpoint required:</strong><br>
+        Add a <code style="background:var(--card2);padding:1px 5px;border-radius:3px">POST /api/send-notification</code> handler to your <code>index.js</code> that accepts
+        <code>{ to, subject, html, senderName?, cc? }</code> and sends via Nodemailer/Gmail.
+        The same <code>GMAIL_USER</code> / <code>GMAIL_APP_PASS</code> env vars used by the scheduler will be reused automatically.
+        <span style="color:var(--accent);cursor:pointer;text-decoration:underline;" onclick="showGmailNotifEndpointSample()">View sample code →</span>
+      </div>
+
       <!-- From name & subject prefix — shown in every reminder email sent via cloud -->
       <div style="border-top:1px solid var(--border);margin:4px 0 16px;"></div>
       <div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:12px">✉️ Reminder Email Identity</div>
@@ -6730,10 +6772,54 @@ function getEmailConfig(){
   };
 }
 function emailTransport(){
+  // Gmail Cloud: if Cloud Function is configured AND Gmail cloud notifications are enabled,
+  // use it as the primary transport (routes all task notifications via the GCF Gmail sender)
+  const gcfUrl = localStorage.getItem('gcf_url')||'';
+  const gmailCloudEnabled = localStorage.getItem('gcf_gmail_notifications') === 'true';
+  if(gcfUrl && gmailCloudEnabled) return 'gmail_cloud';
+
   const c = getEmailConfig();
   if(c.clientId && c.tenantId)   return 'msgraph';
   if(c.ejsService && c.ejsTemplate && c.ejsKey) return 'emailjs';
   return 'mailto';
+}
+
+// ── Gmail Cloud send ───────────────────────────────────────────────────
+// Routes a single notification email through the existing Cloud Function
+// endpoint (/api/send-notification). The function uses its configured
+// GMAIL_USER + GMAIL_APP_PASS (or OAuth) to deliver the email — no
+// browser sign-in required. Falls back to a mailto link if GCF is unset.
+async function sendViaGmailCloud(toEmail, subject, htmlBody, opts={}){
+  const url    = (localStorage.getItem('gcf_url')||'').trim();
+  const secret = (localStorage.getItem('gcf_secret')||'').trim();
+  if(!url) throw new Error('GMAIL_CLOUD_NOT_CONFIGURED: Cloud Function URL not set');
+  if(!toEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(toEmail.trim())){
+    throw new Error('INVALID_RECIPIENT: toEmail is empty or not a valid email address: "' + toEmail + '"');
+  }
+  const endpoint = url.replace(/\/$/, '') + '/api/send-notification';
+  const headers  = { 'Content-Type': 'application/json' };
+  if(secret) headers['x-gcf-secret'] = secret;
+  const senderName  = (localStorage.getItem('tp_sender_name')||'').trim();
+  const subjectPfx  = (localStorage.getItem('tp_subject_prefix')||'').trim();
+  const ccRecipients= (opts.cc||'').split(',').map(e=>e.trim()).filter(e=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
+  const res = await withTimeout(fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      to:           toEmail.trim(),
+      subject:      subject,
+      html:         htmlBody,
+      senderName:   senderName  || undefined,
+      subjectPrefix:subjectPfx  || undefined,
+      cc:           ccRecipients.length ? ccRecipients : undefined,
+      // meta for logging
+      taskTitle:    opts.taskTitle || undefined,
+      type:         opts.type      || 'notification',
+    })
+  }));
+  const data = await res.json().catch(() => ({}));
+  if(!res.ok) throw new Error('GCF Gmail error ' + res.status + ': ' + (data.error || JSON.stringify(data)));
+  return true;
 }
 
 // ── Timeout wrapper ────────────────────────────────────────────────────
@@ -7297,7 +7383,15 @@ async function sendTaskEmail(task, reason='assigned', extra={}){
   const subject  = buildEmailSubject(reason, task.title, task);
   const htmlBody = buildEmailHtml(task, reason, taskLink, extra.changeDetail||'');
   // Let errors propagate so callers can distinguish the failure type
-  if(transport === 'msgraph'){
+  if(transport === 'gmail_cloud'){
+    // Route through Cloud Function Gmail sender — no browser sign-in needed
+    const ccArr = (task.cc||'').split(',').map(e=>e.trim()).filter(e=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
+    await sendViaGmailCloud(toEmail, subject, htmlBody, {
+      cc: ccArr.join(','),
+      taskTitle: task.title,
+      type: reason,
+    });
+  } else if(transport === 'msgraph'){
     // Parse task.cc (may be comma-separated string) into a validated array
     const ccArr = (task.cc||'').split(',').map(e=>e.trim()).filter(e=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
     await sendViaMsGraph(toEmail, subject, htmlBody, ccArr);
@@ -7321,16 +7415,25 @@ async function notifyAssignee(task, reason, extra={}){
       const ok = await sendTaskEmail(task, reason, extra);
       if(ok){
         const _senderHint = getPlantOwnerLoginHint() || getSessionEmail() || localStorage.getItem('admin_notify_email') || '';
-        const senderLabel = transport==='msgraph'
-          ? ('Microsoft 365' + (_senderHint ? ' (from: '+_senderHint+')' : ''))
-          : 'EmailJS (from: '+(getSessionEmail()||'account')+')';
+        let senderLabel;
+        if(transport === 'gmail_cloud'){
+          const gcfGmailUser = localStorage.getItem('gcf_gmail_user') || 'Gmail';
+          senderLabel = '☁️ Gmail Cloud (' + gcfGmailUser + ')';
+        } else if(transport === 'msgraph'){
+          senderLabel = 'Microsoft 365' + (_senderHint ? ' (from: '+_senderHint+')' : '');
+        } else {
+          senderLabel = 'EmailJS (from: '+(getSessionEmail()||'account')+')';
+        }
         toast('📧 Email sent to '+task.assignee+' via '+senderLabel);
         pushReminderLog({ to: task.assignee, taskTitle: task.title, type: reason, transport });
         return;
       }
     }catch(e){
       const msg = e.message || '';
-      if(msg.includes('MS_NOT_SIGNED_IN')){
+      if(msg.includes('GMAIL_CLOUD_NOT_CONFIGURED')){
+        toast('⚠ Cloud Function URL not set — configure in Settings → Cloud Reminder Service','var(--amber)');
+        return;
+      } else if(msg.includes('MS_NOT_SIGNED_IN')){
         toast('⚠ Microsoft not signed in — go to Settings → Email Integration → Sign In','var(--amber)');
         return;
       } else if(msg.includes('MS_NOT_CONFIGURED')){
@@ -11321,14 +11424,19 @@ function saveCloudReminderSettings(){
   const secret      = (document.getElementById('gcf-secret')?.value||'').trim();
   const senderName  = (document.getElementById('tp-sender-name')?.value||'').trim();
   const subjectPfx  = (document.getElementById('tp-subject-prefix')?.value||'').trim();
+  const gmailNotifs = document.getElementById('gcf-gmail-notifications-toggle')?.checked ? 'true' : 'false';
 
-  localStorage.setItem('gcf_url',           url);
-  localStorage.setItem('gcf_send_time',     time);
-  localStorage.setItem('gcf_default_freq',  freq);
-  localStorage.setItem('gcf_cc_recipients', cc);
-  localStorage.setItem('gcf_secret',        secret);
-  localStorage.setItem('tp_sender_name',    senderName);
-  localStorage.setItem('tp_subject_prefix', subjectPfx);
+  localStorage.setItem('gcf_url',                  url);
+  localStorage.setItem('gcf_send_time',            time);
+  localStorage.setItem('gcf_default_freq',         freq);
+  localStorage.setItem('gcf_cc_recipients',        cc);
+  localStorage.setItem('gcf_secret',               secret);
+  localStorage.setItem('tp_sender_name',           senderName);
+  localStorage.setItem('tp_subject_prefix',        subjectPfx);
+  localStorage.setItem('gcf_gmail_notifications',  gmailNotifs);
+
+  // Refresh the Gmail notification status badge inline
+  _updateGmailNotifStatus(gmailNotifs === 'true', url);
 
   // Persist to Firestore — cloud function reads senderName/subjectPrefix from taskPlanner doc
   if(_fbReady && _db){
@@ -11353,6 +11461,102 @@ function saveCloudReminderSettings(){
   // Also push the updated schedule to Cloud Scheduler so the job body
   // (secret + senderName + subjectPrefix) stays in sync with saved settings
   if(url && secret) setTimeout(() => updateCloudSchedule(), 800);
+}
+
+// ── Gmail Cloud Notifications toggle handler ──────────────────────────
+function toggleGmailCloudNotifications(enabled){
+  localStorage.setItem('gcf_gmail_notifications', enabled ? 'true' : 'false');
+  const url = localStorage.getItem('gcf_url')||'';
+  _updateGmailNotifStatus(enabled, url);
+  if(enabled && !url){
+    toast('⚠ Enter and Save your Cloud Function URL first to activate Gmail Cloud Notifications','var(--amber)');
+  } else if(enabled){
+    toast('✅ Gmail Cloud Notifications enabled — task emails now route via Cloud Function Gmail');
+  } else {
+    toast('Gmail Cloud Notifications disabled — using previous email transport');
+  }
+}
+
+function _updateGmailNotifStatus(enabled, url){
+  const el = document.getElementById('gcf-gmail-notif-status');
+  if(!el) return;
+  if(enabled && url){
+    el.innerHTML = '<span style="color:var(--green);font-weight:700">✅ Gmail Cloud notifications active — task emails route via ' + esc(url.replace(/\/$/,'')) + '</span>';
+  } else if(enabled && !url){
+    el.innerHTML = '<span style="color:var(--amber);font-weight:700">⚠ Enabled but no Cloud Function URL set — save the URL above first</span>';
+  } else {
+    el.innerHTML = '<span style="color:var(--text3)">○ Disabled — using Microsoft 365 / EmailJS / mailto as configured above</span>';
+  }
+}
+
+// ── Show sample Cloud Function endpoint code for send-notification ────
+function showGmailNotifEndpointSample(){
+  // Render a modal with copy-able Node.js snippet
+  const existing = document.getElementById('gmail-notif-sample-overlay');
+  if(existing){ existing.remove(); return; }
+  const overlay = document.createElement('div');
+  overlay.id = 'gmail-notif-sample-overlay';
+  overlay.className = 'modal-overlay';
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const code = [
+    "// Add this to your Cloud Function index.js",
+    "// Reuses GMAIL_USER + GMAIL_APP_PASS env vars already set for the scheduler",
+    "",
+    "const nodemailer = require('nodemailer');",
+    "",
+    "// POST /api/send-notification",
+    "app.post('/api/send-notification', async (req, res) => {",
+    "  const secret = process.env.GCF_SECRET;",
+    "  if (secret && req.headers['x-gcf-secret'] !== secret)",
+    "    return res.status(403).json({ error: 'Forbidden' });",
+    "",
+    "  const { to, subject, html, senderName, cc } = req.body;",
+    "  if (!to || !subject || !html)",
+    "    return res.status(400).json({ error: 'Missing to / subject / html' });",
+    "",
+    "  const transporter = nodemailer.createTransport({",
+    "    service: 'gmail',",
+    "    auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASS },",
+    "  });",
+    "",
+    "  const from = senderName",
+    "    ? `\"${senderName}\" <${process.env.GMAIL_USER}>`",
+    "    : process.env.GMAIL_USER;",
+    "",
+    "  try {",
+    "    const info = await transporter.sendMail({",
+    "      from, to, subject, html,",
+    "      cc: Array.isArray(cc) ? cc.join(',') : (cc || undefined),",
+    "    });",
+    "    res.json({ ok: true, messageId: info.messageId });",
+    "  } catch (err) {",
+    "    console.error('[send-notification] error:', err.message);",
+    "    res.status(500).json({ error: err.message });",
+    "  }",
+    "});",
+  ].join('\n');
+  overlay.innerHTML = `
+  <div class="modal" style="max-width:640px">
+    <div class="modal-header">
+      <div class="modal-title">📡 Cloud Function — /api/send-notification</div>
+      <button class="modal-close" onclick="document.getElementById('gmail-notif-sample-overlay').remove()">✕</button>
+    </div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:14px;line-height:1.7">
+      Add this handler to your existing Cloud Function <code>index.js</code>.
+      It reuses the same <code>GMAIL_USER</code> and <code>GMAIL_APP_PASS</code> env vars already set for the reminder scheduler.
+      Deploy once — all task notifications (assignments, updates, replies) will then route through Gmail automatically.
+    </div>
+    <pre style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;font-size:11.5px;color:var(--text);overflow-x:auto;line-height:1.7;white-space:pre-wrap;word-break:break-all">${esc(code)}</pre>
+    <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+      <button class="btn btn-primary btn-sm" onclick="navigator.clipboard.writeText(${JSON.stringify(code)}).then(()=>toast('✅ Code copied to clipboard!'))">📋 Copy Code</button>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('gmail-notif-sample-overlay').remove()">Close</button>
+    </div>
+    <div style="margin-top:12px;background:rgba(255,176,32,.07);border:1px solid rgba(255,176,32,.25);border-radius:8px;padding:10px 13px;font-size:11px;color:var(--text2);line-height:1.7">
+      <strong style="color:var(--amber)">⚡ After deploying:</strong> Enable the toggle above and click <strong>Save Settings</strong>.
+      Use <strong>Test Gmail Connection</strong> to verify delivery, then enable the toggle to go live.
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
 }
 
 async function triggerCloudRemindersNow(silent=false){
@@ -16213,38 +16417,54 @@ function _calRenderDayPanel() {
 
 // ── Reply notification email to admin ────────────────────────────────
 async function sendReplyNotificationEmail(task, reply){
-  const cfg = getEmailConfig();
-  if(!cfg.clientId||!cfg.tenantId) return;
+  const transport = emailTransport();
   const adminEmail = localStorage.getItem('admin_notify_email') || '';
-  // If a plant owner is active, notify their own email; otherwise fall back to admin email
   const loginHint = getPlantOwnerLoginHint();
   const plantOwnerEmail = loginHint || (plantOwnerAuthenticated && currentPlantSession ? ((currentPlantSession.owners||[])[0]||'') : '');
   const notifyEmail = plantOwnerEmail || adminEmail;
   if(!notifyEmail){ console.warn('No notify email set — skipping reply notification'); return; }
   const taskLink = window.location.href.split('?')[0] + '?token=' + (task.token||'');
-  try{
-    const token = await withTimeout(getMSGraphToken(cfg, loginHint));
-    const bodyHtml = buildEmailHtml(
-      { ...task, assignee: notifyEmail, desc: '💬 New reply from ' + reply.author + ':\n\n' + (reply.text||'(attachment)') },
-      'updated', taskLink, reply.author + ' replied: ' + (reply.text||'').slice(0,120)
-    );
-    const res = await withTimeout(fetch('https://graph.microsoft.com/v1.0/me/sendMail',{
-      method:'POST',
-      headers:{ Authorization:'Bearer '+token, 'Content-Type':'application/json' },
-      body: JSON.stringify({
-        message:{
-          subject: '[POLYPLASTICS Tasks] New Reply on Task: ' + task.title,
-          body:{ contentType:'HTML', content: bodyHtml },
-          toRecipients:[{ emailAddress:{ address: notifyEmail } }]
-        },
-        saveToSentItems: false
-      })
-    }));
-    if(!res.ok){ const err=await res.text(); throw new Error('Graph error '+res.status+': '+err); }
-    console.log('Reply notification email sent to:', notifyEmail, plantOwnerEmail ? '(plant owner)' : '(admin)');
-  }catch(e){
-    console.warn('Reply notification email failed:', e.message);
+  const bodyHtml = buildEmailHtml(
+    { ...task, assignee: notifyEmail, desc: '💬 New reply from ' + reply.author + ':\n\n' + (reply.text||'(attachment)') },
+    'updated', taskLink, reply.author + ' replied: ' + (reply.text||'').slice(0,120)
+  );
+  const subject = '[POLYPLASTICS Tasks] New Reply on Task: ' + task.title;
+
+  // Gmail Cloud transport — route via Cloud Function (no browser sign-in needed)
+  if(transport === 'gmail_cloud'){
+    try{
+      await sendViaGmailCloud(notifyEmail, subject, bodyHtml, { taskTitle: task.title, type: 'reply_notif' });
+      console.log('Reply notification sent via Gmail Cloud to:', notifyEmail);
+      pushReminderLog({ to: notifyEmail, taskTitle: task.title, type: 'reply_notif', transport: 'gmail_cloud' });
+    }catch(e){ console.warn('Reply notification (Gmail Cloud) failed:', e.message); }
+    return;
   }
+
+  // MS Graph transport
+  const cfg = getEmailConfig();
+  if(cfg.clientId && cfg.tenantId){
+    try{
+      const token = await withTimeout(getMSGraphToken(cfg, loginHint));
+      const res = await withTimeout(fetch('https://graph.microsoft.com/v1.0/me/sendMail',{
+        method:'POST',
+        headers:{ Authorization:'Bearer '+token, 'Content-Type':'application/json' },
+        body: JSON.stringify({
+          message:{
+            subject,
+            body:{ contentType:'HTML', content: bodyHtml },
+            toRecipients:[{ emailAddress:{ address: notifyEmail } }]
+          },
+          saveToSentItems: false
+        })
+      }));
+      if(!res.ok){ const err=await res.text(); throw new Error('Graph error '+res.status+': '+err); }
+      console.log('Reply notification email sent to:', notifyEmail, plantOwnerEmail ? '(plant owner)' : '(admin)');
+    }catch(e){
+      console.warn('Reply notification email failed:', e.message);
+    }
+    return;
+  }
+  console.warn('sendReplyNotificationEmail: no email transport configured — skipping.');
 }
 
 // ══════════════════════════════════════════
@@ -17315,35 +17535,41 @@ function scrollToReminderSection(sectionId) {
 // a plant admin has created a new task. The email shows the REAL assignee name
 // in the greeting and in the "Assigned To" row. "Assigned By" shows the plant admin.
 async function sendAdminTaskCreationEmail(task){
-  const cfg = getEmailConfig();
-  if(!cfg.clientId||!cfg.tenantId) return;
-
-  // Recipient: the superadmin configured in settings
   const adminEmail = localStorage.getItem('admin_notify_email') || '';
   if(!adminEmail){ console.warn('No admin_notify_email set — skipping admin notification'); return; }
 
-  // Sender token: use plant owner's MS account so mail is sent FROM plant owner's mailbox
   const loginHint = getPlantOwnerLoginHint();
   const taskLink = window.location.href.split('?')[0] + '?token=' + (task.token||'');
+  const taskForAdmin = {
+    ...task,
+    desc: '📋 New task assigned to: ' + task.assignee + (task.desc ? '\n\n' + task.desc : '')
+  };
+  const bodyHtml = buildEmailHtml(taskForAdmin, 'assigned', taskLink, '');
+  const subject  = '[POLYPLASTICS Tasks] New Task Created: ' + task.title;
 
+  const transport = emailTransport();
+
+  // Gmail Cloud transport — route via Cloud Function (no browser sign-in needed)
+  if(transport === 'gmail_cloud'){
+    try{
+      await sendViaGmailCloud(adminEmail, subject, bodyHtml, { taskTitle: task.title, type: 'assigned' });
+      console.log('Admin task-creation notification sent via Gmail Cloud to:', adminEmail);
+      pushReminderLog({ to: adminEmail, taskTitle: task.title, type: 'assigned', transport: 'gmail_cloud' });
+    }catch(e){ console.warn('Admin task-creation email (Gmail Cloud) failed:', e.message); }
+    return;
+  }
+
+  // MS Graph transport
+  const cfg = getEmailConfig();
+  if(!cfg.clientId||!cfg.tenantId) return;
   try{
     const token = await withTimeout(getMSGraphToken(cfg, loginHint));
-
-    // Build email addressed to the superadmin but showing the real task assignee details.
-    // We pass the task as-is (it already has .assignee = real assignee, .assignedBy = plant owner).
-    // We override only the description to prepend a summary line for the admin.
-    const taskForAdmin = {
-      ...task,
-      desc: '📋 New task assigned to: ' + task.assignee + (task.desc ? '\n\n' + task.desc : '')
-    };
-    const bodyHtml = buildEmailHtml(taskForAdmin, 'assigned', taskLink, '');
-
     const res = await withTimeout(fetch('https://graph.microsoft.com/v1.0/me/sendMail',{
       method:'POST',
       headers:{ Authorization:'Bearer '+token, 'Content-Type':'application/json' },
       body: JSON.stringify({
         message:{
-          subject: '[POLYPLASTICS Tasks] New Task Created: ' + task.title,
+          subject,
           body:{ contentType:'HTML', content: bodyHtml },
           toRecipients:[{ emailAddress:{ address: adminEmail } }]
         },
