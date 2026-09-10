@@ -6843,7 +6843,8 @@ async function sendViaGmailCloud(toEmail, subject, htmlBody, opts={}){
   }));
   const data = await res.json().catch(() => ({}));
   if(!res.ok) throw new Error('GCF Gmail error ' + res.status + ': ' + (data.error || JSON.stringify(data)));
-  return true;
+  // v216: return messageId so callers can log it for delivery diagnostics
+  return { ok: true, messageId: data.messageId || data.id || '' };
 }
 
 // ── Timeout wrapper ────────────────────────────────────────────────────
@@ -7410,11 +7411,13 @@ async function sendTaskEmail(task, reason='assigned', extra={}){
   if(transport === 'gmail_cloud'){
     // Route through Cloud Function Gmail sender — no browser sign-in needed
     const ccArr = (task.cc||'').split(',').map(e=>e.trim()).filter(e=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
-    await sendViaGmailCloud(toEmail, subject, htmlBody, {
+    const gcfResult = await sendViaGmailCloud(toEmail, subject, htmlBody, {
       cc: ccArr.join(','),
       taskTitle: task.title,
       type: reason,
     });
+    // v216: store messageId on result so Email Log can show it
+    return gcfResult; // { ok: true, messageId: '...' }
   } else if(transport === 'msgraph'){
     // Parse task.cc (may be comma-separated string) into a validated array
     const ccArr = (task.cc||'').split(',').map(e=>e.trim()).filter(e=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
@@ -7436,8 +7439,8 @@ async function notifyAssignee(task, reason, extra={}){
   const taskLink = window.location.href.split('?')[0]+'?email='+encodeURIComponent(task.assignee);
   if(transport !== 'mailto'){
     try{
-      const ok = await sendTaskEmail(task, reason, extra);
-      if(ok){
+      const result = await sendTaskEmail(task, reason, extra);
+      if(result){
         const _senderHint = getPlantOwnerLoginHint() || getSessionEmail() || localStorage.getItem('admin_notify_email') || '';
         let senderLabel;
         if(transport === 'gmail_cloud'){
@@ -7448,8 +7451,10 @@ async function notifyAssignee(task, reason, extra={}){
         } else {
           senderLabel = 'EmailJS (from: '+(getSessionEmail()||'account')+')';
         }
-        toast('📧 Email sent to '+task.assignee+' via '+senderLabel);
-        pushReminderLog({ to: task.assignee, taskTitle: task.title, type: reason, transport });
+        // v216: include messageId in log for delivery diagnostics
+        const _msgId = (result && result.messageId) ? result.messageId : '';
+        toast('📧 Email sent to '+task.assignee+' via '+senderLabel+(_msgId?' · ID:'+_msgId.slice(-12):''));
+        pushReminderLog({ to: task.assignee, taskTitle: task.title, type: reason, transport, messageId: _msgId });
         return;
       }
     }catch(e){
@@ -17407,6 +17412,29 @@ function renderEmailLog() {
   c.innerHTML = `
   <div class="panel-title fade-in">📨 Email &amp; Escalation Logs</div>
 
+  <!-- ── v216 Delivery Diagnostics Banner ── -->
+  <div id="el-diag-banner" style="background:rgba(255,176,32,.07);border:1px solid rgba(255,176,32,.28);border-radius:var(--radius);padding:14px 18px;margin-bottom:16px;display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap;">
+    <div style="font-size:22px;flex-shrink:0;margin-top:2px;">🔍</div>
+    <div style="flex:1;min-width:220px;">
+      <div style="font-weight:700;font-size:13px;color:var(--amber);margin-bottom:6px;">Gmail Cloud shows "sent" but emails aren't arriving?</div>
+      <div style="font-size:12px;color:var(--text2);line-height:1.8;">
+        The app marks <strong style="color:var(--green)">sent</strong> as soon as the Cloud Function returns HTTP 200 — but delivery still depends on your Gmail setup. Common causes:
+        <ul style="margin:6px 0 0 16px;padding:0;">
+          <li><strong>Gmail App Password wrong / expired</strong> — regenerate at <a href="https://myaccount.google.com/apppasswords" target="_blank" style="color:var(--accent)">myaccount.google.com/apppasswords</a> and update <code style="background:var(--card2);padding:1px 5px;border-radius:3px">GMAIL_APP_PASS</code> in GCP Console → Cloud Function env vars</li>
+          <li><strong>Emails landing in Spam / Promotions</strong> — check <em>all folders</em> in the recipient's mailbox, especially Spam and Promotions tabs</li>
+          <li><strong>Missing messageId</strong> — if the log row below shows no messageId, nodemailer connected but Gmail silently rejected the send</li>
+          <li><strong>Sending to the same Gmail account</strong> — Gmail sometimes silently drops emails sent from and to the same address</li>
+          <li><strong>2FA / Less Secure App Access</strong> — make sure you're using an App Password, not your main Gmail password</li>
+        </ul>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn btn-ghost btn-sm" onclick="testGmailConnection()" style="font-size:11px;color:var(--green);border-color:rgba(52,211,153,.35);">📡 Re-test Gmail Connection</button>
+        <button class="btn btn-ghost btn-sm" onclick="sendTestMail()" style="font-size:11px;color:var(--accent);border-color:rgba(91,141,238,.35);">🧪 Send Test Email Now</button>
+        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('el-diag-banner').style.display='none'" style="font-size:11px;">✕ Dismiss</button>
+      </div>
+    </div>
+  </div>
+
   <div class="el-filter-bar">
     <select id="el-filter-type" onchange="elApplyFilter()">
       <option value="all">All Types</option>
@@ -17461,6 +17489,7 @@ function renderEmailLog() {
           <th>TASK</th>
           <th>RECIPIENT</th>
           <th>SUBJECT</th>
+          <th>MSG ID</th>
           <th>TRANSPORT</th>
           <th>STATUS</th>
         </tr>
@@ -17517,7 +17546,7 @@ function _elRender() {
   if(!tbody) return;
 
   if(!filtered.length) {
-    tbody.innerHTML = `<tr><td colspan="7"><div class="el-empty">
+    tbody.innerHTML = `<tr><td colspan="8"><div class="el-empty">
       <div>📭</div>
       <div>No emails match the current filter.<br>
       <span style="font-size:11px;color:var(--text3)">Cloud reminder emails appear here once the scheduler runs.<br>MS Graph emails appear instantly when sent from browser.</span>
@@ -17535,6 +17564,11 @@ function _elRender() {
     const task    = (r.taskTitle||'—');
     const taskShort = task.length > 30 ? task.slice(0,28)+'…' : task;
     const subjShort = subj.length > 40 ? subj.slice(0,38)+'…' : subj;
+    // v216: messageId from Cloud Function — confirms Gmail actually queued the message
+    const msgId = r.messageId || '';
+    const msgIdShort = msgId ? msgId.slice(-16) : '—';
+    const msgIdColor = msgId ? 'var(--green)' : 'var(--text3)';
+    const msgIdTitle = msgId ? 'Full message ID: ' + msgId : 'No messageId — Gmail may not have queued this email. Check GMAIL_APP_PASS in GCP Console.';
 
     return `<tr>
       <td style="white-space:nowrap;color:var(--text3);font-size:11px">${timeStr}</td>
@@ -17545,6 +17579,9 @@ function _elRender() {
       </td>
       <td style="max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)" title="${esc(subj)}">
         ${esc(subjShort)}
+      </td>
+      <td style="font-size:10px;font-family:monospace;color:${msgIdColor};white-space:nowrap;max-width:120px;overflow:hidden;text-overflow:ellipsis;" title="${esc(msgIdTitle)}">
+        ${msgId ? '<span title="'+esc(msgId)+'" style="cursor:help">✓ '+esc(msgIdShort)+'</span>' : '<span title="No messageId — possible delivery issue" style="cursor:help;color:var(--amber)">⚠ none</span>'}
       </td>
       <td style="white-space:nowrap"><span class="el-transport-badge">${transp}</span></td>
       <td><span class="${r._status === 'failed' ? 'el-status-failed' : 'el-status-sent'}">${r._status}</span></td>
