@@ -700,6 +700,11 @@ tbody tr:last-child td { border-bottom: none; }
 @media(max-width:900px){.comparison-summary{grid-template-columns:repeat(2,1fr)}}
 
 
+/* ── Super Admin: My Approvals history bulk clear ── */
+.approval-history-bulk-bar{display:none;align-items:center;gap:10px;padding:9px 14px;background:#fdf2f2;border-bottom:1px solid #fecaca;}
+.approval-history-bulk-bar .selected-count{font-weight:600;color:var(--danger);font-size:13px;flex:1;}
+.history-cb,.history-select-all{width:15px;height:15px;cursor:pointer;accent-color:var(--primary);}
+
 /* Proposal form option tabs */
 .proposal-option-tabs{display:flex;align-items:center;background:var(--surface2,#f3f4f6);border:1px solid var(--border,#dfe3e8);border-radius:9px;padding:3px;gap:3px}
 .proposal-option-tab{border:0;background:transparent;color:var(--text2,#667085);padding:8px 14px;border-radius:7px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap}
@@ -1571,10 +1576,19 @@ html, body { overflow: hidden; }
             </select>
           </div>
           <div class="card">
+            <!-- Super Admin only: clear selected approval-history actions -->
+            <div id="approval-history-bulk-bar" class="approval-history-bulk-bar">
+              <span id="approval-history-bulk-count" class="selected-count">0 selected</span>
+              <button class="btn btn-danger btn-sm" onclick="bulkClearApprovalHistory()">🗑 Clear Selected</button>
+              <button class="btn btn-ghost btn-sm" onclick="clearApprovalHistorySelection()">✕ Clear</button>
+            </div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
+                    <th id="history-bulk-select-th" style="display:none;width:36px;padding:8px 10px">
+                      <input type="checkbox" id="select-all-history" class="history-select-all" onchange="toggleSelectAllHistory(this.checked)" title="Select all visible actions">
+                    </th>
                     <th>Proposal #</th><th>Plant</th><th>Party</th><th>Description</th>
                     <th>Proposed ₹</th><th>Diff %</th><th>My Action</th><th>Level</th><th>Date & Time</th><th>Comment</th><th>Current Status</th>
                   </tr>
@@ -4307,120 +4321,90 @@ function renderApprovalsTable(props) {
 window.renderHistoryTable = function() {
   const tbody      = document.getElementById('history-tbody');
   if (!tbody) return;
-
   const search     = document.getElementById('hist-search')?.value?.toLowerCase()||'';
   const actionF    = document.getElementById('hist-action-filter')?.value||'';
   const daysF      = parseInt(document.getElementById('hist-date-filter')?.value||'0');
   const cutoff     = daysF ? Date.now() - daysF*86400000 : 0;
-
-  // Build flat list — one row per action this user took.
-  // Primary source: _historyProposals (proposals fetched from Firestore).
-  // Fallback: _userActionMapGlobal entries for proposals not fetchable due to rules.
+  const superAdmin = isSuperAdmin();
   const uid = currentUser?.uid || '';
   const rows = [];
   const seenProposalIds = new Set();
 
   _historyProposals.forEach(p => {
     const plant = allPlants.find(pl=>pl.id===p.plantId);
-    let myActions = (p.approvalHistory||[]).filter(h=>
-      h.approverId===uid || h.approverUid===uid || h.uid===uid
-    );
-
-    // Synthesise action entry from proposal fields if approvalHistory is missing/empty
+    let myActions = (p.approvalHistory||[]).map((h,i)=>({raw:h,index:i})).filter(x=>{
+      const h=x.raw; return h.approverId===uid || h.approverUid===uid || h.uid===uid;
+    });
     if (!myActions.length) {
       if (p.rejectedBy === uid) {
-        myActions = [{ approverId: uid, action: 'Rejected', level: p.currentApprovalLevel||1,
-          actionAt: p.rejectedAt?.toDate?.()?.toISOString?.() || p.rejectedAt || null,
-          comment: p.rejectionReason || p.lastApprovalComment || '' }];
+        myActions = [{ raw:{approverId:uid,action:'Rejected',level:p.currentApprovalLevel||1,actionAt:p.rejectedAt?.toDate?.()?.toISOString?.()||p.rejectedAt||null,comment:p.rejectionReason||p.lastApprovalComment||'',_synthetic:true}, index:-1 }];
       } else if (p.returnedBy === uid) {
-        myActions = [{ approverId: uid, action: 'Returned', level: p.currentApprovalLevel||1,
-          actionAt: p.returnedAt?.toDate?.()?.toISOString?.() || p.returnedAt || null,
-          comment: p.returnComment || p.lastApprovalComment || '' }];
+        myActions = [{ raw:{approverId:uid,action:'Returned',level:p.currentApprovalLevel||1,actionAt:p.returnedAt?.toDate?.()?.toISOString?.()||p.returnedAt||null,comment:p.returnComment||p.lastApprovalComment||'',_synthetic:true}, index:-1 }];
       }
     }
-    myActions.forEach(rawH => {
-      const h = {
-        ...rawH,
-        action:   rawH.action   || (rawH.approvedAt ? 'Approved' : '—'),
-        actionAt: rawH.actionAt || rawH.approvedAt || rawH.timestamp || null,
-      };
-      const actionAt = h.actionAt ? new Date(h.actionAt).getTime() : 0;
-      if (cutoff && actionAt < cutoff) return;
-      if (actionF && h.action !== actionF) return;
-      const searchStr = `${p.proposalNumber||''}${p.partyName||''}${p.productService||''}${h.comment||''}`.toLowerCase();
-      if (search && !searchStr.includes(search)) return;
-      rows.push({ proposal: p, plant, action: h });
+    myActions.forEach(({raw:h,index:actionIndex})=>{
+      const normalized={...h,action:h.action||(h.approvedAt?'Approved':'—'),actionAt:h.actionAt||h.approvedAt||h.timestamp||null};
+      const actionAt=normalized.actionAt?new Date(normalized.actionAt).getTime():0;
+      if(cutoff&&actionAt<cutoff) return;
+      if(actionF&&normalized.action!==actionF) return;
+      const searchStr=`${p.proposalNumber||''}${p.partyName||''}${p.productService||''}${normalized.comment||''}`.toLowerCase();
+      if(search&&!searchStr.includes(search)) return;
+      rows.push({proposal:p,plant,action:normalized,rawAction:h,actionIndex,selectionKey:`proposal:${p.id}|action:${actionIndex}|at:${actionAt}|level:${normalized.level||''}|type:${normalized.action||''}`});
       seenProposalIds.add(p.id);
     });
   });
 
-  // Fallback: userActionMap entries for proposals not loaded due to Firestore rules
-  if (window._userActionMapGlobal) {
-    Object.entries(window._userActionMapGlobal).forEach(([proposalId, ua]) => {
-      if (seenProposalIds.has(proposalId)) return; // already shown
-      const h = {
-        approverId: uid,
-        action: ua.action || 'Approved',
-        actionAt: ua.actionAt || null,
-        level: ua.level || 1,
-        comment: ua.comment || '',
-        approverName: ua.approverName || ''
-      };
-      const actionAt = h.actionAt ? new Date(h.actionAt).getTime() : 0;
-      if (cutoff && actionAt < cutoff) return;
-      if (actionF && h.action !== actionF) return;
-      const searchStr = `${proposalId}${h.comment||''}`.toLowerCase();
-      if (search && !searchStr.includes(search)) return;
-      // Build a minimal proposal object from what we know
-      const stubProposal = {
-        id: proposalId,
-        proposalNumber: ua.proposalNumber || proposalId,
-        partyName: ua.partyName || '—',
-        plantId: ua.plantId || '',
-        proposedPrice: ua.proposedPrice || 0,
-        diffPercent: ua.diffPercent || 0,
-        status: ua.currentStatus || '—',
-        approvalHistory: [{ ...h, approverId: uid }]
-      };
-      rows.push({ proposal: stubProposal, plant: allPlants.find(pl=>pl.id===ua.plantId), action: h });
+  if(window._userActionMapGlobal){
+    Object.entries(window._userActionMapGlobal).forEach(([proposalId,ua])=>{
+      if(seenProposalIds.has(proposalId)) return;
+      const h={approverId:uid,action:ua.action||'Approved',actionAt:ua.actionAt||null,level:ua.level||1,comment:ua.comment||'',approverName:ua.approverName||'',_userActionOnly:true};
+      const actionAt=h.actionAt?new Date(h.actionAt).getTime():0;
+      if(cutoff&&actionAt<cutoff) return;
+      if(actionF&&h.action!==actionF) return;
+      const searchStr=`${proposalId}${h.comment||''}`.toLowerCase();
+      if(search&&!searchStr.includes(search)) return;
+      const stubProposal={id:proposalId,proposalNumber:ua.proposalNumber||proposalId,partyName:ua.partyName||'—',plantId:ua.plantId||'',proposedPrice:ua.proposedPrice||0,diffPercent:ua.diffPercent||0,status:ua.currentStatus||'—',approvalHistory:[{...h,approverId:uid}]};
+      rows.push({proposal:stubProposal,plant:allPlants.find(pl=>pl.id===ua.plantId),action:h,rawAction:h,actionIndex:-1,selectionKey:`userAction:${proposalId}|at:${actionAt}|level:${h.level||''}|type:${h.action||''}`});
     });
   }
 
-  // Sort newest first
-  rows.sort((a,b)=> new Date(b.action.actionAt||0) - new Date(a.action.actionAt||0));
+  rows.sort((a,b)=>new Date(b.action.actionAt||0)-new Date(a.action.actionAt||0));
+  const approved=rows.filter(r=>r.action.action==='Approved').length;
+  const rejected=rows.filter(r=>r.action.action==='Rejected').length;
+  const returned=rows.filter(r=>r.action.action==='Returned').length;
+  const el=id=>document.getElementById(id);
+  if(el('hist-count-approved')) el('hist-count-approved').textContent=approved;
+  if(el('hist-count-rejected')) el('hist-count-rejected').textContent=rejected;
+  if(el('hist-count-returned')) el('hist-count-returned').textContent=returned;
+  if(el('hist-count-total')) el('hist-count-total').textContent=rows.length;
 
-  // Update summary counters
-  const approved = rows.filter(r=>r.action.action==='Approved').length;
-  const rejected = rows.filter(r=>r.action.action==='Rejected').length;
-  const returned = rows.filter(r=>r.action.action==='Returned').length;
-  const el = id => document.getElementById(id);
-  if(el('hist-count-approved')) el('hist-count-approved').textContent = approved;
-  if(el('hist-count-rejected')) el('hist-count-rejected').textContent = rejected;
-  if(el('hist-count-returned')) el('hist-count-returned').textContent = returned;
-  if(el('hist-count-total'))    el('hist-count-total').textContent    = rows.length;
+  const selectTh=el('history-bulk-select-th'), bulkBar=el('approval-history-bulk-bar');
+  if(selectTh) selectTh.style.display=superAdmin?'':'none';
+  const selectedSet=window._historySelectedKeys||new Set();
+  const visibleKeys=new Set(rows.map(r=>r.selectionKey));
+  window._historySelectedKeys=new Set([...selectedSet].filter(k=>visibleKeys.has(k)));
 
-  const actionBadge = {
-    'Approved': '<span style="display:inline-flex;align-items:center;gap:4px;background:#dcfce7;color:#16a34a;padding:3px 10px;border-radius:50px;font-size:12px;font-weight:700">✓ Approved</span>',
-    'Rejected': '<span style="display:inline-flex;align-items:center;gap:4px;background:#fee2e2;color:#dc2626;padding:3px 10px;border-radius:50px;font-size:12px;font-weight:700">✕ Rejected</span>',
-    'Returned': '<span style="display:inline-flex;align-items:center;gap:4px;background:#fef3c7;color:#d97706;padding:3px 10px;border-radius:50px;font-size:12px;font-weight:700">↩ Returned</span>',
+  const actionBadge={
+    Approved:'<span style="display:inline-flex;align-items:center;gap:4px;background:#dcfce7;color:#16a34a;padding:3px 10px;border-radius:50px;font-size:12px;font-weight:700">✓ Approved</span>',
+    Rejected:'<span style="display:inline-flex;align-items:center;gap:4px;background:#fee2e2;color:#dc2626;padding:3px 10px;border-radius:50px;font-size:12px;font-weight:700">✕ Rejected</span>',
+    Returned:'<span style="display:inline-flex;align-items:center;gap:4px;background:#fef3c7;color:#d97706;padding:3px 10px;border-radius:50px;font-size:12px;font-weight:700">↩ Returned</span>'
   };
+  tbody.innerHTML=rows.length?rows.map(({proposal:p,plant,action:h,selectionKey})=>{
+    const checked=window._historySelectedKeys.has(selectionKey);
+    return `<tr onclick="viewProposal('${p.id}')" style="cursor:pointer" title="Click to view proposal">
+      ${superAdmin?`<td onclick="event.stopPropagation()" style="padding:8px 10px;text-align:center"><input type="checkbox" class="history-cb" data-key="${encodeURIComponent(selectionKey)}" ${checked?'checked':''} onchange="onHistoryCbChange(this)" title="Select this approval action"></td>`:''}
+      <td><strong>${esc(p.proposalNumber||'—')}</strong></td><td>${esc(plant?.name||p.plantId||'—')}</td><td>${esc(p.partyName||'—')}</td>
+      <td style="max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(p.productService||p.description||'—')}</td>
+      <td>₹${fmt(p.proposedPrice)}</td><td style="color:${(p.diffPercent||0)>=0?'var(--success)':'var(--danger)'}">${(p.diffPercent||0)>=0?'+':''}${(p.diffPercent||0).toFixed(1)}%</td>
+      <td>${actionBadge[h.action]||h.action}</td><td style="text-align:center"><span class="badge badge-pending">L${h.level||'—'}</span></td>
+      <td style="white-space:nowrap;font-size:12px">${h.actionAt?new Date(h.actionAt).toLocaleString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata'}):'—'}</td>
+      <td style="max-width:180px;font-size:12px;color:var(--text2);font-style:${h.comment?'normal':'italic'}">${esc(h.comment||'No comment')}</td>
+      <td><span class="badge badge-${(p.status||'draft').toLowerCase().replace(/\s/g,'')}">${p.status||'—'}</span></td>
+    </tr>`;
+  }).join(''):`<tr><td colspan="${superAdmin?12:11}"><div class="empty-state" style="padding:32px"><div class="empty-icon">📋</div><h3>No history yet</h3><p>Proposals you approve, reject or return will appear here</p></div></td></tr>`;
 
-  tbody.innerHTML = rows.length
-    ? rows.map(({proposal:p, plant, action:h})=>`
-        <tr onclick="viewProposal('${p.id}')" style="cursor:pointer" title="Click to view proposal">
-          <td><strong>${esc(p.proposalNumber||'—')}</strong></td>
-          <td>${esc(plant?.name||p.plantId||'—')}</td>
-          <td>${esc(p.partyName||'—')}</td>
-          <td style="max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(p.productService||p.description||'—')}</td>
-          <td>₹${fmt(p.proposedPrice)}</td>
-          <td style="color:${(p.diffPercent||0)>=0?'var(--success)':'var(--danger)'}">${(p.diffPercent||0)>=0?'+':''}${(p.diffPercent||0).toFixed(1)}%</td>
-          <td>${actionBadge[h.action]||h.action}</td>
-          <td style="text-align:center"><span class="badge badge-pending">L${h.level||'—'}</span></td>
-          <td style="white-space:nowrap;font-size:12px">${h.actionAt ? new Date(h.actionAt).toLocaleString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata'}) : '—'}</td>
-          <td style="max-width:180px;font-size:12px;color:var(--text2);font-style:${h.comment?'normal':'italic'}">${esc(h.comment||'No comment')}</td>
-          <td><span class="badge badge-${(p.status||'draft').toLowerCase().replace(/\s/g,'')}">${p.status||'—'}</span></td>
-        </tr>`).join('')
-    : '<tr><td colspan="11"><div class="empty-state" style="padding:32px"><div class="empty-icon">📋</div><h3>No history yet</h3><p>Proposals you approve, reject or return will appear here</p></div></td></tr>';
+  if(superAdmin) updateHistoryBulkBar();
+  else if(bulkBar) bulkBar.style.display='none';
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5728,6 +5712,27 @@ async function logAudit(proposalId, action, details) {
     });
   } catch(e) { console.warn('logAudit',e); }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BULK CLEAR APPROVAL HISTORY (Superadmin only)
+// ═══════════════════════════════════════════════════════════════════════════
+window._historySelectedKeys=window._historySelectedKeys||new Set();
+function onHistoryCbChange(cb){const key=decodeURIComponent(cb.dataset.key||'');if(!key)return;if(cb.checked)window._historySelectedKeys.add(key);else window._historySelectedKeys.delete(key);updateHistoryBulkBar();}
+function updateHistoryBulkBar(){const count=window._historySelectedKeys?.size||0,bar=document.getElementById('approval-history-bulk-bar'),countEl=document.getElementById('approval-history-bulk-count'),selectAll=document.getElementById('select-all-history'),boxes=[...document.querySelectorAll('.history-cb')],checked=boxes.filter(cb=>cb.checked).length;if(bar)bar.style.display=isSuperAdmin()&&count?'flex':'none';if(countEl)countEl.textContent=`${count} selected`;if(selectAll){selectAll.indeterminate=checked>0&&checked<boxes.length;selectAll.checked=boxes.length>0&&checked===boxes.length;}}
+function toggleSelectAllHistory(checked){if(!isSuperAdmin())return;document.querySelectorAll('.history-cb').forEach(cb=>{cb.checked=checked;const key=decodeURIComponent(cb.dataset.key||'');if(key){if(checked)window._historySelectedKeys.add(key);else window._historySelectedKeys.delete(key);}});updateHistoryBulkBar();}
+function clearApprovalHistorySelection(){window._historySelectedKeys=new Set();document.querySelectorAll('.history-cb').forEach(cb=>cb.checked=false);const bar=document.getElementById('approval-history-bulk-bar'),selectAll=document.getElementById('select-all-history');if(bar)bar.style.display='none';if(selectAll){selectAll.checked=false;selectAll.indeterminate=false;}}
+function parseHistorySelectionKey(key){const m=/^proposal:(.+)\|action:(\d+)\|at:(-?\d+)\|level:(.*?)\|type:(.*)$/.exec(key||'');return m?{proposalId:m[1],actionIndex:Number(m[2]),actionAt:Number(m[3]),level:m[4],action:m[5]}:null;}
+async function bulkClearApprovalHistory(){if(!isSuperAdmin()){toast('Super Admin only','warning');return;}const keys=[...(window._historySelectedKeys||[])];if(!keys.length)return;const selections=keys.map(parseHistorySelectionKey).filter(Boolean);const userActionOnly=keys.filter(k=>k.startsWith('userAction:'));window.confirm('Clear Approval History',`Clear ${keys.length} selected approval action${keys.length>1?'s':''} from My Approvals? This removes the selected history records and cannot be undone.`,async()=>{try{
+  const fallbackProposalIds=userActionOnly.map(k=>k.slice('userAction:'.length).split('|')[0]).filter(Boolean);
+  const proposalIds=[...new Set([...selections.map(x=>x.proposalId),...fallbackProposalIds])];
+  const snaps=await Promise.all(proposalIds.map(id=>db.collection('pp_proposals').doc(id).get()));
+  const selectedByProposal=new Map();selections.forEach(sel=>{if(!selectedByProposal.has(sel.proposalId))selectedByProposal.set(sel.proposalId,[]);selectedByProposal.get(sel.proposalId).push(sel);});
+  const updates=[];
+  snaps.forEach(snap=>{if(!snap.exists)return;const data=snap.data()||{},selected=selectedByProposal.get(snap.id)||[],history=Array.isArray(data.approvalHistory)?[...data.approvalHistory]:[];const indexes=[...new Set(selected.map(x=>x.actionIndex))].filter(i=>Number.isInteger(i)&&i>=0&&i<history.length).sort((a,b)=>b-a);indexes.forEach(i=>history.splice(i,1));const update={approvalHistory:history,updatedAt:firebase.firestore.FieldValue.serverTimestamp()};const remainingUserAction=history.some(h=>h&&(h.approverId===currentUser.uid||h.approverUid===currentUser.uid||h.uid===currentUser.uid));const selectedTypes=new Set(selected.map(x=>x.action));if(!remainingUserAction&&selectedTypes.has('Rejected')&&data.rejectedBy===currentUser.uid){update.rejectedBy=firebase.firestore.FieldValue.delete();update.rejectedByName=firebase.firestore.FieldValue.delete();update.rejectedAt=firebase.firestore.FieldValue.delete();update.rejectionReason=firebase.firestore.FieldValue.delete();}if(!remainingUserAction&&selectedTypes.has('Returned')&&data.returnedBy===currentUser.uid){update.returnedBy=firebase.firestore.FieldValue.delete();update.returnedByName=firebase.firestore.FieldValue.delete();update.returnedAt=firebase.firestore.FieldValue.delete();update.returnComment=firebase.firestore.FieldValue.delete();}updates.push({ref:snap.ref,data:update});});
+  const operations=[...updates.map(x=>({type:'update',ref:x.ref,data:x.data})),...proposalIds.map(id=>({type:'delete',ref:db.collection('pp_userActions').doc(currentUser.uid).collection('actions').doc(id)}))];
+  const BATCH_SIZE=450;for(let i=0;i<operations.length;i+=BATCH_SIZE){const batch=db.batch();operations.slice(i,i+BATCH_SIZE).forEach(op=>op.type==='delete'?batch.delete(op.ref):batch.update(op.ref,op.data));await batch.commit();}
+  clearApprovalHistorySelection();await loadMyApprovals();switchApprovalTab('history');await logAudit('bulk-history','Cleared Approval History',`Super Admin cleared ${keys.length} selected approval action(s).`);toast(`${keys.length} approval action${keys.length>1?'s':''} cleared`,'success');
+}catch(e){console.error('bulkClearApprovalHistory error:',e);toast('Clear failed: '+(e.message||'Unknown error'),'error');}} ,`Clear ${keys.length}`);}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  BULK DELETE (Superadmin only)
