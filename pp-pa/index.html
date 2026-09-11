@@ -3989,51 +3989,49 @@ async function loadMyApprovals() {
   if (contentEl) contentEl.scrollTop = 0;
 
   try {
-    // ── Load pending proposals (assigned to me, status = Pending Approval) ──
+    const uid = currentUser.uid;
+    const safeGet = q => q.get().catch(()=>({docs:[]}));
+
+    // ── Pending: assigned to me + status = Pending Approval ──
     let pendingProps = [];
     try {
       const snap = await db.collection('pp_proposals')
-        .where('currentApproverId','==',currentUser.uid)
+        .where('currentApproverId','==',uid)
         .where('status','==','Pending Approval')
         .orderBy('updatedAt','desc')
         .limit(100).get();
       pendingProps = snap.docs.map(d=>({id:d.id,...d.data()}));
     } catch(indexErr) {
-      console.warn('loadMyApprovals: composite index missing, falling back', indexErr.message);
-      const snap = await db.collection('pp_proposals')
-        .where('currentApproverId','==',currentUser.uid).limit(200).get();
+      // Composite index not ready — fall back to single-field query
+      const snap = await safeGet(
+        db.collection('pp_proposals').where('currentApproverId','==',uid).limit(200)
+      );
       pendingProps = snap.docs.map(d=>({id:d.id,...d.data()}))
         .filter(p=>p.status==='Pending Approval')
-        .sort((a,b)=>{
-          const ta=a.updatedAt?.toMillis?.()??0, tb=b.updatedAt?.toMillis?.()??0;
-          return tb-ta;
-        });
+        .sort((a,b)=>(b.updatedAt?.toMillis?.()??0)-(a.updatedAt?.toMillis?.()??0));
     }
     renderApprovalsTable(pendingProps);
 
-    // ── Load history — proposals where I appear in approverIds ──
-    try {
-      const histSnap = await db.collection('pp_proposals')
-        .where('approverIds','array-contains',currentUser.uid)
-        .orderBy('updatedAt','desc')
-        .limit(300).get();
-      _historyProposals = histSnap.docs.map(d=>({id:d.id,...d.data()}));
-    } catch(e) {
-      // No index yet — fetch without orderBy
-      const histSnap = await db.collection('pp_proposals')
-        .where('approverIds','array-contains',currentUser.uid)
-        .limit(300).get();
-      _historyProposals = histSnap.docs.map(d=>({id:d.id,...d.data()}))
-        .sort((a,b)=>{
-          const ta=a.updatedAt?.toMillis?.()??0, tb=b.updatedAt?.toMillis?.()??0;
-          return tb-ta;
-        });
-    }
+    // ── History: proposals where I acted (approverIds) OR created by me ──
+    // Two queries merged — approverIds covers post-fix proposals,
+    // createdBy covers proposals where I created and also approved.
+    // Old proposals without approverIds field are found via createdBy fallback.
+    const [actedSnap, createdForHistSnap] = await Promise.all([
+      safeGet(db.collection('pp_proposals').where('approverIds','array-contains',uid).limit(300)),
+      safeGet(db.collection('pp_proposals').where('createdBy','==',uid).limit(200))
+    ]);
+    const histMerged = new Map();
+    [...actedSnap.docs, ...createdForHistSnap.docs].forEach(d=>{
+      if(!histMerged.has(d.id)) histMerged.set(d.id,{id:d.id,...d.data()});
+    });
+    // Only keep proposals where this user actually appears in approvalHistory
+    _historyProposals = [...histMerged.values()].filter(p=>
+      (p.approvalHistory||[]).some(h=>h.approverId===uid)
+    ).sort((a,b)=>(b.updatedAt?.toMillis?.()??0)-(a.updatedAt?.toMillis?.()??0));
 
-    // Update summary badge on History tab button
-    const totalActions = _historyProposals.reduce((n,p)=>{
-      return n + (p.approvalHistory||[]).filter(h=>h.approverId===currentUser.uid).length;
-    }, 0);
+    // Update summary counters
+    const totalActions = _historyProposals.reduce((n,p)=>
+      n+(p.approvalHistory||[]).filter(h=>h.approverId===uid).length, 0);
     const histBadge = document.getElementById('hist-count-total');
     if (histBadge) histBadge.textContent = totalActions;
 
@@ -4459,8 +4457,25 @@ async function deleteMatrixRule(id) {
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadReports() {
   try {
-    const snap = await db.collection('pp_proposals').limit(500).get();
-    const all  = snap.docs.map(d=>({id:d.id,...d.data()}));
+    // Scope query by role — non-admins can only see their own proposals
+    let snap;
+    if (isSuperAdmin() || currentProfile?.role === 'Plant Admin') {
+      snap = await db.collection('pp_proposals').limit(500).get();
+    } else {
+      const safeGet = q => q.get().catch(()=>({docs:[]}));
+      const uid = currentUser.uid;
+      const [s1,s2,s3] = await Promise.all([
+        safeGet(db.collection('pp_proposals').where('createdBy','==',uid).limit(300)),
+        safeGet(db.collection('pp_proposals').where('currentApproverId','==',uid).limit(200)),
+        safeGet(db.collection('pp_proposals').where('approverIds','array-contains',uid).limit(200))
+      ]);
+      const merged = new Map();
+      [...s1.docs,...s2.docs,...s3.docs].forEach(d=>{
+        if(!merged.has(d.id)) merged.set(d.id,{id:d.id,...d.data()});
+      });
+      snap = { docs: [...merged.values()].map(d=>({ data:()=>d, id:d.id })) };
+    }
+    const all = snap.docs.map(d=>({id:d.id,...d.data()}));
     all.sort((a,b)=>{
       const ta=a.createdAt?.toMillis?a.createdAt.toMillis():new Date(a.createdAt||0).getTime();
       const tb=b.createdAt?.toMillis?b.createdAt.toMillis():new Date(b.createdAt||0).getTime();
