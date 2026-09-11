@@ -4032,22 +4032,26 @@ async function loadMyApprovals() {
     }
     renderApprovalsTable(pendingProps);
 
-    // ── History: three-source merge for maximum coverage ──
-    const [userActionsSnap, actedSnap, createdForHistSnap] = await Promise.all([
+    // ── History: five-source merge for maximum coverage ──
+    // 1. pp_userActions — per-user log (new actions after latest deploy)
+    // 2. approverIds array-contains — proposals with new approverIds field
+    // 3. rejectedBy == uid — all proposals this user rejected (queryable field)
+    // 4. returnedBy == uid — all proposals this user returned (queryable field)
+    // 5. createdBy == uid — proposals this user created
+    const [userActionsSnap, actedSnap, rejectedSnap, returnedSnap, createdForHistSnap] = await Promise.all([
       safeGet(db.collection('pp_userActions').doc(uid).collection('actions').limit(500)),
       safeGet(db.collection('pp_proposals').where('approverIds','array-contains',uid).limit(300)),
+      safeGet(db.collection('pp_proposals').where('rejectedBy','==',uid).limit(200)),
+      safeGet(db.collection('pp_proposals').where('returnedBy','==',uid).limit(200)),
       safeGet(db.collection('pp_proposals').where('createdBy','==',uid).limit(200))
     ]);
 
-    // DEBUG — open browser console to see exactly what Firestore returns
     console.group('[History Debug] uid:', uid);
-    console.log('pp_userActions docs:', userActionsSnap.docs.length,
-      userActionsSnap.docs.map(d=>({id:d.id,...d.data()})));
-    console.log('approverIds query docs:', actedSnap.docs.length,
-      actedSnap.docs.map(d=>d.id));
-    console.log('createdBy query docs:', createdForHistSnap.docs.length,
-      createdForHistSnap.docs.map(d=>({id:d.id, status:d.data().status,
-        approvalHistory:(d.data().approvalHistory||[]).map(h=>({approverId:h.approverId,action:h.action}))})));
+    console.log('pp_userActions:', userActionsSnap.docs.length);
+    console.log('approverIds:', actedSnap.docs.length);
+    console.log('rejectedBy:', rejectedSnap.docs.length);
+    console.log('returnedBy:', returnedSnap.docs.length);
+    console.log('createdBy:', createdForHistSnap.docs.length);
     console.groupEnd();
 
     // Get proposal IDs from user action log, then fetch those proposals
@@ -4070,7 +4074,7 @@ async function loadMyApprovals() {
     chunkSnaps.forEach(s=>s.docs.forEach(d=>{
       if(!histMerged.has(d.id)) histMerged.set(d.id,{id:d.id,...d.data()});
     }));
-    [...actedSnap.docs, ...createdForHistSnap.docs].forEach(d=>{
+    [...actedSnap.docs, ...rejectedSnap.docs, ...returnedSnap.docs, ...createdForHistSnap.docs].forEach(d=>{
       if(!histMerged.has(d.id)) histMerged.set(d.id,{id:d.id,...d.data()});
     });
 
@@ -4088,7 +4092,10 @@ async function loadMyApprovals() {
         myUidVariants.includes(h.approverUid) ||
         myUidVariants.includes(h.uid)
       );
-      return inHistory || userActionMap[p.id];
+      // Also include proposals where user is stored as rejectedBy or returnedBy
+      const isRejecter = p.rejectedBy === uid;
+      const isReturner = p.returnedBy === uid;
+      return inHistory || userActionMap[p.id] || isRejecter || isReturner;
     }).sort((a,b)=>(b.updatedAt?.toMillis?.()??0)-(a.updatedAt?.toMillis?.()??0));
 
     console.log('[History Debug] _historyProposals after filter:', _historyProposals.length);
@@ -4170,9 +4177,22 @@ window.renderHistoryTable = function() {
 
   _historyProposals.forEach(p => {
     const plant = allPlants.find(pl=>pl.id===p.plantId);
-    const myActions = (p.approvalHistory||[]).filter(h=>
+    let myActions = (p.approvalHistory||[]).filter(h=>
       h.approverId===uid || h.approverUid===uid || h.uid===uid
     );
+
+    // Synthesise action entry from proposal fields if approvalHistory is missing/empty
+    if (!myActions.length) {
+      if (p.rejectedBy === uid) {
+        myActions = [{ approverId: uid, action: 'Rejected', level: p.currentApprovalLevel||1,
+          actionAt: p.rejectedAt?.toDate?.()?.toISOString?.() || p.rejectedAt || null,
+          comment: p.rejectionReason || p.lastApprovalComment || '' }];
+      } else if (p.returnedBy === uid) {
+        myActions = [{ approverId: uid, action: 'Returned', level: p.currentApprovalLevel||1,
+          actionAt: p.returnedAt?.toDate?.()?.toISOString?.() || p.returnedAt || null,
+          comment: p.returnComment || p.lastApprovalComment || '' }];
+      }
+    }
     myActions.forEach(rawH => {
       const h = {
         ...rawH,
