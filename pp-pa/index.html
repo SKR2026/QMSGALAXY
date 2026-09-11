@@ -1640,7 +1640,7 @@ html, body { overflow: hidden; }
           </div>
         </div>
         <div style="background:var(--warning-bg);border:1px solid #fcd34d;border-radius:var(--radius);padding:12px 16px;margin-bottom:20px;font-size:13px;">
-          ⚠️ <strong>Important:</strong> <strong>Min Annual Impact</strong> is the activation threshold — a level fires when the proposal's annual impact reaches or exceeds it. All levels whose threshold is met are visited in sequence (L1 → L2 → L3). <strong>Max Annual Impact</strong> is used only to select the right approver within a level when multiple approvers exist — it does NOT skip levels. Leave Max blank for a single approver per level. Changes apply to newly submitted proposals only.
+          ⚠️ <strong>Important:</strong> Every proposal passes through <strong>all levels in sequence</strong> (L1 → L2 → L3). <strong>Max Annual Impact</strong> determines which approver handles the proposal at each level — set lower max for junior approvers, leave blank for senior/final approvers. Changes apply to newly submitted proposals only.
         </div>
         <div class="card">
           <div class="table-wrap">
@@ -2213,7 +2213,7 @@ html, body { overflow: hidden; }
         <select id="mm-approver"></select>
       </div>
       <div class="form-row col3">
-        <div class="form-group"><label>Min Annual Impact (₹) <span style="font-size:11px;color:var(--text2);font-weight:400">— approver activates above this</span></label><input type="number" id="mm-min-val" placeholder="0"></div>
+        <div class="form-group"><label>Min Annual Impact (₹) <span style="font-size:11px;color:var(--text2);font-weight:400">— approver handles amounts above this</span></label><input type="number" id="mm-min-val" placeholder="0"></div>
         <div class="form-group"><label>Max Annual Impact (₹) <span style="font-size:11px;color:var(--text2);font-weight:400">— leave blank for no upper limit</span></label><input type="number" id="mm-max-val" placeholder="Leave blank for no limit"></div>
         <div class="form-group"><label>Max % Change</label><input type="number" id="mm-max-pct" placeholder="Leave blank for any"></div>
       </div>
@@ -3956,9 +3956,8 @@ async function executeApprovalAction() {
 
         // Load matrix and compute eligible next levels for THIS proposal's annual impact.
         // minValue / maxValue are compared against the proposal's annual financial impact.
-        // For Option 1 (standard): annualImpact = (proposedPrice - currentPrice) × qtyMonth × 12
-        // For Option 2 (3-quotation): annualImpact = sum of row annual impacts
-        // We use absolute value so both price increases and savings trigger the right level.
+        // All proposals pass through ALL configured levels in sequence.
+        // Amount only determines WHO approves at each level (via maxValue), not which levels run.
         const matrixSnap = await db.collection('pp_approvalMatrices').get();
         const annualImpactRaw = p.annualImpact
           ?? p.comparison?.annualImpact
@@ -3969,16 +3968,11 @@ async function executeApprovalAction() {
           ?? 0;
         const amount = Math.abs(Number(annualImpactRaw || p.proposedPrice || 0));
 
-        // The proposal's max level = highest level whose minValue <= amount
+        // maxLevel = highest level configured for this plant/category — all proposals reach it
         const proposalMaxLevel = Math.max(...[1, ...matrixSnap.docs
           .map(d => ({...d.data()}))
           .filter(r => (!r.plantId || r.plantId===p.plantId))
           .filter(r => (!r.category || r.category===p.category))
-          .filter(r => {
-            const min = Number(r.minValue||0);
-            const max = r.maxValue==null||r.maxValue==='' ? Infinity : Number(r.maxValue);
-            return amount >= min && amount <= max;
-          })
           .map(r => Number(r.level||0))
           .filter(Boolean)
         ]);
@@ -3987,7 +3981,7 @@ async function executeApprovalAction() {
         historyEntry.action = 'Approved';
 
         if (currentLevel >= proposalMaxLevel) {
-          // This is the final level for this proposal's amount — mark approved
+          // Final level — mark fully approved
           await db.collection('pp_proposals').doc(proposalId).update({
             status: 'Approved',
             approvedAt: now,
@@ -3997,18 +3991,13 @@ async function executeApprovalAction() {
             updatedAt: now
           });
         } else {
-          // Find next level > currentLevel that also applies to this amount
+          // Find next level — all levels run, no amount filter
           const eligibleNextLevels = [...new Set(
             matrixSnap.docs
               .map(d => ({...d.data()}))
               .filter(r => Number(r.level||0) > currentLevel)
               .filter(r => (!r.plantId || r.plantId===p.plantId))
               .filter(r => (!r.category || r.category===p.category))
-              .filter(r => {
-                const min = Number(r.minValue||0);
-                const max = r.maxValue==null||r.maxValue==='' ? Infinity : Number(r.maxValue);
-                return amount >= min && amount <= max;
-              })
               .map(r => Number(r.level||0))
               .filter(Boolean)
           )].sort((a,b)=>a-b);
@@ -4016,12 +4005,11 @@ async function executeApprovalAction() {
           const nextLevel = eligibleNextLevels[0];
 
           if (!nextLevel) {
-            // No further levels apply — mark approved now
             await db.collection('pp_proposals').doc(proposalId).update({
               status: 'Approved', approvedAt: now,
               lastApprovalComment: comment || '',
               approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
-            approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
+              approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
               updatedAt: now
             });
             closeModal('approval-modal-overlay');
@@ -4030,19 +4018,25 @@ async function executeApprovalAction() {
             return;
           }
 
-          // amount already declared above — reuse it
-          // minValue = activation threshold; maxValue = optional upper cap
-          const rules = matrixSnap.docs
+          // Select approver at nextLevel: find rule where amount <= maxValue (or no limit)
+          // Pick lowest maxValue that still covers the amount — most specific rule first
+          let rules = matrixSnap.docs
             .map(d => ({id:d.id,...d.data()}))
             .filter(r => (!r.plantId || r.plantId===p.plantId))
             .filter(r => (!r.category || r.category===p.category))
             .filter(r => Number(r.level||0)===nextLevel)
-            .filter(r => {
-              const min = Number(r.minValue||0);
-              const max = r.maxValue==null || r.maxValue==='' ? Infinity : Number(r.maxValue);
-              return amount >= min && amount <= max;
-            })
             .sort((a,b)=>(Number(a.order)||0)-(Number(b.order)||0));
+
+          let matchedRules = rules.filter(r => {
+            const max = r.maxValue==null||r.maxValue==='' ? Infinity : Number(r.maxValue);
+            return amount <= max;
+          }).sort((a,b) => {
+            const maxA = a.maxValue==null||a.maxValue==='' ? Infinity : Number(a.maxValue);
+            const maxB = b.maxValue==null||b.maxValue==='' ? Infinity : Number(b.maxValue);
+            return maxA - maxB;
+          });
+          // Fallback: if amount exceeds all maxValues, use rule with highest maxValue
+          if (!matchedRules.length) matchedRules = [...rules].reverse();
 
           const eligibleRules = rules.filter(r=>{
             const rid = String(r.approverId||'');
@@ -4690,7 +4684,7 @@ function openMatrixModal(editingId) {
     document.getElementById('mm-max-pct').value  = r.maxPctChange||'';
     document.getElementById('mm-order').value    = r.order||1;
   } else {
-    ['mm-level','mm-level-name','mm-min-val','mm-max-val','mm-max-pct'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+    ['mm-level','mm-level-name','mm-min-val','mm-max-val','mm-max-pct'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';})
     document.getElementById('mm-level').value = allMatrixRules.length+1;
     document.getElementById('mm-order').value = allMatrixRules.length+1;
   }
