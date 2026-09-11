@@ -4662,6 +4662,12 @@ function _pushSchedule(statusEl) {
     if (!backendUrl) return;
     const gm = _settingsData.gmail        || {};
     const dd = _settingsData.dailyDigest  || {};
+    // Guard: backend validates sendTime must match HH:MM exactly — skip if invalid
+    const _st = (dd.sendTime || '').trim();
+    if (!_st || !/^\d{2}:\d{2}$/.test(_st)) {
+      console.warn('[_pushSchedule] Skipped — sendTime not set or invalid:', _st);
+      return;
+    }
     fetch(`${backendUrl}/api/update-schedule`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -4717,22 +4723,20 @@ async function sendGmailEmail(toEmail, subject, bodyHtml) {
 }
 
 /**
- * sendGmailDigest(recipients, subject, bodyHtml)
- * Calls POST /api/send-digest on the Cloud Run backend.
+ * sendGmailDigest()
+ * Calls POST /api/send-manual-digest on the Cloud Run backend.
+ * The backend reads visits + recipients directly from Firestore and
+ * builds the email itself — no HTML payload needed from the frontend.
+ * The `recipients`, `subject`, and `bodyHtml` params are kept for
+ * signature compatibility but are NOT sent (backend ignores them).
  */
 async function sendGmailDigest(recipients, subject, bodyHtml, signal) {
   const backendUrl = getGmailBackendUrl();
   if (!backendUrl) return false;
-  const gm = _settingsData.gmail || {};
-  const res = await fetch(`${backendUrl}/api/send-digest`, {
+  const res = await fetch(`${backendUrl}/api/send-manual-digest`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      recipients,
-      subject,
-      htmlBody: bodyHtml,
-      senderName: gm.senderName || 'PlantVisit Digest',
-    }),
+    body: JSON.stringify({ force: true }),
     signal,
   });
   if (!res.ok) {
@@ -4740,7 +4744,7 @@ async function sendGmailDigest(recipients, subject, bodyHtml, signal) {
     throw new Error(err.error || res.statusText);
   }
   const data = await res.json();
-  return data.results || [];
+  return data.results || data.details || [];
 }
 
 function logMail(record, isUpdate) {
@@ -6216,42 +6220,48 @@ async function sendDailyDigestEmail(force = false) {
   saveMail(_digestLogs.slice(0, 100));
   try { document.getElementById('mailBadge').textContent = _digestLogs.length; } catch(e) {}
 
-  // ── Update UI immediately — don't make the user wait for the backend ──
-  const statusEl = document.getElementById('dd_send_status');
-  if (statusEl) {
-    statusEl.style.display = 'block';
-    statusEl.innerHTML = `<div class="alert alert-info">📤 Digest queued — sending to ${digestRecipients.join(', ')}…</div>`;
-  }
-  toast('📬 Digest Queued', `Sending ${relevant.length} record${relevant.length !== 1 ? 's' : ''} → ${digestRecipients.join(', ')}`);
+  // Helper: always reads the live DOM node (re-render may replace the element)
+  function _getStatusEl() { return document.getElementById('dd_send_status'); }
+  const _showStatus = (html) => {
+    const el = _getStatusEl();
+    if (el) { el.style.display = 'block'; el.innerHTML = html; }
+  };
 
-  // Refresh notifications panel to show updated lastSentDate right away
-  if (_settingsActiveTab === 'notifications') {
-    const settingsEl = document.getElementById('settingsContent');
-    if (settingsEl) renderNotificationSettings(settingsEl);
-  }
+  // Update UI immediately
+  _showStatus(`<div class="alert alert-info">Digest queued - sending to ${digestRecipients.join(', ')}...</div>`);
+  toast('Digest Queued', `Sending ${relevant.length} records to ${digestRecipients.join(', ')}`);
 
-  // ── Fire-and-forget network call with 60 s timeout ───────────────────
+  // NOTE: Do NOT call renderNotificationSettings here — it destroys dd_send_status
+  // and clears _ddRecipients mid-flight.
+
+  // Fire-and-forget network call with 60 s timeout
+  _digestSendInProgress = true;
   const _abortCtrl = new AbortController();
   const _abortTimer = setTimeout(() => _abortCtrl.abort(), 60000);
 
   sendGmailDigest(digestRecipients, subject, bodyHtml, _abortCtrl.signal)
-    .then(() => {
+    .then((results) => {
+      _digestSendInProgress = false;
       clearTimeout(_abortTimer);
-      if (statusEl) {
-        statusEl.innerHTML = `<div class="alert alert-good" style="color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">
-          ✅ Digest delivered to ${digestRecipients.join(', ')} — ${relevant.length} record${relevant.length !== 1 ? 's' : ''} included.
-        </div>`;
-        setTimeout(() => { statusEl.style.display = 'none'; }, 8000);
-      }
+      // /api/send-manual-digest returns { sent, failed, concluded, ... }
+      const sentCount  = (results && results.sent  !== undefined) ? results.sent  : digestRecipients.length;
+      const failCount  = (results && results.failed !== undefined) ? results.failed : 0;
+      const statusMsg  = failCount
+        ? `Sent to ${sentCount} recipient${sentCount !== 1 ? 's' : ''}, ${failCount} failed.`
+        : `Delivered to ${digestRecipients.join(', ')}`;
+      _showStatus(`<div class="alert alert-good" style="color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">✅ ${statusMsg}</div>`);
+      toast('✅ Digest Sent', statusMsg);
+      setTimeout(() => { const el = _getStatusEl(); if (el) el.style.display = 'none'; }, 8000);
     })
     .catch(err => {
+      _digestSendInProgress = false;
       clearTimeout(_abortTimer);
-      const msg = _abortCtrl.signal.aborted ? 'Request timed out (60 s) — backend may still deliver it.' : (err?.message || String(err));
-      if (statusEl) {
-        statusEl.innerHTML = `<div class="alert alert-warn">⚠ ${msg}</div>`;
-        setTimeout(() => { statusEl.style.display = 'none'; }, 9000);
-      }
-      toast('Digest Warning', msg, true);
+      const msg = _abortCtrl.signal.aborted
+        ? 'Request timed out (60s) — backend may still deliver it.'
+        : (err && err.message ? err.message : String(err));
+      _showStatus(`<div class="alert alert-warn">Warning: ${msg}</div>`);
+      toast('Digest Failed', msg, true);
+      setTimeout(() => { const el = _getStatusEl(); if (el) el.style.display = 'none'; }, 9000);
     });
 }
 
@@ -9168,6 +9178,7 @@ function _pvBioOfferRegistration(username) {
 // _gmRecipients / _ddRecipients now store {email, enabled} objects
 const _gmRecipients  = [];   // Gmail To/CC recipient list  [{email, enabled}]
 const _ddRecipients  = [];   // Daily Digest recipient list [{email, enabled}]
+let _digestSendInProgress = false; // true while a digest network call is pending
 
 /* ── Helpers ── */
 function _isValidEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim()); }
@@ -9557,7 +9568,11 @@ if (typeof renderNotificationSettings === 'function') {
   const _orig2 = renderNotificationSettings;
   window.renderNotificationSettings = function(el) {
     _orig2(el);
-    // Digest list bootstrap (gmail side already done above via _gmBootstrap)
+    // Digest list bootstrap — rebuild from stored settings after DOM is replaced.
+    // IMPORTANT: do NOT clear _ddRecipients before re-populating — a digest send
+    // in progress holds a local copy of digestRecipients, but clearing here also
+    // prevents _gmBootstrap from being able to hydrate during the send window.
+    // Instead, wipe and fully re-sync from Firestore data every time the panel renders.
     _ddRecipients.length = 0;
     const dd = (_settingsData && _settingsData.dailyDigest) || {};
     const ddStored = (dd.recipientList || []);
@@ -9569,7 +9584,15 @@ if (typeof renderNotificationSettings === 'function') {
     } else if (dd.recipients) {
       _normaliseEmails(dd.recipients).forEach(e => { if (!_ddHasEmail(e)) _ddRecipients.push({email:e, enabled:true}); });
     }
-    setTimeout(_ddRenderList, 0);
+    setTimeout(() => {
+      _ddRenderList();
+      // If a digest send is in progress, restore the status banner
+      // (re-render destroys the element; bring it back with a waiting indicator)
+      if (_digestSendInProgress) {
+        const el = document.getElementById('dd_send_status');
+        if (el) { el.style.display = 'block'; el.innerHTML = '<div class="alert alert-info">Digest sending — please wait...</div>'; }
+      }
+    }, 0);
   };
 }
 
