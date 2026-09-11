@@ -4054,6 +4054,7 @@ async function loadMyApprovals() {
     const userActionProposalIds = userActionsSnap.docs.map(d=>d.id);
     const userActionMap = {};
     userActionsSnap.docs.forEach(d=>{ userActionMap[d.id] = d.data(); });
+    window._userActionMapGlobal = userActionMap; // expose for renderHistoryTable fallback
 
     // Fetch proposals from user action log in batches of 10
     const chunks = [];
@@ -4101,6 +4102,10 @@ async function loadMyApprovals() {
         ).length, 0);
     const histBadge = document.getElementById('hist-count-total');
     if (histBadge) histBadge.textContent = totalActions;
+
+    // Always re-render history table after data loads —
+    // in case the user is already on the History tab
+    renderHistoryTable();
 
   } catch(e) {
     console.error('loadMyApprovals',e);
@@ -4156,17 +4161,19 @@ window.renderHistoryTable = function() {
   const daysF      = parseInt(document.getElementById('hist-date-filter')?.value||'0');
   const cutoff     = daysF ? Date.now() - daysF*86400000 : 0;
 
-  // Build a flat list of individual action rows (one row per action I took)
+  // Build flat list — one row per action this user took.
+  // Primary source: _historyProposals (proposals fetched from Firestore).
+  // Fallback: _userActionMapGlobal entries for proposals not fetchable due to rules.
+  const uid = currentUser?.uid || '';
   const rows = [];
+  const seenProposalIds = new Set();
+
   _historyProposals.forEach(p => {
     const plant = allPlants.find(pl=>pl.id===p.plantId);
     const myActions = (p.approvalHistory||[]).filter(h=>
-      h.approverId===currentUser.uid ||
-      h.approverUid===currentUser.uid ||
-      h.uid===currentUser.uid
+      h.approverId===uid || h.approverUid===uid || h.uid===uid
     );
     myActions.forEach(rawH => {
-      // Normalise: old Cloud Function entries used approvedAt + no action field
       const h = {
         ...rawH,
         action:   rawH.action   || (rawH.approvedAt ? 'Approved' : '—'),
@@ -4175,11 +4182,44 @@ window.renderHistoryTable = function() {
       const actionAt = h.actionAt ? new Date(h.actionAt).getTime() : 0;
       if (cutoff && actionAt < cutoff) return;
       if (actionF && h.action !== actionF) return;
-      const searchStr = `${p.proposalNumber}${p.partyName}${p.productService||''}${h.comment||''}`.toLowerCase();
+      const searchStr = `${p.proposalNumber||''}${p.partyName||''}${p.productService||''}${h.comment||''}`.toLowerCase();
       if (search && !searchStr.includes(search)) return;
       rows.push({ proposal: p, plant, action: h });
+      seenProposalIds.add(p.id);
     });
   });
+
+  // Fallback: userActionMap entries for proposals not loaded due to Firestore rules
+  if (window._userActionMapGlobal) {
+    Object.entries(window._userActionMapGlobal).forEach(([proposalId, ua]) => {
+      if (seenProposalIds.has(proposalId)) return; // already shown
+      const h = {
+        approverId: uid,
+        action: ua.action || 'Approved',
+        actionAt: ua.actionAt || null,
+        level: ua.level || 1,
+        comment: ua.comment || '',
+        approverName: ua.approverName || ''
+      };
+      const actionAt = h.actionAt ? new Date(h.actionAt).getTime() : 0;
+      if (cutoff && actionAt < cutoff) return;
+      if (actionF && h.action !== actionF) return;
+      const searchStr = `${proposalId}${h.comment||''}`.toLowerCase();
+      if (search && !searchStr.includes(search)) return;
+      // Build a minimal proposal object from what we know
+      const stubProposal = {
+        id: proposalId,
+        proposalNumber: ua.proposalNumber || proposalId,
+        partyName: ua.partyName || '—',
+        plantId: ua.plantId || '',
+        proposedPrice: ua.proposedPrice || 0,
+        diffPercent: ua.diffPercent || 0,
+        status: ua.currentStatus || '—',
+        approvalHistory: [{ ...h, approverId: uid }]
+      };
+      rows.push({ proposal: stubProposal, plant: allPlants.find(pl=>pl.id===ua.plantId), action: h });
+    });
+  }
 
   // Sort newest first
   rows.sort((a,b)=> new Date(b.action.actionAt||0) - new Date(a.action.actionAt||0));
