@@ -4416,7 +4416,7 @@ window.renderHistoryTable = function() {
           <td style="color:${(p.diffPercent||0)>=0?'var(--success)':'var(--danger)'}">${(p.diffPercent||0)>=0?'+':''}${(p.diffPercent||0).toFixed(1)}%</td>
           <td>${actionBadge[h.action]||h.action}</td>
           <td style="text-align:center"><span class="badge badge-pending">L${h.level||'—'}</span></td>
-          <td style="white-space:nowrap;font-size:12px">${h.actionAt ? new Date(h.actionAt).toLocaleString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '—'}</td>
+          <td style="white-space:nowrap;font-size:12px">${h.actionAt ? new Date(h.actionAt).toLocaleString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata'}) : '—'}</td>
           <td style="max-width:180px;font-size:12px;color:var(--text2);font-style:${h.comment?'normal':'italic'}">${esc(h.comment||'No comment')}</td>
           <td><span class="badge badge-${(p.status||'draft').toLowerCase().replace(/\s/g,'')}">${p.status||'—'}</span></td>
         </tr>`).join('')
@@ -5763,9 +5763,37 @@ async function bulkDeleteProposals() {
     `Permanently delete ${ids.length} selected proposal${ids.length>1?'s':''}? This cannot be undone.`,
     async () => {
       try {
-        const batch = db.batch();
-        ids.forEach(id => batch.delete(db.collection('pp_proposals').doc(id)));
-        await batch.commit();
+        // Collect all approver UIDs who acted on these proposals
+        // so we can also remove their pp_userActions history entries
+        const affectedProposals = allProposals.filter(p => ids.includes(p.id));
+        const approverActionPairs = []; // [{uid, proposalId}]
+        affectedProposals.forEach(p => {
+          const approverUids = new Set();
+          (p.approverIds || []).forEach(uid => approverUids.add(uid));
+          (p.approvalHistory || []).forEach(h => {
+            if (h.approverId)  approverUids.add(h.approverId);
+            if (h.approverUid) approverUids.add(h.approverUid);
+            if (h.uid)         approverUids.add(h.uid);
+          });
+          approverUids.forEach(uid => approverActionPairs.push({ uid, proposalId: p.id }));
+        });
+
+        // Build full delete list: proposals + matching pp_userActions entries
+        const allDeletes = [
+          ...ids.map(id => db.collection('pp_proposals').doc(id)),
+          ...approverActionPairs.map(({ uid, proposalId }) =>
+            db.collection('pp_userActions').doc(uid).collection('actions').doc(proposalId)
+          )
+        ];
+
+        // Firestore batch limit is 500 — chunk into batches of 490
+        const BATCH_SIZE = 490;
+        for (let i = 0; i < allDeletes.length; i += BATCH_SIZE) {
+          const batch = db.batch();
+          allDeletes.slice(i, i + BATCH_SIZE).forEach(ref => batch.delete(ref));
+          await batch.commit();
+        }
+
         allProposals = allProposals.filter(p => !ids.includes(p.id));
         clearBulkSelection();
         filterProposals();
