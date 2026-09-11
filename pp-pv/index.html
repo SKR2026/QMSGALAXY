@@ -2658,9 +2658,12 @@ function initFirestoreListeners() {
       // Apply shared logo to all logo slots on every settings push
       applySharedLogo(_settingsData?.app?.logoUrl || '');
 
-      // Re-bootstrap recipient lists only if settings tab is NOT currently open
-      // (avoids resetting the dropdown while user is editing)
-      if (typeof _gmBootstrap === 'function' && _settingsActiveTab !== 'azure') {
+      // Re-bootstrap recipient lists from updated settings data.
+      // Always run so _gmRecipients / _ddRecipients are populated on first load,
+      // even when the Gmail tab is the default active tab.
+      // The render hooks (renderAzureSettings / renderNotificationSettings)
+      // call _gmBootstrap again after the DOM is ready, so there's no conflict.
+      if (typeof _gmBootstrap === 'function') {
         _gmBootstrap();
       }
     }
@@ -6173,6 +6176,11 @@ async function sendDailyDigestEmail(force = false) {
   const subject    = (prefixTag ? prefixTag + ' ' : '') + notifLabel + ` | Daily Digest — ${relevant.length} completed · ${newlyAdded.length} new · ${todayOngoing.length} today · ${upcoming48.length} upcoming | ${dateStr}`;
 
   // Determine recipients
+  // Ensure in-memory lists are hydrated from stored settings before resolving
+  // (the lists may be empty if settings were loaded before _gmBootstrap was defined,
+  // or if the Gmail/Notifications tabs have never been opened in this session).
+  if (!_ddRecipients.length && typeof _gmBootstrap === 'function') _gmBootstrap();
+
   // Use only active (enabled) digest recipients; fall back to Gmail notification recipient
   const digestRecipients = _ddActiveEmails().length
     ? _ddActiveEmails()
@@ -9448,18 +9456,27 @@ function _gmBootstrap() {
 /* ── Patch saveAzureSettings to persist recipientList ── */
 const _origSaveAzure = typeof saveAzureSettings === 'function' ? saveAzureSettings : null;
 function saveAzureSettings() {
+  const _prevGm   = _settingsData.gmail || {};
   const toEmailEl = document.getElementById('gm_to_email');
   const toEmail   = (toEmailEl ? toEmailEl.value.trim() : '')
                     || _gmActiveEmails()[0]
-                    || (_gmRecipients[0] ? _gmRecipients[0].email : '');
+                    || (_gmRecipients[0] ? _gmRecipients[0].email : '')
+                    || _prevGm.toEmail || '';
+  // Preserve stored recipientList when _gmRecipients hasn't been bootstrapped yet
+  // (empty array would wipe a previously saved list).
+  const recipientList = _gmRecipients.length
+    ? _gmRecipients.map(r => ({email:r.email, enabled:r.enabled}))
+    : (_prevGm.recipientList || []);
   _settingsData.gmail = {
-    ...(_settingsData.gmail || {}),
-    backendUrl:    (document.getElementById('gm_backend_url')?.value || '').trim().replace(/\/$/, ''),
+    ...(_prevGm),
+    backendUrl:    (document.getElementById('gm_backend_url')?.value || _prevGm.backendUrl || '').trim().replace(/\/$/, ''),
     toEmail,
-    recipientList: _gmRecipients.map(r=>({email:r.email,enabled:r.enabled})),
-    senderName:    (document.getElementById('gm_sender_name')?.value || '').trim(),
-    notifTitle:    (document.getElementById('gm_notif_title')?.value || '').trim(),
-    prefixTag:     (document.getElementById('gm_prefix_tag')?.value  || '').trim(),
+    recipientList,
+    senderName:    (document.getElementById('gm_sender_name')?.value || _prevGm.senderName || '').trim(),
+    notifTitle:    (document.getElementById('gm_notif_title')?.value || _prevGm.notifTitle || '').trim(),
+    prefixTag:     (document.getElementById('gm_prefix_tag')?.value  !== undefined
+                    ? document.getElementById('gm_prefix_tag').value.trim()
+                    : (_prevGm.prefixTag || '')),
   };
   if (!_settingsData.app) _settingsData.app = {};
   _settingsData.app.notificationTitle = _settingsData.gmail.notifTitle || 'Customer Visit';
@@ -9473,19 +9490,40 @@ function saveAzureSettings() {
 /* ── Patch saveNotificationSettings to persist dd recipientList ── */
 const _origSaveNotif = typeof saveNotificationSettings === 'function' ? saveNotificationSettings : null;
 function saveNotificationSettings() {
+  // IMPORTANT: use stored value as fallback when DOM element is absent
+  // (e.g. called from saveAzureSettings while Notifications tab is not rendered).
+  // Without this fallback, optional-chaining returns undefined, which
+  // coerces to false and silently disables all notification emails.
+  const _prevNotif = _settingsData.notification || {};
+  const nEnableEl  = document.getElementById('n_enable');
+  const nCcEl      = document.getElementById('n_cc');
+  const nMgmtEl    = document.getElementById('n_mgmt_email');
+  const nPrefixEl  = document.getElementById('n_prefix');
   _settingsData.notification = {
-    enableEmail:     (document.getElementById('n_enable')?.value === 'true'),
-    ccManagement:    (document.getElementById('n_cc')?.value === 'true'),
-    managementEmail: (document.getElementById('n_mgmt_email')?.value || '').trim(),
-    subjectPrefix:   (document.getElementById('n_prefix')?.value || '').trim(),
+    enableEmail:     nEnableEl  ? (nEnableEl.value  === 'true') : (_prevNotif.enableEmail  !== false),
+    ccManagement:    nCcEl      ? (nCcEl.value      === 'true') : (_prevNotif.ccManagement !== false),
+    managementEmail: nMgmtEl    ? nMgmtEl.value.trim()         : (_prevNotif.managementEmail || ''),
+    subjectPrefix:   nPrefixEl  ? nPrefixEl.value.trim()        : (_prevNotif.subjectPrefix   || ''),
   };
-  const sendTime = document.getElementById('dd_time')?.value || '18:00';
+  const ddTimeEl   = document.getElementById('dd_time');
+  const ddEnableEl = document.getElementById('dd_enable');
+  const _prevDD    = _settingsData.dailyDigest || {};
+  const sendTime   = ddTimeEl ? (ddTimeEl.value || '18:00') : (_prevDD.sendTime || '18:00');
+  // Merge active recipient list; fall back to stored list if _ddRecipients is empty
+  // (can happen when the Notifications tab hasn't been rendered / bootstrapped yet).
+  const _activeEmails = _ddActiveEmails();
+  const recipientList = _ddRecipients.length
+    ? _ddRecipients.map(r => ({email:r.email, enabled:r.enabled}))
+    : (_prevDD.recipientList || []);
+  const recipients = _activeEmails.length
+    ? _activeEmails.join(', ')
+    : (_prevDD.recipients || '');
   _settingsData.dailyDigest = {
-    ...(_settingsData.dailyDigest || {}),
-    enabled:       (document.getElementById('dd_enable')?.value === 'true'),
+    ...(_prevDD),
+    enabled:       ddEnableEl ? (ddEnableEl.value === 'true') : (_prevDD.enabled !== false),
     sendTime,
-    recipients:    _ddActiveEmails().join(', '),
-    recipientList: _ddRecipients.map(r=>({email:r.email,enabled:r.enabled})),
+    recipients,
+    recipientList,
   };
   saveSettings();
   toast('✓ Notification Config Saved', 'Email notification rules updated.');
