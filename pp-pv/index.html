@@ -4723,20 +4723,35 @@ async function sendGmailEmail(toEmail, subject, bodyHtml) {
 }
 
 /**
- * sendGmailDigest()
- * Calls POST /api/send-manual-digest on the Cloud Run backend.
- * The backend reads visits + recipients directly from Firestore and
- * builds the email itself — no HTML payload needed from the frontend.
- * The `recipients`, `subject`, and `bodyHtml` params are kept for
- * signature compatibility but are NOT sent (backend ignores them).
+ * sendGmailDigest(recipients, subject, bodyHtml, signal)
+ * Calls POST /api/send-digest on the Cloud Run backend.
+ *
+ * NOTE on backend routing: /api/send-manual-digest is defined AFTER an
+ * unguarded digest try-block that returns for every path — making it
+ * unreachable. /api/send-digest at line 2142 of the backend IS reachable
+ * and accepts { recipients (array), subject, htmlBody, senderName }.
+ *
+ * recipients must be a non-empty string array — the backend validates
+ * Array.isArray(recipients) and returns 400 if it is not.
  */
 async function sendGmailDigest(recipients, subject, bodyHtml, signal) {
   const backendUrl = getGmailBackendUrl();
   if (!backendUrl) return false;
-  const res = await fetch(`${backendUrl}/api/send-manual-digest`, {
+  const gm = _settingsData.gmail || {};
+  // Ensure recipients is always a proper array (never a comma-string)
+  const recipientsArr = Array.isArray(recipients)
+    ? recipients
+    : (recipients || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!recipientsArr.length) throw new Error('No recipients resolved for digest send');
+  const res = await fetch(`${backendUrl}/api/send-digest`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ force: true }),
+    body: JSON.stringify({
+      recipients: recipientsArr,
+      subject,
+      htmlBody: bodyHtml,
+      senderName: gm.senderName || 'PlantVisit Digest',
+    }),
     signal,
   });
   if (!res.ok) {
@@ -4744,7 +4759,7 @@ async function sendGmailDigest(recipients, subject, bodyHtml, signal) {
     throw new Error(err.error || res.statusText);
   }
   const data = await res.json();
-  return data.results || data.details || [];
+  return data;
 }
 
 function logMail(record, isUpdate) {
@@ -6240,13 +6255,14 @@ async function sendDailyDigestEmail(force = false) {
   const _abortTimer = setTimeout(() => _abortCtrl.abort(), 60000);
 
   sendGmailDigest(digestRecipients, subject, bodyHtml, _abortCtrl.signal)
-    .then((results) => {
+    .then((data) => {
       _digestSendInProgress = false;
       clearTimeout(_abortTimer);
-      // /api/send-manual-digest returns { sent, failed, concluded, ... }
-      const sentCount  = (results && results.sent  !== undefined) ? results.sent  : digestRecipients.length;
-      const failCount  = (results && results.failed !== undefined) ? results.failed : 0;
-      const statusMsg  = failCount
+      // /api/send-digest returns { results: [{to, success, messageId}] }
+      const results   = (data && Array.isArray(data.results)) ? data.results : [];
+      const sentCount = results.filter(r => r.success).length || digestRecipients.length;
+      const failCount = results.filter(r => !r.success).length;
+      const statusMsg = failCount
         ? `Sent to ${sentCount} recipient${sentCount !== 1 ? 's' : ''}, ${failCount} failed.`
         : `Delivered to ${digestRecipients.join(', ')}`;
       _showStatus(`<div class="alert alert-good" style="color:var(--green);background:var(--green-bg);border:1px solid rgba(90,191,122,.2)">✅ ${statusMsg}</div>`);
