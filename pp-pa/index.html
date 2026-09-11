@@ -3116,13 +3116,14 @@ async function loadDashboard() {
       const snap = await db.collection('pp_proposals').limit(100).get();
       props = snap.docs.map(d=>({id:d.id,...d.data()}));
     } else if (['Approver','Creator & Approver','Proposal Creator'].includes(currentProfile?.role)) {
-      // Dual-role users — see proposals they created OR are assigned to approve
-      const [assignedSnap, createdSnap] = await Promise.all([
+      // Three queries: assigned to approve + created by + previously acted on (approverIds)
+      const [assignedSnap, createdSnap, actedSnap] = await Promise.all([
         db.collection('pp_proposals').where('currentApproverId','==',currentUser.uid).limit(100).get(),
-        db.collection('pp_proposals').where('createdBy','==',currentUser.uid).limit(100).get()
+        db.collection('pp_proposals').where('createdBy','==',currentUser.uid).limit(100).get(),
+        db.collection('pp_proposals').where('approverIds','array-contains',currentUser.uid).limit(100).get()
       ]);
       const merged = new Map();
-      [...assignedSnap.docs, ...createdSnap.docs].forEach(d=>{
+      [...assignedSnap.docs, ...createdSnap.docs, ...actedSnap.docs].forEach(d=>{
         if(!merged.has(d.id)) merged.set(d.id,{id:d.id,...d.data()});
       });
       props = [...merged.values()];
@@ -3212,17 +3213,24 @@ async function loadProposals() {
     if (!isSuperAdmin() && currentProfile?.role !== 'Plant Admin') {
       const isApproverRole = ['Approver','Creator & Approver','Proposal Creator'].includes(currentProfile?.role);
       if (isApproverRole) {
-        // Show both: proposals assigned for approval AND proposals created by this user
-        const [assignedSnap, createdSnap] = await Promise.all([
+        // THREE queries merged:
+        // 1. Currently assigned to this user (pending their action)
+        // 2. Created by this user
+        // 3. Previously approved/rejected/returned by this user (in approverIds array)
+        //    — this is how approved proposals remain visible after currentApproverId changes
+        const [assignedSnap, createdSnap, actedSnap] = await Promise.all([
           db.collection('pp_proposals')
             .where('currentApproverId','==',currentUser.uid)
             .limit(200).get(),
           db.collection('pp_proposals')
             .where('createdBy','==',currentUser.uid)
+            .limit(200).get(),
+          db.collection('pp_proposals')
+            .where('approverIds','array-contains',currentUser.uid)
             .limit(200).get()
         ]);
         const merged = new Map();
-        [...assignedSnap.docs, ...createdSnap.docs].forEach(d=>{
+        [...assignedSnap.docs, ...createdSnap.docs, ...actedSnap.docs].forEach(d=>{
           if(!merged.has(d.id)) merged.set(d.id,{id:d.id,...d.data()});
         });
         allProposals = [...merged.values()];
@@ -3761,6 +3769,7 @@ async function executeApprovalAction() {
             approvedAt: now,
             lastApprovalComment: comment || '',
             approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+            approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
             updatedAt: now
           });
         } else {
@@ -3788,6 +3797,7 @@ async function executeApprovalAction() {
               status: 'Approved', approvedAt: now,
               lastApprovalComment: comment || '',
               approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+            approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
               updatedAt: now
             });
             closeModal('approval-modal-overlay');
@@ -3839,6 +3849,7 @@ async function executeApprovalAction() {
             levelName: rule.levelName || null,
             lastApprovalComment: comment || '',
             approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+            approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
             updatedAt: now
           });
         }
@@ -3850,6 +3861,7 @@ async function executeApprovalAction() {
           rejectedBy: uid, rejectedByName: userName,
           rejectedAt: now,
           approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+            approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
           updatedAt: now
         });
       } else if (action === 'return') {
@@ -3860,6 +3872,7 @@ async function executeApprovalAction() {
           returnedBy: uid, returnedByName: userName,
           returnedAt: now,
           approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
+            approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
           updatedAt: now
         });
       }
