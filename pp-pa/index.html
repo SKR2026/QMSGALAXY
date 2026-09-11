@@ -4033,21 +4033,29 @@ async function loadMyApprovals() {
     renderApprovalsTable(pendingProps);
 
     // ── History: three-source merge for maximum coverage ──
-    // Source 1: pp_userActions/{uid}/actions — per-user log written on every action (most reliable)
-    // Source 2: approverIds array-contains uid — proposals approved after latest deploy
-    // Source 3: createdBy == uid — proposals this user created (they may have also approved)
     const [userActionsSnap, actedSnap, createdForHistSnap] = await Promise.all([
       safeGet(db.collection('pp_userActions').doc(uid).collection('actions').limit(500)),
       safeGet(db.collection('pp_proposals').where('approverIds','array-contains',uid).limit(300)),
       safeGet(db.collection('pp_proposals').where('createdBy','==',uid).limit(200))
     ]);
 
+    // DEBUG — open browser console to see exactly what Firestore returns
+    console.group('[History Debug] uid:', uid);
+    console.log('pp_userActions docs:', userActionsSnap.docs.length,
+      userActionsSnap.docs.map(d=>({id:d.id,...d.data()})));
+    console.log('approverIds query docs:', actedSnap.docs.length,
+      actedSnap.docs.map(d=>d.id));
+    console.log('createdBy query docs:', createdForHistSnap.docs.length,
+      createdForHistSnap.docs.map(d=>({id:d.id, status:d.data().status,
+        approvalHistory:(d.data().approvalHistory||[]).map(h=>({approverId:h.approverId,action:h.action}))})));
+    console.groupEnd();
+
     // Get proposal IDs from user action log, then fetch those proposals
     const userActionProposalIds = userActionsSnap.docs.map(d=>d.id);
-    const userActionMap = {}; // proposalId -> action metadata
+    const userActionMap = {};
     userActionsSnap.docs.forEach(d=>{ userActionMap[d.id] = d.data(); });
 
-    // Fetch proposals from user action log in batches of 10 (Firestore 'in' limit)
+    // Fetch proposals from user action log in batches of 10
     const chunks = [];
     for (let i=0; i<userActionProposalIds.length; i+=10) {
       chunks.push(userActionProposalIds.slice(i,i+10));
@@ -4061,12 +4069,17 @@ async function loadMyApprovals() {
     chunkSnaps.forEach(s=>s.docs.forEach(d=>{
       if(!histMerged.has(d.id)) histMerged.set(d.id,{id:d.id,...d.data()});
     }));
-    // Also merge approverIds and createdBy results
     [...actedSnap.docs, ...createdForHistSnap.docs].forEach(d=>{
       if(!histMerged.has(d.id)) histMerged.set(d.id,{id:d.id,...d.data()});
     });
 
-    // Keep only proposals where this user actually appears in approvalHistory
+    console.log('[History Debug] total merged proposals:', histMerged.size);
+    histMerged.forEach((p,id)=>{
+      const myEntries = (p.approvalHistory||[]).filter(h=>
+        h.approverId===uid||h.approverUid===uid||h.uid===uid);
+      if(myEntries.length) console.log('  found my actions in:', id, myEntries);
+    });
+
     const myUidVariants = [uid];
     _historyProposals = [...histMerged.values()].filter(p=>{
       const inHistory = (p.approvalHistory||[]).some(h=>
@@ -4074,11 +4087,11 @@ async function loadMyApprovals() {
         myUidVariants.includes(h.approverUid) ||
         myUidVariants.includes(h.uid)
       );
-      // Also include if found in userActionLog even if approvalHistory not synced yet
       return inHistory || userActionMap[p.id];
     }).sort((a,b)=>(b.updatedAt?.toMillis?.()??0)-(a.updatedAt?.toMillis?.()??0));
 
-    // Count total actions from user action log (most accurate)
+    console.log('[History Debug] _historyProposals after filter:', _historyProposals.length);
+
     const totalActions = userActionsSnap.docs.length ||
       _historyProposals.reduce((n,p)=>
         n+(p.approvalHistory||[]).filter(h=>
