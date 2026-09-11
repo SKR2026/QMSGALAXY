@@ -3784,11 +3784,21 @@ async function executeApprovalAction() {
       const _snapForLevel = await db.collection('pp_proposals').doc(proposalId).get();
       const _pLevel = _snapForLevel.exists ? (_snapForLevel.data().currentApprovalLevel || 1) : 1;
 
+      const actionLabel = action === 'approve' ? 'Approved' : action === 'reject' ? 'Rejected' : 'Returned';
       const historyEntry = {
         level: _pLevel, approverId: uid, approverName: userName,
-        action: action === 'approve' ? 'Approved' : action === 'reject' ? 'Rejected' : 'Returned',
-        comment: comment || '', actionAt: nowISO
+        action: actionLabel, comment: comment || '', actionAt: nowISO
       };
+
+      // Write to per-user action log — queryable by any user for their own history
+      // regardless of whether approverIds field exists on the proposal
+      db.collection('pp_userActions').doc(uid)
+        .collection('actions').doc(proposalId)
+        .set({
+          proposalId, action: actionLabel, level: _pLevel,
+          actionAt: nowISO, comment: comment || '',
+          approverName: userName
+        }, { merge: true }).catch(()=>{}); // fire-and-forget
 
       if (action === 'approve') {
         // Reuse the snap already fetched above for historyEntry level
@@ -4016,32 +4026,60 @@ async function loadMyApprovals() {
     }
     renderApprovalsTable(pendingProps);
 
-    // ── History: proposals where I acted (approverIds) OR created by me ──
-    // Two queries merged — approverIds covers post-fix proposals,
-    // createdBy covers proposals where I created and also approved.
-    // Old proposals without approverIds field are found via createdBy fallback.
-    const [actedSnap, createdForHistSnap] = await Promise.all([
+    // ── History: three-source merge for maximum coverage ──
+    // Source 1: pp_userActions/{uid}/actions — per-user log written on every action (most reliable)
+    // Source 2: approverIds array-contains uid — proposals approved after latest deploy
+    // Source 3: createdBy == uid — proposals this user created (they may have also approved)
+    const [userActionsSnap, actedSnap, createdForHistSnap] = await Promise.all([
+      safeGet(db.collection('pp_userActions').doc(uid).collection('actions').limit(500)),
       safeGet(db.collection('pp_proposals').where('approverIds','array-contains',uid).limit(300)),
       safeGet(db.collection('pp_proposals').where('createdBy','==',uid).limit(200))
     ]);
+
+    // Get proposal IDs from user action log, then fetch those proposals
+    const userActionProposalIds = userActionsSnap.docs.map(d=>d.id);
+    const userActionMap = {}; // proposalId -> action metadata
+    userActionsSnap.docs.forEach(d=>{ userActionMap[d.id] = d.data(); });
+
+    // Fetch proposals from user action log in batches of 10 (Firestore 'in' limit)
+    const chunks = [];
+    for (let i=0; i<userActionProposalIds.length; i+=10) {
+      chunks.push(userActionProposalIds.slice(i,i+10));
+    }
+    const chunkSnaps = await Promise.all(
+      chunks.map(ids =>
+        ids.length ? safeGet(db.collection('pp_proposals').where(firebase.firestore.FieldPath.documentId(),'in',ids)) : Promise.resolve({docs:[]})
+      )
+    );
     const histMerged = new Map();
+    chunkSnaps.forEach(s=>s.docs.forEach(d=>{
+      if(!histMerged.has(d.id)) histMerged.set(d.id,{id:d.id,...d.data()});
+    }));
+    // Also merge approverIds and createdBy results
     [...actedSnap.docs, ...createdForHistSnap.docs].forEach(d=>{
       if(!histMerged.has(d.id)) histMerged.set(d.id,{id:d.id,...d.data()});
     });
-    // Keep proposals where this user appears in approvalHistory (any field variant)
-    _historyProposals = [...histMerged.values()].filter(p=>
-      (p.approvalHistory||[]).some(h=>
-        h.approverId===uid ||
-        h.approverUid===uid ||   // alternate field name used in some legacy entries
-        h.uid===uid
-      )
-    ).sort((a,b)=>(b.updatedAt?.toMillis?.()??0)-(a.updatedAt?.toMillis?.()??0));
 
-    // Update summary counters
-    const totalActions = _historyProposals.reduce((n,p)=>
-      n+(p.approvalHistory||[]).filter(h=>
-        h.approverId===uid || h.approverUid===uid || h.uid===uid
-      ).length, 0);
+    // Keep only proposals where this user actually appears in approvalHistory
+    const myUidVariants = [uid];
+    _historyProposals = [...histMerged.values()].filter(p=>{
+      const inHistory = (p.approvalHistory||[]).some(h=>
+        myUidVariants.includes(h.approverId) ||
+        myUidVariants.includes(h.approverUid) ||
+        myUidVariants.includes(h.uid)
+      );
+      // Also include if found in userActionLog even if approvalHistory not synced yet
+      return inHistory || userActionMap[p.id];
+    }).sort((a,b)=>(b.updatedAt?.toMillis?.()??0)-(a.updatedAt?.toMillis?.()??0));
+
+    // Count total actions from user action log (most accurate)
+    const totalActions = userActionsSnap.docs.length ||
+      _historyProposals.reduce((n,p)=>
+        n+(p.approvalHistory||[]).filter(h=>
+          myUidVariants.includes(h.approverId)||
+          myUidVariants.includes(h.approverUid)||
+          myUidVariants.includes(h.uid)
+        ).length, 0);
     const histBadge = document.getElementById('hist-count-total');
     if (histBadge) histBadge.textContent = totalActions;
 
