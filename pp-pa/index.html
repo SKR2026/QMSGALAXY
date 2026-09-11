@@ -3780,15 +3780,19 @@ async function executeApprovalAction() {
       const userName = currentProfile?.name || currentUser?.email || '';
       const uid = currentUser?.uid || '';
 
+      // Read currentApprovalLevel from proposal before building entry
+      const _snapForLevel = await db.collection('pp_proposals').doc(proposalId).get();
+      const _pLevel = _snapForLevel.exists ? (_snapForLevel.data().currentApprovalLevel || 1) : 1;
+
       const historyEntry = {
-        level: 0, approverId: uid, approverName: userName,
+        level: _pLevel, approverId: uid, approverName: userName,
         action: action === 'approve' ? 'Approved' : action === 'reject' ? 'Rejected' : 'Returned',
         comment: comment || '', actionAt: nowISO
       };
 
       if (action === 'approve') {
-        // Get current proposal to check approval level
-        const snap = await db.collection('pp_proposals').doc(proposalId).get();
+        // Reuse the snap already fetched above for historyEntry level
+        const snap = _snapForLevel;
         const p = snap.data();
         if (p.createdBy && p.createdBy === uid) {
           throw new Error('A proposal creator cannot approve their own proposal. Another approver must approve this level.');
@@ -4024,14 +4028,20 @@ async function loadMyApprovals() {
     [...actedSnap.docs, ...createdForHistSnap.docs].forEach(d=>{
       if(!histMerged.has(d.id)) histMerged.set(d.id,{id:d.id,...d.data()});
     });
-    // Only keep proposals where this user actually appears in approvalHistory
+    // Keep proposals where this user appears in approvalHistory (any field variant)
     _historyProposals = [...histMerged.values()].filter(p=>
-      (p.approvalHistory||[]).some(h=>h.approverId===uid)
+      (p.approvalHistory||[]).some(h=>
+        h.approverId===uid ||
+        h.approverUid===uid ||   // alternate field name used in some legacy entries
+        h.uid===uid
+      )
     ).sort((a,b)=>(b.updatedAt?.toMillis?.()??0)-(a.updatedAt?.toMillis?.()??0));
 
     // Update summary counters
     const totalActions = _historyProposals.reduce((n,p)=>
-      n+(p.approvalHistory||[]).filter(h=>h.approverId===uid).length, 0);
+      n+(p.approvalHistory||[]).filter(h=>
+        h.approverId===uid || h.approverUid===uid || h.uid===uid
+      ).length, 0);
     const histBadge = document.getElementById('hist-count-total');
     if (histBadge) histBadge.textContent = totalActions;
 
@@ -4093,8 +4103,18 @@ window.renderHistoryTable = function() {
   const rows = [];
   _historyProposals.forEach(p => {
     const plant = allPlants.find(pl=>pl.id===p.plantId);
-    const myActions = (p.approvalHistory||[]).filter(h=>h.approverId===currentUser.uid);
-    myActions.forEach(h => {
+    const myActions = (p.approvalHistory||[]).filter(h=>
+      h.approverId===currentUser.uid ||
+      h.approverUid===currentUser.uid ||
+      h.uid===currentUser.uid
+    );
+    myActions.forEach(rawH => {
+      // Normalise: old Cloud Function entries used approvedAt + no action field
+      const h = {
+        ...rawH,
+        action:   rawH.action   || (rawH.approvedAt ? 'Approved' : '—'),
+        actionAt: rawH.actionAt || rawH.approvedAt || rawH.timestamp || null,
+      };
       const actionAt = h.actionAt ? new Date(h.actionAt).getTime() : 0;
       if (cutoff && actionAt < cutoff) return;
       if (actionF && h.action !== actionF) return;
