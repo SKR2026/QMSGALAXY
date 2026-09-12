@@ -2059,8 +2059,8 @@ html, body { overflow: hidden; }
             </div>
             <div class="card-body">
               <p style="font-size:14px;color:var(--text2);margin-bottom:20px;line-height:1.7">
-                This will permanently delete <strong style="color:var(--text)">all transactional and configuration data</strong>
-                from the system. The Super Admin account and Firebase Auth users are <strong style="color:var(--text)">preserved</strong>.
+                This will permanently delete <strong style="color:var(--text)">all proposals, logs, and approval history</strong>
+                from the system. Users, plants, approval matrix, and the Super Admin account are <strong style="color:var(--text)">preserved</strong>.
                 This action <strong style="color:var(--danger)">cannot be undone</strong>.
               </p>
 
@@ -2070,9 +2070,6 @@ html, body { overflow: hidden; }
                   <div style="font-size:12px;font-weight:700;color:var(--danger);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">🗑 Will Be Deleted</div>
                   <ul style="font-size:13px;color:var(--text);list-style:none;display:flex;flex-direction:column;gap:6px">
                     <li>📋 All proposals</li>
-                    <li>👥 All users (except Super Admin)</li>
-                    <li>🏭 All plants</li>
-                    <li>📐 All approval matrices</li>
                     <li>📧 All email logs</li>
                     <li>🔔 All notifications</li>
                     <li>📜 All audit logs</li>
@@ -2086,6 +2083,9 @@ html, body { overflow: hidden; }
                   <div style="font-size:12px;font-weight:700;color:var(--success);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">✅ Will Be Kept</div>
                   <ul style="font-size:13px;color:var(--text);list-style:none;display:flex;flex-direction:column;gap:6px">
                     <li>🔐 Your Super Admin account</li>
+                    <li>👥 All users &amp; roles</li>
+                    <li>🏭 All plants</li>
+                    <li>📐 All approval matrices</li>
                     <li>🔑 All Firebase Auth credentials</li>
                   </ul>
                 </div>
@@ -6117,9 +6117,6 @@ async function executeSystemReset() {
   // handled separately below with targeted (non-listing) direct deletes.
   const WIPE_COLLECTIONS = [
     'pp_proposals',
-    'pp_plants',
-    'pp_approvalMatrices',
-    'pp_emailLogs',
     'pp_notifications',
     'pp_magicLinks',
     'pp_emailTemplates',
@@ -6182,7 +6179,7 @@ async function executeSystemReset() {
     return deleted;
   }
 
-  const total = WIPE_COLLECTIONS.length + 5; // +5 for userActions, auditLogs, users, settings, pp_settings
+  const total = WIPE_COLLECTIONS.length + 5; // +5 for userActions, auditLogs, emailLogs, settings, pp_settings
   let done = 0;
 
   try {
@@ -6254,25 +6251,39 @@ async function executeSystemReset() {
     }
     done++; setProgress(Math.round(done / total * 100));
 
-    // 3. Wipe non-Super-Admin users from pp_users
+    // 2d. Wipe pp_emailLogs — blocked by Firestore rules for full listing,
+    //     so attempt a query-scoped delete first, then fall back to full listing.
     try {
-      const usersSnap = await db.collection('pp_users').get();
-      const batch = db.batch();
-      let count = 0;
-      usersSnap.docs.forEach(d => {
-        if (d.data().uid !== currentUser.uid) {
-          batch.delete(d.ref);
-          count++;
+      let elDeleted = 0;
+      // Try full listing first (works if rules allow Super Admin)
+      try {
+        while (true) {
+          const snap = await db.collection('pp_emailLogs').limit(400).get();
+          if (snap.empty) break;
+          const batch = db.batch();
+          snap.docs.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+          elDeleted += snap.docs.length;
         }
-      });
-      if (count > 0) await batch.commit();
-      log(`pp_users: ${count} non-Super-Admin user${count !== 1 ? 's' : ''} deleted (your account kept)`);
+      } catch(_) {
+        // Rules block listing — delete only docs where sentBy == current user
+        while (true) {
+          const snap = await db.collection('pp_emailLogs')
+            .where('sentBy', '==', currentUser.uid).limit(400).get();
+          if (snap.empty) break;
+          const batch = db.batch();
+          snap.docs.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+          elDeleted += snap.docs.length;
+        }
+      }
+      log(`pp_emailLogs: ${elDeleted} document${elDeleted !== 1 ? 's' : ''} deleted`);
     } catch(e) {
-      log(`pp_users: ${e.message}`, false);
+      log(`pp_emailLogs: ${e.message}`, false);
     }
     done++; setProgress(Math.round(done / total * 100));
 
-    // 4. Wipe pp_settings docs (company, approval, numbering, digest, app)
+    // 3. Wipe pp_settings docs (company, approval, numbering, digest, app)
     try {
       const settingsDocs = ['company', 'approval', 'numbering', 'digest', 'app'];
       const batch = db.batch();
@@ -6286,12 +6297,10 @@ async function executeSystemReset() {
     }
     done++; setProgress(Math.round(done / total * 100));
 
-    // 5. Update the in-memory Super Admin profile to reflect clean state
+    // 4. Update the in-memory state — keep users, plants, and matrix intact
     allProposals = [];
-    allPlants    = [];
-    allUsers     = [currentProfile].filter(Boolean);
 
-    // 6. Clear in-memory approval-history caches so the History tab shows empty
+    // 5. Clear in-memory approval-history caches so the History tab shows empty
     _historyProposals          = [];
     window._userActionMapGlobal = {};
     window._historySelectedKeys = new Set();
@@ -6303,10 +6312,10 @@ async function executeSystemReset() {
     progressLog.innerHTML += '';
     const successEl = document.createElement('div');
     successEl.style.cssText = 'margin-top:8px;font-weight:700;font-size:13px;color:var(--success)';
-    successEl.textContent = '🎉 System reset complete. All data has been cleared.';
+    successEl.textContent = '🎉 System reset complete. Proposals and logs cleared. Users, plants & matrix kept.';
     progressLog.appendChild(successEl);
 
-    toast('System reset complete — fresh start!', 'success');
+    toast('Reset complete — proposals cleared, users & plants kept!', 'success');
 
     // Reload data and UI after short delay
     setTimeout(async () => {
