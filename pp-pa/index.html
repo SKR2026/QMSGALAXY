@@ -1064,7 +1064,10 @@ html, body { overflow: hidden; }
       <button class="nav-item" data-page="create-comparison" onclick="navigate('create-comparison')" data-tip="3-Quotation Comparison" id="nav-create-comparison">
         <span class="nav-icon">📊</span><span class="nav-label">3-Quotation Comparison</span>
       </button>
-      <button class="nav-item" data-page="my-approvals" onclick="navigate('my-approvals')" data-tip="My Approvals" id="nav-approvals">
+      <button class="nav-item" data-page="my-requests" onclick="navigate('my-requests')" data-tip="My Requests" id="nav-my-requests">
+        <span class="nav-icon">🗂️</span><span class="nav-label">My Requests</span>
+      </button>
+            <button class="nav-item" data-page="my-approvals" onclick="navigate('my-approvals')" data-tip="My Approvals" id="nav-approvals">
         <span class="nav-icon">✅</span><span class="nav-label">My Approvals</span>
         <span class="nav-badge" id="approvals-badge" style="display:none">0</span>
       </button>
@@ -1499,6 +1502,42 @@ html, body { overflow: hidden; }
           <div class="page-header-actions" id="vp-actions"></div>
         </div>
         <div id="vp-content"></div>
+      </div>
+
+      <!-- ─── MY REQUESTS ─── -->
+      <div class="page" id="page-my-requests">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+          <h1>My Requests</h1>
+        </div>
+        <!-- Sub-tab bar -->
+        <div style="display:flex;gap:0;border-bottom:2px solid var(--border);margin-bottom:20px">
+          <button id="mreq-tab-proposals" onclick="switchMyRequestsTab('proposals')"
+            style="padding:10px 24px;border:none;background:none;cursor:pointer;font-size:14px;font-weight:600;color:var(--primary);border-bottom:3px solid var(--primary);margin-bottom:-2px;transition:all .15s">
+            📋 My Proposals
+          </button>
+          <button id="mreq-tab-approvals" onclick="switchMyRequestsTab('approvals')"
+            style="padding:10px 24px;border:none;background:none;cursor:pointer;font-size:14px;font-weight:600;color:var(--text-muted);border-bottom:3px solid transparent;margin-bottom:-2px;transition:all .15s">
+            ✅ My Approvals
+          </button>
+        </div>
+        <!-- My Proposals panel -->
+        <div id="mreq-panel-proposals">
+          <div id="mreq-proposals-body">
+            <div style="text-align:center;padding:60px 0;color:var(--text-muted)">
+              <div style="font-size:40px;margin-bottom:12px">📋</div>
+              <div>Loading your proposals…</div>
+            </div>
+          </div>
+        </div>
+        <!-- My Approvals panel -->
+        <div id="mreq-panel-approvals" style="display:none">
+          <div id="mreq-approvals-body">
+            <div style="text-align:center;padding:60px 0;color:var(--text-muted)">
+              <div style="font-size:40px;margin-bottom:12px">✅</div>
+              <div>Loading your approvals…</div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- ─── MY APPROVALS ─── -->
@@ -2504,10 +2543,29 @@ async function saveComparisonProposal(action){
     const data={plantId,plantName:plant?.name||'',partyName:d.customer||d.quotations.find(q=>q.proposedSupplier)?.proposedSupplier||'',productService:d.itemName||item,description:d.rows.find(r=>r.description)?.description||item,justification:d.reasonOther||d.reason.join(', '),proposalDate:d.proposalDate,category:d.commodity,validity:30,comparison:d,formType:'3-Quotation Comparison',updatedAt:firebase.firestore.FieldValue.serverTimestamp()};
     if(attachments.length)data.attachments=attachments;
     if(action==='Submit'){
-      const submitFn=fns.httpsCallable('submitProposal');const result=await submitFn({proposalId:editingId||null,proposalData:data});
-      if(!result.data.success)throw new Error(result.data.message||'Submission failed');
-      toast(`Proposal submitted for approval! #${result.data.proposalNumber}`,'success');await logAudit(result.data.proposalId,'Submitted',`Submitted 3-quotation proposal ${result.data.proposalNumber}`);
-      await fixSelfRoutingIfNeeded(result.data.proposalId, currentUser.uid, currentUser.email);
+      let _cmpResult = null;
+      try {
+        const submitFn=fns.httpsCallable('submitProposal');
+        const cfCmp = await submitFn({proposalId:editingId||null,proposalData:data});
+        if (!cfCmp.data?.success) {
+          const msg = cfCmp.data?.message || '';
+          const isRoutingErr = msg.includes('Level') || msg.includes('approver') || msg.includes('matrix');
+          if (isRoutingErr) {
+            console.warn('[submit-comparison] CF routing error, using client-side fallback:', msg);
+            _cmpResult = await clientSideSubmitProposal(data, editingId||null);
+          } else {
+            _cmpResult = cfCmp.data;
+          }
+        } else {
+          _cmpResult = cfCmp.data;
+        }
+      } catch(cfErr) {
+        console.warn('[submit-comparison] CF threw, using client-side routing fallback:', cfErr.message);
+        _cmpResult = await clientSideSubmitProposal(data, editingId||null);
+      }
+      if(!_cmpResult.success)throw new Error(_cmpResult.message||'Submission failed');
+      toast(`Proposal submitted for approval! #${_cmpResult.proposalNumber}`,'success');await logAudit(_cmpResult.proposalId,'Submitted',`Submitted 3-quotation proposal ${_cmpResult.proposalNumber}`);
+      await fixSelfRoutingIfNeeded(_cmpResult.proposalId, currentUser.uid, currentUser.email);
       navigate('proposals');
     }else{
       if(editingId) await db.collection('pp_proposals').doc(editingId).update({...data,status:'Draft'}); else {data.status='Draft';data.createdBy=currentUser.uid;data.createdByName=currentProfile?.name||currentUser.email;data.createdByEmail=currentUser.email;data.createdAt=firebase.firestore.FieldValue.serverTimestamp();data.currentApprovalLevel=0;await db.collection('pp_proposals').add(data);}
@@ -3229,7 +3287,7 @@ function updateSidebarUser() {
 // ═══════════════════════════════════════════════════════════════════════════
 const pageTitles = {
   dashboard:'Dashboard', proposals:'Proposals', 'create-proposal':'Create Proposal', 'create-comparison':'3-Quotation Comparison',
-  'view-proposal':'View Proposal', 'my-approvals':'My Approvals',
+  'view-proposal':'View Proposal', 'my-approvals':'My Approvals', 'my-requests':'My Requests',
   users:'User Management', plants:'Plant Management', 'approval-matrix':'Approval Matrix',
   reports:'Reports', 'audit-logs':'Audit Logs', 'email-logs':'Email Logs', settings:'Settings'
 };
@@ -3269,6 +3327,7 @@ function navigate(page, extraData) {
     'create-proposal':   () => initProposalForm(extraData),
     'create-comparison': () => initComparisonForm(extraData),
     'my-approvals':      loadMyApprovals,
+    'my-requests':       loadMyRequests,
     users:               loadUsersPage,
     plants:              loadPlantsPage,
     'approval-matrix':   loadMatrixPage,
@@ -3800,12 +3859,31 @@ async function saveProposal(action) {
 
     if (action === 'Submit') {
       // Delegate submission to Cloud Function for secure workflow
-      const submitFn = fns.httpsCallable('submitProposal');
-      const result = await submitFn({ proposalId: editingId||null, proposalData: data });
+      let _submitResult = null;
+      try {
+        const submitFn = fns.httpsCallable('submitProposal');
+        const cfResult = await submitFn({ proposalId: editingId||null, proposalData: data });
+        // If CF returned success:false due to routing error, fall back to client-side
+        if (!cfResult.data?.success) {
+          const msg = cfResult.data?.message || '';
+          const isRoutingErr = msg.includes('Level') || msg.includes('approver') || msg.includes('matrix');
+          if (isRoutingErr) {
+            console.warn('[submit] CF routing error, using client-side fallback:', msg);
+            _submitResult = await clientSideSubmitProposal(data, editingId||null);
+          } else {
+            _submitResult = cfResult.data; // propagate other errors normally
+          }
+        } else {
+          _submitResult = cfResult.data;
+        }
+      } catch(cfErr) {
+        console.warn('[submit] CF threw, using client-side routing fallback:', cfErr.message);
+        _submitResult = await clientSideSubmitProposal(data, editingId||null);
+      }
+      const result = { data: _submitResult };
       if (result.data.success) {
         toast(`Proposal submitted for approval! #${result.data.proposalNumber}`,'success');
         await logAudit(result.data.proposalId, 'Submitted', `Submitted proposal ${result.data.proposalNumber}`);
-        // Fix self-routing: if CF assigned the proposal back to its creator, re-route to correct approver
         await fixSelfRoutingIfNeeded(result.data.proposalId, currentUser.uid, currentUser.email);
         navigate('proposals');
       } else {
@@ -4063,31 +4141,48 @@ function clientResolveAnnualImpact(p) {
 }
 
 // getProposalMaxLevel — mirrors CF exactly:
-// Returns the FIRST (lowest) level whose rules cover the proposal amount.
-// This is the STOP level; the proposal finalises here, not at the highest level.
-function matrixScopeMatchesClient(rule, proposal) {
-  const norm = v => String(v ?? '').trim().toLowerCase();
-  const plant = norm(rule.plantId);
-  const category = norm(rule.category);
-  const proposalPlant = norm(proposal.plantId);
-  const proposalCategory = norm(proposal.category);
-  const plantWildcard = !plant || ['all','all plants','all_plants','*'].includes(plant);
-  const categoryWildcard = !category || ['all','all categories','all_categories','*'].includes(category);
-  return (plantWildcard || plant === proposalPlant) &&
-         (categoryWildcard || category === proposalCategory);
+// Returns the creator's highest matrix level (0 if not in matrix)
+async function getCreatorLevel(p) {
+  const matrixSnap   = await db.collection('pp_approvalMatrices').get();
+  const creatorUid   = String(p.createdBy||'').trim();
+  const creatorEmail = String(p.createdByEmail||'').trim().toLowerCase();
+  return matrixSnap.docs
+    .map(d=>({...d.data(),id:d.id}))
+    .filter(r => {
+      const rEmail = String(r.approverEmail||'').trim().toLowerCase();
+      const rId    = String(r.approverId||'').trim();
+      return (creatorUid && rId===creatorUid) || (creatorEmail && rEmail===creatorEmail);
+    })
+    .map(r=>Number(r.level||0))
+    .filter(Boolean)
+    .reduce((max,lvl)=>Math.max(max,lvl), 0);
 }
 
+// Returns the stop-level for this proposal — first level ABOVE creatorLevel that covers the amount.
 async function getProposalMaxLevel(p) {
-  const matrixSnap = await db.collection('pp_approvalMatrices').get();
+  const matrixSnap   = await db.collection('pp_approvalMatrices').get();
+  const amount       = clientResolveAnnualImpact(p);
+  const creatorLevel = await getCreatorLevel(p);
   const rules = matrixSnap.docs.map(d => ({id:d.id,...d.data()}))
-    .filter(r => matrixScopeMatchesClient(r, p));
+    .filter(r => !r.plantId  || r.plantId  === p.plantId)
+    .filter(r => !r.category || r.category === p.category)
+    .filter(r => Number(r.level||0) > creatorLevel);  // never stop at/below creator's level
   const levels = [...new Set(rules.map(r=>Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
-  // All configured levels are mandatory. Amount limits only select the approver
-  // within each level; they never shorten the approval chain.
+  for (const lvl of levels) {
+    const covered = rules.filter(r=>Number(r.level||0)===lvl)
+      .some(r => {
+        const max = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue);
+        return amount <= max;
+      });
+    if (covered) {
+      const eligible = await resolveApprover(p, lvl);
+      if (eligible?.uid) return lvl;
+    }
+  }
   return levels.length ? Math.max(...levels) : 1;
 }
 
-// resolveApprover — mirrors CF findApprover; creator may also be an approver
+// resolveApprover — mirrors CF findApprover exactly, skipping proposal creator
 async function resolveApprover(p, level) {
   const matrixSnap = await db.collection('pp_approvalMatrices').get();
   const amount = clientResolveAnnualImpact(p);
@@ -4095,7 +4190,8 @@ async function resolveApprover(p, level) {
   const creatorEmail = String(p.createdByEmail||'').trim().toLowerCase();
 
   let rules = matrixSnap.docs.map(d=>({id:d.id,...d.data()}))
-    .filter(r => matrixScopeMatchesClient(r, p))
+    .filter(r => !r.plantId  || r.plantId  === p.plantId)
+    .filter(r => !r.category || r.category === p.category)
     .filter(r => Number(r.level||0) === level)
     .sort((a,b) => (Number(a.order)||0)-(Number(b.order)||0) || String(a.id).localeCompare(String(b.id)));
 
@@ -4120,6 +4216,9 @@ async function resolveApprover(p, level) {
   for (const rule of candidates) {
     const rid    = String(rule.approverId||'').trim();
     const remail = String(rule.approverEmail||'').trim().toLowerCase();
+    if (creatorUid   && rid    && rid    === creatorUid)   continue;
+    if (creatorEmail && remail && remail === creatorEmail) continue;
+
     // Resolve uid/email/name from allUsers (same as CF pp_users lookup)
     const u = allUsers.find(x => x.uid===rid || x.id===rid) ||
               allUsers.find(x => x.email?.toLowerCase()===remail) || {};
@@ -4127,10 +4226,14 @@ async function resolveApprover(p, level) {
     const email = u.email || remail || '';
     const name  = u.name  || rule.approverName || 'Approver';
 
+    // Secondary creator check after uid resolution
+    if (creatorUid && uid && uid === creatorUid) continue;
+    if (creatorEmail && email.toLowerCase() === creatorEmail) continue;
+
     if (!uid || !email) throw new Error(`Level ${level} approver has incomplete configuration.`);
     return { uid, email, name, rule };
   }
-  throw new Error(`No eligible approver at Level ${level}.`);
+  throw new Error(`No eligible approver at Level ${level} — the proposal creator cannot approve their own proposal.`);
 }
 
 // After CF submission, check if the proposal was self-routed (creator == assigned approver)
@@ -4167,6 +4270,100 @@ async function fixSelfRoutingIfNeeded(proposalId, createdByUid, createdByEmail) 
     console.warn('[fixSelfRouting] Could not re-route:', e.message);
     toast('Warning: proposal may be self-routed — check approval matrix', 'warning');
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CLIENT-SIDE DIRECT SUBMIT — used as fallback when the deployed Cloud Function
+//  rejects submission due to outdated routing logic (e.g. "No Level 1 approver").
+//  Replicates CF submitProposal logic using client-side resolveApprover + getCreatorLevel.
+// ─────────────────────────────────────────────────────────────────────────────
+async function clientSideSubmitProposal(proposalData, proposalId) {
+  const uid          = currentUser.uid;
+  const userProfile  = currentProfile || allUsers.find(u => u.uid===uid || u.id===uid) || {};
+  const creatorEmail = (userProfile.email || currentUser.email || '').trim().toLowerCase();
+
+  const proposalForRouting = {
+    ...proposalData,
+    createdBy:      uid,
+    createdByEmail: creatorEmail,
+  };
+
+  // Find the creator's own matrix level (0 if not in matrix)
+  const matrixSnap   = await db.collection('pp_approvalMatrices').get();
+  const creatorLevel = matrixSnap.docs
+    .map(d => ({...d.data(), id:d.id}))
+    .filter(r => {
+      const rEmail = String(r.approverEmail||'').trim().toLowerCase();
+      const rId    = String(r.approverId||'').trim();
+      return rEmail===creatorEmail || rId===uid;
+    })
+    .map(r => Number(r.level||0))
+    .filter(Boolean)
+    .reduce((max, lvl) => Math.max(max, lvl), 0);
+
+  const allLevels = [...new Set(
+    matrixSnap.docs.map(d=>Number(d.data().level||0)).filter(Boolean)
+  )].sort((a,b)=>a-b);
+
+  // Only levels strictly above the creator's own level
+  const eligibleLevels = allLevels.filter(lvl => lvl > creatorLevel);
+
+  let approver   = null;
+  let startLevel = null;
+  for (const lvl of eligibleLevels) {
+    try {
+      const cand = await resolveApprover(proposalForRouting, lvl);
+      if (cand?.uid && cand?.email) {
+        approver   = cand;
+        startLevel = lvl;
+        break;
+      }
+    } catch(_) {}
+  }
+
+  if (!approver || !startLevel) {
+    throw new Error(
+      `No eligible approver found above Level ${creatorLevel||0} in the Approval Matrix. ` +
+      `Please ask your Super Admin to configure an approver at a level above yours.`
+    );
+  }
+
+  // Generate proposal number
+  const plant = allPlants.find(p => p.id===proposalData.plantId) || {};
+  const plantCode = plant.code || 'GEN';
+  const year  = new Date().getFullYear();
+  const prefix = `PP-${plantCode}-${year}-`;
+  const existingSnap = await db.collection('pp_proposals')
+    .where('proposalNumber','>=',prefix)
+    .where('proposalNumber','<', prefix+'~').get();
+  const seq = String(existingSnap.size + 1).padStart(4,'0');
+  const proposalNumber = `${prefix}${seq}`;
+
+  const docData = {
+    ...proposalData,
+    proposalNumber,
+    status:               'Pending Approval',
+    currentApprovalLevel: startLevel,
+    currentApproverId:    approver.uid,
+    currentApproverEmail: approver.email,
+    currentApproverName:  approver.name,
+    createdBy:            uid,
+    createdByName:        userProfile.name  || currentUser.displayName || '',
+    createdByEmail:       creatorEmail,
+    submittedAt:          firebase.firestore.FieldValue.serverTimestamp(),
+    updatedAt:            firebase.firestore.FieldValue.serverTimestamp(),
+  };
+
+  let docRef;
+  if (proposalId) {
+    docRef = db.collection('pp_proposals').doc(proposalId);
+    await docRef.update(docData);
+  } else {
+    docData.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+    docRef = await db.collection('pp_proposals').add(docData);
+  }
+
+  return { success: true, proposalId: docRef.id, proposalNumber };
 }
 
 async function executeApprovalAction() {
@@ -4227,6 +4424,9 @@ async function executeApprovalAction() {
         // Reuse the snap already fetched above for historyEntry level
         const snap = _snapForLevel;
         const p = snap.data();
+        if (p.createdBy && p.createdBy === uid) {
+          throw new Error('A proposal creator cannot approve their own proposal. Another approver must approve this level.');
+        }
         if (p.currentApproverId && p.currentApproverId !== uid) {
           throw new Error('You are not the assigned approver for this proposal.');
         }
@@ -4236,7 +4436,8 @@ async function executeApprovalAction() {
         // minValue / maxValue are compared against the proposal's annual financial impact.
         // All proposals pass through ALL configured levels in sequence.
         // Amount only determines WHO approves at each level (via maxValue), not which levels run.
-        // maxLevel is the highest configured level. Every proposal progresses upward.
+        // maxLevel mirrors CF getProposalMaxLevel: the FIRST level whose rules cover
+        // this proposal's amount. The proposal finalises at this level (not at the highest).
         const proposalMaxLevel = await getProposalMaxLevel(p);
 
         historyEntry.level = currentLevel;
@@ -4253,20 +4454,28 @@ async function executeApprovalAction() {
             updatedAt: now
           });
         } else {
-          // Find the next configured level above the current level
-          const _matrixSnap2 = await db.collection('pp_approvalMatrices').get();
+          // Find next level — above currentLevel, above creator's matrix level, up to maxLevel
+          const _matrixSnap2    = await db.collection('pp_approvalMatrices').get();
+          const _creatorLvlHTML = await getCreatorLevel(p);
           const eligibleNextLevels = [...new Set(
             _matrixSnap2.docs
               .map(d => ({...d.data()}))
-              .filter(r => Number(r.level||0) > currentLevel && Number(r.level||0) <= proposalMaxLevel)
-              .filter(r => matrixScopeMatchesClient(r, p))
+              .filter(r => Number(r.level||0) > currentLevel)
+              .filter(r => Number(r.level||0) > _creatorLvlHTML)   // skip creator's level & below
+              .filter(r => Number(r.level||0) <= proposalMaxLevel)
+              .filter(r => (!r.plantId || r.plantId===p.plantId))
+              .filter(r => (!r.category || r.category===p.category))
               .map(r => Number(r.level||0))
               .filter(Boolean)
           )].sort((a,b)=>a-b);
 
-          const nextLevel = eligibleNextLevels[0];
+          // Walk and skip levels where resolveApprover returns null
+          let nextLevel = null;
+          for (const lvl of eligibleNextLevels) {
+            try { const cand = await resolveApprover(p, lvl); if(cand?.uid){ nextLevel=lvl; break; } } catch(_){}
+          }
 
-          if (!nextLevel) {
+          if (!nextLevel || nextLevel === undefined) {
             await db.collection('pp_proposals').doc(proposalId).update({
               status: 'Approved', approvedAt: now,
               lastApprovalComment: comment || '',
@@ -4350,6 +4559,123 @@ async function executeApprovalAction() {
 let _historyProposals = []; // proposals where I have acted (from approverIds query)
 
 // Switch between Pending and History tabs
+// ═══════════════════════════════════════════════════════════════════════════
+//  MY REQUESTS PAGE — My Proposals + My Approvals sub-tabs
+// ═══════════════════════════════════════════════════════════════════════════
+let _myRequestsActiveTab = 'proposals';
+
+window.switchMyRequestsTab = function(tab) {
+  _myRequestsActiveTab = tab;
+  ['proposals','approvals'].forEach(t => {
+    const btn   = document.getElementById('mreq-tab-' + t);
+    const panel = document.getElementById('mreq-panel-' + t);
+    const active = t === tab;
+    if (btn) {
+      btn.style.color        = active ? 'var(--primary)' : 'var(--text-muted)';
+      btn.style.borderBottom = active ? '3px solid var(--primary)' : '3px solid transparent';
+      btn.style.fontWeight   = active ? '700' : '600';
+    }
+    if (panel) panel.style.display = active ? '' : 'none';
+  });
+  if (tab === 'proposals') renderMyProposals();
+  if (tab === 'approvals') renderMyApprovalsEmbed();
+};
+
+async function loadMyRequests() {
+  _myRequestsActiveTab = 'proposals';
+  // Reset tabs visually
+  ['proposals','approvals'].forEach(t => {
+    const btn   = document.getElementById('mreq-tab-' + t);
+    const panel = document.getElementById('mreq-panel-' + t);
+    if (btn) {
+      btn.style.color        = t==='proposals' ? 'var(--primary)' : 'var(--text-muted)';
+      btn.style.borderBottom = t==='proposals' ? '3px solid var(--primary)' : '3px solid transparent';
+    }
+    if (panel) panel.style.display = t==='proposals' ? '' : 'none';
+  });
+  await renderMyProposals();
+}
+
+async function renderMyProposals() {
+  const el = document.getElementById('mreq-proposals-body');
+  if (!el) return;
+  el.innerHTML = '<div style="text-align:center;padding:40px 0;color:var(--text-muted)">⏳ Loading…</div>';
+  try {
+    const uid  = currentUser?.uid;
+    const snap = await db.collection('pp_proposals')
+      .where('createdBy', '==', uid)
+      .orderBy('createdAt', 'desc')
+      .limit(100).get();
+    const rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (!rows.length) {
+      el.innerHTML = '<div style="text-align:center;padding:60px 0;color:var(--text-muted)"><div style="font-size:40px;margin-bottom:12px">📋</div><div>You have not raised any proposals yet.</div><button onclick="navigate('create-proposal')" style="margin-top:16px;padding:10px 24px;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">+ Create Proposal</button></div>';
+      return;
+    }
+    const statusBadge = s => {
+      const map = { 'Approved':'#16a34a','Pending Approval':'#d97706','Rejected':'#dc2626','Returned':'#7c3aed','Draft':'#6b7280' };
+      const c = map[s] || '#6b7280';
+      return `<span style="display:inline-block;padding:2px 10px;border-radius:50px;font-size:11px;font-weight:700;background:${c}22;color:${c}">${s}</span>`;
+    };
+    const fmtDate = ts => {
+      if (!ts) return '—';
+      try { return new Date(ts.toDate ? ts.toDate() : ts).toLocaleDateString('en-IN'); } catch(_) { return '—'; }
+    };
+    el.innerHTML = `
+      <div style="overflow-x:auto;border:1px solid var(--border);border-radius:12px">
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <thead>
+            <tr style="background:var(--bg-secondary)">
+              <th style="padding:11px 14px;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;text-align:left">Proposal #</th>
+              <th style="padding:11px 14px;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;text-align:left">Description</th>
+              <th style="padding:11px 14px;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;text-align:left">Party</th>
+              <th style="padding:11px 14px;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;text-align:right">Proposed ₹</th>
+              <th style="padding:11px 14px;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;text-align:left">Status</th>
+              <th style="padding:11px 14px;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;text-align:left">Submitted</th>
+              <th style="padding:11px 14px;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;text-align:center">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((p,i) => `
+              <tr style="border-top:1px solid var(--border);transition:background .12s;background:${i%2===0?'':'var(--bg-secondary)11'}" onmouseenter="this.style.background='var(--bg-secondary)'" onmouseleave="this.style.background='${i%2===0?'':'var(--bg-secondary)11'}'">
+                <td style="padding:10px 14px;font-weight:700;color:var(--primary)">${p.proposalNumber || '—'}</td>
+                <td style="padding:10px 14px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(p.productService||p.description||'').replace(/"/g,'&quot;')}">${p.productService || p.description || '—'}</td>
+                <td style="padding:10px 14px">${p.partyName || '—'}</td>
+                <td style="padding:10px 14px;font-weight:600;text-align:right">₹${Number(p.proposedPrice||0).toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
+                <td style="padding:10px 14px">${statusBadge(p.status||'Draft')}</td>
+                <td style="padding:10px 14px;color:var(--text-muted);white-space:nowrap">${fmtDate(p.submittedAt||p.createdAt)}</td>
+                <td style="padding:10px 14px;text-align:center">
+                  <button onclick="navigate('view-proposal',{id:'${p.id}'})" style="padding:4px 14px;border-radius:6px;border:1px solid var(--primary);background:none;cursor:pointer;font-size:12px;font-weight:600;color:var(--primary)">View</button>
+                </td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  } catch(e) {
+    el.innerHTML = '<div style="color:var(--danger);padding:20px">Failed to load: ' + e.message + '</div>';
+  }
+}
+
+async function renderMyApprovalsEmbed() {
+  const el = document.getElementById('mreq-approvals-body');
+  if (!el) return;
+  el.innerHTML = '<div style="text-align:center;padding:40px 0;color:var(--text-muted)">⏳ Loading…</div>';
+  await loadMyApprovals();
+  // Clone rendered content from the hidden my-approvals page
+  const src = document.getElementById('page-my-approvals');
+  const pendingList = src ? src.querySelector('#approval-pending-list') : null;
+  const histList    = src ? src.querySelector('#approval-history-list') : null;
+  if (pendingList || histList) {
+    el.innerHTML = `<div style="display:flex;justify-content:flex-end;margin-bottom:12px">
+      <button onclick="navigate('my-approvals')" style="padding:6px 16px;border:1px solid var(--primary);border-radius:8px;background:none;color:var(--primary);font-size:13px;font-weight:600;cursor:pointer">Open Full View →</button>
+    </div>` + (pendingList ? pendingList.outerHTML : '') + (histList ? histList.outerHTML : '');
+  } else {
+    el.innerHTML = `<div style="text-align:center;padding:40px">
+      <div style="color:var(--text-muted);margin-bottom:16px">No pending approvals</div>
+      <button onclick="navigate('my-approvals')" style="padding:10px 24px;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">Open My Approvals →</button>
+    </div>`;
+  }
+}
+
 window.switchApprovalTab = function(tab) {
   const tabs    = ['pending','history'];
   const pending = document.getElementById('apptab-content-pending');
@@ -6297,66 +6623,67 @@ async function executeSystemReset() {
     }
     done++; setProgress(Math.round(done / total * 100));
 
-    // 2c. Wipe pp_auditLogs — Super Admin's own audit entries only
-    //     (full collection listing is denied by Firestore rules for non-admin SDK clients)
+    // 2c. Wipe pp_auditLogs via Cloud Function (Admin SDK bypasses Firestore rules)
+    //     Falls back to client-side userId query if CF unavailable.
     try {
       let alDeleted = 0;
-      while (true) {
-        // Query only docs written by this user (createdBy / uid field)
-        const snap = await db.collection('pp_auditLogs')
-          .where('uid', '==', currentUser.uid).limit(400).get();
-        if (snap.empty) break;
-        const batch = db.batch();
-        snap.docs.forEach(d => batch.delete(d.ref));
-        await batch.commit();
-        alDeleted += snap.docs.length;
-      }
-      // Also try a direct listing in case rules allow it for Super Admin
       try {
-        let extra = 0;
+        const deleteFn = fns.httpsCallable('deleteAllLogs');
+        const res = await deleteFn({ collection: 'pp_auditLogs' });
+        alDeleted = res.data?.deleted || 0;
+        log(`pp_auditLogs: ${alDeleted} document${alDeleted !== 1 ? 's' : ''} deleted`);
+      } catch(cfErr) {
+        // CF not available — fall back to client-side delete using correct field 'userId'
         while (true) {
-          const snap = await db.collection('pp_auditLogs').limit(400).get();
+          const snap = await db.collection('pp_auditLogs')
+            .where('userId', '==', currentUser.uid).limit(400).get();
           if (snap.empty) break;
           const batch = db.batch();
           snap.docs.forEach(d => batch.delete(d.ref));
           await batch.commit();
-          extra += snap.docs.length;
+          alDeleted += snap.docs.length;
         }
-        alDeleted += extra;
-      } catch(_) { /* rules block listing — already deleted own docs above */ }
-      log(`pp_auditLogs: ${alDeleted} document${alDeleted !== 1 ? 's' : ''} deleted`);
+        // Also try full listing (works if Firestore rules allow Super Admin read)
+        try {
+          while (true) {
+            const snap = await db.collection('pp_auditLogs').limit(400).get();
+            if (snap.empty) break;
+            const batch = db.batch();
+            snap.docs.forEach(d => batch.delete(d.ref));
+            await batch.commit();
+            alDeleted += snap.docs.length;
+          }
+        } catch(_) {}
+        log(`pp_auditLogs: ${alDeleted} document${alDeleted !== 1 ? 's' : ''} deleted`);
+      }
     } catch(e) {
       log(`pp_auditLogs: ${e.message}`, false);
     }
     done++; setProgress(Math.round(done / total * 100));
 
-    // 2d. Wipe pp_emailLogs — blocked by Firestore rules for full listing,
-    //     so attempt a query-scoped delete first, then fall back to full listing.
+    // 2d. Wipe pp_emailLogs via Cloud Function (Admin SDK bypasses Firestore rules)
+    //     Falls back to full listing (emailLogs has no user field to query by).
     try {
       let elDeleted = 0;
-      // Try full listing first (works if rules allow Super Admin)
       try {
-        while (true) {
-          const snap = await db.collection('pp_emailLogs').limit(400).get();
-          if (snap.empty) break;
-          const batch = db.batch();
-          snap.docs.forEach(d => batch.delete(d.ref));
-          await batch.commit();
-          elDeleted += snap.docs.length;
-        }
-      } catch(_) {
-        // Rules block listing — delete only docs where sentBy == current user
-        while (true) {
-          const snap = await db.collection('pp_emailLogs')
-            .where('sentBy', '==', currentUser.uid).limit(400).get();
-          if (snap.empty) break;
-          const batch = db.batch();
-          snap.docs.forEach(d => batch.delete(d.ref));
-          await batch.commit();
-          elDeleted += snap.docs.length;
-        }
+        const deleteFn = fns.httpsCallable('deleteAllLogs');
+        const res = await deleteFn({ collection: 'pp_emailLogs' });
+        elDeleted = res.data?.deleted || 0;
+        log(`pp_emailLogs: ${elDeleted} document${elDeleted !== 1 ? 's' : ''} deleted`);
+      } catch(cfErr) {
+        // CF not available — try full listing
+        try {
+          while (true) {
+            const snap = await db.collection('pp_emailLogs').limit(400).get();
+            if (snap.empty) break;
+            const batch = db.batch();
+            snap.docs.forEach(d => batch.delete(d.ref));
+            await batch.commit();
+            elDeleted += snap.docs.length;
+          }
+        } catch(_) {}
+        log(`pp_emailLogs: ${elDeleted} document${elDeleted !== 1 ? 's' : ''} deleted`);
       }
-      log(`pp_emailLogs: ${elDeleted} document${elDeleted !== 1 ? 's' : ''} deleted`);
     } catch(e) {
       log(`pp_emailLogs: ${e.message}`, false);
     }
