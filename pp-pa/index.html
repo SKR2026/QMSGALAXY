@@ -4232,24 +4232,16 @@ function clientResolveAnnualImpact(p) {
   return Math.abs(Number(p.proposedPrice ?? p.newPrice ?? p.proposedAmount ?? 0));
 }
 
-// getProposalMaxLevel — mirrors CF exactly:
-// Returns the FIRST (lowest) level whose rules cover the proposal amount.
-// This is the STOP level; the proposal finalises here, not at the highest level.
+// getProposalMaxLevel — approval workflow uses the highest configured level.
+// IMPORTANT: Max Annual Impact determines the approver assigned at a level; it
+// does NOT stop the workflow at that level. Once a proposal is at L2, approval
+// must continue upward to L3, then finalise at the highest configured level.
 async function getProposalMaxLevel(p) {
   const matrixSnap = await db.collection('pp_approvalMatrices').get();
-  const amount = clientResolveAnnualImpact(p);
   const rules = matrixSnap.docs.map(d => ({id:d.id,...d.data()}))
     .filter(r => !r.plantId  || r.plantId  === p.plantId)
     .filter(r => !r.category || r.category === p.category);
   const levels = [...new Set(rules.map(r=>Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
-  for (const lvl of levels) {
-    const covered = rules.filter(r=>Number(r.level||0)===lvl)
-      .some(r => {
-        const max = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue);
-        return amount <= max;
-      });
-    if (covered) return lvl;
-  }
   return levels.length ? Math.max(...levels) : 1;
 }
 
@@ -4404,17 +4396,18 @@ async function executeApprovalAction() {
         if (p.createdBy && p.createdBy === uid) {
           throw new Error('A proposal creator cannot approve their own proposal. Another approver must approve this level.');
         }
-        if (p.currentApproverId && p.currentApproverId !== uid) {
+        if (!p.currentApproverId || p.currentApproverId !== uid) {
           throw new Error('You are not the assigned approver for this proposal.');
         }
-        const currentLevel = p.currentApprovalLevel || 1;
+        const currentLevel = Number(p.currentApprovalLevel || 1);
 
-        // Load matrix and compute eligible next levels for THIS proposal's annual impact.
-        // minValue / maxValue are compared against the proposal's annual financial impact.
-        // All proposals pass through ALL configured levels in sequence.
-        // Amount only determines WHO approves at each level (via maxValue), not which levels run.
-        // maxLevel mirrors CF getProposalMaxLevel: the FIRST level whose rules cover
-        // this proposal's amount. The proposal finalises at this level (not at the highest).
+        // The signed-in user may approve only the level currently assigned to them.
+        // Once approved, the proposal moves to the immediate next configured level.
+        // This is deliberately independent of the proposal amount.
+        // Approval is strictly upward: L1 → L2 → L3 → ... → highest configured level.
+        // Max Annual Impact is used only when resolving the approver for the current
+        // level. It must NEVER make an already-assigned L2 proposal jump back to L1
+        // or stop at L2.
         const proposalMaxLevel = await getProposalMaxLevel(p);
 
         historyEntry.level = currentLevel;
@@ -4431,7 +4424,8 @@ async function executeApprovalAction() {
             updatedAt: now
           });
         } else {
-          // Find next level — mirrors CF: only levels between currentLevel and proposalMaxLevel
+          // Find the immediate next configured level. Do not recalculate the
+          // workflow from the proposal amount and do not restart at Level 1.
           const _matrixSnap2 = await db.collection('pp_approvalMatrices').get();
           const eligibleNextLevels = [...new Set(
             _matrixSnap2.docs
