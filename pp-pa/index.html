@@ -6605,24 +6605,29 @@ async function executeSystemReset() {
       setProgress(Math.round(done / total * 100));
     }
 
-    // 2. Wipe pp_userActions for the current Super Admin user directly.
-    //    Firestore rules only allow each user to access their own doc + subcollection,
-    //    so we target uid directly instead of listing all docs (which would be denied).
+    // 2. Wipe ALL pp_userActions via Cloud Function (Admin SDK — bypasses per-user rules)
+    //    Falls back to deleting only the current user's own doc if CF unavailable.
     try {
-      // 2a. Delete the 'actions' subcollection docs under the current user's doc
       let uaDeleted = 0;
-      while (true) {
-        const snap = await db.collection('pp_userActions').doc(currentUser.uid)
-          .collection('actions').limit(400).get();
-        if (snap.empty) break;
-        const batch = db.batch();
-        snap.docs.forEach(d => batch.delete(d.ref));
-        await batch.commit();
-        uaDeleted += snap.docs.length;
+      try {
+        const deleteFn = fns.httpsCallable('deleteAllLogs');
+        const res = await deleteFn({ collection: 'pp_userActions' });
+        uaDeleted = res.data?.deleted || 0;
+        log(`pp_userActions: ${uaDeleted} document${uaDeleted !== 1 ? 's' : ''} deleted`);
+      } catch(cfErr) {
+        // CF not available — delete only own doc + subcollection
+        while (true) {
+          const snap = await db.collection('pp_userActions').doc(currentUser.uid)
+            .collection('actions').limit(400).get();
+          if (snap.empty) break;
+          const batch = db.batch();
+          snap.docs.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+          uaDeleted += snap.docs.length;
+        }
+        await db.collection('pp_userActions').doc(currentUser.uid).delete();
+        log(`pp_userActions: ${uaDeleted} action${uaDeleted !== 1 ? 's' : ''} deleted (own account only — deploy CF for full wipe)`);
       }
-      // 2b. Delete the parent user-actions doc itself
-      await db.collection('pp_userActions').doc(currentUser.uid).delete();
-      log(`pp_userActions: ${uaDeleted} action${uaDeleted !== 1 ? 's' : ''} deleted (your account)`);
     } catch(e) {
       log(`pp_userActions: ${e.message}`, false);
     }
