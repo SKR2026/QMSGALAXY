@@ -2506,7 +2506,9 @@ async function saveComparisonProposal(action){
     if(action==='Submit'){
       const submitFn=fns.httpsCallable('submitProposal');const result=await submitFn({proposalId:editingId||null,proposalData:data});
       if(!result.data.success)throw new Error(result.data.message||'Submission failed');
-      toast(`Proposal submitted for approval! #${result.data.proposalNumber}`,'success');await logAudit(result.data.proposalId,'Submitted',`Submitted 3-quotation proposal ${result.data.proposalNumber}`);navigate('proposals');
+      toast(`Proposal submitted for approval! #${result.data.proposalNumber}`,'success');await logAudit(result.data.proposalId,'Submitted',`Submitted 3-quotation proposal ${result.data.proposalNumber}`);
+      await fixSelfRoutingIfNeeded(result.data.proposalId, currentUser.uid, currentUser.email);
+      navigate('proposals');
     }else{
       if(editingId) await db.collection('pp_proposals').doc(editingId).update({...data,status:'Draft'}); else {data.status='Draft';data.createdBy=currentUser.uid;data.createdByName=currentProfile?.name||currentUser.email;data.createdByEmail=currentUser.email;data.createdAt=firebase.firestore.FieldValue.serverTimestamp();data.currentApprovalLevel=0;await db.collection('pp_proposals').add(data);}
       toast('Comparison draft saved','success');navigate('proposals');
@@ -3803,6 +3805,8 @@ async function saveProposal(action) {
       if (result.data.success) {
         toast(`Proposal submitted for approval! #${result.data.proposalNumber}`,'success');
         await logAudit(result.data.proposalId, 'Submitted', `Submitted proposal ${result.data.proposalNumber}`);
+        // Fix self-routing: if CF assigned the proposal back to its creator, re-route to correct approver
+        await fixSelfRoutingIfNeeded(result.data.proposalId, currentUser.uid, currentUser.email);
         navigate('proposals');
       } else {
         toast(result.data.message||'Submission failed','error');
@@ -4034,6 +4038,100 @@ function openApprovalModal(proposalId, action) {
   showModal('approval-modal-overlay');
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  SHARED: resolve the correct approver at a given level for a proposal,
+//  skipping the proposal creator so they never approve their own proposal.
+//  Returns { uid, email, name, rule } or throws.
+// ═══════════════════════════════════════════════════════════════════════════
+async function resolveApprover(p, level) {
+  const matrixSnap = await db.collection('pp_approvalMatrices').get();
+  const annualImpactRaw = p.annualImpact
+    ?? p.comparison?.annualImpact
+    ?? (p.comparison?.rows ?? []).reduce((s, r) => {
+         const rowImpacts = (r.quotations ?? []).map(q =>
+           Math.abs(((q.newPrice||0) - (q.existingPrice||0)) * (r.qtyMonth||0) * 12));
+         return s + (rowImpacts.length ? Math.max(...rowImpacts) : 0);
+       }, 0)
+    ?? 0;
+  const amount = Math.abs(Number(annualImpactRaw || p.proposedPrice || 0));
+
+  let rules = matrixSnap.docs
+    .map(d => ({id:d.id,...d.data()}))
+    .filter(r => (!r.plantId  || r.plantId  === p.plantId))
+    .filter(r => (!r.category || r.category === p.category))
+    .filter(r => Number(r.level||0) === level)
+    .sort((a,b) => (Number(a.order)||0) - (Number(b.order)||0));
+
+  // Amount-aware: pick rules whose maxValue covers the proposal amount
+  let matchedRules = rules.filter(r => {
+    const max = r.maxValue==null||r.maxValue==='' ? Infinity : Number(r.maxValue);
+    return amount <= max;
+  }).sort((a,b) => {
+    const maxA = a.maxValue==null||a.maxValue==='' ? Infinity : Number(a.maxValue);
+    const maxB = b.maxValue==null||b.maxValue==='' ? Infinity : Number(b.maxValue);
+    return maxA - maxB;
+  });
+  if (!matchedRules.length) matchedRules = [...rules].reverse();
+
+  // Skip the proposal creator
+  const creatorUid   = String(p.createdBy||'');
+  const creatorEmail = String(p.createdByEmail||'').trim().toLowerCase();
+  const eligibleRules = matchedRules.filter(r => {
+    const rid    = String(r.approverId||'');
+    const remail = String(r.approverEmail||'').trim().toLowerCase();
+    if (rid && rid === creatorUid) return false;
+    if (creatorEmail && remail === creatorEmail) return false;
+    return true;
+  });
+
+  const rule = eligibleRules[0];
+  if (!rule) throw new Error(
+    `No eligible approver at Level ${level} — the proposal creator cannot approve their own proposal.`
+  );
+
+  // Resolve uid/email/name from allUsers first, fall back to rule fields
+  const approver = allUsers.find(u => u.uid===rule.approverId || u.id===rule.approverId) || {};
+  const uid   = approver.uid || approver.id || rule.approverId || '';
+  const email = approver.email || rule.approverEmail || '';
+  const name  = approver.name  || rule.approverName  || 'Approver';
+
+  if (!uid || !email) throw new Error(`Level ${level} approver has incomplete configuration (missing uid or email).`);
+  return { uid, email, name, rule };
+}
+
+// After CF submission, check if the proposal was self-routed (creator == assigned approver)
+// and re-route to the correct approver if so.
+async function fixSelfRoutingIfNeeded(proposalId, createdByUid, createdByEmail) {
+  try {
+    const snap = await db.collection('pp_proposals').doc(proposalId).get();
+    if (!snap.exists) return;
+    const p = { id: snap.id, ...snap.data() };
+
+    const assignedId    = String(p.currentApproverId||'');
+    const assignedEmail = String(p.currentApproverEmail||'').trim().toLowerCase();
+    const creatorEmail  = String(createdByEmail||'').trim().toLowerCase();
+
+    const selfRouted = (assignedId && assignedId === createdByUid) ||
+                       (creatorEmail && assignedEmail === creatorEmail);
+    if (!selfRouted) return; // CF routed correctly — nothing to do
+
+    // CF self-routed — find the correct approver, skipping the creator
+    const level = p.currentApprovalLevel || 1;
+    const { uid, email, name, rule } = await resolveApprover(p, level);
+
+    await db.collection('pp_proposals').doc(proposalId).update({
+      currentApproverId:   uid,
+      currentApproverEmail: email,
+      currentApproverName:  name,
+      levelName: rule.levelName || null,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    console.log(`[fixSelfRouting] Re-routed L${level} from ${assignedEmail} → ${email}`);
+  } catch(e) {
+    console.warn('[fixSelfRouting] Could not re-route:', e.message);
+  }
+}
+
 async function executeApprovalAction() {
   if (!pendingAction) return;
   const { proposalId, action } = pendingAction;
@@ -4164,51 +4262,8 @@ async function executeApprovalAction() {
             return;
           }
 
-          // Select approver at nextLevel: find rule where amount <= maxValue (or no limit)
-          // Pick lowest maxValue that still covers the amount — most specific rule first
-          let rules = matrixSnap.docs
-            .map(d => ({id:d.id,...d.data()}))
-            .filter(r => (!r.plantId || r.plantId===p.plantId))
-            .filter(r => (!r.category || r.category===p.category))
-            .filter(r => Number(r.level||0)===nextLevel)
-            .sort((a,b)=>(Number(a.order)||0)-(Number(b.order)||0));
-
-          let matchedRules = rules.filter(r => {
-            const max = r.maxValue==null||r.maxValue==='' ? Infinity : Number(r.maxValue);
-            return amount <= max;
-          }).sort((a,b) => {
-            const maxA = a.maxValue==null||a.maxValue==='' ? Infinity : Number(a.maxValue);
-            const maxB = b.maxValue==null||b.maxValue==='' ? Infinity : Number(b.maxValue);
-            return maxA - maxB;
-          });
-          // Fallback: if amount exceeds all maxValues, use rule with highest maxValue
-          if (!matchedRules.length) matchedRules = [...rules].reverse();
-
-          // Filter out the proposal creator from the amount-matched rules.
-          // Use matchedRules (amount-aware, correctly sorted) not raw rules.
-          const creatorUid   = String(p.createdBy||'');
-          const creatorEmail = String(p.createdByEmail||'').trim().toLowerCase();
-          const eligibleRules = matchedRules.filter(r => {
-            const rid    = String(r.approverId||'');
-            const remail = String(r.approverEmail||'').trim().toLowerCase();
-            // Skip if this approver IS the proposal creator (by uid or email)
-            if (rid && rid === creatorUid) return false;
-            if (creatorEmail && remail === creatorEmail) return false;
-            return true;
-          });
-          const rule = eligibleRules[0];
-          if (!rule) {
-            throw new Error(`No eligible approver is configured for Level ${nextLevel}; the proposal creator cannot approve their own proposal.`);
-          }
-
-          const approver = allUsers.find(u=>u.uid===rule.approverId||u.id===rule.approverId) || {};
-          const nextUid = approver.uid || (approver.id && approver.id);
-          const nextEmail = approver.email || rule.approverEmail || '';
-          const nextName = approver.name || rule.approverName || 'Approver';
-
-          if (!nextUid || !nextEmail) {
-            throw new Error(`Level ${nextLevel} has an invalid approver configuration.`);
-          }
+          // Use shared resolveApprover — skips proposal creator, amount-aware
+          const { uid: nextUid, email: nextEmail, name: nextName, rule } = await resolveApprover(p, nextLevel);
 
           await db.collection('pp_proposals').doc(proposalId).update({
             status: 'Pending Approval',
