@@ -3336,8 +3336,20 @@ async function loadDashboard() {
         if(!merged.has(d.id)) merged.set(d.id,{id:d.id,...d.data()});
       });
       props = [...merged.values()];
+    } else if (currentProfile?.role === 'Viewer') {
+      // Viewer — all Approved proposals (for download) + their own created proposals
+      const safeGet = q => q.get().catch(()=>({docs:[]}));
+      const [approvedSnap, createdSnap] = await Promise.all([
+        safeGet(db.collection('pp_proposals').where('status','==','Approved').limit(100)),
+        safeGet(db.collection('pp_proposals').where('createdBy','==',currentUser.uid).limit(100))
+      ]);
+      const merged = new Map();
+      [...approvedSnap.docs, ...createdSnap.docs].forEach(d=>{
+        if(!merged.has(d.id)) merged.set(d.id,{id:d.id,...d.data()});
+      });
+      props = [...merged.values()];
     } else {
-      // Viewer — only their own created proposals
+      // Unknown role — only their own created proposals
       const snap = await db.collection('pp_proposals')
         .where('createdBy','==',currentUser.uid).limit(100).get();
       props = snap.docs.map(d=>({id:d.id,...d.data()}));
@@ -3404,6 +3416,7 @@ function dashboardStatClick(status) {
 }
 
 function isSuperAdmin() { return currentProfile?.role === 'Super Admin'; }
+function isViewer()    { return currentProfile?.role === 'Viewer'; }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  PROPOSALS LIST
@@ -3436,6 +3449,18 @@ async function loadProposals() {
         ]);
         const merged = new Map();
         [...assignedSnap.docs, ...createdSnap.docs, ...actedSnap.docs].forEach(d=>{
+          if(!merged.has(d.id)) merged.set(d.id,{id:d.id,...d.data()});
+        });
+        allProposals = [...merged.values()];
+      } else if (isViewer()) {
+        // Viewer: see all Approved proposals (for download/record) + own created proposals
+        const safeGet = q => q.get().catch(()=>({docs:[]}));
+        const [approvedSnap, createdSnap] = await Promise.all([
+          safeGet(db.collection('pp_proposals').where('status','==','Approved').limit(200)),
+          safeGet(db.collection('pp_proposals').where('createdBy','==',currentUser.uid).limit(200))
+        ]);
+        const merged = new Map();
+        [...approvedSnap.docs, ...createdSnap.docs].forEach(d=>{
           if(!merged.has(d.id)) merged.set(d.id,{id:d.id,...d.data()});
         });
         allProposals = [...merged.values()];
@@ -3495,7 +3520,7 @@ function filterProposals() {
         const plant = allPlants.find(pl=>pl.id===p.plantId);
         const diff  = p.proposedPrice - p.currentPrice;
         const pct   = p.currentPrice ? (diff/p.currentPrice*100) : 0;
-        const isMyTurn = p.status==='Pending Approval' && (p.currentApproverId===currentUser?.uid || isSuperAdmin());
+        const isMyTurn = !isViewer() && p.status==='Pending Approval' && (p.currentApproverId===currentUser?.uid || isSuperAdmin());
         return `<tr onclick="viewProposal('${p.id}')" style="cursor:pointer${isMyTurn ? ';background:#eff6ff;border-left:3px solid #1a56db' : ''}">
           ${isSuperAdmin() ? `<td onclick="event.stopPropagation()" style="padding:8px 10px"><input type="checkbox" class="proposal-cb" data-id="${p.id}" onchange="onProposalCbChange()" style="cursor:pointer"></td>` : ''}
           <td><strong>${esc(p.proposalNumber||'—')}</strong>${isMyTurn ? ' <span class="badge badge-myaction">🔔 My Turn</span>' : ''}</td>
@@ -3750,7 +3775,7 @@ async function viewProposal(id) {
     const plant  = allPlants.find(pl=>pl.id===p.plantId);
     const diff   = p.proposedPrice - p.currentPrice;
     const pct    = p.currentPrice ? (diff/p.currentPrice*100) : 0;
-    const isMyPending = p.status==='Pending Approval' && (p.currentApproverId===currentUser?.uid || isSuperAdmin());
+    const isMyPending = !isViewer() && p.status==='Pending Approval' && (p.currentApproverId===currentUser?.uid || isSuperAdmin());
 
     // Fetch history
     const histSnap   = await db.collection('pp_proposals').doc(id).collection('approvalHistory').orderBy('timestamp','asc').get();
@@ -3759,13 +3784,14 @@ async function viewProposal(id) {
     document.getElementById('vp-title').textContent = p.proposalNumber||'Draft Proposal';
 
     // Actions bar
-    const canEdit   = ['Draft','Returned'].includes(p.status) && p.createdBy===currentUser?.uid;
+    const _isViewer = isViewer();
+    const canEdit   = !_isViewer && ['Draft','Returned'].includes(p.status) && p.createdBy===currentUser?.uid;
     const canCancel = canEdit;
-    const canDL     = p.status==='Approved';
+    const canDL     = p.status==='Approved'; // Viewer + all roles can download Approved proposals
     document.getElementById('vp-actions').innerHTML = `
       ${canEdit   ? `<button class="btn btn-secondary" onclick="editProposal('${id}')">✏️ Edit</button>` : ''}
       ${canCancel ? `<button class="btn btn-secondary" onclick="cancelProposal('${id}')">🚫 Cancel</button>` : ''}
-      <button class="btn btn-secondary" onclick="exportProposalPDF('${id}')">🖨️ Export PDF</button>
+      ${!_isViewer ? `<button class="btn btn-secondary" onclick="exportProposalPDF('${id}')">🖨️ Export PDF</button>` : ''}
       ${canDL     ? `<button class="btn btn-success" onclick="downloadPDF('${id}')">📄 Download PDF</button>` : ''}
     `;
 
