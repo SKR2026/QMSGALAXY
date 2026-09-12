@@ -4039,75 +4039,114 @@ function openApprovalModal(proposalId, action) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SHARED: resolve the correct approver at a given level for a proposal,
-//  skipping the proposal creator so they never approve their own proposal.
-//  Returns { uid, email, name, rule } or throws.
+//  SHARED HELPERS — mirrors the Cloud Function routing logic exactly
 // ═══════════════════════════════════════════════════════════════════════════
+
+// Resolve annual impact — same priority order as CF resolveAnnualImpact
+function clientResolveAnnualImpact(p) {
+  if (p.annualImpact != null && Math.abs(Number(p.annualImpact)) !== 0)
+    return Math.abs(Number(p.annualImpact));
+  if (p.comparison?.annualImpact != null && Math.abs(Number(p.comparison.annualImpact)) !== 0)
+    return Math.abs(Number(p.comparison.annualImpact));
+  const rows = p.comparison?.rows;
+  if (Array.isArray(rows) && rows.length) {
+    const total = rows.reduce((s, r) => {
+      const qty = Number(r.qtyMonth||0);
+      if (!qty) return s;
+      const impacts = (r.quotations??[]).map(q =>
+        Math.abs((Number(q.newPrice||0) - Number(q.existingPrice||0)) * qty * 12));
+      return s + (impacts.length ? Math.max(...impacts) : 0);
+    }, 0);
+    if (total > 0) return total;
+  }
+  return Math.abs(Number(p.proposedPrice ?? p.newPrice ?? p.proposedAmount ?? 0));
+}
+
+// getProposalMaxLevel — mirrors CF exactly:
+// Returns the FIRST (lowest) level whose rules cover the proposal amount.
+// This is the STOP level; the proposal finalises here, not at the highest level.
+async function getProposalMaxLevel(p) {
+  const matrixSnap = await db.collection('pp_approvalMatrices').get();
+  const amount = clientResolveAnnualImpact(p);
+  const rules = matrixSnap.docs.map(d => ({id:d.id,...d.data()}))
+    .filter(r => !r.plantId  || r.plantId  === p.plantId)
+    .filter(r => !r.category || r.category === p.category);
+  const levels = [...new Set(rules.map(r=>Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
+  for (const lvl of levels) {
+    const covered = rules.filter(r=>Number(r.level||0)===lvl)
+      .some(r => {
+        const max = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue);
+        return amount <= max;
+      });
+    if (covered) return lvl;
+  }
+  return levels.length ? Math.max(...levels) : 1;
+}
+
+// resolveApprover — mirrors CF findApprover exactly, skipping proposal creator
 async function resolveApprover(p, level) {
   const matrixSnap = await db.collection('pp_approvalMatrices').get();
-  const annualImpactRaw = p.annualImpact
-    ?? p.comparison?.annualImpact
-    ?? (p.comparison?.rows ?? []).reduce((s, r) => {
-         const rowImpacts = (r.quotations ?? []).map(q =>
-           Math.abs(((q.newPrice||0) - (q.existingPrice||0)) * (r.qtyMonth||0) * 12));
-         return s + (rowImpacts.length ? Math.max(...rowImpacts) : 0);
-       }, 0)
-    ?? 0;
-  const amount = Math.abs(Number(annualImpactRaw || p.proposedPrice || 0));
+  const amount = clientResolveAnnualImpact(p);
+  const creatorUid   = String(p.createdBy||'').trim();
+  const creatorEmail = String(p.createdByEmail||'').trim().toLowerCase();
 
-  let rules = matrixSnap.docs
-    .map(d => ({id:d.id,...d.data()}))
-    .filter(r => (!r.plantId  || r.plantId  === p.plantId))
-    .filter(r => (!r.category || r.category === p.category))
+  let rules = matrixSnap.docs.map(d=>({id:d.id,...d.data()}))
+    .filter(r => !r.plantId  || r.plantId  === p.plantId)
+    .filter(r => !r.category || r.category === p.category)
     .filter(r => Number(r.level||0) === level)
-    .sort((a,b) => (Number(a.order)||0) - (Number(b.order)||0));
+    .sort((a,b) => (Number(a.order)||0)-(Number(b.order)||0) || String(a.id).localeCompare(String(b.id)));
 
-  // Amount-aware: pick rules whose maxValue covers the proposal amount
-  let matchedRules = rules.filter(r => {
-    const max = r.maxValue==null||r.maxValue==='' ? Infinity : Number(r.maxValue);
+  if (!rules.length) throw new Error(`No matrix rules found for Level ${level}.`);
+
+  // Amount-matched candidates (most specific first)
+  let candidates = rules.filter(r => {
+    const max = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue);
     return amount <= max;
   }).sort((a,b) => {
-    const maxA = a.maxValue==null||a.maxValue==='' ? Infinity : Number(a.maxValue);
-    const maxB = b.maxValue==null||b.maxValue==='' ? Infinity : Number(b.maxValue);
+    const maxA = (a.maxValue==null||a.maxValue==='') ? Infinity : Number(a.maxValue);
+    const maxB = (b.maxValue==null||b.maxValue==='') ? Infinity : Number(b.maxValue);
     return maxA - maxB;
   });
-  if (!matchedRules.length) matchedRules = [...rules].reverse();
-
-  // Skip the proposal creator
-  const creatorUid   = String(p.createdBy||'');
-  const creatorEmail = String(p.createdByEmail||'').trim().toLowerCase();
-  const eligibleRules = matchedRules.filter(r => {
-    const rid    = String(r.approverId||'');
-    const remail = String(r.approverEmail||'').trim().toLowerCase();
-    if (rid && rid === creatorUid) return false;
-    if (creatorEmail && remail === creatorEmail) return false;
-    return true;
+  if (!candidates.length) candidates = [...rules].sort((a,b)=>{
+    const maxA=(a.maxValue==null||a.maxValue==='')?Infinity:Number(a.maxValue);
+    const maxB=(b.maxValue==null||b.maxValue==='')?Infinity:Number(b.maxValue);
+    return maxB-maxA;
   });
 
-  const rule = eligibleRules[0];
-  if (!rule) throw new Error(
-    `No eligible approver at Level ${level} — the proposal creator cannot approve their own proposal.`
-  );
+  // Walk candidates, skip creator
+  for (const rule of candidates) {
+    const rid    = String(rule.approverId||'').trim();
+    const remail = String(rule.approverEmail||'').trim().toLowerCase();
+    if (creatorUid   && rid    && rid    === creatorUid)   continue;
+    if (creatorEmail && remail && remail === creatorEmail) continue;
 
-  // Resolve uid/email/name from allUsers first, fall back to rule fields
-  const approver = allUsers.find(u => u.uid===rule.approverId || u.id===rule.approverId) || {};
-  const uid   = approver.uid || approver.id || rule.approverId || '';
-  const email = approver.email || rule.approverEmail || '';
-  const name  = approver.name  || rule.approverName  || 'Approver';
+    // Resolve uid/email/name from allUsers (same as CF pp_users lookup)
+    const u = allUsers.find(x => x.uid===rid || x.id===rid) ||
+              allUsers.find(x => x.email?.toLowerCase()===remail) || {};
+    const uid   = u.uid || u.id || rid || '';
+    const email = u.email || remail || '';
+    const name  = u.name  || rule.approverName || 'Approver';
 
-  if (!uid || !email) throw new Error(`Level ${level} approver has incomplete configuration (missing uid or email).`);
-  return { uid, email, name, rule };
+    // Secondary creator check after uid resolution
+    if (creatorUid && uid && uid === creatorUid) continue;
+    if (creatorEmail && email.toLowerCase() === creatorEmail) continue;
+
+    if (!uid || !email) throw new Error(`Level ${level} approver has incomplete configuration.`);
+    return { uid, email, name, rule };
+  }
+  throw new Error(`No eligible approver at Level ${level} — the proposal creator cannot approve their own proposal.`);
 }
 
 // After CF submission, check if the proposal was self-routed (creator == assigned approver)
 // and re-route to the correct approver if so.
+// Uses same getProposalMaxLevel logic as CF so routing decisions are identical.
 async function fixSelfRoutingIfNeeded(proposalId, createdByUid, createdByEmail) {
   try {
     const snap = await db.collection('pp_proposals').doc(proposalId).get();
     if (!snap.exists) return;
     const p = { id: snap.id, ...snap.data() };
 
-    const assignedId    = String(p.currentApproverId||'');
+    const assignedId    = String(p.currentApproverId||'').trim();
     const assignedEmail = String(p.currentApproverEmail||'').trim().toLowerCase();
     const creatorEmail  = String(createdByEmail||'').trim().toLowerCase();
 
@@ -4115,20 +4154,22 @@ async function fixSelfRoutingIfNeeded(proposalId, createdByUid, createdByEmail) 
                        (creatorEmail && assignedEmail === creatorEmail);
     if (!selfRouted) return; // CF routed correctly — nothing to do
 
-    // CF self-routed — find the correct approver, skipping the creator
+    // CF self-routed — find the correct approver at this level, skipping the creator
     const level = p.currentApprovalLevel || 1;
     const { uid, email, name, rule } = await resolveApprover(p, level);
 
     await db.collection('pp_proposals').doc(proposalId).update({
-      currentApproverId:   uid,
+      currentApproverId:    uid,
       currentApproverEmail: email,
       currentApproverName:  name,
       levelName: rule.levelName || null,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
     console.log(`[fixSelfRouting] Re-routed L${level} from ${assignedEmail} → ${email}`);
+    toast(`Proposal re-routed to correct approver (${name})`, 'info');
   } catch(e) {
     console.warn('[fixSelfRouting] Could not re-route:', e.message);
+    toast('Warning: proposal may be self-routed — check approval matrix', 'warning');
   }
 }
 
@@ -4202,24 +4243,9 @@ async function executeApprovalAction() {
         // minValue / maxValue are compared against the proposal's annual financial impact.
         // All proposals pass through ALL configured levels in sequence.
         // Amount only determines WHO approves at each level (via maxValue), not which levels run.
-        const matrixSnap = await db.collection('pp_approvalMatrices').get();
-        const annualImpactRaw = p.annualImpact
-          ?? p.comparison?.annualImpact
-          ?? (p.comparison?.rows ?? []).reduce((s, r) => {
-               const rowImpacts = (r.quotations ?? []).map(q => Math.abs(((q.newPrice||0) - (q.existingPrice||0)) * (r.qtyMonth||0) * 12));
-               return s + (rowImpacts.length ? Math.max(...rowImpacts) : 0);
-             }, 0)
-          ?? 0;
-        const amount = Math.abs(Number(annualImpactRaw || p.proposedPrice || 0));
-
-        // maxLevel = highest level configured for this plant/category — all proposals reach it
-        const proposalMaxLevel = Math.max(...[1, ...matrixSnap.docs
-          .map(d => ({...d.data()}))
-          .filter(r => (!r.plantId || r.plantId===p.plantId))
-          .filter(r => (!r.category || r.category===p.category))
-          .map(r => Number(r.level||0))
-          .filter(Boolean)
-        ]);
+        // maxLevel mirrors CF getProposalMaxLevel: the FIRST level whose rules cover
+        // this proposal's amount. The proposal finalises at this level (not at the highest).
+        const proposalMaxLevel = await getProposalMaxLevel(p);
 
         historyEntry.level = currentLevel;
         historyEntry.action = 'Approved';
@@ -4235,11 +4261,12 @@ async function executeApprovalAction() {
             updatedAt: now
           });
         } else {
-          // Find next level — all levels run, no amount filter
+          // Find next level — mirrors CF: only levels between currentLevel and proposalMaxLevel
+          const _matrixSnap2 = await db.collection('pp_approvalMatrices').get();
           const eligibleNextLevels = [...new Set(
-            matrixSnap.docs
+            _matrixSnap2.docs
               .map(d => ({...d.data()}))
-              .filter(r => Number(r.level||0) > currentLevel)
+              .filter(r => Number(r.level||0) > currentLevel && Number(r.level||0) <= proposalMaxLevel)
               .filter(r => (!r.plantId || r.plantId===p.plantId))
               .filter(r => (!r.category || r.category===p.category))
               .map(r => Number(r.level||0))
