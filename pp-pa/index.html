@@ -1579,7 +1579,7 @@ html, body { overflow: hidden; }
             <!-- Super Admin only: clear selected approval-history actions -->
             <div id="approval-history-bulk-bar" class="approval-history-bulk-bar">
               <span id="approval-history-bulk-count" class="selected-count">0 selected</span>
-              <button class="btn btn-danger btn-sm" onclick="bulkClearApprovalHistory()">🗑 Clear Selected</button>
+              <button class="btn btn-danger btn-sm" onclick="bulkClearApprovalHistory()">🗑 Delete Selected</button>
               <button class="btn btn-ghost btn-sm" onclick="clearApprovalHistorySelection()">✕ Clear</button>
             </div>
             <div class="table-wrap">
@@ -1926,7 +1926,7 @@ html, body { overflow: hidden; }
               <div class="form-group"><label>Subject</label><input type="text" id="email-template-subject"></div>
               <div class="form-group"><label>Body (HTML supported)</label><textarea id="email-template-body" rows="10"></textarea></div>
               <div style="background:var(--surface2);border-radius:var(--radius);padding:10px;font-size:11px;color:var(--text2);margin-bottom:16px">
-                All email timestamps are displayed in IST (Asia/Kolkata). Available variables: {{proposalNumber}} {{plant}} {{creatorName}} {{approverName}} {{proposalAmount}} {{proposedAmount}} {{diffPercent}} {{approvalLevel}} {{submissionDate}} {{applicationLink}} {{comment}} {{magicLinkUrl}}
+                Available variables: {{proposalNumber}} {{plant}} {{creatorName}} {{approverName}} {{proposalAmount}} {{proposedAmount}} {{diffPercent}} {{approvalLevel}} {{submissionDate}} {{applicationLink}} {{comment}} {{magicLinkUrl}}
               </div>
               <div style="display:flex;justify-content:flex-end">
                 <button class="btn btn-primary" onclick="saveEmailTemplate()">Save Template</button>
@@ -2620,7 +2620,7 @@ const PAGE_SIZE     = 20;
 const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const fmt = n => Number(n||0).toLocaleString('en-IN', {minimumFractionDigits:2,maximumFractionDigits:2});
 
-// ── Display date/time helpers — ALWAYS IST (Asia/Kolkata) ───────────────────
+// ── Display date/time helpers — ALWAYS IST ─────────────────────────────────
 const DISPLAY_TIME_ZONE = 'Asia/Kolkata';
 const IST_DATE_TIME_FORMATTER = new Intl.DateTimeFormat('en-IN', {
   timeZone: DISPLAY_TIME_ZONE, day:'2-digit', month:'short', year:'numeric',
@@ -5860,6 +5860,10 @@ async function bulkClearApprovalHistory(){if(!isSuperAdmin()){toast('Super Admin
   snaps.forEach(snap=>{if(!snap.exists)return;const data=snap.data()||{},selected=selectedByProposal.get(snap.id)||[],history=Array.isArray(data.approvalHistory)?[...data.approvalHistory]:[];const indexes=[...new Set(selected.map(x=>x.actionIndex))].filter(i=>Number.isInteger(i)&&i>=0&&i<history.length).sort((a,b)=>b-a);indexes.forEach(i=>history.splice(i,1));const update={approvalHistory:history,updatedAt:firebase.firestore.FieldValue.serverTimestamp()};const remainingUserAction=history.some(h=>h&&(h.approverId===currentUser.uid||h.approverUid===currentUser.uid||h.uid===currentUser.uid));const selectedTypes=new Set(selected.map(x=>x.action));if(!remainingUserAction&&selectedTypes.has('Rejected')&&data.rejectedBy===currentUser.uid){update.rejectedBy=firebase.firestore.FieldValue.delete();update.rejectedByName=firebase.firestore.FieldValue.delete();update.rejectedAt=firebase.firestore.FieldValue.delete();update.rejectionReason=firebase.firestore.FieldValue.delete();}if(!remainingUserAction&&selectedTypes.has('Returned')&&data.returnedBy===currentUser.uid){update.returnedBy=firebase.firestore.FieldValue.delete();update.returnedByName=firebase.firestore.FieldValue.delete();update.returnedAt=firebase.firestore.FieldValue.delete();update.returnComment=firebase.firestore.FieldValue.delete();}updates.push({ref:snap.ref,data:update});});
   const operations=[...updates.map(x=>({type:'update',ref:x.ref,data:x.data})),...proposalIds.map(id=>({type:'delete',ref:db.collection('pp_userActions').doc(currentUser.uid).collection('actions').doc(id)}))];
   const BATCH_SIZE=450;for(let i=0;i<operations.length;i+=BATCH_SIZE){const batch=db.batch();operations.slice(i,i+BATCH_SIZE).forEach(op=>op.type==='delete'?batch.delete(op.ref):batch.update(op.ref,op.data));await batch.commit();}
+  // Also remove from in-memory userActionMapGlobal so stub rows don't persist
+  proposalIds.forEach(id=>{ if(window._userActionMapGlobal) delete window._userActionMapGlobal[id]; });
+  // Remove from _historyProposals cache too
+  _historyProposals=_historyProposals.filter(p=>!proposalIds.includes(p.id));
   clearApprovalHistorySelection();await loadMyApprovals();switchApprovalTab('history');await logAudit('bulk-history','Cleared Approval History',`Super Admin cleared ${keys.length} selected approval action(s).`);toast(`${keys.length} approval action${keys.length>1?'s':''} cleared`,'success');
 }catch(e){console.error('bulkClearApprovalHistory error:',e);toast('Clear failed: '+(e.message||'Unknown error'),'error');}} ,`Clear ${keys.length}`);}
 
@@ -6195,9 +6199,20 @@ async function executeSystemReset() {
     }
 
     // 2. Wipe pp_userActions subcollection 'actions' under every user doc
+    // First, explicitly wipe the current Super Admin's own actions subcollection
+    // (it may survive if the parent doc is deleted before the subcollection is read)
     try {
+      let selfDeleted = 0;
+      while (true) {
+        const snap = await db.collection('pp_userActions').doc(currentUser.uid).collection('actions').limit(400).get();
+        if (snap.empty) break;
+        const batch = db.batch();
+        snap.docs.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+        selfDeleted += snap.docs.length;
+      }
       const n = await wipeSubcollection('pp_userActions', 'actions');
-      log(`pp_userActions/*/actions: ${n} docs deleted`);
+      log(`pp_userActions/*/actions: ${n + selfDeleted} docs deleted`);
     } catch(e) {
       log(`pp_userActions subcollection: ${e.message}`, false);
     }
@@ -6239,6 +6254,12 @@ async function executeSystemReset() {
     allProposals = [];
     allPlants    = [];
     allUsers     = [currentProfile].filter(Boolean);
+
+    // 6. Clear in-memory approval-history caches so the History tab shows empty
+    _historyProposals          = [];
+    window._userActionMapGlobal = {};
+    window._historySelectedKeys = new Set();
+    clearApprovalHistorySelection();
 
     setProgress(100);
 
