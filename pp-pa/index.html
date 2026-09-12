@@ -6111,16 +6111,16 @@ async function executeSystemReset() {
     toast('Type RESET to confirm', 'warning'); return;
   }
 
-  // Collections to fully wipe
-  // pp_settings is wiped except we keep the doc keys so app can re-configure
+  // Collections to fully wipe (must be listable by Super Admin per Firestore rules).
+  // pp_auditLogs and pp_userActions are intentionally excluded here — they have
+  // per-user security rules that block listing by any single client. They are
+  // handled separately below with targeted (non-listing) direct deletes.
   const WIPE_COLLECTIONS = [
     'pp_proposals',
     'pp_plants',
     'pp_approvalMatrices',
     'pp_emailLogs',
     'pp_notifications',
-    'pp_auditLogs',
-    'pp_userActions',
     'pp_magicLinks',
     'pp_emailTemplates',
   ];
@@ -6182,7 +6182,7 @@ async function executeSystemReset() {
     return deleted;
   }
 
-  const total = WIPE_COLLECTIONS.length + 4; // +4 for users, settings, userActions subcol, pp_settings
+  const total = WIPE_COLLECTIONS.length + 5; // +5 for userActions, auditLogs, users, settings, pp_settings
   let done = 0;
 
   try {
@@ -6198,23 +6198,59 @@ async function executeSystemReset() {
       setProgress(Math.round(done / total * 100));
     }
 
-    // 2. Wipe pp_userActions subcollection 'actions' under every user doc
-    // First, explicitly wipe the current Super Admin's own actions subcollection
-    // (it may survive if the parent doc is deleted before the subcollection is read)
+    // 2. Wipe pp_userActions for the current Super Admin user directly.
+    //    Firestore rules only allow each user to access their own doc + subcollection,
+    //    so we target uid directly instead of listing all docs (which would be denied).
     try {
-      let selfDeleted = 0;
+      // 2a. Delete the 'actions' subcollection docs under the current user's doc
+      let uaDeleted = 0;
       while (true) {
-        const snap = await db.collection('pp_userActions').doc(currentUser.uid).collection('actions').limit(400).get();
+        const snap = await db.collection('pp_userActions').doc(currentUser.uid)
+          .collection('actions').limit(400).get();
         if (snap.empty) break;
         const batch = db.batch();
         snap.docs.forEach(d => batch.delete(d.ref));
         await batch.commit();
-        selfDeleted += snap.docs.length;
+        uaDeleted += snap.docs.length;
       }
-      const n = await wipeSubcollection('pp_userActions', 'actions');
-      log(`pp_userActions/*/actions: ${n + selfDeleted} docs deleted`);
+      // 2b. Delete the parent user-actions doc itself
+      await db.collection('pp_userActions').doc(currentUser.uid).delete();
+      log(`pp_userActions: ${uaDeleted} action${uaDeleted !== 1 ? 's' : ''} deleted (your account)`);
     } catch(e) {
-      log(`pp_userActions subcollection: ${e.message}`, false);
+      log(`pp_userActions: ${e.message}`, false);
+    }
+    done++; setProgress(Math.round(done / total * 100));
+
+    // 2c. Wipe pp_auditLogs — Super Admin's own audit entries only
+    //     (full collection listing is denied by Firestore rules for non-admin SDK clients)
+    try {
+      let alDeleted = 0;
+      while (true) {
+        // Query only docs written by this user (createdBy / uid field)
+        const snap = await db.collection('pp_auditLogs')
+          .where('uid', '==', currentUser.uid).limit(400).get();
+        if (snap.empty) break;
+        const batch = db.batch();
+        snap.docs.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+        alDeleted += snap.docs.length;
+      }
+      // Also try a direct listing in case rules allow it for Super Admin
+      try {
+        let extra = 0;
+        while (true) {
+          const snap = await db.collection('pp_auditLogs').limit(400).get();
+          if (snap.empty) break;
+          const batch = db.batch();
+          snap.docs.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+          extra += snap.docs.length;
+        }
+        alDeleted += extra;
+      } catch(_) { /* rules block listing — already deleted own docs above */ }
+      log(`pp_auditLogs: ${alDeleted} document${alDeleted !== 1 ? 's' : ''} deleted`);
+    } catch(e) {
+      log(`pp_auditLogs: ${e.message}`, false);
     }
     done++; setProgress(Math.round(done / total * 100));
 
