@@ -4,7 +4,7 @@ import path from 'path';
 
 export default defineConfig({
   plugins: [react()],
-  base: '/pp-5S/',           // ← serves all assets from /pp-5S/
+  base: '/pp-5s/',           // ← serves all assets from /pp-5S/
   resolve: {
     alias: { '@': path.resolve(__dirname, './src') }
   },
