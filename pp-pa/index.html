@@ -4552,15 +4552,34 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     );
   }
 
-  // Generate proposal number
+  // Generate proposal number using an atomic counter document instead of a
+  // collection query. A query across pp_proposals (e.g. WHERE proposalNumber
+  // BETWEEN x AND y with no createdBy filter) is REJECTED by Firestore with
+  // "permission-denied" for non-admins, because the security rule requires
+  // resource.data.createdBy == request.auth.uid and Firestore cannot guarantee
+  // that holds for every document the query could potentially match — it denies
+  // the entire query upfront rather than filtering results. This was the true
+  // root cause of "Missing or insufficient permissions" on submit, and it only
+  // started appearing once OTHER users' proposals existed in the same
+  // plant/year range (which is why the very first submitter never saw it).
   const plant = allPlants.find(p => p.id===proposalData.plantId) || {};
   const plantCode = plant.code || 'GEN';
   const year  = new Date().getFullYear();
   const prefix = `PP-${plantCode}-${year}-`;
-  const existingSnap = await db.collection('pp_proposals')
-    .where('proposalNumber','>=',prefix)
-    .where('proposalNumber','<', prefix+'~').get();
-  const seq = String(existingSnap.size + 1).padStart(4,'0');
+  const counterId  = `${plantCode}_${year}`;
+  const counterRef = db.collection('pp_counters').doc(counterId);
+  const seqNum = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(counterRef);
+    const current = snap.exists ? (snap.data().seq || 0) : 0;
+    const next = current + 1;
+    tx.set(counterRef, {
+      seq: next,
+      plantCode, year,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    return next;
+  });
+  const seq = String(seqNum).padStart(4,'0');
   const proposalNumber = `${prefix}${seq}`;
 
   const docData = {
