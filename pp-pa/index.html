@@ -2623,26 +2623,14 @@ async function saveComparisonProposal(action){
     if(attachments.length)data.attachments=attachments;
     if(_cmpStorageWarning)toast('⚠️ '+_cmpStorageWarning,'warning',10000);
     if(action==='Submit'){
+      // Client-side routing is primary — CF is notified after for emails only
       let _cmpResult = null;
+      _cmpResult = await clientSideSubmitProposal(data, editingId||null);
       try {
         const submitFn=fns.httpsCallable('submitProposal');
-        const cfCmp = await submitFn({proposalId:editingId||null,proposalData:data});
-        if (!cfCmp.data?.success) {
-          const msg = cfCmp.data?.message || '';
-          const isRoutingErr = msg.includes('Level') || msg.includes('approver') || msg.includes('matrix');
-          if (isRoutingErr) {
-            console.warn('[submit-comparison] CF routing error, using client-side fallback:', msg);
-            _cmpResult = await clientSideSubmitProposal(data, editingId||null);
-          } else {
-            _cmpResult = cfCmp.data;
-          }
-        } else {
-          _cmpResult = cfCmp.data;
-        }
-      } catch(cfErr) {
-        console.warn('[submit-comparison] CF threw, using client-side routing fallback:', cfErr.message);
-        _cmpResult = await clientSideSubmitProposal(data, editingId||null);
-      }
+        submitFn({proposalId:_cmpResult.proposalId||null,proposalData:data,notifyOnly:true})
+          .catch(e=>console.warn('[CF notify-cmp] non-fatal:',e.message));
+      } catch(_) {}
       if(!_cmpResult.success)throw new Error(_cmpResult.message||'Submission failed');
       toast(`Proposal submitted for approval! #${_cmpResult.proposalNumber}`,'success');await logAudit(_cmpResult.proposalId,'Submitted',`Submitted 3-quotation proposal ${_cmpResult.proposalNumber}`);
       await fixSelfRoutingIfNeeded(_cmpResult.proposalId, currentUser.uid, currentUser.email);
@@ -2652,8 +2640,9 @@ async function saveComparisonProposal(action){
       toast('Comparison draft saved','success');navigate('proposals');
     }
   }catch(e){
-    const _isPermErr = e.code==='permission-denied'||(e.message||'').toLowerCase().includes('permission');
-    toast(_isPermErr ? '🔒 Permission denied — your session may have expired. Please sign out and sign back in, then try again.' : (e.message||'Failed to save comparison proposal'), 'error', _isPermErr?8000:5000);
+    const _isRoutingErr2 = (e.message||'').includes('approver')||(e.message||'').includes('Level')||(e.message||'').includes('matrix')||(e.message||'').includes('Matrix');
+    const _isPermErr2    = !_isRoutingErr2&&(e.code==='permission-denied'||(e.message||'').toLowerCase().includes('permission'));
+    toast(_isPermErr2 ? '🔒 Permission denied — your session may have expired. Please sign out and sign back in, then try again.' : (e.message||'Failed to save comparison proposal'), 'error', _isPermErr2?8000:6000);
   }finally{btn.disabled=false;btn.textContent=action==='Submit'?'📤 Submit for Approval':'💾 Save Draft';}
 }
 async function loadComparisonForEdit(id){
@@ -4054,27 +4043,21 @@ async function saveProposal(action) {
     if (_storageWarning) toast('⚠️ ' + _storageWarning, 'warning', 10000);
 
     if (action === 'Submit') {
-      // Delegate submission to Cloud Function for secure workflow
+      // Client-side routing is the primary path — it correctly enforces the
+      // "creator routes upward only" rule (L0→L1→L2→L3, L1 creator→L2→L3, etc).
+      // The Cloud Function is called AFTER as an optional step for email notifications only.
       let _submitResult = null;
       try {
-        const submitFn = fns.httpsCallable('submitProposal');
-        const cfResult = await submitFn({ proposalId: editingId||null, proposalData: data });
-        // If CF returned success:false due to routing error, fall back to client-side
-        if (!cfResult.data?.success) {
-          const msg = cfResult.data?.message || '';
-          const isRoutingErr = msg.includes('Level') || msg.includes('approver') || msg.includes('matrix');
-          if (isRoutingErr) {
-            console.warn('[submit] CF routing error, using client-side fallback:', msg);
-            _submitResult = await clientSideSubmitProposal(data, editingId||null);
-          } else {
-            _submitResult = cfResult.data; // propagate other errors normally
-          }
-        } else {
-          _submitResult = cfResult.data;
-        }
-      } catch(cfErr) {
-        console.warn('[submit] CF threw, using client-side routing fallback:', cfErr.message);
         _submitResult = await clientSideSubmitProposal(data, editingId||null);
+        // After client-side routing succeeds, ping CF just for email notifications
+        // (fire-and-forget — we don't block on it or use its routing)
+        try {
+          const submitFn = fns.httpsCallable('submitProposal');
+          submitFn({ proposalId: _submitResult.proposalId||null, proposalData: data, notifyOnly: true })
+            .catch(e => console.warn('[CF notify] non-fatal:', e.message));
+        } catch(_) {}
+      } catch(routingErr) {
+        throw routingErr; // surface routing errors clearly
       }
       const result = { data: _submitResult };
       if (result.data.success) {
@@ -4105,10 +4088,14 @@ async function saveProposal(action) {
       navigate('proposals');
     }
   } catch(e) {
-    const _isPermErr = e.code === 'permission-denied' || (e.message||'').toLowerCase().includes('permission');
+    // Distinguish real Firestore permission errors from approval-matrix routing errors.
+    // Routing errors (no approver, incomplete config) must show their actual message
+    // so the admin knows to fix the matrix — not a misleading "session expired" message.
+    const _isRoutingErr = (e.message||'').includes('approver') || (e.message||'').includes('Level') || (e.message||'').includes('matrix') || (e.message||'').includes('Matrix');
+    const _isPermErr    = !_isRoutingErr && (e.code === 'permission-denied' || (e.message||'').toLowerCase().includes('permission'));
     toast(_isPermErr
       ? '🔒 Permission denied — your session may have expired. Please sign out and sign back in, then try again.'
-      : (e.message || 'Failed to save proposal'), 'error', _isPermErr ? 8000 : 5000);
+      : (e.message || 'Failed to save proposal'), 'error', _isPermErr ? 8000 : 6000);
   } finally {
     btn.disabled = false;
     btn.textContent = action==='Submit'?'📤 Submit for Approval':'💾 Save Draft';
@@ -4357,7 +4344,8 @@ async function getCreatorLevel(p) {
     .reduce((max,lvl)=>Math.max(max,lvl), 0);
 }
 
-// Returns the stop-level for this proposal — first level ABOVE creatorLevel that covers the amount.
+// Returns the final approval level for this proposal — the lowest level ABOVE
+// the creator's own level whose maxValue covers the proposal amount.
 async function getProposalMaxLevel(p) {
   const matrixSnap   = await db.collection('pp_approvalMatrices').get();
   const amount       = clientResolveAnnualImpact(p);
@@ -4365,7 +4353,7 @@ async function getProposalMaxLevel(p) {
   const rules = matrixSnap.docs.map(d => ({id:d.id,...d.data()}))
     .filter(r => !r.plantId  || r.plantId  === p.plantId)
     .filter(r => !r.category || r.category === p.category)
-    .filter(r => Number(r.level||0) > creatorLevel);  // never stop at/below creator's level
+    .filter(r => Number(r.level||0) > creatorLevel);  // only levels above creator
   const levels = [...new Set(rules.map(r=>Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
   for (const lvl of levels) {
     const covered = rules.filter(r=>Number(r.level||0)===lvl)
@@ -4429,10 +4417,13 @@ async function resolveApprover(p, level) {
     if (creatorUid && uid && uid === creatorUid) continue;
     if (creatorEmail && email.toLowerCase() === creatorEmail) continue;
 
-    if (!uid || !email) throw new Error(`Level ${level} approver has incomplete configuration.`);
+    if (!uid || !email) throw new Error(
+      `Level ${level} approver "${rule.approverName||remail||rid}" is missing or was deleted from pp_users. ` +
+      `Please update the Approval Matrix (Settings → Approval Matrix → Level ${level}) to assign a valid active user.`
+    );
     return { uid, email, name, rule };
   }
-  throw new Error(`No eligible approver at Level ${level} — the proposal creator cannot approve their own proposal.`);
+  throw new Error(`No eligible approver at Level ${level} — the assigned approver may have been deleted from the system. Please update the Approval Matrix.`);
 }
 
 // After CF submission, check if the proposal was self-routed (creator == assigned approver)
@@ -4487,14 +4478,21 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     createdByEmail: creatorEmail,
   };
 
-  // Find the creator's own matrix level (0 if not in matrix)
+  // ── Routing logic ────────────────────────────────────────────────────────
+  // Proposals always route UPWARD from the creator's level:
+  //   Level 0 (not in matrix) → L1 → L2 → L3
+  //   Level 1 creator         → L2 → L3
+  //   Level 2 creator         → L3
+  // resolveApprover skips the creator as an individual within each level.
   const matrixSnap   = await db.collection('pp_approvalMatrices').get();
+
+  // Determine the creator's own level in the matrix (0 if not listed)
   const creatorLevel = matrixSnap.docs
     .map(d => ({...d.data(), id:d.id}))
     .filter(r => {
       const rEmail = String(r.approverEmail||'').trim().toLowerCase();
       const rId    = String(r.approverId||'').trim();
-      return rEmail===creatorEmail || rId===uid;
+      return rEmail === creatorEmail || rId === uid;
     })
     .map(r => Number(r.level||0))
     .filter(Boolean)
@@ -4504,7 +4502,7 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     matrixSnap.docs.map(d=>Number(d.data().level||0)).filter(Boolean)
   )].sort((a,b)=>a-b);
 
-  // Only levels strictly above the creator's own level
+  // Only look at levels strictly above the creator's own level
   const eligibleLevels = allLevels.filter(lvl => lvl > creatorLevel);
 
   let approver   = null;
@@ -4517,13 +4515,15 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
         startLevel = lvl;
         break;
       }
-    } catch(_) {}
+    } catch(_) {
+      // This level had no eligible approver for this amount/plant/category — try next
+    }
   }
 
   if (!approver || !startLevel) {
     throw new Error(
       `No eligible approver found above Level ${creatorLevel||0} in the Approval Matrix. ` +
-      `Please ask your Super Admin to configure an approver at a level above yours.`
+      `Please ask your Super Admin to add an approver at a level above ${creatorLevel||0}.`
     );
   }
 
