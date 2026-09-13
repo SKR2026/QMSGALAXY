@@ -2594,6 +2594,13 @@ async function saveComparisonProposal(action){
   if(!plantId||!item){toast('Plant and Item are required','warning');return;}
   const btn=document.getElementById(action==='Submit'?'cmp-submit-btn':'cmp-save-draft-btn');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';
   try{
+    // Force-refresh token so custom claims (ppRole, ppPlantIds) are current before write
+    try {
+      await auth.currentUser.getIdToken(true);
+      const _profileSnap = await db.collection('pp_users').doc(currentUser.uid).get();
+      if (_profileSnap.exists) currentProfile = { uid: currentUser.uid, ..._profileSnap.data() };
+    } catch (_tokenErr) { console.warn('[saveCmpProposal] token refresh (non-fatal):', _tokenErr.message); }
+
     const d=getComparisonData(), plant=allPlants.find(p=>p.id===plantId);
     const attachments=[]; const editingId=comparisonField('cmp-editing-id');
     for(const file of comparisonFiles){const ref=storage.ref(`pp_proposals/comparison/${editingId||'new'}/${Date.now()}_${file.name}`);await ref.put(file);attachments.push({name:file.name,url:await ref.getDownloadURL(),size:file.size,type:file.type});}
@@ -2628,7 +2635,10 @@ async function saveComparisonProposal(action){
       if(editingId) await db.collection('pp_proposals').doc(editingId).update({...data,status:'Draft'}); else {data.status='Draft';data.createdBy=currentUser.uid;data.createdByName=currentProfile?.name||currentUser.email;data.createdByEmail=currentUser.email;data.createdAt=firebase.firestore.FieldValue.serverTimestamp();data.currentApprovalLevel=0;await db.collection('pp_proposals').add(data);}
       toast('Comparison draft saved','success');navigate('proposals');
     }
-  }catch(e){toast(e.message||'Failed to save comparison proposal','error');}finally{btn.disabled=false;btn.textContent=action==='Submit'?'📤 Submit for Approval':'💾 Save Draft';}
+  }catch(e){
+    const _isPermErr = e.code==='permission-denied'||(e.message||'').toLowerCase().includes('permission');
+    toast(_isPermErr ? '🔒 Permission denied — your session may have expired. Please sign out and sign back in, then try again.' : (e.message||'Failed to save comparison proposal'), 'error', _isPermErr?8000:5000);
+  }finally{btn.disabled=false;btn.textContent=action==='Submit'?'📤 Submit for Approval':'💾 Save Draft';}
 }
 async function loadComparisonForEdit(id){
   const p=allProposals.find(x=>x.id===id); if(!p?.comparison)return; const d=p.comparison;
@@ -3260,7 +3270,61 @@ auth.onAuthStateChanged(async user => {
       }
     } catch(e) {
       console.error('Profile load error', e);
-      currentProfile = { uid: user.uid, name: user.email, email: user.email, role: 'Viewer', plantIds: [] };
+      // If we cannot read/verify the pp_users doc (permission denied or missing),
+      // block access rather than silently assigning a Viewer role.
+      // A deleted or missing pp_users doc means the user has no valid PP profile
+      // and any Firestore/Storage writes would fail with "permission-denied" anyway.
+      if (e.code === 'permission-denied' || !e.code) {
+        // Attempt a second read after a short delay (handles transient token-refresh races)
+        try {
+          await new Promise(r => setTimeout(r, 1500));
+          const retrySnap = await db.collection('pp_users').doc(user.uid).get();
+          if (retrySnap.exists) {
+            currentProfile = { uid: user.uid, ...retrySnap.data() };
+          } else {
+            // Doc genuinely does not exist — sign out and show clear error
+            await auth.signOut();
+            currentUser = null; currentProfile = null;
+            document.getElementById('loading-screen').classList.add('hidden');
+            document.getElementById('auth-screen').style.display = '';
+            const errEl = document.getElementById('login-error');
+            if (errEl) {
+              errEl.textContent = 'Your account has been removed from the Price Proposal System. Please contact your administrator.';
+              errEl.style.display = 'block';
+            }
+            return;
+          }
+        } catch(retryErr) {
+          console.error('Profile load retry failed', retryErr);
+          await auth.signOut();
+          currentUser = null; currentProfile = null;
+          document.getElementById('loading-screen').classList.add('hidden');
+          document.getElementById('auth-screen').style.display = '';
+          const errEl = document.getElementById('login-error');
+          if (errEl) {
+            errEl.textContent = 'Unable to load your account profile. Please try again or contact your administrator.';
+            errEl.style.display = 'block';
+          }
+          return;
+        }
+      } else {
+        // Unknown error — fallback Viewer so the session isn't completely broken
+        currentProfile = { uid: user.uid, name: user.email, email: user.email, role: 'Viewer', plantIds: [] };
+      }
+    }
+
+    // Block deactivated (soft-deleted) users from accessing the app
+    if (currentProfile && currentProfile.status === 'Inactive') {
+      await auth.signOut();
+      currentUser = null; currentProfile = null;
+      document.getElementById('loading-screen').classList.add('hidden');
+      document.getElementById('auth-screen').style.display = '';
+      const errEl = document.getElementById('login-error');
+      if (errEl) {
+        errEl.textContent = 'Your account has been deactivated. Please contact your administrator.';
+        errEl.style.display = 'block';
+      }
+      return;
     }
 
     // Check for post-magic-link actions
@@ -3907,6 +3971,20 @@ async function saveProposal(action) {
   btn.disabled = true; btn.innerHTML = '<div class="spinner"></div>';
 
   try {
+    // Force-refresh the Firebase Auth ID token before any Firestore/Storage write.
+    // Custom claims (ppRole, ppPlantIds) set by Cloud Functions are not reflected
+    // in the token until the next refresh — stale claims are the most common cause
+    // of "Missing or insufficient permissions" on proposal saves for users whose
+    // plant assignments were recently added or changed.
+    try {
+      await auth.currentUser.getIdToken(true);
+      // Also re-read currentProfile from Firestore so ppPlantIdsFallback() is current
+      const _profileSnap = await db.collection('pp_users').doc(currentUser.uid).get();
+      if (_profileSnap.exists) currentProfile = { uid: currentUser.uid, ..._profileSnap.data() };
+    } catch (_tokenErr) {
+      console.warn('[saveProposal] token refresh (non-fatal):', _tokenErr.message);
+    }
+
     // Upload files
     const attachments = [];
     for (const file of uploadedFiles) {
@@ -4005,7 +4083,10 @@ async function saveProposal(action) {
       navigate('proposals');
     }
   } catch(e) {
-    toast(e.message||'Failed to save proposal','error');
+    const _isPermErr = e.code === 'permission-denied' || (e.message||'').toLowerCase().includes('permission');
+    toast(_isPermErr
+      ? '🔒 Permission denied — your session may have expired. Please sign out and sign back in, then try again.'
+      : (e.message || 'Failed to save proposal'), 'error', _isPermErr ? 8000 : 5000);
   } finally {
     btn.disabled = false;
     btn.textContent = action==='Submit'?'📤 Submit for Approval':'💾 Save Draft';
@@ -5172,19 +5253,37 @@ async function toggleUserStatus(id, currentStatus) {
 }
 
 async function deleteUser(id, name) {
+  // We soft-delete (deactivate) instead of hard-deleting the pp_users document.
+  //
+  // WHY: Firestore & Storage security rules check ppUserExists() / ppRegistered()
+  // which reads the pp_users doc. If the doc is hard-deleted while the user still
+  // has a valid Firebase Auth session, every subsequent Firestore/Storage write
+  // (including file uploads) returns "Missing or insufficient permissions" until
+  // the user's token expires — even for other users whose proposals reference
+  // the deleted UID in approverIds / currentApproverId fields.
+  //
+  // Soft-delete (status = 'Inactive') keeps the doc intact so rules pass,
+  // while blocking the user from accessing the app via the status check on login.
   window.confirm(
-    '🗑 Delete User?',
-    `Are you sure you want to permanently delete <strong>${name}</strong>?<br><br><span style="color:var(--danger);font-size:13px">⚠️ This will remove the user from the Price Proposal system. This action cannot be undone.</span>`,
+    '🚫 Deactivate User?',
+    `Are you sure you want to deactivate <strong>${name}</strong>?<br><br>
+     <span style="color:var(--warning);font-size:13px">⚠️ Their account will be disabled and they will no longer be able to sign in. Historical proposals and audit records are preserved.</span><br><br>
+     <span style="font-size:12px;color:var(--text2)">To permanently delete the Firebase Auth account, use the Firebase Console.</span>`,
     async () => {
       try {
-        await db.collection('pp_users').doc(id).delete();
-        const idx = allUsers.findIndex(u => u.id === id);
-        if (idx >= 0) allUsers.splice(idx, 1);
-        toast('User deleted successfully', 'success');
+        await db.collection('pp_users').doc(id).update({
+          status: 'Inactive',
+          deactivatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+          deactivatedBy: currentUser.uid
+        });
+        // Update local cache so the table re-renders immediately
+        const u = allUsers.find(u => u.id === id);
+        if (u) { u.status = 'Inactive'; }
+        toast(`"${name}" has been deactivated`, 'success');
         renderUsersTable();
-        await logAudit(id, 'Deleted', `User "${name}" deleted from pp_users`);
+        await logAudit(id, 'Deactivated', `User "${name}" deactivated (soft-delete) from pp_users`);
       } catch(e) {
-        toast(e.message || 'Failed to delete user', 'error');
+        toast(e.message || 'Failed to deactivate user', 'error');
       }
     }
   );
