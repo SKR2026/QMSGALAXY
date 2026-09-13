@@ -4342,7 +4342,10 @@ async function getCreatorLevel(p) {
     .filter(r => {
       const rEmail = String(r.approverEmail||'').trim().toLowerCase();
       const rId    = String(r.approverId||'').trim();
-      return (creatorUid && rId===creatorUid) || (creatorEmail && rEmail===creatorEmail);
+      const rUid   = String(r.uid||'').trim();
+      // Match by email, approverId (doc ID), or uid field — all three for robustness
+      return (creatorEmail && rEmail === creatorEmail) ||
+             (creatorUid && (rId === creatorUid || rUid === creatorUid));
     })
     .map(r=>Number(r.level||0))
     .filter(Boolean)
@@ -4491,17 +4494,28 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   // resolveApprover skips the creator as an individual within each level.
   const matrixSnap   = await db.collection('pp_approvalMatrices').get();
 
-  // Determine the creator's own level in the matrix (0 if not listed)
-  const creatorLevel = matrixSnap.docs
-    .map(d => ({...d.data(), id:d.id}))
+  // Determine the creator's own level in the matrix (0 if not listed).
+  // Match by ANY of: approverId, approverEmail, or uid field stored in the matrix doc.
+  // approverId may be the Firestore doc ID OR the Firebase Auth UID — check both.
+  const _matrixRules = matrixSnap.docs.map(d => ({...d.data(), id:d.id}));
+  console.log('[routing] creatorUid:', uid, '| creatorEmail:', creatorEmail);
+  console.log('[routing] matrix rules:', _matrixRules.map(r=>({level:r.level,approverId:r.approverId,approverEmail:r.approverEmail,uid:r.uid})));
+
+  const creatorLevel = _matrixRules
     .filter(r => {
       const rEmail = String(r.approverEmail||'').trim().toLowerCase();
       const rId    = String(r.approverId||'').trim();
-      return rEmail === creatorEmail || rId === uid;
+      const rUid   = String(r.uid||'').trim();
+      const match  = (creatorEmail && rEmail === creatorEmail) ||
+                     (uid && (rId === uid || rUid === uid));
+      console.log(`[routing] level ${r.level} approver: email="${rEmail}" id="${rId}" uid="${rUid}" → match=${match}`);
+      return match;
     })
     .map(r => Number(r.level||0))
     .filter(Boolean)
     .reduce((max, lvl) => Math.max(max, lvl), 0);
+
+  console.log('[routing] resolved creatorLevel:', creatorLevel);
 
   const allLevels = [...new Set(
     matrixSnap.docs.map(d=>Number(d.data().level||0)).filter(Boolean)
@@ -5458,6 +5472,7 @@ async function saveMatrixRule() {
     level, levelName, approverId,
     approverName: approver.name||'',
     approverEmail:approver.email||'',
+    uid: approver.uid||approver.id||approverId||'',
     minValue:  parseFloat(document.getElementById('mm-min-val').value)||0,
     maxValue:  parseFloat(document.getElementById('mm-max-val').value)||null,
     maxPctChange: parseFloat(document.getElementById('mm-max-pct').value)||null,
