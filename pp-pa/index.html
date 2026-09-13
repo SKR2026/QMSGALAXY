@@ -1695,7 +1695,7 @@ html, body { overflow: hidden; }
           </div>
         </div>
         <div style="background:var(--warning-bg);border:1px solid #fcd34d;border-radius:var(--radius);padding:12px 16px;margin-bottom:20px;font-size:13px;">
-          ⚠️ <strong>Important:</strong> Every proposal passes through <strong>all levels in sequence</strong> (L1 → L2 → L3). <strong>Max Annual Impact</strong> determines which approver handles the proposal at each level — set lower max for junior approvers, leave blank for senior/final approvers. Changes apply to newly submitted proposals only.
+          ⚠️ <strong>Important:</strong> Proposals route <strong>upward from the creator's level</strong>. A Proposal Creator (not in matrix) starts at L1. A Level 1 approver who creates a proposal starts at L2, and so on. <strong>Max Annual Impact</strong> at each level determines the final approval authority — the proposal stops at the first level whose max covers the amount. Leave blank for no upper limit. Changes apply to newly submitted proposals only.
         </div>
         <div class="card">
           <div class="table-wrap">
@@ -2623,14 +2623,23 @@ async function saveComparisonProposal(action){
     if(attachments.length)data.attachments=attachments;
     if(_cmpStorageWarning)toast('⚠️ '+_cmpStorageWarning,'warning',10000);
     if(action==='Submit'){
-      // Client-side routing is primary — CF is notified after for emails only
+      // CF is primary; client-side is fallback only
       let _cmpResult = null;
-      _cmpResult = await clientSideSubmitProposal(data, editingId||null);
       try {
         const submitFn=fns.httpsCallable('submitProposal');
-        submitFn({proposalId:_cmpResult.proposalId||null,proposalData:data,notifyOnly:true})
-          .catch(e=>console.warn('[CF notify-cmp] non-fatal:',e.message));
-      } catch(_) {}
+        const cfCmp = await submitFn({proposalId:editingId||null,proposalData:data});
+        if (!cfCmp.data?.success) {
+          const msg = cfCmp.data?.message || '';
+          const isRoutingErr = msg.includes('Level')||msg.includes('approver')||msg.includes('matrix')||msg.includes('Matrix');
+          if (isRoutingErr) {
+            console.warn('[submit-cmp] CF routing error, client-side fallback:', msg);
+            _cmpResult = await clientSideSubmitProposal(data, editingId||null);
+          } else { _cmpResult = cfCmp.data; }
+        } else { _cmpResult = cfCmp.data; }
+      } catch(cfErr) {
+        console.warn('[submit-cmp] CF threw, client-side fallback:', cfErr.message);
+        _cmpResult = await clientSideSubmitProposal(data, editingId||null);
+      }
       if(!_cmpResult.success)throw new Error(_cmpResult.message||'Submission failed');
       toast(`Proposal submitted for approval! #${_cmpResult.proposalNumber}`,'success');await logAudit(_cmpResult.proposalId,'Submitted',`Submitted 3-quotation proposal ${_cmpResult.proposalNumber}`);
       await fixSelfRoutingIfNeeded(_cmpResult.proposalId, currentUser.uid, currentUser.email);
@@ -4043,21 +4052,27 @@ async function saveProposal(action) {
     if (_storageWarning) toast('⚠️ ' + _storageWarning, 'warning', 10000);
 
     if (action === 'Submit') {
-      // Client-side routing is the primary path — it correctly enforces the
-      // "creator routes upward only" rule (L0→L1→L2→L3, L1 creator→L2→L3, etc).
-      // The Cloud Function is called AFTER as an optional step for email notifications only.
+      // CF is primary for submission and email notifications.
+      // Client-side routing is fallback only if CF throws or returns a routing error.
       let _submitResult = null;
       try {
+        const submitFn = fns.httpsCallable('submitProposal');
+        const cfResult = await submitFn({ proposalId: editingId||null, proposalData: data });
+        if (!cfResult.data?.success) {
+          const msg = cfResult.data?.message || '';
+          const isRoutingErr = msg.includes('Level') || msg.includes('approver') || msg.includes('matrix') || msg.includes('Matrix');
+          if (isRoutingErr) {
+            console.warn('[submit] CF routing error, using client-side fallback:', msg);
+            _submitResult = await clientSideSubmitProposal(data, editingId||null);
+          } else {
+            _submitResult = cfResult.data;
+          }
+        } else {
+          _submitResult = cfResult.data;
+        }
+      } catch(cfErr) {
+        console.warn('[submit] CF threw, using client-side routing fallback:', cfErr.message);
         _submitResult = await clientSideSubmitProposal(data, editingId||null);
-        // After client-side routing succeeds, ping CF just for email notifications
-        // (fire-and-forget — we don't block on it or use its routing)
-        try {
-          const submitFn = fns.httpsCallable('submitProposal');
-          submitFn({ proposalId: _submitResult.proposalId||null, proposalData: data, notifyOnly: true })
-            .catch(e => console.warn('[CF notify] non-fatal:', e.message));
-        } catch(_) {}
-      } catch(routingErr) {
-        throw routingErr; // surface routing errors clearly
       }
       const result = { data: _submitResult };
       if (result.data.success) {
