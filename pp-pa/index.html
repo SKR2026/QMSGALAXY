@@ -4868,8 +4868,11 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   const plant = allPlants.find(p => p.id===proposalData.plantId) || {};
   const plantCode = plant.code || 'GEN';
   const year  = new Date().getFullYear();
+  // Use a GLOBAL counter per year (not per plant) so proposal numbers are unique
+  // across ALL plants and form types — e.g., PP-YNR-2026-0001, PP-BWL-2026-0002
+  // (plant code is still in the label for context, but sequence is global)
   const prefix = `PP-${plantCode}-${year}-`;
-  const counterId  = `${plantCode}_${year}`;
+  const counterId  = `GLOBAL_${year}`;   // <-- single shared counter for all plants/forms
   const counterRef = db.collection('pp_counters').doc(counterId);
   const seqNum = await db.runTransaction(async (tx) => {
     const snap = await tx.get(counterRef);
@@ -4877,7 +4880,7 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     const next = current + 1;
     tx.set(counterRef, {
       seq: next,
-      plantCode, year,
+      year,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
     return next;
@@ -5454,14 +5457,34 @@ window.renderHistoryTable = function() {
   }
 
   rows.sort((a,b)=>new Date(b.action.actionAt||0)-new Date(a.action.actionAt||0));
-  const approved=rows.filter(r=>r.action.action==='Approved').length;
-  const rejected=rows.filter(r=>r.action.action==='Rejected').length;
-  const returned=rows.filter(r=>r.action.action==='Returned').length;
+
+  // Deduplicate: one row per proposal, showing the most recent action but
+  // collecting all level actions so user can see "L2 ✓, L3 ✓" in one row.
+  const proposalRowMap = new Map();
+  rows.forEach(r => {
+    const pid = r.proposal.id;
+    if (!proposalRowMap.has(pid)) {
+      proposalRowMap.set(pid, { ...r, allActions: [r.action] });
+    } else {
+      const existing = proposalRowMap.get(pid);
+      existing.allActions.push(r.action);
+      // keep the most recent action as the primary
+      if (new Date(r.action.actionAt||0) > new Date(existing.action.actionAt||0)) {
+        proposalRowMap.set(pid, { ...r, allActions: existing.allActions });
+      }
+    }
+  });
+  const dedupedRows = [...proposalRowMap.values()];
+  dedupedRows.sort((a,b)=>new Date(b.action.actionAt||0)-new Date(a.action.actionAt||0));
+
+  const approved=dedupedRows.filter(r=>r.action.action==='Approved').length;
+  const rejected=dedupedRows.filter(r=>r.action.action==='Rejected').length;
+  const returned=dedupedRows.filter(r=>r.action.action==='Returned').length;
   const el=id=>document.getElementById(id);
   if(el('hist-count-approved')) el('hist-count-approved').textContent=approved;
   if(el('hist-count-rejected')) el('hist-count-rejected').textContent=rejected;
   if(el('hist-count-returned')) el('hist-count-returned').textContent=returned;
-  if(el('hist-count-total')) el('hist-count-total').textContent=rows.length;
+  if(el('hist-count-total')) el('hist-count-total').textContent=dedupedRows.length;
 
   const selectTh=el('history-bulk-select-th'), bulkBar=el('approval-history-bulk-bar');
   if(selectTh) selectTh.style.display=superAdmin?'':'none';
@@ -5474,16 +5497,30 @@ window.renderHistoryTable = function() {
     Rejected:'<span style="display:inline-flex;align-items:center;gap:4px;background:#fee2e2;color:#dc2626;padding:3px 10px;border-radius:50px;font-size:12px;font-weight:700">✕ Rejected</span>',
     Returned:'<span style="display:inline-flex;align-items:center;gap:4px;background:#fef3c7;color:#d97706;padding:3px 10px;border-radius:50px;font-size:12px;font-weight:700">↩ Returned</span>'
   };
-  tbody.innerHTML=rows.length?rows.map(({proposal:p,plant,action:h,selectionKey})=>{
+  tbody.innerHTML=dedupedRows.length?dedupedRows.map(({proposal:p,plant,action:h,selectionKey,allActions})=>{
     const checked=window._historySelectedKeys.has(selectionKey);
+    // Build level pills showing all levels actioned (e.g. L2 ✓, L3 ✓)
+    const sortedActions = [...(allActions||[h])].sort((a,b)=>(a.level||0)-(b.level||0));
+    const levelPills = sortedActions.map(a => {
+      const color = a.action==='Approved'?'#16a34a':a.action==='Rejected'?'#dc2626':'#d97706';
+      const icon  = a.action==='Approved'?'✓':a.action==='Rejected'?'✕':'↩';
+      return `<span title="${esc(a.approverName||'')} — ${esc(a.actionAt||'')}" style="display:inline-flex;align-items:center;gap:2px;background:${color}22;color:${color};padding:2px 7px;border-radius:50px;font-size:11px;font-weight:700;margin-right:3px">L${a.level||'?'} ${icon}</span>`;
+    }).join('');
+    // Most recent action date
+    const latestDate = sortedActions.reduce((latest, a) => {
+      const t = new Date(a.actionAt||0).getTime();
+      return t > new Date(latest||0).getTime() ? a.actionAt : latest;
+    }, null);
+    const latestComment = sortedActions.filter(a=>a.comment).map(a=>`L${a.level}: ${a.comment}`).join(' | ') || '';
     return `<tr onclick="viewProposal('${p.id}')" style="cursor:pointer" title="Click to view proposal">
       ${superAdmin?`<td onclick="event.stopPropagation()" style="padding:8px 10px;text-align:center"><input type="checkbox" class="history-cb" data-key="${encodeURIComponent(selectionKey)}" ${checked?'checked':''} onchange="onHistoryCbChange(this)" title="Select this approval action"></td>`:''}
       <td><strong>${esc(p.proposalNumber||'—')}</strong></td><td>${esc(plant?.name||p.plantId||'—')}</td><td>${esc(p.partyName||'—')}</td>
       <td style="max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(p.productService||p.description||'—')}</td>
       <td>₹${fmt(p.proposedPrice)}</td><td style="color:${(p.diffPercent||0)>=0?'var(--success)':'var(--danger)'}">${(p.diffPercent||0)>=0?'+':''}${(p.diffPercent||0).toFixed(1)}%</td>
-      <td>${actionBadge[h.action]||h.action}</td><td style="text-align:center"><span class="badge badge-pending">L${h.level||'—'}</span></td>
-      <td style="white-space:nowrap;font-size:12px">${h.actionAt?fmtDateTime(h.actionAt):'—'}</td>
-      <td style="max-width:180px;font-size:12px;color:var(--text2);font-style:${h.comment?'normal':'italic'}">${esc(h.comment||'No comment')}</td>
+      <td>${actionBadge[h.action]||h.action}</td>
+      <td style="text-align:left;white-space:nowrap">${levelPills}</td>
+      <td style="white-space:nowrap;font-size:12px">${latestDate?fmtDateTime(latestDate):'—'}</td>
+      <td style="max-width:180px;font-size:12px;color:var(--text2);font-style:${latestComment?'normal':'italic'}">${esc(latestComment||'No comment')}</td>
       <td><span class="badge badge-${(p.status||'draft').toLowerCase().replace(/\s/g,'')}">${p.status||'—'}</span></td>
     </tr>`;
   }).join(''):`<tr><td colspan="${superAdmin?12:11}"><div class="empty-state" style="padding:32px"><div class="empty-icon">📋</div><h3>No history yet</h3><p>Proposals you approve, reject or return will appear here</p></div></td></tr>`;
@@ -6678,9 +6715,60 @@ function buildStandardPDFHTML(p, plant, diff, pct, history) {
       </div>
     </div>
 
-    ${pdfSignatureRow(['Prepared By','Checked By','Approved By'])}
+    ${buildPDFApprovalSignatures(history, p)}
     ${pdfFooter()}
   </div>`;
+}
+
+// ── Build approval authority signature blocks with names + date/time ──────────
+function buildPDFApprovalSignatures(history, p) {
+  // Collect all authority entries: creator + each approval action
+  const entries = [];
+
+  // Creator (Prepared By)
+  entries.push({
+    label: 'Prepared By',
+    name: p ? pdfEsc(p.createdByName || '—') : '—',
+    sub: p ? pdfEsc(p.createdByEmail || '') : '',
+    date: p ? (fmtDateTime(p.createdAt) || '') : ''
+  });
+
+  // Approval history entries (Checked By / Approved By per level)
+  const levelLabels = { 1: 'Checked By (L1)', 2: 'Authorised By (L2)', 3: 'Approved By (L3)' };
+  if (history && history.length) {
+    history.forEach(h => {
+      const lbl = levelLabels[h.level] || `Level ${h.level||'?'} Authority`;
+      entries.push({
+        label: lbl,
+        name: pdfEsc(h.approverName || '—'),
+        sub: pdfEsc(h.approverEmail || ''),
+        date: fmtDateTime(h.timestamp) || h.actionAt || '',
+        action: h.action || '',
+        comment: h.comment || ''
+      });
+    });
+  } else {
+    // Blank signature blocks for pending proposals
+    entries.push({ label: 'Checked By / Authority', name: '', sub: '', date: '' });
+    entries.push({ label: 'Final Approved By', name: '', sub: '', date: '' });
+  }
+
+  // Render as a responsive signature table
+  const cols = Math.min(entries.length, 4);
+  const gridCols = `repeat(${cols}, 1fr)`;
+  const blocks = entries.map(e => `
+    <div style="border-top:1.5px solid #333;padding-top:8px;font-size:10px;text-align:center;color:#333">
+      <div style="font-weight:700;font-size:11px;color:#1a56db;margin-bottom:2px">${e.label}</div>
+      ${e.action ? `<div style="font-size:10px;margin-bottom:2px;color:${e.action==='Approved'?'#16a34a':e.action==='Rejected'?'#dc2626':'#d97706'};font-weight:700">${pdfEsc(e.action)}</div>` : ''}
+      <div style="min-height:28px;display:flex;align-items:flex-end;justify-content:center;padding-bottom:4px">
+        <strong>${e.name || '&nbsp;'}</strong>
+      </div>
+      ${e.sub ? `<div style="color:#555;font-size:9px">${e.sub}</div>` : ''}
+      ${e.date ? `<div style="color:#555;font-size:9px;margin-top:2px">📅 ${pdfEsc(e.date)}</div>` : '<div style="color:#999;font-size:9px;margin-top:2px">(pending)</div>'}
+      ${e.comment ? `<div style="margin-top:4px;padding:3px 6px;background:#fffbeb;border-radius:3px;font-size:9px;color:#92400e;text-align:left"><em>"${pdfEsc(e.comment)}"</em></div>` : ''}
+    </div>`).join('');
+
+  return `<div style="margin-top:32px;display:grid;grid-template-columns:${gridCols};gap:16px">${blocks}</div>`;
 }
 
 // ── 2. Export 3-Quotation Comparison form (from live form inputs) ─────────────
@@ -6736,7 +6824,7 @@ window.exportStandardFormPDF = function() {
       </div>
     </div>
 
-    ${pdfSignatureRow(['Prepared By','Checked By','Approved By'])}
+    ${buildPDFApprovalSignatures([], {createdByName: currentProfile?.name||'', createdByEmail: currentUser?.email||'', createdAt: new Date()})}
     ${pdfFooter()}
   </div>`;
   showPDFFrame(html);
@@ -6751,6 +6839,47 @@ function buildComparisonPDFHTML(p, plant, history) {
 // ── Build PDF HTML for 3-Quotation form (from live form inputs) ───────────────
 function buildComparisonInputPDFHTML(d, plant) {
   return buildComparisonDocHTML(d, plant, '(Draft — not yet submitted)', 'Draft', []);
+}
+
+function buildComparisonPDFSignatures(history, d) {
+  // For comparison form, use role-based labels
+  const entries = [];
+  entries.push({
+    label: 'Requested By / Signature',
+    name: pdfEsc(d.requestedBy || '—'),
+    sub: pdfEsc(d.designation || ''),
+    date: pdfEsc(d.proposalDate || '')
+  });
+  const levelLabels = { 1: 'Authorised By (L1)', 2: 'Authorised By (L2) / Plant Head', 3: 'Finance / Accounts (L3)' };
+  if (history && history.length) {
+    history.forEach(h => {
+      const lbl = levelLabels[h.level] || `Level ${h.level||'?'} Authority`;
+      entries.push({
+        label: lbl,
+        name: (h.approverName || '—').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'),
+        sub: (h.approverEmail || '').replace(/&/g,'&amp;'),
+        date: typeof fmtDateTime === 'function' ? (fmtDateTime(h.timestamp) || '') : '',
+        action: h.action || '',
+        comment: h.comment || ''
+      });
+    });
+  } else {
+    entries.push({ label: 'Authorised By / Plant Head', name: '', sub: '', date: '' });
+    entries.push({ label: 'Finance / Accounts', name: '', sub: '', date: '' });
+  }
+  const cols = Math.min(entries.length, 4);
+  const gridCols = 'repeat(' + cols + ', 1fr)';
+  const blocks = entries.map(function(e) {
+    return '<div style="border-top:1.5px solid #333;padding-top:8px;font-size:10px;text-align:center;color:#333">'
+      + '<div style="font-weight:700;font-size:11px;color:#1a56db;margin-bottom:2px">' + e.label + '</div>'
+      + (e.action ? '<div style="font-size:10px;margin-bottom:2px;color:' + (e.action==='Approved'?'#16a34a':e.action==='Rejected'?'#dc2626':'#d97706') + ';font-weight:700">' + e.action + '</div>' : '')
+      + '<div style="min-height:28px;display:flex;align-items:flex-end;justify-content:center;padding-bottom:4px"><strong>' + (e.name || '&nbsp;') + '</strong></div>'
+      + (e.sub ? '<div style="color:#555;font-size:9px">' + e.sub + '</div>' : '')
+      + (e.date ? '<div style="color:#555;font-size:9px;margin-top:2px">📅 ' + e.date + '</div>' : '<div style="color:#999;font-size:9px;margin-top:2px">(pending)</div>')
+      + (e.comment ? '<div style="margin-top:4px;padding:3px 6px;background:#fffbeb;border-radius:3px;font-size:9px;color:#92400e;text-align:left"><em>"' + e.comment + '"</em></div>' : '')
+      + '</div>';
+  }).join('');
+  return '<div style="margin-top:32px;display:grid;grid-template-columns:' + gridCols + ';gap:16px">' + blocks + '</div>';
 }
 
 function buildComparisonDocHTML(d, plant, proposalNo, status, history) {
@@ -6906,7 +7035,7 @@ function buildComparisonDocHTML(d, plant, proposalNo, status, history) {
     + (d.remarks?'<div style="background:#f8fafc;border-radius:5px;padding:8px 10px;font-size:11px;margin-top:8px"><strong>Remarks:</strong> '+(d.remarks||'').replace(/&/g,'&amp;')+'</div>':'')
     + '</div>'
     + timelineHTML
-    + pdfSignatureRow(['Requested By / Signature','Authorised By / Plant Head','Finance / Accounts'])
+    + buildComparisonPDFSignatures(history, d)
     + pdfFooter()
     + '</div>';
 }
