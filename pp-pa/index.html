@@ -2650,7 +2650,9 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const auth   = firebase.auth();
 const db     = firebase.firestore();
-const storage= firebase.storage();
+// Explicitly pass bucket URL — fixes permissions error with new .firebasestorage.app
+// domain when using the compat SDK (firebase-storage-compat 10.x)
+const storage = firebase.storage(firebase.app(), `gs://${firebaseConfig.storageBucket}`);
 const fns    = firebase.app().functions('asia-south1'); // asia-south1 matches deployed functions
   // Cloud Functions: default region (us-central1). Keep this aligned with
   // functions/index.js. All approval emails are sent server-side.
@@ -3868,7 +3870,7 @@ async function saveProposal(action) {
       validity: parseInt(document.getElementById('pf-validity').value)||30,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
     };
-    if (attachments.length) data.attachments = attachments; // plain array — arrayUnion applied at write time below
+    if (attachments.length) data.attachments = firebase.firestore.FieldValue.arrayUnion(...attachments);
 
     if (action === 'Submit') {
       // Delegate submission to Cloud Function for secure workflow
@@ -3905,9 +3907,7 @@ async function saveProposal(action) {
     } else {
       // Save as draft locally
       if (editingId) {
-        const draftWrite = { ...data, status:'Draft' };
-        if (attachments.length) draftWrite.attachments = firebase.firestore.FieldValue.arrayUnion(...attachments);
-        await db.collection('pp_proposals').doc(editingId).update(draftWrite);
+        await db.collection('pp_proposals').doc(editingId).update({ ...data, status:'Draft' });
         toast('Draft updated','success');
         await logAudit(editingId,'Edited','Draft updated');
       } else {
@@ -4152,12 +4152,6 @@ function clientResolveAnnualImpact(p) {
     }, 0);
     if (total > 0) return total;
   }
-  // Fall back to absolute price difference (not raw proposed price) so routing
-  // doesn't overshoot matrix thresholds when qty/month is not provided.
-  const diff = Math.abs(Number(p.proposedPrice ?? p.newPrice ?? p.proposedAmount ?? 0)
-                      - Number(p.currentPrice  ?? p.existingPrice ?? 0));
-  if (diff > 0) return diff;
-  // Last resort: use proposed price itself (e.g. new-item proposals with no existing price)
   return Math.abs(Number(p.proposedPrice ?? p.newPrice ?? p.proposedAmount ?? 0));
 }
 
@@ -4378,14 +4372,9 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   let docRef;
   if (proposalId) {
     docRef = db.collection('pp_proposals').doc(proposalId);
-    const updateData = { ...docData };
-    if (Array.isArray(updateData.attachments) && updateData.attachments.length) {
-      updateData.attachments = firebase.firestore.FieldValue.arrayUnion(...updateData.attachments);
-    }
-    await docRef.update(updateData);
+    await docRef.update(docData);
   } else {
     docData.createdAt = firebase.firestore.FieldValue.serverTimestamp();
-    // attachments is already a plain array — Firestore add() accepts it directly
     docRef = await db.collection('pp_proposals').add(docData);
   }
 
