@@ -2602,10 +2602,26 @@ async function saveComparisonProposal(action){
     } catch (_tokenErr) { console.warn('[saveCmpProposal] token refresh (non-fatal):', _tokenErr.message); }
 
     const d=getComparisonData(), plant=allPlants.find(p=>p.id===plantId);
-    const attachments=[]; const editingId=comparisonField('cmp-editing-id');
-    for(const file of comparisonFiles){const ref=storage.ref(`pp_proposals/comparison/${editingId||'new'}/${Date.now()}_${file.name}`);await ref.put(file);attachments.push({name:file.name,url:await ref.getDownloadURL(),size:file.size,type:file.type});}
+    const attachments=[]; let _cmpStorageWarning=null; const editingId=comparisonField('cmp-editing-id');
+    for(const file of comparisonFiles){
+      const _cmpPath=`pp_proposals/comparison/${editingId||'new'}/${Date.now()}_${file.name}`;
+      console.log('[cmp-upload] bucket:',storage.app.options.storageBucket,'path:',_cmpPath,'uid:',auth.currentUser?.uid);
+      try{
+        await storage.ref(_cmpPath).put(file);
+        const _cmpUrl=await storage.ref(_cmpPath).getDownloadURL();
+        attachments.push({name:file.name,url:_cmpUrl,size:file.size,type:file.type});
+      }catch(_cmpUpErr){
+        const _cmpCode=_cmpUpErr.code||'';
+        console.error('[cmp-upload] FAILED code:',_cmpCode,'msg:',_cmpUpErr.message,'serverResponse:',_cmpUpErr.serverResponse);
+        _cmpStorageWarning=(_cmpCode==='storage/unauthorized'||_cmpCode.includes('permission')||(_cmpUpErr.message||'').toLowerCase().includes('permission'))
+          ? `File "${file.name}" blocked by Storage rules (${_cmpCode}). Check Firebase Console > Storage > Rules for: ${storage.app.options.storageBucket}. Proposal saved WITHOUT this attachment.`
+          : `Upload of "${file.name}" failed (${_cmpCode||_cmpUpErr.message}). Proposal saved without this attachment.`;
+        // Do NOT re-throw
+      }
+    }
     const data={plantId,plantName:plant?.name||'',partyName:d.customer||d.quotations.find(q=>q.proposedSupplier)?.proposedSupplier||'',productService:d.itemName||item,description:d.rows.find(r=>r.description)?.description||item,justification:d.reasonOther||d.reason.join(', '),proposalDate:d.proposalDate,category:d.commodity,validity:30,comparison:d,formType:'3-Quotation Comparison',updatedAt:firebase.firestore.FieldValue.serverTimestamp()};
     if(attachments.length)data.attachments=attachments;
+    if(_cmpStorageWarning)toast('⚠️ '+_cmpStorageWarning,'warning',10000);
     if(action==='Submit'){
       let _cmpResult = null;
       try {
@@ -3985,26 +4001,31 @@ async function saveProposal(action) {
       console.warn('[saveProposal] token refresh (non-fatal):', _tokenErr.message);
     }
 
-    // Upload files
+    // Upload files — Storage errors are caught per-file and never block the proposal save.
+    // If upload fails, the proposal is saved without that attachment and the user gets
+    // a specific warning telling them exactly what went wrong (bucket, code, etc.).
     const attachments = [];
+    let _storageWarning = null;
     for (const file of uploadedFiles) {
       const path = `pp_proposals/${editingId||'new'}/${Date.now()}_${file.name}`;
-      console.log('[upload] path:', path, 'size:', file.size, 'type:', file.type);
-      console.log('[upload] auth:', auth.currentUser?.uid, auth.currentUser?.email);
-      let uploadTask;
+      console.log('[upload] bucket:', storage.app.options.storageBucket);
+      console.log('[upload] path:', path, 'size:', file.size, 'uid:', auth.currentUser?.uid);
       try {
         const ref = storage.ref(path);
-        uploadTask = await ref.put(file);
+        await ref.put(file);
+        const url = await storage.ref(path).getDownloadURL();
+        attachments.push({ name: file.name, url, size: file.size, type: file.type });
       } catch(uploadErr) {
-        console.error('[upload] ERROR code:', uploadErr.code);
-        console.error('[upload] ERROR message:', uploadErr.message);
-        console.error('[upload] ERROR serverResponse:', uploadErr.serverResponse);
-        console.error('[upload] ERROR customData:', JSON.stringify(uploadErr.customData));
-        throw uploadErr;
+        const code = uploadErr.code || '';
+        const msg  = uploadErr.message || '';
+        console.error('[upload] FAILED code:', code, '| msg:', msg, '| serverResponse:', uploadErr.serverResponse);
+        if (code === 'storage/unauthorized' || code.includes('permission') || msg.toLowerCase().includes('permission')) {
+          _storageWarning = `File "${file.name}" could not be uploaded — Storage rules are blocking access (${code}). Check Firebase Console > Storage > Rules for bucket: ${storage.app.options.storageBucket}. Proposal saved WITHOUT this attachment.`;
+        } else {
+          _storageWarning = `Upload of "${file.name}" failed (${code || msg}). Proposal saved without this attachment.`;
+        }
+        // Do NOT re-throw — let proposal save proceed without this file
       }
-      const ref2 = storage.ref(path);
-      const url = await ref2.getDownloadURL();
-      attachments.push({ name: file.name, url, size: file.size, type: file.type });
     }
 
     const diff    = proposedPrice - currentPrice;
@@ -4030,6 +4051,7 @@ async function saveProposal(action) {
     // Send attachments as a plain array — the Cloud Function handles arrayUnion server-side.
     // FieldValue.arrayUnion() cannot be serialized over a callable function boundary.
     if (attachments.length) data.attachments = attachments;
+    if (_storageWarning) toast('⚠️ ' + _storageWarning, 'warning', 10000);
 
     if (action === 'Submit') {
       // Delegate submission to Cloud Function for secure workflow
