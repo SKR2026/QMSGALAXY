@@ -1172,13 +1172,12 @@ html, body { overflow: hidden; }
         <div class="page-header">
           <h1>Proposals</h1>
           <div class="page-header-actions">
-            <button class="btn btn-secondary" onclick="exportProposalsCSV()">⬇ Export CSV</button>
             <button class="btn btn-primary" onclick="navigate('create-proposal')">+ New Proposal</button>
           </div>
         </div>
         <div class="filter-bar">
           <input type="text" placeholder="Search proposals..." id="proposals-search" oninput="filterProposals()">
-          <select id="proposals-plant-filter" onchange="filterProposals()">
+          <select id="proposals-plant-filter" onchange="filterProposals()" style="display:none">
             <option value="">All Plants</option>
           </select>
           <select id="proposals-status-filter" onchange="filterProposals()">
@@ -1192,6 +1191,18 @@ html, body { overflow: hidden; }
             <option value="30">Last 30 Days</option>
             <option value="90">Last 90 Days</option>
           </select>
+        </div>
+        <!-- Plant tabs + export toolbar -->
+        <div id="proposals-plant-toolbar" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:nowrap;gap:10px;margin-bottom:14px;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:nowrap;overflow-x:auto;min-width:0;padding-bottom:2px">
+            <span id="proposals-record-count" style="font-size:13px;color:var(--text2);white-space:nowrap;margin-right:4px"></span>
+            <div id="proposals-plant-pills" style="display:flex;gap:6px;flex-wrap:nowrap"></div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+            <button class="btn btn-secondary btn-sm" onclick="exportProposalsPDF()" title="Export as PDF">🖨️ Export PDF</button>
+            <button class="btn btn-success btn-sm" onclick="exportProposalsCSV()" title="Export as Excel/CSV">📊 Export Excel</button>
+            <button class="btn btn-primary btn-sm" onclick="openBulkUploadModal()" title="Bulk Upload proposals">⬆ Bulk Upload</button>
+          </div>
         </div>
         <div class="card">
           <!-- Bulk delete bar — superadmin only, shown when items selected -->
@@ -3704,6 +3715,7 @@ async function loadPlants() {
       const el=document.getElementById(id);
       if(el) el.innerHTML=`<option value="">All Plants</option>${plantOptions}`;
     });
+    renderPlantPills();
   } catch(e) { console.error('loadPlants', e); }
 }
 
@@ -3903,15 +3915,191 @@ async function loadProposals() {
   } catch(e) { console.error('loadProposals',e); toast('Failed to load proposals','error'); }
 }
 
+// ── PLANT PILL TABS ──────────────────────────────────────────────────────────
+let _activePlantFilter = '';
+
+function renderPlantPills() {
+  const container = document.getElementById('proposals-plant-pills');
+  if (!container) return;
+  const pills = [{ id: '', name: 'All Plants' }, ...allPlants.map(p => ({ id: p.id, name: p.code || p.name }))];
+  container.innerHTML = pills.map(p => {
+    const isActive = _activePlantFilter === p.id;
+    return `<button onclick="setPlantFilter('${p.id}')" style="
+      padding:5px 14px;border-radius:50px;font-size:12px;font-weight:600;cursor:pointer;
+      white-space:nowrap;border:1.5px solid ${isActive ? 'transparent' : 'var(--border)'};
+      background:${isActive ? 'var(--danger)' : 'var(--surface)'};
+      color:${isActive ? '#fff' : 'var(--text)'};
+      transition:all .15s;
+    ">${esc(p.name)}</button>`;
+  }).join('');
+}
+
+function setPlantFilter(plantId) {
+  _activePlantFilter = plantId;
+  const sel = document.getElementById('proposals-plant-filter');
+  if (sel) sel.value = plantId;
+  renderPlantPills();
+  proposalPage = 1;
+  filterProposals();
+}
+
+// ── EXPORT PROPOSALS PDF ─────────────────────────────────────────────────────
+function exportProposalsPDF() {
+  const visible = allProposals.filter(p => {
+    const plant  = _activePlantFilter ? p.plantId === _activePlantFilter : true;
+    const status = document.getElementById('proposals-status-filter')?.value;
+    const search = document.getElementById('proposals-search')?.value?.toLowerCase()||'';
+    const days   = parseInt(document.getElementById('proposals-date-filter')?.value||'0');
+    if (!plant) return false;
+    if (status && p.status !== status) return false;
+    if (search && !`${p.proposalNumber}${p.partyName}${p.description}${p.productService}`.toLowerCase().includes(search)) return false;
+    if (days) {
+      const d = p.createdAt?.toDate ? p.createdAt.toDate() : new Date(p.createdAt||0);
+      if (Date.now()-d.getTime() > days*86400000) return false;
+    }
+    return true;
+  });
+  if (!visible.length) { toast('No proposals to export', 'warning'); return; }
+
+  const win = window.open('', '_blank');
+  const rows = visible.map(p => {
+    const plant = allPlants.find(pl => pl.id === p.plantId);
+    const diff  = p.currentPrice ? ((p.proposedPrice - p.currentPrice)/p.currentPrice*100).toFixed(1) : '—';
+    return `<tr>
+      <td>${esc(p.proposalNumber||'—')}</td>
+      <td>${esc(plant?.name||'—')}</td>
+      <td>${esc(p.partyName||'—')}</td>
+      <td>${esc(p.description||p.productService||'—')}</td>
+      <td style="text-align:right">₹${fmt(p.currentPrice)}</td>
+      <td style="text-align:right">₹${fmt(p.proposedPrice)}</td>
+      <td style="text-align:right">${diff !== '—' ? diff+'%' : '—'}</td>
+      <td>${esc(p.status||'—')}</td>
+      <td>${fmtDate(p.createdAt)}</td>
+    </tr>`;
+  }).join('');
+
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <title>Proposals Export</title>
+    <style>
+      body{font-family:Arial,sans-serif;font-size:12px;margin:24px}
+      h2{font-size:16px;margin-bottom:4px}
+      p{color:#666;margin-bottom:16px;font-size:11px}
+      table{width:100%;border-collapse:collapse}
+      th{background:#1a56db;color:#fff;padding:8px 10px;text-align:left;font-size:11px;text-transform:uppercase}
+      td{padding:7px 10px;border-bottom:1px solid #e5e7eb;font-size:12px}
+      tr:nth-child(even) td{background:#f9fafb}
+      @media print{button{display:none}}
+    </style></head><body>
+    <h2>Proposals Report</h2>
+    <p>Generated: ${new Date().toLocaleString('en-IN')} &nbsp;|&nbsp; ${visible.length} record${visible.length!==1?'s':''}</p>
+    <table><thead><tr>
+      <th>Proposal #</th><th>Plant</th><th>Party</th><th>Description</th>
+      <th>Current ₹</th><th>Proposed ₹</th><th>Diff %</th><th>Status</th><th>Date</th>
+    </tr></thead><tbody>${rows}</tbody></table>
+    <br><button onclick="window.print()" style="padding:8px 20px;background:#1a56db;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px">🖨️ Print / Save as PDF</button>
+  </body></html>`);
+  win.document.close();
+}
+
+// ── BULK UPLOAD MODAL ────────────────────────────────────────────────────────
+function openBulkUploadModal() {
+  // Show a simple modal prompting CSV upload
+  const existing = document.getElementById('bulk-upload-overlay');
+  if (existing) { existing.style.display = 'flex'; return; }
+
+  const overlay = document.createElement('div');
+  overlay.id = 'bulk-upload-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:5000;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.innerHTML = `
+    <div style="background:#fff;border-radius:12px;width:100%;max-width:480px;box-shadow:0 20px 40px rgba(0,0,0,.15)">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:18px 24px;border-bottom:1px solid #e5e7eb">
+        <h2 style="font-size:16px;font-weight:700;margin:0">⬆ Bulk Upload Proposals</h2>
+        <button onclick="document.getElementById('bulk-upload-overlay').style.display='none'"
+          style="background:none;border:none;font-size:20px;cursor:pointer;color:#6b7280;line-height:1">✕</button>
+      </div>
+      <div style="padding:24px">
+        <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:14px;margin-bottom:20px;font-size:13px;color:#1e40af">
+          <strong>📋 Instructions:</strong> Upload a CSV file with columns:<br>
+          <code style="font-size:11px;background:#dbeafe;padding:2px 6px;border-radius:4px">Plant, Party Name, Description, Current Price, Proposed Price, Category</code>
+        </div>
+        <div id="bulk-drop-zone" style="border:2px dashed #d1d5db;border-radius:8px;padding:32px;text-align:center;cursor:pointer;transition:all .15s"
+          onclick="document.getElementById('bulk-csv-input').click()"
+          ondragover="event.preventDefault();this.style.borderColor='#1a56db';this.style.background='#eff6ff'"
+          ondragleave="this.style.borderColor='#d1d5db';this.style.background=''"
+          ondrop="event.preventDefault();this.style.borderColor='#d1d5db';this.style.background='';handleBulkDrop(event)">
+          <div style="font-size:36px;margin-bottom:8px">📂</div>
+          <div style="font-weight:600;color:#374151;margin-bottom:4px">Click or drag & drop CSV file</div>
+          <div style="font-size:12px;color:#9ca3af">Supported: .csv files only, max 5MB</div>
+        </div>
+        <input type="file" id="bulk-csv-input" accept=".csv" style="display:none" onchange="handleBulkCsvSelect(event)">
+        <div id="bulk-upload-status" style="margin-top:14px;font-size:13px;display:none"></div>
+        <div style="margin-top:20px;display:flex;justify-content:space-between;align-items:center">
+          <a href="#" onclick="downloadBulkTemplate();return false" style="font-size:12px;color:#1a56db;font-weight:600">⬇ Download Template</a>
+          <div style="display:flex;gap:8px">
+            <button onclick="document.getElementById('bulk-upload-overlay').style.display='none'"
+              class="btn btn-secondary btn-sm">Cancel</button>
+            <button id="bulk-upload-confirm-btn" class="btn btn-primary btn-sm" onclick="processBulkUpload()" disabled style="opacity:.5">Upload</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+}
+
+let _bulkCsvFile = null;
+
+function handleBulkDrop(e) {
+  const file = e.dataTransfer.files[0];
+  if (file) setBulkCsvFile(file);
+}
+
+function handleBulkCsvSelect(e) {
+  const file = e.target.files[0];
+  if (file) setBulkCsvFile(file);
+}
+
+function setBulkCsvFile(file) {
+  if (!file.name.endsWith('.csv')) { toast('Please select a .csv file', 'error'); return; }
+  if (file.size > 5*1024*1024) { toast('File too large (max 5MB)', 'error'); return; }
+  _bulkCsvFile = file;
+  const statusEl = document.getElementById('bulk-upload-status');
+  const btn = document.getElementById('bulk-upload-confirm-btn');
+  if (statusEl) { statusEl.style.display = ''; statusEl.innerHTML = `<span style="color:#057a55">✅ Ready: <strong>${esc(file.name)}</strong> (${(file.size/1024).toFixed(1)} KB)</span>`; }
+  if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+}
+
+function downloadBulkTemplate() {
+  const csv = 'Plant Code,Party Name,Description / Product Service,Current Price,Proposed Price,Category\nYNR,Sample Vendor,Sample Material,1000,1100,Raw Material\n';
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'bulk_upload_template.csv'; a.click();
+}
+
+function processBulkUpload() {
+  if (!_bulkCsvFile) { toast('No file selected', 'warning'); return; }
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const lines = e.target.result.split('\n').map(l => l.trim()).filter(l => l);
+    if (lines.length < 2) { toast('CSV is empty or has only headers', 'error'); return; }
+    const statusEl = document.getElementById('bulk-upload-status');
+    if (statusEl) statusEl.innerHTML = `<span style="color:#1a56db">⏳ Parsed ${lines.length-1} row(s) — bulk Firestore write not connected in demo. Integrate with your <code>pp_proposals</code> collection to save.</span>`;
+    toast(`Parsed ${lines.length-1} row(s) from CSV. Connect to Firestore to save.`, 'success');
+    const btn = document.getElementById('bulk-upload-confirm-btn');
+    if (btn) { btn.disabled = true; btn.style.opacity = '.5'; }
+  };
+  reader.readAsText(_bulkCsvFile);
+}
+
 function filterProposals() {
   const search = document.getElementById('proposals-search')?.value?.toLowerCase()||'';
-  const plant  = document.getElementById('proposals-plant-filter')?.value||'';
+  const plant  = _activePlantFilter || document.getElementById('proposals-plant-filter')?.value||'';
   const status = document.getElementById('proposals-status-filter')?.value||'';
   const days   = parseInt(document.getElementById('proposals-date-filter')?.value||'0');
 
   let list = allProposals.filter(p=>{
     if (search && !`${p.proposalNumber}${p.partyName}${p.description}${p.productService}`.toLowerCase().includes(search)) return false;
     if (plant && p.plantId !== plant) return false;
+
     if (status && p.status !== status) return false;
     if (days) {
       const d = p.createdAt?.toDate ? p.createdAt.toDate() : new Date(p.createdAt||0);
@@ -3975,6 +4163,10 @@ function filterProposals() {
     : `<tr><td colspan="${isSuperAdmin()?13:12}"><div class="empty-state"><div class="empty-icon">📋</div><h3>No proposals found</h3></div></td></tr>`;
 
   renderPagination('proposals-pagination', list.length, proposalPage, (p)=>{proposalPage=p;filterProposals();});
+
+  // Update record count label
+  const countEl = document.getElementById('proposals-record-count');
+  if (countEl) countEl.textContent = list.length + ' record' + (list.length !== 1 ? 's' : '');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
