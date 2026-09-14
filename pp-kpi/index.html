@@ -10193,254 +10193,274 @@ onAuthChange(async user => {
 });
 
 // ── Load master + entry data from Firestore ──────────────────────
-async function loadFirebaseData() {
-  // 0. Org / escalation settings (applies company name to sidebar)
-  try {
-    await loadEscalationSettingsUI();
-    startReminderEngine(); // start in-browser reminder engine (noop if cloud active)
-  } catch (err) { console.warn('Settings load error:', err); }
-
-  // 0a. Plants — Firestore is authoritative once user is signed in.
-  // Don't gate on length > 0 or deleted plants reappear on reload.
-  try {
-    const fsPlants = await getPlants();
-    plantsList.length = 0;
-    fsPlants.forEach(p => plantsList.push({
-      id:   p.id,
-      code: p.plantCode || p.code || p.id,
-      name: p.plantName || p.name,
-      kpis: p.kpis || 0
-    }));
-    // If Firestore has no plants yet, seed it with the defaults
-    if (fsPlants.length === 0) {
-      const defaults = [
-        {code:'CHN', name:'Chennai'},
-        {code:'DSL', name:'Daslana'},
-        {code:'NOI', name:'Noida'}
-      ];
-      for (const pl of defaults) {
-        try { await addPlant({ plantCode: pl.code, plantName: pl.name }); } catch(e) { /* already exists */ }
-        plantsList.push({ id: pl.code, code: pl.code, name: pl.name, kpis: 0 });
-      }
+// ── Skeleton loader helpers ──────────────────────────────────────
+function _showDataSkeleton() {
+  // Show shimmer placeholders in metric cards and KPI table while data loads
+  const skId = '__loadSkeleton';
+  if (document.getElementById(skId)) return;
+  const sk = document.createElement('div');
+  sk.id = skId;
+  sk.style.cssText = 'position:fixed;inset:0;z-index:4999;pointer-events:none';
+  const shimmerCSS = `
+    @keyframes _skShimmer{0%{background-position:-600px 0}100%{background-position:600px 0}}
+    .__sk{border-radius:6px;background:linear-gradient(90deg,var(--surface2) 25%,var(--border) 50%,var(--surface2) 75%);
+      background-size:600px 100%;animation:_skShimmer 1.2s infinite linear}
+  `;
+  const style = document.createElement('style');
+  style.textContent = shimmerCSS;
+  sk.appendChild(style);
+  document.body.appendChild(sk);
+  // Shimmer over the metric bar
+  ['m-total','m-achieved','m-missed','m-nearmiss','m-pct'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && !el.dataset.skOrig) {
+      el.dataset.skOrig = el.textContent;
+      el.innerHTML = '<span class="__sk" style="display:inline-block;width:32px;height:16px;vertical-align:middle"></span>';
     }
-    refreshPlantSelectors();
-    renderPlantsPage();
-    // Re-apply the user's saved plant order (Firebase load wiped the in-memory sort)
+  });
+}
+function _hideDataSkeleton() {
+  const sk = document.getElementById('__loadSkeleton');
+  if (sk) sk.remove();
+  // Restore any metric placeholders that weren't already updated
+  ['m-total','m-achieved','m-missed','m-nearmiss','m-pct'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && el.dataset.skOrig !== undefined && el.querySelector('.__sk')) {
+      el.textContent = el.dataset.skOrig;
+      delete el.dataset.skOrig;
+    }
+  });
+}
+
+async function loadFirebaseData() {
+  _showDataSkeleton();
+
+  // ── Phase 1: fire all independent fetches in parallel ───────────
+  // Settings, Plants, Departments, KPI Master, Entries, My Entries,
+  // Action Plans, and Users all go out simultaneously.
+  const email = (window._fbProfile && window._fbProfile.email) || (currentUser && currentUser.email);
+
+  const [
+    _settings,
+    fsPlants,
+    fsDepts,
+    fsKPIs,
+    fsEntriesRaw,
+    mineRaw,
+    actionsRaw,
+    fsUsers
+  ] = await Promise.allSettled([
+    // 0. Settings
+    loadEscalationSettingsUI().then(r => { startReminderEngine(); return r; }),
+    // 0a. Plants
+    getPlants(),
+    // 0b. Departments
+    getDepts(),
+    // 1. KPI Master
+    getKPIMaster(),
+    // 2. KPI Entries
+    getKPIEntries({}),
+    // 2b. My entries
+    (email && window.FB && window.FB.getMyEntries) ? getMyEntries(email) : Promise.resolve([]),
+    // 3. Action plans
+    getOpenActionPlans(),
+    // 4. Users
+    getAllUsers()
+  ]);
+
+  // ── Phase 2: process each result in dependency order ────────────
+
+  // Settings (fire-and-forget, already ran inside the promise above)
+  if (_settings.status === 'rejected') console.warn('Settings load error:', _settings.reason);
+
+  // 0a. Plants
+  if (fsPlants.status === 'fulfilled') {
     try {
-      const savedOrder = JSON.parse(localStorage.getItem('kpiPlantOrder') || 'null');
-      if(savedOrder && Array.isArray(savedOrder)){
-        plantsList.sort((a,b)=>{
-          const ia=savedOrder.indexOf(a.name), ib=savedOrder.indexOf(b.name);
-          return (ia===-1?999:ia)-(ib===-1?999:ib);
-        });
-        refreshPlantSelectors();
-      }
-    } catch(e){}
-    // Re-apply FY settings so year/month dropdowns reflect user preference
-    applyFYSettings();
-  } catch (err) {
-    console.warn('Plants load error:', err);
-  }
-
-  // 0b. Departments — Firestore is authoritative once user is signed in.
-  // Even an empty result means "no saved departments" — don't fall back to
-  // the hardcoded list, or deleted departments will reappear on every reload.
-  try {
-    console.log('[loadFirebaseData] Fetching departments from Firestore...');
-    const fsDepts = await getDepts();
-    console.log('[loadFirebaseData] Firestore departments received:', fsDepts.length, fsDepts.map(d=>({id:d.id,name:d.deptName||d.name})));
-
-    deptList.length = 0;
-
-    if (fsDepts.length > 0) {
-      // Firestore has departments — use them as source of truth
-      fsDepts.forEach(d => deptList.push({
-        id:   d.id,
-        name: d.deptName || d.name,
-        kpis: d.kpis || 0,
-        ach:  d.ach  || 0
+      const plants = fsPlants.value;
+      plantsList.length = 0;
+      plants.forEach(p => plantsList.push({
+        id:   p.id,
+        code: p.plantCode || p.code || p.id,
+        name: p.plantName || p.name,
+        kpis: p.kpis || 0
       }));
-      console.log('[loadFirebaseData] deptList populated from Firestore:', deptList.map(d=>d.name));
-    } else {
-      // Empty result — could mean "first-ever use" OR "user deleted every
-      // department". Only seed defaults in the former case, by checking a
-      // one-time marker doc. This prevents deleted departments (including
-      // the defaults) from reappearing on refresh.
-      const seedMarkerRef = doc(db, "kpiSettings", "_meta");
-      let alreadySeeded = false;
-      try {
-        const markerSnap = await getDoc(seedMarkerRef);
-        alreadySeeded = markerSnap.exists() && markerSnap.data().deptsSeeded === true;
-      } catch(e) {
-        console.warn('[loadFirebaseData] Could not read seed marker:', e);
-      }
-
-      if (alreadySeeded) {
-        console.log('[loadFirebaseData] Departments previously seeded and now empty (user deleted all) — leaving empty.');
-      } else {
-      console.log('[loadFirebaseData] No departments in Firestore — seeding defaults...');
-      const defaults = [
-        {name:'Quality'},{name:'Production'},{name:'HR'},
-        {name:'Maintenance'},{name:'Finance'},{name:'SCM'}
-      ];
-      for (const dept of defaults) {
-        try {
-          const ref = await addDept({ deptName: dept.name });
-          const seededId = (ref && ref.id) ? ref.id : dept.name.replace(/[^a-zA-Z0-9]+/g,'_');
-          deptList.push({ id: seededId, name: dept.name, kpis: 0, ach: 0 });
-          console.log('[loadFirebaseData] Seeded dept:', dept.name, '→ id:', seededId);
-        } catch(e) {
-          console.error('[loadFirebaseData] Failed to seed dept:', dept.name, e);
+      if (plants.length === 0) {
+        const defaults = [
+          {code:'CHN', name:'Chennai'},
+          {code:'DSL', name:'Daslana'},
+          {code:'NOI', name:'Noida'}
+        ];
+        for (const pl of defaults) {
+          try { await addPlant({ plantCode: pl.code, plantName: pl.name }); } catch(e) {}
+          plantsList.push({ id: pl.code, code: pl.code, name: pl.name, kpis: 0 });
         }
       }
+      refreshPlantSelectors();
+      renderPlantsPage();
       try {
-        await setDoc(seedMarkerRef, { deptsSeeded: true }, { merge: true });
-      } catch(e) {
-        console.warn('[loadFirebaseData] Could not write seed marker:', e);
-      }
-      }
-    }
-    refreshDeptSelectors();
-    renderPlantsPage();
-    refreshAll();
-    // Re-apply the user's saved dept order (Firebase load wiped the in-memory sort)
+        const savedOrder = JSON.parse(localStorage.getItem('kpiPlantOrder') || 'null');
+        if (savedOrder && Array.isArray(savedOrder)) {
+          plantsList.sort((a,b) => {
+            const ia=savedOrder.indexOf(a.name), ib=savedOrder.indexOf(b.name);
+            return (ia===-1?999:ia)-(ib===-1?999:ib);
+          });
+          refreshPlantSelectors();
+        }
+      } catch(e) {}
+      applyFYSettings();
+    } catch(err) { console.warn('Plants process error:', err); }
+  } else { console.warn('Plants load error:', fsPlants.reason); }
+
+  // 0b. Departments
+  if (fsDepts.status === 'fulfilled') {
     try {
-      const savedOrder = JSON.parse(localStorage.getItem('kpiDeptOrder') || 'null');
-      if(savedOrder && Array.isArray(savedOrder)){
-        deptList.sort((a,b)=>{
-          const ia=savedOrder.indexOf(a.name), ib=savedOrder.indexOf(b.name);
-          return (ia===-1?999:ia)-(ib===-1?999:ib);
-        });
-        refreshDeptSelectors();
+      const depts = fsDepts.value;
+      console.log('[loadFirebaseData] Firestore departments received:', depts.length, depts.map(d=>({id:d.id,name:d.deptName||d.name})));
+      deptList.length = 0;
+      if (depts.length > 0) {
+        depts.forEach(d => deptList.push({ id: d.id, name: d.deptName || d.name, kpis: d.kpis || 0, ach: d.ach || 0 }));
+        console.log('[loadFirebaseData] deptList populated from Firestore:', deptList.map(d=>d.name));
+      } else {
+        const seedMarkerRef = doc(db, "kpiSettings", "_meta");
+        let alreadySeeded = false;
+        try {
+          const markerSnap = await getDoc(seedMarkerRef);
+          alreadySeeded = markerSnap.exists() && markerSnap.data().deptsSeeded === true;
+        } catch(e) { console.warn('[loadFirebaseData] Could not read seed marker:', e); }
+        if (alreadySeeded) {
+          console.log('[loadFirebaseData] Departments previously seeded and now empty — leaving empty.');
+        } else {
+          console.log('[loadFirebaseData] No departments in Firestore — seeding defaults...');
+          const defaults = [{name:'Quality'},{name:'Production'},{name:'HR'},{name:'Maintenance'},{name:'Finance'},{name:'SCM'}];
+          for (const dept of defaults) {
+            try {
+              const ref = await addDept({ deptName: dept.name });
+              const seededId = (ref && ref.id) ? ref.id : dept.name.replace(/[^a-zA-Z0-9]+/g,'_');
+              deptList.push({ id: seededId, name: dept.name, kpis: 0, ach: 0 });
+            } catch(e) { console.error('[loadFirebaseData] Failed to seed dept:', dept.name, e); }
+          }
+          try { await setDoc(seedMarkerRef, { deptsSeeded: true }, { merge: true }); }
+          catch(e) { console.warn('[loadFirebaseData] Could not write seed marker:', e); }
+        }
       }
-    } catch(e){}
-  } catch (err) {
-    console.error('[loadFirebaseData] Departments load error:', err.code || err.message || err);
-  }
+      refreshDeptSelectors();
+      renderPlantsPage();
+      try {
+        const savedOrder = JSON.parse(localStorage.getItem('kpiDeptOrder') || 'null');
+        if (savedOrder && Array.isArray(savedOrder)) {
+          deptList.sort((a,b) => {
+            const ia=savedOrder.indexOf(a.name), ib=savedOrder.indexOf(b.name);
+            return (ia===-1?999:ia)-(ib===-1?999:ib);
+          });
+          refreshDeptSelectors();
+        }
+      } catch(e) {}
+    } catch(err) { console.error('[loadFirebaseData] Departments process error:', err.code || err.message || err); }
+  } else { console.error('[loadFirebaseData] Departments load error:', fsDepts.reason); }
 
-  // 1. KPI Master
-  try {
-    const fsKPIs = await getKPIMaster();
-    if (fsKPIs.length > 0) {
-      // Replace local kpiMaster array with Firestore data
-      kpiMaster.length = 0;
-      fsKPIs.forEach((k, i) => kpiMaster.push({
-        id:     k.id,           // Firestore string ID
-        name:   k.name,
-        unit:   k.unit,
-        target: k.target,
-        dir:    k.direction || 'higher', // default to higher-is-better if direction not set
-        dept:   k.department,
-        plant:  k.plant || 'All',
-        weight: k.weightage || 0,
-        plantOverrides: k.plantOverrides || {},
-        yearTargets:    k.yearTargets    || {},
-        monthTargets:   k.monthTargets   || {},
-        ytdMethod:      k.ytdMethod      || 'auto',
-        seq: k.seq != null ? k.seq : (i+1)*10,
-        eventBased: !!k.eventBased,
-        eventType:  k.eventType || 'generic'
-      }));
-      renderKPIMaster();
-      // Re-resolve saved KPI matrix order now that real ids are known
-      resolveMatrixKPIOrder();
-
-      // Re-populate KPI trend selector
-      const tSel = document.getElementById('trendKPISelect');
-      if (tSel) {
-        tSel.innerHTML = kpiMaster.map(k =>
-          `<option value="${k.id}">${k.name}</option>`).join('');
+  // 1. KPI Master — must be processed before entries so kpiMaster[] is populated
+  if (fsKPIs.status === 'fulfilled') {
+    try {
+      const kpis = fsKPIs.value;
+      if (kpis.length > 0) {
+        kpiMaster.length = 0;
+        kpis.forEach((k, i) => kpiMaster.push({
+          id:     k.id,
+          name:   k.name,
+          unit:   k.unit,
+          target: k.target,
+          dir:    k.direction || 'higher',
+          dept:   k.department,
+          plant:  k.plant || 'All',
+          weight: k.weightage || 0,
+          plantOverrides: k.plantOverrides || {},
+          yearTargets:    k.yearTargets    || {},
+          monthTargets:   k.monthTargets   || {},
+          ytdMethod:      k.ytdMethod      || 'auto',
+          seq: k.seq != null ? k.seq : (i+1)*10,
+          eventBased: !!k.eventBased,
+          eventType:  k.eventType || 'generic'
+        }));
+        renderKPIMaster();
+        resolveMatrixKPIOrder();
+        const tSel = document.getElementById('trendKPISelect');
+        if (tSel) tSel.innerHTML = kpiMaster.map(k => `<option value="${k.id}">${k.name}</option>`).join('');
       }
-      refreshAll();
-    }
-  } catch (err) {
-    console.warn('KPI master load error:', err);
-  }
+    } catch(err) { console.warn('KPI master process error:', err); }
+  } else { console.warn('KPI master load error:', fsKPIs.reason); }
 
-  // 2. KPI Entries — initial load
-  // Firestore is the authoritative source. Clear BOTH local arrays so nothing
-  // persists from before login and all data comes fresh from Firestore.
-  try {
-    kpiData.length = 0;
-    recentEntries.length = 0; // ← critical: prevents stale local entries surviving across sessions
-    let fsEntries = await getKPIEntries({}); // no filters — need full dataset
-
-    // Deduplicate Firestore entries by business key (kpiId+plant+month+year).
-    // ALWAYS prefer the submitted/locked doc. If two docs exist for the same
-    // business key (legacy addDoc duplicates), keep submitted; among drafts,
-    // keep the most recently updated. We do NOT auto-delete to avoid any risk
-    // of removing the wrong doc — duplicates simply collapse in the UI.
-    const bizMap = new Map();
-    fsEntries.forEach(fe => {
-      const key = `${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
-      const existing = bizMap.get(key);
-      if (!existing) { bizMap.set(key, fe); return; }
-      const feSubmitted = fe.locked || fe.entryStatus === 'submitted';
-      const exSubmitted = existing.locked || existing.entryStatus === 'submitted';
-      // Submitted always wins over draft
-      if (feSubmitted && !exSubmitted) { bizMap.set(key, fe); return; }
-      if (!feSubmitted && exSubmitted) { return; } // keep existing submitted
-      // Both same status — keep most recently updated
-      const feTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
-      const exTs = existing.updatedAt?.toMillis ? existing.updatedAt.toMillis() : 0;
-      if (feTs >= exTs) bizMap.set(key, fe);
-    });
-    fsEntries = [...bizMap.values()];
-
-    mergeFirebaseEntries(fsEntries);
-    refreshAll();
-    renderRecentEntries();
-  } catch (err) {
-    console.warn('KPI entries load error (may need a Firestore composite index — see console link):', err);
+  // 2. KPI Entries — deduplicate then merge
+  if (fsEntriesRaw.status === 'fulfilled') {
+    try {
+      kpiData.length = 0;
+      recentEntries.length = 0;
+      let fsEntries = fsEntriesRaw.value;
+      const bizMap = new Map();
+      fsEntries.forEach(fe => {
+        const key = `${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
+        const existing = bizMap.get(key);
+        if (!existing) { bizMap.set(key, fe); return; }
+        const feSubmitted = fe.locked || fe.entryStatus === 'submitted';
+        const exSubmitted = existing.locked || existing.entryStatus === 'submitted';
+        if (feSubmitted && !exSubmitted) { bizMap.set(key, fe); return; }
+        if (!feSubmitted && exSubmitted) { return; }
+        const feTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
+        const exTs = existing.updatedAt?.toMillis ? existing.updatedAt.toMillis() : 0;
+        if (feTs >= exTs) bizMap.set(key, fe);
+      });
+      mergeFirebaseEntries([...bizMap.values()]);
+      renderRecentEntries();
+    } catch(err) { console.warn('KPI entries process error:', err); showToast('KPI entries unavailable — using sample data'); }
+  } else {
+    console.warn('KPI entries load error (may need a Firestore composite index):', fsEntriesRaw.reason);
     showToast('KPI entries unavailable — using sample data');
   }
 
-  // 2b. My own draft / submitted entries (independent of the Year/Month/Plant
-  // filter, so a draft saved for a different month is still visible & editable).
-  // Use keepSubmitted merge so this never downgrades an already-submitted entry.
-  try {
-    const email = (window._fbProfile && window._fbProfile.email) || (currentUser && currentUser.email);
-    if (email && window.FB && window.FB.getMyEntries) {
-      const mine = await getMyEntries(email);
-      if (mine.length > 0) {
+  // 2b. My entries
+  if (mineRaw.status === 'fulfilled') {
+    try {
+      const mine = mineRaw.value;
+      if (mine && mine.length > 0) {
         mergeFirebaseEntriesKeepSubmitted(mine);
         renderRecentEntries();
         renderMyEntries();
       }
-    }
-  } catch (err) {
-    console.error('Could not load your saved entries:', err);
-  }
+    } catch(err) { console.error('Could not process your saved entries:', err); }
+  } else { console.error('Could not load your saved entries:', mineRaw.reason); }
 
-  // 3. Action plans — keepSubmitted merge (never downgrade submitted entries)
-  try {
-    const actions = await getOpenActionPlans();
-    if (actions.length > 0) {
-      mergeFirebaseEntriesKeepSubmitted(actions);
-      renderActionPlans('all');
-    }
-  } catch (err) {
-    console.warn('Action plans load error:', err);
-  }
+  // 3. Action plans
+  if (actionsRaw.status === 'fulfilled') {
+    try {
+      const actions = actionsRaw.value;
+      if (actions.length > 0) {
+        mergeFirebaseEntriesKeepSubmitted(actions);
+        renderActionPlans('all');
+      }
+    } catch(err) { console.warn('Action plans process error:', err); }
+  } else { console.warn('Action plans load error:', actionsRaw.reason); }
 
   // 4. Users
-  try {
-    const fsUsers = await getAllUsers();
-    if (fsUsers.length > 0) {
-      usersList = fsUsers.map(u => ({
-        id: u.id,
-        name: u.name || u.email || 'Unnamed',
-        email: u.email || '',
-        role: u.role || 'Dept User',
-        plant: u.plant || 'All',
-        department: u.department || 'All',
-        active: u.active !== false
-      }));
-      renderUsersPage();
-    }
-  } catch (err) {
-    console.warn('Could not load users list:', err);
-  }
+  if (fsUsers.status === 'fulfilled') {
+    try {
+      const users = fsUsers.value;
+      if (users.length > 0) {
+        usersList = users.map(u => ({
+          id: u.id,
+          name: u.name || u.email || 'Unnamed',
+          email: u.email || '',
+          role: u.role || 'Dept User',
+          plant: u.plant || 'All',
+          department: u.department || 'All',
+          active: u.active !== false
+        }));
+        renderUsersPage();
+      }
+    } catch(err) { console.warn('Users process error:', err); }
+  } else { console.warn('Could not load users list:', fsUsers.reason); }
+
+  // ── Final render pass — everything is in memory now ─────────────
+  refreshAll();
+  _hideDataSkeleton();
 }
 
 // Merge Firestore entries into local arrays — single source of truth.
