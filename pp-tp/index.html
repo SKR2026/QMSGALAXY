@@ -2898,10 +2898,11 @@ function _renderDashCharts(_dashTasksRaw){
       const ab           = (t.assignedBy||'').toLowerCase().trim();
       const assignee     = (t.assignee||'').toLowerCase().trim();
       const assigneeName = (t.assigneeName||'').trim();
-      if (!_isBySA(ab)) return false;                              // not assigned by SA
-      if (!assignee && !assigneeName) return false;                 // completely blank assignee
-      if (assignee && _saAssigneeAliases.has(assignee)) return false; // SA assigned to themselves
-      return true;
+      // Include tasks assigned BY superadmin (to anyone, including self)
+      if (_isBySA(ab) && (assignee || assigneeName)) return true;
+      // Also include tasks assigned TO superadmin (by anyone)
+      if (_saChartEmail && assignee === _saChartEmail) return true;
+      return false;
     };
 
     // Year-filtered scope — for charts that respect the dashboard date filter
@@ -3076,7 +3077,7 @@ function _renderDashCharts(_dashTasksRaw){
       // Use email as key if present, else fall back to lowercase name
       const key = email || assigneeName.toLowerCase();
       if (!key) return;
-      if (_saChartEmail && email === _saChartEmail) return; // skip SA-to-self
+      if (_saChartEmail && email === _saChartEmail) return; // skip SA-self — shown in My Tasks bar separately
       const name = _resolveName(t) || assigneeName;
       if (!name) return;
       if (!map.has(key)) map.set(key, { name, tasks: [] });
@@ -3092,10 +3093,9 @@ function _renderDashCharts(_dashTasksRaw){
   // ── Compliance + Avg Days — one shared masterRows, same sort, same name order ──
   (()=>{
     const emailMap = _buildEmailMap();
-    const acColors = ['#3b82f6','#a855f7','#06b6d4','#f97316','#10b981','#f59e0b','#ef4444','#22c55e'];
 
     // Build one row per person covering both metrics
-    const masterRows = [...emailMap.entries()].map(([email, {name, tasks}]) => {
+    const allRows = [...emailMap.entries()].map(([email, {name, tasks}]) => {
       const total  = tasks.length;
       const closed = tasks.filter(t => t.status === 'Done').length;
       const pct    = total ? Math.round(closed / total * 100) : 0;
@@ -3111,10 +3111,17 @@ function _renderDashCharts(_dashTasksRaw){
         : null;
 
       return { email, name, pct, total, closed, avgDays, doneCount: doneTasks.length };
-    });
+    })
+    // Drop rows with no tasks at all, or no name — keeps charts clean
+    .filter(r => r.total > 0 && r.name && r.name.trim());
 
-    // Sort: compliance % desc, then name A→Z for ties — BOTH charts use this order
-    masterRows.sort((a, b) => b.pct - a.pct || a.name.localeCompare(b.name));
+    // Compliance chart: all rows with at least 1 task, sorted by % desc then name
+    const masterRows = [...allRows].sort((a, b) => b.pct - a.pct || a.name.localeCompare(b.name));
+
+    // Avg Days chart: only rows with at least 1 completed task (avgDays !== null)
+    const avgRows = [...allRows]
+      .filter(r => r.avgDays !== null)
+      .sort((a, b) => a.avgDays - b.avgDays || a.name.localeCompare(b.name));
 
     const names  = masterRows.map(r => r.name);
     const chartH = Math.max(220, names.length * 36);
@@ -3124,7 +3131,7 @@ function _renderDashCharts(_dashTasksRaw){
     const compColors = compVals.map(v => v >= 80 ? '#22c55e' : v >= 50 ? '#f59e0b' : '#ef4444');
     destroyChart('ch-compliance');
     const _cw = document.getElementById('ch-compliance')?.parentElement;
-    if (_cw) _cw.style.height = chartH + 'px';
+    if (_cw) _cw.style.height = Math.max(220, names.length * 36) + 'px';
     chartInstances['ch-compliance'] = new Chart(document.getElementById('ch-compliance'), {
       type: 'bar',
       data: { labels: names, datasets: [{ label: 'Compliance %', data: compVals, backgroundColor: compColors, borderRadius: 6, borderWidth: 0 }] },
@@ -3144,26 +3151,28 @@ function _renderDashCharts(_dashTasksRaw){
       }
     });
 
-    // ── Avg Days chart — same name order, null = no bar (row still present) ──
-    const avgVals = masterRows.map(r => r.avgDays);
+    // ── Avg Days chart — only people with at least one completed task ──
+    const avgNames = avgRows.map(r => r.name);
+    const avgVals  = avgRows.map(r => r.avgDays);
+    const acColors = ['#3b82f6','#a855f7','#06b6d4','#f97316','#10b981','#f59e0b','#ef4444','#22c55e'];
     destroyChart('ch-avgclose');
     const _aw = document.getElementById('ch-avgclose')?.parentElement;
-    if (_aw) _aw.style.height = chartH + 'px';
+    if (_aw) _aw.style.height = Math.max(220, avgNames.length * 36) + 'px';
     chartInstances['ch-avgclose'] = new Chart(document.getElementById('ch-avgclose'), {
       type: 'bar',
-      data: { labels: names, datasets: [{ label: 'Avg Days', data: avgVals, backgroundColor: names.map((_,i) => acColors[i%acColors.length]), borderRadius: 6, borderWidth: 0 }] },
+      data: { labels: avgNames, datasets: [{ label: 'Avg Days', data: avgVals, backgroundColor: avgNames.map((_,i) => acColors[i%acColors.length]), borderRadius: 6, borderWidth: 0 }] },
       options: {
         indexAxis: 'y',
         plugins: {
           legend: { display: false },
-          tooltip: { callbacks: { label: ctx => { const r = masterRows[ctx.dataIndex]; return r.avgDays===null ? ' No completed tasks' : ` ${ctx.raw}d avg  (${r.doneCount} task${r.doneCount!==1?'s':''} closed)`; } }}
+          tooltip: { callbacks: { label: ctx => { const r = avgRows[ctx.dataIndex]; return ` ${ctx.raw}d avg  (${r.doneCount} task${r.doneCount!==1?'s':''} closed)`; } }}
         },
         scales: {
           x: { ticks: { color: tickCol, font: { size: 10, weight: '600' }, callback: v => v+'d' }, grid: { color: gridCol } },
           y: { ticks: { color: tickCol, font: { size: 10, weight: '600' } }, grid: { display: false } }
         },
         maintainAspectRatio: false,
-        onClick: (evt, el) => { if (el&&el.length) { const r=masterRows[el[0].index]; if(r) goToTasksByName(r.name, r.email, _chartTaskIdSet, true); } },
+        onClick: (evt, el) => { if (el&&el.length) { const r=avgRows[el[0].index]; if(r) goToTasksByName(r.name, r.email, _chartTaskIdSet, true); } },
         onHover: (evt, el) => { evt.native.target.style.cursor = el&&el.length ? 'pointer' : 'default'; }
       }
     });
