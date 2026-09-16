@@ -2879,40 +2879,28 @@ function _renderDashCharts(_dashTasksRaw){
     // Tasks showing "Head Office" in UI have assignedBy='superadmin' — included via alias.
     const _saAliases = new Set(['superadmin', '']);  // '' = blank assignedBy also means SA
     if (_saChartEmail) {
-      _saAliases.add(_saChartEmail);                    // full email
-      _saAliases.add(_saChartEmail.split('@')[0]);      // email prefix e.g. "sushil"
+      _saAliases.add(_saChartEmail);
+      _saAliases.add(_saChartEmail.split('@')[0]);
     }
     const _selfName = (localStorage.getItem('self_name')||'').trim().toLowerCase();
-    if (_selfName) _saAliases.add(_selfName);           // display name e.g. "sushil"
+    if (_selfName) _saAliases.add(_selfName);
 
-    // Also collect all plant owner emails so we can EXCLUDE tasks assigned by them
-    const _plantOwnerEmails = new Set();
-    getPlantGroups().forEach(p => (p.owners||[]).forEach(o => {
-      if (o) _plantOwnerEmails.add(o.toLowerCase().trim());
-    }));
-    // Also exclude appUser emails (logged-in team members who assign their own tasks)
-    (_allAppUsers||[]).forEach(u => {
-      if (u.email) _plantOwnerEmails.add(u.email.toLowerCase().trim());
-    });
+    // Positive-only check — only use known SA alias strings, not negative exclusion
+    // (negative exclusion via _allAppUsers is unreliable as it loads lazily in Settings)
+    const _isBySA = ab => _saAliases.has(ab);
 
-    const _isBySA = ab => {
-      if (_saAliases.has(ab)) return true;
-      // If assignedBy is not a known plant owner / app user → treat as SA
-      // (covers legacy tasks where assignedBy was stored as a name/nickname)
-      if (!_plantOwnerEmails.has(ab)) return true;
-      return false;
-    };
     // All known identity strings for the SA as ASSIGNEE — for self-task exclusion
     const _saAssigneeAliases = new Set([_saChartEmail]);
     if (_saChartEmail) _saAssigneeAliases.add(_saChartEmail.split('@')[0]);
     if (_selfName) _saAssigneeAliases.add(_selfName);
 
     const _saTaskFilter = t => {
-      const ab       = (t.assignedBy||'').toLowerCase().trim();
-      const assignee = (t.assignee||'').toLowerCase().trim();
-      if (!_isBySA(ab)) return false;                    // not assigned by SA
-      if (!assignee) return false;                        // blank assignee
-      if (_saAssigneeAliases.has(assignee)) return false; // SA assigned to themselves (any form)
+      const ab           = (t.assignedBy||'').toLowerCase().trim();
+      const assignee     = (t.assignee||'').toLowerCase().trim();
+      const assigneeName = (t.assigneeName||'').trim();
+      if (!_isBySA(ab)) return false;                              // not assigned by SA
+      if (!assignee && !assigneeName) return false;                 // completely blank assignee
+      if (assignee && _saAssigneeAliases.has(assignee)) return false; // SA assigned to themselves
       return true;
     };
 
@@ -3077,19 +3065,23 @@ function _renderDashCharts(_dashTasksRaw){
     t.completedDate || t.closedAt || t.doneAt ||
     (t.status === 'Done' ? today() : '');
 
-  // Build Map<email,{name,tasks[]}> from _allChartTasks (all-time, unfiltered by year/month).
+  // Build Map<key,{name,tasks[]}> from _allChartTasks (all-time, unfiltered by year/month).
+  // Key is assignee email when available, else lowercase assigneeName (for name-only assignees).
   // Compliance and avg-days always reflect lifetime totals regardless of dashboard date filter.
   const _buildEmailMap = () => {
     const map = new Map();
     _allChartTasks.forEach(t => {
-      const email = (t.assignee||'').toLowerCase().trim();
-      if (!email) return;
+      const email        = (t.assignee||'').toLowerCase().trim();
+      const assigneeName = (t.assigneeName||'').trim();
+      // Use email as key if present, else fall back to lowercase name
+      const key = email || assigneeName.toLowerCase();
+      if (!key) return;
       if (_saChartEmail && email === _saChartEmail) return; // skip SA-to-self
-      const name = _resolveName(t);
+      const name = _resolveName(t) || assigneeName;
       if (!name) return;
-      if (!map.has(email)) map.set(email, { name, tasks: [] });
-      if (name.length > map.get(email).name.length) map.get(email).name = name;
-      map.get(email).tasks.push(t);
+      if (!map.has(key)) map.set(key, { name, tasks: [] });
+      if (name.length > map.get(key).name.length) map.get(key).name = name;
+      map.get(key).tasks.push(t);
     });
     return map;
   };
@@ -5685,56 +5677,61 @@ function renderTeam(){
   //   • The logged-in user assigned a task TO them  (assignedBy===myE, assignee===them)
   //   • They assigned a task TO the logged-in user  (assignee===myE, assignedBy===them)
   //   • The logged-in user IS that person (self card)
-  let memberEmailSet;
+  // memberKeySet stores either an email OR a lowercase name for name-only assignees
+  let memberKeySet;
   if(_memberViewActive && _memberViewEmail) {
-    memberEmailSet = new Set([_memberViewEmail.toLowerCase()]);
+    memberKeySet = new Set([_memberViewEmail.toLowerCase()]);
   } else {
-    memberEmailSet = new Set();
+    memberKeySet = new Set();
     allTasks.forEach(t => {
-      const assignee   = (t.assignee||'').toLowerCase();
-      const assignedBy = (t.assignedBy||'').toLowerCase();
-      // I assigned this task → add the assignee (person I assigned to)
+      const assignee     = (t.assignee||'').toLowerCase();
+      const assigneeName = (t.assigneeName||'').trim();
+      const assignedBy   = (t.assignedBy||'').toLowerCase();
+      // Use email as key if present, else lowercase name
+      const assigneeKey  = assignee || assigneeName.toLowerCase();
+      // I assigned this task → add the assignee
       const iAmAssigner = myE && (
         assignedBy === myE ||
         (!currentSession && (assignedBy === 'superadmin' || !assignedBy))
       );
-      if(iAmAssigner && assignee && assignee !== myE) {
-        memberEmailSet.add(assignee);
+      if(iAmAssigner && assigneeKey && assigneeKey !== myE) {
+        memberKeySet.add(assigneeKey);
       }
       // Someone assigned a task TO me → add that person
       if(myE && assignee === myE && assignedBy && assignedBy !== myE && assignedBy !== 'superadmin') {
-        memberEmailSet.add(assignedBy);
+        memberKeySet.add(assignedBy);
       }
     });
     // Always include self
-    if(myE) memberEmailSet.add(myE);
+    if(myE) memberKeySet.add(myE);
   }
 
-  const uniqueEmails = [...memberEmailSet].filter(Boolean);
+  const uniqueKeys = [...memberKeySet].filter(Boolean);
 
-  const members = uniqueEmails.map(email => {
-    // Tasks assigned TO this member (their workload as assignee)
-    const assignedToThem  = allTasks.filter(t => (t.assignee||'').toLowerCase() === email);
-    // Tasks this member assigned to others (their activity as assigner)
-    const assignedByThem  = allTasks.filter(t => (t.assignedBy||'').toLowerCase() === email);
-    // Deduplicated union — a task where member is both sides is counted once
-    const memberTaskIds   = new Set([...assignedToThem.map(t=>t.id), ...assignedByThem.map(t=>t.id)]);
-    const memberTasks     = allTasks.filter(t => memberTaskIds.has(t.id));
-    const nick = _nickCache[email] || email.split('@')[0];
-    // BUG FIX v218: Always base workload stats on tasks assigned TO them.
-    // The old fallback (assignedByThem when assignedToThem is empty) caused
-    // done/inprog/overdue to count the wrong tasks for plant owners.
+  const members = uniqueKeys.map(key => {
+    // Match tasks where assignee email OR lowercase assigneeName equals key
+    const assignedToThem = allTasks.filter(t => {
+      const e = (t.assignee||'').toLowerCase();
+      const n = (t.assigneeName||'').toLowerCase().trim();
+      return e === key || (!e && n === key);
+    });
+    const assignedByThem = allTasks.filter(t => (t.assignedBy||'').toLowerCase() === key);
+    const nick = _nickCache[key] || key.split('@')[0];
+    // Prefer assigneeName from first task if available (for display)
+    const displayNickFromTask = assignedToThem[0]?.assigneeName?.trim() || '';
+    const resolvedNick = displayNickFromTask || _nickCache[key] || key.split('@')[0];
     return {
-      email, nick,
-      total:        assignedToThem.length, // TOTAL = tasks assigned to them (their workload)
+      email: key,  // used as unique identifier (may be email or name-key)
+      nick: resolvedNick,
+      total:        assignedToThem.length,
       assignedTo:   assignedToThem.length,
       assignedBy:   assignedByThem.length,
       done:         assignedToThem.filter(t=>t.status==='Done').length,
       inprog:       assignedToThem.filter(t=>t.status==='In Progress').length,
       overdue:      assignedToThem.filter(isOverdue).length,
       // Relationship labels
-      iAssigned:    allTasks.some(t=>{ const ab=(t.assignedBy||'').toLowerCase(); return (ab===myE||(!currentSession&&(ab==='superadmin'||!ab))) && (t.assignee||'').toLowerCase()===email; }),
-      theyAssigned: myE && email !== myE && allTasks.some(t=>(t.assignee||'').toLowerCase()===myE && (t.assignedBy||'').toLowerCase()===email),
+      iAssigned:    allTasks.some(t=>{ const ab=(t.assignedBy||'').toLowerCase(); const e=(t.assignee||'').toLowerCase(); const n=(t.assigneeName||'').toLowerCase().trim(); const ak=e||n; return (ab===myE||(!currentSession&&(ab==='superadmin'||!ab))) && ak===key && ak!==myE; }),
+      theyAssigned: myE && key !== myE && allTasks.some(t=>(t.assignee||'').toLowerCase()===myE && (t.assignedBy||'').toLowerCase()===key),
     };
   });
 
@@ -5745,25 +5742,29 @@ function renderTeam(){
   <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px" class="fade-in">
   ${members.map(m=>{
     const pct=m.assignedTo?Math.round(m.done/m.assignedTo*100):0;
+    const isEmailKey = m.email.includes('@');  // false for name-only members
     const displayNick = (m.nick || m.email.split('@')[0]).replace(/^(.)/, c => c.toUpperCase());
     const initials=displayNick.slice(0,2).toUpperCase();
     const colors=['var(--accent)','var(--purple)','var(--green)','var(--amber)','var(--cyan)'];
     const color=colors[m.email.charCodeAt(0)%colors.length];
-    const isSelf = currentSession && m.email.toLowerCase() === currentSession.email.toLowerCase();
+    const isSelf = isEmailKey && currentSession && m.email.toLowerCase() === currentSession.email.toLowerCase();
     // Relationship tags
     const relTags = [];
     if(isSelf) relTags.push('<span style="font-size:10px;font-weight:700;color:var(--accent);background:rgba(91,141,238,.12);border:1px solid rgba(91,141,238,.25);border-radius:4px;padding:1px 6px;">You</span>');
     if(!isSelf && m.iAssigned) relTags.push('<span style="font-size:10px;font-weight:700;color:var(--green);background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.25);border-radius:4px;padding:1px 6px;">Assigned by you</span>');
     if(!isSelf && m.theyAssigned) relTags.push('<span style="font-size:10px;font-weight:700;color:var(--purple);background:rgba(179,102,255,.1);border:1px solid rgba(179,102,255,.25);border-radius:4px;padding:1px 6px;">Assigned you</span>');
+    const emailDisplay = isEmailKey
+      ? `<div style="font-size:11px;color:var(--text2);word-break:break-all">${m.email}</div>`
+      : `<div style="font-size:11px;color:var(--text3);font-style:italic">No email — name only</div>`;
     return`<div class="card" style="border-top:3px solid ${color}">
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
         <div style="width:44px;height:44px;border-radius:50%;background:${color}22;border:2px solid ${color}44;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;color:${color};flex-shrink:0">${initials}</div>
         <div style="flex:1;min-width:0;">
           <div style="font-weight:700;font-size:14px;color:var(--text);margin-bottom:4px;">${displayNick}</div>
           <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px;">${relTags.join('')}</div>
-          <div style="font-size:11px;color:var(--text2);word-break:break-all">${m.email}</div>
+          ${emailDisplay}
         </div>
-        ${!isSelf?`<button class="btn btn-ghost btn-sm" style="padding:4px 10px;font-size:11px;flex-shrink:0;" onclick="enterMemberImpersonation('${m.email}','${displayNick}')">👁 View</button>`:''}
+        ${(!isSelf && isEmailKey)?`<button class="btn btn-ghost btn-sm" style="padding:4px 10px;font-size:11px;flex-shrink:0;" onclick="enterMemberImpersonation('${m.email}','${displayNick}')">👁 View</button>`:''}
       </div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:6px">
         <div style="text-align:center;background:var(--bg);border-radius:8px;padding:8px;cursor:pointer;border:1px solid var(--accent);transition:transform .15s;" title="View all tasks" onclick="goToTasksFilteredByAssignee(\'All\',\'${m.email}\')">
@@ -5786,7 +5787,7 @@ function renderTeam(){
       </div>
       <div class="progress-bar" style="margin-bottom:5px"><div class="progress-fill" style="width:${pct}%;background:${color}"></div></div>
       <div style="font-size:11px;color:var(--text2);margin-bottom:12px">${pct}% completion rate</div>
-      <button class="btn btn-ghost btn-sm" style="width:100%;justify-content:center;font-size:11px;" onclick="copyAssigneeLink('${m.email}')">🔗 Copy Task Link</button>
+      ${isEmailKey?`<button class="btn btn-ghost btn-sm" style="width:100%;justify-content:center;font-size:11px;" onclick="copyAssigneeLink('${m.email}')">🔗 Copy Task Link</button>`:`<div style="font-size:11px;color:var(--text3);text-align:center;padding:6px 0">Add email to enable task link</div>`}
     </div>`;
   }).join('')}
   </div>`;
@@ -8113,10 +8114,8 @@ function getScopedTasks(){
       // LEGACY FIX (v157): tasks created before v157 stored assignedBy = admin_notify_email
       // (e.g. Aniket's email). They still belong to superadmin — show them.
       if(saEmail && assignedBy === saEmail) return true;
-      if(assignedBy === 'superadmin') return true;
+      if(assignedBy === 'superadmin') return true;  // includes name-only assignee tasks
       // Tasks with no assignedBy — only include if assignee is ME (legacy self-created tasks)
-      // Do NOT include tasks with no assignedBy where assignee is someone else (e.g. Sunil Bhalekar)
-      // as those were created by a different user and should not appear in superadmin's My Tasks.
       if(!assignedBy && saEmail && assignee === saEmail) return true;
       // Group members' tasks — only accepted members (not arbitrary third-party emails)
       if(authorised.has(assignee) || (assignedBy && authorised.has(assignedBy))) return true;
