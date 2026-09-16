@@ -2873,11 +2873,11 @@ function _renderDashCharts(_dashTasksRaw){
   if (_isSuperAdminView) {
     _saChartEmail = (localStorage.getItem('admin_notify_email')||'').trim().toLowerCase();
 
-    // v206: Build a set of ALL strings that mean "assigned by superadmin".
+    // v218: Build a set of ALL strings that mean "assigned by superadmin".
     // Older tasks may store assignedBy as the display name ("Sushil"), the email
     // prefix ("sushil"), the full email, or the canonical string "superadmin".
     // Tasks showing "Head Office" in UI have assignedBy='superadmin' — included via alias.
-    const _saAliases = new Set(['superadmin']);
+    const _saAliases = new Set(['superadmin', '']);  // '' = blank assignedBy also means SA
     if (_saChartEmail) {
       _saAliases.add(_saChartEmail);                    // full email
       _saAliases.add(_saChartEmail.split('@')[0]);      // email prefix e.g. "sushil"
@@ -2885,7 +2885,23 @@ function _renderDashCharts(_dashTasksRaw){
     const _selfName = (localStorage.getItem('self_name')||'').trim().toLowerCase();
     if (_selfName) _saAliases.add(_selfName);           // display name e.g. "sushil"
 
-    const _isBySA = ab => _saAliases.has(ab);
+    // Also collect all plant owner emails so we can EXCLUDE tasks assigned by them
+    const _plantOwnerEmails = new Set();
+    getPlantGroups().forEach(p => (p.owners||[]).forEach(o => {
+      if (o) _plantOwnerEmails.add(o.toLowerCase().trim());
+    }));
+    // Also exclude appUser emails (logged-in team members who assign their own tasks)
+    (_allAppUsers||[]).forEach(u => {
+      if (u.email) _plantOwnerEmails.add(u.email.toLowerCase().trim());
+    });
+
+    const _isBySA = ab => {
+      if (_saAliases.has(ab)) return true;
+      // If assignedBy is not a known plant owner / app user → treat as SA
+      // (covers legacy tasks where assignedBy was stored as a name/nickname)
+      if (!_plantOwnerEmails.has(ab)) return true;
+      return false;
+    };
     // All known identity strings for the SA as ASSIGNEE — for self-task exclusion
     const _saAssigneeAliases = new Set([_saChartEmail]);
     if (_saChartEmail) _saAssigneeAliases.add(_saChartEmail.split('@')[0]);
@@ -2904,9 +2920,9 @@ function _renderDashCharts(_dashTasksRaw){
     _chartTasks = _dashTasks.filter(_saTaskFilter);
 
     // All-time scope — compliance & avg-days always show lifetime totals.
-    // Use the full tasks array (not getDashScopedTasks) so legacy tasks where
-    // assignedBy was stored as a name ("Sushil") are included — getDashScopedTasks
-    // only checks the email and 'superadmin' string, missing name-form values.
+    // Only include tasks assigned BY the superadmin to others (not self-assigned,
+    // not tasks assigned by plant owners to their own members).
+    // This ensures the compliance chart shows only the people YOU assigned tasks to.
     const _seenAll = new Set();
     _allChartTasks = tasks
       .filter(t => { if(_seenAll.has(t.id)) return false; _seenAll.add(t.id); return true; })
@@ -5705,17 +5721,17 @@ function renderTeam(){
     const memberTaskIds   = new Set([...assignedToThem.map(t=>t.id), ...assignedByThem.map(t=>t.id)]);
     const memberTasks     = allTasks.filter(t => memberTaskIds.has(t.id));
     const nick = _nickCache[email] || email.split('@')[0];
-    // Base workload stats on the assignee side (tasks assigned TO them)
-    // Fall back to assigner side only if they have no tasks assigned to them
-    const workTasks = assignedToThem.length ? assignedToThem : assignedByThem;
+    // BUG FIX v218: Always base workload stats on tasks assigned TO them.
+    // The old fallback (assignedByThem when assignedToThem is empty) caused
+    // done/inprog/overdue to count the wrong tasks for plant owners.
     return {
       email, nick,
-      total:        memberTasks.length,
+      total:        assignedToThem.length, // TOTAL = tasks assigned to them (their workload)
       assignedTo:   assignedToThem.length,
       assignedBy:   assignedByThem.length,
-      done:         workTasks.filter(t=>t.status==='Done').length,
-      inprog:       workTasks.filter(t=>t.status==='In Progress').length,
-      overdue:      workTasks.filter(isOverdue).length,
+      done:         assignedToThem.filter(t=>t.status==='Done').length,
+      inprog:       assignedToThem.filter(t=>t.status==='In Progress').length,
+      overdue:      assignedToThem.filter(isOverdue).length,
       // Relationship labels
       iAssigned:    allTasks.some(t=>{ const ab=(t.assignedBy||'').toLowerCase(); return (ab===myE||(!currentSession&&(ab==='superadmin'||!ab))) && (t.assignee||'').toLowerCase()===email; }),
       theyAssigned: myE && email !== myE && allTasks.some(t=>(t.assignee||'').toLowerCase()===myE && (t.assignedBy||'').toLowerCase()===email),
@@ -5728,7 +5744,7 @@ function renderTeam(){
   <div class="panel-sub">${members.length} member(s) in your team${plantOwnerAuthenticated&&currentPlantSession?' — 🏭 '+esc(currentPlantSession.name):''}</div>
   <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px" class="fade-in">
   ${members.map(m=>{
-    const pct=m.assignedTo?Math.round(m.done/m.total*100):0;
+    const pct=m.assignedTo?Math.round(m.done/m.assignedTo*100):0;
     const displayNick = (m.nick || m.email.split('@')[0]).replace(/^(.)/, c => c.toUpperCase());
     const initials=displayNick.slice(0,2).toUpperCase();
     const colors=['var(--accent)','var(--purple)','var(--green)','var(--amber)','var(--cyan)'];
@@ -6431,6 +6447,7 @@ function renderSettings(){
         <button class="btn btn-ghost" onclick="exportData()">⬇ Export All Tasks (JSON)</button>
         <button class="btn btn-ghost" onclick="importData()">⬆ Import Tasks (JSON)</button>
         <button class="btn btn-danger" onclick="resetData()">🔄 Reset to Demo Data</button>
+        <button class="btn btn-danger" onclick="deleteAllTasks()">🗑 Delete All Tasks</button>
       </div>
     </div>
 
@@ -11983,6 +12000,23 @@ function resetData(){
     });
   }
   showPanel('dashboard'); toast('Reset to demo data');
+}
+
+function deleteAllTasks(){
+  const n = tasks.length;
+  if(!n){ toast('No tasks to delete.','var(--amber)'); return; }
+  if(!confirm(`Permanently delete ALL ${n} task(s)? This cannot be undone.`)) return;
+  tasks = [];
+  _safeSetTasks(tasks);
+  if(_fbReady && _db){
+    _db.collection('tasks').get().then(snap=>{
+      const batch = _db.batch();
+      snap.docs.forEach(d => batch.delete(d.ref));
+      batch.commit().catch(e => console.warn('deleteAllTasks batch error', e));
+    });
+  }
+  showPanel('dashboard');
+  toast(`🗑 Deleted ${n} task(s).`, 'var(--red)');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
