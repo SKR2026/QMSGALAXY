@@ -5403,6 +5403,8 @@ async function executeApprovalAction() {
             approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
             updatedAt: now
           });
+          // Notify CC observers of final approval (fire-and-forget, non-blocking)
+          notifyFinalApprovalObservers(p, proposalId).catch(()=>{});
         } else {
           // Find next level — above currentLevel, above creator's matrix level, up to maxLevel
           const _matrixSnap2    = await db.collection('pp_approvalMatrices').get();
@@ -5433,6 +5435,8 @@ async function executeApprovalAction() {
               approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
               updatedAt: now
             });
+            // Notify CC observers of final approval (fire-and-forget, non-blocking)
+            notifyFinalApprovalObservers(p, proposalId).catch(()=>{});
             closeModal('approval-modal-overlay');
             toast('Proposal finally approved!','success');
             navigate('proposals');
@@ -6730,6 +6734,83 @@ window.removeCCObserver = function(idx) {
   window._ccObservers.splice(idx, 1);
   renderCCObservers();
 };
+
+// ── FINAL APPROVAL OBSERVER NOTIFICATION ──────────────────────────────────
+// Called after a proposal reaches its final approval (status → 'Approved').
+// Reads ccObservers from pp_settings/approval, then sends each observer an
+// email via the sendFinalApprovalCC Cloud Function (preferred) or falls back
+// to writing pp_notifications docs so they see it in-app.
+async function notifyFinalApprovalObservers(proposal, proposalId) {
+  try {
+    // 1. Load observers from Firestore (fresh read, not stale window._ccObservers)
+    const settSnap = await db.collection('pp_settings').doc('approval').get();
+    const observers = (settSnap.exists ? settSnap.data()?.ccObservers : null) || window._ccObservers || [];
+    if (!observers.length) return; // nothing to do
+
+    const p = proposal;
+    const proposalNum  = p.proposalNumber  || proposalId;
+    const creatorName  = p.creatorName     || p.createdByName || 'Proposer';
+    const plant        = p.plantName       || p.plantId       || '—';
+    const proposedAmt  = p.proposedPrice !== undefined
+      ? '₹' + Number(p.proposedPrice).toLocaleString('en-IN')
+      : (p.proposedAmount !== undefined ? '₹' + Number(p.proposedAmount).toLocaleString('en-IN') : '—');
+    const approvalDate = new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' });
+    const appLink      = window.location.href.split('?')[0];
+
+    const subject = `[CC] APPROVED: Price Proposal ${proposalNum}`;
+    const body =
+      `Dear Observer,\n\n` +
+      `This is an automated CC notification. The following price proposal has received its FINAL APPROVAL.\n\n` +
+      `Proposal #  : ${proposalNum}\n` +
+      `Proposer    : ${creatorName}\n` +
+      `Plant       : ${plant}\n` +
+      `Approved Price: ${proposedAmt}\n` +
+      `Approved On : ${approvalDate}\n\n` +
+      `You are receiving this because you are listed as a Final Approval Observer.\n` +
+      `View the proposal at: ${appLink}\n\n` +
+      `Regards,\nPrice Approval System`;
+
+    // 2. Try CF sendFinalApprovalCC first (if deployed)
+    let cfSent = false;
+    try {
+      const ccFn = fns.httpsCallable('sendFinalApprovalCC');
+      await ccFn({ proposalId, proposalNumber: proposalNum, observers, subject, body });
+      cfSent = true;
+    } catch (_) { /* CF not deployed — use fallback */ }
+
+    if (!cfSent) {
+      // 3. Fallback: write pp_notifications docs for each observer
+      //    (in-app notification; email delivery requires CF trigger on this collection)
+      const batch = db.batch();
+      const ts = firebase.firestore.FieldValue.serverTimestamp();
+      for (const obs of observers) {
+        if (!obs.email) continue;
+        // Look up userId by email so in-app bell lights up
+        const userSnap = await db.collection('pp_users').where('email','==', obs.email).limit(1).get();
+        const userId = userSnap.empty ? `observer_${obs.email}` : userSnap.docs[0].id;
+        const ref = db.collection('pp_notifications').doc();
+        batch.set(ref, {
+          userId,
+          email: obs.email,
+          name: obs.name || obs.email,
+          title: `✅ Final Approval: Proposal ${proposalNum}`,
+          body: `Proposal ${proposalNum} by ${creatorName} (${plant}) has been FINALLY APPROVED at ${proposedAmt} on ${approvalDate}.`,
+          type: 'final_approval',
+          proposalId,
+          proposalNumber: proposalNum,
+          read: false,
+          createdAt: ts
+        });
+      }
+      await batch.commit();
+    }
+
+    console.log(`[notifyFinalApprovalObservers] Notified ${observers.length} observer(s) for ${proposalNum}. CF used: ${cfSent}`);
+  } catch (e) {
+    // Non-fatal — log and continue; don't block the approval flow
+    console.warn('[notifyFinalApprovalObservers] Failed:', e.message || e);
+  }
+}
 
 // ── MANAGEMENT DIGEST SETTINGS ──────────────────────────────────────────────
 
