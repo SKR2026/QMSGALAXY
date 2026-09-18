@@ -6776,11 +6776,30 @@ async function notifyFinalApprovalObservers(proposal, proposalId) {
       const ccFn = fns.httpsCallable('sendFinalApprovalCC');
       await ccFn({ proposalId, proposalNumber: proposalNum, observers, subject, body });
       cfSent = true;
-    } catch (_) { /* CF not deployed — use fallback */ }
+    } catch (_) {
+      console.warn('[notifyFinalApprovalObservers] sendFinalApprovalCC CF not deployed — falling back to per-observer Gmail CF + in-app notification.');
+    }
 
     if (!cfSent) {
-      // 3. Fallback: write pp_notifications docs for each observer
-      //    (in-app notification; email delivery requires CF trigger on this collection)
+      // 3a. Fallback email: call testGmailNotification for each observer so a real
+      //     email is dispatched even without the dedicated sendFinalApprovalCC CF.
+      const gmailFn = fns.httpsCallable('testGmailNotification');
+      let emailsSent = 0;
+      for (const obs of observers) {
+        if (!obs.email) continue;
+        try {
+          // testGmailNotification accepts { to, subject, body } — subject & body
+          // are optional but passed here so the email carries the approval details.
+          await gmailFn({ to: obs.email, subject, body });
+          emailsSent++;
+          console.log(`[notifyFinalApprovalObservers] Email sent via Gmail CF to ${obs.email}`);
+        } catch (emailErr) {
+          console.warn(`[notifyFinalApprovalObservers] Gmail CF failed for ${obs.email}:`, emailErr.message || emailErr);
+        }
+      }
+
+      // 3b. Always write pp_notifications docs for in-app bell notification,
+      //     regardless of whether email succeeded above.
       const batch = db.batch();
       const ts = firebase.firestore.FieldValue.serverTimestamp();
       for (const obs of observers) {
@@ -6803,6 +6822,7 @@ async function notifyFinalApprovalObservers(proposal, proposalId) {
         });
       }
       await batch.commit();
+      console.log(`[notifyFinalApprovalObservers] Fallback: ${emailsSent}/${observers.length} email(s) sent via Gmail CF; in-app notifications written.`);
     }
 
     console.log(`[notifyFinalApprovalObservers] Notified ${observers.length} observer(s) for ${proposalNum}. CF used: ${cfSent}`);
