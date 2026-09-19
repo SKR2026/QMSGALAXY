@@ -3724,7 +3724,7 @@ function superadminHTML() {
       <div class="card-title">📧 Accounts Department — Plant-wise Invoice Notifications
         <span class="badge badge-success" style="font-size:11px">Auto Email · Per Plant</span>
       </div>
-      <div class="alert alert-info mb-4">ℹ️ Invoice upload notifications are <b>plant-specific</b>. Configure the accounts team emails for each plant under <b>Plants → ✏️ Edit Plant</b>. Only the accounts team of the relevant plant receives the notification.</div>
+      <div class="alert alert-info mb-4">ℹ️ Invoice upload notifications are <b>plant-specific</b>. Configure the accounts team emails for each plant under <b>Plants → ✏️ Edit Plant</b>. On invoice upload, a record is written to <code>vems_invoice_notifications</code> in Firestore — the existing Cloud Function picks it up and sends the email. No changes to <code>index.js</code> are needed.</div>
 
       <!-- Per-plant summary table -->
       <div class="table-wrap">
@@ -4453,30 +4453,32 @@ window.testNotification = async function(type) {
 
 
 window.testAccountsNotification = async function(plantId) {
-  const pid = plantId || S.plants[0]?.id;
+  const pid   = plantId || S.plants[0]?.id;
   const plant = S.plants.find(p => p.id === pid);
-  const accountsEmails = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
-  if (!accountsEmails.length) {
-    showToast(`No accounts emails configured for ${plant?.name || 'this plant'}. Edit the plant first.`, 'error'); return;
-  }
+  const recipients = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
   const el = document.getElementById('accounts-email-status');
-  if (el) el.innerHTML = `<span style="color:#d97706">⏳ Sending test notification for ${plant?.name}…</span>`;
+
+  if (!recipients.length) {
+    showToast(`No accounts emails configured for ${plant?.name || 'this plant'}. Edit the plant first.`, 'error');
+    return;
+  }
+  if (el) el.innerHTML = `<span style="color:#d97706">⏳ Queuing test notification for ${plant?.name}…</span>`;
 
   const dummyData = {
-    vehicleId:  S.vehicles.find(v => v.plantId === pid)?.id || S.vehicles[0]?.id || '',
-    plantId:    pid,
-    category:   'Maintenance',
-    vendor:     'Test Vendor Ltd.',
-    invoiceNo:  'TEST-001',
-    invoiceDate: new Date().toISOString().slice(0,10),
-    date:       new Date().toISOString().slice(0,10),
-    amount:     5000,
-    gst:        900,
+    vehicleId:   S.vehicles.find(v => v.plantId === pid)?.id || S.vehicles[0]?.id || '',
+    plantId:     pid,
+    category:    'Maintenance',
+    vendor:      'Test Vendor Ltd.',
+    invoiceNo:   'TEST-001',
+    invoiceDate: new Date().toISOString().slice(0, 10),
+    date:        new Date().toISOString().slice(0, 10),
+    amount:      5000,
+    gst:         900,
   };
   try {
-    await sendInvoiceUploadNotification(dummyData, '#test-url');
-    if (el) el.innerHTML = `<span style="color:#16a34a">✅ Test notification sent to: ${accountsEmails.join(', ')} (${plant?.name})</span>`;
-    showToast('Test notification sent!', 'success');
+    await sendInvoiceUploadNotification(dummyData, '#test-bill-url');
+    if (el) el.innerHTML = `<span style="color:#16a34a">✅ Test notification queued for: ${recipients.join(', ')} (${plant?.name}). The cloud function will send the email on its next run.</span>`;
+    showToast('Test notification queued in Firestore!', 'success');
   } catch(e) {
     if (el) el.innerHTML = `<span style="color:#dc2626">❌ ${e.message}</span>`;
     showToast('Test failed: ' + e.message, 'error');
@@ -5716,83 +5718,50 @@ window.saveExpense = async function(expenseId='') {
 };
 
 // ── ACCOUNTS EMAIL NOTIFICATION AFTER INVOICE UPLOAD ────────────────
+// Writes a notification record to Firestore (vems_invoice_notifications).
+// The existing VEMS Cloud Function picks this up on its scheduled run and
+// sends the email — no new API endpoint or index.js changes required.
 async function sendInvoiceUploadNotification(expenseData, billUrl) {
-  const cfg = S.notifConfig || {};
+  // Plant-specific accounts emails
+  const plant   = S.plants.find(p => p.id === expenseData.plantId);
+  const recipients = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
 
-  // ── Plant-specific accounts emails (primary source) ──────────────
-  const plant = S.plants.find(p => p.id === expenseData.plantId);
-  const plantAccountsEmails = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
-
-  // ── Global fallback accounts emails (from notifConfig, if any) ───
-  const globalAccountsEmails = (cfg.accountsEmails || []).filter(e => e && e.includes('@'));
-
-  // Merge: plant-specific first, then any global extras not already included
-  const allRecipients = [
-    ...plantAccountsEmails,
-    ...globalAccountsEmails.filter(e => !plantAccountsEmails.includes(e)),
-  ];
-
-  if (!allRecipients.length) {
+  if (!recipients.length) {
     console.log(`[Accounts Notification] No accounts emails for plant "${plant?.name || expenseData.plantId}" — skipped.`);
     return;
   }
 
-  const url    = (cfg.notifFunctionUrl || '').trim().replace(/\/$/, '');
-  const secret = (cfg.vemsSecret || '').trim();
-
   const vehicle = S.vehicles.find(v => v.id === expenseData.vehicleId);
 
-  const payload = {
-    to: allRecipients,
-    subject: `📎 New Invoice Uploaded — ${plant?.name || 'Plant'} | ${vehicle?.regNo || 'Vehicle'} · ${expenseData.category} · ${fmtR(expenseData.amount)}`,
-    type: 'invoice_upload',
-    expenseDetails: {
-      vehicleRegNo:  vehicle?.regNo || expenseData.vehicleId,
+  try {
+    await addDoc(collection(db, 'vems_invoice_notifications'), {
+      type:        'invoice_upload',
+      status:      'pending',           // cloud function sets this to 'sent'
+      plantId:     expenseData.plantId,
+      plantName:   plant?.name  || '',
+      plantCode:   plant?.code  || '',
+      recipients,
+      vehicleRegNo:  vehicle?.regNo || '',
       vehicleMake:   `${vehicle?.make || ''} ${vehicle?.model || ''}`.trim(),
-      plantName:     plant?.name || expenseData.plantId,
-      plantCode:     plant?.code || '',
-      category:      expenseData.category,
-      vendor:        expenseData.vendor || '—',
-      invoiceNo:     expenseData.invoiceNo || '—',
-      invoiceDate:   expenseData.invoiceDate || expenseData.date,
-      date:          expenseData.date,
-      amount:        fmtR(expenseData.amount),
-      gst:           expenseData.gst ? fmtR(expenseData.gst) : '—',
-      total:         fmtR((expenseData.amount || 0) + (expenseData.gst || 0)),
+      category:      expenseData.category  || '',
+      vendor:        expenseData.vendor    || '',
+      invoiceNo:     expenseData.invoiceNo || '',
+      invoiceDate:   expenseData.invoiceDate || expenseData.date || '',
+      expenseDate:   expenseData.date       || '',
+      amount:        expenseData.amount     || 0,
+      gst:           expenseData.gst        || 0,
+      total:        (expenseData.amount || 0) + (expenseData.gst || 0),
       billUrl,
-      uploadedBy:    S.user?.email || '—',
-      uploadedAt:    new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-    },
-  };
-
-  if (url && secret) {
-    const res = await fetch(`${url}/api/invoice-notify`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'x-internal-secret': secret },
-      body:    JSON.stringify(payload),
+      uploadedBy:    S.user?.email || '',
+      uploadedAt:    new Date().toISOString(),
+      createdAt:     serverTimestamp(),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      console.warn('[Accounts Notification] Cloud function error:', data.error || res.status);
-    } else {
-      console.log(`[Accounts Notification] Sent to ${allRecipients.join(', ')} for plant "${plant?.name}"`);
-      addAudit('Invoice Upload Notified', expenseData.invoiceNo || '—',
-        `${plant?.name} → ${allRecipients.join(', ')}`);
-    }
-  } else {
-    // Fallback — store notification record in Firestore for local display
-    console.warn('[Accounts Notification] No Cloud Function URL set. Storing notification locally.');
-    try {
-      await addDoc(collection(db, 'vems_notifications'), {
-        type: 'invoice_upload',
-        ...payload.expenseDetails,
-        recipients: allRecipients,
-        plantId: expenseData.plantId,
-        status: 'pending_email',
-        createdAt: serverTimestamp(),
-        createdBy: S.user?.email,
-      });
-    } catch(_) {}
+
+    addAudit('Invoice Notification Queued', expenseData.invoiceNo || '—',
+      `${plant?.name} → ${recipients.join(', ')}`);
+    console.log(`[Accounts Notification] Queued for ${recipients.join(', ')} (${plant?.name})`);
+  } catch(e) {
+    console.warn('[Accounts Notification] Firestore write failed:', e.message);
   }
 }
 
