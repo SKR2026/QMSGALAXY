@@ -130,6 +130,7 @@ tr:hover td{background:#fafbff}
 .badge-info{background:#dbeafe;color:#1d4ed8}
 .badge-purple{background:#ede9fe;color:#7c3aed}
 .badge-gray{background:var(--gray-100);color:var(--gray-600)}
+.badge-teal{background:#ccfbf1;color:#0f766e}
 
 /* ALERT */
 .alert{display:flex;align-items:flex-start;gap:10px;padding:12px 16px;border-radius:var(--radius);font-size:13.5px;margin-bottom:12px}
@@ -691,6 +692,8 @@ const sevColor = s => ({expired:'#dc2626',critical:'#ea580c',warning:'#d97706',n
 const sevBadge = s => ({expired:'badge-danger',critical:'badge-danger',warning:'badge-warning',notice:'badge-info',ok:'badge-success'})[s]||'badge-gray';
 const uid = () => 'id-' + Date.now() + '-' + Math.random().toString(36).slice(2,7);
 const isSA = () => S.isSuperAdmin;
+const isPlantAdmin = () => !S.isSuperAdmin && !S.isTopMgmt && S.userProfile?.role !== 'user';
+const isUser = () => S.userProfile?.role === 'user';
 const myPlantId = () => S.userProfile?.plantId || '';
 
 function myPlants() {
@@ -790,7 +793,7 @@ function vehicleReg(id) { return S.vehicles.find(v=>v.id===id)?.regNo || id; }
 
 function addAudit(action, oldVal='', newVal='', extra='') {
   S.auditLog.unshift({
-    id: uid(), user: S.user?.email||'', role: isSA()?'Superadmin':'Plant Admin',
+    id: uid(), user: S.user?.email||'', role: isSA()?'Superadmin':isUser()?'User':'Plant Admin',
     plant: isSA()?'All':plantName(myPlantId()), action, oldVal, newVal, extra,
     timestamp: new Date().toISOString()
   });
@@ -842,6 +845,15 @@ async function loadFirestoreData() {
       if (efDoc.exists()) S.emissionFactors = { ...EMISSION_FACTORS_DEFAULT, ...efDoc.data() };
     } catch {}
 
+    // Load notifConfig (cloud function URL, secret, etc.) from Firestore (shared across devices)
+    try {
+      const ncDoc = await getDoc(doc(db, 'vems_settings', 'notifConfig'));
+      if (ncDoc.exists()) {
+        const nc = ncDoc.data();
+        S.notifConfig = { ...(S.notifConfig || {}), ...nc };
+      }
+    } catch {}
+
     // Load custom expense categories (superadmin-managed)
     try {
       const catDoc = await getDoc(doc(db, 'vems_settings', 'expenseCategories'));
@@ -860,8 +872,8 @@ async function loadFirestoreData() {
       }
     } catch {}
 
-    // Load users list (superadmin only)
-    if (isSA()) await fsLoadUsers();
+    // Load users list (superadmin + plant admin)
+    if (isSA() || isPlantAdmin()) await fsLoadUsers();
 
     S.dataLoaded = true;
     S.loading = false;
@@ -1024,7 +1036,13 @@ async function fsSaveEmissionFactors(factors) {
 // other apps (PlantVisit, Legal etc.) that share the same Firebase project.
 async function fsLoadUsers() {
   try {
-    const snap = await getDocs(collection(db,'vems_users'));
+    let snap;
+    if (isSA()) {
+      snap = await getDocs(collection(db,'vems_users'));
+    } else {
+      // Plant admin: load only users in their plant
+      snap = await getDocs(query(collection(db,'vems_users'), where('plantId','==',myPlantId())));
+    }
     S.users = snap.docs
       .map(d => ({ uid: d.id, ...d.data() }))
       .filter(u => u.email !== SUPERADMIN_EMAIL);
@@ -1034,7 +1052,7 @@ async function fsLoadUsers() {
 // Creates a user via Firebase Auth REST API then saves to Firestore vems_users.
 // If email already exists in Firebase Auth (shared with other apps),
 // we skip Auth creation and just add/update the vems_users Firestore record.
-async function fsInviteUser(email, displayName, plantId, password, allowedVehicles=[]) {
+async function fsInviteUser(email, displayName, plantId, password, allowedVehicles=[], role='plant_admin') {
   const apiKey = firebaseConfig.apiKey;
   let newUid = null;
 
@@ -1113,7 +1131,7 @@ async function fsInviteUser(email, displayName, plantId, password, allowedVehicl
   // Step 2: Write to vems_users collection (separate from other apps)
   const profile = {
     email, displayName, plantId,
-    role: 'plant_admin', status: 'Active',
+    role, status: 'Active',
     app: 'vems',
     allowedVehicles,
     createdAt: serverTimestamp(), createdBy: S.user?.email,
@@ -1208,15 +1226,20 @@ window.deleteUser = async function(uid, name) {
 window.showUserModal = function(uid='') {
   const user = uid ? S.users.find(u=>u.uid===uid) : null;
   const isEdit = !!user;
-  const plants = S.plants;
+  // Plant admins can only add/edit users in their own plant
+  const plants = isPlantAdmin() ? myPlants() : S.plants;
+  // Plant admins can only add 'user' role; superadmin can add both
+  const canAddPlantAdmin = isSA();
 
   // For edit mode, pre-render vehicle rights section for assigned plant
   const editVehicleRights = isEdit ? _buildVehicleRightsHTML(user.plantId, user.allowedVehicles||[]) : '';
+  const userRole = user?.role || 'plant_admin';
+  const roleLabel = userRole === 'user' ? '👤 User' : '🏭 Plant Admin';
 
   S.modal = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
     <div class="modal">
       <div class="modal-header">
-        <h2>${isEdit ? '&#x270F;&#xFE0F; Edit Plant Admin' : '&#x2795; Add Plant Admin'}</h2>
+        <h2>${isEdit ? `&#x270F;&#xFE0F; Edit ${roleLabel}` : '&#x2795; Add User'}</h2>
         <button onclick="closeModal()">&#x2715;</button>
       </div>
       <div class="modal-body">
@@ -1224,19 +1247,33 @@ window.showUserModal = function(uid='') {
         <div class="form-grid">
           <div class="form-group form-full">
             <label class="form-label">Full Name <span class="req">*</span></label>
-            <input id="usr-name" class="form-input" placeholder="Plant Admin Name" value="${user?.displayName||''}"/>
+            <input id="usr-name" class="form-input" placeholder="User Full Name" value="${user?.displayName||''}"/>
           </div>
           <div class="form-group form-full">
             <label class="form-label">Email <span class="req">*</span></label>
-            <input id="usr-email" type="email" class="form-input" placeholder="admin.plant@company.com" value="${user?.email||''}" ${isEdit?'readonly':''}/>
+            <input id="usr-email" type="email" class="form-input" placeholder="user@company.com" value="${user?.email||''}" ${isEdit?'readonly':''}/>
           </div>
-          <div class="form-group form-full">
+          <div class="form-group ${canAddPlantAdmin ? '' : 'form-full'}">
             <label class="form-label">Assign Plant <span class="req">*</span></label>
-            <select id="usr-plant" class="form-select" onchange="renderModalVehicleRights(this.value)">
+            <select id="usr-plant" class="form-select" onchange="renderModalVehicleRights(this.value)" ${isPlantAdmin()?'disabled':''}>
               <option value="">&#x2014; Select Plant &#x2014;</option>
-              ${plants.map(p=>`<option value="${p.id}" ${user?.plantId===p.id?'selected':''}>${p.name} (${p.code})</option>`).join('')}
+              ${plants.map(p=>`<option value="${p.id}" ${(user?.plantId===p.id || (isPlantAdmin()&&p.id===myPlantId()))?'selected':''}>${p.name} (${p.code})</option>`).join('')}
             </select>
+            ${isPlantAdmin()?`<input type="hidden" id="usr-plant-hidden" value="${myPlantId()}"/>`:''}
           </div>
+          ${canAddPlantAdmin ? `
+          <div class="form-group">
+            <label class="form-label">Role <span class="req">*</span></label>
+            <select id="usr-role" class="form-select">
+              <option value="plant_admin" ${userRole==='plant_admin'?'selected':''}>🏭 Plant Admin</option>
+              <option value="user" ${userRole==='user'?'selected':''}>👤 User (View + Download)</option>
+            </select>
+          </div>` : `
+          <div class="form-group">
+            <label class="form-label">Role</label>
+            <input class="form-input" value="👤 User (View + Download)" readonly style="background:var(--gray-50);color:var(--gray-500)"/>
+            <input type="hidden" id="usr-role" value="user"/>
+          </div>`}
           ${!isEdit ? `
           <div class="form-group form-full">
             <label class="form-label">Temporary Password <span class="req">*</span></label>
@@ -1302,7 +1339,9 @@ window.saveUser = async function(uid='') {
   const isEdit = !!uid;
   const displayName = document.getElementById('usr-name')?.value.trim();
   const email = document.getElementById('usr-email')?.value.trim();
-  const plantId = document.getElementById('usr-plant')?.value;
+  // Plant admins use hidden field (their plant is pre-set); superadmin uses dropdown
+  const plantId = document.getElementById('usr-plant-hidden')?.value ||
+                  document.getElementById('usr-plant')?.value;
   const status = document.getElementById('usr-status')?.value || 'Active';
 
   if (!displayName) return showToast('Name is required', 'error');
@@ -1319,11 +1358,12 @@ window.saveUser = async function(uid='') {
   if (!isEdit) {
     const pass = document.getElementById('usr-pass')?.value;
     if (!pass || pass.length < 6) return showToast('Password must be at least 6 characters', 'error');
+    const role = document.getElementById('usr-role')?.value || 'plant_admin';
 
     const btn = document.getElementById('usr-submit-btn');
     if (btn) { btn.textContent = '⏳ Creating…'; btn.disabled = true; }
     try {
-      await fsInviteUser(email, displayName, plantId, pass, allowedVehicles);
+      await fsInviteUser(email, displayName, plantId, pass, allowedVehicles, role);
       const vLabel = allowedVehicles.length === 0 ? 'all vehicles' : allowedVehicles.length + ' vehicle(s)';
       showToast('User ' + displayName + ' created with access to ' + vLabel + '.', 'success');
       closeModal(); render();
@@ -2221,6 +2261,7 @@ function sidebarHTML() {
     { section:'Admin', items:[
       {id:'plants',label:'Plants',icon:'🏭'},
       ...(isSA()?[{id:'users',label:'User Management',icon:'👥'},{id:'emfactors',label:'Emission Factors',icon:'⚗️'},{id:'expensecategories',label:'Expense Categories',icon:'🏷️'},{id:'audit',label:'Audit Trail',icon:'📋'},{id:'license',label:'License',icon:'🔑'},{id:'superadmin',label:'Superadmin Panel',icon:'🛡️'}]:[]),
+      ...(isPlantAdmin()?[{id:'users',label:'User Management',icon:'👥'}]:[]),
     ]},
     { section:'Account', items:[
       {id:'settings',label:'Settings',icon:'⚙️'},
@@ -2238,7 +2279,7 @@ function sidebarHTML() {
     </div>
     <div class="sidebar-user">
       <div class="user-avatar">${(S.user?.email||'U')[0].toUpperCase()}</div>
-      <div><div class="user-name">${(()=>{const n=S.user?.email?.split('@')[0]||'User';return n.charAt(0).toUpperCase()+n.slice(1);})()}</div><div class="user-role">${isSA()?'🛡️ Superadmin':S.isTopMgmt?'👁️ Top Management':'🏭 Plant Admin'}</div></div>
+      <div><div class="user-name">${(()=>{const n=S.user?.email?.split('@')[0]||'User';return n.charAt(0).toUpperCase()+n.slice(1);})()}</div><div class="user-role">${isSA()?'🛡️ Superadmin':S.isTopMgmt?'👁️ Top Management':isUser()?'👤 User':'🏭 Plant Admin'}</div></div>
     </div>
     ${nav.map(s=>`<div class="sidebar-section">
       <div class="sidebar-section-label">${s.section}</div>
@@ -2264,11 +2305,11 @@ function pageHTML() {
     case 'notifications': return notificationsHTML();
     case 'vehicles':    return vehiclesHTML();
     case 'fuel':        return fuelHTML();
-    case 'expenses':    return expensesHTML();
+    case 'expenses':    return isUser() ? userExpensesHTML() : expensesHTML();
     case 'co2':         return co2HTML();
     case 'reports':     return reportsHTML();
     case 'plants':      return plantsHTML();
-    case 'users':       return isSA()?usersHTML():dashboardHTML();
+    case 'users':       return (isSA()||isPlantAdmin())?usersHTML():dashboardHTML();
     case 'emfactors':          return isSA()?emFactorsHTML():dashboardHTML();
     case 'expensecategories':  return isSA()?expenseCategoriesHTML():dashboardHTML();
     case 'audit':       return isSA()?auditHTML():dashboardHTML();
@@ -3083,7 +3124,7 @@ function expensesHTML() {
         <select class="form-select" style="font-size:12px;padding:5px 8px;min-width:120px" onchange="window.setQuickFilter('cat',this.value)">
           <option value="">All Categories</option>${EXPENSE_CATEGORIES.map(c=>`<option value="${c}" ${S.filterCat===c?'selected':''}>${c}</option>`).join('')}
         </select>
-        ${!S.isTopMgmt?`<button class="btn btn-primary btn-sm" onclick="showExpenseModal()">+ Add</button>
+        ${(!S.isTopMgmt && !isUser())?`<button class="btn btn-primary btn-sm" onclick="showExpenseModal()">+ Add</button>
         <button class="btn btn-secondary btn-sm" onclick="showBulkUploadModal()">📤 Bulk</button>`:''}
         <button class="btn btn-secondary btn-sm" onclick="exportExpensesCSV()">⬇ CSV</button>
         <button class="btn btn-secondary btn-sm" onclick="exportExpensesPDF()">⬇ PDF</button>
@@ -3470,7 +3511,9 @@ function plantsHTML() {
       ${isSA()?`<button class="btn btn-primary" onclick="showPlantModal()">+ Add Plant</button>`:''}
     </div>
     <div class="grid-3">
-      ${plants.map(p=>`<div class="card">
+      ${plants.map(p=>{
+        const acEmails = (p.accountsEmails||[]);
+        return `<div class="card">
         <div class="card-title">🏭 ${p.name}
           ${isSA()?`<div class="flex gap-2">
             <button class="btn btn-ghost btn-sm" onclick="showPlantModal('${p.id}')">✏️</button>
@@ -3482,12 +3525,21 @@ function plantsHTML() {
           <span class="badge ${p.status==='Active'?'badge-success':'badge-danger'}">${p.status}</span>
         </div>
         ${[['📍 Location',p.location],['🏠 Address',p.address||'—'],['🗺️ State',p.state||'—'],['👤 Plant Admin',p.plantAdminEmail||'—']].map(([l,v])=>`<div class="stat-mini"><span class="stat-mini-label">${l}</span><span class="stat-mini-val">${v}</span></div>`).join('')}
+        <div class="stat-mini" style="align-items:flex-start;padding-top:8px">
+          <span class="stat-mini-label">📧 Accounts CC</span>
+          <span class="stat-mini-val" style="font-size:11px;line-height:1.6">
+            ${acEmails.length
+              ? acEmails.map(e=>`<div>${e}</div>`).join('')
+              : '<span style="color:var(--gray-400);font-size:11px">Not configured</span>'}
+          </span>
+        </div>
         <hr class="divider"/>
         <div class="grid-2" style="gap:8px;margin-top:8px">
           <div class="vehicle-stat"><div class="vehicle-stat-label">Vehicles</div><div class="vehicle-stat-value">${S.vehicles.filter(v=>v.plantId===p.id).length}</div></div>
           <div class="vehicle-stat"><div class="vehicle-stat-label">Expenses</div><div class="vehicle-stat-value">${fmtR(S.expenses.filter(e=>e.plantId===p.id).reduce((s,e)=>s+e.amount,0))}</div></div>
         </div>
-      </div>`).join('')}
+      </div>`;
+      }).join('')}
     </div>
     <div id="modal-root"></div>
   </div>`;
@@ -3496,46 +3548,91 @@ function plantsHTML() {
 // ── USERS ─────────────────────────────────────────────────────────
 function usersHTML() {
   const users = S.users || [];
+  const plantAdmins = users.filter(u => u.role !== 'user');
+  const regularUsers = users.filter(u => u.role === 'user');
+  const amPlantAdmin = isPlantAdmin();
   return `<div class="page">
     <div class="page-header">
-      <div><h1 class="page-title">👥 User Management</h1><p class="page-subtitle">Manage Plant Admin accounts · ${users.length} user${users.length!==1?'s':''}</p></div>
-      <button class="btn btn-primary" onclick="showUserModal()">+ Add Plant Admin</button>
+      <div><h1 class="page-title">👥 User Management</h1>
+        <p class="page-subtitle">${amPlantAdmin?`Users for ${plantName(myPlantId())} · `:'All users · '}${users.length} user${users.length!==1?'s':''}</p>
+      </div>
+      <button class="btn btn-primary" onclick="showUserModal()">+ Add User</button>
     </div>
-    <div class="alert alert-info mb-4">ℹ️ Plant Admins can only access their assigned plant data. Superadmin has full access to all plants.</div>
-    <div class="card">
+    <div class="alert alert-info mb-4">
+      ${amPlantAdmin
+        ? 'ℹ️ As Plant Admin, you can add <b>Users</b> for your plant. Users can view expenses and download bills — they cannot add or edit records.'
+        : 'ℹ️ <b>Plant Admins</b> can access their assigned plant data and manage Users. <b>Users</b> can view and download bills only. Superadmin has full access.'}
+    </div>
+
+    ${isSA() ? `<!-- Superadmin row -->
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-title" style="margin-bottom:10px">🛡️ Superadmin</div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Assigned Plant</th><th>Vehicle Rights</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Scope</th><th>Status</th></tr></thead>
+        <tbody><tr>
+          <td><b>Sushil (You)</b></td><td>${SUPERADMIN_EMAIL}</td>
+          <td><span class="badge badge-purple">🛡️ Superadmin</span></td>
+          <td>All Plants</td><td><span class="badge badge-success">Active</span></td>
+        </tr></tbody>
+      </table></div>
+    </div>` : ''}
+
+    ${(isSA() || amPlantAdmin) && plantAdmins.length > 0 && isSA() ? `
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-title" style="margin-bottom:10px">🏭 Plant Admins <span class="badge badge-info" style="font-size:11px">${plantAdmins.length}</span></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Name</th><th>Email</th><th>Plant</th><th>Vehicle Rights</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead>
         <tbody>
-          <tr>
-            <td><b>Sushil (You)</b></td>
-            <td>${SUPERADMIN_EMAIL}</td>
-            <td><span class="badge badge-purple">🛡️ Superadmin</span></td>
-            <td>All Plants</td>
-            <td><span class="badge badge-success">All</span></td>
-            <td><span class="badge badge-success">Active</span></td>
-            <td>—</td>
-            <td>—</td>
-          </tr>
-          ${users.map(u=>`<tr>
+          ${plantAdmins.map(u=>`<tr>
             <td><b>${u.displayName||u.email.split('@')[0]}</b></td>
-            <td>${u.email}</td>
-            <td><span class="badge badge-info">🏭 Plant Admin</span></td>
-            <td>${plantName(u.plantId)||u.plantId||'—'}</td>
-            <td style="font-size:12px;color:var(--gray-500)">${(()=>{const av=u.allowedVehicles;return(!av||av.length===0)?'<span class="badge badge-success">All</span>':`<span class="badge badge-info">${av.length} vehicle${av.length>1?'s':''}</span>`;})()}</td>
+            <td style="font-size:12px;color:var(--gray-500)">${u.email}</td>
+            <td>${plantName(u.plantId)||'—'}</td>
+            <td>${(()=>{const av=u.allowedVehicles;return(!av||av.length===0)?'<span class="badge badge-success">All</span>':`<span class="badge badge-info">${av.length} vehicle${av.length>1?'s':''}</span>`;})()}</td>
             <td><span class="badge ${u.status==='Active'?'badge-success':u.status==='Pending'?'badge-warning':'badge-danger'}">${u.status||'Active'}</span></td>
-            <td>${u.createdAt?fmtDate(u.createdAt.toDate?u.createdAt.toDate():u.createdAt):'—'}</td>
+            <td style="font-size:12px">${u.createdAt?fmtDate(u.createdAt.toDate?u.createdAt.toDate():u.createdAt):'—'}</td>
+            <td style="white-space:nowrap">
+              <button class="btn btn-ghost btn-xs" onclick="showUserModal('${u.uid}')">✏️</button>
+              <button class="btn btn-ghost btn-xs text-warning" onclick="resetUserPassword('${u.email}')">🔑</button>
+              <button class="btn btn-ghost btn-xs text-danger" onclick="toggleUserStatus('${u.uid}','${u.status||'Active'}')">
+                ${u.status==='Inactive'?'✅':'🚫'}
+              </button>
+              <button class="btn btn-ghost btn-xs" onclick="showVehicleRightsModal('${u.uid}')">🚗</button>
+              <button class="btn btn-ghost btn-xs" style="color:#6b7280" onclick="deleteUser('${u.uid}','${(u.displayName||u.email).replace(/'/g,'')}')">🗑</button>
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table></div>
+    </div>` : ''}
+
+    <!-- Users (role = user) -->
+    <div class="card">
+      <div class="card-title" style="margin-bottom:10px">
+        👤 Users <span class="badge badge-gray" style="font-size:11px">${regularUsers.length}</span>
+        <span style="font-size:11px;font-weight:400;color:var(--gray-500);margin-left:8px">Can view expenses &amp; download bills · Read-only</span>
+      </div>
+      ${regularUsers.length === 0 ? `<p style="text-align:center;color:var(--gray-400);padding:24px">No users yet. Click "+ Add User" to create one.</p>` : `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Name</th><th>Email</th><th>Plant</th><th>Vehicle Rights</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${regularUsers.map(u=>`<tr>
+            <td><b>${u.displayName||u.email.split('@')[0]}</b></td>
+            <td style="font-size:12px;color:var(--gray-500)">${u.email}</td>
+            <td>${plantName(u.plantId)||'—'}</td>
+            <td>${(()=>{const av=u.allowedVehicles;return(!av||av.length===0)?'<span class="badge badge-success">All</span>':`<span class="badge badge-info">${av.length} vehicle${av.length>1?'s':''}</span>`;})()}</td>
+            <td><span class="badge ${u.status==='Active'?'badge-success':u.status==='Pending'?'badge-warning':'badge-danger'}">${u.status||'Active'}</span></td>
+            <td style="font-size:12px">${u.createdAt?fmtDate(u.createdAt.toDate?u.createdAt.toDate():u.createdAt):'—'}</td>
             <td style="white-space:nowrap">
               <button class="btn btn-ghost btn-xs" onclick="showUserModal('${u.uid}')">✏️ Edit</button>
               <button class="btn btn-ghost btn-xs text-warning" onclick="resetUserPassword('${u.email}')">🔑 Reset PW</button>
               <button class="btn btn-ghost btn-xs text-danger" onclick="toggleUserStatus('${u.uid}','${u.status||'Active'}')">
                 ${u.status==='Inactive'?'✅ Activate':'🚫 Deactivate'}
               </button>
-              <button class="btn btn-ghost btn-xs" onclick="showVehicleRightsModal('${u.uid}')">🚗 Vehicle Rights</button>
-              <button class="btn btn-ghost btn-xs" style="color:#6b7280" onclick="deleteUser('${u.uid}','${(u.displayName||u.email).replace(/'/g,'')}')">🗑 Delete</button>
+              <button class="btn btn-ghost btn-xs" onclick="showVehicleRightsModal('${u.uid}')">🚗 Vehicles</button>
+              <button class="btn btn-ghost btn-xs" style="color:#6b7280" onclick="deleteUser('${u.uid}','${(u.displayName||u.email).replace(/'/g,'')}')">🗑</button>
             </td>
           </tr>`).join('')}
         </tbody>
-      </table></div>
+      </table></div>`}
     </div>
     <div id="modal-root"></div>
   </div>`;
@@ -3620,6 +3717,56 @@ function superadminHTML() {
       ${kpi('Total Vehicles',S.vehicles.length,'Registered','#0ea5e9','🚗')}
       ${kpi('Total Expenses',fmtR(S.expenses.reduce((s,e)=>s+e.amount,0)),'All time','#7c3aed','₹')}
       ${kpi('Total CO₂',S.expenses.reduce((s,e)=>s+(e.co2Emission||0),0).toFixed(0)+' kg','All plants','#dc2626','🌱')}
+    </div>
+
+    <!-- Accounts Email Notification — Plant-wise -->
+    <div class="card mb-4">
+      <div class="card-title">📧 Accounts Department — Plant-wise Invoice Notifications
+        <span class="badge badge-success" style="font-size:11px">Auto Email · Per Plant</span>
+      </div>
+      <div class="alert alert-info mb-4">ℹ️ Invoice upload notifications are <b>plant-specific</b>. Configure the accounts team emails for each plant under <b>Plants → ✏️ Edit Plant</b>. Only the accounts team of the relevant plant receives the notification.</div>
+
+      <!-- Per-plant summary table -->
+      <div class="table-wrap">
+        <table style="font-size:12px">
+          <thead><tr style="background:var(--gray-50)">
+            <th style="padding:8px 12px">Plant</th>
+            <th style="padding:8px 12px">Code</th>
+            <th style="padding:8px 12px">Accounts Emails</th>
+            <th style="padding:8px 12px">Status</th>
+            <th style="padding:8px 12px">Action</th>
+          </tr></thead>
+          <tbody>
+            ${S.plants.map(p => {
+              const emails = p.accountsEmails || [];
+              return `<tr>
+                <td style="padding:7px 12px;font-weight:600">${p.name}</td>
+                <td style="padding:7px 12px"><span class="badge badge-info">${p.code}</span></td>
+                <td style="padding:7px 12px;font-size:11px;color:var(--gray-600)">
+                  ${emails.length ? emails.join('<br/>') : '<span style="color:#dc2626">⚠️ Not configured</span>'}
+                </td>
+                <td style="padding:7px 12px">
+                  ${emails.length
+                    ? `<span class="badge badge-success">✅ ${emails.length} email${emails.length>1?'s':''}</span>`
+                    : '<span class="badge badge-danger">❌ Missing</span>'}
+                </td>
+                <td style="padding:7px 12px">
+                  <button class="btn btn-secondary btn-xs" onclick="showPlantModal('${p.id}')">✏️ Configure</button>
+                  ${emails.length ? `<button class="btn btn-ghost btn-xs" onclick="testAccountsNotification('${p.id}')" style="color:#1a56a0">🧪 Test</button>` : ''}
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+
+      <div style="background:var(--gray-50);border-radius:var(--radius);padding:14px;border:1px solid var(--gray-200);margin-top:14px">
+        <div style="font-size:12px;font-weight:600;color:var(--gray-600);margin-bottom:8px">📋 What each plant's accounts notification includes:</div>
+        <div style="font-size:12px;color:var(--gray-500);display:grid;grid-template-columns:1fr 1fr;gap:4px">
+          ${['✅ Plant name & code','✅ Vehicle registration & make','✅ Expense category & date','✅ Vendor name & invoice number','✅ Amount, GST & total payable','✅ Direct invoice download link','✅ Who uploaded & timestamp','✅ Sent instantly on upload'].map(i=>`<div>${i}</div>`).join('')}
+        </div>
+      </div>
+      <div id="accounts-email-status" style="margin-top:8px;font-size:12px"></div>
     </div>
 
     <!-- Top Management Magic Link -->
@@ -4301,6 +4448,38 @@ window.testNotification = async function(type) {
     showToast('Test email failed: ' + msg, 'error');
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = icons[type]; }
+  }
+};
+
+
+window.testAccountsNotification = async function(plantId) {
+  const pid = plantId || S.plants[0]?.id;
+  const plant = S.plants.find(p => p.id === pid);
+  const accountsEmails = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
+  if (!accountsEmails.length) {
+    showToast(`No accounts emails configured for ${plant?.name || 'this plant'}. Edit the plant first.`, 'error'); return;
+  }
+  const el = document.getElementById('accounts-email-status');
+  if (el) el.innerHTML = `<span style="color:#d97706">⏳ Sending test notification for ${plant?.name}…</span>`;
+
+  const dummyData = {
+    vehicleId:  S.vehicles.find(v => v.plantId === pid)?.id || S.vehicles[0]?.id || '',
+    plantId:    pid,
+    category:   'Maintenance',
+    vendor:     'Test Vendor Ltd.',
+    invoiceNo:  'TEST-001',
+    invoiceDate: new Date().toISOString().slice(0,10),
+    date:       new Date().toISOString().slice(0,10),
+    amount:     5000,
+    gst:        900,
+  };
+  try {
+    await sendInvoiceUploadNotification(dummyData, '#test-url');
+    if (el) el.innerHTML = `<span style="color:#16a34a">✅ Test notification sent to: ${accountsEmails.join(', ')} (${plant?.name})</span>`;
+    showToast('Test notification sent!', 'success');
+  } catch(e) {
+    if (el) el.innerHTML = `<span style="color:#dc2626">❌ ${e.message}</span>`;
+    showToast('Test failed: ' + e.message, 'error');
   }
 };
 
@@ -5504,6 +5683,8 @@ window.saveExpense = async function(expenseId='') {
       enteredBy:old?.enteredBy||S.user?.email||''
     };
 
+    const invoiceJustUploaded = !!pendingBillFile; // track before clearing
+
     if(expenseId){
       await fsUpdateExpense(expenseId,data);
       pendingBillFile=null;
@@ -5515,6 +5696,14 @@ window.saveExpense = async function(expenseId='') {
       closeModal();
       showToast('Expense saved successfully','success');
     }
+
+    // ── Auto-notify accounts team when a new invoice is uploaded ──
+    if (invoiceJustUploaded && billUrl) {
+      sendInvoiceUploadNotification(data, billUrl).catch(e =>
+        console.warn('[Accounts Notification] Failed:', e.message)
+      );
+    }
+
     render();
   } catch(e) {
     console.error('Expense save/update error:',e);
@@ -5525,6 +5714,147 @@ window.saveExpense = async function(expenseId='') {
     showToast(msg,'error');
   }
 };
+
+// ── ACCOUNTS EMAIL NOTIFICATION AFTER INVOICE UPLOAD ────────────────
+async function sendInvoiceUploadNotification(expenseData, billUrl) {
+  const cfg = S.notifConfig || {};
+
+  // ── Plant-specific accounts emails (primary source) ──────────────
+  const plant = S.plants.find(p => p.id === expenseData.plantId);
+  const plantAccountsEmails = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
+
+  // ── Global fallback accounts emails (from notifConfig, if any) ───
+  const globalAccountsEmails = (cfg.accountsEmails || []).filter(e => e && e.includes('@'));
+
+  // Merge: plant-specific first, then any global extras not already included
+  const allRecipients = [
+    ...plantAccountsEmails,
+    ...globalAccountsEmails.filter(e => !plantAccountsEmails.includes(e)),
+  ];
+
+  if (!allRecipients.length) {
+    console.log(`[Accounts Notification] No accounts emails for plant "${plant?.name || expenseData.plantId}" — skipped.`);
+    return;
+  }
+
+  const url    = (cfg.notifFunctionUrl || '').trim().replace(/\/$/, '');
+  const secret = (cfg.vemsSecret || '').trim();
+
+  const vehicle = S.vehicles.find(v => v.id === expenseData.vehicleId);
+
+  const payload = {
+    to: allRecipients,
+    subject: `📎 New Invoice Uploaded — ${plant?.name || 'Plant'} | ${vehicle?.regNo || 'Vehicle'} · ${expenseData.category} · ${fmtR(expenseData.amount)}`,
+    type: 'invoice_upload',
+    expenseDetails: {
+      vehicleRegNo:  vehicle?.regNo || expenseData.vehicleId,
+      vehicleMake:   `${vehicle?.make || ''} ${vehicle?.model || ''}`.trim(),
+      plantName:     plant?.name || expenseData.plantId,
+      plantCode:     plant?.code || '',
+      category:      expenseData.category,
+      vendor:        expenseData.vendor || '—',
+      invoiceNo:     expenseData.invoiceNo || '—',
+      invoiceDate:   expenseData.invoiceDate || expenseData.date,
+      date:          expenseData.date,
+      amount:        fmtR(expenseData.amount),
+      gst:           expenseData.gst ? fmtR(expenseData.gst) : '—',
+      total:         fmtR((expenseData.amount || 0) + (expenseData.gst || 0)),
+      billUrl,
+      uploadedBy:    S.user?.email || '—',
+      uploadedAt:    new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    },
+  };
+
+  if (url && secret) {
+    const res = await fetch(`${url}/api/invoice-notify`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'x-internal-secret': secret },
+      body:    JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.warn('[Accounts Notification] Cloud function error:', data.error || res.status);
+    } else {
+      console.log(`[Accounts Notification] Sent to ${allRecipients.join(', ')} for plant "${plant?.name}"`);
+      addAudit('Invoice Upload Notified', expenseData.invoiceNo || '—',
+        `${plant?.name} → ${allRecipients.join(', ')}`);
+    }
+  } else {
+    // Fallback — store notification record in Firestore for local display
+    console.warn('[Accounts Notification] No Cloud Function URL set. Storing notification locally.');
+    try {
+      await addDoc(collection(db, 'vems_notifications'), {
+        type: 'invoice_upload',
+        ...payload.expenseDetails,
+        recipients: allRecipients,
+        plantId: expenseData.plantId,
+        status: 'pending_email',
+        createdAt: serverTimestamp(),
+        createdBy: S.user?.email,
+      });
+    } catch(_) {}
+  }
+}
+
+// ── USER ROLE: read-only expenses with bill download ─────────────────
+function userExpensesHTML() {
+  const exps = filteredExpenses().sort((a,b) => b.date.localeCompare(a.date));
+  const total = exps.reduce((s, e) => s + e.amount, 0);
+  const withBill = exps.filter(e => e.hasBill).length;
+  return `<div class="page" style="padding:16px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px">
+      <div>
+        <h1 style="font-size:18px;font-weight:700;color:var(--gray-900)">₹ Expenses</h1>
+        <p style="font-size:12px;color:var(--gray-500);margin-top:2px">Total: ${fmtR(total)} · ${exps.length} records · ${withBill} with invoice</p>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <select class="form-select" style="font-size:12px;padding:5px 8px;min-width:130px" onchange="window.setQuickFilter('vehicle',this.value)">
+          <option value="">All Vehicles</option>${myVehicles().map(v=>`<option value="${v.id}" ${S.filterVehicle===v.id?'selected':''}>${v.regNo}</option>`).join('')}
+        </select>
+        <select class="form-select" style="font-size:12px;padding:5px 8px;min-width:120px" onchange="window.setQuickFilter('cat',this.value)">
+          <option value="">All Categories</option>${EXPENSE_CATEGORIES.map(c=>`<option value="${c}" ${S.filterCat===c?'selected':''}>${c}</option>`).join('')}
+        </select>
+        <button class="btn btn-secondary btn-sm" onclick="exportExpensesCSV()">⬇ CSV</button>
+      </div>
+    </div>
+    ${filterBarHTML()}
+    <div class="card" style="padding:0;margin-bottom:0">
+      <div class="table-wrap"><table style="font-size:12px">
+        <thead><tr style="background:var(--gray-50)">
+          <th style="padding:8px 12px">Date</th>
+          <th style="padding:8px 12px">Vehicle</th>
+          <th style="padding:8px 12px">Plant</th>
+          <th style="padding:8px 12px">Category</th>
+          <th style="padding:8px 12px">Vendor</th>
+          <th style="padding:8px 12px">Invoice No</th>
+          <th style="padding:8px 12px;text-align:right">Amount</th>
+          <th style="padding:8px 12px;text-align:right">Total</th>
+          <th style="padding:8px 12px">Invoice / Bill</th>
+        </tr></thead>
+        <tbody>${exps.slice(0, 200).map(e => `<tr>
+          <td style="padding:7px 12px;white-space:nowrap">${fmtDate(e.date)}</td>
+          <td style="padding:7px 12px;font-weight:600">${vehicleReg(e.vehicleId)}</td>
+          <td style="padding:7px 12px">${S.plants.find(p=>p.id===e.plantId)?.code||'—'}</td>
+          <td style="padding:7px 12px"><span class="badge badge-info" style="font-size:10px">${e.category}</span></td>
+          <td style="padding:7px 12px;color:var(--gray-600)">${e.vendor||'—'}</td>
+          <td style="padding:7px 12px;font-size:11px;color:var(--gray-500)">${e.invoiceNo||'—'}</td>
+          <td style="padding:7px 12px;text-align:right;font-weight:600">${fmtR(e.amount)}</td>
+          <td style="padding:7px 12px;text-align:right;font-weight:600">${fmtR((e.amount||0)+(e.gst||0))}</td>
+          <td style="padding:7px 12px">
+            ${e.billUrl
+              ? `<div style="display:flex;gap:4px">
+                  <button class="btn btn-secondary btn-xs" onclick="viewInvoice('${e.id}')">👁 View</button>
+                  <button class="btn btn-primary btn-xs" onclick="downloadInvoice('${e.id}')">⬇ Download</button>
+                 </div>`
+              : e.invoiceException
+                ? '<span class="badge badge-warning" style="font-size:10px">⚠️ Exception</span>'
+                : '<span style="color:#dc2626;font-size:11px">❌ No Bill</span>'}
+          </td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </div>
+  </div>`;
+}
 
 window.viewInvoice = function(expId) {
   const e = S.expenses.find(x=>x.id===expId);
@@ -5599,9 +5929,10 @@ window.deleteExpense = async function(expId) {
 
 window.showPlantModal = function(plantId='') {
   const p = plantId ? S.plants.find(x=>x.id===plantId) : null;
+  const acEmails = (p?.accountsEmails||[]).join('\n');
   S.modal = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()">
-    <div class="modal">
-      <div class="modal-header"><h2>${p?'Edit Plant':'Add Plant'}</h2><button onclick="closeModal()">✕</button></div>
+    <div class="modal modal-lg">
+      <div class="modal-header"><h2>${p?'✏️ Edit Plant':'🏭 Add Plant'}</h2><button onclick="closeModal()">✕</button></div>
       <div class="modal-body">
         <div class="form-grid">
           <div class="form-group"><label class="form-label">Plant Name <span class="req">*</span></label><input id="p-name" class="form-input" value="${p?.name||''}"/></div>
@@ -5612,10 +5943,28 @@ window.showPlantModal = function(plantId='') {
           <div class="form-group"><label class="form-label">Plant Admin Email</label><input id="p-admin" type="email" class="form-input" value="${p?.plantAdminEmail||''}"/></div>
           <div class="form-group"><label class="form-label">Status</label><select id="p-status" class="form-select"><option ${p?.status==='Active'?'selected':''}>Active</option><option ${p?.status==='Inactive'?'selected':''}>Inactive</option></select></div>
         </div>
+        <hr class="divider"/>
+        <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:var(--radius);padding:14px;margin-top:4px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+            <span style="font-size:16px">📧</span>
+            <div>
+              <div style="font-weight:600;font-size:13px;color:#1e40af">Accounts Team Emails — Plant Specific</div>
+              <div style="font-size:11px;color:#3b82f6">Auto-notified whenever an invoice is uploaded for this plant</div>
+            </div>
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">Accounts / Finance Emails <span style="font-size:11px;color:var(--gray-400)">(one per line)</span></label>
+            <textarea id="p-accounts-emails" class="form-textarea" rows="3"
+              placeholder="accounts.manesar@company.com&#10;finance@company.com&#10;billing@company.com">${acEmails}</textarea>
+            <div style="font-size:11px;color:var(--gray-500);margin-top:5px">
+              These email IDs will receive an <b>instant notification</b> with invoice details + download link every time a bill is uploaded for a vehicle in this plant.
+            </div>
+          </div>
+        </div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="savePlant('${plantId}')">${p?'Update':'Add Plant'}</button>
+        <button class="btn btn-primary" onclick="savePlant('${plantId}')">${p?'💾 Update Plant':'🏭 Add Plant'}</button>
       </div>
     </div>
   </div>`;
@@ -5626,10 +5975,20 @@ window.savePlant = async function(plantId='') {
   const name = document.getElementById('p-name')?.value.trim();
   const code = document.getElementById('p-code')?.value.trim().toUpperCase();
   if(!name||!code) return showToast('Plant name and code are required','error');
-  const data = { name, code, location:document.getElementById('p-loc')?.value||'', address:document.getElementById('p-addr')?.value||'', state:document.getElementById('p-state')?.value||'', plantAdminEmail:document.getElementById('p-admin')?.value||'', status:document.getElementById('p-status')?.value||'Active' };
+  const accountsEmails = (document.getElementById('p-accounts-emails')?.value || '')
+    .split('\n').map(e => e.trim()).filter(e => e.includes('@'));
+  const data = {
+    name, code,
+    location:       document.getElementById('p-loc')?.value||'',
+    address:        document.getElementById('p-addr')?.value||'',
+    state:          document.getElementById('p-state')?.value||'',
+    plantAdminEmail:document.getElementById('p-admin')?.value||'',
+    status:         document.getElementById('p-status')?.value||'Active',
+    accountsEmails,
+  };
   try {
-    if(plantId) { await fsUpdatePlant(plantId, data); showToast('Plant updated!'); }
-    else { await fsAddPlant(data); showToast('Plant added!'); }
+    if(plantId) { await fsUpdatePlant(plantId, data); showToast(`Plant updated! ${accountsEmails.length} accounts email${accountsEmails.length!==1?'s':''} saved.`,'success'); }
+    else { await fsAddPlant(data); showToast('Plant added!','success'); }
     closeModal(); render();
   } catch(e) { showToast('Error: '+e.message,'error'); }
 };
