@@ -5748,16 +5748,19 @@ window.saveExpense = async function(expenseId='') {
       showToast('Expense saved successfully','success');
     }
 
-    // ── Auto-notify accounts team when a new invoice is uploaded ──
-    // Run AFTER save but synchronously (await) so errors surface and
-    // S.plants / S.notifConfig state is still intact.
+    // ── Auto-notify accounts team when a bill is uploaded ──
+    // Fire when a new bill file was just uploaded (new expense OR editing existing)
     if (invoiceJustUploaded && billUrl) {
+      console.log('[saveExpense] Invoice uploaded — triggering accounts notification',
+        { plantId: data.plantId, billUrl: billUrl?.slice(0,60) });
       try {
         await sendInvoiceUploadNotification(data, billUrl);
       } catch(e) {
         console.warn('[Accounts Notification] Failed:', e.message);
         showToast('Expense saved. Accounts notification failed: ' + e.message, 'warning');
       }
+    } else {
+      console.log('[saveExpense] No notification — invoiceJustUploaded:', invoiceJustUploaded, 'billUrl:', !!billUrl);
     }
 
     render();
@@ -5775,14 +5778,31 @@ window.saveExpense = async function(expenseId='') {
 // Calls /api/invoice-upload-notify on the VEMS Cloud Function.
 // This endpoint exists in index.js and sends via the existing Gmail transporter.
 async function sendInvoiceUploadNotification(expenseData, billUrl) {
-  const plant      = S.plants.find(p => p.id === expenseData.plantId);
-  const recipients = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
+  console.log('[InvoiceNotif] plantId:', expenseData.plantId);
 
-  console.log('[InvoiceNotif] plant:', plant?.name, '| accountsEmails:', plant?.accountsEmails, '| recipients:', recipients);
+  // Always reload plant fresh from Firestore to get latest accountsEmails
+  // (local S.plants may be stale if emails were added after last login)
+  let plant = S.plants.find(p => p.id === expenseData.plantId);
+  try {
+    const plantDoc = await getDoc(doc(db, 'vems_plants', expenseData.plantId));
+    if (plantDoc.exists()) {
+      plant = { id: plantDoc.id, ...plantDoc.data() };
+      // Update local state
+      const idx = S.plants.findIndex(p => p.id === expenseData.plantId);
+      if (idx >= 0) S.plants[idx] = plant;
+    }
+  } catch(e) {
+    console.warn('[InvoiceNotif] Could not reload plant from Firestore:', e.message);
+  }
+
+  console.log('[InvoiceNotif] plant:', plant?.name, '| accountsEmails:', plant?.accountsEmails);
+
+  const recipients = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
+  console.log('[InvoiceNotif] recipients:', recipients);
 
   if (!recipients.length) {
-    showToast(`⚠️ Accounts notification skipped — no emails configured for ${plant?.name || 'this plant'}. Edit the plant to add accounts emails.`, 'warning');
-    console.warn('[InvoiceNotif] No recipients — skipping.');
+    showToast(`⚠️ Accounts notification skipped — no accounts emails configured for ${plant?.name || 'this plant'}. Go to Plants → ✏️ Edit to add accounts emails.`, 'warning');
+    console.warn('[InvoiceNotif] No recipients. Plant:', plant?.name, '| accountsEmails:', plant?.accountsEmails);
     return;
   }
 
