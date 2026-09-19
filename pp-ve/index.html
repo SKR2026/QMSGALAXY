@@ -3754,7 +3754,7 @@ function superadminHTML() {
       <div class="card-title">📧 Accounts Department — Plant-wise Invoice Notifications
         <span class="badge badge-success" style="font-size:11px">Auto Email · Per Plant</span>
       </div>
-      <div class="alert alert-info mb-4">ℹ️ Invoice upload notifications are <b>plant-specific</b>. Configure accounts team emails per plant under <b>Plants → ✏️ Edit Plant</b>. On every invoice upload, VEMS calls <code>/api/send-welcome-email</code> (existing endpoint, no <code>index.js</code> changes) with the full invoice HTML for each recipient. If the Cloud Function is not configured, falls back to <code>mailto:</code>.</div>
+      <div class="alert alert-info mb-4">ℹ️ Invoice upload notifications are <b>plant-specific</b>. Configure accounts team emails per plant under <b>Plants → ✏️ Edit Plant</b>. On every invoice upload, VEMS calls <code>/api/invoice-upload-notify</code> on the Cloud Function which sends via the existing Gmail setup. Falls back to <code>mailto:</code> if the Cloud Function is not configured.</div>
 
       <!-- Per-plant summary table -->
       <div class="table-wrap">
@@ -5772,10 +5772,8 @@ window.saveExpense = async function(expenseId='') {
 };
 
 // ── ACCOUNTS EMAIL NOTIFICATION AFTER INVOICE UPLOAD ────────────────
-// Sends via the existing Cloud Function's /api/send-welcome-email endpoint
-// which accepts { to, displayName, subject, html } and delivers via Gmail.
-// Falls back to mailto: if Cloud Function is not configured.
-// No index.js changes required.
+// Calls /api/invoice-upload-notify on the VEMS Cloud Function.
+// This endpoint exists in index.js and sends via the existing Gmail transporter.
 async function sendInvoiceUploadNotification(expenseData, billUrl) {
   const plant      = S.plants.find(p => p.id === expenseData.plantId);
   const recipients = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
@@ -5794,119 +5792,76 @@ async function sendInvoiceUploadNotification(expenseData, billUrl) {
   console.log('[InvoiceNotif] Cloud Fn URL:', url ? url : '(not set)');
   console.log('[InvoiceNotif] Sending to:', recipients);
 
-  const subject = `📎 New Invoice Uploaded — ${plant?.name || ''} | ${vehicle?.regNo || ''} · ${expenseData.category} · ${fmtR(expenseData.amount || 0)}`;
-
-  const htmlBody = `
-<div style="font-family:Inter,sans-serif;max-width:600px;margin:0 auto;background:#f9fafb;padding:24px">
-  <div style="background:#fff;border-radius:12px;padding:28px;border:1px solid #e5e7eb">
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
-      <span style="font-size:28px">📎</span>
-      <div>
-        <h2 style="margin:0;font-size:18px;color:#1a56a0">New Invoice Uploaded</h2>
-        <p style="margin:2px 0 0;font-size:12px;color:#6b7280">VEMS — Vehicle Expense Management System</p>
-      </div>
-    </div>
-    <table style="width:100%;border-collapse:collapse;font-size:14px">
-      <tr style="background:#eff6ff"><td style="padding:8px 12px;font-weight:600;color:#1e40af;width:40%">Plant</td><td style="padding:8px 12px">${plant?.name || '—'} (${plant?.code || '—'})</td></tr>
-      <tr><td style="padding:8px 12px;font-weight:600;color:#374151">Vehicle</td><td style="padding:8px 12px">${vehicle?.regNo || '—'} — ${vehicle?.make || ''} ${vehicle?.model || ''}</td></tr>
-      <tr style="background:#f9fafb"><td style="padding:8px 12px;font-weight:600;color:#374151">Category</td><td style="padding:8px 12px">${expenseData.category || '—'}</td></tr>
-      <tr><td style="padding:8px 12px;font-weight:600;color:#374151">Vendor</td><td style="padding:8px 12px">${expenseData.vendor || '—'}</td></tr>
-      <tr style="background:#f9fafb"><td style="padding:8px 12px;font-weight:600;color:#374151">Invoice No.</td><td style="padding:8px 12px">${expenseData.invoiceNo || '—'}</td></tr>
-      <tr><td style="padding:8px 12px;font-weight:600;color:#374151">Invoice Date</td><td style="padding:8px 12px">${expenseData.invoiceDate || expenseData.date || '—'}</td></tr>
-      <tr style="background:#f9fafb"><td style="padding:8px 12px;font-weight:600;color:#374151">Amount</td><td style="padding:8px 12px">${fmtR(expenseData.amount || 0)}</td></tr>
-      <tr><td style="padding:8px 12px;font-weight:600;color:#374151">GST</td><td style="padding:8px 12px">${expenseData.gst ? fmtR(expenseData.gst) : '—'}</td></tr>
-      <tr style="background:#dcfce7"><td style="padding:8px 12px;font-weight:700;color:#15803d">Total Payable</td><td style="padding:8px 12px;font-weight:700;color:#15803d">${fmtR((expenseData.amount || 0) + (expenseData.gst || 0))}</td></tr>
-    </table>
-    ${billUrl && billUrl !== '#test-bill-url' ? `
-    <div style="margin-top:20px;text-align:center">
-      <a href="${billUrl}" style="display:inline-block;background:#1a56a0;color:#fff;padding:10px 24px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px">⬇ Download Invoice</a>
-    </div>` : ''}
-    <div style="margin-top:20px;padding-top:16px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af">
-      Uploaded by: ${S.user?.email || '—'} · ${new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})}
-    </div>
-  </div>
-</div>`;
-
-  let emailSent = false;
+  const payload = {
+    plantId:     expenseData.plantId    || '',
+    plantName:   plant?.name            || '',
+    plantCode:   plant?.code            || '',
+    vehicleRegNo: vehicle?.regNo        || '',
+    vehicleMake: `${vehicle?.make || ''} ${vehicle?.model || ''}`.trim(),
+    category:    expenseData.category   || '',
+    vendor:      expenseData.vendor     || '',
+    invoiceNo:   expenseData.invoiceNo  || '',
+    invoiceDate: expenseData.invoiceDate || expenseData.date || '',
+    expenseDate: expenseData.date        || '',
+    amount:      fmtR(expenseData.amount || 0),
+    gst:         expenseData.gst ? fmtR(expenseData.gst) : '—',
+    total:       fmtR((expenseData.amount || 0) + (expenseData.gst || 0)),
+    billUrl,
+    uploadedBy:  S.user?.email || '',
+    uploadedAt:  new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    recipients,
+  };
 
   if (url && secret) {
-    for (const to of recipients) {
-      try {
-        console.log(`[InvoiceNotif] Calling /api/send-welcome-email for ${to}…`);
-        const res = await fetch(`${url}/api/send-welcome-email`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'x-internal-secret': secret },
-          body:    JSON.stringify({ to, displayName: to.split('@')[0], subject, html: htmlBody }),
-        });
-        const data = await res.json().catch(() => ({}));
-        console.log(`[InvoiceNotif] Response for ${to}: HTTP ${res.status}`, data);
-        if (res.ok) {
-          emailSent = true;
-          console.log(`[InvoiceNotif] ✅ Sent to ${to} (${plant?.name})`);
-        } else {
-          console.warn(`[InvoiceNotif] ❌ Failed for ${to}:`, data.error || res.status);
-          _openMailtoFallback(to, subject, expenseData, vehicle, plant, billUrl);
-        }
-      } catch(e) {
-        console.warn(`[InvoiceNotif] ❌ Fetch error for ${to}:`, e.message);
-        _openMailtoFallback(to, subject, expenseData, vehicle, plant, billUrl);
+    try {
+      console.log(`[InvoiceNotif] Calling ${url}/api/invoice-upload-notify…`);
+      const res = await fetch(`${url}/api/invoice-upload-notify`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-internal-secret': secret },
+        body:    JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      console.log(`[InvoiceNotif] Response: HTTP ${res.status}`, data);
+      if (res.ok && data.ok) {
+        addAudit('Invoice Notification Sent', expenseData.invoiceNo || '—',
+          `${plant?.name} → ${recipients.join(', ')}`);
+        showToast(`📧 Accounts notified: ${recipients.join(', ')}`, 'success');
+      } else {
+        throw new Error(data.error || `HTTP ${res.status}`);
       }
+    } catch(e) {
+      console.warn(`[InvoiceNotif] ❌ Cloud function error:`, e.message);
+      // Fallback to mailto
+      _openMailtoFallback(recipients, payload);
     }
   } else {
-    console.warn('[InvoiceNotif] No Cloud Function URL — using mailto fallback for all recipients.');
-    for (const to of recipients) {
-      _openMailtoFallback(to, subject, expenseData, vehicle, plant, billUrl);
-    }
-  }
-
-  // Firestore audit log
-  try {
-    await addDoc(collection(db, 'vems_invoice_notifications'), {
-      status:        emailSent ? 'sent' : 'mailto_fallback',
-      plantId:       expenseData.plantId,
-      plantName:     plant?.name  || '',
-      recipients,
-      vehicleRegNo:  vehicle?.regNo || '',
-      category:      expenseData.category  || '',
-      invoiceNo:     expenseData.invoiceNo || '',
-      amount:        expenseData.amount    || 0,
-      billUrl,
-      uploadedBy:    S.user?.email || '',
-      createdAt:     serverTimestamp(),
-    });
-  } catch(e) {
-    console.warn('[Accounts Notification] Firestore log failed:', e.message);
-  }
-
-  if (emailSent) {
-    addAudit('Invoice Notification Sent', expenseData.invoiceNo || '—',
-      `${plant?.name} → ${recipients.join(', ')}`);
-    showToast(`📧 Accounts notified: ${recipients.join(', ')}`, 'success');
+    console.warn('[InvoiceNotif] No Cloud Function URL — using mailto fallback.');
+    _openMailtoFallback(recipients, payload);
   }
 }
 
-function _openMailtoFallback(to, subject, expenseData, vehicle, plant, billUrl) {
+function _openMailtoFallback(recipients, payload) {
   const body = [
     `New invoice uploaded in VEMS.`,
     ``,
-    `Plant: ${plant?.name || '—'} (${plant?.code || '—'})`,
-    `Vehicle: ${vehicle?.regNo || '—'} — ${vehicle?.make || ''} ${vehicle?.model || ''}`,
-    `Category: ${expenseData.category || '—'}`,
-    `Vendor: ${expenseData.vendor || '—'}`,
-    `Invoice No: ${expenseData.invoiceNo || '—'}`,
-    `Date: ${expenseData.invoiceDate || expenseData.date || '—'}`,
-    `Amount: ${fmtR(expenseData.amount || 0)}`,
-    `GST: ${expenseData.gst ? fmtR(expenseData.gst) : '—'}`,
-    `Total: ${fmtR((expenseData.amount || 0) + (expenseData.gst || 0))}`,
-    billUrl && billUrl !== '#test-bill-url' ? `Invoice Link: ${billUrl}` : '',
+    `Plant: ${payload.plantName} (${payload.plantCode})`,
+    `Vehicle: ${payload.vehicleRegNo} — ${payload.vehicleMake}`,
+    `Category: ${payload.category}`,
+    `Vendor: ${payload.vendor}`,
+    `Invoice No: ${payload.invoiceNo}`,
+    `Invoice Date: ${payload.invoiceDate}`,
+    `Amount: ${payload.amount}`,
+    `GST: ${payload.gst}`,
+    `Total: ${payload.total}`,
+    payload.billUrl && payload.billUrl !== '#test-bill-url' ? `Invoice Link: ${payload.billUrl}` : '',
     ``,
-    `Uploaded by: ${S.user?.email || '—'}`,
-  ].filter(l => l !== undefined).join('\n');
+    `Uploaded by: ${payload.uploadedBy}`,
+    `Uploaded at: ${payload.uploadedAt}`,
+  ].filter(Boolean).join('\n');
 
-  window.open(
-    `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`,
-    '_blank'
-  );
+  const subject = `📎 New Invoice Uploaded — ${payload.plantName} | ${payload.vehicleRegNo} · ${payload.category} · ${payload.total}`;
+  const to = recipients.join(',');
+  window.open(`mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, '_blank');
 }
 
 // ── USER ROLE: read-only expenses with bill download ─────────────────
