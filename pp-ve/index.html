@@ -588,10 +588,10 @@ const firebaseConfig = {
   measurementId: "G-MMF7E44JJF"
 };
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-window._auth = auth;
-const db = getFirestore(app);
+const app     = initializeApp(firebaseConfig);
+const auth    = getAuth(app);
+window._auth  = auth;
+const db      = getFirestore(app);
 const storage = getStorage(app);
 
 // ── CONSTANTS ─────────────────────────────────────────────────────
@@ -5709,7 +5709,7 @@ window.saveExpense = async function(expenseId='') {
     const co2 = cat==='Fuel'&&fuelQty>0?parseFloat((fuelQty*ef).toFixed(2)):0;
     const data = {
       vehicleId,
-      plantId:vehicle.plantId||'',
+      plantId: vehicle.plantId || myPlantId() || '',
       date:document.getElementById('exp-date')?.value||'',
       category:cat,
       vendor:document.getElementById('exp-vendor')?.value||'',
@@ -5784,9 +5784,9 @@ async function sendInvoiceUploadNotification(expenseData, billUrl) {
   let plant = S.plants.find(p => p.id === expenseData.plantId);
   try {
     const plantDoc = await getDoc(doc(db, 'vems_plants', expenseData.plantId));
+    console.log('[InvoiceNotif] plantDoc exists:', plantDoc.exists(), '| raw data:', JSON.stringify(plantDoc.data()));
     if (plantDoc.exists()) {
       plant = { id: plantDoc.id, ...plantDoc.data() };
-      // Update local state
       const idx = S.plants.findIndex(p => p.id === expenseData.plantId);
       if (idx >= 0) S.plants[idx] = plant;
     }
@@ -5809,52 +5809,64 @@ async function sendInvoiceUploadNotification(expenseData, billUrl) {
   const { url, secret } = getCloudFnConfig();
 
   console.log('[InvoiceNotif] Cloud Fn URL:', url ? url : '(not set)');
+  console.log('[InvoiceNotif] Secret configured:', !!secret);
   console.log('[InvoiceNotif] Sending to:', recipients);
 
   const payload = {
-    plantId:     expenseData.plantId    || '',
-    plantName:   plant?.name            || '',
-    plantCode:   plant?.code            || '',
-    vehicleRegNo: vehicle?.regNo        || '',
-    vehicleMake: `${vehicle?.make || ''} ${vehicle?.model || ''}`.trim(),
-    category:    expenseData.category   || '',
-    vendor:      expenseData.vendor     || '',
-    invoiceNo:   expenseData.invoiceNo  || '',
-    invoiceDate: expenseData.invoiceDate || expenseData.date || '',
-    expenseDate: expenseData.date        || '',
-    amount:      fmtR(expenseData.amount || 0),
-    gst:         expenseData.gst ? fmtR(expenseData.gst) : '—',
-    total:       fmtR((expenseData.amount || 0) + (expenseData.gst || 0)),
+    plantId:      expenseData.plantId    || '',
+    plantName:    plant?.name            || '',
+    plantCode:    plant?.code            || '',
+    vehicleRegNo: vehicle?.regNo         || '',
+    vehicleMake:  `${vehicle?.make || ''} ${vehicle?.model || ''}`.trim(),
+    category:     expenseData.category   || '',
+    vendor:       expenseData.vendor     || '',
+    invoiceNo:    expenseData.invoiceNo  || '',
+    invoiceDate:  expenseData.invoiceDate || expenseData.date || '',
+    expenseDate:  expenseData.date        || '',
+    amount:       fmtR(expenseData.amount || 0),
+    gst:          expenseData.gst ? fmtR(expenseData.gst) : '—',
+    total:        fmtR((expenseData.amount || 0) + (expenseData.gst || 0)),
     billUrl,
-    uploadedBy:  S.user?.email || '',
-    uploadedAt:  new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    uploadedBy:   S.user?.email || '',
+    uploadedAt:   new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
     recipients,
   };
 
-  if (url && secret) {
-    try {
-      console.log(`[InvoiceNotif] Calling ${url}/api/invoice-upload-notify…`);
-      const res = await fetch(`${url}/api/invoice-upload-notify`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'x-internal-secret': secret },
-        body:    JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
-      console.log(`[InvoiceNotif] Response: HTTP ${res.status}`, data);
-      if (res.ok && data.ok) {
-        addAudit('Invoice Notification Sent', expenseData.invoiceNo || '—',
-          `${plant?.name} → ${recipients.join(', ')}`);
-        showToast(`📧 Accounts notified: ${recipients.join(', ')}`, 'success');
-      } else {
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-    } catch(e) {
-      console.warn(`[InvoiceNotif] ❌ Cloud function error:`, e.message);
-      // Fallback to mailto
-      _openMailtoFallback(recipients, payload);
+  if (!url || !secret) {
+    console.warn('[InvoiceNotif] No URL or secret — using mailto fallback.');
+    showToast('⚠️ Cloud Function not configured. Opening email client instead.', 'warning');
+    _openMailtoFallback(recipients, payload);
+    return;
+  }
+
+  try {
+    // Get Firebase ID token so Cloud Run can verify the caller is authenticated
+    const idToken = await S.user.getIdToken();
+
+    console.log(`[InvoiceNotif] POSTing to ${url}/api/invoice-upload-notify`);
+    const res  = await fetch(`${url}/api/invoice-upload-notify`, {
+      method:  'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-internal-secret': secret,
+        'Authorization':     `Bearer ${idToken}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    console.log(`[InvoiceNotif] Response: HTTP ${res.status}`, data);
+
+    if (res.ok && data.ok) {
+      addAudit('Invoice Notification Sent', expenseData.invoiceNo || '—',
+        `${plant?.name} → ${recipients.join(', ')}`);
+      showToast(`📧 Accounts notified: ${recipients.join(', ')}`, 'success');
+    } else {
+      throw new Error(data.error || `HTTP ${res.status}`);
     }
-  } else {
-    console.warn('[InvoiceNotif] No Cloud Function URL — using mailto fallback.');
+  } catch(e) {
+    console.warn('[InvoiceNotif] ❌ Failed:', e.message);
+    showToast(`⚠️ Notification failed (${e.message}). Opening email client.`, 'warning');
     _openMailtoFallback(recipients, payload);
   }
 }
