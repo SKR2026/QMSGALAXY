@@ -845,16 +845,16 @@ async function loadFirestoreData() {
       if (efDoc.exists()) S.emissionFactors = { ...EMISSION_FACTORS_DEFAULT, ...efDoc.data() };
     } catch {}
 
-    // Load notifConfig (cloud function URL, secret, etc.) from Firestore (shared across devices)
+    // Load notifConfig — try both vems_settings/notifConfig and vems_settings/data
+    // These may be restricted to superadmin only — errors are expected for Plant Admins
     try {
       const ncDoc = await getDoc(doc(db, 'vems_settings', 'notifConfig'));
       if (ncDoc.exists()) {
         const nc = ncDoc.data();
         S.notifConfig = { ...(S.notifConfig || {}), ...nc };
       }
-    } catch {}
+    } catch(e) { console.log('[notifConfig] read restricted (expected for non-superadmin):', e.code); }
 
-    // Also load notifFunctionUrl from vems_settings/data (where saveAllSuperadminSettings writes it)
     try {
       const dataDoc = await getDoc(doc(db, 'vems_settings', 'data'));
       if (dataDoc.exists()) {
@@ -862,7 +862,18 @@ async function loadFirestoreData() {
         if (d.notifFunctionUrl) S.notifConfig = { ...(S.notifConfig || {}), notifFunctionUrl: d.notifFunctionUrl };
         if (d.vemsSecret)       S.notifConfig = { ...(S.notifConfig || {}), vemsSecret: d.vemsSecret };
       }
-    } catch {}
+    } catch(e) { console.log('[vems_settings/data] read restricted (expected for non-superadmin):', e.code); }
+
+    // Load cloud function config from vems_settings/public — readable by ALL authenticated users
+    // Superadmin writes notifFunctionUrl + vemsSecret here so Plant Admins can send notifications
+    try {
+      const pubDoc = await getDoc(doc(db, 'vems_settings', 'public'));
+      if (pubDoc.exists()) {
+        const p = pubDoc.data();
+        if (p.notifFunctionUrl) S.notifConfig = { ...(S.notifConfig || {}), notifFunctionUrl: p.notifFunctionUrl };
+        if (p.vemsSecret)       S.notifConfig = { ...(S.notifConfig || {}), vemsSecret: p.vemsSecret };
+      }
+    } catch(e) { console.warn('[vems_settings/public] read failed:', e.code, '— add Firestore rule: allow read if request.auth != null'); }
 
     // Load custom expense categories (superadmin-managed)
     try {
@@ -3754,7 +3765,12 @@ function superadminHTML() {
       <div class="card-title">📧 Accounts Department — Plant-wise Invoice Notifications
         <span class="badge badge-success" style="font-size:11px">Auto Email · Per Plant</span>
       </div>
-      <div class="alert alert-info mb-4">ℹ️ Invoice upload notifications are <b>plant-specific</b>. Configure accounts team emails per plant under <b>Plants → ✏️ Edit Plant</b>. On every invoice upload, VEMS calls <code>/api/invoice-upload-notify</code> on the Cloud Function which sends via the existing Gmail setup. Falls back to <code>mailto:</code> if the Cloud Function is not configured.</div>
+      <div class="alert alert-info mb-4">ℹ️ Invoice upload notifications are <b>plant-specific</b>. Configure accounts team emails per plant under <b>Plants → ✏️ Edit Plant</b>. On every invoice upload, VEMS calls <code>/api/invoice-upload-notify</code> on the Cloud Function which sends via the existing Gmail setup. Falls back to <code>mailto:</code> if the Cloud Function is not configured.
+        <div style="margin-top:8px;padding:8px 10px;background:#fef9c3;border-radius:6px;font-size:11px;color:#713f12">
+          <b>⚠️ Firestore Rule required</b> — Add this to your Firestore security rules so Plant Admins can read the Cloud Function config:<br/>
+          <code style="display:block;margin-top:4px;background:#fff;padding:4px 8px;border-radius:4px;font-size:11px">match /vems_settings/public { allow read: if request.auth != null; allow write: if false; }</code>
+        </div>
+      </div>
 
       <!-- Per-plant summary table -->
       <div class="table-wrap">
@@ -4300,6 +4316,16 @@ window.saveAllSuperadminSettings = async function() {
       updatedBy: S.user?.email,
     }, { merge: true });
   } catch(err) { console.warn('notifConfig save error:', err); }
+
+  // Write to vems_settings/public — readable by ALL authenticated users (Plant Admins)
+  // so they can call the cloud function for invoice notifications
+  try {
+    await setDoc(doc(db, 'vems_settings', 'public'), {
+      notifFunctionUrl: form.notifFunctionUrl || '',
+      vemsSecret:       form.vemsSecret || '',
+      updatedAt: serverTimestamp(),
+    }, { merge: true });
+  } catch(err) { console.warn('vems_settings/public save error:', err); }
 
   // Sync to cloud + Firestore
   await saveAndSyncSchedules();
