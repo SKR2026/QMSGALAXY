@@ -5693,7 +5693,7 @@ window.saveExpense = async function(expenseId='') {
       enteredBy:old?.enteredBy||S.user?.email||''
     };
 
-    const invoiceJustUploaded = !!pendingBillFile; // track before clearing
+    const invoiceJustUploaded = !!pendingBillFile; // capture before clearing
 
     if(expenseId){
       await fsUpdateExpense(expenseId,data);
@@ -5708,10 +5708,15 @@ window.saveExpense = async function(expenseId='') {
     }
 
     // ── Auto-notify accounts team when a new invoice is uploaded ──
+    // Run AFTER save but synchronously (await) so errors surface and
+    // S.plants / S.notifConfig state is still intact.
     if (invoiceJustUploaded && billUrl) {
-      sendInvoiceUploadNotification(data, billUrl).catch(e =>
-        console.warn('[Accounts Notification] Failed:', e.message)
-      );
+      try {
+        await sendInvoiceUploadNotification(data, billUrl);
+      } catch(e) {
+        console.warn('[Accounts Notification] Failed:', e.message);
+        showToast('Expense saved. Accounts notification failed: ' + e.message, 'warning');
+      }
     }
 
     render();
@@ -5734,13 +5739,19 @@ async function sendInvoiceUploadNotification(expenseData, billUrl) {
   const plant      = S.plants.find(p => p.id === expenseData.plantId);
   const recipients = (plant?.accountsEmails || []).filter(e => e && e.includes('@'));
 
+  console.log('[InvoiceNotif] plant:', plant?.name, '| accountsEmails:', plant?.accountsEmails, '| recipients:', recipients);
+
   if (!recipients.length) {
-    console.log(`[Accounts Notification] No accounts emails for plant "${plant?.name || expenseData.plantId}" — skipped.`);
+    showToast(`⚠️ Accounts notification skipped — no emails configured for ${plant?.name || 'this plant'}. Edit the plant to add accounts emails.`, 'warning');
+    console.warn('[InvoiceNotif] No recipients — skipping.');
     return;
   }
 
   const vehicle = S.vehicles.find(v => v.id === expenseData.vehicleId);
   const { url, secret } = getCloudFnConfig();
+
+  console.log('[InvoiceNotif] Cloud Fn URL:', url ? url : '(not set)');
+  console.log('[InvoiceNotif] Sending to:', recipients);
 
   const subject = `📎 New Invoice Uploaded — ${plant?.name || ''} | ${vehicle?.regNo || ''} · ${expenseData.category} · ${fmtR(expenseData.amount || 0)}`;
 
@@ -5780,27 +5791,28 @@ async function sendInvoiceUploadNotification(expenseData, billUrl) {
   if (url && secret) {
     for (const to of recipients) {
       try {
+        console.log(`[InvoiceNotif] Calling /api/send-welcome-email for ${to}…`);
         const res = await fetch(`${url}/api/send-welcome-email`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json', 'x-internal-secret': secret },
           body:    JSON.stringify({ to, displayName: to.split('@')[0], subject, html: htmlBody }),
         });
         const data = await res.json().catch(() => ({}));
+        console.log(`[InvoiceNotif] Response for ${to}: HTTP ${res.status}`, data);
         if (res.ok) {
           emailSent = true;
-          console.log(`[Accounts Notification] Sent to ${to} (${plant?.name})`);
+          console.log(`[InvoiceNotif] ✅ Sent to ${to} (${plant?.name})`);
         } else {
-          console.warn(`[Accounts Notification] Failed for ${to}:`, data.error || res.status);
-          // Fallback: open mailto for this recipient
+          console.warn(`[InvoiceNotif] ❌ Failed for ${to}:`, data.error || res.status);
           _openMailtoFallback(to, subject, expenseData, vehicle, plant, billUrl);
         }
       } catch(e) {
-        console.warn(`[Accounts Notification] Fetch error for ${to}:`, e.message);
+        console.warn(`[InvoiceNotif] ❌ Fetch error for ${to}:`, e.message);
         _openMailtoFallback(to, subject, expenseData, vehicle, plant, billUrl);
       }
     }
   } else {
-    // No Cloud Function configured — open mailto for all recipients
+    console.warn('[InvoiceNotif] No Cloud Function URL — using mailto fallback for all recipients.');
     for (const to of recipients) {
       _openMailtoFallback(to, subject, expenseData, vehicle, plant, billUrl);
     }
