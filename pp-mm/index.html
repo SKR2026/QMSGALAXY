@@ -1539,6 +1539,7 @@ const NAV=[
   ]},
   {section:'Users',roles:['admin'],items:[
     {id:'settings-users',label:'Users & Roles',icon:'<circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/>',roles:['admin']},
+    {id:'settings-escalation',label:'Escalation Rules',icon:'<path d="M8 1l2 5h5l-4 3 1.5 5L8 11l-4.5 3L5 9 1 6h5z"/>',roles:['admin']},
   ]},
   {section:'Developer',devOnly:true,roles:['developer'],items:[
     {id:'dev-console',label:'Dev Console',icon:'<path d="M5 3l-4 5 4 5M11 3l4 5-4 5M9 2l-2 12"/>'},
@@ -1588,7 +1589,7 @@ function accessDenied(){
 /* pages restricted to super-admin / admin only */
 const SA_ONLY=['bulk-upload','reports','audit','email-log',
   'settings-firebase','settings-email','settings-users',
-  'settings-escalation','settings-notifications','settings-license','settings-gmail-reminders','settings-company','settings-meeting-types','settings-plants'];
+  'settings-notifications','settings-license','settings-gmail-reminders','settings-company','settings-meeting-types','settings-plants'];
 /* pages restricted to super-admin only (not admin, developer, or any other role) */
 const SUPERADMIN_ONLY=['settings-license'];
 /* pages hidden from assignee and manager */
@@ -6865,20 +6866,226 @@ function renderPlantDetail(plantId){
 }
 
 function renderEscCfg(){
-  document.getElementById('content').innerHTML=`
-  <div style="max-width:620px;"><div class="card">
-    <div class="ch"><div class="ctit">Escalation Rules</div></div>
-    ${[1,2,3].map(l=>`
-    <div style="display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--br);">
-      <div style="width:26px;height:26px;border-radius:50%;background:${l===1?'var(--wl)':l===2?'var(--el)':'var(--il)'};color:${l===1?'var(--wn)':l===2?'var(--er)':'var(--in)'};display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;">L${l}</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px;flex:1;align-items:end;">
-        <div class="fg" style="margin:0;"><label>TRIGGER (DAYS)</label><input type="number" value="${l===1?3:l===2?7:14}" style="width:70px;"></div>
-        <div class="fg" style="margin:0;"><label>NOTIFY</label><select style="font-size:11px;">${USERS.map(u=>`<option>${u.name}</option>`).join('')}</select></div>
-        <div class="fg" style="margin:0;"><label>FREQUENCY</label><select style="font-size:11px;"><option>Once</option><option selected>Daily until resolved</option></select></div>
+  const isSA = currentRole==='super-admin' || currentRole==='developer';
+  const isAdmin = currentRole==='admin';
+
+  // Determine which plants this user can configure
+  const configurablePlants = isSA ? PLANTS : (isAdmin ? PLANTS.filter(p=>p.adminId===loggedInAs?.id||p.adminEmail===loggedInAs?.email) : []);
+
+  // Load saved rules from localStorage (keyed per plant)
+  function _loadRules(plantId){
+    try {
+      const raw = localStorage.getItem('mompro_esc_rules_'+plantId);
+      return raw ? JSON.parse(raw) : null;
+    } catch(e){ return null; }
+  }
+  function _defaultRules(plantId){
+    return [
+      { level:1, days:3,  notifyUid:'',  freq:'daily',  enabled:true,  plantId },
+      { level:2, days:7,  notifyUid:'',  freq:'daily',  enabled:true,  plantId },
+      { level:3, days:14, notifyUid:'',  freq:'once',   enabled:true,  plantId },
+    ];
+  }
+  function _saveRules(plantId, rules){
+    try { localStorage.setItem('mompro_esc_rules_'+plantId, JSON.stringify(rules)); } catch(e){}
+    // Also write to Firestore
+    const c = FS_META();
+    if(c) c.doc('esc_rules_'+plantId).set({ plantId, rules, updatedAt:new Date().toISOString() }, {merge:true})
+           .catch(e=>console.warn('ESC rules save:', e.message));
+  }
+
+  // Load from Firestore and refresh UI
+  function _loadFromFs(plantId, cb){
+    const c = FS_META();
+    if(c && _authFs && _authFs.currentUser){
+      c.doc('esc_rules_'+plantId).get()
+        .then(doc=>{
+          if(doc.exists && doc.data().rules){
+            try { localStorage.setItem('mompro_esc_rules_'+plantId, JSON.stringify(doc.data().rules)); } catch(e){}
+            cb(doc.data().rules);
+          } else { cb(null); }
+        }).catch(()=>cb(null));
+    } else { cb(null); }
+  }
+
+  function _buildPlantPanel(plant){
+    const savedRules = _loadRules(plant.id) || _defaultRules(plant.id);
+    const plantUsers = USERS.filter(u=>u.plantId===plant.id||!u.plantId); // plant users + global
+    const userOpts = USERS.map(u=>`<option value="${u.id}">${u.name}${u.dept?' ('+u.dept+')':''}</option>`).join('');
+
+    const levelColors = ['','var(--wn)','var(--er)','var(--in)'];
+    const levelBgs    = ['','var(--wl)','var(--el)','var(--il)'];
+
+    return `
+    <div class="card" id="esc-panel-${plant.id}" style="margin-bottom:16px;">
+      <div class="ch">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="width:32px;height:32px;border-radius:var(--rs);background:var(--al);display:flex;align-items:center;justify-content:center;font-size:16px;">🏭</div>
+          <div>
+            <div class="ctit">${plant.name}</div>
+            <div style="font-size:11px;color:var(--t3);">Escalation Rules — applied to all tasks in this plant</div>
+          </div>
+        </div>
+        <button class="btn bs" onclick="_loadEscFromFs('${plant.id}')" title="Reload from server" style="padding:4px 10px;font-size:11px;">↻ Reload</button>
       </div>
-    </div>`).join('')}
-    <button class="btn bp" style="margin-top:14px;" onclick="showToast('Escalation rules saved','ok')">Save Rules</button>
-  </div></div>`;
+
+      <div style="font-size:11px;color:var(--t3);margin-bottom:14px;padding:8px 12px;background:var(--bg3);border-radius:var(--rs);">
+        When a task is overdue and not updated, escalation emails are sent automatically to the designated person at each level.
+      </div>
+
+      ${[1,2,3].map(l=>{
+        const rule = savedRules.find(r=>r.level===l) || { level:l, days:l===1?3:l===2?7:14, notifyUid:'', freq:'daily', enabled:true };
+        return `
+        <div style="display:flex;align-items:flex-start;gap:12px;padding:14px 0;border-bottom:1px solid var(--br);">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex-shrink:0;">
+            <div style="width:32px;height:32px;border-radius:50%;background:${levelBgs[l]};color:${levelColors[l]};display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;">L${l}</div>
+            <label style="display:flex;align-items:center;gap:3px;cursor:pointer;">
+              <input type="checkbox" id="esc-en-${plant.id}-${l}" ${rule.enabled?'checked':''} onchange="_escToggle('${plant.id}',${l},this.checked)">
+              <span style="font-size:9px;color:var(--t3);">ON</span>
+            </label>
+          </div>
+          <div style="flex:1;display:grid;grid-template-columns:100px 1fr 140px;gap:10px;align-items:end;">
+            <div class="fg" style="margin:0;">
+              <label>OVERDUE DAYS</label>
+              <input type="number" id="esc-days-${plant.id}-${l}" value="${rule.days}" min="1" max="365"
+                style="width:80px;font-size:13px;"
+                onchange="_escDraft('${plant.id}')">
+            </div>
+            <div class="fg" style="margin:0;">
+              <label>NOTIFY (ESCALATE TO)</label>
+              <select id="esc-uid-${plant.id}-${l}" onchange="_escDraft('${plant.id}')"
+                style="font-size:12px;width:100%;">
+                <option value="">— Select user —</option>
+                ${userOpts}
+              </select>
+            </div>
+            <div class="fg" style="margin:0;">
+              <label>FREQUENCY</label>
+              <select id="esc-freq-${plant.id}-${l}" onchange="_escDraft('${plant.id}')"
+                style="font-size:12px;width:100%;">
+                <option value="once" ${rule.freq==='once'?'selected':''}>Once only</option>
+                <option value="daily" ${rule.freq==='daily'?'selected':''}>Daily until resolved</option>
+                <option value="weekly" ${rule.freq==='weekly'?'selected':''}>Weekly until resolved</option>
+              </select>
+            </div>
+          </div>
+        </div>`;
+      }).join('')}
+
+      <div style="display:flex;align-items:center;gap:10px;margin-top:14px;">
+        <button class="btn bp" onclick="_saveEscRules('${plant.id}')">💾 Save Rules for ${plant.name}</button>
+        <button class="btn bs" onclick="_resetEscRules('${plant.id}')">Reset to defaults</button>
+        <span id="esc-status-${plant.id}" style="font-size:11px;color:var(--ok);display:none;">✅ Saved</span>
+      </div>
+    </div>`;
+  }
+
+  // Set select values after render
+  function _setSelectValues(plantId){
+    const saved = _loadRules(plantId) || _defaultRules(plantId);
+    [1,2,3].forEach(l=>{
+      const rule = saved.find(r=>r.level===l);
+      if(!rule) return;
+      const sel = document.getElementById('esc-uid-'+plantId+'-'+l);
+      if(sel && rule.notifyUid) sel.value = String(rule.notifyUid);
+    });
+  }
+
+  document.getElementById('content').innerHTML = `
+  <div style="max-width:700px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;">
+      <div>
+        <div style="font-size:18px;font-weight:700;color:var(--tx);">Escalation Rules</div>
+        <div style="font-size:12px;color:var(--t3);margin-top:3px;">Configure per-plant escalation levels. Rules apply to all overdue tasks within each plant.</div>
+      </div>
+      ${isSA?`<button class="btn bs" onclick="renderEscCfg()" style="font-size:11px;">↻ Refresh</button>`:''}
+    </div>
+
+    ${configurablePlants.length===0
+      ? `<div class="card" style="text-align:center;padding:40px;">
+           <div style="font-size:32px;margin-bottom:12px;">🔒</div>
+           <div style="font-weight:600;">No plants assigned</div>
+           <div style="font-size:12px;color:var(--t3);margin-top:6px;">Ask Super Admin to assign you as admin of a plant to configure its escalation rules.</div>
+         </div>`
+      : configurablePlants.map(p=>_buildPlantPanel(p)).join('')
+    }
+  </div>`;
+
+  // Set saved notifyUid values into selects (after innerHTML is set)
+  configurablePlants.forEach(p=>{
+    _setSelectValues(p.id);
+    // Also try to load latest from Firestore
+    _loadFromFs(p.id, rules=>{ if(rules){ try{ localStorage.setItem('mompro_esc_rules_'+p.id,JSON.stringify(rules)); }catch(e){} _setSelectValues(p.id); } });
+  });
+}
+
+// ── Escalation rule helpers (called from inline onchange/onclick) ──────────────
+function _escDraft(plantId){ /* just mark dirty — saved on button click */ }
+
+function _escToggle(plantId, level, enabled){
+  // Update checkbox state immediately; will be committed on Save
+}
+
+function _saveEscRules(plantId){
+  const rules = [1,2,3].map(l=>({
+    level:   l,
+    days:    parseInt(document.getElementById('esc-days-'+plantId+'-'+l)?.value)||( l===1?3:l===2?7:14 ),
+    notifyUid: document.getElementById('esc-uid-'+plantId+'-'+l)?.value||'',
+    freq:    document.getElementById('esc-freq-'+plantId+'-'+l)?.value||'daily',
+    enabled: document.getElementById('esc-en-'+plantId+'-'+l)?.checked!==false,
+    plantId,
+  }));
+
+  // Validate
+  const hasNotify = rules.some(r=>r.enabled && r.notifyUid);
+  if(!hasNotify){ showToast('Please select at least one "Notify" user for an enabled level','warn'); return; }
+
+  try { localStorage.setItem('mompro_esc_rules_'+plantId, JSON.stringify(rules)); } catch(e){}
+  const c = FS_META();
+  if(c) c.doc('esc_rules_'+plantId).set({ plantId, rules, updatedAt:new Date().toISOString() }, {merge:true})
+         .catch(e=>console.warn('ESC save:', e.message));
+
+  const st = document.getElementById('esc-status-'+plantId);
+  if(st){ st.style.display='inline'; setTimeout(()=>st.style.display='none',2500); }
+  showToast('Escalation rules saved for '+( PLANTS.find(p=>p.id===plantId)?.name||plantId ),'ok');
+  addAudit('ESC_RULES_SAVED','Escalation rules updated for plant: '+plantId);
+}
+
+function _resetEscRules(plantId){
+  if(!confirm('Reset escalation rules for this plant to defaults?')) return;
+  try { localStorage.removeItem('mompro_esc_rules_'+plantId); } catch(e){}
+  const c = FS_META();
+  if(c) c.doc('esc_rules_'+plantId).delete().catch(()=>{});
+  renderEscCfg();
+  showToast('Rules reset to defaults','ok');
+}
+
+function _loadEscFromFs(plantId){
+  const c = FS_META();
+  if(!c||!_authFs||!_authFs.currentUser){ showToast('Firebase not connected','warn'); return; }
+  c.doc('esc_rules_'+plantId).get()
+    .then(doc=>{
+      if(doc.exists&&doc.data().rules){
+        try{ localStorage.setItem('mompro_esc_rules_'+plantId,JSON.stringify(doc.data().rules)); }catch(e){}
+        renderEscCfg();
+        showToast('Rules loaded from server','ok');
+      } else {
+        showToast('No saved rules found on server — using defaults','info');
+      }
+    }).catch(e=>showToast('Load failed: '+e.message,'warn'));
+}
+
+// ── Public: get escalation rules for a plant (used by escalation engine) ──────
+function getEscRules(plantId){
+  try {
+    const raw = localStorage.getItem('mompro_esc_rules_'+plantId);
+    if(raw) return JSON.parse(raw);
+  } catch(e){}
+  return [
+    { level:1, days:3,  notifyUid:'', freq:'daily',  enabled:true,  plantId },
+    { level:2, days:7,  notifyUid:'', freq:'daily',  enabled:true,  plantId },
+    { level:3, days:14, notifyUid:'', freq:'once',   enabled:true,  plantId },
+  ];
 }
 
 function renderCompanySettings(){
