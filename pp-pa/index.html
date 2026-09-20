@@ -5284,38 +5284,78 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     );
   }
 
-  // Generate proposal number using an atomic counter document instead of a
-  // collection query. A query across pp_proposals (e.g. WHERE proposalNumber
-  // BETWEEN x AND y with no createdBy filter) is REJECTED by Firestore with
-  // "permission-denied" for non-admins, because the security rule requires
-  // resource.data.createdBy == request.auth.uid and Firestore cannot guarantee
-  // that holds for every document the query could potentially match — it denies
-  // the entire query upfront rather than filtering results. This was the true
-  // root cause of "Missing or insufficient permissions" on submit, and it only
-  // started appearing once OTHER users' proposals existed in the same
-  // plant/year range (which is why the very first submitter never saw it).
-  const plant = allPlants.find(p => p.id===proposalData.plantId) || {};
-  const plantCode = plant.code || 'GEN';
-  const year  = new Date().getFullYear();
-  // Use a GLOBAL counter per year (not per plant) so proposal numbers are unique
-  // across ALL plants and form types — e.g., PP-YNR-2026-0001, PP-BWL-2026-0002
-  // (plant code is still in the label for context, but sequence is global)
-  const prefix = `PP-${plantCode}-${year}-`;
-  const counterId  = `GLOBAL_${year}`;   // <-- single shared counter for all plants/forms
-  const counterRef = db.collection('pp_counters').doc(counterId);
-  const seqNum = await db.runTransaction(async (tx) => {
-    const snap = await tx.get(counterRef);
-    const current = snap.exists ? (snap.data().seq || 0) : 0;
-    const next = current + 1;
-    tx.set(counterRef, {
-      seq: next,
-      year,
-      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
-    return next;
-  });
-  const seq = String(seqNum).padStart(4,'0');
-  const proposalNumber = `${prefix}${seq}`;
+  // Generate proposal number — but ONLY if this proposal doesn't already have one.
+  // Reusing the existing number prevents duplicates when a Draft is re-submitted
+  // or when the CF fallback fires after the CF already assigned a number.
+  let proposalNumber;
+  if (proposalId) {
+    // Check Firestore for an existing proposalNumber on this doc
+    try {
+      const existingSnap = await db.collection('pp_proposals').doc(proposalId).get();
+      proposalNumber = existingSnap.exists ? existingSnap.data()?.proposalNumber : null;
+    } catch(_) { proposalNumber = null; }
+  }
+
+  if (!proposalNumber) {
+    // Generate proposal number using an atomic counter document instead of a
+    // collection query. A query across pp_proposals (e.g. WHERE proposalNumber
+    // BETWEEN x AND y with no createdBy filter) is REJECTED by Firestore with
+    // "permission-denied" for non-admins, because the security rule requires
+    // resource.data.createdBy == request.auth.uid and Firestore cannot guarantee
+    // that holds for every document the query could potentially match — it denies
+    // the entire query upfront rather than filtering results. This was the true
+    // root cause of "Missing or insufficient permissions" on submit, and it only
+    // started appearing once OTHER users' proposals existed in the same
+    // plant/year range (which is why the very first submitter never saw it).
+    const plant = allPlants.find(p => p.id===proposalData.plantId) || {};
+    const plantCode = plant.code || 'GEN';
+    const year  = new Date().getFullYear();
+    // Use a GLOBAL counter per year (not per plant) so proposal numbers are unique
+    // across ALL plants and form types — e.g., PP-YNR-2026-0001, PP-BWL-2026-0002
+    // (plant code is still in the label for context, but sequence is global)
+    const prefix = `PP-${plantCode}-${year}-`;
+    const counterId  = `GLOBAL_${year}`;   // <-- single shared counter for all plants/forms
+    const counterRef = db.collection('pp_counters').doc(counterId);
+    const seqNum = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(counterRef);
+      const current = snap.exists ? (snap.data().seq || 0) : 0;
+      const next = current + 1;
+      tx.set(counterRef, {
+        seq: next,
+        year,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      return next;
+    });
+    const seq = String(seqNum).padStart(4,'0');
+    proposalNumber = `${prefix}${seq}`;
+  }
+
+  // Guard: ensure the generated proposalNumber doesn't already exist on a DIFFERENT doc
+  // (can happen if CF and client-side both run, or in rare race conditions)
+  try {
+    const dupSnap = await db.collection('pp_proposals')
+      .where('proposalNumber', '==', proposalNumber)
+      .limit(2).get();
+    const conflictDocs = dupSnap.docs.filter(d => d.id !== (proposalId || '__none__'));
+    if (conflictDocs.length > 0) {
+      // The number is already taken by another doc — bump the counter and get a fresh one
+      const plant2   = allPlants.find(p => p.id===proposalData.plantId) || {};
+      const code2    = plant2.code || 'GEN';
+      const year2    = new Date().getFullYear();
+      const ref2     = db.collection('pp_counters').doc(`GLOBAL_${year2}`);
+      const seqNum2  = await db.runTransaction(async tx => {
+        const s = await tx.get(ref2);
+        const next = (s.exists ? (s.data().seq||0) : 0) + 1;
+        tx.set(ref2, { seq: next, year: year2, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        return next;
+      });
+      proposalNumber = `PP-${code2}-${year2}-${String(seqNum2).padStart(4,'0')}`;
+      console.warn('[submit] Duplicate number detected — assigned fresh number:', proposalNumber);
+    }
+  } catch(dupErr) {
+    console.warn('[submit] Duplicate check failed (non-fatal):', dupErr.message);
+  }
 
   const docData = {
     ...proposalData,
