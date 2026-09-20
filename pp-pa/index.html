@@ -4119,9 +4119,12 @@ async function loadProposals() {
       allProposals = snap.docs.map(d=>({id:d.id,...d.data()}));
     }
     allProposals.sort((a,b)=>{
-      const ta=a.createdAt?.toMillis?a.createdAt.toMillis():new Date(a.createdAt||0).getTime();
-      const tb=b.createdAt?.toMillis?b.createdAt.toMillis():new Date(b.createdAt||0).getTime();
-      return tb-ta;
+      // Sort by submittedAt desc (latest submitted proposal first); fall back to createdAt
+      const getTs = p => {
+        const ts = p.submittedAt || p.createdAt;
+        return ts?.toMillis ? ts.toMillis() : new Date(ts||0).getTime();
+      };
+      return getTs(b) - getTs(a);
     });
     // Apply the status selected from a dashboard statistic card.
     if (dashboardProposalFilter !== null) {
@@ -4135,15 +4138,22 @@ async function loadProposals() {
 }
 
 // ── PLANT PILL TABS ──────────────────────────────────────────────────────────
-let _activePlantFilter = '';
+let _activePlantFilter = ''; // stores plant CODE (e.g. 'BWL') or '' for All
 
 function renderPlantPills() {
   const container = document.getElementById('proposals-plant-pills');
   if (!container) return;
-  const pills = [{ id: '', name: 'All Plants' }, ...allPlants.map(p => ({ id: p.id, name: p.code || p.name }))];
+  // Deduplicate by code — multiple Firestore docs can share the same plant code
+  const seen = new Set();
+  const uniqueCodes = [];
+  allPlants.forEach(p => {
+    const code = p.code || p.name;
+    if (!seen.has(code)) { seen.add(code); uniqueCodes.push({ code, name: code }); }
+  });
+  const pills = [{ code: '', name: 'All Plants' }, ...uniqueCodes];
   container.innerHTML = pills.map(p => {
-    const isActive = _activePlantFilter === p.id;
-    return `<button onclick="setPlantFilter('${p.id}')" style="
+    const isActive = _activePlantFilter === p.code;
+    return `<button onclick="setPlantFilter('${p.code}')" style="
       padding:5px 14px;border-radius:50px;font-size:12px;font-weight:600;cursor:pointer;
       white-space:nowrap;border:1.5px solid ${isActive ? 'transparent' : 'var(--border)'};
       background:${isActive ? 'var(--danger)' : 'var(--surface)'};
@@ -4153,10 +4163,14 @@ function renderPlantPills() {
   }).join('');
 }
 
-function setPlantFilter(plantId) {
-  _activePlantFilter = plantId;
+function setPlantFilter(plantCode) {
+  _activePlantFilter = plantCode;
+  // Keep the hidden select in sync (best-effort: match first plant with this code)
   const sel = document.getElementById('proposals-plant-filter');
-  if (sel) sel.value = plantId;
+  if (sel) {
+    const match = allPlants.find(p => (p.code || p.name) === plantCode);
+    sel.value = match ? match.id : '';
+  }
   renderPlantPills();
   proposalPage = 1;
   filterProposals();
@@ -4164,12 +4178,14 @@ function setPlantFilter(plantId) {
 
 // ── EXPORT PROPOSALS PDF ─────────────────────────────────────────────────────
 function exportProposalsPDF() {
+  const _exportPlantIdSet = _activePlantFilter
+    ? new Set(allPlants.filter(pl => (pl.code || pl.name) === _activePlantFilter).map(pl => pl.id))
+    : null;
   const visible = allProposals.filter(p => {
-    const plant  = _activePlantFilter ? p.plantId === _activePlantFilter : true;
     const status = document.getElementById('proposals-status-filter')?.value;
     const search = document.getElementById('proposals-search')?.value?.toLowerCase()||'';
     const days   = parseInt(document.getElementById('proposals-date-filter')?.value||'0');
-    if (!plant) return false;
+    if (_exportPlantIdSet && !_exportPlantIdSet.has(p.plantId)) return false;
     if (status && p.status !== status) return false;
     if (search && !`${p.proposalNumber}${p.partyName}${p.description}${p.productService}`.toLowerCase().includes(search)) return false;
     if (days) {
@@ -4311,13 +4327,18 @@ function processBulkUpload() {
 
 function filterProposals() {
   const search = document.getElementById('proposals-search')?.value?.toLowerCase()||'';
-  const plant  = _activePlantFilter || document.getElementById('proposals-plant-filter')?.value||'';
+  const plant  = _activePlantFilter; // now a plant CODE e.g. 'BWL', or '' for all
   const status = document.getElementById('proposals-status-filter')?.value||'';
   const days   = parseInt(document.getElementById('proposals-date-filter')?.value||'0');
 
+  // Build a set of all plantIds that share the selected code (handles duplicate docs)
+  const plantIdSet = plant
+    ? new Set(allPlants.filter(pl => (pl.code || pl.name) === plant).map(pl => pl.id))
+    : null;
+
   let list = allProposals.filter(p=>{
     if (search && !`${p.proposalNumber}${p.partyName}${p.description}${p.productService}`.toLowerCase().includes(search)) return false;
-    if (plant && p.plantId !== plant) return false;
+    if (plantIdSet && !plantIdSet.has(p.plantId)) return false;
 
     if (status && p.status !== status) return false;
     if (days) {
