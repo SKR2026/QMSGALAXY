@@ -5491,32 +5491,23 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     if (covered) { maxLevel = lvl; break; }
   }
 
-  console.log('[routing] amount:', amount, 'maxLevel:', maxLevel, 'allLevels:', allLevels);
+  console.log('[routing] amount:', amount, 'maxLevel:', maxLevel, 'creatorLevel:', creatorLevel);
 
-  // Find first level ≤ maxLevel with a non-creator approver.
-  // If creator is the only approver at maxLevel, escalate above it.
+  // Start ABOVE creator's own matrix level:
+  //   Zoho (creatorLevel=2) → start at L3+
+  //   Sushil (creatorLevel=1) → start at L2+
+  //   Not in matrix (creatorLevel=0) → start at L1+
+  // If amount-based maxLevel is at or below creator level, go to the first level above creator.
+  const startFrom = Math.max(creatorLevel + 1, 1);
+
   let approver   = null;
   let startLevel = null;
 
-  for (const lvl of allLevels.filter(l => l <= maxLevel)) {
+  for (const lvl of allLevels.filter(l => l >= startFrom)) {
     try {
       const cand = await resolveApprover(proposalForRouting, lvl);
       if (cand?.email) { approver = cand; startLevel = lvl; break; }
     } catch(_) {}
-  }
-
-  // If no approver found within maxLevel (creator is only one there), escalate above
-  if (!approver) {
-    for (const lvl of allLevels.filter(l => l > maxLevel)) {
-      try {
-        const cand = await resolveApprover(proposalForRouting, lvl);
-        if (cand?.email) {
-          approver = cand; startLevel = lvl;
-          console.log(`[routing] Escalated above maxLevel(${maxLevel}) to L${lvl} — creator was only approver at stop level`);
-          break;
-        }
-      } catch(_) {}
-    }
   }
 
   if (!approver || !startLevel) {
@@ -5723,10 +5714,9 @@ async function executeApprovalAction() {
           // Reload allUsers to ensure all approvers are in cache
           await loadUsers();
 
-          // Find next level above currentLevel with a non-creator approver.
-          // Walk ALL levels above current — not just up to proposalMaxLevel —
-          // because if maxLevel is the creator themselves (e.g. Zoho's ₹15k proposal:
-          // maxLevel=L2 but L2 only has Zoho), we must skip L2 and go to L3.
+          // Find next level above currentLevel — also skip levels at or below
+          // the proposal creator's own matrix level (they can't approve their own)
+          const creatorLvl = await getCreatorLevel(p);
           const _matrixSnap2 = await db.collection('pp_approvalMatrices').get();
           const allLevelsAbove = [...new Set(
             _matrixSnap2.docs
@@ -5738,10 +5728,12 @@ async function executeApprovalAction() {
               .filter(Boolean)
           )].sort((a,b)=>a-b);
 
-          // Walk levels above current — skip any where the only approver is the creator
+          // Skip levels at or below creator's level, and skip levels where
+          // the only approver is the creator
           let nextLevel = null;
           let nextApprover = null;
           for (const lvl of allLevelsAbove) {
+            if (lvl <= creatorLvl) continue; // skip — creator's own level or below
             try {
               const cand = await resolveApprover(p, lvl);
               if (cand?.email) { nextLevel = lvl; nextApprover = cand; break; }
