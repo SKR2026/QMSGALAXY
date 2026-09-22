@@ -5274,51 +5274,56 @@ async function getCreatorLevel(p) {
 
   const rules = matrixSnap.docs.map(d=>({...d.data(),id:d.id}));
 
-  // Build a resolved-email cache for each rule's approverId so we don't hit
-  // Firestore repeatedly. Also try fetching the pp_users doc directly when
-  // the allUsers in-memory cache misses (handles the case where the matrix
-  // stores a Firestore doc ID that is NOT the Firebase Auth UID).
-  const resolveRuleEmail = async (r) => {
-    let rEmail = String(r.approverEmail||'').trim().toLowerCase();
-    const rId  = String(r.approverId||'').trim();
-    if (!rEmail && rId) {
-      // 1. Try allUsers cache (uid or doc-id match)
-      const u = allUsers.find(x => x.uid===rId || x.id===rId);
-      if (u) {
-        rEmail = String(u.email||'').trim().toLowerCase();
-      } else {
-        // 2. Direct Firestore fetch as fallback — handles mismatched IDs
-        try {
-          const uSnap = await db.collection('pp_users').doc(rId).get();
-          if (uSnap.exists) rEmail = String(uSnap.data()?.email||'').trim().toLowerCase();
-        } catch(_) {}
-      }
+  // Build a complete lookup: for each rule resolve BOTH the uid and email of the approver.
+  // approverId in the matrix may be:
+  //   (a) Firebase Auth UID  — matches currentUser.uid directly
+  //   (b) Firestore doc ID   — need to fetch pp_users doc to get uid + email
+  // approverEmail may be stale (e.g. old Rediff address when user now logs in via Zoho).
+  // So we resolve by: approverId == creatorUid  OR  resolvedUid == creatorUid  OR  resolvedEmail == creatorEmail
+  const resolveRule = async (r) => {
+    const rId    = String(r.approverId||'').trim();
+    let rEmail   = String(r.approverEmail||'').trim().toLowerCase();
+    let rUid     = rId; // assume approverId IS the Auth UID until proven otherwise
+
+    // Try allUsers cache first (fast)
+    const uCached = allUsers.find(x => x.uid===rId || x.id===rId);
+    if (uCached) {
+      if (!rEmail) rEmail = String(uCached.email||'').trim().toLowerCase();
+      rUid = uCached.uid || uCached.id || rId;
+    } else if (rId) {
+      // Direct Firestore fetch — handles Firestore doc-ID ≠ Auth UID mismatch
+      try {
+        const uSnap = await db.collection('pp_users').doc(rId).get();
+        if (uSnap.exists) {
+          const ud = uSnap.data();
+          if (!rEmail) rEmail = String(ud.email||'').trim().toLowerCase();
+          rUid = ud.uid || rId; // pp_users doc may store the real Auth UID in a 'uid' field
+        }
+      } catch(_) {}
     }
-    return rEmail;
+    return { rId, rEmail, rUid };
   };
 
-  // For each rule, resolve the actual email of the approver (from pp_users if needed)
   let maxLevel = 0;
   for (const r of rules) {
-    const rId    = String(r.approverId||'').trim();
-    const rEmail = await resolveRuleEmail(r);
-    const lvl    = Number(r.level||0);
+    const lvl = Number(r.level||0);
     if (!lvl) continue;
 
-    const matchEmail = creatorEmail && rEmail && rEmail === creatorEmail;
-    const matchId    = creatorUid   && rId    && rId    === creatorUid;
-    // Also check uid field stored on the user in allUsers
-    const matchUid   = creatorUid && allUsers.some(u =>
-      (u.uid===creatorUid||u.id===creatorUid) &&
-      (u.email?.toLowerCase()===rEmail)
+    const { rId, rEmail, rUid } = await resolveRule(r);
+
+    const matchEmail   = creatorEmail && rEmail  && rEmail  === creatorEmail;
+    const matchId      = creatorUid   && rId     && rId     === creatorUid;   // doc-id match
+    const matchAuthUid = creatorUid   && rUid    && rUid    === creatorUid;   // auth-uid match
+    const matchViaCache = creatorUid  && allUsers.some(u =>
+      (u.uid===creatorUid||u.id===creatorUid) && u.email?.toLowerCase()===rEmail
     );
 
-    if (matchEmail || matchId || matchUid) {
-      console.log(`[getCreatorLevel] MATCH level ${lvl}: rId="${rId}" rEmail="${rEmail}"`);
-      maxLevel = Math.max(maxLevel, lvl);
-    }
+    const matched = matchEmail || matchId || matchAuthUid || matchViaCache;
+    console.log(`[getCreatorLevel] L${lvl} rId="${rId}" rUid="${rUid}" rEmail="${rEmail}" | matchEmail=${matchEmail} matchId=${matchId} matchAuthUid=${matchAuthUid} → ${matched?'MATCH':'skip'}`);
+
+    if (matched) maxLevel = Math.max(maxLevel, lvl);
   }
-  console.log('[getCreatorLevel] resolved level:', maxLevel, '| creatorEmail:', creatorEmail, '| creatorUid:', creatorUid);
+  console.log('[getCreatorLevel] RESULT:', maxLevel, '| creatorEmail:', creatorEmail, '| creatorUid:', creatorUid);
   return maxLevel;
 }
 
@@ -5467,41 +5472,44 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   const _matrixRules = matrixSnap.docs.map(d => ({...d.data(), id:d.id}));
   console.log('[routing] creatorUid:', uid, '| creatorEmail:', creatorEmail);
 
-  // Determine creator's matrix level — check approverId AND approverEmail.
-  // Resolve approverId → email via allUsers cache, then direct Firestore fetch as fallback
-  // (handles case where matrix stores a Firestore doc ID ≠ Firebase Auth UID).
+  // Determine creator's matrix level — resolve by approverId (doc-ID or Auth UID),
+  // approverEmail, or the uid field inside the pp_users doc.
+  // Handles: (a) stale email on rule, (b) Firestore doc-ID ≠ Firebase Auth UID.
   let creatorLevel = 0;
   for (const r of _matrixRules) {
     const rId    = String(r.approverId||'').trim();
     let   rEmail = String(r.approverEmail||'').trim().toLowerCase();
+    let   rUid   = rId; // default: assume approverId IS the Auth UID
     const lvl    = Number(r.level||0);
     if (!lvl) continue;
 
-    // If email not stored on rule, resolve via allUsers cache first, then Firestore
-    if (!rEmail && rId) {
-      const u = allUsers.find(x => x.uid===rId || x.id===rId);
-      if (u) {
-        rEmail = String(u.email||'').trim().toLowerCase();
-      } else {
-        // Direct Firestore fetch — catches mismatched doc-ID vs Auth-UID
-        try {
-          const uSnap = await db.collection('pp_users').doc(rId).get();
-          if (uSnap.exists) rEmail = String(uSnap.data()?.email||'').trim().toLowerCase();
-        } catch(_) {}
-      }
+    // Resolve real Auth UID and current email from allUsers cache or Firestore
+    const uCached = allUsers.find(x => x.uid===rId || x.id===rId);
+    if (uCached) {
+      if (!rEmail) rEmail = String(uCached.email||'').trim().toLowerCase();
+      rUid = uCached.uid || uCached.id || rId;
+    } else if (rId) {
+      try {
+        const uSnap = await db.collection('pp_users').doc(rId).get();
+        if (uSnap.exists) {
+          const ud = uSnap.data();
+          if (!rEmail) rEmail = String(ud.email||'').trim().toLowerCase();
+          rUid = ud.uid || rId; // real Auth UID may differ from the doc ID
+        }
+      } catch(_) {}
     }
 
-    const matchEmail = creatorEmail && rEmail && rEmail === creatorEmail;
-    const matchId    = uid && rId && rId === uid;
-    // Also match if the user in allUsers with creatorUid has the same email as the rule
+    const matchEmail   = creatorEmail && rEmail && rEmail === creatorEmail;
+    const matchId      = uid && rId  && rId  === uid;   // doc-id matches auth uid
+    const matchAuthUid = uid && rUid && rUid === uid;   // resolved auth uid matches
     const matchViaUser = uid && rEmail && allUsers.some(u =>
       (u.uid===uid||u.id===uid) && String(u.email||'').trim().toLowerCase()===rEmail
     );
 
-    if (matchEmail || matchId || matchViaUser) {
-      creatorLevel = Math.max(creatorLevel, lvl);
-      console.log(`[routing] MATCH level ${lvl}: rId="${rId}" rEmail="${rEmail}" matchEmail=${matchEmail} matchId=${matchId}`);
-    }
+    const matched = matchEmail || matchId || matchAuthUid || matchViaUser;
+    console.log(`[routing] L${lvl} rId="${rId}" rUid="${rUid}" rEmail="${rEmail}" | matchEmail=${matchEmail} matchId=${matchId} matchAuthUid=${matchAuthUid} → ${matched?'MATCH':'skip'}`);
+
+    if (matched) creatorLevel = Math.max(creatorLevel, lvl);
   }
   console.log('[routing] resolved creatorLevel:', creatorLevel);
 
