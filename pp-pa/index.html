@@ -2993,22 +2993,22 @@ async function saveComparisonProposal(action){
     if(attachments.length)data.attachments=attachments;
     if(_cmpStorageWarning)toast('⚠️ '+_cmpStorageWarning,'warning',10000);
     if(action==='Submit'){
-      // CF is primary; client-side is fallback only
+      // Client-side routing is PRIMARY — CF has stale routing logic
       let _cmpResult = null;
       try {
-        const submitFn=fns.httpsCallable('submitProposal');
-        const cfCmp = await submitFn({proposalId:editingId||null,proposalData:data});
-        if (!cfCmp.data?.success) {
-          const msg = cfCmp.data?.message || '';
-          const isRoutingErr = msg.includes('Level')||msg.includes('approver')||msg.includes('matrix')||msg.includes('Matrix');
-          if (isRoutingErr) {
-            console.warn('[submit-cmp] CF routing error, client-side fallback:', msg);
-            _cmpResult = await clientSideSubmitProposal(data, editingId||null);
-          } else { _cmpResult = cfCmp.data; }
-        } else { _cmpResult = cfCmp.data; }
-      } catch(cfErr) {
-        console.warn('[submit-cmp] CF threw, client-side fallback:', cfErr.message);
         _cmpResult = await clientSideSubmitProposal(data, editingId||null);
+        // CF fire-and-forget for email notifications only
+        try {
+          const submitFn=fns.httpsCallable('submitProposal');
+          submitFn({proposalId:_cmpResult.proposalId,proposalData:data,notifyOnly:true}).catch(e=>console.warn('[submit-cmp] CF notify (non-fatal):',e.message));
+        } catch(_) {}
+      } catch(clientErr) {
+        console.warn('[submit-cmp] client-side failed, trying CF:', clientErr.message);
+        try {
+          const submitFn=fns.httpsCallable('submitProposal');
+          const cfCmp = await submitFn({proposalId:editingId||null,proposalData:data});
+          _cmpResult = cfCmp.data;
+        } catch(cfErr) { throw clientErr; }
       }
       if(!_cmpResult.success)throw new Error(_cmpResult.message||'Submission failed');
       toast(`Proposal submitted for approval! #${_cmpResult.proposalNumber}`,'success');await logAudit(_cmpResult.proposalId,'Submitted',`Submitted 3-quotation proposal ${_cmpResult.proposalNumber}`);
@@ -4698,33 +4698,36 @@ async function saveProposal(action) {
     if (_storageWarning) toast('⚠️ ' + _storageWarning, 'warning', 10000);
 
     if (action === 'Submit') {
-      // CF is primary for submission and email notifications.
-      // Client-side routing is fallback only if CF throws or returns a routing error.
+      // Client-side routing is now PRIMARY — it has the latest creator-level logic.
+      // CF is called after for email notifications only (fire-and-forget).
       let _submitResult = null;
       try {
-        const submitFn = fns.httpsCallable('submitProposal');
-        const cfResult = await submitFn({ proposalId: editingId||null, proposalData: data });
-        if (!cfResult.data?.success) {
-          const msg = cfResult.data?.message || '';
-          const isRoutingErr = msg.includes('Level') || msg.includes('approver') || msg.includes('matrix') || msg.includes('Matrix');
-          if (isRoutingErr) {
-            console.warn('[submit] CF routing error, using client-side fallback:', msg);
-            _submitResult = await clientSideSubmitProposal(data, editingId||null);
-          } else {
-            _submitResult = cfResult.data;
-          }
-        } else {
-          _submitResult = cfResult.data;
-        }
-      } catch(cfErr) {
-        console.warn('[submit] CF threw — code:', cfErr.code, '| message:', cfErr.message, '| details:', cfErr.details, '| httpStatus:', cfErr.httpErrorCode?.status);
-        // Debug: log current token claims before client-side write
+        // Debug: log current token claims
         try {
           const _idToken = await auth.currentUser.getIdTokenResult(false);
           console.log('[submit] token claims:', JSON.stringify(_idToken.claims));
           console.log('[submit] token ppRole:', _idToken.claims.ppRole, '| ppPlantIds:', JSON.stringify(_idToken.claims.ppPlantIds));
         } catch(_te) { console.warn('[submit] could not read token claims:', _te.message); }
+
         _submitResult = await clientSideSubmitProposal(data, editingId||null);
+
+        // Fire CF in background for email notifications — ignore routing result
+        try {
+          const submitFn = fns.httpsCallable('submitProposal');
+          submitFn({ proposalId: _submitResult.proposalId, proposalData: data, notifyOnly: true })
+            .catch(e => console.warn('[submit] CF notify (non-fatal):', e.message));
+        } catch(_) {}
+
+      } catch(clientErr) {
+        console.warn('[submit] client-side failed:', clientErr.message, '— trying CF fallback');
+        try {
+          const submitFn = fns.httpsCallable('submitProposal');
+          const cfResult = await submitFn({ proposalId: editingId||null, proposalData: data });
+          _submitResult = cfResult.data;
+        } catch(cfErr) {
+          console.warn('[submit] CF also failed:', cfErr.message);
+          throw clientErr; // surface the original error
+        }
       }
       const result = { data: _submitResult };
       if (result.data.success) {
