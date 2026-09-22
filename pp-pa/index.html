@@ -5304,26 +5304,19 @@ async function getCreatorLevel(p) {
   return maxLevel;
 }
 
-// Returns the final approval level for this proposal — the first level (from L1 up)
-// whose rules cover the proposal amount. Proposals stop here.
-// Does NOT filter by creator level — that is handled by resolveApprover skipping
-// the creator individually at each level.
+// getProposalMaxLevel — returns the stop level based on approval limits.
+// Walks L1→L2→L3 and returns the FIRST level whose maxValue covers the amount.
+// If the stop-level approver is the proposal creator, the caller escalates to the next level.
 async function getProposalMaxLevel(p) {
-  const matrixSnap   = await db.collection('pp_approvalMatrices').get();
-  const amount       = clientResolveAnnualImpact(p);
-  const allRules = matrixSnap.docs.map(d => ({id:d.id,...d.data()}))
-    .filter(r => {
-      const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []);
-      return !ids.length || ids.includes(p.plantId);
-    })
+  const matrixSnap = await db.collection('pp_approvalMatrices').get();
+  const amount     = clientResolveAnnualImpact(p);
+  const allRules   = matrixSnap.docs.map(d => ({id:d.id,...d.data()}))
+    .filter(r => { const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []); return !ids.length || ids.includes(p.plantId); })
     .filter(r => !r.category || r.category === p.category);
   const levels = [...new Set(allRules.map(r=>Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
   for (const lvl of levels) {
     const covered = allRules.filter(r=>Number(r.level||0)===lvl)
-      .some(r => {
-        const max = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue);
-        return amount <= max;
-      });
+      .some(r => { const max = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue); return amount <= max; });
     if (covered) return lvl;
   }
   return levels.length ? Math.max(...levels) : 1;
@@ -5489,30 +5482,40 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     matrixSnap.docs.map(d=>Number(d.data().level||0)).filter(Boolean)
   )].sort((a,b)=>a-b);
 
-  // ── Walk ALL levels from L1, skip creator individually at each level ──────
-  // Do NOT skip entire levels based on creator's matrix membership.
-  // findApprover already skips the creator as an individual within each level.
-  // This handles Zoho (L2) correctly: L1 finds Sushil (not Zoho) → assigned L1.
-  // After Sushil approves L1, advancement skips Zoho at L2, goes to Galaxy at L3.
-  const eligibleLevels = allLevels; // all levels, creator skipped per-level inside resolveApprover
+  // Compute amount-based stop level
+  const amount = clientResolveAnnualImpact({...proposalData, createdBy: uid, createdByEmail: creatorEmail});
+  let maxLevel = allLevels[allLevels.length-1] || 1;
+  for (const lvl of allLevels) {
+    const rules = matrixSnap.docs.map(d=>d.data()).filter(r=>Number(r.level||0)===lvl);
+    const covered = rules.some(r=>{ const m=(r.maxValue==null||r.maxValue==='')?Infinity:Number(r.maxValue); return amount<=m; });
+    if (covered) { maxLevel = lvl; break; }
+  }
 
-  console.log('[routing] allLevels:', allLevels, 'creatorEmail:', creatorEmail, 'creatorUid:', uid);
+  console.log('[routing] amount:', amount, 'maxLevel:', maxLevel, 'allLevels:', allLevels);
 
+  // Find first level ≤ maxLevel with a non-creator approver.
+  // If creator is the only approver at maxLevel, escalate above it.
   let approver   = null;
   let startLevel = null;
-  for (const lvl of eligibleLevels) {
+
+  for (const lvl of allLevels.filter(l => l <= maxLevel)) {
     try {
       const cand = await resolveApprover(proposalForRouting, lvl);
-      // Accept if we have at least an email — uid may be unresolved if pp_users
-      // doc lacks the uid field, but email is sufficient for routing and notification.
-      if (cand?.email) {
-        approver   = cand;
-        startLevel = lvl;
-        console.log(`[routing] found approver at L${lvl}: uid="${cand.uid}" email="${cand.email}"`);
-        break;
-      }
-    } catch(err) {
-      console.warn(`[routing] L${lvl} skipped:`, err.message);
+      if (cand?.email) { approver = cand; startLevel = lvl; break; }
+    } catch(_) {}
+  }
+
+  // If no approver found within maxLevel (creator is only one there), escalate above
+  if (!approver) {
+    for (const lvl of allLevels.filter(l => l > maxLevel)) {
+      try {
+        const cand = await resolveApprover(proposalForRouting, lvl);
+        if (cand?.email) {
+          approver = cand; startLevel = lvl;
+          console.log(`[routing] Escalated above maxLevel(${maxLevel}) to L${lvl} — creator was only approver at stop level`);
+          break;
+        }
+      } catch(_) {}
     }
   }
 
@@ -5717,37 +5720,35 @@ async function executeApprovalAction() {
           // Notify CC observers of final approval (fire-and-forget, non-blocking)
           notifyFinalApprovalObservers(p, proposalId).catch(()=>{});
         } else {
-          // Reload allUsers to ensure Galaxy and others are in cache before resolveApprover
+          // Reload allUsers to ensure all approvers are in cache
           await loadUsers();
 
-          // Find next level — strictly above currentLevel, up to proposalMaxLevel
-          const _matrixSnap2    = await db.collection('pp_approvalMatrices').get();
-          const eligibleNextLevels = [...new Set(
+          // Find next level above currentLevel with a non-creator approver.
+          // Walk ALL levels above current — not just up to proposalMaxLevel —
+          // because if maxLevel is the creator themselves (e.g. Zoho's ₹15k proposal:
+          // maxLevel=L2 but L2 only has Zoho), we must skip L2 and go to L3.
+          const _matrixSnap2 = await db.collection('pp_approvalMatrices').get();
+          const allLevelsAbove = [...new Set(
             _matrixSnap2.docs
               .map(d => ({...d.data()}))
               .filter(r => Number(r.level||0) > currentLevel)
-              .filter(r => Number(r.level||0) <= proposalMaxLevel)
-              .filter(r => {
-                const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []);
-                return !ids.length || ids.includes(p.plantId);
-              })
+              .filter(r => { const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []); return !ids.length || ids.includes(p.plantId); })
               .filter(r => (!r.category || r.category===p.category))
               .map(r => Number(r.level||0))
               .filter(Boolean)
           )].sort((a,b)=>a-b);
 
-          // Walk and skip levels where resolveApprover returns null or no email
-          // Pass proposal creator's UID so resolveApprover skips them correctly
+          // Walk levels above current — skip any where the only approver is the creator
           let nextLevel = null;
-          for (const lvl of eligibleNextLevels) {
+          let nextApprover = null;
+          for (const lvl of allLevelsAbove) {
             try {
               const cand = await resolveApprover(p, lvl);
-              // Accept if we have at least an email (uid may be unresolved for some users)
-              if (cand?.email) { nextLevel = lvl; break; }
+              if (cand?.email) { nextLevel = lvl; nextApprover = cand; break; }
             } catch(_) {}
           }
 
-          if (!nextLevel || nextLevel === undefined) {
+          if (!nextLevel || !nextApprover) {
             await db.collection('pp_proposals').doc(proposalId).update({
               status: 'Approved', approvedAt: now,
               lastApprovalComment: comment || '',
@@ -5764,7 +5765,6 @@ async function executeApprovalAction() {
           }
 
           // Use shared resolveApprover — skips proposal creator, amount-aware
-          const nextApprover = await resolveApprover(p, nextLevel);
           const nextUid   = nextApprover.uid || nextApprover.rule?.approverId || null;
           const nextEmail = nextApprover.email;
           const nextName  = nextApprover.name;
