@@ -5680,6 +5680,11 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     submittedByEmail:     creatorEmail,
     submittedAt:          firebase.firestore.FieldValue.serverTimestamp(),
     updatedAt:            firebase.firestore.FieldValue.serverTimestamp(),
+    // _clientRouted: true tells the CF onCreate/onWrite trigger to skip re-routing.
+    // The client has already resolved the correct approver — CF must not overwrite it.
+    _clientRouted:        true,
+    _clientRoutedLevel:   startLevel,
+    _clientRoutedEmail:   approver.email,
   };
 
   let docRef;
@@ -5690,6 +5695,42 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     docData.createdAt = firebase.firestore.FieldValue.serverTimestamp();
     docRef = await db.collection('pp_proposals').add(docData);
   }
+
+  // ── Post-write guard ─────────────────────────────────────────────────────
+  // The deployed CF may have a Firestore onCreate/onWrite trigger that fires
+  // server-side and overwrites our routing. Wait 3 s then re-assert the correct
+  // approver if the CF clobbered it.
+  const savedProposalId  = docRef.id;
+  const correctApproverId    = approver.uid || approver.rule?.approverId || null;
+  const correctApproverEmail = approver.email;
+  const correctApproverName  = approver.name;
+  const correctLevel         = startLevel;
+
+  setTimeout(async () => {
+    try {
+      const live = await db.collection('pp_proposals').doc(savedProposalId).get();
+      if (!live.exists) return;
+      const liveData = live.data();
+      const liveEmail = (liveData.currentApproverEmail||'').toLowerCase().trim();
+      const wantEmail = correctApproverEmail.toLowerCase().trim();
+      if (liveEmail !== wantEmail) {
+        console.warn(`[post-write guard] CF overwrote approver from "${wantEmail}" → "${liveEmail}". Re-asserting correct routing...`);
+        await db.collection('pp_proposals').doc(savedProposalId).update({
+          currentApprovalLevel: correctLevel,
+          currentApproverId:    correctApproverId,
+          currentApproverEmail: correctApproverEmail,
+          currentApproverName:  correctApproverName,
+          _clientRouted:        true,
+          updatedAt:            firebase.firestore.FieldValue.serverTimestamp(),
+        });
+        console.log('[post-write guard] Re-asserted routing → level', correctLevel, correctApproverEmail);
+      } else {
+        console.log('[post-write guard] Routing intact ✓', liveEmail);
+      }
+    } catch(e) {
+      console.warn('[post-write guard] Could not verify routing:', e.message);
+    }
+  }, 3000);
 
   return { success: true, proposalId: docRef.id, proposalNumber };
 }
