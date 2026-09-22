@@ -5263,25 +5263,45 @@ function clientResolveAnnualImpact(p) {
   return Math.abs(Number(p.proposedPrice ?? p.newPrice ?? p.proposedAmount ?? 0));
 }
 
-// getProposalMaxLevel — mirrors CF exactly:
-// Returns the creator's highest matrix level (0 if not in matrix)
+// getCreatorLevel — returns the highest matrix level the proposal creator sits at (0 if not in matrix).
+// Matches on approverEmail OR by resolving approverId → pp_users → email.
+// This handles the common case where the matrix approverId field is a Firestore doc ID
+// that differs from the Auth UID stored in pp_users.data.uid.
 async function getCreatorLevel(p) {
   const matrixSnap   = await db.collection('pp_approvalMatrices').get();
   const creatorUid   = String(p.createdBy||'').trim();
   const creatorEmail = String(p.createdByEmail||'').trim().toLowerCase();
-  return matrixSnap.docs
-    .map(d=>({...d.data(),id:d.id}))
-    .filter(r => {
-      const rEmail = String(r.approverEmail||'').trim().toLowerCase();
-      const rId    = String(r.approverId||'').trim();
-      const rUid   = String(r.uid||'').trim();
-      // Match by email, approverId (doc ID), or uid field — all three for robustness
-      return (creatorEmail && rEmail === creatorEmail) ||
-             (creatorUid && (rId === creatorUid || rUid === creatorUid));
-    })
-    .map(r=>Number(r.level||0))
-    .filter(Boolean)
-    .reduce((max,lvl)=>Math.max(max,lvl), 0);
+
+  const rules = matrixSnap.docs.map(d=>({...d.data(),id:d.id}));
+
+  // For each rule, resolve the actual email of the approver (from pp_users if needed)
+  let maxLevel = 0;
+  for (const r of rules) {
+    let rEmail = String(r.approverEmail||'').trim().toLowerCase();
+    const rId  = String(r.approverId||'').trim();
+
+    // If matrix rule has no email stored, resolve it from pp_users
+    if (!rEmail && rId) {
+      const u = allUsers.find(x => x.uid===rId || x.id===rId);
+      if (u) rEmail = String(u.email||'').trim().toLowerCase();
+    }
+
+    const lvl = Number(r.level||0);
+    if (!lvl) continue;
+
+    const matchEmail = creatorEmail && rEmail && rEmail === creatorEmail;
+    const matchId    = creatorUid   && rId    && rId    === creatorUid;
+    // Also check uid field stored on the user in allUsers
+    const matchUid   = creatorUid && allUsers.some(u =>
+      (u.uid===creatorUid||u.id===creatorUid) &&
+      (u.email?.toLowerCase()===rEmail)
+    );
+
+    if (matchEmail || matchId || matchUid) {
+      maxLevel = Math.max(maxLevel, lvl);
+    }
+  }
+  return maxLevel;
 }
 
 // Returns the final approval level for this proposal.
@@ -5347,27 +5367,31 @@ async function resolveApprover(p, level) {
   for (const rule of candidates) {
     const rid    = String(rule.approverId||'').trim();
     const remail = String(rule.approverEmail||'').trim().toLowerCase();
-    if (creatorUid   && rid    && rid    === creatorUid)   continue;
-    if (creatorEmail && remail && remail === creatorEmail) continue;
 
-    // Resolve uid/email/name from allUsers (same as CF pp_users lookup)
+    // Resolve uid/email/name from allUsers
     const u = allUsers.find(x => x.uid===rid || x.id===rid) ||
               allUsers.find(x => x.email?.toLowerCase()===remail) || {};
-    const uid   = u.uid || u.id || rid || '';
-    const email = u.email || remail || '';
-    const name  = u.name  || rule.approverName || 'Approver';
+    const resolvedUid   = u.uid || u.id || rid || '';
+    const resolvedEmail = u.email?.toLowerCase() || remail || '';
+    const resolvedName  = u.name || rule.approverName || 'Approver';
 
-    // Secondary creator check after uid resolution
-    if (creatorUid && uid && uid === creatorUid) continue;
-    if (creatorEmail && email.toLowerCase() === creatorEmail) continue;
+    // Skip if this is the proposal creator
+    if (creatorUid   && resolvedUid   && resolvedUid   === creatorUid)   continue;
+    if (creatorEmail && resolvedEmail && resolvedEmail === creatorEmail) continue;
 
-    if (!uid || !email) throw new Error(
+    // Must have at least an email to be usable
+    if (!resolvedEmail) continue;
+
+    // If uid is still missing, use rid as fallback so the proposal can be assigned
+    const finalUid = resolvedUid || rid;
+    if (!finalUid && !resolvedEmail) throw new Error(
       `Level ${level} approver "${rule.approverName||remail||rid}" is missing or was deleted from pp_users. ` +
-      `Please update the Approval Matrix (Settings → Approval Matrix → Level ${level}) to assign a valid active user.`
+      `Please update the Approval Matrix to assign a valid active user.`
     );
-    return { uid, email, name, rule };
+
+    return { uid: finalUid, email: resolvedEmail, name: resolvedName, rule };
   }
-  throw new Error(`No eligible approver at Level ${level} — the assigned approver may have been deleted from the system. Please update the Approval Matrix.`);
+  throw new Error(`No eligible approver at Level ${level} — the assigned approver may be the proposal creator or have been deleted.`);
 }
 
 // After CF submission, check if the proposal was self-routed (creator == assigned approver)
@@ -5435,22 +5459,34 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   // approverId may be the Firestore doc ID OR the Firebase Auth UID — check both.
   const _matrixRules = matrixSnap.docs.map(d => ({...d.data(), id:d.id}));
   console.log('[routing] creatorUid:', uid, '| creatorEmail:', creatorEmail);
-  console.log('[routing] matrix rules:', _matrixRules.map(r=>({level:r.level,approverId:r.approverId,approverEmail:r.approverEmail,uid:r.uid})));
 
-  const creatorLevel = _matrixRules
-    .filter(r => {
-      const rEmail = String(r.approverEmail||'').trim().toLowerCase();
-      const rId    = String(r.approverId||'').trim();
-      const rUid   = String(r.uid||'').trim();
-      const match  = (creatorEmail && rEmail === creatorEmail) ||
-                     (uid && (rId === uid || rUid === uid));
-      console.log(`[routing] level ${r.level} approver: email="${rEmail}" id="${rId}" uid="${rUid}" → match=${match}`);
-      return match;
-    })
-    .map(r => Number(r.level||0))
-    .filter(Boolean)
-    .reduce((max, lvl) => Math.max(max, lvl), 0);
+  // Determine creator's matrix level — check approverId AND approverEmail.
+  // Resolve approverId → email via allUsers cache when approverEmail is missing on the rule.
+  let creatorLevel = 0;
+  for (const r of _matrixRules) {
+    const rId    = String(r.approverId||'').trim();
+    let   rEmail = String(r.approverEmail||'').trim().toLowerCase();
+    const lvl    = Number(r.level||0);
+    if (!lvl) continue;
 
+    // If email not stored on rule, resolve via allUsers cache
+    if (!rEmail && rId) {
+      const u = allUsers.find(x => x.uid===rId || x.id===rId);
+      if (u) rEmail = String(u.email||'').trim().toLowerCase();
+    }
+
+    const matchEmail = creatorEmail && rEmail && rEmail === creatorEmail;
+    const matchId    = uid && rId && rId === uid;
+    // Also match if the user in allUsers with creatorUid has the same email as the rule
+    const matchViaUser = uid && rEmail && allUsers.some(u =>
+      (u.uid===uid||u.id===uid) && String(u.email||'').trim().toLowerCase()===rEmail
+    );
+
+    if (matchEmail || matchId || matchViaUser) {
+      creatorLevel = Math.max(creatorLevel, lvl);
+      console.log(`[routing] MATCH level ${lvl}: rId="${rId}" rEmail="${rEmail}" matchEmail=${matchEmail} matchId=${matchId}`);
+    }
+  }
   console.log('[routing] resolved creatorLevel:', creatorLevel);
 
   const allLevels = [...new Set(
@@ -5465,13 +5501,16 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   for (const lvl of eligibleLevels) {
     try {
       const cand = await resolveApprover(proposalForRouting, lvl);
-      if (cand?.uid && cand?.email) {
+      // Accept if we have at least an email — uid may be unresolved if pp_users
+      // doc lacks the uid field, but email is sufficient for routing and notification.
+      if (cand?.email) {
         approver   = cand;
         startLevel = lvl;
+        console.log(`[routing] found approver at L${lvl}: uid="${cand.uid}" email="${cand.email}"`);
         break;
       }
-    } catch(_) {
-      // This level had no eligible approver for this amount/plant/category — try next
+    } catch(err) {
+      console.warn(`[routing] L${lvl} skipped:`, err.message);
     }
   }
 
@@ -5560,7 +5599,9 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     proposalNumber,
     status:               'Pending Approval',
     currentApprovalLevel: startLevel,
-    currentApproverId:    approver.uid,
+    // approver.uid may be empty if pp_users doc is missing uid field —
+    // use approver.rule?.approverId as fallback so the assignment is still stored
+    currentApproverId:    approver.uid || approver.rule?.approverId || null,
     currentApproverEmail: approver.email,
     currentApproverName:  approver.name,
     createdBy:            uid,
