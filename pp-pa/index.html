@@ -5348,22 +5348,30 @@ async function getProposalMaxLevel(p) {
   return levels.length ? Math.max(...levels) : 1;
 }
 
-// resolveApprover — mirrors CF findApprover exactly, skipping proposal creator
+// resolveApprover — finds the right approver at a given level, skipping the proposal creator
 async function resolveApprover(p, level) {
   const matrixSnap = await db.collection('pp_approvalMatrices').get();
   const amount = clientResolveAnnualImpact(p);
   const creatorUid   = String(p.createdBy||'').trim();
   const creatorEmail = String(p.createdByEmail||'').trim().toLowerCase();
 
+  // Support both plantIds (array, new) and plantId (string, legacy)
+  const matchesPlant = (r) => {
+    const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds
+              : (r.plantId ? [r.plantId] : []);
+    return ids.length === 0 || ids.includes(p.plantId);
+  };
+
   let rules = matrixSnap.docs.map(d=>({id:d.id,...d.data()}))
-    .filter(r => !r.plantId  || r.plantId  === p.plantId)
+    .filter(r => matchesPlant(r))
     .filter(r => !r.category || r.category === p.category)
     .filter(r => Number(r.level||0) === level)
     .sort((a,b) => (Number(a.order)||0)-(Number(b.order)||0) || String(a.id).localeCompare(String(b.id)));
 
-  if (!rules.length) throw new Error(`No matrix rules found for Level ${level}.`);
+  console.log(`[resolveApprover] L${level}: ${rules.length} rules | plantId="${p.plantId}" amount=${amount} creatorEmail="${creatorEmail}"`);
+  if (!rules.length) throw new Error(`No matrix rules found for Level ${level} (plant="${p.plantId}", category="${p.category}").`);
 
-  // Amount-matched candidates (most specific first)
+  // Amount-matched candidates (most specific first); fall back to all rules if none match amount
   let candidates = rules.filter(r => {
     const max = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue);
     return amount <= max;
@@ -5377,33 +5385,29 @@ async function resolveApprover(p, level) {
     const maxB=(b.maxValue==null||b.maxValue==='')?Infinity:Number(b.maxValue);
     return maxB-maxA;
   });
+  console.log(`[resolveApprover] L${level}: ${candidates.length} candidates after amount filter`);
 
   // Walk candidates, skip creator
   for (const rule of candidates) {
     const rid    = String(rule.approverId||'').trim();
     const remail = String(rule.approverEmail||'').trim().toLowerCase();
 
-    // Resolve uid/email/name from allUsers
+    // Resolve uid/email/name from allUsers cache
     const u = allUsers.find(x => x.uid===rid || x.id===rid) ||
               allUsers.find(x => x.email?.toLowerCase()===remail) || {};
     const resolvedUid   = u.uid || u.id || rid || '';
     const resolvedEmail = u.email?.toLowerCase() || remail || '';
     const resolvedName  = u.name || rule.approverName || 'Approver';
 
-    // Skip if this is the proposal creator
-    if (creatorUid   && resolvedUid   && resolvedUid   === creatorUid)   continue;
-    if (creatorEmail && resolvedEmail && resolvedEmail === creatorEmail) continue;
+    const skipUid   = creatorUid   && resolvedUid   && resolvedUid   === creatorUid;
+    const skipEmail = creatorEmail && resolvedEmail && resolvedEmail === creatorEmail;
+    console.log(`[resolveApprover] L${level} rule: rid="${rid}" resolvedEmail="${resolvedEmail}" | skipUid=${skipUid} skipEmail=${skipEmail}`);
 
-    // Must have at least an email to be usable
+    if (skipUid || skipEmail) continue;
     if (!resolvedEmail) continue;
 
-    // If uid is still missing, use rid as fallback so the proposal can be assigned
     const finalUid = resolvedUid || rid;
-    if (!finalUid && !resolvedEmail) throw new Error(
-      `Level ${level} approver "${rule.approverName||remail||rid}" is missing or was deleted from pp_users. ` +
-      `Please update the Approval Matrix to assign a valid active user.`
-    );
-
+    console.log(`[resolveApprover] L${level}: SELECTED "${resolvedName}" <${resolvedEmail}>`);
     return { uid: finalUid, email: resolvedEmail, name: resolvedName, rule };
   }
   throw new Error(`No eligible approver at Level ${level} — the assigned approver may be the proposal creator or have been deleted.`);
@@ -5525,8 +5529,9 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   console.log('[routing] resolved creatorLevel:', creatorLevel);
 
   const allLevels = [...new Set(
-    matrixSnap.docs.map(d=>Number(d.data().level||0)).filter(Boolean)
-  )].sort((a,b)=>a-b);
+    matrixSnap.docs.map(d => Number(d.data().level||0)).filter(Boolean)
+  )].sort((a,b) => a-b);
+  console.log('[routing] allLevels:', allLevels);
 
   // Compute amount-based stop level
   const amount = clientResolveAnnualImpact({...proposalData, createdBy: uid, createdByEmail: creatorEmail});
@@ -5543,17 +5548,21 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   //   Zoho (creatorLevel=2) → start at L3+
   //   Sushil (creatorLevel=1) → start at L2+
   //   Not in matrix (creatorLevel=0) → start at L1+
-  // If amount-based maxLevel is at or below creator level, go to the first level above creator.
   const startFrom = Math.max(creatorLevel + 1, 1);
+  console.log('[routing] startFrom:', startFrom, '| levels to check:', allLevels.filter(l => l >= startFrom));
 
   let approver   = null;
   let startLevel = null;
 
   for (const lvl of allLevels.filter(l => l >= startFrom)) {
     try {
+      console.log('[routing] trying resolveApprover at level', lvl, '...');
       const cand = await resolveApprover(proposalForRouting, lvl);
+      console.log('[routing] resolveApprover L'+lvl+' result:', cand?.email, cand?.name);
       if (cand?.email) { approver = cand; startLevel = lvl; break; }
-    } catch(_) {}
+    } catch(resolveErr) {
+      console.warn('[routing] resolveApprover L'+lvl+' threw:', resolveErr.message);
+    }
   }
 
   if (!approver || !startLevel) {
