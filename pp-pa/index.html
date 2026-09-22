@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Price Approval System</title>
+<title>Price Approval System v27</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📋</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -5274,19 +5274,35 @@ async function getCreatorLevel(p) {
 
   const rules = matrixSnap.docs.map(d=>({...d.data(),id:d.id}));
 
+  // Build a resolved-email cache for each rule's approverId so we don't hit
+  // Firestore repeatedly. Also try fetching the pp_users doc directly when
+  // the allUsers in-memory cache misses (handles the case where the matrix
+  // stores a Firestore doc ID that is NOT the Firebase Auth UID).
+  const resolveRuleEmail = async (r) => {
+    let rEmail = String(r.approverEmail||'').trim().toLowerCase();
+    const rId  = String(r.approverId||'').trim();
+    if (!rEmail && rId) {
+      // 1. Try allUsers cache (uid or doc-id match)
+      const u = allUsers.find(x => x.uid===rId || x.id===rId);
+      if (u) {
+        rEmail = String(u.email||'').trim().toLowerCase();
+      } else {
+        // 2. Direct Firestore fetch as fallback — handles mismatched IDs
+        try {
+          const uSnap = await db.collection('pp_users').doc(rId).get();
+          if (uSnap.exists) rEmail = String(uSnap.data()?.email||'').trim().toLowerCase();
+        } catch(_) {}
+      }
+    }
+    return rEmail;
+  };
+
   // For each rule, resolve the actual email of the approver (from pp_users if needed)
   let maxLevel = 0;
   for (const r of rules) {
-    let rEmail = String(r.approverEmail||'').trim().toLowerCase();
-    const rId  = String(r.approverId||'').trim();
-
-    // If matrix rule has no email stored, resolve it from pp_users
-    if (!rEmail && rId) {
-      const u = allUsers.find(x => x.uid===rId || x.id===rId);
-      if (u) rEmail = String(u.email||'').trim().toLowerCase();
-    }
-
-    const lvl = Number(r.level||0);
+    const rId    = String(r.approverId||'').trim();
+    const rEmail = await resolveRuleEmail(r);
+    const lvl    = Number(r.level||0);
     if (!lvl) continue;
 
     const matchEmail = creatorEmail && rEmail && rEmail === creatorEmail;
@@ -5298,9 +5314,11 @@ async function getCreatorLevel(p) {
     );
 
     if (matchEmail || matchId || matchUid) {
+      console.log(`[getCreatorLevel] MATCH level ${lvl}: rId="${rId}" rEmail="${rEmail}"`);
       maxLevel = Math.max(maxLevel, lvl);
     }
   }
+  console.log('[getCreatorLevel] resolved level:', maxLevel, '| creatorEmail:', creatorEmail, '| creatorUid:', creatorUid);
   return maxLevel;
 }
 
@@ -5450,7 +5468,8 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   console.log('[routing] creatorUid:', uid, '| creatorEmail:', creatorEmail);
 
   // Determine creator's matrix level — check approverId AND approverEmail.
-  // Resolve approverId → email via allUsers cache when approverEmail is missing on the rule.
+  // Resolve approverId → email via allUsers cache, then direct Firestore fetch as fallback
+  // (handles case where matrix stores a Firestore doc ID ≠ Firebase Auth UID).
   let creatorLevel = 0;
   for (const r of _matrixRules) {
     const rId    = String(r.approverId||'').trim();
@@ -5458,10 +5477,18 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     const lvl    = Number(r.level||0);
     if (!lvl) continue;
 
-    // If email not stored on rule, resolve via allUsers cache
+    // If email not stored on rule, resolve via allUsers cache first, then Firestore
     if (!rEmail && rId) {
       const u = allUsers.find(x => x.uid===rId || x.id===rId);
-      if (u) rEmail = String(u.email||'').trim().toLowerCase();
+      if (u) {
+        rEmail = String(u.email||'').trim().toLowerCase();
+      } else {
+        // Direct Firestore fetch — catches mismatched doc-ID vs Auth-UID
+        try {
+          const uSnap = await db.collection('pp_users').doc(rId).get();
+          if (uSnap.exists) rEmail = String(uSnap.data()?.email||'').trim().toLowerCase();
+        } catch(_) {}
+      }
     }
 
     const matchEmail = creatorEmail && rEmail && rEmail === creatorEmail;
