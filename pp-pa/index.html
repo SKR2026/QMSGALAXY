@@ -2997,11 +2997,7 @@ async function saveComparisonProposal(action){
       let _cmpResult = null;
       try {
         _cmpResult = await clientSideSubmitProposal(data, editingId||null);
-        // CF fire-and-forget for email notifications only
-        try {
-          const submitFn=fns.httpsCallable('submitProposal');
-          submitFn({proposalId:_cmpResult.proposalId,proposalData:data,notifyOnly:true}).catch(e=>console.warn('[submit-cmp] CF notify (non-fatal):',e.message));
-        } catch(_) {}
+        // CF intentionally NOT called — it has stale routing logic and would overwrite correct routing.
       } catch(clientErr) {
         console.warn('[submit-cmp] client-side failed, trying CF:', clientErr.message);
         try {
@@ -4710,13 +4706,8 @@ async function saveProposal(action) {
         } catch(_te) { console.warn('[submit] could not read token claims:', _te.message); }
 
         _submitResult = await clientSideSubmitProposal(data, editingId||null);
-
-        // Fire CF in background for email notifications — ignore routing result
-        try {
-          const submitFn = fns.httpsCallable('submitProposal');
-          submitFn({ proposalId: _submitResult.proposalId, proposalData: data, notifyOnly: true })
-            .catch(e => console.warn('[submit] CF notify (non-fatal):', e.message));
-        } catch(_) {}
+        // CF intentionally NOT called — it has stale routing logic and would
+        // overwrite the correct currentApproverId/currentApprovalLevel we just saved.
 
       } catch(clientErr) {
         console.warn('[submit] client-side failed:', clientErr.message, '— trying CF fallback');
@@ -5392,22 +5383,37 @@ async function resolveApprover(p, level) {
     const rid    = String(rule.approverId||'').trim();
     const remail = String(rule.approverEmail||'').trim().toLowerCase();
 
-    // Resolve uid/email/name from allUsers cache
-    const u = allUsers.find(x => x.uid===rid || x.id===rid) ||
-              allUsers.find(x => x.email?.toLowerCase()===remail) || {};
+    // Resolve uid/email/name from allUsers cache.
+    // CRITICAL: prefer u.uid (Firebase Auth UID) over u.id (Firestore doc ID) —
+    // My Approvals query filters by currentApproverId === currentUser.uid (Auth UID).
+    // If we write the doc ID instead of the Auth UID, Galaxy never sees the proposal.
+    let u = allUsers.find(x => x.uid===rid || x.id===rid) ||
+            allUsers.find(x => x.email?.toLowerCase()===remail) || null;
+
+    // If not in cache, fetch directly from pp_users to get the real Auth UID
+    if (!u && rid) {
+      try {
+        const uSnap = await db.collection('pp_users').doc(rid).get();
+        if (uSnap.exists) u = { id: uSnap.id, ...uSnap.data() };
+      } catch(_) {}
+    }
+    u = u || {};
+
+    // Use Auth UID (u.uid) as the primary identifier — fall back to doc ID (u.id) then rid
     const resolvedUid   = u.uid || u.id || rid || '';
-    const resolvedEmail = u.email?.toLowerCase() || remail || '';
+    const resolvedEmail = (u.email || remail || '').toLowerCase().trim();
     const resolvedName  = u.name || rule.approverName || 'Approver';
 
     const skipUid   = creatorUid   && resolvedUid   && resolvedUid   === creatorUid;
     const skipEmail = creatorEmail && resolvedEmail && resolvedEmail === creatorEmail;
-    console.log(`[resolveApprover] L${level} rule: rid="${rid}" resolvedEmail="${resolvedEmail}" | skipUid=${skipUid} skipEmail=${skipEmail}`);
+    console.log(`[resolveApprover] L${level} rule: rid="${rid}" resolvedUid="${resolvedUid}" resolvedEmail="${resolvedEmail}" | skipUid=${skipUid} skipEmail=${skipEmail}`);
 
     if (skipUid || skipEmail) continue;
     if (!resolvedEmail) continue;
 
-    const finalUid = resolvedUid || rid;
-    console.log(`[resolveApprover] L${level}: SELECTED "${resolvedName}" <${resolvedEmail}>`);
+    // finalUid MUST be the Firebase Auth UID so My Approvals query (currentApproverId==currentUser.uid) works
+    const finalUid = u.uid || u.id || rid;
+    console.log(`[resolveApprover] L${level}: SELECTED "${resolvedName}" <${resolvedEmail}> uid="${finalUid}"`);
     return { uid: finalUid, email: resolvedEmail, name: resolvedName, rule };
   }
   throw new Error(`No eligible approver at Level ${level} — the assigned approver may be the proposal creator or have been deleted.`);
@@ -5653,6 +5659,8 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   } catch(dupErr) {
     console.warn('[submit] Duplicate check failed (non-fatal):', dupErr.message);
   }
+
+  console.log('[submit] WRITING TO FIRESTORE — currentApprovalLevel:', startLevel, '| currentApproverId:', approver.uid, '| currentApproverEmail:', approver.email, '| currentApproverName:', approver.name);
 
   const docData = {
     ...proposalData,
