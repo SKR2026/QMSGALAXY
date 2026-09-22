@@ -3986,14 +3986,17 @@ async function loadDashboard() {
       });
       props = [...merged.values()];
     } else if (currentProfile?.role === 'Accounts') {
-      // Accounts: see all Approved proposals (need to update ERP ref)
-      const safeGet = q => q.get().catch(()=>({docs:[]}));
-      const approvedSnap = await safeGet(db.collection('pp_proposals').where('status','==','Approved').limit(200));
-      const merged = new Map();
-      approvedSnap.docs.forEach(d=>{
-        if(!merged.has(d.id)) merged.set(d.id,{id:d.id,...d.data()});
-      });
-      props = [...merged.values()];
+      // Accounts: call CF to get Approved proposals (bypasses Firestore security rules)
+      try {
+        const getFn = fns.httpsCallable('getApprovedProposals');
+        const result = await getFn({});
+        props = (result.data?.proposals || []);
+      } catch(cfErr) {
+        console.warn('[Dashboard/Accounts] CF failed, trying direct:', cfErr.message);
+        const safeGet = q => q.get().catch(()=>({docs:[]}));
+        const approvedSnap = await safeGet(db.collection('pp_proposals').where('status','==','Approved').limit(200));
+        props = approvedSnap.docs.map(d=>({id:d.id,...d.data()}));
+      }
     } else if (currentProfile?.role === 'Viewer') {
       // Viewer — all Approved proposals (for download) + their own created proposals
       const safeGet = q => q.get().catch(()=>({docs:[]}));
@@ -4128,16 +4131,27 @@ async function loadProposals() {
     if (!isSuperAdmin() && currentProfile?.role !== 'Plant Admin') {
       const isApproverRole = ['Approver','Creator & Approver','Proposal Creator'].includes(currentProfile?.role);
       if (isAccounts()) {
-        // Accounts: see all Approved proposals (to fill in ERP ref) + proposals awaiting their ack
-        const safeGet = q => q.get().catch(()=>({docs:[]}));
-        const [approvedSnap] = await Promise.all([
-          safeGet(db.collection('pp_proposals').where('status','==','Approved').limit(200))
-        ]);
-        const merged = new Map();
-        [...approvedSnap.docs].forEach(d=>{
-          if(!merged.has(d.id)) merged.set(d.id,{id:d.id,...d.data()});
-        });
-        allProposals = [...merged.values()];
+        // Accounts: call CF getApprovedProposals — runs with admin privileges,
+        // bypasses Firestore security rules that restrict direct status queries.
+        try {
+          const getFn = fns.httpsCallable('getApprovedProposals');
+          const result = await getFn({});
+          allProposals = (result.data?.proposals || []).map(p => ({
+            ...p,
+            // Convert plain timestamp objects back to Firestore-like format
+            createdAt:  p.createdAt  ? { toMillis: () => new Date(p.createdAt._seconds  ? p.createdAt._seconds*1000  : p.createdAt).getTime(), toDate: () => new Date(p.createdAt._seconds ? p.createdAt._seconds*1000 : p.createdAt) } : null,
+            submittedAt: p.submittedAt ? { toMillis: () => new Date(p.submittedAt._seconds ? p.submittedAt._seconds*1000 : p.submittedAt).getTime(), toDate: () => new Date(p.submittedAt._seconds ? p.submittedAt._seconds*1000 : p.submittedAt) } : null,
+            approvedAt:  p.approvedAt  ? { toMillis: () => new Date(p.approvedAt._seconds  ? p.approvedAt._seconds*1000  : p.approvedAt).getTime(),  toDate: () => new Date(p.approvedAt._seconds  ? p.approvedAt._seconds*1000  : p.approvedAt)  } : null,
+          }));
+        } catch(cfErr) {
+          console.warn('[Accounts] CF getApprovedProposals failed, trying direct query:', cfErr.message);
+          // Fallback: direct Firestore query (works if rules allow it)
+          const safeGet = q => q.get().catch(()=>({docs:[]}));
+          const approvedSnap = await safeGet(
+            db.collection('pp_proposals').where('status','==','Approved').limit(500)
+          );
+          allProposals = approvedSnap.docs.map(d=>({id:d.id,...d.data()}));
+        }
       } else if (isApproverRole) {
         // THREE queries merged:
         // 1. Currently assigned to this user (pending their action)
@@ -4928,9 +4942,22 @@ async function viewProposal(id) {
   navigate('view-proposal');
   document.getElementById('vp-content').innerHTML = '<div style="text-align:center;padding:40px"><div class="spinner dark"></div></div>';
   try {
-    const snap   = await db.collection('pp_proposals').doc(id).get();
-    if (!snap.exists) { toast('Proposal not found','error'); return; }
-    const p      = { id: snap.id, ...snap.data() };
+    let p;
+    try {
+      const snap = await db.collection('pp_proposals').doc(id).get();
+      if (snap.exists) {
+        p = { id: snap.id, ...snap.data() };
+      } else {
+        // Try from local cache (Accounts role may have it from CF load)
+        p = allProposals.find(x => x.id === id);
+        if (!p) { toast('Proposal not found','error'); return; }
+      }
+    } catch(readErr) {
+      // Firestore rules blocked direct read — use cached version from allProposals
+      console.warn('[viewProposal] direct read blocked, using cache:', readErr.message);
+      p = allProposals.find(x => x.id === id);
+      if (!p) { toast('Unable to load proposal — permission denied','error'); return; }
+    }
     const plant  = allPlants.find(pl=>pl.id===p.plantId);
     const diff   = p.proposedPrice - p.currentPrice;
     const pct    = p.currentPrice ? (diff/p.currentPrice*100) : 0;
@@ -5139,33 +5166,39 @@ async function viewProposal(id) {
 // ═══════════════════════════════════════════════════════════════════════════
 async function saveAccountsAck(proposalId, markAcknowledged) {
   if (!isAccounts()) { toast('Only Accounts users can update this section.', 'error'); return; }
-  const erpRef   = (document.getElementById('ack-erp-ref')?.value || '').trim();
-  const updatedOn= (document.getElementById('ack-updated-on')?.value || '').trim();
-  const comments = (document.getElementById('ack-comments')?.value || '').trim();
-  const byName   = (document.getElementById('ack-by-name')?.value || '').trim() || currentProfile?.name || '';
+  const erpRef    = (document.getElementById('ack-erp-ref')?.value || '').trim();
+  const updatedOn = (document.getElementById('ack-updated-on')?.value || '').trim();
+  const comments  = (document.getElementById('ack-comments')?.value || '').trim();
 
   if (markAcknowledged && !erpRef) { toast('ERP / System Ref. No. is required before acknowledging.', 'warning'); return; }
 
-  const ackData = {
-    erpRef, updatedOn, comments,
-    acknowledgedByName: byName,
-    acknowledgedByEmail: currentProfile?.email || '',
-    acknowledged: markAcknowledged,
-    savedAt: firebase.firestore.FieldValue.serverTimestamp()
-  };
-
   try {
-    await db.collection('pp_proposals').doc(proposalId).update({
-      accountsAck: ackData,
-      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-    });
+    // Use CF to bypass Firestore rules (Accounts cannot write pp_proposals directly)
+    const saveFn = fns.httpsCallable('saveAccountsAck');
+    await saveFn({ proposalId, erpRef, updatedOn, comments, acknowledged: markAcknowledged });
     toast(markAcknowledged ? '✅ Accounts acknowledged & saved!' : '💾 Draft saved', 'success');
     await logAudit(proposalId, markAcknowledged ? 'AccountsAcknowledged' : 'AccountsAckDraft',
-      `ERP Ref: ${erpRef||'—'} | By: ${byName}`);
-    // Refresh the view
+      `ERP Ref: ${erpRef||'—'}`);
     await viewProposal(proposalId);
   } catch(e) {
-    toast('Save failed: ' + (e.message || 'Unknown error'), 'error');
+    // Fallback: try direct Firestore write
+    try {
+      const byName = currentProfile?.name || '';
+      const ackData = {
+        erpRef, updatedOn, comments,
+        acknowledgedByName:  byName,
+        acknowledgedByEmail: currentProfile?.email || '',
+        acknowledged: markAcknowledged,
+        savedAt: firebase.firestore.FieldValue.serverTimestamp()
+      };
+      await db.collection('pp_proposals').doc(proposalId).update({
+        accountsAck: ackData, updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      });
+      toast(markAcknowledged ? '✅ Acknowledged!' : '💾 Saved', 'success');
+      await viewProposal(proposalId);
+    } catch(e2) {
+      toast('Save failed: ' + (e2.message || 'Unknown error'), 'error');
+    }
   }
 }
 
