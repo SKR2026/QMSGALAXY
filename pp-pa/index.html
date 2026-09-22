@@ -5251,27 +5251,31 @@ async function getCreatorLevel(p) {
     .reduce((max,lvl)=>Math.max(max,lvl), 0);
 }
 
-// Returns the final approval level for this proposal — the lowest level ABOVE
-// the creator's own level whose maxValue covers the proposal amount.
+// Returns the final approval level for this proposal.
+// Uses the SAME logic as the CF getProposalMaxLevel:
+//   Walk levels above the creator's level in ascending order.
+//   First level whose rules cover the proposal amount → that is the stop level.
+//   If no rule has a maxValue covering the amount, fall back to the highest level.
+// NOTE: Does NOT call resolveApprover (avoids allUsers cache dependency).
 async function getProposalMaxLevel(p) {
   const matrixSnap   = await db.collection('pp_approvalMatrices').get();
   const amount       = clientResolveAnnualImpact(p);
   const creatorLevel = await getCreatorLevel(p);
-  const rules = matrixSnap.docs.map(d => ({id:d.id,...d.data()}))
-    .filter(r => !r.plantId  || r.plantId  === p.plantId)
+  const allRules = matrixSnap.docs.map(d => ({id:d.id,...d.data()}))
+    .filter(r => {
+      const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []);
+      return !ids.length || ids.includes(p.plantId);
+    })
     .filter(r => !r.category || r.category === p.category)
     .filter(r => Number(r.level||0) > creatorLevel);  // only levels above creator
-  const levels = [...new Set(rules.map(r=>Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
+  const levels = [...new Set(allRules.map(r=>Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
   for (const lvl of levels) {
-    const covered = rules.filter(r=>Number(r.level||0)===lvl)
+    const covered = allRules.filter(r=>Number(r.level||0)===lvl)
       .some(r => {
         const max = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue);
         return amount <= max;
       });
-    if (covered) {
-      const eligible = await resolveApprover(p, lvl);
-      if (eligible?.uid) return lvl;
-    }
+    if (covered) return lvl;
   }
   return levels.length ? Math.max(...levels) : 1;
 }
@@ -5618,11 +5622,6 @@ async function executeApprovalAction() {
         const currentLevel = p.currentApprovalLevel || 1;
 
         // Load matrix and compute eligible next levels for THIS proposal's annual impact.
-        // minValue / maxValue are compared against the proposal's annual financial impact.
-        // All proposals pass through ALL configured levels in sequence.
-        // Amount only determines WHO approves at each level (via maxValue), not which levels run.
-        // maxLevel mirrors CF getProposalMaxLevel: the FIRST level whose rules cover
-        // this proposal's amount. The proposal finalises at this level (not at the highest).
         const proposalMaxLevel = await getProposalMaxLevel(p);
 
         historyEntry.level = currentLevel;
@@ -5641,16 +5640,20 @@ async function executeApprovalAction() {
           // Notify CC observers of final approval (fire-and-forget, non-blocking)
           notifyFinalApprovalObservers(p, proposalId).catch(()=>{});
         } else {
-          // Find next level — above currentLevel, above creator's matrix level, up to maxLevel
+          // Reload allUsers to ensure Galaxy and others are in cache before resolveApprover
+          await loadUsers();
+
+          // Find next level — strictly above currentLevel, up to proposalMaxLevel
           const _matrixSnap2    = await db.collection('pp_approvalMatrices').get();
-          const _creatorLvlHTML = await getCreatorLevel(p);
           const eligibleNextLevels = [...new Set(
             _matrixSnap2.docs
               .map(d => ({...d.data()}))
               .filter(r => Number(r.level||0) > currentLevel)
-              .filter(r => Number(r.level||0) > _creatorLvlHTML)   // skip creator's level & below
               .filter(r => Number(r.level||0) <= proposalMaxLevel)
-              .filter(r => (!r.plantId || r.plantId===p.plantId))
+              .filter(r => {
+                const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []);
+                return !ids.length || ids.includes(p.plantId);
+              })
               .filter(r => (!r.category || r.category===p.category))
               .map(r => Number(r.level||0))
               .filter(Boolean)
