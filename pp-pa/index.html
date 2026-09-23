@@ -2317,6 +2317,7 @@ html, body { overflow: hidden; }
                     <li>🔗 All magic links</li>
                     <li>⚙️ All settings (company, approval, numbering)</li>
                     <li>📝 All email templates</li>
+                    <li>🔢 Proposal number series (restarts at 0001)</li>
                   </ul>
                 </div>
                 <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:var(--radius);padding:16px">
@@ -8586,7 +8587,7 @@ async function executeSystemReset() {
     return deleted;
   }
 
-  const total = WIPE_COLLECTIONS.length + 5; // +5 for userActions, auditLogs, emailLogs, settings, pp_settings
+  const total = WIPE_COLLECTIONS.length + 6; // +6 for userActions, auditLogs, emailLogs, settings, pp_settings, pp_counters
   let done = 0;
 
   try {
@@ -8707,6 +8708,41 @@ async function executeSystemReset() {
       log(`pp_settings: all configuration cleared`);
     } catch(e) {
       log(`pp_settings: ${e.message}`, false);
+    }
+    done++; setProgress(Math.round(done / total * 100));
+
+    // 3b. Reset proposal number counters (pp_counters) so numbering restarts at 0001
+    //     Without this, the GLOBAL_{year} counter keeps its old seq and new
+    //     proposals continue the previous series after a reset.
+    try {
+      let cDeleted = 0;
+      // Try a full listing first (removes counters for every year)
+      try {
+        while (true) {
+          const snap = await db.collection('pp_counters').limit(400).get();
+          if (snap.empty) break;
+          const batch = db.batch();
+          snap.docs.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+          cDeleted += snap.docs.length;
+        }
+      } catch(_) {}
+      // Always force the known yearly counters back to zero as well
+      // (works even if Firestore rules block listing/deleting pp_counters)
+      const yr = new Date().getFullYear();
+      const batch = db.batch();
+      for (const y of [yr - 1, yr, yr + 1]) {
+        batch.set(db.collection('pp_counters').doc(`GLOBAL_${y}`), {
+          seq: 0,
+          year: y,
+          resetAt: firebase.firestore.FieldValue.serverTimestamp(),
+          updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+      }
+      await batch.commit();
+      log(`pp_counters: proposal numbering reset — next proposal will be #0001` + (cDeleted ? ` (${cDeleted} old counter${cDeleted !== 1 ? 's' : ''} removed)` : ''));
+    } catch(e) {
+      log(`pp_counters: ${e.message}`, false);
     }
     done++; setProgress(Math.round(done / total * 100));
 
