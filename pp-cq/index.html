@@ -665,6 +665,7 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
       <div class="grid-2 mb-16">
         <div class="card">
           <div class="card-title">Change Password</div>
+          <div style="font-size:12px;color:var(--text3);margin:-4px 0 12px">Your login is shared with other apps in this Firebase project, so a new password here applies there too.</div>
           <div style="display:flex;flex-direction:column;gap:14px">
             <div class="field"><label>Current Password</label><input type="password" id="cpCurrent" placeholder="Current password"></div>
             <div class="field"><label>New Password</label><input type="password" id="cpNew" placeholder="Min 6 characters"></div>
@@ -1185,6 +1186,15 @@ const auth  = getAuth(app);
 const auth2 = getAuth(app2);
 const db    = getFirestore(app);
 
+// ── COPQ-only user store ───────────────────────────────────────
+// All COPQ user profiles live ONLY in this collection. Other apps in the
+// skr-msa project keep their own user collections and are never read,
+// written or deleted by COPQ. Firebase Auth logins are shared project-wide,
+// so COPQ never deletes or modifies an Auth account — it only grants or
+// removes COPQ access via documents in this collection.
+const USERS_COL = 'copqUsers';
+const pendingId = email => 'pending_' + String(email||'').trim().toLowerCase();
+
 window.FB = {
   // Auth
   async login(email,pw){ return signInWithEmailAndPassword(auth,email,pw); },
@@ -1197,15 +1207,42 @@ window.FB = {
     await updatePassword(user,newPw);
   },
   // Users
-  async getProfile(uid){ const d=await getDoc(doc(db,'copqUsers',uid)); return d.exists()?{id:d.id,...d.data()}:null; },
-  async getUsers(){ const s=await getDocs(collection(db,'copqUsers')); return s.docs.map(d=>({id:d.id,...d.data()})); },
-  async createUser(email,pw,data){
-    const cred=await createUserWithEmailAndPassword(auth2,email,pw);
-    await setDoc(doc(db,'copqUsers',cred.user.uid),{...data,email,createdAt:serverTimestamp()});
-    await signOut(auth2); return cred.user.uid;
+  async getProfile(uid,email){
+    const d=await getDoc(doc(db,USERS_COL,uid));
+    if(d.exists()) return {id:d.id,...d.data()};
+    if(!email) return null;
+    // No COPQ profile yet — check whether an admin granted access to this email
+    // (used when the login already existed for another app in this project).
+    const pref=doc(db,USERS_COL,pendingId(email));
+    let p;
+    try{ p=await getDoc(pref); }catch(e){ return null; }
+    if(!p.exists()) return null;
+    const {pending,...data}=p.data();
+    await setDoc(doc(db,USERS_COL,uid),{...data,claimedAt:serverTimestamp()});
+    await deleteDoc(pref);
+    return {id:uid,...data};
   },
-  async updateUser(id,data){ await updateDoc(doc(db,'copqUsers',id),data); },
-  async deleteUser(id){ await deleteDoc(doc(db,'copqUsers',id)); },
+  async getUsers(){ const s=await getDocs(collection(db,USERS_COL)); return s.docs.map(d=>({id:d.id,...d.data()})); },
+  async createUser(email,pw,data){
+    email=String(email).trim().toLowerCase();
+    try{
+      const cred=await createUserWithEmailAndPassword(auth2,email,pw);
+      await setDoc(doc(db,USERS_COL,cred.user.uid),{...data,email,createdAt:serverTimestamp()});
+      return {status:'created'};
+    }catch(err){
+      if(err.code!=='auth/email-already-in-use') throw err;
+      // Login already exists (e.g. created by another app in this project).
+      // Leave that account untouched; grant COPQ access on their next sign-in.
+      await setDoc(doc(db,USERS_COL,pendingId(email)),{...data,email,pending:true,createdAt:serverTimestamp()});
+      return {status:'pending'};
+    }finally{
+      try{ await signOut(auth2); }catch(e){}
+    }
+  },
+  async updateUser(id,data){ await updateDoc(doc(db,USERS_COL,id),data); },
+  // Removes COPQ access only. The Firebase Auth login is NOT deleted,
+  // because it may belong to / be used by other apps in this project.
+  async deleteUser(id){ await deleteDoc(doc(db,USERS_COL,id)); },
   // Plants
   async getPlants(){ const s=await getDocs(collection(db,'copqPlants')); return s.docs.map(d=>({id:d.id,...d.data()})); },
   async addPlant(data){ return addDoc(collection(db,'copqPlants'),{...data,createdAt:serverTimestamp()}); },
@@ -1247,15 +1284,19 @@ window.FB.onAuth(async user=>{
       console.log('[COPQ] Step 2: Loading profile from copqUsers/'+user.uid);
       let profile=null;
       try{
-        profile=await window.FB.getProfile(user.uid);
+        profile=await window.FB.getProfile(user.uid,user.email);
       }catch(profileErr){
         showDiag('STEP 2 FAILED — Could not read copqUsers/'+user.uid+': '+profileErr.message+' | code: '+(profileErr.code||'n/a'));
         return;
       }
 
       if(!profile){
-        showDiag('STEP 2 FAILED — No document found at copqUsers/'+user.uid+'. Create a Firestore document at collection=copqUsers, doc='+user.uid+' with fields: name, email, role="super_admin", plant="All"');
-        await window.FB.logout(); return;
+        // Valid login for this Firebase project (e.g. another app's user) but no COPQ access.
+        console.warn('[COPQ] No copqUsers profile for uid='+user.uid+' — access denied.');
+        await window.FB.logout();
+        const le=document.getElementById('loginError');
+        if(le){ le.textContent='This account does not have access to COPQ. Ask your COPQ admin to add you.'; le.style.display='block'; }
+        return;
       }
 
       console.log('[COPQ] Step 3: Profile loaded. role="'+profile.role+'" plant="'+profile.plant+'" name="'+profile.name+'"');
@@ -1366,8 +1407,16 @@ window.saveUser=async function(){
       if(idx!==-1) usersList[idx]={...usersList[idx],name,email,role,plant};
       showToast('User updated ✓');
     } else {
-      await window.FB.createUser(email,pw,{name,role,plant});
-      showToast('User created ✓');
+      const em=email.toLowerCase();
+      if((usersList||[]).some(u=>(u.email||'').toLowerCase()===em)){
+        showToast('This email already has COPQ access'); return;
+      }
+      const res=await window.FB.createUser(email,pw,{name,role,plant});
+      if(res?.status==='pending'){
+        showToast('This email already has a login in this Firebase project (another app). COPQ access granted — they sign in with their existing password. The password you typed was not used.',9000);
+      } else {
+        showToast('User created ✓');
+      }
       usersList=await window.FB.getUsers();
     }
     closeModal('userModal');
@@ -2369,7 +2418,7 @@ function renderUsers(){
     <td style="color:var(--text2);font-size:12px">${u.email||'—'}</td>
     <td><span class="badge ${roleColors[u.role]||'badge-blue'}">${roleLabels[u.role]||u.role}</span></td>
     <td>${u.plant||'All'}</td>
-    <td><span class="badge badge-green">Active</span></td>
+    <td>${u.pending?'<span class="badge badge-amber" title="Access granted to an existing project login; activates on their first COPQ sign-in">Pending first sign-in</span>':'<span class="badge badge-green">Active</span>'}</td>
     <td><div style="display:flex;gap:4px">
       <button class="btn btn-sm" onclick="openEditUserModal('${u.id}')">Edit</button>
       ${isSA&&u.id!==currentUser?.uid?`<button class="btn btn-sm" style="color:var(--red)" onclick="deleteUser('${u.id}')">Delete</button>`:''}
@@ -2432,10 +2481,10 @@ function openEditUserModal(id){
   document.getElementById('userModal').classList.add('open');
 }
 async function deleteUser(id){
-  if(!confirm('Delete this user?')) return;
+  if(!confirm('Remove this user\'s COPQ access?\n\nTheir login is not deleted, so any other apps they use in this Firebase project are not affected.')) return;
   await window.FB.deleteUser(id);
   usersList=usersList.filter(u=>u.id!==id);
-  renderUsers(); showToast('User deleted');
+  renderUsers(); showToast('COPQ access removed');
 }
 
 // ── Plants ───────────────────────────────────────────────────
