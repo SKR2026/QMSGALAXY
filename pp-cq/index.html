@@ -244,6 +244,7 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
       <div class="field"><label>Password</label><input type="password" id="loginPassword" placeholder="••••••••"></div>
       <div id="loginError" style="font-size:12px;color:var(--red);display:none;line-height:1.5;padding:8px 12px;background:var(--red-bg);border-radius:6px"></div>
       <button id="loginBtn" class="btn btn-primary" style="justify-content:center;padding:10px;font-size:13px;margin-top:4px" onclick="doLogin()">Sign in</button>
+      <div style="text-align:center;font-size:12px"><a href="#" onclick="forgotPassword();return false;" style="color:var(--text3)">Forgot password? / First time signing in?</a></div>
     </div>
   </div>
 
@@ -1164,7 +1165,7 @@ window.showDiag=showDiag;
 import { initializeApp, getApps } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
          updatePassword, reauthenticateWithCredential, EmailAuthProvider,
-         createUserWithEmailAndPassword }
+         createUserWithEmailAndPassword, sendPasswordResetEmail }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import { getFirestore, collection, doc, addDoc, setDoc, getDoc, getDocs,
          updateDoc, deleteDoc, serverTimestamp }
@@ -1199,6 +1200,7 @@ window.FB = {
   // Auth
   async login(email,pw){ return signInWithEmailAndPassword(auth,email,pw); },
   async logout(){ return signOut(auth); },
+  async resetPassword(email){ return sendPasswordResetEmail(auth,String(email).trim().toLowerCase()); },
   onAuth(cb){ return onAuthStateChanged(auth,cb); },
   async changePassword(current,newPw){
     const user=auth.currentUser; if(!user) throw new Error('Not signed in');
@@ -1286,7 +1288,15 @@ window.FB.onAuth(async user=>{
       try{
         profile=await window.FB.getProfile(user.uid,user.email);
       }catch(profileErr){
-        showDiag('STEP 2 FAILED — Could not read copqUsers/'+user.uid+': '+profileErr.message+' | code: '+(profileErr.code||'n/a'));
+        console.error('[COPQ] Profile load failed', profileErr);
+        await window.FB.logout();
+        const le=document.getElementById('loginError');
+        if(le){
+          le.textContent=(profileErr.code==='permission-denied')
+            ?'Signed in, but COPQ could not load your access (permission denied). Ask the admin to check that the latest Firestore rules are published.'
+            :'Signed in, but COPQ could not load your access: '+profileErr.message;
+          le.style.display='block';
+        }
         return;
       }
 
@@ -1351,11 +1361,27 @@ window.doLogin = async function(){
   try{ await window.FB.login(email,pw); }
   catch(err){
     let msg='Sign-in failed.'; const c=err.code||'';
-    if(c.includes('user-not-found')||c.includes('invalid-credential')||c.includes('invalid-email')) msg='No account found for this email.';
-    else if(c.includes('wrong-password')) msg='Incorrect password.';
+    if(c.includes('invalid-email')) msg='Please enter a valid email address.';
+    else if(c.includes('user-not-found')) msg='No account found for this email.';
+    else if(c.includes('invalid-credential')||c.includes('wrong-password'))
+      msg='Email or password is incorrect. If you already use this email in another company app, use that same password — or click "Forgot password?" below to set one.';
+    else if(c.includes('user-disabled')) msg='This login has been disabled. Contact your administrator.';
     else if(c.includes('too-many-requests')) msg='Too many attempts — try again later.';
     errEl.textContent=msg; errEl.style.display='block';
   } finally{ btn.textContent='Sign in'; btn.disabled=false; }
+};
+window.forgotPassword=async function(){
+  const email=document.getElementById('loginEmail').value.trim();
+  const errEl=document.getElementById('loginError');
+  if(!email){ errEl.textContent='Enter your email address above, then click "Forgot password?" again.'; errEl.style.display='block'; return; }
+  try{
+    await window.FB.resetPassword(email);
+    errEl.style.display='none';
+    showToast('If this email has a login, a password-reset link has been sent to it. Check inbox/spam.',8000);
+  }catch(err){
+    errEl.textContent='Could not send reset email: '+(err.code==='auth/invalid-email'?'invalid email address.':err.message);
+    errEl.style.display='block';
+  }
 };
 window.doSignOut=async function(){ await window.FB.logout(); };
 
@@ -1413,7 +1439,11 @@ window.saveUser=async function(){
       }
       const res=await window.FB.createUser(email,pw,{name,role,plant});
       if(res?.status==='pending'){
-        showToast('This email already has a login in this Firebase project (another app). COPQ access granted — they sign in with their existing password. The password you typed was not used.',9000);
+        showToast('COPQ access granted. This email already had a login (another app), so the password you typed was NOT applied.',9000);
+        if(confirm('This person already has a login from another app, so the password you typed was not set.\n\nSend them a password-reset email now so they can sign in?\n\n(OK = send email. Note: the new password will also apply to the other app.\nCancel = they will sign in with their existing password.)')){
+          try{ await window.FB.resetPassword(email); showToast('Password-reset email sent to '+email,6000); }
+          catch(e){ showToast('Could not send reset email: '+e.message,6000); }
+        }
       } else {
         showToast('User created ✓');
       }
@@ -2421,6 +2451,7 @@ function renderUsers(){
     <td>${u.pending?'<span class="badge badge-amber" title="Access granted to an existing project login; activates on their first COPQ sign-in">Pending first sign-in</span>':'<span class="badge badge-green">Active</span>'}</td>
     <td><div style="display:flex;gap:4px">
       <button class="btn btn-sm" onclick="openEditUserModal('${u.id}')">Edit</button>
+      ${u.pending&&isAdmin?`<button class="btn btn-sm" title="Email a password-reset link to this user" onclick="sendUserReset('${u.email}')">Send reset email</button>`:''}
       ${isSA&&u.id!==currentUser?.uid?`<button class="btn btn-sm" style="color:var(--red)" onclick="deleteUser('${u.id}')">Delete</button>`:''}
     </div></td>
   </tr>`).join('');
@@ -2479,6 +2510,11 @@ function openEditUserModal(id){
     plantEl.value=u.plant||'All';
   }
   document.getElementById('userModal').classList.add('open');
+}
+async function sendUserReset(email){
+  if(!confirm('Send a password-reset email to '+email+'?\n\nThis login is shared with other apps in this Firebase project, so the new password will apply there too.')) return;
+  try{ await window.FB.resetPassword(email); showToast('Password-reset email sent to '+email,6000); }
+  catch(e){ showToast('Could not send reset email: '+e.message,6000); }
 }
 async function deleteUser(id){
   if(!confirm('Remove this user\'s COPQ access?\n\nTheir login is not deleted, so any other apps they use in this Firebase project are not affected.')) return;
@@ -3150,6 +3186,7 @@ window.exportReportsPDF      = exportReportsPDF;
 window.openUserModal         = openUserModal;
 window.openEditUserModal     = openEditUserModal;
 window.deleteUser            = deleteUser;
+window.sendUserReset         = sendUserReset;
 window.openPlantModal        = openPlantModal;
 window.openEditPlantModal    = openEditPlantModal;
 window.openMasterModal       = openMasterModal;
