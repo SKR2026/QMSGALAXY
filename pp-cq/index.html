@@ -666,7 +666,7 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
       <div class="grid-2 mb-16">
         <div class="card">
           <div class="card-title">Change Password</div>
-          <div style="font-size:12px;color:var(--text3);margin:-4px 0 12px">Your login is shared with other apps in this Firebase project, so a new password here applies there too.</div>
+          <div id="cpNote" style="font-size:12px;color:var(--text3);margin:-4px 0 12px"></div>
           <div style="display:flex;flex-direction:column;gap:14px">
             <div class="field"><label>Current Password</label><input type="password" id="cpCurrent" placeholder="Current password"></div>
             <div class="field"><label>New Password</label><input type="password" id="cpNew" placeholder="Min 6 characters"></div>
@@ -734,6 +734,20 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
             </div>
             <div id="logoSaveMsg" style="display:none;margin-top:10px;font-size:12px;color:var(--green);padding:8px 12px;background:var(--green-bg);border-radius:6px">Logo saved and applied ✓</div>
           </div>
+        </div>
+      </div>
+
+      <!-- Separate COPQ project: one-time import (Super Admin only) -->
+      <div class="card" id="migrateCard" style="display:none;margin-top:16px">
+        <div class="card-title">Separate COPQ Logins — Import from old shared project</div>
+        <div id="migrateStatus" style="font-size:12px;color:var(--text2);margin-bottom:12px;line-height:1.6"></div>
+        <div id="migrateForm" style="display:none;flex-direction:column;gap:12px;max-width:460px">
+          <div class="field"><label>Your OLD login email (old shared project)</label><input type="email" id="migOldEmail" placeholder="you@company.com"></div>
+          <div class="field"><label>Your OLD password</label><input type="password" id="migOldPw"></div>
+          <div class="field"><label>Temporary password for all imported users</label><input type="text" id="migTempPw" placeholder="Min 6 characters"></div>
+          <label style="font-size:12px;display:flex;gap:8px;align-items:center"><input type="checkbox" id="migSendResets" checked> Also email each user a link to set their own COPQ password</label>
+          <button class="btn btn-primary" id="migBtn" onclick="runImportFromOld()">Import users &amp; data</button>
+          <pre id="migLog" style="display:none;max-height:260px;overflow:auto;font-size:11px;background:var(--surface2);padding:10px;border-radius:8px;white-space:pre-wrap"></pre>
         </div>
       </div>
     </div>
@@ -1168,10 +1182,27 @@ import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
          createUserWithEmailAndPassword, sendPasswordResetEmail }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import { getFirestore, collection, doc, addDoc, setDoc, getDoc, getDocs,
-         updateDoc, deleteDoc, serverTimestamp }
+         updateDoc, deleteDoc, serverTimestamp, writeBatch }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
-const firebaseConfig = {
+// ════════════════════════════════════════════════════════════════
+// STEP 1: PASTE THE CONFIG OF COPQ's OWN (NEW) FIREBASE PROJECT HERE.
+// A separate project = separate logins & passwords. COPQ users get
+// NO access to other apps, and other apps' users get NO access to COPQ.
+// Until this is filled in, the app keeps running on the old shared project.
+// ════════════════════════════════════════════════════════════════
+const COPQ_CONFIG = {
+  apiKey: "PASTE_NEW_API_KEY",
+  authDomain: "PASTE_NEW_PROJECT.firebaseapp.com",
+  projectId: "PASTE_NEW_PROJECT",
+  storageBucket: "PASTE_NEW_PROJECT.firebasestorage.app",
+  messagingSenderId: "PASTE",
+  appId: "PASTE"
+};
+
+// Old shared project (skr-msa). After the switch it is used ONLY by the
+// one-time "Import from old shared project" tool in Settings.
+const OLD_SHARED_CONFIG = {
   apiKey: "AIzaSyD1Ey-yqHEqLB0NFOAfPND0N0TmwA4a6pE",
   authDomain: "skr-msa.firebaseapp.com",
   projectId: "skr-msa",
@@ -1179,6 +1210,11 @@ const firebaseConfig = {
   messagingSenderId: "957782831083",
   appId: "1:957782831083:web:04afe89e5a994b3898b3ae"
 };
+
+const COPQ_READY = !String(COPQ_CONFIG.apiKey).startsWith('PASTE');
+window.COPQ_READY = COPQ_READY;
+const firebaseConfig = COPQ_READY ? COPQ_CONFIG : OLD_SHARED_CONFIG;
+console.log('[COPQ] Firebase project: '+firebaseConfig.projectId+(COPQ_READY?' (separate COPQ project)':' (OLD shared project)'));
 
 const existingApps=getApps();
 const app  = existingApps.find(a=>a.name==='copq')  || initializeApp(firebaseConfig,'copq');
@@ -1224,7 +1260,7 @@ window.FB = {
     await deleteDoc(pref);
     return {id:uid,...data};
   },
-  async getUsers(){ const s=await getDocs(collection(db,USERS_COL)); return s.docs.map(d=>({id:d.id,...d.data()})); },
+  async getUsers(){ const s=await getDocs(collection(db,USERS_COL)); return s.docs.map(d=>({id:d.id,...d.data()})).filter(u=>!u.disabled); },
   async createUser(email,pw,data){
     email=String(email).trim().toLowerCase();
     try{
@@ -1233,6 +1269,16 @@ window.FB = {
       return {status:'created'};
     }catch(err){
       if(err.code!=='auth/email-already-in-use') throw err;
+      if(COPQ_READY){
+        // Separate COPQ project: this login belongs to COPQ. Re-enable if it was removed.
+        const all=await getDocs(collection(db,USERS_COL));
+        const hit=all.docs.find(d=>(d.data().email||'').toLowerCase()===email);
+        if(hit && hit.data().disabled){
+          await updateDoc(doc(db,USERS_COL,hit.id),{...data,email,disabled:false,reenabledAt:serverTimestamp()});
+          return {status:'reenabled'};
+        }
+        throw new Error('This email already has a COPQ login.');
+      }
       // Login already exists (e.g. created by another app in this project).
       // Leave that account untouched; grant COPQ access on their next sign-in.
       await setDoc(doc(db,USERS_COL,pendingId(email)),{...data,email,pending:true,createdAt:serverTimestamp()});
@@ -1244,7 +1290,70 @@ window.FB = {
   async updateUser(id,data){ await updateDoc(doc(db,USERS_COL,id),data); },
   // Removes COPQ access only. The Firebase Auth login is NOT deleted,
   // because it may belong to / be used by other apps in this project.
-  async deleteUser(id){ await deleteDoc(doc(db,USERS_COL,id)); },
+  async deleteUser(id){
+    if(COPQ_READY) await updateDoc(doc(db,USERS_COL,id),{disabled:true,disabledAt:serverTimestamp()});
+    else await deleteDoc(doc(db,USERS_COL,id));
+  },
+
+  // ── One-time import: old shared project → COPQ's own project ──
+  async importFromOld(oldEmail,oldPw,tempPw,sendResets,log){
+    if(!COPQ_READY) throw new Error('Paste the new project config (COPQ_CONFIG) first.');
+    const me=auth.currentUser; if(!me) throw new Error('Not signed in');
+    const oldApp=getApps().find(a=>a.name==='copqOld')||initializeApp(OLD_SHARED_CONFIG,'copqOld');
+    const oldAuth=getAuth(oldApp), oldDb=getFirestore(oldApp);
+    log('Signing in to old shared project…');
+    await signInWithEmailAndPassword(oldAuth,oldEmail,oldPw);
+    try{
+      const readOld=async name=>(await getDocs(collection(oldDb,name))).docs.map(d=>({id:d.id,data:d.data()}));
+      // Users
+      const oldUsers=await readOld('copqUsers');
+      const newUsersSnap=await getDocs(collection(db,USERS_COL));
+      const newByEmail={}; newUsersSnap.docs.forEach(d=>{const e=(d.data().email||'').toLowerCase(); if(e) newByEmail[e]=d.id;});
+      const uidMap={}; const created=[];
+      log('Users found: '+oldUsers.length);
+      for(const u of oldUsers){
+        const {pending,claimedAt,...d}=u.data; const em=(d.email||'').toLowerCase();
+        if(!em){ log('  skip (no email): '+u.id); continue; }
+        if(em===(me.email||'').toLowerCase()){
+          uidMap[u.id]=me.uid;
+          const {role,...rest}=d;
+          await setDoc(doc(db,USERS_COL,me.uid),{...rest,email:em,role:'super_admin'},{merge:true});
+          log('  you ('+em+'): access settings copied'); continue;
+        }
+        if(newByEmail[em]){ uidMap[u.id]=newByEmail[em]; log('  already in new project: '+em); continue; }
+        try{
+          const cred=await createUserWithEmailAndPassword(auth2,em,tempPw);
+          await signOut(auth2);
+          uidMap[u.id]=cred.user.uid;
+          await setDoc(doc(db,USERS_COL,cred.user.uid),{...d,email:em,migratedFromUid:u.id});
+          created.push(em); log('  created: '+em);
+        }catch(e){ log('  FAILED '+em+': '+(e.code||e.message)); }
+      }
+      // Data collections (replace whatever is in the new project, e.g. auto-seeded masters)
+      const remap=x=>{ if(x&&x.enteredByUid&&uidMap[x.enteredByUid]) x.enteredByUid=uidMap[x.enteredByUid]; return x; };
+      for(const name of ['copqPlants','copqMasters','copqEntries','copqSales','copqSettings']){
+        const rows=await readOld(name);
+        const existing=(await getDocs(collection(db,name))).docs;
+        const ops=[...existing.map(d=>({del:d.id})), ...rows.map(r=>({id:r.id,data:remap({...r.data})}))];
+        for(let i=0;i<ops.length;i+=400){
+          const b=writeBatch(db);
+          ops.slice(i,i+400).forEach(o=> o.del!==undefined ? b.delete(doc(db,name,o.del)) : b.set(doc(db,name,o.id),o.data));
+          await b.commit();
+        }
+        log(name+': '+rows.length+' copied');
+      }
+      if(sendResets){
+        for(const em of created){
+          try{ await sendPasswordResetEmail(auth,em); log('  reset email sent: '+em); }
+          catch(e){ log('  reset email FAILED '+em+': '+(e.code||e.message)); }
+        }
+      }
+      log('DONE. '+created.length+' new COPQ logins created.');
+      return {created:created.length};
+    } finally {
+      try{ await signOut(oldAuth); }catch(e){}
+    }
+  },
   // Plants
   async getPlants(){ const s=await getDocs(collection(db,'copqPlants')); return s.docs.map(d=>({id:d.id,...d.data()})); },
   async addPlant(data){ return addDoc(collection(db,'copqPlants'),{...data,createdAt:serverTimestamp()}); },
@@ -1300,6 +1409,7 @@ window.FB.onAuth(async user=>{
         return;
       }
 
+      if(profile && profile.disabled) profile=null;
       if(!profile){
         // Valid login for this Firebase project (e.g. another app's user) but no COPQ access.
         console.warn('[COPQ] No copqUsers profile for uid='+user.uid+' — access denied.');
@@ -1438,7 +1548,9 @@ window.saveUser=async function(){
         showToast('This email already has COPQ access'); return;
       }
       const res=await window.FB.createUser(email,pw,{name,role,plant});
-      if(res?.status==='pending'){
+      if(res?.status==='reenabled'){
+        showToast('User re-enabled. Their previous COPQ password still works — use "Send reset email" if they forgot it.',8000);
+      } else if(res?.status==='pending'){
         showToast('COPQ access granted. This email already had a login (another app), so the password you typed was NOT applied.',9000);
         if(confirm('This person already has a login from another app, so the password you typed was not set.\n\nSend them a password-reset email now so they can sign in?\n\n(OK = send email. Note: the new password will also apply to the other app.\nCancel = they will sign in with their existing password.)')){
           try{ await window.FB.resetPassword(email); showToast('Password-reset email sent to '+email,6000); }
@@ -2451,7 +2563,7 @@ function renderUsers(){
     <td>${u.pending?'<span class="badge badge-amber" title="Access granted to an existing project login; activates on their first COPQ sign-in">Pending first sign-in</span>':'<span class="badge badge-green">Active</span>'}</td>
     <td><div style="display:flex;gap:4px">
       <button class="btn btn-sm" onclick="openEditUserModal('${u.id}')">Edit</button>
-      ${u.pending&&isAdmin?`<button class="btn btn-sm" title="Email a password-reset link to this user" onclick="sendUserReset('${u.email}')">Send reset email</button>`:''}
+      ${(u.pending||window.COPQ_READY)&&isAdmin&&u.id!==currentUser?.uid?`<button class="btn btn-sm" title="Email a password-reset link to this user" onclick="sendUserReset('${u.email}')">Send reset email</button>`:''}
       ${isSA&&u.id!==currentUser?.uid?`<button class="btn btn-sm" style="color:var(--red)" onclick="deleteUser('${u.id}')">Delete</button>`:''}
     </div></td>
   </tr>`).join('');
@@ -2511,13 +2623,32 @@ function openEditUserModal(id){
   }
   document.getElementById('userModal').classList.add('open');
 }
+async function runImportFromOld(){
+  const em=document.getElementById('migOldEmail').value.trim();
+  const pw=document.getElementById('migOldPw').value;
+  const tp=document.getElementById('migTempPw').value;
+  const sr=document.getElementById('migSendResets').checked;
+  if(!em||!pw){showToast('Enter your old login email and password');return;}
+  if(tp.length<6){showToast('Temporary password must be at least 6 characters');return;}
+  if(!confirm('Import COPQ users and data from the old shared project?\n\nCOPQ data already in this new project will be replaced. Run this only once.')) return;
+  const logEl=document.getElementById('migLog'), btn=document.getElementById('migBtn');
+  logEl.style.display='block'; logEl.textContent=''; btn.disabled=true; btn.textContent='Importing…';
+  const log=m=>{ logEl.textContent+=m+'\n'; logEl.scrollTop=logEl.scrollHeight; };
+  try{
+    await window.FB.importFromOld(em,pw,tp,sr,log);
+    document.getElementById('migOldPw').value='';
+    await loadAllData(); refreshDashboard(); renderUsers();
+    showToast('Import complete ✓',6000);
+  }catch(e){ log('ERROR: '+(e.code||'')+' '+e.message); showToast('Import failed: '+e.message,8000); }
+  finally{ btn.disabled=false; btn.textContent='Import users & data'; }
+}
 async function sendUserReset(email){
-  if(!confirm('Send a password-reset email to '+email+'?\n\nThis login is shared with other apps in this Firebase project, so the new password will apply there too.')) return;
+  if(!confirm('Send a password-reset email to '+email+'?'+(window.COPQ_READY?'':'\n\nThis login is shared with other apps in this Firebase project, so the new password will apply there too.'))) return;
   try{ await window.FB.resetPassword(email); showToast('Password-reset email sent to '+email,6000); }
   catch(e){ showToast('Could not send reset email: '+e.message,6000); }
 }
 async function deleteUser(id){
-  if(!confirm('Remove this user\'s COPQ access?\n\nTheir login is not deleted, so any other apps they use in this Firebase project are not affected.')) return;
+  if(!confirm('Remove this user\'s COPQ access?\n\nThey will no longer be able to sign in to COPQ. You can add the same email again later to restore access.')) return;
   await window.FB.deleteUser(id);
   usersList=usersList.filter(u=>u.id!==id);
   renderUsers(); showToast('COPQ access removed');
@@ -2597,6 +2728,22 @@ function renderSettings(){
     <div style="display:flex;flex-direction:column;gap:4px"><span style="font-weight:700;color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.07em">Plant</span><span style="font-size:14px">${currentProfile.plant||'All Plants'}</span></div>`;
   const lc=document.getElementById('logoSettingsCard');
   if(lc) lc.style.display=currentProfile.role==='super_admin'?'':'none';
+  const cpn=document.getElementById('cpNote');
+  if(cpn) cpn.textContent=window.COPQ_READY
+    ?'Your COPQ password is separate from all other company apps.'
+    :'Your login is currently shared with other apps in this Firebase project, so a new password here applies there too.';
+  const mc=document.getElementById('migrateCard');
+  if(mc){
+    mc.style.display=currentProfile.role==='super_admin'?'':'none';
+    const st=document.getElementById('migrateStatus'), mf=document.getElementById('migrateForm');
+    if(window.COPQ_READY){
+      st.innerHTML='✅ COPQ is running on its <b>own Firebase project</b>. Logins and passwords here are completely separate from other apps.<br>Run this import <b>once</b> to copy users, plants, masters, entries, sales and settings from the old shared project. It replaces COPQ data currently in this project.';
+      mf.style.display='flex';
+    } else {
+      st.innerHTML='⚠️ COPQ is still using the <b>old shared project</b>, so logins are shared with other apps. To separate them, create a new Firebase project and paste its config into <code>COPQ_CONFIG</code> in the HTML file.';
+      mf.style.display='none';
+    }
+  }
   // restore logo preview
   const s=window._companySettings;
   if(s&&s.logoBase64){
@@ -3187,6 +3334,7 @@ window.openUserModal         = openUserModal;
 window.openEditUserModal     = openEditUserModal;
 window.deleteUser            = deleteUser;
 window.sendUserReset         = sendUserReset;
+window.runImportFromOld      = runImportFromOld;
 window.openPlantModal        = openPlantModal;
 window.openEditPlantModal    = openEditPlantModal;
 window.openMasterModal       = openMasterModal;
