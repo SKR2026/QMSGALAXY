@@ -1,5 +1,5 @@
 // Polyplastics App Launcher – service worker
-const CACHE = 'polyplastics-v1';
+const CACHE = 'polyplastics-v2';
 const SHELL = ['./', './index.html', './manifest.json',
   './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png'];
 

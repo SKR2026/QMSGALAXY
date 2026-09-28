@@ -222,6 +222,30 @@ tr:last-child td{border-bottom:none;}
 }
 @media(max-width:360px){.grid{grid-template-columns:repeat(2,1fr);}}
 
+/* ── Biometric lock ── */
+#bio-lock{position:fixed;inset:0;z-index:300;background:var(--bg);display:none;align-items:center;justify-content:center;padding:24px;}
+#bio-lock.show{display:flex;}
+.bio-card{background:#fff;border:1px solid var(--border);border-radius:20px;padding:36px 28px;width:100%;max-width:380px;text-align:center;box-shadow:0 10px 40px rgba(26,31,54,.08);}
+.bio-title{font-size:20px;font-weight:700;margin-bottom:6px;}
+.bio-sub{font-size:13px;color:var(--muted);line-height:1.6;word-break:break-all;}
+.bio-fp{width:96px;height:96px;border-radius:50%;background:#e3f0fd;color:#1565c0;border:none;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;margin:26px auto 18px;transition:transform .15s,background .15s;}
+.bio-fp:active{transform:scale(.94);background:#cfe4fb;}
+.bio-fp.busy{animation:bioPulse 1.2s ease-in-out infinite;}
+@keyframes bioPulse{0%,100%{box-shadow:0 0 0 0 rgba(21,101,192,.35)}50%{box-shadow:0 0 0 14px rgba(21,101,192,0)}}
+.bio-err{font-size:13px;color:var(--danger);min-height:20px;margin-bottom:6px;}
+.bio-link{background:none;border:none;color:var(--accent);font-family:inherit;font-size:13px;font-weight:500;cursor:pointer;padding:8px;}
+#bio-sheet{position:fixed;inset:0;z-index:250;background:rgba(26,31,54,.45);display:none;align-items:flex-end;justify-content:center;}
+#bio-sheet.show{display:flex;}
+.bio-sheet-card{background:#fff;border-radius:20px 20px 0 0;padding:26px 24px 30px;width:100%;max-width:480px;text-align:center;}
+@media(min-width:601px){#bio-sheet{align-items:center;}.bio-sheet-card{border-radius:20px;}}
+.bio-sheet-card .bio-fp{width:72px;height:72px;margin:0 auto 14px;cursor:default;}
+.bio-actions{display:flex;gap:10px;margin-top:20px;}
+.bio-actions button{flex:1;padding:12px;border-radius:10px;font-family:inherit;font-size:14px;font-weight:600;cursor:pointer;}
+.bio-primary{background:#1565c0;color:#fff;border:none;}
+.bio-secondary{background:#fff;color:var(--text);border:1px solid var(--border);}
+.bio-danger{background:#fff;color:var(--danger);border:1px solid rgba(224,49,49,.35);}
+
 /* ── PWA install button ── */
 #install-btn{display:none;position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:150;
   background:#1565c0;color:#fff;border:none;border-radius:24px;padding:12px 22px;font-family:inherit;
@@ -280,7 +304,7 @@ tr:last-child td{border-bottom:none;}
       <svg width="14" height="14" fill="none" stroke="#fff" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
       <input type="search" id="search" placeholder="Search apps…" autocomplete="off"/>
     </div>
-    <div class="user-pill">
+    <div class="user-pill" onclick="openBioSettings()" title="Fingerprint / face unlock settings">
       <div class="avatar" id="user-avatar">?</div>
       <span id="user-label">Loading…</span>
     </div>
@@ -509,7 +533,15 @@ let lastAddedUser = null;
 window.onload = async () => {
   const saved = localStorage.getItem('pp_user_email');
   if (saved) {
-    await loginUser(saved);
+    if (bioIsEnabledFor(saved)) {
+      showBioLock(saved);
+    } else {
+      try { await loginUser(saved); }
+      catch(e) {
+        document.getElementById('gate-email').value = saved;
+        onEmailInput(saved);
+      }
+    }
   }
   document.getElementById('gate-email').addEventListener('keydown', e => {
     if (e.key === 'Enter') handleEmailSubmit();
@@ -554,13 +586,15 @@ async function handleEmailSubmit() {
   const btn = document.querySelector('.gate-btn');
   btn.innerHTML = '<span class="spinner"></span>';
   btn.disabled  = true;
-  try { await loginUser(raw); }
+  let ok = false;
+  try { await loginUser(raw); ok = true; }
   catch(e) { err.textContent = e.message; }
+  if (ok) maybeOfferBiometric();
   btn.innerHTML = 'Continue →';
   btn.disabled  = false;
 }
 
-async function loginUser(email) {
+async function loginUser(email, storedPwHash) {
   const normalized = email.toLowerCase().trim();
   isSuperAdmin = normalized === SUPERADMIN_EMAIL.toLowerCase();
 
@@ -568,7 +602,8 @@ async function loginUser(email) {
     if (isSuperAdmin) {
       // ── Password verification ──
       const pwInput = document.getElementById('gate-password').value;
-      const pwHash  = await hashPassword(pwInput);
+      const pwHash  = storedPwHash || await hashPassword(pwInput);
+      if (!storedPwHash && !pwInput) throw new Error('Please enter the superadmin password.');
       const saDoc   = await db.collection('launcher_users').doc(normalized).get();
 
       if (saDoc.exists && saDoc.data().passwordHash) {
@@ -602,6 +637,7 @@ async function loginUser(email) {
   }
 
   currentUser = normalized;
+  sessionPwHash = isSuperAdmin ? (storedPwHash || await hashPassword(document.getElementById('gate-password').value)) : null;
   localStorage.setItem('pp_user_email', currentUser);
 
   const initials = currentUser.substring(0,2).toUpperCase();
@@ -615,6 +651,7 @@ async function loginUser(email) {
 
 function handleLogout() {
   localStorage.removeItem('pp_user_email');
+  bioClear();
   location.reload();
 }
 
@@ -854,6 +891,8 @@ async function changePassword() {
 
   const newHash = await hashPassword(newPw);
   await db.collection('launcher_users').doc(currentUser).update({ passwordHash: newHash });
+  sessionPwHash = newHash;
+  if (bioIsEnabledFor(currentUser)) localStorage.setItem('pp_bio_pw', newHash);
 
   document.getElementById('pw-current').value = '';
   document.getElementById('pw-new').value = '';
@@ -1125,6 +1164,167 @@ function showToast(msg) {
   toastTimer = setTimeout(() => t.classList.remove('show'), 2800);
 }
 
+// ── Biometric unlock (WebAuthn platform authenticator) ─────────
+// Uses the phone's fingerprint / face unlock / screen lock via the browser's
+// built-in WebAuthn API. The fingerprint itself never leaves the phone.
+let sessionPwHash = null;
+let bioHiddenAt   = 0;
+const BIO_RELOCK_MS = 60 * 1000;   // re-lock after 1 min in background
+
+const b64u = {
+  enc: buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),
+  dec: str => Uint8Array.from(atob(str.replace(/-/g,'+').replace(/_/g,'/') + '==='.slice((str.length + 3) % 4)), c => c.charCodeAt(0))
+};
+
+async function bioSupported() {
+  try {
+    return !!(window.PublicKeyCredential && window.isSecureContext &&
+      await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
+  } catch { return false; }
+}
+function bioIsEnabledFor(email) {
+  return !!localStorage.getItem('pp_bio_cred') && localStorage.getItem('pp_bio_email') === email;
+}
+function bioClear() {
+  ['pp_bio_cred','pp_bio_email','pp_bio_pw','pp_bio_declined'].forEach(k => localStorage.removeItem(k));
+}
+
+async function bioRegister() {
+  const cred = await navigator.credentials.create({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)),
+    rp: { name: 'Polyplastics App Launcher' },
+    user: {
+      id: crypto.getRandomValues(new Uint8Array(16)),
+      name: currentUser, displayName: currentUser
+    },
+    pubKeyCredParams: [{ type:'public-key', alg:-7 }, { type:'public-key', alg:-257 }],
+    authenticatorSelection: { authenticatorAttachment:'platform', userVerification:'required', residentKey:'discouraged' },
+    attestation: 'none', timeout: 60000
+  }});
+  localStorage.setItem('pp_bio_cred',  b64u.enc(cred.rawId));
+  localStorage.setItem('pp_bio_email', currentUser);
+  if (sessionPwHash) localStorage.setItem('pp_bio_pw', sessionPwHash);
+  else localStorage.removeItem('pp_bio_pw');
+  localStorage.removeItem('pp_bio_declined');
+}
+
+async function bioVerify() {
+  const assertion = await navigator.credentials.get({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)),
+    allowCredentials: [{ type:'public-key', id: b64u.dec(localStorage.getItem('pp_bio_cred')), transports:['internal'] }],
+    userVerification: 'required', timeout: 60000
+  }});
+  // Byte 32 of authenticatorData holds flags; bit 0x04 = user was verified.
+  const flags = new Uint8Array(assertion.response.authenticatorData)[32];
+  if (!(flags & 0x04)) throw new Error('Verification was not completed.');
+}
+
+function showBioLock(email) {
+  document.getElementById('bio-lock-email').textContent = email;
+  document.getElementById('bio-lock-err').textContent = '';
+  document.getElementById('bio-lock').classList.add('show');
+  setTimeout(biometricUnlock, 350);   // prompt straight away; button is the fallback
+}
+
+let bioBusy = false;
+async function biometricUnlock() {
+  if (bioBusy) return;
+  bioBusy = true;
+  const btn = document.getElementById('bio-lock-btn');
+  const err = document.getElementById('bio-lock-err');
+  err.textContent = '';
+  btn.classList.add('busy');
+  try {
+    await bioVerify();
+    if (!currentUser) {
+      const email = localStorage.getItem('pp_user_email');
+      try { await loginUser(email, localStorage.getItem('pp_bio_pw') || undefined); }
+      catch(e) {
+        bioClear();
+        document.getElementById('bio-lock').classList.remove('show');
+        document.getElementById('gate-email').value = email;
+        onEmailInput(email);
+        document.getElementById('gate-error').textContent = 'Please sign in again. ' + (e.message || '');
+        return;
+      }
+    }
+    document.getElementById('bio-lock').classList.remove('show');
+  } catch(e) {
+    err.textContent = e.name === 'NotAllowedError'
+      ? 'Cancelled. Tap the fingerprint to try again.'
+      : 'Could not verify: ' + (e.message || e.name);
+  } finally {
+    btn.classList.remove('busy');
+    bioBusy = false;
+  }
+}
+
+// Re-lock when the app comes back after being in the background
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { bioHiddenAt = Date.now(); return; }
+  if (currentUser && bioIsEnabledFor(currentUser) && bioHiddenAt &&
+      Date.now() - bioHiddenAt > BIO_RELOCK_MS) {
+    showBioLock(currentUser);
+  }
+});
+
+// Sheet UI
+function closeBioSheet() { document.getElementById('bio-sheet').classList.remove('show'); }
+function renderBioSheet(title, text, buttons) {
+  document.getElementById('bio-sheet-title').textContent = title;
+  document.getElementById('bio-sheet-text').textContent  = text;
+  document.getElementById('bio-sheet-err').textContent   = '';
+  const wrap = document.getElementById('bio-sheet-actions');
+  wrap.innerHTML = '';
+  buttons.forEach(([label, cls, fn]) => {
+    const b = document.createElement('button');
+    b.className = cls; b.textContent = label; b.onclick = fn;
+    wrap.appendChild(b);
+  });
+  document.getElementById('bio-sheet').classList.add('show');
+}
+
+async function enableBioFromSheet() {
+  try {
+    await bioRegister();
+    closeBioSheet();
+    showToast('🔒 Fingerprint unlock turned on');
+  } catch(e) {
+    document.getElementById('bio-sheet-err').textContent =
+      e.name === 'NotAllowedError' ? 'Cancelled — you can try again.' : 'Could not turn on: ' + (e.message || e.name);
+  }
+}
+
+async function maybeOfferBiometric() {
+  if (!currentUser || bioIsEnabledFor(currentUser)) return;
+  if (localStorage.getItem('pp_bio_declined') === currentUser) return;
+  if (!(await bioSupported())) return;
+  renderBioSheet('Unlock with fingerprint?',
+    "Next time, open the launcher with your phone's fingerprint, face unlock or screen lock instead of typing your email.",
+    [['Not now', 'bio-secondary', () => { localStorage.setItem('pp_bio_declined', currentUser); closeBioSheet(); }],
+     ['Turn on', 'bio-primary', enableBioFromSheet]]);
+}
+
+async function openBioSettings() {
+  if (!currentUser) return;
+  if (!(await bioSupported())) {
+    renderBioSheet('Biometric unlock unavailable',
+      'This device or browser does not support fingerprint / face unlock, or no screen lock is set up. Open the installed app in Chrome on Android over HTTPS.',
+      [['OK', 'bio-primary', closeBioSheet]]);
+    return;
+  }
+  if (bioIsEnabledFor(currentUser)) {
+    renderBioSheet('Fingerprint unlock is on',
+      'The launcher asks for your fingerprint, face or screen lock when it opens, and again after 1 minute in the background.',
+      [['Turn off', 'bio-danger', () => { bioClear(); localStorage.setItem('pp_bio_declined', currentUser); closeBioSheet(); showToast('Fingerprint unlock turned off'); }],
+       ['Done', 'bio-primary', closeBioSheet]]);
+  } else {
+    renderBioSheet('Unlock with fingerprint?',
+      "Open the launcher with your phone's fingerprint, face unlock or screen lock.",
+      [['Cancel', 'bio-secondary', closeBioSheet], ['Turn on', 'bio-primary', enableBioFromSheet]]);
+  }
+}
+
 // ── PWA: service worker + install prompt ─────────────────────────
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
@@ -1150,6 +1350,29 @@ window.addEventListener('appinstalled', () => {
   if (typeof showToast === 'function') showToast('App installed');
 });
 </script>
+<!-- Biometric lock screen -->
+<div id="bio-lock">
+  <div class="bio-card">
+    <div class="bio-title">Welcome back</div>
+    <div class="bio-sub" id="bio-lock-email"></div>
+    <button class="bio-fp" id="bio-lock-btn" onclick="biometricUnlock()" aria-label="Unlock with fingerprint"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/><path d="M9 6.8a6 6 0 0 1 9 5.2c0 .47 0 1.17-.02 2"/></svg></button>
+    <div class="bio-sub" style="margin-bottom:10px;">Tap to unlock with fingerprint, face or screen lock</div>
+    <div class="bio-err" id="bio-lock-err"></div>
+    <button class="bio-link" onclick="handleLogout()">Use a different account</button>
+  </div>
+</div>
+
+<!-- Biometric enable / settings sheet -->
+<div id="bio-sheet" onclick="if(event.target===this)closeBioSheet()">
+  <div class="bio-sheet-card">
+    <div class="bio-fp"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/><path d="M9 6.8a6 6 0 0 1 9 5.2c0 .47 0 1.17-.02 2"/></svg></div>
+    <div class="bio-title" id="bio-sheet-title">Unlock with fingerprint?</div>
+    <div class="bio-sub" id="bio-sheet-text">Use your phone's fingerprint, face unlock or screen lock to open the launcher.</div>
+    <div class="bio-err" id="bio-sheet-err" style="margin-top:10px;"></div>
+    <div class="bio-actions" id="bio-sheet-actions"></div>
+  </div>
+</div>
+
 <button id="install-btn" type="button">
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
   Install app
