@@ -152,6 +152,21 @@ table{width:100%;border-collapse:collapse;font-size:13px;}
 th{text-align:left;padding:8px 12px;font-weight:600;font-size:12px;color:var(--muted);border-bottom:2px solid var(--border);}
 td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle;}
 tr:last-child td{border-bottom:none;}
+/* app reorder controls */
+.order-cell{white-space:nowrap;width:1%;}
+.order-wrap{display:flex;align-items:center;gap:6px;}
+.drag-handle{cursor:grab;color:#9aa1b9;font-size:18px;line-height:1;padding:4px 2px;user-select:none;touch-action:none;border-radius:4px;}
+.drag-handle:hover{color:var(--accent);background:#eef1fd;}
+.drag-handle:active{cursor:grabbing;}
+.order-num{font-size:11px;color:var(--muted);min-width:16px;text-align:right;font-variant-numeric:tabular-nums;}
+.order-btns{display:flex;flex-direction:column;gap:2px;}
+.order-btn{width:22px;height:16px;border:1px solid var(--border);background:#fff;border-radius:4px;cursor:pointer;font-size:9px;line-height:1;color:var(--muted);display:flex;align-items:center;justify-content:center;padding:0;}
+.order-btn:hover:not(:disabled){border-color:var(--accent);color:var(--accent);background:#f0f4ff;}
+.order-btn:disabled{opacity:.35;cursor:default;}
+tr.row-dragging td{background:#f0f4ff;}
+tr.row-dragging{box-shadow:0 4px 14px rgba(59,91,219,.18);}
+#apps-tbody.is-dragging{user-select:none;}
+.order-hint{font-size:12px;color:var(--muted);font-weight:400;margin-left:8px;}
 .tag{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:500;}
 
 /* app icon in table */
@@ -396,10 +411,10 @@ tr:last-child td{border-bottom:none;}
         <button class="btn btn-primary" onclick="addApp()">+ Add App</button>
       </div>
       <div class="admin-section">
-        <h3>All apps</h3>
+        <h3>All apps <span class="order-hint">Drag ⠿ or use ▲▼ to change the order shown to users</span></h3>
         <div style="overflow-x:auto">
         <table id="apps-table">
-          <thead><tr><th>Icon</th><th>Name</th><th>URL</th><th>Tag</th><th>Action</th></tr></thead>
+          <thead><tr><th>Order</th><th>Icon</th><th>Name</th><th>URL</th><th>Tag</th><th>Action</th></tr></thead>
           <tbody id="apps-tbody"></tbody>
         </table>
         </div>
@@ -927,9 +942,24 @@ async function changePassword() {
 async function loadAdminApps() {
   const snap = await db.collection('launcher_apps').orderBy('order').get();
   allApps = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  renderAdminApps();
+}
+
+function renderAdminApps() {
   const tbody = document.getElementById('apps-tbody');
-  tbody.innerHTML = allApps.map(a => `
-    <tr>
+  const last = allApps.length - 1;
+  tbody.innerHTML = allApps.map((a, i) => `
+    <tr data-id="${a.id}">
+      <td class="order-cell">
+        <div class="order-wrap">
+          <span class="drag-handle" title="Drag to reorder" onpointerdown="startRowDrag(event, this)">⠿</span>
+          <span class="order-num">${i + 1}</span>
+          <div class="order-btns">
+            <button class="order-btn" title="Move up" onclick="moveApp(${i}, -1)" ${i === 0 ? 'disabled' : ''}>▲</button>
+            <button class="order-btn" title="Move down" onclick="moveApp(${i}, 1)" ${i === last ? 'disabled' : ''}>▼</button>
+          </div>
+        </div>
+      </td>
       <td><div class="app-icon" style="background:${a.bg||'#eee'}">${a.iconImage ? `<img src="${a.iconImage}" style="width:24px;height:24px;object-fit:contain;border-radius:4px;"/>` : (a.icon||'🔗')}</div></td>
       <td><strong>${a.name}</strong></td>
       <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
@@ -940,6 +970,90 @@ async function loadAdminApps() {
         <button class="btn btn-danger btn-sm" onclick="deleteApp('${a.id}','${a.name.replace(/'/g,"\\'")}')">Delete</button>
       </td>
     </tr>`).join('');
+}
+
+// ── Reorder apps (▲▼ buttons + drag) ──────────────────────────
+function moveApp(index, dir) {
+  const target = index + dir;
+  if (target < 0 || target >= allApps.length) return;
+  [allApps[index], allApps[target]] = [allApps[target], allApps[index]];
+  renderAdminApps();
+  saveAppOrder();
+}
+
+let rowDrag = null;
+function startRowDrag(e, handle) {
+  if (e.button !== undefined && e.button !== 0) return;
+  e.preventDefault();
+  const row = handle.closest('tr');
+  const tbody = row.parentNode;
+  handle.setPointerCapture(e.pointerId);
+  row.classList.add('row-dragging');
+  tbody.classList.add('is-dragging');
+  rowDrag = { row, tbody, handle, startId: row.dataset.id,
+              startIndex: [...tbody.children].indexOf(row),
+              scroller: document.getElementById('admin-overlay') };
+  handle.onpointermove = onRowDragMove;
+  handle.onpointerup = handle.onpointercancel = endRowDrag;
+}
+
+function onRowDragMove(e) {
+  if (!rowDrag) return;
+  const { row, tbody, scroller } = rowDrag;
+  // Auto-scroll when dragging near the top/bottom edge of the screen
+  const edge = 60;
+  if (e.clientY < edge) { scroller.scrollTop -= 12; window.scrollBy(0, -12); }
+  else if (e.clientY > window.innerHeight - edge) { scroller.scrollTop += 12; window.scrollBy(0, 12); }
+  // Place the row before the first row whose midpoint is below the pointer
+  let before = null;
+  for (const r of tbody.children) {
+    if (r === row) continue;
+    const b = r.getBoundingClientRect();
+    if (e.clientY < b.top + b.height / 2) { before = r; break; }
+  }
+  if (row.nextSibling !== before) tbody.insertBefore(row, before);
+}
+
+function endRowDrag() {
+  if (!rowDrag) return;
+  const { row, tbody, handle, startIndex } = rowDrag;
+  handle.onpointermove = handle.onpointerup = handle.onpointercancel = null;
+  row.classList.remove('row-dragging');
+  tbody.classList.remove('is-dragging');
+  const newIndex = [...tbody.children].indexOf(row);
+  rowDrag = null;
+  if (newIndex === startIndex) return;
+  const ids = [...tbody.children].map(r => r.dataset.id);
+  allApps.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+  renderAdminApps();   // refresh numbers and ▲▼ states
+  saveAppOrder();
+}
+
+let orderSaveTimer = null;
+function saveAppOrder() {
+  // Debounce so clicking ▲▼ several times quickly results in one save
+  clearTimeout(orderSaveTimer);
+  orderSaveTimer = setTimeout(async () => {
+    try {
+      const batch = db.batch();
+      let changed = 0;
+      allApps.forEach((a, i) => {
+        const order = i + 1;
+        if (a.order !== order) {
+          batch.update(db.collection('launcher_apps').doc(a.id), { order });
+          a.order = order;
+          changed++;
+        }
+      });
+      if (changed) await batch.commit();
+      showToast('✅ App order saved');
+      loadAppsAndRender(document.getElementById('search')?.value || '');
+    } catch (err) {
+      console.error(err);
+      showToast('⚠️ Could not save order — reloading');
+      loadAdminApps();
+    }
+  }, 400);
 }
 
 // ── App icon image upload helpers ─────────────────────────────
