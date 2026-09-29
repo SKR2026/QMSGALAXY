@@ -1007,21 +1007,49 @@ async function seedSampleData() {
 
 async function reloadExpenses() {
   try {
-    const yearStart = `${S.filterYear}-01-01`;
+    // Same range as loadFirestoreData(): previous + selected year,
+    // so a reload never drops records that a page refresh would show.
+    const yearStart = `${parseInt(S.filterYear)-1}-01-01`;
     const yearEnd   = `${S.filterYear}-12-31`;
-    // Plant Admin: query only by plantId to avoid requiring a composite
-    // Firestore index on (plantId + date). Filter the selected year locally.
-    // Superadmin keeps the date-range query because it does not combine
-    // plantId with the date range.
+    const fullAccess = isSA() || S.isTopMgmt;
     const expSnap = await getDocs(
-      isSA()
+      fullAccess
         ? query(collection(db,'vems_expenses'), where('date','>=',yearStart), where('date','<=',yearEnd), orderBy('date','desc'))
         : query(collection(db,'vems_expenses'), where('plantId','==',myPlantId()))
     );
     S.expenses = expSnap.docs.map(d => ({ id: d.id, ...d.data() }))
-      .filter(e => isSA() || (e.date >= yearStart && e.date <= yearEnd))
+      .filter(e => fullAccess || (e.date >= yearStart && e.date <= yearEnd))
       .sort((a,b) => (b.date || '').localeCompare(a.date || ''));
-  } catch(e) { console.error('Reload expenses error:', e); }
+    return true;
+  } catch(e) { console.error('Reload expenses error:', e); return false; }
+}
+
+// If the dashboard filters (year / month / plant / vehicle / category / search)
+// would hide a just-saved expense, relax only the conflicting filters so the
+// record is visible immediately. Returns true if any filter was changed.
+function revealExpense(id) {
+  const e = S.expenses.find(x => x.id === id);
+  if (!e || filteredExpenses().some(x => x.id === id)) return false;
+  const d = e.date || '';
+  if (S.filterMode === 'FY') {
+    if (!inFY(d, S.filterYear)) {
+      const y = parseInt(d.slice(0,4)), m = parseInt(d.slice(5,7));
+      S.filterYear = String(m >= 4 ? y + 1 : y);
+      localStorage.setItem('vems_filterYear', S.filterYear);
+    }
+    if (S.filterMonth && !d.startsWith(S.filterMonth)) S.filterMonth = '';
+  } else {
+    if (S.filterYear && !d.startsWith(S.filterYear)) {
+      S.filterYear = d.slice(0,4);
+      localStorage.setItem('vems_filterYear', S.filterYear);
+    }
+    if (S.filterMonth && !d.startsWith(S.filterYear + '-' + S.filterMonth)) S.filterMonth = '';
+  }
+  if (S.filterPlant && e.plantId !== S.filterPlant) { S.filterPlant = ''; localStorage.setItem('vems_filterPlant', ''); }
+  if (S.filterVehicle && e.vehicleId !== S.filterVehicle) S.filterVehicle = '';
+  if (S.filterCat && e.category !== S.filterCat) S.filterCat = '';
+  S.expVehicleSearch = '';
+  return true;
 }
 
 // ── FIRESTORE CRUD ────────────────────────────────────────────────
@@ -3243,6 +3271,7 @@ function expensesHTML() {
         <button class="btn btn-secondary btn-sm" onclick="exportExpensesPDF()">⬇ PDF</button>
       </div>
     </div>
+    ${filterBarHTML()}
     ${withoutBill>0?`<div class="alert alert-warning" style="padding:7px 12px;font-size:12px;margin-bottom:8px">⚠️ <b>${withoutBill} expenses</b> missing invoices.</div>`:''}
     ${isSA()?`<div class="exp-selection-bar" style="padding:6px 10px;margin-bottom:8px">
       <button class="btn btn-secondary btn-xs" onclick="toggleAllExpenses(${!allChecked})">${allChecked?'☐ Clear All':'☑ Select All'}</button>
@@ -5870,27 +5899,33 @@ window.saveExpense = async function(expenseId='') {
 
     const invoiceJustUploaded = !!pendingBillFile; // capture before clearing
 
+    let savedId = expenseId;
     if(expenseId){
       await fsUpdateExpense(expenseId,data);
-      pendingBillFile=null;
-      closeModal();
-      showToast('Expense updated successfully','success');
     } else {
-      await fsAddExpense(data);
-      pendingBillFile=null;
-      closeModal();
-      showToast('Expense saved successfully','success');
+      savedId = await fsAddExpense(data);
     }
+    pendingBillFile=null;
 
-    // ── Auto-notify accounts team on every expense save ──
-    try {
-      await sendInvoiceUploadNotification(data, billUrl || '');
-    } catch(e) {
+    // Re-sync from Firestore so the list matches what a page refresh shows.
+    // Keep the locally saved copy if the reload fails or hasn't caught up yet.
+    const localCopy = S.expenses.find(x=>x.id===savedId);
+    await reloadExpenses();
+    if (localCopy && !S.expenses.some(x=>x.id===savedId)) S.expenses.unshift(localCopy);
+
+    const filtersChanged = revealExpense(savedId);
+    closeModal();
+    showToast(
+      (expenseId ? 'Expense updated successfully' : 'Expense saved successfully') +
+      (filtersChanged ? ' — filters adjusted to show it' : ''),
+      'success'
+    );
+
+    // ── Auto-notify accounts team (does not block the list refresh) ──
+    sendInvoiceUploadNotification(data, billUrl || '').catch(e => {
       console.warn('[Accounts Notification] Failed:', e.message);
       showToast('Expense saved. Accounts notification failed: ' + e.message, 'warning');
-    }
-
-    render();
+    });
   } catch(e) {
     console.error('Expense save/update error:',e);
     if(btn){btn.disabled=false;btn.textContent=expenseId?'Update Expense':'Save Expense';}
