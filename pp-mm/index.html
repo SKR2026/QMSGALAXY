@@ -1688,11 +1688,43 @@ function _openFilteredTasks(status){
 function getAdminPlantMeetingIds(){
   // Returns Set of meeting IDs for the plant this admin manages, or null if unassigned.
   if(currentRole !== 'admin') return null;
-  const uid = loggedInAs && loggedInAs.id != null ? Number(loggedInAs.id) : null;
-  if(uid == null) return null;
-  const plant = PLANTS.find(p => Number(p.adminId) === uid);
+  const plant = getAdminPlant();
   if(!plant) return new Set(); // admin not assigned to any plant
   return new Set(MEETINGS.filter(m => m.plantId === plant.id).map(m => m.id));
+}
+
+/* ── Plant-scoped task permissions ──────────────────────────────
+   super-admin / developer → may edit / delete ANY task (incl. tasks
+                             from minutes uploaded by super-admin)
+   admin                   → only tasks belonging to THEIR plant:
+                             meeting in their plant, OR task tagged
+                             with their plant, OR assignee in their plant
+   everyone else           → no manage rights
+──────────────────────────────────────────────────────────────── */
+function taskInAdminPlant(t){
+  if(!t) return false;
+  const plant = getAdminPlant();
+  if(!plant) return false;
+  const m = MEETINGS.find(x => x.id === t.mid);
+  if(m && m.plantId === plant.id) return true;
+  if(t.plantId && t.plantId === plant.id) return true;
+  const u = (t.uid != null) ? USERS.find(x => Number(x.id) === Number(t.uid)) : null;
+  return !!(u && u.plantId && u.plantId === plant.id);
+}
+function canManageTask(t){
+  if(typeof t === 'string') t = TASKS.find(x => x.id === t);
+  if(!t) return false;
+  if(currentRole === 'super-admin' || currentRole === 'developer') return true;
+  if(currentRole === 'admin') return taskInAdminPlant(t);
+  return false;
+}
+function momCanDel(meetingId){
+  if(currentRole === 'super-admin' || currentRole === 'developer') return true;
+  if(currentRole !== 'admin') return false;
+  const m = MEETINGS.find(x => x.id === meetingId);
+  const plant = getAdminPlant();
+  if(m && plant && m.plantId === plant.id) return true;
+  return TASKS.some(t => t.mid === meetingId && taskInAdminPlant(t));
 }
 
 function getAdminPlant(){
@@ -1715,9 +1747,8 @@ function getVisibleTasks(allTasks){
   }
   if(role === 'admin'){
     // Plant admin sees only tasks from meetings in their assigned plant
-    const plantMtgIds = getAdminPlantMeetingIds();
-    if(!plantMtgIds) return [];
-    return allTasks.filter(t => plantMtgIds.has(t.mid));
+    if(!getAdminPlant()) return [];
+    return allTasks.filter(t => taskInAdminPlant(t));
   }
   if(role === 'manager'){
     // Manager sees tasks belonging to users in the same department
@@ -3250,9 +3281,16 @@ function filterMeetings(q){
   const f=pool.filter(m=>m.title.toLowerCase().includes(q.toLowerCase())||m.no.toLowerCase().includes(q.toLowerCase()));
   document.getElementById('mtbl').innerHTML=meetingRows(f);
 }
+function canManageMeetingRecord(m){
+  if(!m) return false;
+  if(currentRole==='super-admin'||currentRole==='developer') return true;
+  if(currentRole==='admin'){ const pl=getAdminPlant(); return !!(pl && m.plantId===pl.id); }
+  return false;
+}
 function deleteMeeting(id){
   const m=MEETINGS.find(x=>x.id===id);
   if(!m)return;
+  if(!canManageMeetingRecord(m)){showToast('You can only delete meetings in your own plant.','err');return;}
   // Collect tasks BEFORE removing them from local array
   const linkedTasks=TASKS.filter(t=>t.mid===id);
   const taskCount=linkedTasks.length;
@@ -3277,6 +3315,7 @@ function deleteMeeting(id){
 function renderEditMeetingModal(meetingId){
   const m=MEETINGS.find(x=>x.id===meetingId);
   if(!m)return;
+  if(!canManageMeetingRecord(m)){showToast('You can only edit meetings in your own plant.','err');return;}
   // Use same extAttendees global so add/remove helpers work
   extAttendees=(m.externalAttendees||[]).map(ea=>({...ea}));
   document.getElementById('modal-title').textContent=`Edit Meeting — ${m.no}`;
@@ -3649,14 +3688,7 @@ function updateSelBar(){
    others                  → no
 ────────────────────────────────────────────────────────────────── */
 function canDeleteTask(taskId){
-  if(currentRole==='super-admin'||currentRole==='developer') return true;
-  if(currentRole==='admin'){
-    const plantMtgIds=getAdminPlantMeetingIds();
-    if(!plantMtgIds) return false;
-    const t=TASKS.find(x=>x.id===taskId);
-    return t ? plantMtgIds.has(t.mid) : false;
-  }
-  return false;
+  return canManageTask(taskId);
 }
 
 function deleteTaskInline(taskId){
@@ -4152,6 +4184,13 @@ function processBulkUpload(){
         priority:row.priority||'medium',
         status:'pending',
         esc:0,
+        plantId:(function(){
+          const _pn=(row.plant_name||'').trim().toLowerCase();
+          const _rp=_pn?PLANTS.find(p=>p.name.trim().toLowerCase()===_pn):null;
+          if(_rp) return _rp.id;
+          const _mm=MEETINGS.find(m=>m.id===resolvedMid);
+          return (_mm&&_mm.plantId)||(assignee&&assignee.plantId)||'';
+        })(),
         mid:resolvedMid,   // ← now correctly MOM-001 not MTG-2024-01
         mno:mno||null,
         tags:[],
@@ -7721,6 +7760,10 @@ function renderTaskModal(taskId){
   const t=TASKS.find(x=>x.id===taskId);
   if(!t)return;
   const cmts=(COMMENTS[taskId]||[]);
+  const _myUid=(loggedInAs&&loggedInAs.id!=null)?Number(loggedInAs.id):null;
+  if(currentRole==='admin' && !canManageTask(t) && !(_myUid!=null && Number(t.uid)===_myUid)){
+    showToast('You can only update tasks in your own plant.','err'); closeModal(); return;
+  }
   const isSA=currentRole==='super-admin'||currentRole==='admin'||currentRole==='developer';
   // assignee & top-mgmt: read-only view + status update only
   const ro=!isSA;
@@ -7861,6 +7904,7 @@ function _logAndNotify(t, oldStatus, newStatus, cmt, userName){
 function saveTaskStatus(id){
   const t=TASKS.find(x=>x.id===id);
   if(!t)return;
+  if(currentRole==='admin' && !canManageTask(t) && !(loggedInAs&&loggedInAs.id!=null&&Number(t.uid)===Number(loggedInAs.id))){showToast('You can only update tasks in your own plant.','err');return;}
   const newStatus = document.getElementById('tm-status')?.value || t.status;
   const newPct    = parseInt(document.getElementById('tm-pct') ? (document.getElementById('tm-pct').value || t.pct) : t.pct);
   const cmt       = (document.getElementById('new-cmt')?.value||'').trim();
@@ -7886,6 +7930,7 @@ function saveTaskStatus(id){
 
 function saveTask(id){
   const t=TASKS.find(x=>x.id===id);
+  if(t && !canManageTask(t) && !(currentRole==='admin' && loggedInAs&&loggedInAs.id!=null&&Number(t.uid)===Number(loggedInAs.id))){showToast('You can only edit tasks in your own plant.','err');return;}
   const userName = document.getElementById('un')?.textContent || 'Admin';
   if(t){
     const oldStatus = t.status;
@@ -8114,6 +8159,7 @@ function _momBuildAttendeeHtml(m){
 
 function _momBuildTasksHtml(tasks, meetingId, canDel, isPrev, sfxOverride){
   _momSelectedTasks=new Set();
+  canDel = tasks.some(canManageTask); // per-task plant scope decides who gets checkboxes / bulk delete
   if(!tasks.length) return `<div style="color:var(--t3);font-size:13px;text-align:center;padding:20px 0;">${isPrev?'No open points from previous meeting.':'No action items yet.'}</div>`;
   const sfx = (sfxOverride !== undefined) ? sfxOverride : (isPrev?'-p':'');
   const tabType = (sfxOverride !== undefined) ? sfxOverride.replace(/^-/,'') : (isPrev?'p':'c');
@@ -8123,9 +8169,10 @@ function _momBuildTasksHtml(tasks, meetingId, canDel, isPrev, sfxOverride){
     const u=gu(t.uid);
     const actualDate=t.actualDate?displayDate(t.actualDate):(t.status==='completed'&&t.completedAt?displayDate(t.completedAt.slice(0,10)):'\u2014');
     const actualColor=t.actualDate&&t.due?(new Date(t.actualDate)>new Date(t.due)?'color:var(--er);font-weight:600;':'color:var(--ok);font-weight:600;'):'color:var(--t3);';
-    const cb=canDel?`<td style="width:30px;"><input type="checkbox" id="mom-cb-${t.id}-${sfx}" class="task-cb mom-task-cb-${sfx}" data-tid="${t.id}" onchange="momTaskCbChange('${meetingId}','${tabType}','${sfx}')"></td>`:'<td></td>';
-    const editBtn=isSAorAdmin?`<button class="btn bs" onclick="closeModal();setTimeout(()=>{openModal('task','${t.id}')},80)" title="Edit task" style="padding:2px 7px;font-size:11px;">&#9998;</button>`:'';
-    const delBtn=canDel?`<button class="btn bs ber" onclick="deleteTaskFromMeetingDetailModal('${t.id}','${meetingId}')" title="Delete task" style="padding:2px 7px;font-size:11px;">&#10005;</button>`:'';
+    const can=canManageTask(t);
+    const cb=can?`<td style="width:30px;"><input type="checkbox" id="mom-cb-${t.id}-${sfx}" class="task-cb mom-task-cb-${sfx}" data-tid="${t.id}" onchange="momTaskCbChange('${meetingId}','${tabType}','${sfx}')"></td>`:'<td></td>';
+    const editBtn=can?`<button class="btn bs" onclick="closeModal();setTimeout(()=>{openModal('task','${t.id}')},80)" title="Edit task" style="padding:2px 7px;font-size:11px;">&#9998;</button>`:'';
+    const delBtn=can?`<button class="btn bs ber" onclick="deleteTaskFromMeetingDetailModal('${t.id}','${meetingId}')" title="Delete task" style="padding:2px 7px;font-size:11px;">&#10005;</button>`:'';
     const actionCell=`<td style="white-space:nowrap;display:flex;gap:3px;">${editBtn}${delBtn}</td>`;
     return`<tr>${cb}<td style="font-size:11px;color:var(--t3);padding-right:6px;">${i+1}</td><td style="max-width:220px;white-space:normal;line-height:1.4;">${t.title}</td><td>${ma(u)}</td><td style="font-size:11px;white-space:nowrap;color:${t.status==='overdue'?'var(--er)':'var(--t2)'};">${displayDate(t.due)}</td><td style="font-size:11px;white-space:nowrap;${actualColor}">${actualDate}</td><td>${sb(t.status)}</td><td>${eb(t.esc)}</td>${actionCell}</tr>`;
   }).join('');
@@ -8157,9 +8204,11 @@ function momDeleteSelected(meetingId, tabType, sfx){
   const effectiveSfx = sfx !== undefined ? sfx : (tabType==='p'?'-p':'');
   // Collect checked tasks from this section only
   const sectionCbs = document.querySelectorAll('.mom-task-cb-'+effectiveSfx+':checked');
-  const toDelete = new Set([...sectionCbs].map(cb=>cb.dataset.tid));
-  if(!toDelete.size){showToast('No tasks selected','warn');return;}
-  if(!confirm(`Delete ${toDelete.size} selected task(s)? This cannot be undone.`))return;
+  const _picked = [...sectionCbs].map(cb=>cb.dataset.tid);
+  const toDelete = new Set(_picked.filter(id=>canDeleteTask(id)));
+  if(!_picked.length){showToast('No tasks selected','warn');return;}
+  if(!toDelete.size){showToast('None of the selected tasks are in your plant.','err');return;}
+  if(!confirm(`Delete ${toDelete.size} selected task(s)? This cannot be undone.`+(_picked.length>toDelete.size?`\n\n⚠ ${_picked.length-toDelete.size} task(s) outside your plant will be skipped.`:'')))return;
   const user=document.getElementById('un')?.textContent||'Admin';
   const cnt=toDelete.size;
   toDelete.forEach(tid=>{
@@ -8205,7 +8254,7 @@ function renderMeetingDetailModal(meetingId){_momId=meetingId;
   const prevOpenTasks=prevM?TASKS.filter(t=>t.mid===prevM.id&&t.status!=='completed'):[];
   // Also show imported tasks that came from previous meeting, as they are still open carry-overs
   const carryOverTasks=importedTasks.filter(t=>t.status!=='completed');
-  const canDel=(currentRole==='super-admin'||currentRole==='developer')||(currentRole==='admin'&&(()=>{const pmids=getAdminPlantMeetingIds();return pmids&&pmids.has(meetingId);})());
+  const canDel=momCanDel(meetingId);
   document.getElementById('modal-title').textContent=`MoM — ${m.no}`;
   document.getElementById('modal-body').innerHTML=`
   ${_momBuildAttendeeHtml(m)}
@@ -8264,7 +8313,7 @@ function momFilterByEmployee(meetingId){
   const m=MEETINGS.find(x=>x.id===meetingId);
   if(!m)return;
   const mt=TASKS.filter(t=>t.mid===meetingId&&!t.importedFrom); // only native tasks
-  const canDel=(currentRole==='super-admin'||currentRole==='developer')||(currentRole==='admin'&&(()=>{const pmids=getAdminPlantMeetingIds();return pmids&&pmids.has(meetingId);})());
+  const canDel=momCanDel(meetingId);
   const filtered=uid==='all'?mt:mt.filter(t=>String(t.uid)===String(uid));
   const body=document.getElementById('mom-task-body');
   const label=document.getElementById('mom-task-label');
