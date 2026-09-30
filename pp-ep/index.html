@@ -1725,6 +1725,81 @@ function toast(msg, type, ms) {
 
 // Firebase helpers — functions are hoisted, safe to call anytime
 function DB()   { return firebase.firestore(); }
+
+// ── SPEED: local cache + short-lived read cache ─────────────────
+// 1. Keeps a copy of downloaded data on this device (IndexedDB), so
+//    repeat visits and reconnects load faster.
+// 2. On admin screens, identical reads made within READ_CACHE_MS reuse
+//    the same result instead of downloading the whole collection again
+//    (e.g. switching plant tabs / exam filter on the Dashboard, moving
+//    between pages). Any write (add/set/update/delete/batch) clears the
+//    cache immediately, so your own changes always show up at once.
+//    Candidate exam and result-portal links are never cached.
+var EP_READ_CACHE_MS = 60000;
+var _epReadCache = { docs: {}, queries: [] };
+function epClearReadCache() { _epReadCache.docs = {}; _epReadCache.queries = []; }
+function epSpeedUpFirestore() {
+  var fs;
+  try { fs = firebase.firestore(); } catch (e) { return; }
+  try {
+    fs.enablePersistence({ synchronizeTabs: true }).catch(function (err) {
+      console.warn('Offline cache not enabled:', err && err.code);
+    });
+  } catch (e) { console.warn('Offline cache not enabled:', e); }
+
+  var params = new URLSearchParams(window.location.search);
+  if (params.get('exam') || params.get('results')) return; // candidates: always live data
+
+  var ns = firebase.firestore;
+  var QP = ns.Query && ns.Query.prototype;
+  var DP = ns.DocumentReference && ns.DocumentReference.prototype;
+  if (!QP || !DP || QP._epPatched) return;
+  QP._epPatched = true;
+
+  function fresh(entry) { return entry && (Date.now() - entry.t) < EP_READ_CACHE_MS; }
+  function track(promise) { return promise.catch(function (e) { epClearReadCache(); throw e; }); }
+
+  var qGet = QP.get;
+  QP.get = function (opts) {
+    if (opts) return qGet.call(this, opts);
+    var list = _epReadCache.queries, self = this;
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      if (fresh(e)) { try { if (e.q.isEqual(self)) return e.p; } catch (x) {} }
+    }
+    _epReadCache.queries = list.filter(fresh);
+    var p = track(qGet.call(this));
+    _epReadCache.queries.push({ q: this, p: p, t: Date.now() });
+    return p;
+  };
+
+  var dGet = DP.get;
+  DP.get = function (opts) {
+    if (opts) return dGet.call(this, opts);
+    var key = this.path, e = _epReadCache.docs[key];
+    if (fresh(e)) return e.p;
+    var p = track(dGet.call(this));
+    _epReadCache.docs[key] = { p: p, t: Date.now() };
+    return p;
+  };
+
+  function wrapWrite(proto, name) {
+    if (!proto || typeof proto[name] !== 'function') return;
+    var orig = proto[name];
+    proto[name] = function () {
+      epClearReadCache();
+      var r = orig.apply(this, arguments);
+      if (r && typeof r.then === 'function') {
+        r.then(epClearReadCache, epClearReadCache);
+      }
+      return r;
+    };
+  }
+  wrapWrite(DP, 'set'); wrapWrite(DP, 'update'); wrapWrite(DP, 'delete');
+  wrapWrite(ns.CollectionReference && ns.CollectionReference.prototype, 'add');
+  wrapWrite(ns.WriteBatch && ns.WriteBatch.prototype, 'commit');
+  wrapWrite(ns.Firestore && ns.Firestore.prototype, 'runTransaction');
+}
 function AUTH() { return firebase.auth(); }
 
 var LIC_STORE_KEY = 'exampro_license_v2'; // v2 = requires validated flag
@@ -1783,6 +1858,7 @@ function licCacheStatus() {
   }
   try {
     firebase.initializeApp(FCFG);
+    epSpeedUpFirestore();
     document.title = CFG.title + ' — ' + CFG.company;
     // Apply branding
     ['vLogIco','vSIco','vEntIco'].forEach(function(id){ setTx(id, CFG.logo); });
@@ -2185,6 +2261,7 @@ function resolveAdminUser(user) {
 }
 function doLogout() {
   if (S.tmr) clearInterval(S.tmr);
+  epClearReadCache();
   AUTH().signOut().then(function(){ hideAll(); show('vAdmLog'); setTimeout(epBioInitLoginBtn, 200); });
 }
 function showE(id, m) { var e=G(id); if(e){ e.textContent=m; show(id); } }
@@ -3329,7 +3406,7 @@ function _fetchQwiseData(examId, cb) {
 
     // Fetch question docs in chunks of 10
     var chunks=[], allQDocs={};
-    for(var i=0;i<qOrder.length;i+=10) chunks.push(qOrder.slice(i,i+10));
+    for(var i=0;i<qOrder.length;i+=30) chunks.push(qOrder.slice(i,i+30));
     Promise.all(chunks.map(function(chunk){
       return DB().collection('questions')
         .where(firebase.firestore.FieldPath.documentId(),'in',chunk).get()
@@ -4898,7 +4975,7 @@ function showAttemptDetail(attId) {
   // Fetch all question docs in chunks of 10
   var qIds = aq.map(function(item){ return item.questionId; }).filter(Boolean);
   var chunks = [], allQDocs = {};
-  for(var c=0;c<qIds.length;c+=10) chunks.push(qIds.slice(c,c+10));
+  for(var c=0;c<qIds.length;c+=30) chunks.push(qIds.slice(c,c+30));
 
   Promise.all(chunks.map(function(chunk){
     return DB().collection('questions')
@@ -6929,7 +7006,7 @@ function loadExamQs(att, exam) {
 
   var qIds=att.assignedQuestions.map(function(aq){return aq.questionId;});
   var chunks=[], all=[];
-  for(var i=0;i<qIds.length;i+=10) chunks.push(qIds.slice(i,i+10));
+  for(var i=0;i<qIds.length;i+=30) chunks.push(qIds.slice(i,i+30));
 
   var promises=chunks.map(function(chunk){
     return DB().collection('questions').where(firebase.firestore.FieldPath.documentId(),'in',chunk).get()
