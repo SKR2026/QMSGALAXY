@@ -1769,6 +1769,7 @@ body.sb-animating canvas{pointer-events:none}
               <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
               Fix Role
             </button>
+            <button class="btn btn-sm" id="importOldUsersBtn" onclick="importOldUsers()" style="display:none" title="Copy KPI users from the old shared /users collection into /kpiUsers">Import old users</button>
             <button class="btn btn-sm btn-primary" onclick="openUserModal()">+ Add user</button>
           </div>
         </div>
@@ -6014,6 +6015,8 @@ function applyRoleRestrictions(profile){
   // Fix Role button — Super Admin only
   const fixRoleBtn = document.getElementById('fixRoleBtn');
   if(fixRoleBtn) fixRoleBtn.style.display = isSuperAdmin ? '' : 'none';
+  const importBtn = document.getElementById('importOldUsersBtn');
+  if(importBtn) importBtn.style.display = (isSuperAdmin && !window._isGuest) ? '' : 'none';
 
   // ── Role badge in sidebar ─────────────────────────────────────────
   const roleBadgeEl = document.getElementById('sidebarRoleBadge');
@@ -8547,6 +8550,33 @@ let usersList = [
   {name:'Meera Verma',  email:'meera@polyplasticsindia.com',  role:'Dept User',   plant:'Daslana',  department:'Quality', active:false}
 ];
 
+// ══ IMPORT OLD USERS (/users → /kpiUsers) ═══════════════════════
+async function importOldUsers(){
+  const btn = document.getElementById('importOldUsersBtn');
+  if(!window.FB || !window.FB.migrateLegacyKpiUsers){ showToast('Firebase not available'); return; }
+  if(btn){ btn.disabled = true; btn.textContent = 'Importing…'; }
+  try {
+    const r = await window.FB.migrateLegacyKpiUsers();
+    const all = await window.FB.getAllUsers();
+    usersList = all.map(u => ({
+      id: u.id, name: u.name || u.email || 'Unnamed', email: u.email || '',
+      role: u.role || 'Dept User', plant: u.plant || 'All',
+      department: u.department || 'All', active: u.active !== false
+    }));
+    renderUsersPage();
+    let msg = `Imported ${r.copied} user(s). ${r.alreadyThere} already in KPI, ${r.notKpi} non-KPI account(s) skipped.`;
+    if (r.failed.length) msg += ` ${r.failed.length} failed: ${r.failed[0].error}`;
+    showToast(msg, 9000);
+    if (r.notKpiList.length) console.info('[KPI] Skipped (no KPI role in /users):', r.notKpiList);
+    if (r.failed.length) console.warn('[KPI] Import failures:', r.failed);
+  } catch(e){
+    console.error('Import old users failed:', e);
+    showToast('Import failed: ' + (e.code || e.message), 8000);
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = 'Import old users'; }
+  }
+}
+
 // ══ FIX ROLE MODAL ══════════════════════════════════════════════
 let _fixRoleTarget = null; // { uid, email, name, currentRole }
 
@@ -9840,10 +9870,14 @@ const KPI_ROLES = ['Super Admin', 'Top Management', 'Plant Admin', 'Dept User'];
 
 // Returns the canonical KPI role string ('Plant Admin', …) or null if the
 // value is not a KPI role (e.g. ExamPro's 'admin' / 'student').
+const KPI_ROLE_ALIASES = {
+  'department user': 'Dept User', 'dept. user': 'Dept User',
+  'superadmin': 'Super Admin', 'top mgmt': 'Top Management', 'plantadmin': 'Plant Admin'
+};
 function canonicalKpiRole(r) {
   if (!r) return null;
   const v = String(r).trim().toLowerCase();
-  return KPI_ROLES.find(k => k.toLowerCase() === v) || null;
+  return KPI_ROLES.find(k => k.toLowerCase() === v) || KPI_ROLE_ALIASES[v] || null;
 }
 
 // KPI role held in a legacy /users doc, or null if it isn't a KPI user.
@@ -9901,18 +9935,25 @@ export async function migrateLegacyKpiUsers() {
     getDocs(collection(db, KPI_USERS_COL))
   ]);
   const have = new Set(kpiSnap.docs.map(d => d.id));
-  let copied = 0;
+  const report = { copied: 0, alreadyThere: 0, notKpi: 0, notKpiList: [], failed: [] };
   for (const d of legacySnap.docs) {
-    if (have.has(d.id)) continue;
-    const role = legacyKpiRoleOf(d.data());
-    if (!role) continue;                       // ExamPro-only account — skip
+    if (have.has(d.id)) { report.alreadyThere++; continue; }
+    const data = d.data();
+    const role = legacyKpiRoleOf(data);
+    if (!role) {                               // ExamPro-only account — skip
+      report.notKpi++;
+      report.notKpiList.push({ uid: d.id, email: data.email || '', role: data.role || '', kpiRole: data.kpiRole || '' });
+      continue;
+    }
     try {
-      await setDoc(doc(db, KPI_USERS_COL, d.id), kpiDocFromLegacy(d.data(), role));
-      copied++;
-    } catch (e) { console.warn('[KPI] migrate user failed', d.id, e.code || e.message); }
+      await setDoc(doc(db, KPI_USERS_COL, d.id), kpiDocFromLegacy(data, role));
+      report.copied++;
+    } catch (e) {
+      report.failed.push({ uid: d.id, email: data.email || '', error: e.code || e.message });
+    }
   }
-  if (copied) console.info(`[KPI] Migrated ${copied} user(s) from /users to /kpiUsers`);
-  return copied;
+  console.info('[KPI] Legacy user migration:', report);
+  return report;
 }
 
 let _legacyMigrationDone = false;
@@ -10978,7 +11019,9 @@ async function loadFirebaseData() {
   if (fsUsers.status === 'fulfilled') {
     try {
       const users = fsUsers.value;
-      if (users.length > 0) {
+      // Always replace the built-in placeholder list with what's in /kpiUsers,
+      // even when it's empty, so demo users are never shown as real ones.
+      {
         usersList = users.map(u => ({
           id: u.id,
           name: u.name || u.email || 'Unnamed',
@@ -10991,7 +11034,12 @@ async function loadFirebaseData() {
         renderUsersPage();
       }
     } catch(err) { console.warn('Users process error:', err); }
-  } else { console.warn('Could not load users list:', fsUsers.reason); }
+  } else {
+    console.warn('Could not load users list:', fsUsers.reason);
+    usersList = [];
+    renderUsersPage();
+    showToast('Could not load users: ' + ((fsUsers.reason && (fsUsers.reason.code || fsUsers.reason.message)) || 'unknown error'), 6000);
+  }
 
   // ── Final render pass — everything is in memory now ─────────────
   refreshAll();
