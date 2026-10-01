@@ -1726,6 +1726,13 @@ function toast(msg, type, ms) {
 
 // Firebase helpers — functions are hoisted, safe to call anytime
 function DB()   { return firebase.firestore(); }
+/* ExamPro keeps its admin profiles in its OWN collection so it never reads,
+   writes or deletes documents that belong to other apps (KPI Dashboard etc.)
+   in the shared /users collection. */
+var EP_USERS_COL  = 'exampro_users';   // ExamPro-only admin profiles
+var EP_LEGACY_COL = 'users';           // shared collection — READ-ONLY, used once for migration
+function EPU()  { return DB().collection(EP_USERS_COL); }
+function EP_BOOTSTRAP_REF() { return DB().collection('exampro_meta').doc('bootstrap'); }
 
 // ── SPEED: local cache + short-lived read cache ─────────────────
 // 1. Keeps a copy of downloaded data on this device (IndexedDB), so
@@ -2151,109 +2158,106 @@ function normalizeRole(raw) {
   return null; // not a recognized admin-ish role
 }
 
-/** Load the Firestore user doc and show the admin shell (or error).
+/** Load the ExamPro admin profile and show the admin shell (or error).
  *
- *  MULTI-APP ISOLATION (complete as of this version):
- *  ExamPro and KPI Dashboard share the same Firebase project and /users/{uid}
- *  collection, but are fully isolated at every layer:
+ *  COLLECTION ISOLATION
+ *  ExamPro admin profiles live in  /exampro_users/{uid}  — a collection that
+ *  only ExamPro uses. The shared  /users  collection (KPI Dashboard and other
+ *  apps) is never written, updated or deleted by ExamPro.
  *
- *  1. FIELD ISOLATION
- *     ExamPro reads/writes  examRole  exclusively.
- *     KPI Dashboard reads/writes  kpiRole  (and legacy  role ) exclusively.
- *     Neither app ever writes the other app's field.
- *
- *  2. FIRESTORE RULE ISOLATION
- *     isExamAdmin() in firestore.rules now checks  examRole  (not  role ),
- *     so changing a user's KPI role never affects their ExamPro permissions
- *     and vice-versa.  A legacy fallback in the rule covers old docs that only
- *     have the shared  role  field.
- *
- *  3. WRITE ISOLATION
- *     createPlantAdmin()  →  writes examRole only (merge:true preserves kpiRole)
- *     saveEditAdminUser() →  writes examRole only (never touches role/kpiRole)
- *     First super-admin   →  writes examRole only (role field omitted)
- *
- *  Read priority:  examRole  (ExamPro-specific)  →  role  (legacy / fallback)
+ *  One-time migration: if an admin has no /exampro_users doc yet but their
+ *  shared /users doc carries an ExamPro  examRole , those ExamPro fields are
+ *  COPIED into /exampro_users. The /users doc is left exactly as it was.
  */
+function _epApplyProfile(user, d) {
+  var canonicalRole = normalizeRole(d.examRole);
+  if (!canonicalRole) return false;
+  var ep  = d.examPlant || '';
+  var eps = Array.isArray(d.examPlants) ? d.examPlants : [];
+  CURRENT_USER.role  = canonicalRole;
+  CURRENT_USER.plant = ep;
+  if (eps.length > 1 || (eps.length === 1 && !ep)) { CURRENT_USER.plants = eps; CURRENT_USER.plant = ''; }
+  else { CURRENT_USER.plants = ep ? [ep] : eps; }
+  CURRENT_USER.displayName = d.displayName || d.name || (d.email||'').split('@')[0];
+  CURRENT_USER.email       = d.email || user.email || '';
+  CURRENT_USER.uid         = user.uid;
+  d.role = canonicalRole;
+  showAdmin(d);
+  return true;
+}
+
+function _epNoAccess(msg) {
+  showE('aErr', msg || 'Your account does not have ExamPro access. Contact your Super Admin to assign you an ExamPro role.');
+  hideAll(); show('vAdmLog'); setTimeout(epBioInitLoginBtn, 200);
+}
+
 function resolveAdminUser(user) {
   if (!user) { hideAll(); show('vAdmLog'); setTimeout(epBioInitLoginBtn, 200); return; }
-  DB().collection('users').doc(user.uid).get()
+  EPU().doc(user.uid).get()
     .then(function(doc) {
       if (doc.exists) {
         var d = doc.data();
-        // Prefer examRole (ExamPro-specific field). Fall back to the shared
-        // role field only for users created before the multi-app isolation fix.
-        var rawRole = d.examRole || d.role;
-        var canonicalRole = normalizeRole(rawRole);
-        if (canonicalRole) {
-          // Silently migrate: write examRole if it's missing or not canonical,
-          // so future logins use the app-specific field. Failure is non-fatal.
-          if (d.examRole !== canonicalRole) {
-            DB().collection('users').doc(user.uid).update({ examRole: canonicalRole })
-              .catch(function(e){ console.warn('examRole migration failed:', e.message); });
-          }
-          CURRENT_USER.role        = canonicalRole;
-          // Read ExamPro-specific plant fields (examPlant / examPlants).
-          // Fall back to shared plant/plants only for legacy docs created before
-          // this isolation fix, so existing admins are not locked out.
-          var ep  = d.examPlant  !== undefined ? (d.examPlant  || '') : (d.plant  || '');
-          var eps = d.examPlants !== undefined ? d.examPlants         : (Array.isArray(d.plants) ? d.plants : null);
-          CURRENT_USER.plant  = ep;
-          if (Array.isArray(eps) && eps.length) {
-            CURRENT_USER.plants = eps;
-            CURRENT_USER.plant  = '';
-          } else {
-            CURRENT_USER.plants = ep ? [ep] : [];
-          }
-          CURRENT_USER.displayName = d.displayName || d.name || (d.email||'').split('@')[0];
-          CURRENT_USER.email       = d.email || user.email || '';
-          CURRENT_USER.uid         = user.uid;
-          d.role = canonicalRole;
-          showAdmin(d);
-        } else {
-          // Doc exists but has no ExamPro role (e.g. a KPI-only user).
-          showE('aErr', 'Your account does not have ExamPro access. Contact your Super Admin to assign you an ExamPro role.');
-          hideAll(); show('vAdmLog'); setTimeout(epBioInitLoginBtn, 200);
+        // Make sure the bootstrap marker exists once a super admin is active,
+        // so nobody else can ever self-promote to first Super Admin.
+        if (normalizeRole(d.examRole) === 'super_admin') {
+          EP_BOOTSTRAP_REF().get().then(function(b){
+            if (!b.exists) EP_BOOTSTRAP_REF().set({ uid: user.uid, createdAt: firebase.firestore.FieldValue.serverTimestamp() })
+              .catch(function(e){ console.warn('bootstrap marker:', e.message); });
+          }).catch(function(){});
         }
-      } else {
-        // No user doc at all — this is a brand-new Firebase Auth account.
-        // We no longer auto-create here because:
-        //   1. In a multi-app project the first admin must be created
-        //      deliberately (not silently on first login).
-        //   2. Firestore token propagation race conditions caused intermittent
-        //      "Missing or insufficient permissions" errors on auto-create.
-        //
-        // Instead: try once to create the first Super Admin doc. If this is
-        // genuinely the very first login (empty /users collection), this will
-        // succeed via the "own uid" create rule. If permissions deny it (i.e.
-        // a KPI-only account trying ExamPro), we show a clear message.
-        var newDoc = {
-          examRole:    'super_admin',
-          // NOTE: The shared `role` field is intentionally NOT written here.
-          // ExamPro uses the app-specific `examRole` field exclusively so that
-          // KPI Dashboard's role assignments are never overwritten by ExamPro.
-          // The Firestore isExamAdmin() rule has been updated to check examRole.
-          displayName: user.displayName || (user.email||'').split('@')[0],
-          email:       user.email || '',
-          createdAt:   firebase.firestore.FieldValue.serverTimestamp()
-        };
-        DB().collection('users').doc(user.uid).set(newDoc)
-          .then(function() {
-            CURRENT_USER.role        = 'super_admin';
-            CURRENT_USER.plant       = '';
-            CURRENT_USER.plants      = [];
-            CURRENT_USER.displayName = newDoc.displayName;
-            CURRENT_USER.email       = newDoc.email;
-            CURRENT_USER.uid         = user.uid;
-            showAdmin(newDoc);
-          })
-          .catch(function(err2) {
-            // Permission denied almost always means this Firebase Auth account
-            // was not created by ExamPro and has no /users doc here.
-            showE('aErr', 'No ExamPro profile found for this account. Ask your Super Admin to create one, or use your ExamPro credentials.');
-            hideAll(); show('vAdmLog'); setTimeout(epBioInitLoginBtn, 200);
-          });
+        if (!_epApplyProfile(user, d)) _epNoAccess();
+        return;
       }
+      // No ExamPro profile yet → try one-time migration from the shared collection (read-only).
+      return DB().collection(EP_LEGACY_COL).doc(user.uid).get()
+        .catch(function(){ return null; })
+        .then(function(legacy) {
+          var L = (legacy && legacy.exists) ? legacy.data() : null;
+          if (L && normalizeRole(L.examRole)) {
+            // Copy ONLY ExamPro fields. Values mirror the Firestore rule check exactly.
+            var migrated = {
+              examRole:    L.examRole,
+              examPlant:   ('examPlant'  in L) ? L.examPlant  : (('plant'  in L) ? L.plant  : ''),
+              examPlants:  ('examPlants' in L) ? L.examPlants : (('plants' in L) ? L.plants : []),
+              displayName: L.displayName || L.name || (L.email||user.email||'').split('@')[0],
+              email:       L.email || user.email || '',
+              migratedFrom: EP_LEGACY_COL,
+              createdAt:   firebase.firestore.FieldValue.serverTimestamp()
+            };
+            var batch = DB().batch();
+            batch.set(EPU().doc(user.uid), migrated);
+            var p = (normalizeRole(L.examRole) === 'super_admin')
+              ? EP_BOOTSTRAP_REF().get().then(function(b){
+                  if (!b.exists) batch.set(EP_BOOTSTRAP_REF(), { uid: user.uid, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+                }).catch(function(){})
+              : Promise.resolve();
+            return p.then(function(){ return batch.commit(); })
+              .then(function(){ if (!_epApplyProfile(user, migrated)) _epNoAccess(); })
+              .catch(function(e){
+                console.warn('ExamPro migration failed:', e.message);
+                _epNoAccess('Could not set up your ExamPro profile (' + e.message + '). Ask your Super Admin to re-add you.');
+              });
+          }
+          // Not an ExamPro admin anywhere. Allow first-ever Super Admin bootstrap only
+          // if no bootstrap marker exists (enforced by Firestore rules too).
+          return EP_BOOTSTRAP_REF().get().then(function(b) {
+            if (b.exists) { _epNoAccess('No ExamPro profile found for this account. Ask your Super Admin to create one.'); return; }
+            var newDoc = {
+              examRole:    'super_admin',
+              examPlant:   '',
+              examPlants:  [],
+              displayName: user.displayName || (user.email||'').split('@')[0],
+              email:       user.email || '',
+              createdAt:   firebase.firestore.FieldValue.serverTimestamp()
+            };
+            var batch = DB().batch();
+            batch.set(EPU().doc(user.uid), newDoc);
+            batch.set(EP_BOOTSTRAP_REF(), { uid: user.uid, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+            return batch.commit()
+              .then(function(){ _epApplyProfile(user, newDoc); })
+              .catch(function(){ _epNoAccess('No ExamPro profile found for this account. Ask your Super Admin to create one.'); });
+          }).catch(function(){ _epNoAccess('No ExamPro profile found for this account. Ask your Super Admin to create one.'); });
+        });
     })
     .catch(function(err) {
       showE('aErr', 'Sign-in error: ' + err.message);
@@ -6154,18 +6158,15 @@ function renderUserMgmt() {
   var umEl = G('vUserMgmtSection');
   if (!umEl) return;
   setHtml('vUserMgmtSection', '<div style="padding:10px 0;color:var(--tx3);font-size:13px">Loading users...</div>');
-  DB().collection('users').get().then(function(snap) {
+  EPU().get().then(function(snap) {
     var users = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
     users.sort(function(a,b){ return (a.email||'').localeCompare(b.email||''); });
     var rows = users.map(function(u) {
-      // Use examRole (app-specific); fall back to shared role for legacy docs
-      var resolvedRole = u.examRole || u.role || '';
+      var resolvedRole = normalizeRole(u.examRole) || '';
       var isSA = resolvedRole === 'super_admin';
       // Read ExamPro-specific plant fields for display; fall back for legacy docs
-      var uExamPlant  = u.examPlant  !== undefined ? (u.examPlant  || '') : (u.plant  || '');
-      var uExamPlants = u.examPlants !== undefined
-        ? (Array.isArray(u.examPlants) ? u.examPlants : [])
-        : (Array.isArray(u.plants)     ? u.plants     : []);
+      var uExamPlant  = u.examPlant || '';
+      var uExamPlants = Array.isArray(u.examPlants) ? u.examPlants : [];
       var isMultiPlant = uExamPlants.length > 1;
       var roleTag = isSA
         ? '<span class="bk" style="background:var(--ambg);color:var(--am);border:1px solid var(--ambd)">⭐ Super Admin</span>'
@@ -6176,7 +6177,7 @@ function renderUserMgmt() {
         ? uExamPlants.map(function(p){ return '<span class="bk bb" style="margin-left:3px">'+esc(p)+'</span>'; }).join('')
         : (uExamPlant ? '<span class="bk bb" style="margin-left:4px">'+esc(uExamPlant)+'</span>' : '<span style="color:var(--tx3);font-size:11px">—</span>');
       var editBtn = '<button class="b bg bxs" onclick="openEditAdminUser(\''+u.id+'\')">✏️ Edit</button>';
-      var delBtn  = !isSA ? '<button class="b bd_ bxs" onclick="deleteAdminUser(\''+u.id+'\',\''+esc(u.email||'')+'\')">🗑 Delete</button>' : '';
+      var delBtn  = !isSA ? '<button class="b bd_ bxs" title="Remove ExamPro access only" onclick="deleteAdminUser(\''+u.id+'\',\''+esc(u.email||'')+'\')">🗑 Delete</button>' : '';
       return '<tr>'+
         '<td class="tn">'+esc(u.displayName||u.email||'—')+'</td>'+
         '<td style="color:var(--tx2);font-size:12px">'+esc(u.email||'—')+'</td>'+
@@ -6277,7 +6278,9 @@ function createPlantAdmin() {
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ email:em, password:pw, displayName:nm, returnSecureToken:false })
   }).then(function(r){ return r.json(); }).then(function(data) {
-    if (data.error) { showAdmErr(data.error.message||'Firebase error'); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} return; }
+    if (data.error) { showAdmErr(data.error.message === 'EMAIL_EXISTS'
+        ? 'This email already has a login (possibly from another app). To give them ExamPro access, create a doc in the exampro_users collection with their UID (from Firebase Console › Authentication) and fields examRole, examPlant, examPlants.'
+        : (data.error.message||'Firebase error')); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} return; }
     var uid = data.localId;
     var userDoc = {
       examRole:    'admin',  // ExamPro-specific — never overwrites KPI's kpiRole field
@@ -6289,9 +6292,8 @@ function createPlantAdmin() {
       createdAt:   firebase.firestore.FieldValue.serverTimestamp(),
       createdBy:   CURRENT_USER.uid || ''
     };
-    // Use merge:true so that if this user already has a KPI profile (kpiRole, plant, etc.)
-    // those fields are preserved — we only set/update ExamPro-specific fields.
-    DB().collection('users').doc(uid).set(userDoc, { merge: true }).then(function(){
+    // Written to ExamPro's own collection only — other apps' /users docs are untouched.
+    EPU().doc(uid).set(userDoc, { merge: true }).then(function(){
       var scopeLabel = plants.length > 1 ? plants.join(', ') : pl;
       toast('Admin created for '+scopeLabel+'!','ok');
       ['newAdmName','newAdmEmail','newAdmPwd','newAdmRole','newAdmPlant'].forEach(function(id){var e=G(id);if(e)e.value='';});
@@ -6303,60 +6305,17 @@ function createPlantAdmin() {
 }
 
 function deleteAdminUser(uid, email) {
-  if (!confirm('Delete admin account for "'+email+'"?\n\nThis will permanently remove their login access AND profile. This cannot be undone.')) return;
-
-  var apiKey = FCFG.apiKey;
-
-  // Step 1: Set a random temporary password on the target account so we can sign them in
-  var tmpPwd = 'TMP_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-
-  // Use accounts:update (requires the user's idToken normally, but we use the admin approach:
-  // create a secondary app, sign in with the temp password, get idToken, call accounts:delete)
-  // First: reset the target user's password via admin endpoint
-  fetch('https://identitytoolkit.googleapis.com/v1/accounts:update?key=' + apiKey, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ localId: uid, password: tmpPwd, returnSecureToken: false })
-  })
-  .then(function(r){ return r.json(); })
-  .then(function(upd) {
-    if (upd.error) throw new Error(upd.error.message || 'Password reset failed');
-    // Step 2: Sign in as that user to get their idToken
-    return fetch('https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' + apiKey, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: email, password: tmpPwd, returnSecureToken: true })
-    }).then(function(r){ return r.json(); });
-  })
-  .then(function(signIn) {
-    if (signIn.error) throw new Error(signIn.error.message || 'Sign-in for deletion failed');
-    var targetIdToken = signIn.idToken;
-    // Step 3: Delete the Firebase Auth account using the user's own idToken
-    return fetch('https://identitytoolkit.googleapis.com/v1/accounts:delete?key=' + apiKey, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ idToken: targetIdToken })
-    }).then(function(r){ return r.json(); });
-  })
-  .then(function(del) {
-    if (del.error) throw new Error(del.error.message || 'Auth deletion failed');
-    // Step 4: Delete the Firestore profile doc
-    return DB().collection('users').doc(uid).delete();
-  })
-  .then(function() {
-    toast('Admin "' + email + '" deleted from login and system.', 'ok');
-    renderUserMgmt();
-  })
-  .catch(function(e) {
-    // If auth deletion fails, still offer to remove just the Firestore profile
-    var msg = e.message || 'Unknown error';
-    if (confirm('Auth deletion error: ' + msg + '\n\nRemove their profile from the system anyway? (They may still be able to log in until removed from Firebase Console.)')) {
-      DB().collection('users').doc(uid).delete().then(function(){
-        toast('Profile removed. Please delete "' + email + '" from Firebase Console > Authentication manually.', 'wn');
-        renderUserMgmt();
-      }).catch(function(e2){ toast('Error: ' + e2.message, 'er'); });
-    }
-  });
+  // The Firebase Auth login is SHARED with other apps (KPI Dashboard, etc.),
+  // so ExamPro only removes its own profile. The person loses ExamPro access
+  // but keeps their login and their profiles in every other app.
+  if (uid === CURRENT_USER.uid) { toast('You cannot remove your own ExamPro access.', 'er'); return; }
+  if (!confirm('Remove ExamPro access for "'+email+'"?\n\nTheir ExamPro admin profile will be deleted. Their login and any access to other apps (e.g. KPI Dashboard) are NOT affected.')) return;
+  EPU().doc(uid).delete()
+    .then(function(){
+      toast('ExamPro access removed for "' + email + '".', 'ok');
+      renderUserMgmt();
+    })
+    .catch(function(e){ toast('Error: ' + e.message, 'er'); });
 }
 
 
@@ -6365,17 +6324,14 @@ var _editAdmUid = '';
 
 function openEditAdminUser(uid) {
   _editAdmUid = uid;
-  DB().collection('users').doc(uid).get().then(function(doc) {
+  EPU().doc(uid).get().then(function(doc) {
     if (!doc.exists) { toast('User not found.', 'er'); return; }
     var u = doc.data();
-    // Read examRole (app-specific) first; fall back to shared role for legacy docs
-    var resolvedRole = u.examRole || u.role || '';
+    var resolvedRole = normalizeRole(u.examRole) || '';
     var isSA = resolvedRole === 'super_admin';
     // Read ExamPro-specific plant fields; fall back to shared fields for legacy docs
-    var currentPlant  = u.examPlant  !== undefined ? (u.examPlant  || '') : (u.plant  || '');
-    var currentPlants = u.examPlants !== undefined
-      ? (Array.isArray(u.examPlants) ? u.examPlants : (currentPlant ? [currentPlant] : []))
-      : (Array.isArray(u.plants)     ? u.plants     : (currentPlant ? [currentPlant] : []));
+    var currentPlant  = u.examPlant || '';
+    var currentPlants = Array.isArray(u.examPlants) && u.examPlants.length ? u.examPlants : (currentPlant ? [currentPlant] : []);
     var isMulti = currentPlants.length > 1;
     var currentRole = isSA ? 'super_admin' : (isMulti ? 'multi' : 'plant');
 
@@ -6468,7 +6424,7 @@ function saveEditAdminUser() {
   if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
   if (errEl) errEl.classList.add('h');
 
-  DB().collection('users').doc(uid).update(update)
+  EPU().doc(uid).update(update)
     .then(function(){
       closeMo();
       toast('Admin user updated!', 'ok');
