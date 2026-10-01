@@ -1733,6 +1733,9 @@ var EP_USERS_COL  = 'exampro_users';   // ExamPro-only admin profiles
 var EP_LEGACY_COL = 'users';           // shared collection — READ-ONLY, used once for migration
 function EPU()  { return DB().collection(EP_USERS_COL); }
 function EP_BOOTSTRAP_REF() { return DB().collection('exampro_meta').doc('bootstrap'); }
+/* Invites for people who ALREADY have a login (e.g. from KPI Dashboard).
+   Keyed by lower-case email; claimed automatically on their first ExamPro login. */
+function EPI()  { return DB().collection('exampro_invites'); }
 
 // ── SPEED: local cache + short-lived read cache ─────────────────
 // 1. Keeps a copy of downloaded data on this device (IndexedDB), so
@@ -2208,7 +2211,42 @@ function resolveAdminUser(user) {
         if (!_epApplyProfile(user, d)) _epNoAccess();
         return;
       }
-      // No ExamPro profile yet → try one-time migration from the shared collection (read-only).
+      // No ExamPro profile yet → 1) claim a pending invite for this email, if any.
+      var myEmail = String(user.email || '').trim().toLowerCase();
+      var inviteP = myEmail
+        ? EPI().doc(myEmail).get().catch(function(){ return null; })
+        : Promise.resolve(null);
+      return inviteP.then(function(inv) {
+        if (inv && inv.exists) {
+          var I = inv.data();
+          var claimed = {
+            examRole:    I.examRole,
+            examPlant:   I.examPlant  || '',
+            examPlants:  Array.isArray(I.examPlants) ? I.examPlants : [],
+            displayName: I.displayName || user.displayName || myEmail.split('@')[0],
+            name:        I.displayName || user.displayName || myEmail.split('@')[0],
+            email:       myEmail,
+            createdBy:   I.createdBy || '',
+            createdAt:   firebase.firestore.FieldValue.serverTimestamp()
+          };
+          var b = DB().batch();
+          b.set(EPU().doc(user.uid), claimed);
+          b.delete(EPI().doc(myEmail));
+          return b.commit()
+            .then(function(){ if (!_epApplyProfile(user, claimed)) _epNoAccess(); })
+            .catch(function(e){ _epNoAccess('Could not activate your ExamPro access (' + e.message + '). Ask your Super Admin.'); });
+        }
+        // 2) otherwise try one-time migration from the shared collection (read-only).
+        return _epMigrateOrBootstrap(user);
+      });
+    })
+    .catch(function(err) {
+      showE('aErr', 'Sign-in error: ' + err.message);
+      hideAll(); show('vAdmLog'); setTimeout(epBioInitLoginBtn, 200);
+    });
+}
+
+function _epMigrateOrBootstrap(user) {
       return DB().collection(EP_LEGACY_COL).doc(user.uid).get()
         .catch(function(){ return null; })
         .then(function(legacy) {
@@ -2258,11 +2296,6 @@ function resolveAdminUser(user) {
               .catch(function(){ _epNoAccess('No ExamPro profile found for this account. Ask your Super Admin to create one.'); });
           }).catch(function(){ _epNoAccess('No ExamPro profile found for this account. Ask your Super Admin to create one.'); });
         });
-    })
-    .catch(function(err) {
-      showE('aErr', 'Sign-in error: ' + err.message);
-      hideAll(); show('vAdmLog'); setTimeout(epBioInitLoginBtn, 200);
-    });
 }
 function doLogout() {
   if (S.tmr) clearInterval(S.tmr);
@@ -6158,8 +6191,11 @@ function renderUserMgmt() {
   var umEl = G('vUserMgmtSection');
   if (!umEl) return;
   setHtml('vUserMgmtSection', '<div style="padding:10px 0;color:var(--tx3);font-size:13px">Loading users...</div>');
-  EPU().get().then(function(snap) {
+  Promise.all([EPU().get(), EPI().get().catch(function(){ return { docs: [] }; })]).then(function(res) {
+    var snap = res[0];
+    var invites = res[1].docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
     var users = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
+    _epKnownEmails = users.map(function(u){ return String(u.email||'').toLowerCase(); });
     users.sort(function(a,b){ return (a.email||'').localeCompare(b.email||''); });
     var rows = users.map(function(u) {
       var resolvedRole = normalizeRole(u.examRole) || '';
@@ -6189,6 +6225,17 @@ function renderUserMgmt() {
     setHtml('vUserMgmtSection',
       '<div class="tw"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Plant</th><th></th></tr></thead>'+
       '<tbody>'+(rows||noRows(5,'No admin users found.'))+'</tbody></table></div>'+
+      (invites.length
+        ? '<div style="margin-top:14px;font-size:13px;font-weight:700;margin-bottom:6px">⏳ Pending access (activates on their first ExamPro login)</div>'+
+          '<div class="tw"><table><thead><tr><th>Name</th><th>Email</th><th>Plant</th><th></th></tr></thead><tbody>'+
+          invites.map(function(iv){
+            var pls = Array.isArray(iv.examPlants) && iv.examPlants.length ? iv.examPlants : (iv.examPlant ? [iv.examPlant] : []);
+            return '<tr><td class="tn">'+esc(iv.displayName||'—')+'</td>'+
+              '<td style="color:var(--tx2);font-size:12px">'+esc(iv.id)+'</td>'+
+              '<td>'+(pls.map(function(p){ return '<span class="bk bb" style="margin-left:3px">'+esc(p)+'</span>'; }).join('')||'—')+'</td>'+
+              '<td><button class="b bd_ bxs" onclick="cancelExamInvite(\''+esc(iv.id)+'\')">✖ Cancel</button></td></tr>';
+          }).join('')+'</tbody></table></div>'
+        : '')+
       '<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--bd)">'+
         '<div style="font-size:13px;font-weight:700;margin-bottom:10px">➕ Create Admin User</div>'+
         '<div class="fr">'+
@@ -6278,9 +6325,31 @@ function createPlantAdmin() {
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ email:em, password:pw, displayName:nm, returnSecureToken:false })
   }).then(function(r){ return r.json(); }).then(function(data) {
-    if (data.error) { showAdmErr(data.error.message === 'EMAIL_EXISTS'
-        ? 'This email already has a login (possibly from another app). To give them ExamPro access, create a doc in the exampro_users collection with their UID (from Firebase Console › Authentication) and fields examRole, examPlant, examPlants.'
-        : (data.error.message||'Firebase error')); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} return; }
+    if (data.error && data.error.message === 'EMAIL_EXISTS') {
+      // Login already exists (e.g. KPI Dashboard user). Don't touch it —
+      // just grant ExamPro access, which activates on their first ExamPro login.
+      var emLower = em.trim().toLowerCase();
+      if (_epKnownEmails.indexOf(emLower) > -1) {
+        showAdmErr('This person is already an ExamPro admin. Use ✏️ Edit to change their plant.');
+        if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} return;
+      }
+      EPI().doc(emLower).set({
+        examRole:    'admin',
+        examPlant:   pl,
+        examPlants:  plants,
+        displayName: nm,
+        createdBy:   CURRENT_USER.uid || '',
+        createdAt:   firebase.firestore.FieldValue.serverTimestamp()
+      }).then(function(){
+        toast('ExamPro access added. '+em+' can sign in with their EXISTING password (the password you typed is not used).','ok');
+        ['newAdmName','newAdmEmail','newAdmPwd','newAdmRole','newAdmPlant'].forEach(function(id){var e=G(id);if(e)e.value='';});
+        document.querySelectorAll('.newAdmPChk').forEach(function(cb){cb.checked=false;});
+        var wrap=G('vNewAdmPlantWrap'); if(wrap) wrap.classList.add('h');
+        renderUserMgmt();
+      }).catch(function(e){ showAdmErr('Firestore error: '+e.message); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} });
+      return;
+    }
+    if (data.error) { showAdmErr(data.error.message||'Firebase error'); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} return; }
     var uid = data.localId;
     var userDoc = {
       examRole:    'admin',  // ExamPro-specific — never overwrites KPI's kpiRole field
@@ -6302,6 +6371,15 @@ function createPlantAdmin() {
       renderUserMgmt();
     }).catch(function(e){ showAdmErr('Firestore error: '+e.message); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} });
   }).catch(function(e){ showAdmErr('Network error: '+e.message); if(btn){btn.disabled=false;btn.textContent='➕ Create Admin';} });
+}
+
+var _epKnownEmails = [];
+
+function cancelExamInvite(email) {
+  if (!confirm('Cancel pending ExamPro access for "'+email+'"?')) return;
+  EPI().doc(email).delete()
+    .then(function(){ toast('Pending access cancelled.', 'ok'); renderUserMgmt(); })
+    .catch(function(e){ toast('Error: '+e.message, 'er'); });
 }
 
 function deleteAdminUser(uid, email) {
