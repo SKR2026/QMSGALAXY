@@ -1987,7 +1987,7 @@ body.sb-animating canvas{pointer-events:none}
               </div>
             </div>
             <div style="padding:8px 12px;background:var(--amber-bg);border-radius:var(--r-md);border:0.5px solid var(--border2);font-size:11px;color:var(--amber)">
-              This writes directly to the Firestore <code style="font-size:10px">/users/{uid}</code> document. The user must <strong>sign out and sign back in</strong> on all devices for the new role to take effect.
+              This writes directly to the Firestore <code style="font-size:10px">/kpiUsers/{uid}</code> document. The user must <strong>sign out and sign back in</strong> on all devices for the new role to take effect.
             </div>
           </div>
           <div id="fixRoleError" style="font-size:12px;color:var(--red);display:none"></div>
@@ -5970,22 +5970,12 @@ function bulkDeleteKPIs(){
 // ══ ROLE-BASED ACCESS CONTROL ══
 window._roleInfo = { role: null, plant: null, isSuperAdmin: true, isPlantAdmin: false, isTopMgmt: false };
 function applyRoleRestrictions(profile){
-  // MULTI-APP ISOLATION FIX (2025):
-  // KPI Dashboard and ExamPro share the same /users/{uid} Firestore collection.
-  // To prevent ExamPro's role assignments from affecting KPI Dashboard access
-  // (and vice-versa), KPI Dashboard reads the dedicated  kpiRole  field.
-  // Fall back to the shared  role  field only for legacy docs created before
-  // this fix so existing users are not locked out on first upgrade.
-  const kpiRoleRaw = (profile && profile.kpiRole) ? String(profile.kpiRole).trim() : '';
-  const legacyRoleRaw = (profile && profile.role)  ? String(profile.role).trim()    : '';
-  const effectiveRole = kpiRoleRaw || legacyRoleRaw;
-
-  // If we are using the legacy field, schedule a silent migration so future
-  // logins use kpiRole and the shared field is no longer touched by this app.
-  if (!kpiRoleRaw && legacyRoleRaw && window.FB && window.FB.updateUser && profile && profile.id) {
-    window.FB.updateUser(profile.id, { kpiRole: legacyRoleRaw })
-      .catch(e => console.warn('[KPI] kpiRole migration failed:', e.message));
-  }
+  // MULTI-APP ISOLATION:
+  // KPI Dashboard users live in their own /kpiUsers/{uid} collection, so the
+  // role field there belongs to this app alone — ExamPro (/users) and
+  // CarbonOps (/orgs/main/users) can never change KPI access, and vice-versa.
+  // (kpiRole is still honoured for the guest profile / old cached objects.)
+  const effectiveRole = String((profile && (profile.kpiRole || profile.role)) || '').trim();
 
   const roleRaw = effectiveRole.toLowerCase();
 
@@ -8855,9 +8845,9 @@ async function saveUser(){
   } catch(err){
     console.error('Create user error:', err);
     if(err.code === 'auth/email-already-in-use'){
-      errEl.innerHTML = `This email is already registered in Firebase Auth but may be missing its profile.
+      errEl.innerHTML = `This email already has a login (e.g. from ExamPro or CarbonOps) but no KPI Dashboard profile. Enter that account's existing password above, then:
         <br><button onclick="repairOrphanProfile()" style="margin-top:8px;padding:5px 12px;background:var(--amber);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;font-family:inherit">
-          Fix missing profile →
+          Add to KPI Dashboard →
         </button>`;
       errEl.style.display = 'block';
     } else if(err.code === 'auth/weak-password'){
@@ -8877,7 +8867,8 @@ async function saveUser(){
 }
 
 // ── Orphan profile repair ─────────────────────────────────────────
-// Called when Firebase Auth already has the email but no Firestore /users/{uid} doc exists.
+// Called when Firebase Auth already has the email but no Firestore /kpiUsers/{uid} doc exists
+// (e.g. the person already has an ExamPro / CarbonOps login on the same Firebase project).
 // Uses the secondaryAuth instance (same password the admin just entered) to resolve the UID,
 // writes the missing profile doc, then signs secondary back out.
 async function repairOrphanProfile(){
@@ -9766,7 +9757,7 @@ const secondaryAuth = getAuth(secondaryApp);
 
 /**
  * Sign in with email + password.
- * Returns { user, profile } where profile is the Firestore /users/{uid} doc.
+ * Returns { user, profile } where profile is the Firestore /kpiUsers/{uid} doc.
  * Throws on bad credentials.
  */
 export async function loginUser(email, password) {
@@ -9821,73 +9812,153 @@ export function onAuthChange(callback) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  USERS  (Firestore: /users/{uid})
+//  USERS  (Firestore: /kpiUsers/{uid})
+//
+//  KPI Dashboard has its OWN user collection, /kpiUsers. The shared
+//  /users collection belongs to ExamPro and is never written by this app.
+//  It is only READ once, to migrate KPI users who were created before the
+//  split (docs that carry a KPI role in kpiRole or role).
 // ════════════════════════════════════════════════════════════════
 
 /**
- * Firestore document shape:
+ * /kpiUsers/{uid} document shape:
  * {
  *   name: "Sushil Kumar",
  *   email: "sushil@polyplasticsindia.com",
- *   role: "Super Admin" | "Plant Admin" | "Department User",
+ *   role: "Super Admin" | "Top Management" | "Plant Admin" | "Dept User",
  *   plant: "Chennai" | "Daslana" | "Noida" | "All",
- *   department: "Quality" | "Production" | "HR" | "Maintenance" | "Finance" | "SCM" | "All",
+ *   department: "Quality" | ... | "All",
+ *   active: true,
  *   createdAt: Timestamp
  * }
  */
 
-export async function getUserProfile(uid) {
-  const snap = await getDoc(doc(db, "users", uid));
-  if (!snap.exists()) return null;
-  const data = snap.data();
-  // Resolve the effective KPI role: prefer kpiRole (app-isolated field),
-  // fall back to the shared role field for legacy docs.
-  const effectiveKpiRole = data.kpiRole || data.role || null;
-  return { id: snap.id, ...data, role: effectiveKpiRole };
+const KPI_USERS_COL    = "kpiUsers";   // KPI Dashboard only
+const LEGACY_USERS_COL = "users";      // shared with ExamPro — read-only here
+
+const KPI_ROLES = ['Super Admin', 'Top Management', 'Plant Admin', 'Dept User'];
+
+// Returns the canonical KPI role string ('Plant Admin', …) or null if the
+// value is not a KPI role (e.g. ExamPro's 'admin' / 'student').
+function canonicalKpiRole(r) {
+  if (!r) return null;
+  const v = String(r).trim().toLowerCase();
+  return KPI_ROLES.find(k => k.toLowerCase() === v) || null;
 }
 
+// KPI role held in a legacy /users doc, or null if it isn't a KPI user.
+function legacyKpiRoleOf(data) {
+  if (!data) return null;
+  return canonicalKpiRole(data.kpiRole) || canonicalKpiRole(data.role);
+}
+
+// Build a /kpiUsers doc from a legacy /users doc (only KPI-relevant fields).
+function kpiDocFromLegacy(data, role) {
+  return {
+    name:       data.name || '',
+    email:      data.email || '',
+    role,
+    plant:      data.plant || 'All',
+    department: data.department || data.dept || 'All',
+    active:     data.active !== false,
+    migratedFromUsers: true,
+    createdAt:  serverTimestamp()
+  };
+}
+
+let _currentKpiRole = null;   // role of the signed-in KPI user (set on profile load)
+
+export async function getUserProfile(uid) {
+  const ref  = doc(db, KPI_USERS_COL, uid);
+  let   snap = await getDoc(ref);
+
+  if (!snap.exists()) {
+    // One-time migration: a KPI user created before the split still lives in
+    // /users. Copy their KPI fields into /kpiUsers (the /users doc is left
+    // untouched so ExamPro is unaffected). Non-KPI accounts get null.
+    const legacy = await getDoc(doc(db, LEGACY_USERS_COL, uid));
+    const role   = legacy.exists() ? legacyKpiRoleOf(legacy.data()) : null;
+    if (!role) return null;
+    await setDoc(ref, kpiDocFromLegacy(legacy.data(), role));
+    snap = await getDoc(ref);
+    if (!snap.exists()) return null;
+  }
+
+  const data = snap.data();
+  const profile = { id: snap.id, ...data, role: canonicalKpiRole(data.role) || data.role || null };
+  if (auth.currentUser && auth.currentUser.uid === uid) _currentKpiRole = profile.role;
+  return profile;
+}
+
+/**
+ * Super Admin only: copy every legacy KPI user still sitting in /users into
+ * /kpiUsers so they appear on the Users page before they next log in.
+ * Safe to run repeatedly — existing /kpiUsers docs are never overwritten.
+ */
+export async function migrateLegacyKpiUsers() {
+  const [legacySnap, kpiSnap] = await Promise.all([
+    getDocs(collection(db, LEGACY_USERS_COL)),
+    getDocs(collection(db, KPI_USERS_COL))
+  ]);
+  const have = new Set(kpiSnap.docs.map(d => d.id));
+  let copied = 0;
+  for (const d of legacySnap.docs) {
+    if (have.has(d.id)) continue;
+    const role = legacyKpiRoleOf(d.data());
+    if (!role) continue;                       // ExamPro-only account — skip
+    try {
+      await setDoc(doc(db, KPI_USERS_COL, d.id), kpiDocFromLegacy(d.data(), role));
+      copied++;
+    } catch (e) { console.warn('[KPI] migrate user failed', d.id, e.code || e.message); }
+  }
+  if (copied) console.info(`[KPI] Migrated ${copied} user(s) from /users to /kpiUsers`);
+  return copied;
+}
+
+let _legacyMigrationDone = false;
+
 export async function getAllUsers() {
-  const snap = await getDocs(collection(db, "users"));
+  // First Super Admin load after the split pulls legacy KPI users across.
+  if (!_legacyMigrationDone && _currentKpiRole === 'Super Admin') {
+    _legacyMigrationDone = true;
+    try { await migrateLegacyKpiUsers(); }
+    catch (e) { console.warn('[KPI] legacy user migration skipped:', e.code || e.message); }
+  }
+  const snap = await getDocs(collection(db, KPI_USERS_COL));
   return snap.docs.map(d => {
     const data = d.data();
-    // Resolve effective KPI role so the Users page always shows the right role
-    const effectiveKpiRole = data.kpiRole || data.role || null;
-    return { id: d.id, ...data, role: effectiveKpiRole };
+    return { id: d.id, ...data, role: canonicalKpiRole(data.role) || data.role || null };
   });
 }
 
 export async function createUser(uid, userData) {
-  // Store the KPI-specific role in kpiRole so ExamPro roles are never overwritten.
-  const { role, ...rest } = userData;
-  await setDoc(doc(db, "users", uid), {
-    ...rest,
-    kpiRole: role,   // KPI Dashboard app-specific field
+  await setDoc(doc(db, KPI_USERS_COL, uid), {
+    ...userData,
+    role: canonicalKpiRole(userData.role) || userData.role,
     createdAt: serverTimestamp()
   });
 }
 
 export async function updateUser(uid, updates) {
-  // If the caller is changing the role, write to kpiRole (app-isolated field)
-  // instead of the shared role field, so ExamPro roles are never overwritten.
-  const { role, ...otherUpdates } = updates;
-  const safeUpdates = { ...otherUpdates };
-  if (role !== undefined) safeUpdates.kpiRole = role;
-  await updateDoc(doc(db, "users", uid), safeUpdates);
+  const safeUpdates = { ...updates };
+  delete safeUpdates.kpiRole;   // legacy field — not used in /kpiUsers
+  if (safeUpdates.role !== undefined) {
+    safeUpdates.role = canonicalKpiRole(safeUpdates.role) || safeUpdates.role;
+  }
+  await updateDoc(doc(db, KPI_USERS_COL, uid), safeUpdates);
 }
 
 /**
- * Create a brand-new login (Firebase Auth account) + matching /users/{uid}
- * Firestore profile, WITHOUT signing out the current admin.
+ * Create a brand-new login (Firebase Auth account) + matching /kpiUsers/{uid}
+ * profile, WITHOUT signing out the current admin.
  * profile: { name, email, role, plant, department }
  * Throws on failure (e.g. email already in use, weak password).
  */
 export async function registerUser(email, password, profile) {
   const cred = await createUserWithEmailAndPassword(secondaryAuth, email, password);
-  // Store KPI role in kpiRole so ExamPro's examRole field is never overwritten.
-  const { role, ...profileRest } = profile;
-  await setDoc(doc(db, "users", cred.user.uid), {
-    ...profileRest,
-    kpiRole: role,   // KPI Dashboard app-specific field
+  await setDoc(doc(db, KPI_USERS_COL, cred.user.uid), {
+    ...profile,
+    role: canonicalKpiRole(profile.role) || profile.role,
     email,
     active: true,
     createdAt: serverTimestamp()
@@ -9899,31 +9970,23 @@ export async function registerUser(email, password, profile) {
 }
 
 /**
- * Repair an orphan Firebase Auth account that has no Firestore /users/{uid} doc.
+ * Give KPI access to an existing Firebase Auth account that has no
+ * /kpiUsers/{uid} doc (e.g. an ExamPro / CarbonOps user, or an orphan login).
  * Signs in with the existing credentials using secondaryAuth to resolve the UID,
- * writes the missing profile doc, then signs secondary out.
+ * writes the /kpiUsers profile, then signs secondary out.
  * profile: { name, role, plant, department }
  */
 export async function repairOrphanProfile(email, password, profile) {
-  // Sign in as that user on the secondary instance to get their UID
   const cred = await signInWithEmailAndPassword(secondaryAuth, email, password);
   const uid  = cred.user.uid;
+  const ref  = doc(db, KPI_USERS_COL, uid);
+  const role = canonicalKpiRole(profile.role) || profile.role;
 
-  // Check if a Firestore doc already exists — if so, just update it
-  const snap = await getDoc(doc(db, "users", uid));
-  const { role, ...profileRest } = profile;
-  if(snap.exists()){
-    // Doc exists — patch it with the supplied profile details.
-    // Write kpiRole (app-isolated) instead of shared role field.
-    await updateDoc(doc(db, "users", uid), {
-      ...profileRest, kpiRole: role, email, active: true
-    });
+  const snap = await getDoc(ref);
+  if (snap.exists()) {
+    await updateDoc(ref, { ...profile, role, email, active: true });
   } else {
-    // Doc is missing — create it fresh.
-    await setDoc(doc(db, "users", uid), {
-      ...profileRest, kpiRole: role, email, active: true,
-      repairedAt: serverTimestamp()
-    });
+    await setDoc(ref, { ...profile, role, email, active: true, repairedAt: serverTimestamp() });
   }
 
   await signOut(secondaryAuth);
@@ -9961,9 +10024,9 @@ export async function deletePlant(plantId) {
 }
 
 export async function deleteUserDoc(uid) {
-  // Removes the Firestore profile only. The Firebase Auth account itself
-  // can only be deleted via the Admin SDK / a Cloud Function.
-  await deleteDoc(doc(db, "users", uid));
+  // Removes the KPI profile only (/kpiUsers). The shared Firebase Auth account
+  // and any ExamPro /users doc are left intact so other apps keep working.
+  await deleteDoc(doc(db, KPI_USERS_COL, uid));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -10483,7 +10546,7 @@ function computeStatus(actual, target, direction, pct) {
 window.FB = {
   _auth: auth,
   loginUser, logoutUser, loginAnonymously, onAuthChange,
-  getUserProfile, getAllUsers, createUser, updateUser, registerUser, deleteUserDoc, repairOrphanProfile, changePassword, adminResetPassword,
+  getUserProfile, getAllUsers, migrateLegacyKpiUsers, createUser, updateUser, registerUser, deleteUserDoc, repairOrphanProfile, changePassword, adminResetPassword,
   getPlants, addPlant, updatePlant, deletePlant,
   getKPIMaster, addKPI, updateKPI, deleteKPI,
   addDept, updateDept, deleteDept, getDepts,
