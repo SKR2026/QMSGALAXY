@@ -1866,7 +1866,7 @@ html, body { overflow: hidden; }
                   <th id="bulk-select-th" style="display:none;width:36px;padding:8px 10px"><input type="checkbox" id="select-all-proposals" onchange="toggleSelectAllProposals(this.checked)" style="cursor:pointer"></th>
                   <th>Proposal #</th><th>Plant</th><th>Party</th><th>Description</th>
                   <th>Current ₹</th><th>Proposed ₹</th><th>Diff %</th>
-                  <th>Status</th><th>Level</th><th>Date</th><th>📎</th><th>Actions</th>
+                  <th>Status</th><th id="ack-status-th" style="display:none">Accounts Ack.</th><th>Level</th><th>Date</th><th>📎</th><th>Actions</th>
                 </tr>
               </thead>
               <tbody id="proposals-tbody"></tbody>
@@ -4643,12 +4643,12 @@ async function loadDashboard() {
     const draft     = props.filter(p=>p.status==='Draft').length;
 
     if (isAccounts()) {
-      const ackDone    = props.filter(p=>p.accountsAck?.acknowledged).length;
+      const ackDone    = props.filter(p=>p.status==='Approved' && p.accountsAck?.acknowledged).length;
       const ackPending = approved - ackDone;
       document.getElementById('dash-stats').innerHTML = `
-        ${statCard('Total Approved','blue',approved,'Approved proposals','')}
-        ${statCard('Acknowledged','green',ackDone,'ERP updated','Approved')}
-        ${statCard('Pending Ack.','warning',ackPending,'Awaiting ERP update','Approved')}
+        ${statCard('Total Approved','blue',approved,'Approved proposals','Approved')}
+        ${statCard('Acknowledged','green',ackDone,'ERP updated',ACK_FILTER_DONE)}
+        ${statCard('Pending Ack.','warning',ackPending,'Awaiting ERP update',ACK_FILTER_PENDING)}
       `;
     } else {
       document.getElementById('dash-stats').innerHTML = `
@@ -4733,6 +4733,42 @@ function dashboardStatClick(status) {
 function isSuperAdmin()  { return currentProfile?.role === 'Super Admin'; }
 function isViewer()     { return currentProfile?.role === 'Viewer'; }
 function isAccounts()   { return currentProfile?.role === 'Accounts'; }
+
+// ── Accounts acknowledgement filter helpers ─────────────────────────────────
+const ACK_FILTER_DONE    = '__ack_done';
+const ACK_FILTER_PENDING = '__ack_pending';
+function isAckDone(p) { return p.status === 'Approved' && !!p.accountsAck?.acknowledged; }
+// Matches a proposal against the status dropdown value (normal status or ack filter)
+function matchesStatusFilter(p, status) {
+  if (!status) return true;
+  if (status === ACK_FILTER_DONE)    return isAckDone(p);
+  if (status === ACK_FILTER_PENDING) return p.status === 'Approved' && !isAckDone(p);
+  return p.status === status;
+}
+// Adds the acknowledgement options to the status dropdown for Accounts only
+function syncAckStatusOptions() {
+  const sel = document.getElementById('proposals-status-filter');
+  if (!sel) return;
+  const existing = sel.querySelector('optgroup[data-ack]');
+  if (isAccounts()) {
+    if (!existing) {
+      const g = document.createElement('optgroup');
+      g.label = 'Accounts Acknowledgement';
+      g.setAttribute('data-ack', '1');
+      g.innerHTML = `<option value="${ACK_FILTER_DONE}">Acknowledged</option><option value="${ACK_FILTER_PENDING}">Ack. Pending</option>`;
+      sel.appendChild(g);
+    }
+  } else if (existing) {
+    if ([ACK_FILTER_DONE, ACK_FILTER_PENDING].includes(sel.value)) sel.value = '';
+    existing.remove();
+  }
+}
+function ackBadgeHTML(p) {
+  if (p.status !== 'Approved') return '<span style="color:var(--text3);font-size:12px">—</span>';
+  return isAckDone(p)
+    ? '<span class="badge" style="background:#d1fae5;color:#065f46">✅ Acknowledged</span>'
+    : '<span class="badge" style="background:#fdf4ff;color:#7e22ce">📝 Ack. Pending</span>';
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  PROPOSALS LIST
@@ -4820,6 +4856,7 @@ async function loadProposals() {
       return getTs(b) - getTs(a);
     });
     // Apply the status selected from a dashboard statistic card.
+    syncAckStatusOptions();
     if (dashboardProposalFilter !== null) {
       const statusEl = document.getElementById('proposals-status-filter');
       if (statusEl) statusEl.value = dashboardProposalFilter;
@@ -4879,7 +4916,7 @@ function exportProposalsPDF() {
     const search = document.getElementById('proposals-search')?.value?.toLowerCase()||'';
     const days   = parseInt(document.getElementById('proposals-date-filter')?.value||'0');
     if (_exportPlantIdSet && !_exportPlantIdSet.has(p.plantId)) return false;
-    if (status && p.status !== status) return false;
+    if (!matchesStatusFilter(p, status)) return false;
     if (search && !`${p.proposalNumber}${p.partyName}${p.description}${p.productService}`.toLowerCase().includes(search)) return false;
     if (days) {
       const d = p.createdAt?.toDate ? p.createdAt.toDate() : new Date(p.createdAt||0);
@@ -4902,6 +4939,7 @@ function exportProposalsPDF() {
       <td style="text-align:right">₹${fmt(p.proposedPrice)}</td>
       <td style="text-align:right">${diff !== '—' ? diff+'%' : '—'}</td>
       <td>${esc(p.status||'—')}</td>
+      ${isAccounts() ? `<td>${p.status==='Approved' ? (isAckDone(p)?'Acknowledged':'Ack. Pending') : '—'}</td>` : ''}
       <td>${fmtDate(p.createdAt)}</td>
     </tr>`;
   }).join('');
@@ -4922,7 +4960,7 @@ function exportProposalsPDF() {
     <p>Generated: ${new Date().toLocaleString('en-IN')} &nbsp;|&nbsp; ${visible.length} record${visible.length!==1?'s':''}</p>
     <table><thead><tr>
       <th>Proposal #</th><th>Plant</th><th>Party</th><th>Description</th>
-      <th>Current ₹</th><th>Proposed ₹</th><th>Diff %</th><th>Status</th><th>Date</th>
+      <th>Current ₹</th><th>Proposed ₹</th><th>Diff %</th><th>Status</th>${isAccounts() ? '<th>Accounts Ack.</th>' : ''}<th>Date</th>
     </tr></thead><tbody>${rows}</tbody></table>
     <br><button onclick="window.print()" style="padding:8px 20px;background:#1a56db;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px">🖨️ Print / Save as PDF</button>
   </body></html>`);
@@ -5033,7 +5071,7 @@ function filterProposals() {
     if (search && !`${p.proposalNumber}${p.partyName}${p.description}${p.productService}`.toLowerCase().includes(search)) return false;
     if (plantIdSet && !plantIdSet.has(p.plantId)) return false;
 
-    if (status && p.status !== status) return false;
+    if (!matchesStatusFilter(p, status)) return false;
     if (days) {
       const d = p.createdAt?.toDate ? p.createdAt.toDate() : new Date(p.createdAt||0);
       if (Date.now()-d.getTime() > days*86400000) return false;
@@ -5049,6 +5087,9 @@ function filterProposals() {
   const bulkTh = document.getElementById('bulk-select-th');
   if (bulkTh) bulkTh.style.display = isSuperAdmin() ? '' : 'none';
   if (!isSuperAdmin()) { document.getElementById('bulk-delete-bar').style.display='none'; }
+  const _showAck = isAccounts();
+  const ackTh = document.getElementById('ack-status-th');
+  if (ackTh) ackTh.style.display = _showAck ? '' : 'none';
 
   document.getElementById('proposals-tbody').innerHTML = paged.length
     ? paged.map(p=>{
@@ -5075,6 +5116,7 @@ function filterProposals() {
           <td>
             <span class="badge badge-${(p.status||'draft').toLowerCase().replace(/\s/g,'')}">${p.status||'Draft'}</span>
           </td>
+          ${_showAck ? `<td style="white-space:nowrap">${ackBadgeHTML(p)}</td>` : ''}
           <td>L${p.currentApprovalLevel||'—'}</td>
           <td>${fmtDate(p.createdAt)}</td>
           <td onclick="event.stopPropagation()" style="text-align:center;white-space:nowrap">
@@ -5093,7 +5135,7 @@ function filterProposals() {
           </td>
         </tr>`;
       }).join('')
-    : `<tr><td colspan="${isSuperAdmin()?13:12}"><div class="empty-state"><div class="empty-icon">📋</div><h3>No proposals found</h3></div></td></tr>`;
+    : `<tr><td colspan="${12 + (isSuperAdmin()?1:0) + (_showAck?1:0)}"><div class="empty-state"><div class="empty-icon">📋</div><h3>No proposals found</h3></div></td></tr>`;
 
   renderPagination('proposals-pagination', list.length, proposalPage, (p)=>{proposalPage=p;filterProposals();});
 
@@ -9037,10 +9079,14 @@ function downloadCSV(content, filename) {
 function exportProposalsCSV() {
   const rows = allProposals.map(p=>{
     const plant = allPlants.find(pl=>pl.id===p.plantId);
-    return [p.proposalNumber,plant?.name,p.partyName,p.productService,p.currentPrice,p.proposedPrice,p.diffPercent?.toFixed(2),p.status,p.proposalDate,fmtDateTime(p.createdAt)]
+    const cols = [p.proposalNumber,plant?.name,p.partyName,p.productService,p.currentPrice,p.proposedPrice,p.diffPercent?.toFixed(2),p.status];
+    if (isAccounts()) cols.push(p.status==='Approved' ? (isAckDone(p)?'Acknowledged':'Ack. Pending') : '—', p.accountsAck?.erpRef||'');
+    cols.push(p.proposalDate,fmtDateTime(p.createdAt));
+    return cols
       .map(c=>`"${String(c||'').replace(/"/g,'""')}"`).join(',');
   });
-  downloadCSV(['Proposal #,Plant,Party,Product,Current ₹,Proposed ₹,Diff %,Status,Date,Created',...rows].join('\n'),'proposals.csv');
+  const header = 'Proposal #,Plant,Party,Product,Current ₹,Proposed ₹,Diff %,Status,' + (isAccounts() ? 'Accounts Ack.,ERP Ref.,' : '') + 'Date,Created';
+  downloadCSV([header,...rows].join('\n'),'proposals.csv');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
