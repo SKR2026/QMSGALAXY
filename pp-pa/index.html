@@ -2646,6 +2646,11 @@ html, body { overflow: hidden; }
                   <div class="form-group"><label>Email</label><input type="email" id="s-company-email"></div>
                 </div>
                 <div class="form-group"><label>PDF Footer Text</label><input type="text" id="s-footer-text" placeholder="Electronically approved through Price Approval System"></div>
+                <div class="form-group"><label>Live Application URL (used in all email links)</label>
+                  <div style="display:flex;gap:8px"><input type="url" id="s-app-url" placeholder="https://your-live-app-address/" style="flex:1">
+                  <button type="button" class="btn btn-secondary" onclick="document.getElementById('s-app-url').value=_currentPageUrl()">Use this page</button></div>
+                  <div style="font-size:11px;color:var(--text3);margin-top:4px">Approve / View / Reset links in emails will open this address. Open the live app, click "Use this page", then Save.</div>
+                </div>
               </div>
               <div style="display:flex;justify-content:flex-end">
                 <button class="btn btn-primary" onclick="saveCompanySettings()">Save Company Settings</button>
@@ -3581,7 +3586,7 @@ async function saveComparisonProposal(action){
         console.warn('[submit-cmp] client-side failed, trying CF:', clientErr.message);
         try {
           const submitFn=fns.httpsCallable('submitProposal');
-          const cfCmp = await submitFn({proposalId:editingId||null,proposalData:data});
+          const cfCmp = await submitFn({proposalId:editingId||null,proposalData:data,appUrl:getLiveAppUrl()});
           _cmpResult = cfCmp.data;
         } catch(cfErr) { throw clientErr; }
       }
@@ -3673,6 +3678,31 @@ const storage = firebase.storage(firebase.app());
 
 
 const fns    = firebase.app().functions('asia-south1'); // asia-south1 matches deployed functions
+
+// ── LIVE APP URL for email links ───────────────────────────────────────────
+function _currentPageUrl() { return window.location.origin + window.location.pathname; }
+function _normAppUrl(u) {
+  u = String(u || '').trim();
+  if (!u) return '';
+  if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  return u.split('#')[0].split('?')[0];
+}
+function getLiveAppUrl() {
+  const saved = (typeof appSettings !== 'undefined' && appSettings && appSettings.appUrl) ? appSettings.appUrl : '';
+  return _normAppUrl(saved) || _currentPageUrl();
+}
+// Make sure pp_settings/app.appUrl always holds the live app address
+async function ensureLiveAppUrlSaved() {
+  try {
+    if (typeof isSuperAdmin !== 'function' || !isSuperAdmin()) return;
+    if (window.location.protocol === 'file:') return;          // never store a local file path
+    if (appSettings && appSettings.appUrl) return;             // admin already set it
+    const url = _currentPageUrl();
+    await db.collection('pp_settings').doc('app').set({ appUrl: url, appUrlUpdatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    appSettings.appUrl = url;
+    console.info('[appUrl] Live application URL saved:', url);
+  } catch (e) { console.warn('[appUrl] could not save live URL', e); }
+}
   // Cloud Functions: default region (us-central1). Keep this aligned with
   // functions/index.js. All approval emails are sent server-side.
   // No Gmail credentials are stored in this browser application.
@@ -3776,6 +3806,12 @@ async function checkMagicLink() {
   const params = new URLSearchParams(window.location.search);
   const token  = params.get('magic');
   const action = params.get('action'); // approve | reject | return
+  // Email "View proposal" links: ?proposal=<id>  → open that proposal after sign-in
+  const linkProposal = params.get('proposal');
+  if (!token && linkProposal) {
+    sessionStorage.setItem('goto_proposal', linkProposal);
+    history.replaceState(null, '', window.location.pathname);
+  }
   if (!token) return false;
 
   // Show magic link screen immediately
@@ -3872,7 +3908,7 @@ async function magicLinkAction(token, proposalId, action) {
   try {
     const idToken = await auth.currentUser.getIdToken(true);
     const processFn = fns.httpsCallable('processMagicLinkApproval');
-    const result = await processFn({ token, proposalId, action, comment });
+    const result = await processFn({ token, proposalId, action, comment, appUrl: getLiveAppUrl() });
     if (result.data.success) {
       document.getElementById('ml-icon').textContent = action==='approve'?'✅':'❌';
       document.getElementById('ml-title').textContent = action==='approve'?'Proposal Approved!': action==='reject'?'Proposal Rejected':'Returned for Correction';
@@ -4330,6 +4366,7 @@ async function showApp() {
   document.getElementById('app').classList.add('visible');
   applyRoleUI();
   await Promise.all([ loadSettings(), loadPlants(), loadUsers(), loadMatrixRules() ]);
+  ensureLiveAppUrlSaved();
   setupNotifications();
   updateSidebarUser();
   loadDummyEntryToggle(); // apply dummy entry tab visibility for all users
@@ -5379,7 +5416,7 @@ async function saveProposal(action) {
         console.warn('[submit] client-side failed:', clientErr.message, '— trying CF fallback');
         try {
           const submitFn = fns.httpsCallable('submitProposal');
-          const cfResult = await submitFn({ proposalId: editingId||null, proposalData: data });
+          const cfResult = await submitFn({ proposalId: editingId||null, proposalData: data, appUrl: getLiveAppUrl() });
           _submitResult = cfResult.data;
         } catch(cfErr) {
           console.warn('[submit] CF also failed:', cfErr.message);
@@ -5835,7 +5872,7 @@ async function saveAccountsAck(proposalId, markAcknowledged) {
   try {
     // Use CF to bypass Firestore rules (Accounts cannot write pp_proposals directly)
     const saveFn = fns.httpsCallable('saveAccountsAck');
-    await saveFn({ proposalId, erpRef, updatedOn, comments, acknowledged: markAcknowledged });
+    await saveFn({ proposalId, erpRef, updatedOn, comments, acknowledged: markAcknowledged, appUrl: getLiveAppUrl() });
     toast(markAcknowledged ? '✅ Accounts acknowledged & saved!' : '💾 Draft saved', 'success');
     await logAudit(proposalId, markAcknowledged ? 'AccountsAcknowledged' : 'AccountsAckDraft',
       `ERP Ref: ${erpRef||'—'}`);
@@ -7136,7 +7173,7 @@ async function saveUser() {
       const pw = document.getElementById('um-password').value;
       if (!pw||pw.length<6) { toast('Password must be at least 6 characters','warning'); return; }
       const createFn = fns.httpsCallable('createUser');
-      const result = await createFn({ name, email, password:pw, role, department:dept, plantIds, status });
+      const result = await createFn({ name, email, password:pw, role, department:dept, plantIds, status, appUrl: getLiveAppUrl() });
       if (!result.data.success) { toast(result.data.message||'Failed to create user','error'); return; }
       data.uid = result.data.uid;
       data.id  = result.data.uid;
@@ -7630,7 +7667,7 @@ async function triggerManualEscalation() {
 
   try {
     const triggerFn = fns.httpsCallable('triggerEscalationManually');
-    const result = await triggerFn({});
+    const result = await triggerFn({ appUrl: getLiveAppUrl() });
     statusEl.innerHTML = `<div style="color:#16a34a;font-size:13px;background:#f0fdf4;padding:12px;border-radius:8px">
       ✅ Escalation complete!<br>
       <strong>Checked:</strong> ${result.data?.checked || 0} proposals<br>
@@ -7714,7 +7751,7 @@ async function sendTestEmail() {
 
   try {
     const testFn = fns.httpsCallable('testGmailNotification');
-    const result = await testFn({ to });
+    const result = await testFn({ to, appUrl: getLiveAppUrl() });
     setStatus(`Test email sent successfully to ${to}`, 'success');
     toast('Test email sent!', 'success');
   } catch(e) {
@@ -7754,6 +7791,7 @@ async function saveCompanySettings() {
       phone:        document.getElementById('s-company-phone').value.trim(),
       email:        document.getElementById('s-company-email').value.trim(),
       footerText:   document.getElementById('s-footer-text').value.trim(),
+      appUrl:       _normAppUrl(document.getElementById('s-app-url').value) || _currentPageUrl(),
       updatedAt:    firebase.firestore.FieldValue.serverTimestamp()
     };
     await db.collection('pp_settings').doc('app').set(data, {merge:true});
@@ -7849,7 +7887,7 @@ async function notifyFinalApprovalObservers(proposal, proposalId) {
       ? '₹' + Number(p.proposedPrice).toLocaleString('en-IN')
       : (p.proposedAmount !== undefined ? '₹' + Number(p.proposedAmount).toLocaleString('en-IN') : '—');
     const approvalDate = new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' });
-    const appLink      = window.location.href.split('?')[0];
+    const appLink      = getLiveAppUrl();
 
     const subject = `[CC] APPROVED: Price Proposal ${proposalNum}`;
     const body =
@@ -7868,7 +7906,7 @@ async function notifyFinalApprovalObservers(proposal, proposalId) {
     let cfSent = false;
     try {
       const ccFn = fns.httpsCallable('sendFinalApprovalCC');
-      await ccFn({ proposalId, proposalNumber: proposalNum, observers, subject, body });
+      await ccFn({ proposalId, proposalNumber: proposalNum, observers, subject, body, appUrl: getLiveAppUrl() });
       cfSent = true;
     } catch (_) {
       console.warn('[notifyFinalApprovalObservers] sendFinalApprovalCC CF not deployed — falling back to per-observer Gmail CF + in-app notification.');
@@ -7884,7 +7922,7 @@ async function notifyFinalApprovalObservers(proposal, proposalId) {
         try {
           // testGmailNotification accepts { to, subject, body } — subject & body
           // are optional but passed here so the email carries the approval details.
-          await gmailFn({ to: obs.email, subject, body });
+          await gmailFn({ to: obs.email, subject, body, appUrl: getLiveAppUrl() });
           emailsSent++;
           console.log(`[notifyFinalApprovalObservers] Email sent via Gmail CF to ${obs.email}`);
         } catch (emailErr) {
@@ -7987,7 +8025,7 @@ async function saveDigestSettings() {
     // Update Cloud Scheduler cron to match chosen time
     try {
       const updateFn = fns.httpsCallable('updateDigestSchedule');
-      await updateFn({ sendTime });
+      await updateFn({ sendTime, appUrl: getLiveAppUrl() });
       toast('\u2705 Digest settings saved & Cloud Scheduler updated to ' + sendTime + ' IST — ' + window._digestRecipients.length + ' recipient(s)', 'success', 6000);
     } catch(schedErr) {
       console.error('Cloud Scheduler update failed:', schedErr.message);
@@ -8006,7 +8044,7 @@ async function triggerDigestNow() {
   btn.disabled = true; btn.innerHTML = '<div class="spinner dark"></div> Sending…';
   try {
     const fn = fns.httpsCallable('triggerDigestManually');
-    const result = await fn({});
+    const result = await fn({ appUrl: getLiveAppUrl() });
     const d = result.data || {};
     const msg = d.message
       || `✅ Digest sent to ${d.sentCount ?? '?'} recipient(s) covering ${d.proposalCount ?? '?'} proposal(s).`;
@@ -9152,6 +9190,7 @@ async function loadSettingsPage() {
   setVal('s-company-phone', s.phone);
   setVal('s-company-email', s.email);
   setVal('s-footer-text',   s.footerText);
+  setVal('s-app-url',       s.appUrl || _currentPageUrl());
 
   // Logo preview
   const lp = document.getElementById('logo-preview-box');
@@ -9528,6 +9567,7 @@ async function executeSystemReset() {
     // Reload data and UI after short delay
     setTimeout(async () => {
       await Promise.all([loadSettings(), loadPlants(), loadUsers(), loadMatrixRules()]);
+      ensureLiveAppUrlSaved();
       navigate('dashboard');
       // Re-enable the button + form for potential second run
       confirmWrap.style.opacity = '';
