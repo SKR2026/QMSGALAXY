@@ -8819,18 +8819,67 @@ function buildComparisonDocHTML(d, plant, proposalNo, status, history, p) {
     + '</div>';
 }
 async function downloadPDF(proposalId) {
-  toast('Generating PDF via Cloud Functions…','info');
+  toast('Preparing PDF…', 'info');
   try {
-    const genFn = fns.httpsCallable('generateApprovedProposalPDF');
-    const result= await genFn({ proposalId });
-    if (result.data.url) {
-      window.open(result.data.url,'_blank');
-      await logAudit(proposalId,'Downloaded','PDF downloaded');
-    } else {
-      toast('PDF generation failed: '+result.data.message,'error');
-    }
-  } catch(e) {
-    toast(e.message||'PDF generation failed','error');
+    const snap    = await db.collection('pp_proposals').doc(proposalId).get();
+    const p       = { id: snap.id, ...snap.data() };
+    const plant   = allPlants.find(pl => pl.id === p.plantId);
+    const diff    = (p.proposedPrice || 0) - (p.currentPrice || 0);
+    const pct     = p.currentPrice ? (diff / p.currentPrice * 100) : 0;
+    const history = (Array.isArray(p.approvalHistory) ? [...p.approvalHistory] : [])
+      .sort((a, b) => (a.timestamp?.toMillis?.() || a.timestamp?.seconds || 0)
+                    - (b.timestamp?.toMillis?.() || b.timestamp?.seconds || 0));
+
+    const isComparison = p.formType === '3-Quotation Comparison';
+    // Add landscape style for comparison proposals
+    const pageStyle = isComparison
+      ? '@page { size: A4 landscape; margin: 10mm; }'
+      : '@page { size: A4 portrait; margin: 12mm; }';
+
+    const bodyHTML = isComparison && p.comparison
+      ? buildComparisonPDFHTML(p, plant, history)
+      : buildStandardPDFHTML(p, plant, diff, pct, history);
+
+    // Collect all CSS from the current page that applies to .pdf-* classes
+    const pdfStyles = Array.from(document.styleSheets)
+      .flatMap(sheet => { try { return Array.from(sheet.cssRules); } catch { return []; } })
+      .filter(r => r.cssText && r.cssText.includes('pdf'))
+      .map(r => r.cssText)
+      .join('\n');
+
+    const win = window.open('', '_blank');
+    if (!win) { toast('Pop-up blocked — please allow pop-ups and try again.', 'warning'); return; }
+
+    win.document.write(`<!DOCTYPE html><html><head>
+      <meta charset="UTF-8">
+      <title>${p.proposalNumber || 'Proposal'} — PDF</title>
+      <link rel="preconnect" href="https://fonts.googleapis.com">
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+      <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Inter', Arial, sans-serif; font-size: 14px; background: #fff; color: #111; }
+        ${pageStyle}
+        ${pdfStyles}
+        @media print { button { display: none !important; } }
+      </style>
+    </head><body>
+      <div style="position:fixed;top:12px;right:16px;display:flex;gap:8px;z-index:9999">
+        <button onclick="window.print()"
+          style="padding:8px 20px;background:#059669;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">
+          🖨️ Print / Save PDF
+        </button>
+        <button onclick="window.close()"
+          style="padding:8px 16px;background:#6b7280;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">
+          ✕ Close
+        </button>
+      </div>
+      ${bodyHTML}
+    </body></html>`);
+    win.document.close();
+
+    await logAudit(proposalId, 'Downloaded', 'PDF downloaded');
+  } catch (e) {
+    toast(e.message || 'PDF generation failed', 'error');
   }
 }
 
