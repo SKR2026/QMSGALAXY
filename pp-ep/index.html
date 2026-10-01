@@ -1749,6 +1749,18 @@ function EPI()  { return DB().collection('exampro_invites'); }
 var EP_READ_CACHE_MS = 60000;
 var _epReadCache = { docs: {}, queries: [] };
 function epClearReadCache() { _epReadCache.docs = {}; _epReadCache.queries = []; }
+
+/* LIVE QUERIES — each collection query an admin page runs is downloaded ONCE,
+   then kept up to date by a real-time listener. Later visits to any page that
+   needs the same data are instant, and Firestore only sends what changed
+   (new results, edits) instead of re-downloading whole collections. */
+var EP_LIVE_MAX = 40;          // max simultaneous listeners (oldest dropped first)
+var EP_LIVE_WAIT_MS = 2500;    // max wait for server-fresh data before using device copy
+var _epLive = [];              // [{ q, snap, ready, unsub, used }]
+function epStopLive() {
+  _epLive.forEach(function (e) { try { e.unsub && e.unsub(); } catch (x) {} });
+  _epLive = [];
+}
 function epSpeedUpFirestore() {
   var fs;
   try { fs = firebase.firestore(); } catch (e) { return; }
@@ -1773,15 +1785,42 @@ function epSpeedUpFirestore() {
   var qGet = QP.get;
   QP.get = function (opts) {
     if (opts) return qGet.call(this, opts);
-    var list = _epReadCache.queries, self = this;
-    for (var i = 0; i < list.length; i++) {
-      var e = list[i];
-      if (fresh(e)) { try { if (e.q.isEqual(self)) return e.p; } catch (x) {} }
+    var self = this;
+    // 1) Already listening to this exact query? Return the live copy instantly.
+    for (var i = 0; i < _epLive.length; i++) {
+      var e = _epLive[i];
+      try { if (e.q.isEqual(self)) { e.used = Date.now(); return e.done ? Promise.resolve(e.snap) : e.first; } } catch (x) {}
     }
-    _epReadCache.queries = list.filter(fresh);
-    var p = track(qGet.call(this));
-    _epReadCache.queries.push({ q: this, p: p, t: Date.now() });
-    return p;
+    // 2) Start a listener. Resolve as soon as server-fresh data arrives
+    //    (only changes are sent if this device already has a copy), or use the
+    //    device copy after EP_LIVE_WAIT_MS if the network is slow.
+    var entry = { q: self, snap: null, used: Date.now(), unsub: null, done: false };
+    entry.first = new Promise(function (resolve) {
+      var done = false, timer = null;
+      function finish(snap) { if (!done) { done = true; entry.done = true; if (timer) clearTimeout(timer); resolve(snap); } }
+      try {
+        entry.unsub = self.onSnapshot({ includeMetadataChanges: true }, function (snap) {
+          entry.snap = snap;                          // later gets get the newest copy
+          if (!snap.metadata.fromCache) finish(snap);
+          else if (!timer) timer = setTimeout(function () { finish(entry.snap); }, EP_LIVE_WAIT_MS);
+        }, function (err) {
+          // Listener not allowed / failed → drop it and fall back to a normal read.
+          _epLive = _epLive.filter(function (x) { return x !== entry; });
+          if (!done) { done = true; if (timer) clearTimeout(timer); resolve(qGet.call(self)); }
+        });
+      } catch (x) {
+        done = true;
+        setTimeout(function(){ _epLive = _epLive.filter(function (y) { return y !== entry; }); }, 0);
+        resolve(qGet.call(self));
+      }
+    });
+    _epLive.push(entry);
+    if (_epLive.length > EP_LIVE_MAX) {
+      _epLive.sort(function (a, b) { return a.used - b.used; });
+      var old = _epLive.shift();
+      try { old.unsub && old.unsub(); } catch (x) {}
+    }
+    return entry.first;
   };
 
   var dGet = DP.get;
@@ -2300,6 +2339,7 @@ function _epMigrateOrBootstrap(user) {
 function doLogout() {
   if (S.tmr) clearInterval(S.tmr);
   epClearReadCache();
+  epStopLive();
   AUTH().signOut().then(function(){ hideAll(); show('vAdmLog'); setTimeout(epBioInitLoginBtn, 200); });
 }
 function showE(id, m) { var e=G(id); if(e){ e.textContent=m; show(id); } }
@@ -4576,7 +4616,7 @@ function pgResults() {
   setHtml('vPgCnt',loading());
   Promise.all([
     DB().collection('exams').get(),
-    DB().collection('attempts').get(),
+    DB().collection('attempts').get(), // live-synced — always current, no re-download
     DB().collection('candidates').get(),
     DB().collection('questions').where('isActive','==',true).get()
   ]).then(function(res){
@@ -4594,6 +4634,13 @@ function pgResults() {
     // Pass allExamsMap so attempts whose candidate has a blank plant but whose exam
     // is assigned to this plant admin's plant are still included in results.
     var atts = isSuperAdmin() ? attsRaw : filterAttemptsByPlant(attsRaw, cands, allExamsMap);
+    // Exams that were STARTED but never submitted (browser closed, network
+    // dropped, time ran out offline…). They are not "completed", so they
+    // were invisible here. Show them so an admin can finalize them.
+    var unsubRaw = res[1].docs.map(function(d){return Object.assign({id:d.id},d.data());})
+                          .filter(function(a){return a.status==='in_progress';});
+    var unsub = isSuperAdmin() ? unsubRaw : filterAttemptsByPlant(unsubRaw, cands, allExamsMap);
+    window._runsub = unsub; window._rexAll = allExamsMap;
     atts.sort(function(a,b){return (b.submittedAt&&b.submittedAt.seconds||0)-(a.submittedAt&&a.submittedAt.seconds||0);});
     window._ra=atts; window._re=exams; window._rc=cands; window._rq=questions;
 
@@ -4658,13 +4705,72 @@ function pgResults() {
         '</div>';
     }
 
+    var unsubBanner = unsub.length
+      ? '<div style="background:var(--ambg);border:1px solid var(--ambd);border-radius:9px;padding:12px 14px;margin-bottom:14px;font-size:13px;color:var(--am);display:flex;gap:10px;align-items:center;flex-wrap:wrap">'+
+          '<span>⏳ <strong>'+unsub.length+'</strong> exam(s) were started but never submitted, so they are not counted in the results below.</span>'+
+          '<button class="b bg bsm" style="margin-left:auto" onclick="showUnsubmitted()">View &amp; finalize</button>'+
+        '</div>'
+      : '';
     setHtml('vPgCnt',
       diagBanner+
+      unsubBanner+
       tabBar+
       '<div id="rpanel-overview">'+buildOverview(atts,pass,avg,avgTime,deptMap,plantMap,qStats)+'</div>'+
       '<div id="rpanel-detailed" style="display:none">'+buildDetailedResults(atts,exams,cands)+'</div>'
     );
   }).catch(function(e){setHtml('vPgCnt',errB(e.message));});
+}
+
+// ── STARTED-BUT-NOT-SUBMITTED ATTEMPTS ──────────────────────
+function showUnsubmitted() {
+  var list = window._runsub || [], exams = window._rexAll || {};
+  var rows = list.map(function(a){
+    var ex = exams[a.examId] || {};
+    var answered = Object.keys(a.answers||{}).filter(function(k){ return (a.answers[k]||[]).length; }).length;
+    var total = (a.assignedQuestions||[]).length;
+    var started = a.startedAt && a.startedAt.toDate ? a.startedAt.toDate().toLocaleString('en-IN') : '—';
+    return '<tr><td class="tc">'+esc(a.employeeCode||'—')+'</td><td class="tn">'+esc(a.candidateName||'—')+'</td>'+
+      '<td style="font-size:12px">'+esc(ex.name||'—')+'</td><td style="color:var(--tx2)">'+esc(a.plantLocation||'—')+'</td>'+
+      '<td style="font-size:12px">'+started+'</td><td>'+answered+' / '+total+'</td>'+
+      '<td><button class="b bs bxs" onclick="finalizeAttempt(\''+a.id+'\')">✔ Finalize</button></td></tr>';
+  }).join('');
+  openMo('⏳ Started but not submitted',
+    '<div style="font-size:12px;color:var(--tx2);margin-bottom:10px">Finalize scores the attempt using the answers already saved (unanswered questions get 0) and adds it to Results.</div>'+
+    '<div class="tw"><table><thead><tr><th>Code</th><th>Name</th><th>Exam</th><th>Plant</th><th>Started</th><th>Answered</th><th></th></tr></thead>'+
+    '<tbody>'+(rows||noRows(7,'Nothing pending.'))+'</tbody></table></div>',
+    [{lbl:'Close',cls:'b bg',fn:'closeMo()'}]);
+}
+
+function finalizeAttempt(attId) {
+  var a = (window._runsub||[]).filter(function(x){ return x.id===attId; })[0];
+  if (!a) return;
+  if (!confirm('Finalize the exam for '+(a.candidateName||a.employeeCode||'this candidate')+' using their saved answers?')) return;
+  var ex = (window._rexAll||{})[a.examId] || {};
+  var qids = (a.assignedQuestions||[]).map(function(q){ return q.questionId; }).filter(Boolean);
+  Promise.all(qids.map(function(id){ return DB().collection('questions').doc(id).get(); }))
+    .then(function(snaps){
+      var marks = 0, maxMarks = 0, ans = a.answers || {};
+      snaps.forEach(function(sn){
+        if (!sn.exists) return;
+        var q = sn.data(), qm = q.marks || 2;
+        maxMarks += qm;
+        var ua = (ans[sn.id]||[]).slice().sort(), ca = (q.correctAnswers||[]).slice().sort();
+        if (ca.length && JSON.stringify(ua) === JSON.stringify(ca)) marks += qm;
+      });
+      var totalMarks = maxMarks > 0 ? maxMarks : (ex.totalMarks || 100);
+      var pct = totalMarks > 0 ? Math.round(marks/totalMarks*1000)/10 : 0;
+      var passScore = ex.passingMarks || CFG.passScore;
+      return DB().collection('attempts').doc(attId).update({
+        status: 'completed',
+        submittedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        marksObtained: marks, totalMarks: totalMarks, percentage: pct,
+        result: pct >= passScore ? 'pass' : 'fail',
+        certNo: a.certNo || ('CERT-'+new Date().getFullYear()+'-'+(ex.department||'GEN').substring(0,3).toUpperCase()+'-'+(a.employeeCode||'XXX')+'-'+rnd()),
+        finalizedByAdmin: CURRENT_USER.uid || ''
+      });
+    })
+    .then(function(){ closeMo(); toast('Attempt finalized and added to Results.','ok'); pgResults(); })
+    .catch(function(e){ toast('Error: '+e.message,'er'); });
 }
 
 function rSwitchTab(tab) {
