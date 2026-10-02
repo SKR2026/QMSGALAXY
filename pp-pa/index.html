@@ -5431,36 +5431,9 @@ async function saveProposal(action) {
         toast(`Proposal submitted for approval! #${result.data.proposalNumber}`,'success');
         await logAudit(result.data.proposalId, 'Submitted', `Submitted proposal ${result.data.proposalNumber}`);
         await fixSelfRoutingIfNeeded(result.data.proposalId, currentUser.uid, currentUser.email);
-        // ── Email: notify first approver on submission ───────────────────────
-        (async () => {
-          try {
-            const _s = await db.collection('pp_proposals').doc(result.data.proposalId).get();
-            if (_s.exists) {
-              const _d = _s.data();
-              _ppSendEmail(
-                _d.currentApproverEmail,
-                _d.currentApproverName,
-                'New Price Proposal Pending Your Approval: ' + _d.proposalNumber,
-                [
-                  'Dear ' + (_d.currentApproverName || _d.currentApproverEmail) + ',',
-                  '',
-                  'A new price proposal requires your approval.',
-                  '',
-                  'Proposal No. : ' + _d.proposalNumber,
-                  'Party        : ' + (_d.partyName || '—'),
-                  'Submitted by : ' + (_d.createdByName || _d.createdByEmail || '—'),
-                  'Annual Impact: ₹' + Number(_d.annualImpact || _d.proposedPrice || _d.proposedAmount || 0).toLocaleString('en-IN'),
-                  '',
-                  'Please log in to review and approve:',
-                  getLiveAppUrl(),
-                  '',
-                  'Regards,',
-                  'Price Approval System'
-                ]
-              );
-            }
-          } catch(_e) { console.warn('[ppEmail] submit read err:', _e.message); }
-        })();
+        // ── Trigger submitProposal CF to email the first approver ────────────
+        // CF reads currentApproverEmail from the already-written Firestore doc.
+        _ppSendEmail(result.data.proposalId);
         navigate('proposals');
       } else {
         toast(result.data.message||'Submission failed','error');
@@ -6622,28 +6595,8 @@ async function executeApprovalAction() {
             approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
             updatedAt: now
           });
-          // ── Email: notify next approver ──────────────────────────────
-          _ppSendEmail(
-            nextEmail,
-            nextName,
-            'Price Proposal Pending Your Approval: ' + (p.proposalNumber || proposalId),
-            [
-              'Dear ' + (nextName || nextEmail) + ',',
-              '',
-              'A price proposal has been approved at Level ' + currentLevel + ' and now requires your review at Level ' + nextLevel + '.',
-              '',
-              'Proposal No. : ' + (p.proposalNumber || proposalId),
-              'Party        : ' + (p.partyName || '—'),
-              'Annual Impact: ₹' + Number(p.annualImpact || p.proposedPrice || p.proposedAmount || 0).toLocaleString('en-IN'),
-              'Approved by  : ' + userName + ' (Level ' + currentLevel + ')',
-              '',
-              'Please log in to review and approve:',
-              getLiveAppUrl(),
-              '',
-              'Regards,',
-              'Price Approval System'
-            ]
-          );
+          // ── Trigger CF to email next approver (blue pending-approval email) ──
+          _ppSendEmail(proposalId);
         }
       } else if (action === 'reject') {
         await db.collection('pp_proposals').doc(proposalId).update({
@@ -6657,27 +6610,29 @@ async function executeApprovalAction() {
           updatedAt: now
         });
         // Per-user action log
-        // ── Email: notify creator of rejection ──────────────────────────
+        // ── Email creator about rejection ─────────────────────────────────
         (() => {
-          const _p = _snapForLevel.data();
-          _ppSendEmail(
-            _p.createdByEmail || _p.submittedByEmail,
-            _p.createdByName  || _p.submittedByName,
-            'REJECTED: Price Proposal ' + (_p.proposalNumber || proposalId),
-            [
-              'Dear ' + (_p.createdByName || _p.submittedByName || 'Proposer') + ',',
+          const _rp = _snapForLevel.data();
+          const _rEmail = _rp.createdByEmail || _rp.submittedByEmail || '';
+          if (_rEmail) fns.httpsCallable('sendFinalApprovalCC')({
+            proposalId: '', proposalNumber: '',
+            observers: [{ email: _rEmail, name: _rp.createdByName || _rp.submittedByName || 'Proposer' }],
+            subject: 'REJECTED: Price Proposal ' + (_rp.proposalNumber || proposalId),
+            body: [
+              'Dear ' + (_rp.createdByName || _rp.submittedByName || 'Proposer') + ',',
               '',
-              'Your price proposal ' + (_p.proposalNumber || proposalId) + ' has been REJECTED.',
+              'Your price proposal ' + (_rp.proposalNumber || proposalId) + ' has been REJECTED.',
               '',
-              'Reason      : ' + (comment || '—'),
+              'Reason      : ' + (comment || '\u2014'),
               'Rejected by : ' + userName,
               '',
               'Please log in to view details: ' + getLiveAppUrl(),
               '',
               'Regards,',
               'Price Approval System'
-            ]
-          );
+            ].join('\n'),
+            appUrl: getLiveAppUrl()
+          }).catch(e => console.warn('[ppEmail] reject notify failed:', e.message));
         })();
         db.collection('pp_userActions').doc(uid).collection('actions').doc(proposalId)
           .set({ proposalId, action:'Rejected', level:historyEntry.level, actionAt:nowISO, comment:comment||'', approverName:userName }, {merge:true}).catch(()=>{});
@@ -6693,52 +6648,31 @@ async function executeApprovalAction() {
           updatedAt: now
         });
         // Per-user action log
-        // ── Email: notify creator of return-for-correction ──────────────
+        // ── Email creator about return-for-correction ─────────────────────
         (() => {
-          const _p = _snapForLevel.data();
-          _ppSendEmail(
-            _p.createdByEmail || _p.submittedByEmail,
-            _p.createdByName  || _p.submittedByName,
-            'Return for Correction: ' + (_p.proposalNumber || proposalId),
-            [
-              'Dear ' + (_p.createdByName || _p.submittedByName || 'Proposer') + ',',
+          const _tp = _snapForLevel.data();
+          const _tEmail = _tp.createdByEmail || _tp.submittedByEmail || '';
+          if (_tEmail) fns.httpsCallable('sendFinalApprovalCC')({
+            proposalId: '', proposalNumber: '',
+            observers: [{ email: _tEmail, name: _tp.createdByName || _tp.submittedByName || 'Proposer' }],
+            subject: 'Return for Correction: ' + (_tp.proposalNumber || proposalId),
+            body: [
+              'Dear ' + (_tp.createdByName || _tp.submittedByName || 'Proposer') + ',',
               '',
-              'Your price proposal ' + (_p.proposalNumber || proposalId) + ' has been returned for correction.',
+              'Your price proposal ' + (_tp.proposalNumber || proposalId) + ' has been returned for correction.',
               '',
-              'Correction required : ' + (comment || '—'),
+              'Correction required : ' + (comment || '\u2014'),
               'Returned by         : ' + userName,
               '',
               'Please update and resubmit: ' + getLiveAppUrl(),
               '',
               'Regards,',
               'Price Approval System'
-            ]
-          );
+            ].join('\n'),
+            appUrl: getLiveAppUrl()
+          }).catch(e => console.warn('[ppEmail] return notify failed:', e.message));
         })();
-        // ── Email: notify creator of return-for-correction ──────────────
-        (() => {
-          const _p = _snapForLevel.data();
-          _ppSendEmail(
-            _p.createdByEmail || _p.submittedByEmail,
-            _p.createdByName  || _p.submittedByName,
-            'Return for Correction: ' + (_p.proposalNumber || proposalId),
-            [
-              'Dear ' + (_p.createdByName || _p.submittedByName || 'Proposer') + ',',
-              '',
-              'Your price proposal ' + (_p.proposalNumber || proposalId) + ' has been returned for correction.',
-              '',
-              'Correction required : ' + (comment || '—'),
-              'Returned by         : ' + userName,
-              '',
-              'Please update and resubmit: ' + getLiveAppUrl(),
-              '',
-              'Regards,',
-              'Price Approval System'
-            ]
-          );
-        })();
-        db.collection('pp_userActions').doc(uid).collection('actions').doc(proposalId)
-          .set({ proposalId, action:'Returned', level:historyEntry.level, actionAt:nowISO, comment:comment||'', approverName:userName }, {merge:true}).catch(()=>{});
+
       }
       // Firestore writes succeeded — show result and navigate
       const label = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'returned';
@@ -7994,24 +7928,22 @@ window.removeCCObserver = function(idx) {
 // email via the sendFinalApprovalCC Cloud Function (preferred) or falls back
 // to writing pp_notifications docs so they see it in-app.
 // ══════════════════════════════════════════════════════════════════════════
-//  _ppSendEmail — sends stage notification emails via sendFinalApprovalCC CF.
-//  proposalId is intentionally NOT passed so the CF uses our custom
-//  subject + body instead of rendering its "Final Approval" HTML template.
-//  Falls back to testGmailNotification if sendFinalApprovalCC fails.
+//  _ppSendEmail — triggers the submitProposal CF with an existing proposalId.
+//  The CF reads currentApproverEmail from Firestore and sends the same
+//  blue "New Proposal Awaiting Your Approval" email that approvers already
+//  receive. proposalData is passed empty because the CF reads from Firestore
+//  when proposalId is supplied.
 // ══════════════════════════════════════════════════════════════════════════
-function _ppSendEmail(toEmail, toName, subject, bodyLines) {
-  if (!toEmail) return;
-  const body      = bodyLines.join('\n');
-  const observers = [{ email: toEmail, name: toName || toEmail }];
-  // Do NOT pass proposalId — prevents CF from overriding with "Final Approval" template
-  fns.httpsCallable('sendFinalApprovalCC')({
-    proposalId: '', proposalNumber: '', observers, subject, body, appUrl: getLiveAppUrl()
-  }).then(() => {
-    console.log('[ppEmail] ✓ sent to', toEmail, '|', subject);
-  }).catch(() => {
-    fns.httpsCallable('testGmailNotification')({ to: toEmail, subject, body, appUrl: getLiveAppUrl() })
-      .then(() => console.log('[ppEmail] fallback ✓ sent to', toEmail))
-      .catch(e  => console.warn('[ppEmail] both CFs failed for', toEmail, ':', e.message || e));
+function _ppSendEmail(proposalId) {
+  if (!proposalId) return;
+  fns.httpsCallable('submitProposal')({
+    proposalId,
+    proposalData: {},
+    appUrl: getLiveAppUrl()
+  }).then(r => {
+    console.log('[ppEmail] submitProposal CF email triggered for', proposalId, r?.data);
+  }).catch(e => {
+    console.warn('[ppEmail] submitProposal CF failed for', proposalId, ':', e.message || e);
   });
 }
 
