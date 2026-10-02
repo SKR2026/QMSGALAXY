@@ -6534,99 +6534,29 @@ async function executeApprovalAction() {
         }, { merge: true }).catch(()=>{}); // fire-and-forget
 
       if (action === 'approve') {
-        // Reuse the snap already fetched above for historyEntry level
-        const snap = _snapForLevel;
-        const p = snap.data();
-        if (p.createdBy && p.createdBy === uid) {
-          throw new Error('A proposal creator cannot approve their own proposal. Another approver must approve this level.');
-        }
-        if (p.currentApproverId && p.currentApproverId !== uid) {
-          throw new Error('You are not the assigned approver for this proposal.');
-        }
-        const currentLevel = p.currentApprovalLevel || 1;
-
-        // Load matrix and compute eligible next levels for THIS proposal's annual impact.
-        const proposalMaxLevel = await getProposalMaxLevel(p);
-
-        historyEntry.level = currentLevel;
-        historyEntry.action = (currentLevel >= proposalMaxLevel) ? 'Approved' : 'Recommended';
-
-        if (currentLevel >= proposalMaxLevel) {
-          // Final level — mark fully approved
-          await db.collection('pp_proposals').doc(proposalId).update({
-            status: 'Approved',
-            approvedAt: now,
-            lastApprovalComment: comment || '',
-            approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
-            approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
-            updatedAt: now
+        // Use processApproval CF — it handles routing, history, AND sends the correct
+        // blue "Pending Approval" email with magic link to the next approver.
+        // Direct Firestore writes were bypassing the email step entirely.
+        try {
+          const approveFn = fns.httpsCallable('processApproval');
+          const approveResult = await approveFn({
+            proposalId,
+            comment: comment || '',
+            appUrl: getLiveAppUrl()
           });
-          // onProposalWritten CF handles all final-approval emails server-side
-        } else {
-          // Reload allUsers to ensure all approvers are in cache
-          await loadUsers();
-
-          // Find next level above currentLevel — also skip levels at or below
-          // the proposal creator's own matrix level (they can't approve their own)
-          const creatorLvl = await getCreatorLevel(p);
-          const _matrixSnap2 = await db.collection('pp_approvalMatrices').get();
-          const allLevelsAbove = [...new Set(
-            _matrixSnap2.docs
-              .map(d => ({...d.data()}))
-              .filter(r => Number(r.level||0) > currentLevel)
-              .filter(r => { const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []); return !ids.length || ids.includes(p.plantId); })
-              .filter(r => (!r.category || r.category===p.category))
-              .map(r => Number(r.level||0))
-              .filter(Boolean)
-          )].sort((a,b)=>a-b);
-
-          // Skip levels at or below creator's level, and skip levels where
-          // the only approver is the creator
-          let nextLevel = null;
-          let nextApprover = null;
-          for (const lvl of allLevelsAbove) {
-            if (lvl <= creatorLvl) continue; // skip — creator's own level or below
-            try {
-              const cand = await resolveApprover(p, lvl);
-              if (cand?.email) { nextLevel = lvl; nextApprover = cand; break; }
-            } catch(_) {}
-          }
-
-          if (!nextLevel || !nextApprover) {
-            await db.collection('pp_proposals').doc(proposalId).update({
-              status: 'Approved', approvedAt: now,
-              lastApprovalComment: comment || '',
-              approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
-              approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
-              updatedAt: now
-            });
-            // onProposalWritten CF handles all final-approval emails server-side
-            closeModal('approval-modal-overlay');
-            toast('Proposal finally approved!','success');
-            navigate('proposals');
-            return;
-          }
-
-          // Use shared resolveApprover — skips proposal creator, amount-aware
-          const nextUid   = nextApprover.uid || nextApprover.rule?.approverId || null;
-          const nextEmail = nextApprover.email;
-          const nextName  = nextApprover.name;
-          const rule      = nextApprover.rule;
-
-          const _nextIsFinal = nextLevel >= proposalMaxLevel;
-          await db.collection('pp_proposals').doc(proposalId).update({
-            status: 'Pending Approval',
-            currentApprovalLevel: nextLevel,
-            currentApproverId: nextUid,
-            currentApproverEmail: nextEmail,
-            currentApproverName: nextName,
-            levelName: rule?.levelName || null,
-            lastApprovalComment: comment || '',
-            approvalHistory: firebase.firestore.FieldValue.arrayUnion(historyEntry),
-            approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
-            updatedAt: now
-          });
+          if (!approveResult.data?.success) throw new Error('Approval CF returned failure.');
+        } catch(cfErr) {
+          resetBtn();
+          toast('Approval failed: ' + (cfErr.message || 'Unknown error'), 'error');
+          return;
         }
+        closeModal('approval-modal-overlay');
+        await logAudit(proposalId, 'Approved', comment || '');
+        toast('Action recorded — next approver has been notified', 'success');
+        await refreshAll();
+        navigate('proposals');
+        return;
+
       } else if (action === 'reject') {
         await db.collection('pp_proposals').doc(proposalId).update({
           status: 'Rejected',
