@@ -5379,7 +5379,10 @@ async function saveProposal(action) {
     const plant   = allPlants.find(p=>p.id===plantId);
 
     const qtyMonth     = parseFloat(document.getElementById('pf-qty-month')?.value)||0;
-    const monthlyImpact = qtyMonth ? (diff * qtyMonth) : 0;
+    // Use proposedPrice (not diff) when currentPrice is zero/unknown (new items).
+    // This ensures routing is based on full annual spend, not just the price change.
+    const _impactBase   = (currentPrice > 0) ? Math.abs(diff) : Math.abs(proposedPrice);
+    const monthlyImpact = qtyMonth ? (_impactBase * qtyMonth) : 0;
     const annualImpact  = monthlyImpact * 12;
 
     const data = {
@@ -5431,9 +5434,8 @@ async function saveProposal(action) {
         toast(`Proposal submitted for approval! #${result.data.proposalNumber}`,'success');
         await logAudit(result.data.proposalId, 'Submitted', `Submitted proposal ${result.data.proposalNumber}`);
         await fixSelfRoutingIfNeeded(result.data.proposalId, currentUser.uid, currentUser.email);
-        // ── Trigger submitProposal CF to email the first approver ────────────
-        // CF reads currentApproverEmail from the already-written Firestore doc.
-        _ppSendEmail(result.data.proposalId);
+        // Trigger blue 'Pending Approval' email to first approver
+        _ppTriggerApprovalEmail(result.data.proposalId);
         navigate('proposals');
       } else {
         toast(result.data.message||'Submission failed','error');
@@ -5963,7 +5965,12 @@ function clientResolveAnnualImpact(p) {
     }, 0);
     if (total > 0) return total;
   }
-  return Math.abs(Number(p.proposedPrice ?? p.newPrice ?? p.proposedAmount ?? 0));
+  // Fallback: use proposedPrice × monthly qty × 12 if qty is known;
+  // otherwise bare proposedPrice. This ensures new items (currentPrice=0)
+  // and proposals with no explicit annualImpact are still routed correctly.
+  const _price = Math.abs(Number(p.proposedPrice ?? p.newPrice ?? p.proposedAmount ?? 0));
+  const _qty   = Number(p.approxQtyMonth || p.qtyMonth || 0);
+  return _qty > 0 ? _price * _qty * 12 : _price;
 }
 
 // getCreatorLevel — returns the highest matrix level the proposal creator sits at (0 if not in matrix).
@@ -6595,8 +6602,8 @@ async function executeApprovalAction() {
             approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
             updatedAt: now
           });
-          // ── Trigger CF to email next approver (blue pending-approval email) ──
-          _ppSendEmail(proposalId);
+          // Trigger blue 'Pending Approval' email to next approver
+          _ppTriggerApprovalEmail(proposalId);
         }
       } else if (action === 'reject') {
         await db.collection('pp_proposals').doc(proposalId).update({
@@ -6610,30 +6617,6 @@ async function executeApprovalAction() {
           updatedAt: now
         });
         // Per-user action log
-        // ── Email creator about rejection ─────────────────────────────────
-        (() => {
-          const _rp = _snapForLevel.data();
-          const _rEmail = _rp.createdByEmail || _rp.submittedByEmail || '';
-          if (_rEmail) fns.httpsCallable('sendFinalApprovalCC')({
-            proposalId: '', proposalNumber: '',
-            observers: [{ email: _rEmail, name: _rp.createdByName || _rp.submittedByName || 'Proposer' }],
-            subject: 'REJECTED: Price Proposal ' + (_rp.proposalNumber || proposalId),
-            body: [
-              'Dear ' + (_rp.createdByName || _rp.submittedByName || 'Proposer') + ',',
-              '',
-              'Your price proposal ' + (_rp.proposalNumber || proposalId) + ' has been REJECTED.',
-              '',
-              'Reason      : ' + (comment || '\u2014'),
-              'Rejected by : ' + userName,
-              '',
-              'Please log in to view details: ' + getLiveAppUrl(),
-              '',
-              'Regards,',
-              'Price Approval System'
-            ].join('\n'),
-            appUrl: getLiveAppUrl()
-          }).catch(e => console.warn('[ppEmail] reject notify failed:', e.message));
-        })();
         db.collection('pp_userActions').doc(uid).collection('actions').doc(proposalId)
           .set({ proposalId, action:'Rejected', level:historyEntry.level, actionAt:nowISO, comment:comment||'', approverName:userName }, {merge:true}).catch(()=>{});
       } else if (action === 'return') {
@@ -6648,31 +6631,8 @@ async function executeApprovalAction() {
           updatedAt: now
         });
         // Per-user action log
-        // ── Email creator about return-for-correction ─────────────────────
-        (() => {
-          const _tp = _snapForLevel.data();
-          const _tEmail = _tp.createdByEmail || _tp.submittedByEmail || '';
-          if (_tEmail) fns.httpsCallable('sendFinalApprovalCC')({
-            proposalId: '', proposalNumber: '',
-            observers: [{ email: _tEmail, name: _tp.createdByName || _tp.submittedByName || 'Proposer' }],
-            subject: 'Return for Correction: ' + (_tp.proposalNumber || proposalId),
-            body: [
-              'Dear ' + (_tp.createdByName || _tp.submittedByName || 'Proposer') + ',',
-              '',
-              'Your price proposal ' + (_tp.proposalNumber || proposalId) + ' has been returned for correction.',
-              '',
-              'Correction required : ' + (comment || '\u2014'),
-              'Returned by         : ' + userName,
-              '',
-              'Please update and resubmit: ' + getLiveAppUrl(),
-              '',
-              'Regards,',
-              'Price Approval System'
-            ].join('\n'),
-            appUrl: getLiveAppUrl()
-          }).catch(e => console.warn('[ppEmail] return notify failed:', e.message));
-        })();
-
+        db.collection('pp_userActions').doc(uid).collection('actions').doc(proposalId)
+          .set({ proposalId, action:'Returned', level:historyEntry.level, actionAt:nowISO, comment:comment||'', approverName:userName }, {merge:true}).catch(()=>{});
       }
       // Firestore writes succeeded — show result and navigate
       const label = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'returned';
@@ -7927,31 +7887,78 @@ window.removeCCObserver = function(idx) {
 // Reads ccObservers from pp_settings/approval, then sends each observer an
 // email via the sendFinalApprovalCC Cloud Function (preferred) or falls back
 // to writing pp_notifications docs so they see it in-app.
-// ══════════════════════════════════════════════════════════════════════════
-//  _ppSendEmail — triggers the submitProposal CF with an existing proposalId.
-//  The CF reads currentApproverEmail from Firestore and sends the same
-//  blue "New Proposal Awaiting Your Approval" email that approvers already
-//  receive. proposalData is passed empty because the CF reads from Firestore
-//  when proposalId is supplied.
-// ══════════════════════════════════════════════════════════════════════════
-function _ppSendEmail(proposalId) {
+// ── _ppTriggerApprovalEmail ───────────────────────────────────────────────────
+// Calls submitProposal CF with an existing proposalId so the CF reads
+// currentApproverEmail from Firestore and sends the blue "Pending Approval" email.
+// Fire-and-forget — never blocks the approval flow.
+function _ppTriggerApprovalEmail(proposalId) {
   if (!proposalId) return;
-  fns.httpsCallable('submitProposal')({
-    proposalId,
-    proposalData: {},
-    appUrl: getLiveAppUrl()
-  }).then(r => {
-    console.log('[ppEmail] submitProposal CF email triggered for', proposalId, r?.data);
-  }).catch(e => {
-    console.warn('[ppEmail] submitProposal CF failed for', proposalId, ':', e.message || e);
-  });
+  fns.httpsCallable('submitProposal')({ proposalId, proposalData: {}, appUrl: getLiveAppUrl() })
+    .then(() => console.log('[ppEmail] approval email triggered for', proposalId))
+    .catch(e  => console.warn('[ppEmail] submitProposal CF failed:', e.message || e));
 }
 
 async function notifyFinalApprovalObservers(proposal, proposalId) {
   try {
     // 1. Load observers from Firestore (fresh read, not stale window._ccObservers)
     const settSnap = await db.collection('pp_settings').doc('approval').get();
-    const observers = (settSnap.exists ? settSnap.data()?.ccObservers : null) || window._ccObservers || [];
+    const allObservers = (settSnap.exists ? settSnap.data()?.ccObservers : null) || window._ccObservers || [];
+
+    // ── Filter to ONLY the final authority for this proposal ──────────────────
+    // Determine which level is the final approval level for this proposal's
+    // annual impact, then find that approver's email from the matrix.
+    // Only send CC to the observer whose email matches the final authority.
+    // This prevents intermediate approvers, proposers, and unrelated observers
+    // from receiving the "Finally Approved" CC email.
+    let finalAuthorityEmail = null;
+    try {
+      const _mSnap = await db.collection('pp_approvalMatrices').get();
+      const _mRules = _mSnap.docs.map(d => ({...d.data(), id: d.id}))
+        .filter(r => { const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []); return !ids.length || ids.includes(proposal.plantId); })
+        .filter(r => !r.category || r.category === proposal.category);
+      const _mLevels = [...new Set(_mRules.map(r => Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
+      const _amount  = clientResolveAnnualImpact(proposal);
+      // Final level = first level whose maxValue >= amount (per matrix description)
+      let _finalLevel = _mLevels.length ? Math.max(..._mLevels) : 1;
+      for (const lvl of _mLevels) {
+        const covered = _mRules.filter(r => Number(r.level||0) === lvl)
+          .some(r => { const m = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue); return _amount <= m; });
+        if (covered) { _finalLevel = lvl; break; }
+      }
+      // Get the approver email at the final level
+      const _finalRule = _mRules.filter(r => Number(r.level||0) === _finalLevel)[0];
+      if (_finalRule) {
+        // Try to resolve email via pp_users (approverId may be a Firestore doc id)
+        if (_finalRule.approverEmail) {
+          finalAuthorityEmail = _finalRule.approverEmail.trim().toLowerCase();
+        } else if (_finalRule.approverId) {
+          try {
+            const _uSnap = await db.collection('pp_users').doc(_finalRule.approverId).get();
+            if (_uSnap.exists) finalAuthorityEmail = (_uSnap.data().email||'').trim().toLowerCase();
+          } catch(_) {}
+          if (!finalAuthorityEmail) {
+            const _uMatch = allUsers.find(u => u.id===_finalRule.approverId || u.uid===_finalRule.approverId);
+            if (_uMatch?.email) finalAuthorityEmail = _uMatch.email.trim().toLowerCase();
+          }
+        }
+      }
+    } catch(_fe) {
+      console.warn('[notifyFinalApprovalObservers] could not resolve final authority:', _fe.message);
+    }
+
+    // Keep only the observer whose email matches the final authority.
+    // If nobody in ccObservers matches, send directly to the final authority email.
+    let observers;
+    if (finalAuthorityEmail) {
+      observers = allObservers.filter(o => (o.email||'').trim().toLowerCase() === finalAuthorityEmail);
+      if (!observers.length) {
+        // Final authority not in ccObservers — add them so they still get the email
+        observers = [{ email: finalAuthorityEmail, name: finalAuthorityEmail }];
+      }
+    } else {
+      observers = allObservers; // fallback: send to all if we couldn't determine final authority
+    }
+
     if (!observers.length) return; // nothing to do
 
     const p = proposal;
