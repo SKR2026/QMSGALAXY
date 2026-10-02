@@ -5435,7 +5435,8 @@ async function saveProposal(action) {
         await logAudit(result.data.proposalId, 'Submitted', `Submitted proposal ${result.data.proposalNumber}`);
         await fixSelfRoutingIfNeeded(result.data.proposalId, currentUser.uid, currentUser.email);
         // Trigger blue 'Pending Approval' email to first approver
-        _ppTriggerApprovalEmail(result.data.proposalId);
+        // Small delay ensures Firestore write is committed before CF reads the doc
+        setTimeout(() => _ppTriggerApprovalEmail(result.data.proposalId), 800);
         navigate('proposals');
       } else {
         toast(result.data.message||'Submission failed','error');
@@ -6631,7 +6632,8 @@ async function executeApprovalAction() {
             updatedAt: now
           });
           // Trigger blue 'Pending Approval' email to next approver
-          _ppTriggerApprovalEmail(proposalId);
+          // Small delay ensures Firestore write is committed before CF reads the doc
+          setTimeout(() => _ppTriggerApprovalEmail(proposalId), 800);
         }
       } else if (action === 'reject') {
         await db.collection('pp_proposals').doc(proposalId).update({
@@ -7916,14 +7918,26 @@ window.removeCCObserver = function(idx) {
 // email via the sendFinalApprovalCC Cloud Function (preferred) or falls back
 // to writing pp_notifications docs so they see it in-app.
 // ── _ppTriggerApprovalEmail ───────────────────────────────────────────────────
-// Calls submitProposal CF with an existing proposalId so the CF reads
-// currentApproverEmail from Firestore and sends the blue "Pending Approval" email.
+// Reads the proposal from Firestore (to get the FULL proposalData including the
+// already-assigned proposalNumber) then calls submitProposal CF so the CF:
+//   • Does NOT generate a new proposal number (proposalId exists + proposalNumber present)
+//   • Sends the blue "Pending Approval" email to currentApproverEmail
 // Fire-and-forget — never blocks the approval flow.
 function _ppTriggerApprovalEmail(proposalId) {
   if (!proposalId) return;
-  fns.httpsCallable('submitProposal')({ proposalId, proposalData: {}, appUrl: getLiveAppUrl() })
-    .then(() => console.log('[ppEmail] approval email triggered for', proposalId))
-    .catch(e  => console.warn('[ppEmail] submitProposal CF failed:', e.message || e));
+  db.collection('pp_proposals').doc(proposalId).get().then(snap => {
+    if (!snap.exists) return;
+    const proposalData = snap.data();
+    // Strip Firestore server timestamps that can't be serialised over httpsCallable
+    delete proposalData.createdAt;
+    delete proposalData.updatedAt;
+    delete proposalData.approvedAt;
+    delete proposalData.rejectedAt;
+    delete proposalData.returnedAt;
+    fns.httpsCallable('submitProposal')({ proposalId, proposalData, appUrl: getLiveAppUrl() })
+      .then(() => console.log('[ppEmail] approval email triggered for', proposalId))
+      .catch(e  => console.warn('[ppEmail] submitProposal CF failed:', e.message || e));
+  }).catch(e => console.warn('[ppEmail] read failed for', proposalId, ':', e.message || e));
 }
 
 async function notifyFinalApprovalObservers(proposal, proposalId) {
