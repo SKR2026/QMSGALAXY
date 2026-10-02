@@ -5438,10 +5438,8 @@ async function saveProposal(action) {
             if (_s.exists) {
               const _d = _s.data();
               _ppSendEmail(
-                _d.currentApproverEmail,
-                _d.currentApproverName,
-                result.data.proposalId,
-                _d.proposalNumber,
+                _d.currentApproverEmail, _d.currentApproverName,
+                result.data.proposalId, _d.proposalNumber,
                 'New Price Proposal Pending Your Approval: ' + _d.proposalNumber,
                 [
                   'Dear ' + (_d.currentApproverName || _d.currentApproverEmail) + ',',
@@ -6068,12 +6066,17 @@ async function getProposalMaxLevel(p) {
     .filter(r => { const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []); return !ids.length || ids.includes(p.plantId); })
     .filter(r => !r.category || r.category === p.category);
   const levels = [...new Set(allRules.map(r=>Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
-  for (const lvl of levels) {
+  // Return the HIGHEST level that must approve this proposal.
+  // A level "must approve" when its maxValue covers the amount (or is blank = no limit).
+  // Walking from highest to lowest: the first level whose maxValue >= amount is the ceiling.
+  // Any level with no maxValue (blank) is always required if it is the highest level.
+  let maxLevel = levels.length ? Math.max(...levels) : 1;
+  for (const lvl of [...levels].reverse()) {
     const covered = allRules.filter(r=>Number(r.level||0)===lvl)
       .some(r => { const max = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue); return amount <= max; });
-    if (covered) return lvl;
+    if (covered) { maxLevel = lvl; } else { break; }
   }
-  return levels.length ? Math.max(...levels) : 1;
+  return maxLevel;
 }
 
 // resolveApprover — finds the right approver at a given level, skipping the proposal creator
@@ -6284,13 +6287,14 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   )].sort((a,b) => a-b);
   console.log('[routing] allLevels:', allLevels);
 
-  // Compute amount-based stop level
+  // Compute amount-based stop level — use the HIGHEST level that covers the amount.
+  // A level with blank maxValue (no limit) is always required if it is the highest level.
   const amount = clientResolveAnnualImpact({...proposalData, createdBy: uid, createdByEmail: creatorEmail});
   let maxLevel = allLevels[allLevels.length-1] || 1;
-  for (const lvl of allLevels) {
+  for (const lvl of [...allLevels].reverse()) {
     const rules = matrixSnap.docs.map(d=>d.data()).filter(r=>Number(r.level||0)===lvl);
     const covered = rules.some(r=>{ const m=(r.maxValue==null||r.maxValue==='')?Infinity:Number(r.maxValue); return amount<=m; });
-    if (covered) { maxLevel = lvl; break; }
+    if (covered) { maxLevel = lvl; } else { break; }
   }
 
   console.log('[routing] amount:', amount, 'maxLevel:', maxLevel, 'creatorLevel:', creatorLevel);
@@ -6623,12 +6627,9 @@ async function executeApprovalAction() {
             approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
             updatedAt: now
           });
-          // ── Email the next approver ────────────────────────────────────
+          // ── Email the next approver ───────────────────────────────────
           _ppSendEmail(
-            nextEmail,
-            nextName,
-            proposalId,
-            p.proposalNumber || proposalId,
+            nextEmail, nextName, proposalId, p.proposalNumber || proposalId,
             'Price Proposal Pending Your Approval: ' + (p.proposalNumber || proposalId),
             [
               'Dear ' + (nextName || nextEmail) + ',',
@@ -6658,29 +6659,16 @@ async function executeApprovalAction() {
           updatedAt: now
         });
         // Per-user action log
-        // ── Email the proposal creator about rejection ──────────────────
+        // ── Email creator about rejection ─────────────────────────────
         (() => {
           const _p = _snapForLevel.data();
-          _ppSendEmail(
-            _p.createdByEmail || _p.submittedByEmail,
-            _p.createdByName  || _p.submittedByName,
-            proposalId,
-            _p.proposalNumber || proposalId,
-            'REJECTED: Price Proposal ' + (_p.proposalNumber || proposalId),
-            [
-              'Dear ' + (_p.createdByName || _p.submittedByName || 'Proposer') + ',',
-              '',
-              'Your price proposal ' + (_p.proposalNumber || proposalId) + ' has been REJECTED.',
-              '',
-              'Reason      : ' + (comment || '—'),
-              'Rejected by : ' + userName,
-              '',
-              'View: ' + getLiveAppUrl(),
-              '',
-              'Regards,',
-              'Price Approval System'
-            ]
-          );
+          _ppSendEmail(_p.createdByEmail||_p.submittedByEmail, _p.createdByName||_p.submittedByName,
+            proposalId, _p.proposalNumber||proposalId,
+            'REJECTED: Price Proposal ' + (_p.proposalNumber||proposalId),
+            ['Dear ' + (_p.createdByName||_p.submittedByName||'Proposer') + ',', '',
+             'Your price proposal ' + (_p.proposalNumber||proposalId) + ' has been REJECTED.', '',
+             'Reason: ' + (comment||'—'), 'Rejected by: ' + userName, '',
+             'View: ' + getLiveAppUrl(), '', 'Regards,', 'Price Approval System']);
         })();
         db.collection('pp_userActions').doc(uid).collection('actions').doc(proposalId)
           .set({ proposalId, action:'Rejected', level:historyEntry.level, actionAt:nowISO, comment:comment||'', approverName:userName }, {merge:true}).catch(()=>{});
@@ -6696,29 +6684,27 @@ async function executeApprovalAction() {
           updatedAt: now
         });
         // Per-user action log
-        // ── Email the proposal creator about return-for-correction ──────
+        // ── Email creator about return-for-correction ─────────────────
         (() => {
           const _p = _snapForLevel.data();
-          _ppSendEmail(
-            _p.createdByEmail || _p.submittedByEmail,
-            _p.createdByName  || _p.submittedByName,
-            proposalId,
-            _p.proposalNumber || proposalId,
-            'Return for Correction: ' + (_p.proposalNumber || proposalId),
-            [
-              'Dear ' + (_p.createdByName || _p.submittedByName || 'Proposer') + ',',
-              '',
-              'Your price proposal ' + (_p.proposalNumber || proposalId) + ' has been returned for correction.',
-              '',
-              'Correction required : ' + (comment || '—'),
-              'Returned by         : ' + userName,
-              '',
-              'Please update and resubmit: ' + getLiveAppUrl(),
-              '',
-              'Regards,',
-              'Price Approval System'
-            ]
-          );
+          _ppSendEmail(_p.createdByEmail||_p.submittedByEmail, _p.createdByName||_p.submittedByName,
+            proposalId, _p.proposalNumber||proposalId,
+            'Return for Correction: ' + (_p.proposalNumber||proposalId),
+            ['Dear ' + (_p.createdByName||_p.submittedByName||'Proposer') + ',', '',
+             'Your proposal ' + (_p.proposalNumber||proposalId) + ' has been returned for correction.', '',
+             'Correction required: ' + (comment||'—'), 'Returned by: ' + userName, '',
+             'Please update and resubmit: ' + getLiveAppUrl(), '', 'Regards,', 'Price Approval System']);
+        })();
+        // ── Email creator about return-for-correction ─────────────────
+        (() => {
+          const _p = _snapForLevel.data();
+          _ppSendEmail(_p.createdByEmail||_p.submittedByEmail, _p.createdByName||_p.submittedByName,
+            proposalId, _p.proposalNumber||proposalId,
+            'Return for Correction: ' + (_p.proposalNumber||proposalId),
+            ['Dear ' + (_p.createdByName||_p.submittedByName||'Proposer') + ',', '',
+             'Your proposal ' + (_p.proposalNumber||proposalId) + ' has been returned for correction.', '',
+             'Correction required: ' + (comment||'—'), 'Returned by: ' + userName, '',
+             'Please update and resubmit: ' + getLiveAppUrl(), '', 'Regards,', 'Price Approval System']);
         })();
         db.collection('pp_userActions').doc(uid).collection('actions').doc(proposalId)
           .set({ proposalId, action:'Returned', level:historyEntry.level, actionAt:nowISO, comment:comment||'', approverName:userName }, {merge:true}).catch(()=>{});
@@ -7977,26 +7963,19 @@ window.removeCCObserver = function(idx) {
 // email via the sendFinalApprovalCC Cloud Function (preferred) or falls back
 // to writing pp_notifications docs so they see it in-app.
 // ══════════════════════════════════════════════════════════════════════════
-//  _ppSendEmail — sends via sendFinalApprovalCC CF (the same CF used for
-//  final-approval CC emails, which are confirmed working).
+//  _ppSendEmail — sends via sendFinalApprovalCC CF (confirmed working for CC).
 //  Falls back to testGmailNotification if that CF is not deployed.
 // ══════════════════════════════════════════════════════════════════════════
 function _ppSendEmail(toEmail, toName, proposalId, proposalNumber, subject, bodyLines) {
   if (!toEmail) return;
   const body      = bodyLines.join('\n');
   const observers = [{ email: toEmail, name: toName || toEmail }];
-  // Try the deployed sendFinalApprovalCC CF first — same one that handles CC emails
   fns.httpsCallable('sendFinalApprovalCC')({
-    proposalId:    proposalId || '',
-    proposalNumber: proposalNumber || proposalId || '',
-    observers,
-    subject,
-    body,
-    appUrl: getLiveAppUrl()
+    proposalId: proposalId || '', proposalNumber: proposalNumber || proposalId || '',
+    observers, subject, body, appUrl: getLiveAppUrl()
   }).then(() => {
     console.log('[ppEmail] sent via sendFinalApprovalCC to', toEmail);
   }).catch(() => {
-    // Fallback: testGmailNotification
     fns.httpsCallable('testGmailNotification')({ to: toEmail, subject, body, appUrl: getLiveAppUrl() })
       .then(() => console.log('[ppEmail] sent via testGmailNotification to', toEmail))
       .catch(e  => console.warn('[ppEmail] both CFs failed for', toEmail, ':', e.message || e));
