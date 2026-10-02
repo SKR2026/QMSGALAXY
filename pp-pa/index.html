@@ -2722,6 +2722,7 @@ html, body { overflow: hidden; }
                   <option value="return">Returned for Correction</option>
                   <option value="reminder">Approval Reminder</option>
                   <option value="magic_link">Magic Link Notification</option>
+                  <option value="accounts_ack">Accounts Acknowledgement</option>
                 </select>
               </div>
               <div class="form-group"><label>Subject</label><input type="text" id="email-template-subject"></div>
@@ -5876,6 +5877,65 @@ async function saveAccountsAck(proposalId, markAcknowledged) {
     // Use CF to bypass Firestore rules (Accounts cannot write pp_proposals directly)
     const saveFn = fns.httpsCallable('saveAccountsAck');
     await saveFn({ proposalId, erpRef, updatedOn, comments, acknowledged: markAcknowledged, appUrl: getLiveAppUrl() });
+    // ── Email: notify creator & CC observers on Accounts Acknowledgement ──
+    if (markAcknowledged) {
+      try {
+        const _ackSnap = await db.collection('pp_proposals').doc(proposalId).get();
+        if (_ackSnap.exists) {
+          const _ap     = _ackSnap.data();
+          const _aEmail = _ap.createdByEmail || _ap.submittedByEmail || '';
+          const _aName  = _ap.createdByName  || _ap.submittedByName  || 'Proposer';
+          const _aNum   = _ap.proposalNumber || proposalId;
+          const _ackBy  = currentProfile?.name || currentUser?.email || 'Accounts';
+          if (_aEmail) _sendStageEmail(
+            _aEmail,
+            `Accounts Acknowledged: Price Proposal ${_aNum}`,
+            [
+              `Dear ${_aName},`,
+              '',
+              `Price proposal ${_aNum} has been updated in the system by Accounts.`,
+              '',
+              `ERP / System Ref : ${erpRef || '—'}`,
+              `Updated On       : ${updatedOn || new Date().toLocaleDateString('en-IN')}`,
+              `Acknowledged by  : ${_ackBy}`,
+              comments ? `Comments : ${comments}` : '',
+              '',
+              `View: ${getLiveAppUrl()}`,
+              '',
+              'Regards,',
+              'Price Approval System'
+            ].filter(Boolean)
+          ).catch(()=>{});
+          try {
+            const _ss = await db.collection('pp_settings').doc('approval').get();
+            const _obs = (_ss.exists ? _ss.data()?.ccObservers : null) || [];
+            const _amt = _ap.proposedPrice != null
+              ? '₹' + Number(_ap.proposedPrice).toLocaleString('en-IN')
+              : '₹' + Number(_ap.proposedAmount || 0).toLocaleString('en-IN');
+            for (const _o of _obs) {
+              if (!_o.email || _o.email === _aEmail) continue;
+              _sendStageEmail(
+                _o.email,
+                `[CC] Accounts Acknowledged: ${_aNum}`,
+                [
+                  `Dear ${_o.name || _o.email},`,
+                  '',
+                  `Price proposal ${_aNum} (${_ap.partyName || '—'}, ${_amt}) has been acknowledged by Accounts.`,
+                  '',
+                  `ERP / System Ref : ${erpRef || '—'}`,
+                  `Acknowledged by  : ${_ackBy}`,
+                  '',
+                  `View: ${getLiveAppUrl()}`,
+                  '',
+                  'Regards,',
+                  'Price Approval System'
+                ]
+              ).catch(()=>{});
+            }
+          } catch(_oe) { console.warn('[ackEmail] CC observers:', _oe.message); }
+        }
+      } catch(_ae) { console.warn('[ackEmail] non-fatal:', _ae.message); }
+    }
     toast(markAcknowledged ? '✅ Accounts acknowledged & saved!' : '💾 Draft saved', 'success');
     await logAudit(proposalId, markAcknowledged ? 'AccountsAcknowledged' : 'AccountsAckDraft',
       `ERP Ref: ${erpRef||'—'}`);
@@ -6438,6 +6498,28 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
     }
   }, 3000);
 
+  // ── Email: notify first approver on submission ──────────────────────────
+  _sendStageEmail(
+    approver.email,
+    `New Price Proposal Pending Your Approval: ${proposalNumber}`,
+    [
+      `Dear ${approver.name || approver.email},`,
+      '',
+      'A new price proposal requires your approval.',
+      '',
+      `Proposal   : ${proposalNumber}`,
+      `Plant      : ${proposalData.plantName || proposalData.plantId || '—'}`,
+      `Party      : ${proposalData.partyName || '—'}`,
+      `Proposed   : ₹${Number(proposalData.proposedPrice || proposalData.proposedAmount || 0).toLocaleString('en-IN')}`,
+      `Submitted by: ${userProfile.name || creatorEmail}`,
+      '',
+      `View & Approve: ${getLiveAppUrl()}`,
+      '',
+      'Regards,',
+      'Price Approval System'
+    ]
+  ).catch(()=>{});
+
   return { success: true, proposalId: docRef.id, proposalNumber };
 }
 
@@ -6592,6 +6674,27 @@ async function executeApprovalAction() {
             approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
             updatedAt: now
           });
+          // ── Email: notify next-level approver ─────────────────────────────
+          _sendStageEmail(
+            nextEmail,
+            `Price Proposal Pending Your Approval (Level ${nextLevel}): ${p.proposalNumber || proposalId}`,
+            [
+              `Dear ${nextName},`,
+              '',
+              `Proposal ${p.proposalNumber || proposalId} has been approved at Level ${currentLevel} and now requires your review.`,
+              '',
+              `Plant      : ${p.plantName || p.plantId || '—'}`,
+              `Party      : ${p.partyName || '—'}`,
+              `Proposed   : ₹${Number(p.proposedPrice || p.proposedAmount || 0).toLocaleString('en-IN')}`,
+              `Approved by: ${userName}`,
+              '',
+              `View & Approve: ${getLiveAppUrl()}`,
+              '',
+              'Regards,',
+              'Price Approval System'
+            ]
+          ).catch(()=>{});
+
         }
       } else if (action === 'reject') {
         await db.collection('pp_proposals').doc(proposalId).update({
@@ -6604,6 +6707,29 @@ async function executeApprovalAction() {
           approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
           updatedAt: now
         });
+        // ── Email: notify creator of rejection ────────────────────────────
+        (() => {
+          const _rp = _snapForLevel.data();
+          const _rEmail = _rp.createdByEmail || _rp.submittedByEmail || '';
+          const _rName  = _rp.createdByName  || _rp.submittedByName  || 'Proposer';
+          if (_rEmail) _sendStageEmail(
+            _rEmail,
+            `REJECTED: Price Proposal ${_rp.proposalNumber || proposalId}`,
+            [
+              `Dear ${_rName},`,
+              '',
+              `Your price proposal ${_rp.proposalNumber || proposalId} has been REJECTED.`,
+              '',
+              `Reason      : ${comment || '—'}`,
+              `Rejected by : ${userName}`,
+              '',
+              `View: ${getLiveAppUrl()}`,
+              '',
+              'Regards,',
+              'Price Approval System'
+            ]
+          ).catch(()=>{});
+        })();
         // Per-user action log
         db.collection('pp_userActions').doc(uid).collection('actions').doc(proposalId)
           .set({ proposalId, action:'Rejected', level:historyEntry.level, actionAt:nowISO, comment:comment||'', approverName:userName }, {merge:true}).catch(()=>{});
@@ -6618,6 +6744,29 @@ async function executeApprovalAction() {
           approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
           updatedAt: now
         });
+        // ── Email: notify creator of return-for-correction ──────────────
+        (() => {
+          const _tp = _snapForLevel.data();
+          const _tEmail = _tp.createdByEmail || _tp.submittedByEmail || '';
+          const _tName  = _tp.createdByName  || _tp.submittedByName  || 'Proposer';
+          if (_tEmail) _sendStageEmail(
+            _tEmail,
+            `Return for Correction: ${_tp.proposalNumber || proposalId}`,
+            [
+              `Dear ${_tName},`,
+              '',
+              `Your price proposal ${_tp.proposalNumber || proposalId} has been returned for correction.`,
+              '',
+              `Correction required : ${comment || '—'}`,
+              `Returned by         : ${userName}`,
+              '',
+              `Please update and resubmit: ${getLiveAppUrl()}`,
+              '',
+              'Regards,',
+              'Price Approval System'
+            ]
+          ).catch(()=>{});
+        })();
         // Per-user action log
         db.collection('pp_userActions').doc(uid).collection('actions').doc(proposalId)
           .set({ proposalId, action:'Returned', level:historyEntry.level, actionAt:nowISO, comment:comment||'', approverName:userName }, {merge:true}).catch(()=>{});
@@ -7875,6 +8024,20 @@ window.removeCCObserver = function(idx) {
 // Reads ccObservers from pp_settings/approval, then sends each observer an
 // email via the sendFinalApprovalCC Cloud Function (preferred) or falls back
 // to writing pp_notifications docs so they see it in-app.
+// ── Stage email helper (v32) ─────────────────────────────────────────────────
+// Fire-and-forget: sends one email via the deployed Gmail CF.
+async function _sendStageEmail(to, subject, bodyLines) {
+  if (!to) return;
+  const body = Array.isArray(bodyLines) ? bodyLines.join('\n') : bodyLines;
+  try {
+    const _gf = fns.httpsCallable('testGmailNotification');
+    await _gf({ to, subject, body, appUrl: getLiveAppUrl() });
+    console.log('[stageEmail] ✓ sent to', to, '|', subject);
+  } catch(_e) {
+    console.warn('[stageEmail] failed for', to, ':', _e.message || _e);
+  }
+}
+
 async function notifyFinalApprovalObservers(proposal, proposalId) {
   try {
     // 1. Load observers from Firestore (fresh read, not stale window._ccObservers)
@@ -8194,6 +8357,7 @@ function getDefaultTemplate(type) {
     rejection:      { subject:'REJECTED: Price Proposal {{proposalNumber}}', body:'Dear {{creatorName}},\n\nYour price proposal {{proposalNumber}} has been REJECTED.\n\nReason: {{comment}}\nRejected By: {{approverName}}\n\nView: {{applicationLink}}\n\nRegards,\nPrice Approval System' },
     return:         { subject:'Return for Correction: {{proposalNumber}}', body:'Dear {{creatorName}},\n\nYour price proposal {{proposalNumber}} has been returned for correction.\n\nCorrection Required: {{comment}}\nReturned By: {{approverName}}\n\nPlease update and resubmit: {{applicationLink}}\n\nRegards,\nPrice Approval System' },
     reminder:       { subject:'Reminder: Proposal {{proposalNumber}} Awaiting Your Approval', body:'Dear {{approverName}},\n\nThis is a reminder that proposal {{proposalNumber}} is awaiting your approval for {{pendingHours}} hours.\n\nOne-click Approval: {{magicLinkUrl}}\n\nOr sign in: {{applicationLink}}\n\nRegards,\nPrice Approval System' },
+    accounts_ack:   { subject:'Accounts Acknowledged: {{proposalNumber}}', body:'Dear {{creatorName}},\n\nPrice proposal {{proposalNumber}} has been acknowledged by Accounts and updated in the ERP.\n\nERP Ref: {{erpRef}}\nAcknowledged by: {{approverName}}\n\nView: {{applicationLink}}\n\nRegards,\nPrice Approval System' },
     magic_link:     { subject:'One-Click Approval: {{proposalNumber}}', body:'Dear {{approverName}},\n\nYou can approve proposal {{proposalNumber}} directly using this secure link (valid 48 hours):\n\n{{magicLinkUrl}}\n\nOr sign in to view full details:\n{{applicationLink}}\n\nProposal: {{proposalNumber}} | ₹{{proposalAmount}} | {{diffPercent}}% change\n\nThis link is unique to you. Do not share.\n\nRegards,\nPrice Approval System' }
   };
   return templates[type] || { subject:'', body:'' };
