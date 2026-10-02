@@ -5434,9 +5434,6 @@ async function saveProposal(action) {
         toast(`Proposal submitted for approval! #${result.data.proposalNumber}`,'success');
         await logAudit(result.data.proposalId, 'Submitted', `Submitted proposal ${result.data.proposalNumber}`);
         await fixSelfRoutingIfNeeded(result.data.proposalId, currentUser.uid, currentUser.email);
-        // Trigger blue 'Pending Approval' email to first approver
-        // Small delay ensures Firestore write is committed before CF reads the doc
-        setTimeout(() => _ppTriggerApprovalEmail(result.data.proposalId), 800);
         navigate('proposals');
       } else {
         toast(result.data.message||'Submission failed','error');
@@ -6407,7 +6404,7 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   const docData = {
     ...proposalData,
     proposalNumber,
-    status:               startLevel >= maxLevel ? 'Pending Approval' : 'Pending Recommendation',
+    status:               'Pending Approval',
     currentApprovalLevel: startLevel,
     // approver.uid may be empty if pp_users doc is missing uid field —
     // use approver.rule?.approverId as fallback so the assignment is still stored
@@ -6564,8 +6561,7 @@ async function executeApprovalAction() {
             approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
             updatedAt: now
           });
-          // Notify CC observers of final approval (fire-and-forget, non-blocking)
-          notifyFinalApprovalObservers(p, proposalId).catch(()=>{});
+          // onProposalWritten CF handles all final-approval emails server-side
         } else {
           // Reload allUsers to ensure all approvers are in cache
           await loadUsers();
@@ -6604,8 +6600,7 @@ async function executeApprovalAction() {
               approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
               updatedAt: now
             });
-            // Notify CC observers of final approval (fire-and-forget, non-blocking)
-            notifyFinalApprovalObservers(p, proposalId).catch(()=>{});
+            // onProposalWritten CF handles all final-approval emails server-side
             closeModal('approval-modal-overlay');
             toast('Proposal finally approved!','success');
             navigate('proposals');
@@ -6620,7 +6615,7 @@ async function executeApprovalAction() {
 
           const _nextIsFinal = nextLevel >= proposalMaxLevel;
           await db.collection('pp_proposals').doc(proposalId).update({
-            status: _nextIsFinal ? 'Pending Approval' : 'Pending Recommendation',
+            status: 'Pending Approval',
             currentApprovalLevel: nextLevel,
             currentApproverId: nextUid,
             currentApproverEmail: nextEmail,
@@ -6631,9 +6626,6 @@ async function executeApprovalAction() {
             approverIds: firebase.firestore.FieldValue.arrayUnion(currentUser.uid),
             updatedAt: now
           });
-          // Trigger blue 'Pending Approval' email to next approver
-          // Small delay ensures Firestore write is committed before CF reads the doc
-          setTimeout(() => _ppTriggerApprovalEmail(proposalId), 800);
         }
       } else if (action === 'reject') {
         await db.collection('pp_proposals').doc(proposalId).update({
@@ -7918,26 +7910,14 @@ window.removeCCObserver = function(idx) {
 // email via the sendFinalApprovalCC Cloud Function (preferred) or falls back
 // to writing pp_notifications docs so they see it in-app.
 // ── _ppTriggerApprovalEmail ───────────────────────────────────────────────────
-// Reads the proposal from Firestore (to get the FULL proposalData including the
-// already-assigned proposalNumber) then calls submitProposal CF so the CF:
-//   • Does NOT generate a new proposal number (proposalId exists + proposalNumber present)
-//   • Sends the blue "Pending Approval" email to currentApproverEmail
+// Calls submitProposal CF with an existing proposalId so the CF reads
+// currentApproverEmail from Firestore and sends the blue "Pending Approval" email.
 // Fire-and-forget — never blocks the approval flow.
 function _ppTriggerApprovalEmail(proposalId) {
   if (!proposalId) return;
-  db.collection('pp_proposals').doc(proposalId).get().then(snap => {
-    if (!snap.exists) return;
-    const proposalData = snap.data();
-    // Strip Firestore server timestamps that can't be serialised over httpsCallable
-    delete proposalData.createdAt;
-    delete proposalData.updatedAt;
-    delete proposalData.approvedAt;
-    delete proposalData.rejectedAt;
-    delete proposalData.returnedAt;
-    fns.httpsCallable('submitProposal')({ proposalId, proposalData, appUrl: getLiveAppUrl() })
-      .then(() => console.log('[ppEmail] approval email triggered for', proposalId))
-      .catch(e  => console.warn('[ppEmail] submitProposal CF failed:', e.message || e));
-  }).catch(e => console.warn('[ppEmail] read failed for', proposalId, ':', e.message || e));
+  fns.httpsCallable('submitProposal')({ proposalId, proposalData: {}, appUrl: getLiveAppUrl() })
+    .then(() => console.log('[ppEmail] approval email triggered for', proposalId))
+    .catch(e  => console.warn('[ppEmail] submitProposal CF failed:', e.message || e));
 }
 
 async function notifyFinalApprovalObservers(proposal, proposalId) {
