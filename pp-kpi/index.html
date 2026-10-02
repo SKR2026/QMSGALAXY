@@ -4428,7 +4428,6 @@ function onCalendarPick(val){
 // In-memory list of pending attachments for the current entry
 // Each item: { file (File|null), name, size, type, url, path, status, localUrl }
 let _pendingAttachments = [];
-window._pendingAttachmentsRef = () => _pendingAttachments;
 
 function handleAttachmentSelect(files){
   if(!files || !files.length) return;
@@ -4479,8 +4478,7 @@ function renderAttachList(){
 }
 
 // Upload all pending attachments to Firebase Storage, return array of attachment objects
-async function uploadPendingAttachments(entryFsId, list){
-  const _pendingAttachments = list || window._pendingAttachmentsRef();
+async function uploadPendingAttachments(entryFsId){
   if(!_pendingAttachments.length) return [];
   const results = [];
   for(let i=0; i<_pendingAttachments.length; i++){
@@ -4554,18 +4552,11 @@ function updateKPIs(silent){
   // Determine which KPI IDs already have a submitted/locked entry for this plant+year+month
   const allEntries = [...kpiData, ...recentEntries];
   const filledKpiIds = new Set();
-  const eventCounts = {};   // event-based KPIs: number of events logged this month
-  const evtIds = new Set(kpiMaster.filter(k=>k.eventBased).map(k=>String(k.id)));
   if(plant && year && month){
     allEntries.forEach(d=>{
-      if(String(d.year)===String(year) && d.month===month && d.plant===plant){
-        const kid = String(d.kpiId);
-        if(evtIds.has(kid)){
-          // Event-based KPIs accept unlimited entries per month — never lock them out
-          eventCounts[kid] = (eventCounts[kid]||0) + 1;
-        } else if(d.locked || d.entryStatus==='submitted'){
-          filledKpiIds.add(kid);
-        }
+      if(String(d.year)===String(year) && d.month===month && d.plant===plant
+         && (d.locked || d.entryStatus==='submitted')){
+        filledKpiIds.add(String(d.kpiId));
       }
     });
   }
@@ -4575,9 +4566,7 @@ function updateKPIs(silent){
     if(isFilled){
       return `<option value="${k.id}" data-dir="${k.dir||'higher'}" disabled style="color:#aaa">✓ ${k.name} (already submitted)</option>`;
     }
-    const n = eventCounts[String(k.id)];
-    const label = (k.eventBased && n) ? `${k.name} (${n} logged this month)` : k.name;
-    return `<option value="${k.id}" data-dir="${k.dir||'higher'}">${label}</option>`;
+    return `<option value="${k.id}" data-dir="${k.dir||'higher'}">${k.name}</option>`;
   }).join('');
   // Restore previously selected KPI if it's still in the list and not disabled
   if(prevKpi){
@@ -5025,9 +5014,8 @@ function saveEntry(mode){
         return;
       }
     } else {
-      // For event-based KPIs: several events can happen on the same day, so only
-      // block an exact duplicate — same KPI + plant + date + same reference no.
-      const dupCheck = d => !!eventRef && String(d.kpiId)===String(kpiId) && String(d.plant).trim().toLowerCase()===String(plant).trim().toLowerCase() && d.eventDate === eventDate && String(d.eventRef||'').trim().toLowerCase()===eventRef.toLowerCase();
+      // For event-based KPIs: only block if same KPI+plant+date (exact duplicate)
+      const dupCheck = d => String(d.kpiId)===String(kpiId) && String(d.plant).trim().toLowerCase()===String(plant).trim().toLowerCase() && d.eventDate === eventDate;
       const dup = recentEntries.find(dupCheck) || kpiData.find(dupCheck);
       if(dup){
         if(dup.locked){
@@ -5048,7 +5036,7 @@ function saveEntry(mode){
     const collision = [...recentEntries,...kpiData].find(d=>{
       if(String(d.id)===String(editingEntryId)) return false;
       if(String(d.kpiId)!==String(kpiId) || d.plant!==plant) return false;
-      if(k.eventBased) return !!eventRef && d.eventDate === eventDate && String(d.eventRef||'').trim().toLowerCase()===eventRef.toLowerCase(); // event-based: same date + same ref = collision
+      if(k.eventBased) return d.eventDate === eventDate; // event-based: same date = collision
       return d.month===month && String(d.year)===String(year); // normal: same month/year
     });
     if(collision){ showToast('Another entry already exists for this KPI/'+(k.eventBased?'date':'plant/month')); return; }
@@ -5071,13 +5059,9 @@ function saveEntry(mode){
   renderRecentEntries();
   renderMyEntries(); // keep My Entries page in sync
   showToast(mode==='submitted' ? 'KPI data submitted — locked for editing' : 'Draft saved — click Submit when ready to lock it');
-  // Snapshot attachments for the background upload, then free the form for the next entry
-  const _attachSnapshot = _pendingAttachments;
   if(mode==='submitted'){
     // Keep ALL fields as-is — only clear Actual and achievement
     _softClearEntryForm();
-    _pendingAttachments = [];
-    renderAttachList();
   } else {
     // Draft saved — context already persisted above; keep form loaded for Submit
     editingEntryId = entry.id;
@@ -5085,18 +5069,6 @@ function saveEntry(mode){
     if(banner) banner.style.display='flex';
   }
   refreshAll();
-  // Rebuild the KPI dropdown so status/counts update immediately after every entry.
-  // Event-based KPIs stay selectable, so re-select it and re-open its panels
-  // (event date pre-filled, complaint/accident fields shown) ready for the next one.
-  if(mode==='submitted'){
-    updateKPIs(true);
-    const kpiSel = document.getElementById('entryKPI');
-    if(kpiSel && k.eventBased){
-      const opt = [...kpiSel.options].find(o=>String(o.value)===String(kpiId));
-      if(opt && !opt.disabled) kpiSel.value = String(kpiId);
-    }
-    loadKPITarget();
-  }
 
   if (window.FB && window.FB.saveKPIEntry) {
     const payload = {
@@ -5115,9 +5087,9 @@ function saveEntry(mode){
       if(id && !entry.fsId){ entry.fsId = id; }
       setTimeout(()=>showToast('✓ Saved to Firestore'), 500);
       // Upload any pending attachments now that we have a Firestore ID
-      if(_attachSnapshot.some(a=>a.status==='pending') && entry.fsId){
+      if(_pendingAttachments.some(a=>a.status==='pending') && entry.fsId){
         try{
-          const attachments = await uploadPendingAttachments(entry.fsId, _attachSnapshot);
+          const attachments = await uploadPendingAttachments(entry.fsId);
           const savedAttachments = attachments.filter(a=>!a.error);
           if(savedAttachments.length){
             entry.attachments = savedAttachments;
@@ -11001,9 +10973,7 @@ async function loadFirebaseData() {
       let fsEntries = fsEntriesRaw.value;
       const bizMap = new Map();
       fsEntries.forEach(fe => {
-        const key = fe.eventDate
-          ? `evt|${fe.id}`   // event-based: each Firestore doc is a separate event
-          : `${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
+        const key = `${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
         const existing = bizMap.get(key);
         if (!existing) { bizMap.set(key, fe); return; }
         const feSubmitted = fe.locked || fe.entryStatus === 'submitted';
@@ -11079,18 +11049,6 @@ async function loadFirebaseData() {
 // Merge Firestore entries into local arrays — single source of truth.
 // Deduplication: first by fsId (Firestore doc ID), then by business key (kpiId+plant+month+year).
 // A submitted/locked entry always wins over a draft for the same business key.
-// Event-based entries are never merged by month. An incoming Firestore event doc
-// only matches a local entry that hasn't received its Firestore id yet and has
-// the same KPI, plant, event date, ref no. and actual value.
-function _evtLocalMatch(fe){
-  return d => !d.fsId &&
-    String(d.kpiId) === String(fe.kpiId) &&
-    String(d.plant||'').trim().toLowerCase() === String(fe.plant||'').trim().toLowerCase() &&
-    d.eventDate === fe.eventDate &&
-    String(d.eventRef||'') === String(fe.eventRef||'') &&
-    Number(d.actual) === Number(fe.actual);
-}
-
 function mergeFirebaseEntries(fsEntries) {
   fsEntries.forEach(fe => {
     const mapped = {
@@ -11139,7 +11097,7 @@ function mergeFirebaseEntries(fsEntries) {
       String(d.month).trim().toLowerCase() === String(fe.month||'').trim().toLowerCase() &&
       String(d.year)    === String(fe.year);
 
-    const byBizKey = recentEntries.findIndex(fe.eventDate ? _evtLocalMatch(fe) : bizKey);
+    const byBizKey = recentEntries.findIndex(bizKey);
     if (byBizKey >= 0) {
       const existing = recentEntries[byBizKey];
       // Submitted/locked wins; if same status, latest updatedAt wins
@@ -11215,7 +11173,7 @@ function mergeFirebaseEntriesKeepSubmitted(fsEntries) {
       String(d.month||'').trim().toLowerCase() === String(fe.month||'').trim().toLowerCase() &&
       String(d.year) === String(fe.year);
 
-    const byBiz = recentEntries.findIndex(fe.eventDate ? _evtLocalMatch(fe) : bizKey);
+    const byBiz = recentEntries.findIndex(bizKey);
     if (byBiz >= 0) {
       const local = recentEntries[byBiz];
       // Local submitted beats incoming draft
@@ -11285,11 +11243,6 @@ window.saveEntry = async function(mode) {
 
   const k = kpiMaster.find(k => String(k.id) === String(kpiId));
   if (!k) { showToast('KPI not found'); return; }
-
-  // Event-based KPIs (Customer Complaints, Accidents, ...) allow many entries per
-  // month and carry extra fields (event date, ref no., part, customer, attachments).
-  // The core saveEntry handles all of that and writes to Firestore itself.
-  if (k.eventBased) { return _localSaveEntry(mode); }
 
   const year        = parseInt(document.getElementById('entryYear').value);
   const month       = document.getElementById('entryMonth').value;
@@ -12075,8 +12028,7 @@ if (footer) {
 console.log('%cFirebase connected — skr-msa project', 'color:#185FA5;font-weight:600');
 console.log('To seed Firestore: window.FB.seedFirestore(kpiMaster, kpiData)');
 console.log('To remove seeded demo entries: await window.FB.clearSeedData()');
-console.log('%cKPI Dashboard build: 2026-10-02-r19 (Event-based KPIs: unlimited entries/month, dropdown auto-refresh, no month dedup)', 'color:#185FA5;font-weight:600');
-console.log('%cKPI Dashboard build (prev): 2026-06-24-r18 (Fix HTML structure for complaint/accident panels; auto-detect eventType from KPI name; clean div nesting)', 'color:#185FA5;font-weight:600');
+console.log('%cKPI Dashboard build: 2026-06-24-r18 (Fix HTML structure for complaint/accident panels; auto-detect eventType from KPI name; clean div nesting)', 'color:#185FA5;font-weight:600');
 </script>
 
 <script>
