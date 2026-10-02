@@ -1953,6 +1953,7 @@ html, body { overflow: hidden; }
                     <option>Services</option><option>Capital Equipment</option>
                     <option>Utilities</option><option>Other</option>
                   </select>
+                  <div style="font-size:11px;color:var(--text3);margin-top:3px">Decides which approval chain this proposal follows.</div>
                 </div>
               </div>
               <div class="form-row col3" style="margin-top:8px">
@@ -2618,6 +2619,7 @@ html, body { overflow: hidden; }
           <button class="settings-tab" onclick="switchSettingsTab('notifications', this)">🔔 Notifications</button>
           <button class="settings-tab" onclick="switchSettingsTab('digest', this)">📊 Management Digest</button>
           <button class="settings-tab" onclick="switchSettingsTab('numbering', this)">🔢 Numbering</button>
+          <button class="settings-tab" onclick="switchSettingsTab('categories', this)">🏷️ Categories</button>
           <button class="settings-tab" onclick="switchSettingsTab('profile', this)">👤 My Profile</button>
           <button class="settings-tab" id="tab-danger-zone" onclick="switchSettingsTab('danger', this)" style="display:none;color:var(--danger);border-color:var(--danger)">⚠️ Danger Zone</button>
         </div>
@@ -2823,6 +2825,33 @@ html, body { overflow: hidden; }
               <div style="display:flex;gap:12px;justify-content:flex-end">
                 <button class="btn btn-secondary" onclick="triggerDigestNow()" id="digest-test-btn">🧪 Send Test Digest Now</button>
                 <button class="btn btn-primary" onclick="saveDigestSettings()">Save Digest Settings</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="settings-categories" class="settings-pane" style="display:none">
+          <div class="card">
+            <div class="card-body">
+              <div class="form-section">
+                <div class="form-section-title">🏷️ Proposal Categories</div>
+                <div style="background:var(--info-bg);border:1px solid #bfdbfe;border-radius:var(--radius);padding:12px 14px;margin-bottom:14px;font-size:13px;line-height:1.5">
+                  These categories appear in the <strong>Create Proposal</strong> form and in the <strong>Approval Matrix</strong>.
+                  Edit a name to rename it — approval matrix rules using the old name are updated automatically.
+                  A category that is still used by a matrix rule cannot be deleted.
+                </div>
+                <div id="cat-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
+                <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+                  <div class="form-group" style="flex:1;min-width:240px;margin:0">
+                    <label>New Category</label>
+                    <input type="text" id="cat-new-name" placeholder="e.g. Packing Material" onkeydown="if(event.key==='Enter'){event.preventDefault();addCategoryRow();}">
+                  </div>
+                  <button class="btn btn-secondary" onclick="addCategoryRow()">+ Add</button>
+                </div>
+              </div>
+              <div style="display:flex;justify-content:flex-end;gap:8px">
+                <button class="btn btn-secondary" onclick="renderCategoryEditor(true)">Reset</button>
+                <button class="btn btn-primary" id="cat-save-btn" onclick="saveCategories()">Save Categories</button>
               </div>
             </div>
           </div>
@@ -3122,6 +3151,7 @@ html, body { overflow: hidden; }
             <option>Services</option><option>Capital Equipment</option>
             <option>Utilities</option><option>Other</option>
           </select>
+          <div style="font-size:11px;color:var(--text2);margin-top:4px;line-height:1.4">If a category has its own rules, proposals of that category follow <strong>only</strong> those rules. Categories without rules follow the <em>All Categories</em> rules.</div>
         </div>
       </div>
       <div class="form-row col2">
@@ -4368,7 +4398,7 @@ auth.onAuthStateChanged(async user => {
 async function showApp() {
   document.getElementById('app').classList.add('visible');
   applyRoleUI();
-  await Promise.all([ loadSettings(), loadPlants(), loadUsers(), loadMatrixRules() ]);
+  await Promise.all([ loadSettings(), loadPlants(), loadUsers(), loadMatrixRules(), loadCategories() ]);
   ensureLiveAppUrlSaved();
   setupNotifications();
   updateSidebarUser();
@@ -4609,6 +4639,160 @@ async function loadUsers() {
     const snap = await db.collection('pp_users').get();
     allUsers = snap.docs.map(d=>({id:d.id,...d.data()}));
   } catch(e) { console.error('loadUsers', e); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CATEGORY MASTER — editable by Super Admin (Settings → Categories)
+//  Stored in pp_settings/categories { list: [..] }
+// ═══════════════════════════════════════════════════════════════════════════
+const DEFAULT_CATEGORIES = ['Raw Material','Finished Goods','Services','Capital Equipment','Utilities','Other'];
+let allCategories = [...DEFAULT_CATEGORIES];
+
+async function loadCategories() {
+  try {
+    const snap = await db.collection('pp_settings').doc('categories').get();
+    const list = snap.exists ? (snap.data()?.list || []) : [];
+    const clean = [...new Set(list.map(c => String(c||'').trim()).filter(Boolean))];
+    allCategories = clean.length ? clean : [...DEFAULT_CATEGORIES];
+  } catch(e) {
+    console.warn('loadCategories — using defaults:', e.message);
+    allCategories = allCategories.length ? allCategories : [...DEFAULT_CATEGORIES];
+  }
+  populateCategorySelects();
+}
+
+// Sets a <select>'s value; if the value is not in the current list (e.g. a
+// category that was later renamed/removed), it is added so it is not lost.
+function setCategorySelectValue(sel, val) {
+  if (!sel) return;
+  val = val == null ? '' : String(val);
+  if (val && ![...sel.options].some(o => o.value === val)) {
+    const o = document.createElement('option');
+    o.value = val; o.textContent = val + ' (not in list)';
+    sel.appendChild(o);
+  }
+  sel.value = val;
+}
+
+function populateCategorySelects() {
+  const opts = allCategories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  const pf = document.getElementById('pf-category');
+  if (pf) { const v = pf.value; pf.innerHTML = opts; if (v) setCategorySelectValue(pf, v); }
+  const mm = document.getElementById('mm-category');
+  if (mm) { const v = mm.value; mm.innerHTML = '<option value="">All Categories</option>' + opts; setCategorySelectValue(mm, v); }
+}
+
+// Editor state: [{orig: 'name in Firestore' | null, name: 'current text'}]
+window._catRows = [];
+
+function renderCategoryEditor(reset) {
+  if (reset) window._catRows = allCategories.map(c => ({ orig: c, name: c }));
+  const box = document.getElementById('cat-list');
+  if (!box) return;
+  const usage = name => (allMatrixRules||[]).filter(r => normCat(r.category) === normCat(name)).length;
+  box.innerHTML = window._catRows.length ? window._catRows.map((r, i) => {
+    const used = r.orig ? usage(r.orig) : 0;
+    const renamed = r.orig && r.orig !== r.name.trim();
+    return `<div style="display:flex;align-items:center;gap:8px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px">
+      <span style="font-size:12px;color:var(--text3);width:22px;text-align:right">${i+1}.</span>
+      <input type="text" value="${esc(r.name)}" oninput="window._catRows[${i}].name=this.value" onchange="renderCategoryEditor()" style="flex:1;min-width:0">
+      ${!r.orig ? '<span class="badge badge-submitted" style="font-size:10px">New</span>' : ''}
+      ${renamed ? `<span style="font-size:11px;color:#b45309;white-space:nowrap" title="Renamed from ${esc(r.orig)}">was “${esc(r.orig)}”</span>` : ''}
+      <span style="font-size:11px;color:var(--text2);white-space:nowrap" title="Approval matrix rules using this category">${used} rule${used===1?'':'s'}</span>
+      <button class="btn btn-ghost btn-sm" title="Move up" ${i===0?'disabled':''} onclick="moveCategoryRow(${i},-1)">↑</button>
+      <button class="btn btn-ghost btn-sm" title="Move down" ${i===window._catRows.length-1?'disabled':''} onclick="moveCategoryRow(${i},1)">↓</button>
+      <button class="btn btn-ghost btn-sm" style="color:var(--danger)" onclick="removeCategoryRow(${i})">✕</button>
+    </div>`;
+  }).join('') : '<div style="font-size:12px;color:var(--text2);padding:6px 0">No categories. Add at least one.</div>';
+}
+
+window.addCategoryRow = function() {
+  const inp = document.getElementById('cat-new-name');
+  const name = (inp?.value || '').trim();
+  if (!name) { toast('Enter a category name','warning'); return; }
+  if (window._catRows.some(r => normCat(r.name) === normCat(name))) { toast('This category already exists','warning'); return; }
+  window._catRows.push({ orig: null, name });
+  inp.value = '';
+  renderCategoryEditor();
+};
+window.moveCategoryRow = function(i, d) {
+  const j = i + d, a = window._catRows;
+  if (j < 0 || j >= a.length) return;
+  [a[i], a[j]] = [a[j], a[i]];
+  renderCategoryEditor();
+};
+window.removeCategoryRow = function(i) {
+  const r = window._catRows[i];
+  if (r?.orig) {
+    const used = (allMatrixRules||[]).filter(m => normCat(m.category) === normCat(r.orig)).length;
+    if (used) { toast(`“${r.orig}” is used by ${used} approval matrix rule${used>1?'s':''}. Change or delete those rules first.`, 'warning', 6000); return; }
+  }
+  window._catRows.splice(i, 1);
+  renderCategoryEditor();
+};
+
+window.saveCategories = async function() {
+  if (!isSuperAdmin()) { toast('Super Admin only','warning'); return; }
+  const rows = window._catRows.map(r => ({ orig: r.orig, name: String(r.name||'').trim() }));
+  if (rows.some(r => !r.name)) { toast('Category names cannot be blank','warning'); return; }
+  if (!rows.length) { toast('Keep at least one category','warning'); return; }
+  const seen = new Set();
+  for (const r of rows) {
+    const k = normCat(r.name);
+    if (seen.has(k)) { toast(`Duplicate category: “${r.name}”`,'warning'); return; }
+    seen.add(k);
+  }
+  const renames = rows.filter(r => r.orig && r.orig !== r.name);
+  const btn = document.getElementById('cat-save-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    // Carry renames through to the approval matrix so routing keeps working.
+    let updatedRules = 0;
+    if (renames.length) {
+      const mSnap = await db.collection('pp_approvalMatrices').get();
+      const batch = db.batch();
+      mSnap.docs.forEach(d => {
+        const rn = renames.find(r => normCat(r.orig) === normCat(d.data().category));
+        if (rn) { batch.update(d.ref, { category: rn.name, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }); updatedRules++; }
+      });
+      if (updatedRules) await batch.commit();
+    }
+    await db.collection('pp_settings').doc('categories').set({
+      list: rows.map(r => r.name),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      updatedBy: currentUser?.email || ''
+    }, { merge: true });
+    allCategories = rows.map(r => r.name);
+    populateCategorySelects();
+    if (updatedRules) await loadMatrixRules();
+    renderCategoryEditor(true);
+    if (typeof renderMatrixTable === 'function' && document.getElementById('matrix-tbody')) { try { renderMatrixTable(); } catch(_) {} }
+    toast(`✅ Categories saved${updatedRules ? ` — ${updatedRules} matrix rule${updatedRules>1?'s':''} updated` : ''}`, 'success');
+  } catch(e) {
+    console.error('saveCategories', e);
+    toast('❌ Failed to save categories: ' + (e.message || e.code || 'Permission denied'), 'error', 7000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save Categories'; }
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  APPROVAL MATRIX — plant + category rule selection (single source of truth)
+//  1. Keep rules for the proposal's plant (or "All Plants").
+//  2. If any of those rules is set for the proposal's category, ONLY those
+//     category rules are used (the category has its own approval chain).
+//     Otherwise the "All Categories" rules are used.
+// ═══════════════════════════════════════════════════════════════════════════
+function normCat(c) { return String(c||'').trim().toLowerCase(); }
+function ruleMatchesPlant(r, p) {
+  const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []);
+  return !ids.length || !p?.plantId || ids.includes(p.plantId);
+}
+function getApplicableMatrixRules(rules, p) {
+  const plantRules = (rules || []).filter(r => ruleMatchesPlant(r, p));
+  const pc = normCat(p?.category);
+  const specific = pc ? plantRules.filter(r => r.category && normCat(r.category) === pc) : [];
+  return specific.length ? specific : plantRules.filter(r => !normCat(r.category));
 }
 
 async function loadMatrixRules() {
@@ -5223,7 +5407,7 @@ function initProposalForm(editingId) {
     if (document.getElementById('pf-qty-month')) document.getElementById('pf-qty-month').value = p.approxQtyMonth||'';
     document.getElementById('pf-validity').value     = p.validity||'30';
     const catSel=document.getElementById('pf-category');
-    if(catSel&&p.category) catSel.value=p.category;
+    if(catSel&&p.category) setCategorySelectValue(catSel, p.category);
     const plantSel=document.getElementById('pf-plant');
     if(plantSel&&p.plantId) plantSel.value=p.plantId;
     calcPriceDiff();
@@ -5726,7 +5910,7 @@ async function viewProposal(id) {
     });
     if (['Pending Approval','Draft','Returned'].includes(p.status)) {
       const doneLevels = new Set(history.map(h=>h.level));
-      const relevantRules = allMatrixRules.filter(r=>!r.plantId||r.plantId===p.plantId).sort((a,b)=>(Number(a.level)||0)-(Number(b.level)||0));
+      const relevantRules = getApplicableMatrixRules(allMatrixRules, p).sort((a,b)=>(Number(a.level)||0)-(Number(b.level)||0));
       const maxLevel = relevantRules.length ? Math.max(...relevantRules.map(r=>Number(r.level)||0)) : Math.max(3, p.currentApprovalLevel||1);
       for (let lvl=1; lvl<=maxLevel; lvl++) {
         if (doneLevels.has(lvl)) continue;
@@ -5959,9 +6143,7 @@ function openApprovalModal(proposalId, action) {
 // Returns the final approver's level number for this proposal's annual impact.
 // Levels below the final are RECOMMENDERS; the final level is the APPROVER.
 function clientGetMaxLevelSync(p) {
-  const rules  = (allMatrixRules || [])
-    .filter(r => { const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []); return !ids.length || ids.includes(p.plantId); })
-    .filter(r => !r.category || r.category === p.category);
+  const rules  = getApplicableMatrixRules(allMatrixRules || [], p);
   const levels = [...new Set(rules.map(r => Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
   const amount = clientResolveAnnualImpact(p);
   for (const lvl of levels) {
@@ -6005,7 +6187,7 @@ async function getCreatorLevel(p) {
   const creatorUid   = String(p.createdBy||'').trim();
   const creatorEmail = String(p.createdByEmail||'').trim().toLowerCase();
 
-  const rules = matrixSnap.docs.map(d=>({...d.data(),id:d.id}));
+  const rules = getApplicableMatrixRules(matrixSnap.docs.map(d=>({...d.data(),id:d.id})), p);
 
   // Build a complete lookup: for each rule resolve BOTH the uid and email of the approver.
   // approverId in the matrix may be:
@@ -6066,9 +6248,7 @@ async function getCreatorLevel(p) {
 async function getProposalMaxLevel(p) {
   const matrixSnap = await db.collection('pp_approvalMatrices').get();
   const amount     = clientResolveAnnualImpact(p);
-  const allRules   = matrixSnap.docs.map(d => ({id:d.id,...d.data()}))
-    .filter(r => { const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []); return !ids.length || ids.includes(p.plantId); })
-    .filter(r => !r.category || r.category === p.category);
+  const allRules   = getApplicableMatrixRules(matrixSnap.docs.map(d => ({id:d.id,...d.data()})), p);
   const levels = [...new Set(allRules.map(r=>Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
   for (const lvl of levels) {
     const covered = allRules.filter(r=>Number(r.level||0)===lvl)
@@ -6092,9 +6272,7 @@ async function resolveApprover(p, level) {
     return ids.length === 0 || ids.includes(p.plantId);
   };
 
-  let rules = matrixSnap.docs.map(d=>({id:d.id,...d.data()}))
-    .filter(r => matchesPlant(r))
-    .filter(r => !r.category || r.category === p.category)
+  let rules = getApplicableMatrixRules(matrixSnap.docs.map(d=>({id:d.id,...d.data()})), p)
     .filter(r => Number(r.level||0) === level)
     .sort((a,b) => (Number(a.order)||0)-(Number(b.order)||0) || String(a.id).localeCompare(String(b.id)));
 
@@ -6229,7 +6407,9 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   // Determine the creator's own level in the matrix (0 if not listed).
   // Match by ANY of: approverId, approverEmail, or uid field stored in the matrix doc.
   // approverId may be the Firestore doc ID OR the Firebase Auth UID — check both.
-  const _matrixRules = matrixSnap.docs.map(d => ({...d.data(), id:d.id}));
+  // Only the rules of this proposal's chain (plant + category) take part in routing.
+  const _matrixRules = getApplicableMatrixRules(matrixSnap.docs.map(d => ({...d.data(), id:d.id})), proposalForRouting);
+  console.log('[routing] plant:', proposalForRouting.plantId, '| category:', proposalForRouting.category, '| applicable rules:', _matrixRules.length);
   console.log('[routing] creatorUid:', uid, '| creatorEmail:', creatorEmail);
 
   // Determine creator's matrix level — resolve by approverId (doc-ID or Auth UID),
@@ -6282,7 +6462,7 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   console.log('[routing] resolved creatorLevel:', creatorLevel);
 
   const allLevels = [...new Set(
-    matrixSnap.docs.map(d => Number(d.data().level||0)).filter(Boolean)
+    _matrixRules.map(r => Number(r.level||0)).filter(Boolean)
   )].sort((a,b) => a-b);
   console.log('[routing] allLevels:', allLevels);
 
@@ -6290,7 +6470,7 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   const amount = clientResolveAnnualImpact({...proposalData, createdBy: uid, createdByEmail: creatorEmail});
   let maxLevel = allLevels[allLevels.length-1] || 1;
   for (const lvl of allLevels) {
-    const rules = matrixSnap.docs.map(d=>d.data()).filter(r=>Number(r.level||0)===lvl);
+    const rules = _matrixRules.filter(r=>Number(r.level||0)===lvl);
     const covered = rules.some(r=>{ const m=(r.maxValue==null||r.maxValue==='')?Infinity:Number(r.maxValue); return amount<=m; });
     if (covered) { maxLevel = lvl; break; }
   }
@@ -7355,7 +7535,7 @@ function openMatrixModal(editingId) {
     const selectedIds = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds
                       : (r.plantId ? [r.plantId] : []);
     renderMatrixPlantCheckboxes(selectedIds);
-    document.getElementById('mm-category').value  = r.category||'';
+    setCategorySelectValue(document.getElementById('mm-category'), r.category||'');
     document.getElementById('mm-level').value     = r.level||1;
     document.getElementById('mm-level-name').value= r.levelName||'';
     document.getElementById('mm-approver').value  = r.approverId||'';
@@ -7739,6 +7919,7 @@ function switchSettingsTab(tab, el) {
   if (pane) pane.style.display='';
   if (tab==='profile') { loadProfileSettings(); _refreshBioSettingsUI(); }
   if (tab==='danger') { loadDummyEntryToggle(); }
+  if (tab==='categories') { loadCategories().then(()=>renderCategoryEditor(true)); }
 }
 
 function loadProfileSettings() {
@@ -7865,9 +8046,7 @@ async function notifyFinalApprovalObservers(proposal, proposalId) {
     let finalAuthorityEmail = null;
     try {
       const _mSnap = await db.collection('pp_approvalMatrices').get();
-      const _mRules = _mSnap.docs.map(d => ({...d.data(), id: d.id}))
-        .filter(r => { const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []); return !ids.length || ids.includes(proposal.plantId); })
-        .filter(r => !r.category || r.category === proposal.category);
+      const _mRules = getApplicableMatrixRules(_mSnap.docs.map(d => ({...d.data(), id: d.id})), proposal);
       const _mLevels = [...new Set(_mRules.map(r => Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
       const _amount  = clientResolveAnnualImpact(proposal);
       // Final level = first level whose maxValue >= amount (per matrix description)
@@ -8495,8 +8674,7 @@ function buildStandardPDFHTML(p, plant, diff, pct, history) {
         </div>`).join('')}
         ${p.status==='Pending Approval' ? (() => {
           const doneLevels = new Set(history.map(h=>h.level));
-          const relevantRules = allMatrixRules
-            .filter(r => !r.plantId || r.plantId === p.plantId)
+          const relevantRules = getApplicableMatrixRules(allMatrixRules, p)
             .sort((a,b)=>(Number(a.level)||0)-(Number(b.level)||0));
           const maxLevel = relevantRules.length ? Math.max(...relevantRules.map(r=>Number(r.level)||0)) : Math.max(3, p.currentApprovalLevel||1);
           const blocks = [];
@@ -8570,8 +8748,7 @@ function buildPDFApprovalSignatures(history, p) {
     });
   }
   // Always show remaining pending levels (even if no history yet)
-  const relevantRules = (typeof allMatrixRules !== 'undefined' ? allMatrixRules : [])
-    .filter(r => !p || !r.plantId || r.plantId === p.plantId)
+  const relevantRules = (p ? getApplicableMatrixRules(typeof allMatrixRules !== 'undefined' ? allMatrixRules : [], p) : (typeof allMatrixRules !== 'undefined' ? allMatrixRules : []))
     .sort((a,b)=>(Number(a.level)||0)-(Number(b.level)||0));
   const maxLevel = relevantRules.length
     ? Math.max(...relevantRules.map(r=>Number(r.level)||0))
@@ -9273,7 +9450,7 @@ window.navigate = function(page, extraData) {
 function applySettingsRoleRestriction() {
   const sa = isSuperAdmin();
   // Tabs that are Super Admin only
-  const superAdminOnlyTabs = ['company','approval','email','notifications','digest','numbering'];
+  const superAdminOnlyTabs = ['company','approval','email','notifications','digest','numbering','categories'];
   document.querySelectorAll('.settings-tab').forEach(btn => {
     const onclick = btn.getAttribute('onclick') || '';
     const match = onclick.match(/switchSettingsTab\('([^']+)'/);
@@ -9600,7 +9777,7 @@ async function executeSystemReset() {
 
     // Reload data and UI after short delay
     setTimeout(async () => {
-      await Promise.all([loadSettings(), loadPlants(), loadUsers(), loadMatrixRules()]);
+      await Promise.all([loadSettings(), loadPlants(), loadUsers(), loadMatrixRules(), loadCategories()]);
       ensureLiveAppUrlSaved();
       navigate('dashboard');
       // Re-enable the button + form for potential second run
