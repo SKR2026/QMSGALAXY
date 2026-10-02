@@ -5166,7 +5166,7 @@ function filterProposals() {
           </td>
           <td onclick="event.stopPropagation()" style="white-space:nowrap">
             ${isMyTurn
-              ? `<button class="btn btn-success btn-sm" onclick="openApprovalModal('${p.id}','approve')">✅</button>
+              ? `<button class="btn btn-success btn-sm" onclick="openApprovalModal('${p.id}','approve')">${clientGetMaxLevelSync(p)>(p.currentApprovalLevel||1)?'👍':'✅'}</button>
                  <button class="btn btn-warning btn-sm" onclick="openApprovalModal('${p.id}','return')">↩</button>
                  <button class="btn btn-danger btn-sm" onclick="openApprovalModal('${p.id}','reject')">❌</button>`
               : `<button class="btn btn-ghost btn-sm" onclick="viewProposal('${p.id}')">View</button>
@@ -5749,8 +5749,16 @@ async function viewProposal(id) {
 
     // ── Build approval action bar ──────────────────────────────────────
     const actionBarHTML = isMyPending
-      ? '<div class="approval-action-bar"><div class="aa-info"><h3>⏳ This proposal is awaiting your approval</h3><p>Level '+p.currentApprovalLevel+' \u2014 '+(p.levelName||'Approval')+'</p></div>'
-        + '<button class="btn btn-success" onclick="openApprovalModal(\''+id+'\',\'approve\')" style="padding:10px 22px;font-size:14px;font-weight:700;border-radius:50px;box-shadow:0 2px 8px rgba(22,163,74,.3)">\u2705 Approve</button>'
+      ? (()=>{
+          const _mxL = clientGetMaxLevelSync(p);
+          const _fin = p.currentApprovalLevel >= _mxL;
+          const _bl  = _fin ? '\u2705 Approve' : '\uD83D\uDC4D Recommend';
+          const _hl  = _fin ? 'awaiting your approval' : 'awaiting your recommendation';
+          const _ll  = _fin ? (p.levelName||'Final Approval') : (p.levelName||'Recommendation');
+          return '<div class="approval-action-bar"><div class="aa-info"><h3>\u23F3 This proposal is '+_hl+'</h3>'
+                +'<p>Level '+p.currentApprovalLevel+' \u2014 '+_ll+'</p></div>'
+                +'<button class="btn btn-success" onclick="openApprovalModal(\''+id+'\',\'approve\')" style="padding:10px 22px;font-size:14px;font-weight:700;border-radius:50px;box-shadow:0 2px 8px rgba(22,163,74,.3)">'+_bl+'</button>';
+        })()
         + '<button class="btn btn-warning" onclick="openApprovalModal(\''+id+'\',\'return\')" style="padding:10px 22px;font-size:14px;font-weight:700;border-radius:50px;box-shadow:0 2px 8px rgba(217,119,6,.3)">\u21a9 Return</button>'
         + '<button class="btn btn-danger"  onclick="openApprovalModal(\''+id+'\',\'reject\')" style="padding:10px 22px;font-size:14px;font-weight:700;border-radius:50px;box-shadow:0 2px 8px rgba(220,38,38,.3)">\u274c Reject</button>'
         + '</div>'
@@ -5949,6 +5957,23 @@ function openApprovalModal(proposalId, action) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Resolve annual impact — same priority order as CF resolveAnnualImpact
+// clientGetMaxLevelSync — sync version using cached allMatrixRules.
+// Returns the final approver's level number for this proposal's annual impact.
+// Levels below the final are RECOMMENDERS; the final level is the APPROVER.
+function clientGetMaxLevelSync(p) {
+  const rules  = (allMatrixRules || [])
+    .filter(r => { const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []); return !ids.length || ids.includes(p.plantId); })
+    .filter(r => !r.category || r.category === p.category);
+  const levels = [...new Set(rules.map(r => Number(r.level||0)).filter(Boolean))].sort((a,b)=>a-b);
+  const amount = clientResolveAnnualImpact(p);
+  for (const lvl of levels) {
+    const covered = rules.filter(r => Number(r.level||0) === lvl)
+      .some(r => { const m = (r.maxValue==null||r.maxValue==='') ? Infinity : Number(r.maxValue); return amount <= m; });
+    if (covered) return lvl;
+  }
+  return levels.length ? Math.max(...levels) : 1;
+}
+
 function clientResolveAnnualImpact(p) {
   if (p.annualImpact != null && Math.abs(Number(p.annualImpact)) !== 0)
     return Math.abs(Number(p.annualImpact));
@@ -6381,7 +6406,7 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
   const docData = {
     ...proposalData,
     proposalNumber,
-    status:               'Pending Approval',
+    status:               startLevel >= maxLevel ? 'Pending Approval' : 'Pending Recommendation',
     currentApprovalLevel: startLevel,
     // approver.uid may be empty if pp_users doc is missing uid field —
     // use approver.rule?.approverId as fallback so the assignment is still stored
@@ -6454,7 +6479,9 @@ async function clientSideSubmitProposal(proposalData, proposalId) {
 async function executeApprovalAction() {
   if (!pendingAction) return;
   const { proposalId, action } = pendingAction;
-  const titles  = { approve:'Approve Proposal', reject:'Reject Proposal', return:'Return for Correction' };
+  const _pT = allProposals.find(x=>x.id===proposalId);
+  const _fin2 = !_pT || (_pT.currentApprovalLevel >= clientGetMaxLevelSync(_pT));
+  const titles  = { approve: _fin2 ? 'Approve Proposal' : 'Recommend Proposal', reject:'Reject Proposal', return:'Return for Correction' };
   const comment = document.getElementById('approval-comment').value.trim();
   const warnEl  = document.getElementById('approval-action-warning');
 
@@ -6524,7 +6551,7 @@ async function executeApprovalAction() {
         const proposalMaxLevel = await getProposalMaxLevel(p);
 
         historyEntry.level = currentLevel;
-        historyEntry.action = 'Approved';
+        historyEntry.action = (currentLevel >= proposalMaxLevel) ? 'Approved' : 'Recommended';
 
         if (currentLevel >= proposalMaxLevel) {
           // Final level — mark fully approved
@@ -6590,8 +6617,9 @@ async function executeApprovalAction() {
           const nextName  = nextApprover.name;
           const rule      = nextApprover.rule;
 
+          const _nextIsFinal = nextLevel >= proposalMaxLevel;
           await db.collection('pp_proposals').doc(proposalId).update({
-            status: 'Pending Approval',
+            status: _nextIsFinal ? 'Pending Approval' : 'Pending Recommendation',
             currentApprovalLevel: nextLevel,
             currentApproverId: nextUid,
             currentApproverEmail: nextEmail,
