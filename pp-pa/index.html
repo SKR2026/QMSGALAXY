@@ -3134,7 +3134,7 @@ html, body { overflow: hidden; }
     <div class="modal-body">
       <div class="form-row col2">
         <div class="form-group">
-          <label>Plant <span style="font-size:11px;color:var(--text2);font-weight:400">— leave all unchecked for any plant</span></label>
+          <label>Plant <span style="font-size:11px;color:var(--text2);font-weight:400">— tick one or more</span></label>
           <div id="mm-plant-checkboxes" style="display:flex;flex-direction:column;gap:6px;max-height:160px;overflow-y:auto;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface2)">
             <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:400;cursor:pointer;color:var(--text2)">
               <input type="checkbox" id="mm-plant-all" onchange="handleAllPlantsToggle(this)" style="width:14px;height:14px">
@@ -3144,13 +3144,14 @@ html, body { overflow: hidden; }
           </div>
         </div>
         <div class="form-group">
-          <label>Category</label>
-          <select id="mm-category">
-            <option value="">All Categories</option>
-            <option>Raw Material</option><option>Finished Goods</option>
-            <option>Services</option><option>Capital Equipment</option>
-            <option>Utilities</option><option>Other</option>
-          </select>
+          <label>Category <span style="font-size:11px;color:var(--text2);font-weight:400">— tick one or more</span></label>
+          <div id="mm-cat-checkboxes" style="display:flex;flex-direction:column;gap:6px;max-height:160px;overflow-y:auto;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface2)">
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:400;cursor:pointer;color:var(--text2)">
+              <input type="checkbox" id="mm-cat-all" onchange="handleAllCategoriesToggle(this)" style="width:14px;height:14px">
+              <em>All Categories</em>
+            </label>
+            <div id="mm-cat-list" style="display:flex;flex-direction:column;gap:6px;margin-top:2px"></div>
+          </div>
           <div style="font-size:11px;color:var(--text2);margin-top:4px;line-height:1.4">If a category has its own rules, proposals of that category follow <strong>only</strong> those rules. Categories without rules follow the <em>All Categories</em> rules.</div>
         </div>
       </div>
@@ -4689,7 +4690,7 @@ function renderCategoryEditor(reset) {
   if (reset) window._catRows = allCategories.map(c => ({ orig: c, name: c }));
   const box = document.getElementById('cat-list');
   if (!box) return;
-  const usage = name => (allMatrixRules||[]).filter(r => normCat(r.category) === normCat(name)).length;
+  const usage = name => (allMatrixRules||[]).filter(r => ruleCategories(r).some(c => normCat(c) === normCat(name))).length;
   box.innerHTML = window._catRows.length ? window._catRows.map((r, i) => {
     const used = r.orig ? usage(r.orig) : 0;
     const renamed = r.orig && r.orig !== r.name.trim();
@@ -4724,7 +4725,7 @@ window.moveCategoryRow = function(i, d) {
 window.removeCategoryRow = function(i) {
   const r = window._catRows[i];
   if (r?.orig) {
-    const used = (allMatrixRules||[]).filter(m => normCat(m.category) === normCat(r.orig)).length;
+    const used = (allMatrixRules||[]).filter(m => ruleCategories(m).some(c => normCat(c) === normCat(r.orig))).length;
     if (used) { toast(`“${r.orig}” is used by ${used} approval matrix rule${used>1?'s':''}. Change or delete those rules first.`, 'warning', 6000); return; }
   }
   window._catRows.splice(i, 1);
@@ -4752,8 +4753,14 @@ window.saveCategories = async function() {
       const mSnap = await db.collection('pp_approvalMatrices').get();
       const batch = db.batch();
       mSnap.docs.forEach(d => {
-        const rn = renames.find(r => normCat(r.orig) === normCat(d.data().category));
-        if (rn) { batch.update(d.ref, { category: rn.name, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }); updatedRules++; }
+        const cats = ruleCategories(d.data());
+        if (!cats.length) return;
+        let changed = false;
+        const next = cats.map(c => { const rn = renames.find(r => normCat(r.orig) === normCat(c)); if (rn) { changed = true; return rn.name; } return c; });
+        if (changed) {
+          batch.update(d.ref, { categories: next, category: next.length === 1 ? next[0] : null, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+          updatedRules++;
+        }
       });
       if (updatedRules) await batch.commit();
     }
@@ -4788,11 +4795,17 @@ function ruleMatchesPlant(r, p) {
   const ids = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds : (r.plantId ? [r.plantId] : []);
   return !ids.length || !p?.plantId || ids.includes(p.plantId);
 }
+// Categories a rule applies to: [] = All Categories. Supports the new
+// `categories` array and the legacy single `category` field.
+function ruleCategories(r) {
+  const list = Array.isArray(r?.categories) && r.categories.length ? r.categories : (r?.category ? [r.category] : []);
+  return list.map(c => String(c||'').trim()).filter(Boolean);
+}
 function getApplicableMatrixRules(rules, p) {
   const plantRules = (rules || []).filter(r => ruleMatchesPlant(r, p));
   const pc = normCat(p?.category);
-  const specific = pc ? plantRules.filter(r => r.category && normCat(r.category) === pc) : [];
-  return specific.length ? specific : plantRules.filter(r => !normCat(r.category));
+  const specific = pc ? plantRules.filter(r => ruleCategories(r).some(c => normCat(c) === pc)) : [];
+  return specific.length ? specific : plantRules.filter(r => !ruleCategories(r).length);
 }
 
 async function loadMatrixRules() {
@@ -7470,7 +7483,9 @@ function renderMatrixTable() {
         const approver = allUsers.find(u=>u.uid===r.approverId||u.id===r.approverId);
         return `<tr>
           <td style="min-width:120px">${plantCell}</td>
-          <td>${esc(r.category||'All')}</td>
+          <td style="min-width:120px">${ruleCategories(r).length
+            ? ruleCategories(r).map(c=>`<span style="display:inline-block;background:#fef3c7;color:#92400e;font-size:11px;font-weight:600;padding:2px 8px;border-radius:50px;margin:2px 2px 2px 0;white-space:nowrap">${esc(c)}</span>`).join('')
+            : '<span style="color:var(--text2);font-size:12px">All Categories</span>'}</td>
           <td><span class="badge badge-submitted">Level ${r.level}</span></td>
           <td>
             <div style="font-weight:600">${esc(approver?.name||r.approverName||'—')}</div>
@@ -7501,21 +7516,69 @@ function renderMatrixPlantCheckboxes(selectedIds = []) {
              style="width:14px;height:14px;cursor:pointer" ${selectedIds.includes(p.id) ? 'checked' : ''}>
       ${esc(p.name)}
     </label>`).join('');
-  if (allEl) allEl.checked = (selectedIds.length === 0);
+  // No plants stored = rule applies to every plant → show everything ticked
+  if (selectedIds.length === 0) listEl.querySelectorAll('.mm-plant-cb').forEach(c => c.checked = true);
+  syncAllPlantsCheckbox();
 }
 
+// "All Plants" ticks / unticks every plant
 window.handleAllPlantsToggle = function(cb) {
-  if (cb.checked) document.querySelectorAll('.mm-plant-cb').forEach(c => c.checked = false);
+  document.querySelectorAll('.mm-plant-cb').forEach(c => c.checked = cb.checked);
+  cb.indeterminate = false;
 };
 
 window.syncAllPlantsCheckbox = function() {
-  const any = [...document.querySelectorAll('.mm-plant-cb')].some(c => c.checked);
+  const boxes = [...document.querySelectorAll('.mm-plant-cb')];
+  const n = boxes.filter(c => c.checked).length;
   const allEl = document.getElementById('mm-plant-all');
-  if (allEl) allEl.checked = !any;
+  if (!allEl) return;
+  allEl.checked = boxes.length > 0 && n === boxes.length;
+  allEl.indeterminate = n > 0 && n < boxes.length;
 };
 
+// [] = all plants (every plant ticked); otherwise the ticked plant ids
 function getMatrixSelectedPlantIds() {
-  return [...document.querySelectorAll('.mm-plant-cb:checked')].map(c => c.value);
+  const boxes = [...document.querySelectorAll('.mm-plant-cb')];
+  const ticked = boxes.filter(c => c.checked).map(c => c.value);
+  return ticked.length === boxes.length ? [] : ticked;
+}
+
+// ── Approval Matrix — multi-category helpers ─────────────────────────────────
+function renderMatrixCategoryCheckboxes(selected = []) {
+  const listEl = document.getElementById('mm-cat-list');
+  if (!listEl) return;
+  const sel = selected.map(String);
+  // Keep categories a rule still uses even if they were removed from the list
+  const extra = sel.filter(c => !allCategories.some(a => normCat(a) === normCat(c)));
+  const names = [...allCategories, ...extra];
+  listEl.innerHTML = names.map(c => `
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:400;cursor:pointer;padding:1px 0">
+      <input type="checkbox" class="mm-cat-cb" value="${esc(c)}" onchange="syncAllCategoriesCheckbox()"
+             style="width:14px;height:14px;cursor:pointer" ${(sel.length === 0 || sel.some(x => normCat(x) === normCat(c))) ? 'checked' : ''}>
+      ${esc(c)}${extra.includes(c) ? ' <span style="font-size:11px;color:#b45309">(not in list)</span>' : ''}
+    </label>`).join('');
+  syncAllCategoriesCheckbox();
+}
+
+window.handleAllCategoriesToggle = function(cb) {
+  document.querySelectorAll('.mm-cat-cb').forEach(c => c.checked = cb.checked);
+  cb.indeterminate = false;
+};
+
+window.syncAllCategoriesCheckbox = function() {
+  const boxes = [...document.querySelectorAll('.mm-cat-cb')];
+  const n = boxes.filter(c => c.checked).length;
+  const allEl = document.getElementById('mm-cat-all');
+  if (!allEl) return;
+  allEl.checked = boxes.length > 0 && n === boxes.length;
+  allEl.indeterminate = n > 0 && n < boxes.length;
+};
+
+// [] = All Categories (every category ticked); otherwise the ticked names
+function getMatrixSelectedCategories() {
+  const boxes = [...document.querySelectorAll('.mm-cat-cb')];
+  const ticked = boxes.filter(c => c.checked).map(c => c.value);
+  return ticked.length === boxes.length ? [] : ticked;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7535,7 +7598,7 @@ function openMatrixModal(editingId) {
     const selectedIds = Array.isArray(r.plantIds) && r.plantIds.length ? r.plantIds
                       : (r.plantId ? [r.plantId] : []);
     renderMatrixPlantCheckboxes(selectedIds);
-    setCategorySelectValue(document.getElementById('mm-category'), r.category||'');
+    renderMatrixCategoryCheckboxes(ruleCategories(r));
     document.getElementById('mm-level').value     = r.level||1;
     document.getElementById('mm-level-name').value= r.levelName||'';
     document.getElementById('mm-approver').value  = r.approverId||'';
@@ -7545,6 +7608,7 @@ function openMatrixModal(editingId) {
     document.getElementById('mm-order').value     = r.order||1;
   } else {
     renderMatrixPlantCheckboxes([]);
+    renderMatrixCategoryCheckboxes([]);
     ['mm-level','mm-level-name','mm-min-val','mm-max-val','mm-max-pct'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
     document.getElementById('mm-level').value = allMatrixRules.length+1;
     document.getElementById('mm-order').value = allMatrixRules.length+1;
@@ -7560,11 +7624,15 @@ async function saveMatrixRule() {
   if (!levelName||!approverId) { toast('Level name and approver are required','warning'); return; }
 
   const approver  = allUsers.find(u=>u.uid===approverId||u.id===approverId)||{};
-  const plantIds  = getMatrixSelectedPlantIds(); // [] means all plants
+  if (!document.querySelector('.mm-plant-cb:checked')) { toast('Tick at least one plant (or All Plants)','warning'); return; }
+  if (!document.querySelector('.mm-cat-cb:checked'))   { toast('Tick at least one category (or All Categories)','warning'); return; }
+  const plantIds   = getMatrixSelectedPlantIds();   // [] means all plants
+  const categories = getMatrixSelectedCategories(); // [] means all categories
   const data = {
     plantIds,
     plantId:  plantIds.length === 1 ? plantIds[0] : (plantIds.length === 0 ? null : null), // legacy compat
-    category: document.getElementById('mm-category').value||null,
+    categories,
+    category: categories.length === 1 ? categories[0] : null, // legacy compat
     level, levelName, approverId,
     approverName: approver.name||'',
     approverEmail:approver.email||'',
