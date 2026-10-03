@@ -2227,9 +2227,17 @@ const firebaseConfig = {
          allow read, write: if isAuthenticated();
        }
 
-       // Per-user docs in appUsers collection
-       match /appUsers/{userId} {
+       // Plant Visit's own user storage (separate from other apps)
+       match /plantVisitUsers/{userId} {
          allow read, write: if isAuthenticated();
+       }
+       match /plantVisitConfig/{docId} {
+         allow read, write: if isAuthenticated();
+       }
+
+       // Legacy shared collection — Plant Visit only READS it, once, for import
+       match /appUsers/{userId} {
+         allow read: if isAuthenticated();
        }
      }
    }
@@ -2245,9 +2253,22 @@ try {
 } catch(e) { console.warn('Firebase init failed — running in offline mode:', e); }
 const VISITS_COL  = 'visits';
 const MAIL_DOC    = db.collection('config').doc('mailLogs');
-const USERS_DOC   = db.collection('config').doc('appUsers');   // legacy – kept for migration read
-const USERS_COL   = 'appUsers';                                // ★ NEW: one doc per user
-const APP_ID      = 'plant-visit';                             // ★ scopes users to this app only
+const APP_ID      = 'plant-visit';
+/* ★ PLANT VISIT OWNS ITS OWN USER STORAGE — nothing below is shared with other apps.
+     plantVisitUsers/{id}                 one doc per custom user
+     plantVisitConfig/usersMeta           { deletedDefaults: [...] }
+     plantVisitConfig/defaultOverrides    { overrides: { id: {password} } }
+     plantVisitConfig/migration           marker: legacy import already done */
+const USERS_COL           = 'plantVisitUsers';
+const PV_CFG_COL          = 'plantVisitConfig';
+const USERS_META_DOC      = db.collection(PV_CFG_COL).doc('usersMeta');
+const USERS_OVERRIDES_DOC = db.collection(PV_CFG_COL).doc('defaultOverrides');
+const USERS_MIGRATION_DOC = db.collection(PV_CFG_COL).doc('migration');
+/* Legacy SHARED locations — READ-ONLY, used only for the one-time import. Never written to. */
+const LEGACY_USERS_COL    = 'appUsers';
+const LEGACY_USERS_DOC    = db.collection('config').doc('appUsers');
+const LEGACY_META_DOC     = db.collection('config').doc('appUsersMeta');
+const LEGACY_OVERRIDES_DOC= db.collection('config').doc('appDefaultOverrides');
 const SETTINGS_DOC  = db.collection('config').doc('appSettings');
 const LICENSE_DOC   = db.collection('config').doc('license');
 
@@ -2480,9 +2501,9 @@ function _persistUsers() {
   // on the next saveUsers() call because _usersData still has DEFAULT_USERS.
   //
   // We store three things in Firestore:
-  //   appUsers/<id>              — custom users only
-  //   config/appUsersMeta        — list of deleted default user IDs
-  //   config/appDefaultOverrides — password changes for default accounts
+  //   plantVisitUsers/<id>                — custom users only
+  //   plantVisitConfig/usersMeta          — list of deleted default user IDs
+  //   plantVisitConfig/defaultOverrides   — password changes for default accounts
 
   const customOnly = {};
   const defaultOverrides = {};
@@ -2510,10 +2531,8 @@ function _persistUsers() {
   });
 
   // Write deleted-defaults list and password overrides to config
-  batch.set(db.collection('config').doc('appUsersMeta'),
-    { deletedDefaults: _deletedDefaultUsers });
-  batch.set(db.collection('config').doc('appDefaultOverrides'),
-    { overrides: defaultOverrides });
+  batch.set(USERS_META_DOC, { deletedDefaults: _deletedDefaultUsers });
+  batch.set(USERS_OVERRIDES_DOC, { overrides: defaultOverrides });
 
   batch.commit()
     .then(() => {
@@ -2755,7 +2774,7 @@ function initFirestoreListeners() {
   // ── appUsersMeta listener: deletedDefaults (MUST register before appUsers) ──
   // By listening to this first, _deletedDefaultUsers will often be populated
   // before appUsers snapshot fires, avoiding the rebuild race.
-  db.collection('config').doc('appUsersMeta').onSnapshot(doc => {
+  USERS_META_DOC.onSnapshot(doc => {
     const fsDeleted = doc.exists ? (doc.data().deletedDefaults || []) : [];
     _deletedDefaultUsers = [...fsDeleted];  // Firestore is the authoritative list
     localStorage.setItem('pv_deleted_defaults', JSON.stringify(_deletedDefaultUsers));
@@ -2769,7 +2788,7 @@ function initFirestoreListeners() {
   });
 
   // ── appDefaultOverrides listener: password changes for default accounts ────
-  db.collection('config').doc('appDefaultOverrides').onSnapshot(doc => {
+  USERS_OVERRIDES_DOC.onSnapshot(doc => {
     _fsOverrides = doc.exists ? (doc.data().overrides || {}) : {};
     _fsOverridesReady = true;
     _rebuildUsersData();
@@ -2779,74 +2798,65 @@ function initFirestoreListeners() {
     _rebuildUsersData();
   });
 
-  // ── appUsers listener: one doc per user ──────────────────────────────────
-  // ── One-time backfill: stamp app:APP_ID on existing docs that are missing it ──
-  // Runs once on startup against the unfiltered collection so old docs (written
-  // before this field existed) become visible to the filtered query above.
-  let _appFieldBackfillDone = false;
-  function _backfillAppField() {
-    if (_appFieldBackfillDone) return;
-    _appFieldBackfillDone = true;
-    db.collection(USERS_COL).get().then(snap => {
-      const batch = db.batch();
-      let count = 0;
-      snap.docs.forEach(d => {
-        if (!d.data().app) {
-          batch.update(d.ref, { app: APP_ID });
-          count++;
+  // ── One-time, READ-ONLY import from the old shared locations ──────────────
+  // Copies Plant Visit users / deleted-defaults / password overrides into the
+  // plantVisit* collections. Old shared data is never modified or deleted, and
+  // a marker doc ensures this runs once only (so deleting every custom user
+  // later can't trigger a re-import).
+  let _legacyImportStarted = false;
+  function _importLegacyUsersOnce() {
+    if (_legacyImportStarted) return;
+    _legacyImportStarted = true;
+    USERS_MIGRATION_DOC.get().then(marker => {
+      if (marker.exists) return;
+      return Promise.all([
+        db.collection(LEGACY_USERS_COL).where('app', '==', APP_ID).get(),
+        LEGACY_USERS_DOC.get(),
+        LEGACY_META_DOC.get(),
+        LEGACY_OVERRIDES_DOC.get(),
+        USERS_META_DOC.get(),
+        USERS_OVERRIDES_DOC.get()
+      ]).then(([usersSnap, legacyDoc, metaDoc, ovDoc, newMeta, newOv]) => {
+        const b = db.batch();
+        const seen = new Set();
+        usersSnap.docs.forEach(d => {
+          seen.add(d.id);
+          b.set(db.collection(USERS_COL).doc(d.id), { ...d.data(), _id: d.data()._id || d.id, app: APP_ID });
+        });
+        if (legacyDoc.exists && legacyDoc.data().users) {
+          Object.entries(legacyDoc.data().users).forEach(([id, u]) => {
+            if (!seen.has(id)) b.set(db.collection(USERS_COL).doc(id), { ...u, _id: id, app: APP_ID });
+          });
         }
+        if (!newMeta.exists) {
+          const del = new Set([
+            ...((metaDoc.exists && metaDoc.data().deletedDefaults) || []),
+            ...((legacyDoc.exists && legacyDoc.data().deletedDefaults) || [])
+          ]);
+          b.set(USERS_META_DOC, { deletedDefaults: [...del] });
+        }
+        if (!newOv.exists && ovDoc.exists) {
+          b.set(USERS_OVERRIDES_DOC, { overrides: ovDoc.data().overrides || {} });
+        }
+        b.set(USERS_MIGRATION_DOC, { done: true, at: Date.now(), from: 'appUsers' });
+        return b.commit().then(() =>
+          console.log('[PlantVisit] ✓ Legacy users imported into', USERS_COL, '(' + usersSnap.size + ' docs).'));
       });
-      if (count > 0) {
-        batch.commit()
-          .then(() => console.log(`[PlantVisit] ✓ Backfilled app field on ${count} user doc(s).`))
-          .catch(e => console.warn('[PlantVisit] App field backfill failed:', e));
-      }
-    }).catch(e => console.warn('[PlantVisit] App field backfill read failed:', e));
+    }).catch(e => console.warn('[PlantVisit] Legacy user import failed:', e));
   }
-  _backfillAppField();
 
-  db.collection(USERS_COL).where('app', '==', APP_ID).onSnapshot(snapshot => {
-    console.log('[PlantVisit] 👥 appUsers onSnapshot fired. Docs count:', snapshot.docs.length);
-    if (snapshot.docs.length > 0) {
-      // Cache the raw Firestore user map
-      _fsUsersCache = {};
-      snapshot.docs.forEach(d => {
-        const data = d.data();
-        const uid  = data._id || d.id;
-        const { _id, ...rest } = data;
-        _fsUsersCache[uid] = rest;
-      });
-      _rebuildUsersData();
-
-    } else {
-      // No docs yet — mark cache as empty so _rebuildUsersData can run
-      _fsUsersCache = {};
-      _rebuildUsersData();
-
-      // Attempt one-time migration from old single-doc format
-      USERS_DOC.get().then(doc => {
-        if (doc.exists && doc.data().users) {
-          console.log('[PlantVisit] Migrating users from legacy single-doc to per-doc collection…');
-          const legacyUsers = doc.data().users;
-          const legacyDeleted = doc.data().deletedDefaults || [];
-          legacyDeleted.forEach(id => {
-            if (!_deletedDefaultUsers.includes(id)) _deletedDefaultUsers.push(id);
-          });
-          localStorage.setItem('pv_deleted_defaults', JSON.stringify(_deletedDefaultUsers));
-          const migBatch = db.batch();
-          Object.entries(legacyUsers).forEach(([id, u]) => {
-            migBatch.set(db.collection(USERS_COL).doc(id), { ...u, _id: id, app: APP_ID });
-          });
-          migBatch.set(
-            db.collection('config').doc('appUsersMeta'),
-            { deletedDefaults: _deletedDefaultUsers }
-          );
-          migBatch.commit()
-            .then(() => console.log('[PlantVisit] User migration complete.'))
-            .catch(e => console.error('[PlantVisit] Migration error:', e));
-        }
-      }).catch(e => console.warn('Legacy user doc read error:', e));
-    }
+  // ── plantVisitUsers listener: one doc per user, exclusive to this app ─────
+  db.collection(USERS_COL).onSnapshot(snapshot => {
+    console.log('[PlantVisit] 👥 plantVisitUsers snapshot. Docs:', snapshot.docs.length);
+    _fsUsersCache = {};
+    snapshot.docs.forEach(d => {
+      const data = d.data();
+      const uid  = data._id || d.id;
+      const { _id, app, ...rest } = data;
+      _fsUsersCache[uid] = rest;
+    });
+    _rebuildUsersData();
+    if (snapshot.docs.length === 0) _importLegacyUsersOnce();
   }, e => console.error('Users collection listener error:', e));
 
   // Dedicated license listener — separate doc so saveSettings() never overwrites it
@@ -7362,7 +7372,7 @@ This action cannot be undone.`)) return;
     if (!_deletedDefaultUsers.includes(id)) _deletedDefaultUsers.push(id);
     localStorage.setItem('pv_deleted_defaults', JSON.stringify(_deletedDefaultUsers));
     // Write only the meta doc — do NOT call saveUsers() which would re-create the deleted user
-    db.collection('config').doc('appUsersMeta')
+    USERS_META_DOC
       .set({ deletedDefaults: _deletedDefaultUsers })
       .catch(e => console.error('deleteUser meta write error:', e));
   } else {
