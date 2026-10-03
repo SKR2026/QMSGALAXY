@@ -2411,10 +2411,14 @@ body.sb-animating canvas{pointer-events:none}
         </div>
         <div style="font-size:12px;color:var(--text2);margin-top:18px">Set per-month targets. Overrides year-wise target for that month.</div>
       </div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:8px;background:var(--blue-bg);color:var(--blue);padding:7px 10px;border-radius:var(--r-sm)">
+        ✔ <strong>Planned</strong> checkbox: tick only the months this KPI is measured. Unticked months show as <em>grey (not planned)</em> in the matrix and are hidden from the data entry form.
+      </div>
       <div class="table-wrap">
         <table style="font-size:12px">
           <thead><tr style="background:var(--blue);color:#fff">
             <th style="padding:7px 10px">Month</th>
+            <th style="padding:7px 10px;text-align:center">Planned</th>
             <th style="padding:7px 10px;text-align:center">Target</th>
             <th style="padding:7px 10px;text-align:center">Year Target</th>
             <th style="padding:7px 10px;text-align:center">Base Target</th>
@@ -2422,9 +2426,12 @@ body.sb-animating canvas{pointer-events:none}
           <tbody id="tsMonthGrid"></tbody>
         </table>
       </div>
-      <div style="margin-top:10px;display:flex;gap:8px">
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-sm" onclick="copyTSYearToMonths()" style="color:var(--text2);border-color:var(--border2)">Copy year target to all months</button>
         <button class="btn btn-sm" onclick="clearTSMonths()" style="color:var(--red);border-color:var(--red)">Clear all months</button>
+        <button class="btn btn-sm" onclick="setTSQuarterly()" style="color:var(--blue);border-color:var(--blue)">Set quarterly (Apr/Jul/Oct/Jan)</button>
+        <button class="btn btn-sm" onclick="setTSAllPlanned(true)" style="color:var(--green);border-color:var(--green)">Check all</button>
+        <button class="btn btn-sm" onclick="setTSAllPlanned(false)" style="color:var(--text2);border-color:var(--border2)">Uncheck all</button>
       </div>
     </div>
 
@@ -2555,6 +2562,7 @@ kpiMaster.forEach(k=>{
   if(!k.plantOverrides) k.plantOverrides = {};
   if(!k.yearTargets)    k.yearTargets    = {}; // { "2025": 400, "2026": 350 }
   if(!k.monthTargets)   k.monthTargets   = {}; // { "2025": { "April": 420, ... } }
+  if(!k.plannedMonths)  k.plannedMonths  = {}; // { "2026": ["April","July","October","January"] } — null/empty = all months planned
   if(!k.ytdMethod)      k.ytdMethod      = 'auto'; // 'sum' | 'avg' | 'auto'
 });
 kpiMaster.forEach((k,i)=>{ if(k.seq==null) k.seq = (i+1)*10; });
@@ -2874,6 +2882,31 @@ function resolveTarget(k, year, month, plant){
 
   // 6. Global base target
   return k.target;
+}
+
+// ── Planned-month check ──────────────────────────────────────────
+// Returns true when a KPI is planned/has-a-target for the given FY year + month.
+// Rules:
+//   - If k.plannedMonths[yr] is a non-empty array, only those months are planned.
+//   - If k.plannedMonths[yr] is empty/missing, treat ALL months as planned.
+//   - If k has a month-specific target (monthTargets[yr][mon]), it is always planned.
+function isKPIPlannedForMonth(k, year, month){
+  if(!k) return true;
+  if(!month || month === 'All') return true;
+
+  // Convert to FY start year key
+  let fyStartYear = parseInt(year || filterState.year || new Date().getFullYear());
+  if(appSettings.fyMode === 'apr' && ['January','February','March'].includes(month)) fyStartYear -= 1;
+  const yr = String(fyStartYear);
+
+  // If a month-specific target is explicitly set, it is always planned
+  const mTgts = k.monthTargets && k.monthTargets[yr];
+  if(mTgts && mTgts[month] != null) return true;
+
+  // Check plannedMonths whitelist
+  const planned = k.plannedMonths && k.plannedMonths[yr];
+  if(!planned || !Array.isArray(planned) || planned.length === 0) return true; // all planned
+  return planned.includes(month);
 }
 
 // For a stored entry d, get the live resolved target (ignores d.target which may be stale)
@@ -4571,7 +4604,13 @@ function updateKPIs(silent){
   const plant=document.getElementById('entryPlant').value;
   const year=document.getElementById('entryYear').value;
   const month=document.getElementById('entryMonth').value;
-  const kpis=kpiMaster.filter(k=>(k.dept===dept||k.dept==='All') && kpiApplicable(k,plant));
+  // Filter KPIs by dept/plant applicability AND by planned months
+  // If a month is selected and a KPI is not planned for that month, hide it entirely.
+  const allKpisForDept = kpiMaster.filter(k=>(k.dept===dept||k.dept==='All') && kpiApplicable(k,plant));
+  const kpis = (month && month !== '')
+    ? allKpisForDept.filter(k => isKPIPlannedForMonth(k, year, month))
+    : allKpisForDept;
+
   const sel=document.getElementById('entryKPI');
   const prevKpi = sel ? sel.value : '';
 
@@ -6618,15 +6657,23 @@ function renderMatrix(){
     const ytdCell = cellDisplay(ytdActual, ytdTarget, k.dir, viewBy);
     const ytdTgtDisplay = viewBy==='ach' ? '—' : (ytdTarget != null ? ytdTarget : '—');
 
-    // Monthly target cells (blue, no status colour)
+    // Monthly target cells (blue, no status colour) — grey if not planned
     const monthTargetCells = _om.map(m=>{
+      const planned = isKPIPlannedForMonth(k, year, m);
+      if(!planned){
+        return `<td title="Not planned for ${m}" style="padding:4px 8px;text-align:center;background:#e8e8e8;color:#aaa;font-size:11px;border:0.5px dashed #ccc">—</td>`;
+      }
       const tgt = monthTargets[m] ?? annualTarget;
       const val = viewBy==='ach' ? '—' : (tgt != null ? tgt : '—');
       return `<td style="padding:4px 8px;text-align:center;background:${TGT_BG};color:${TGT_CLR};font-size:11px;font-weight:600;border:0.5px solid var(--border)">${val}</td>`;
     }).join('');
 
-    // Monthly actual cells
+    // Monthly actual cells — grey if not planned
     const monthActualCells = _om.map(m=>{
+      const planned = isKPIPlannedForMonth(k, year, m);
+      if(!planned){
+        return `<td title="Not planned for ${m}" style="padding:5px 8px;text-align:center;background:#e8e8e8;color:#aaa;border:0.5px dashed #ccc;font-size:11px">—</td>`;
+      }
       const tgt = monthTargets[m] ?? annualTarget;
       const c   = cellDisplay(monthActuals[m], tgt, k.dir, viewBy);
       return `<td style="padding:5px 8px;text-align:center;background:${c.bg};color:${c.color};font-weight:500;border:0.5px solid var(--border)">${c.text}</td>`;
@@ -7034,10 +7081,14 @@ function renderMonthReport(){
     const deptLabel = k.dept!==lastDept ? k.dept : '';
     lastDept = k.dept;
 
+    // Check if this KPI is planned for the selected month
+    const kpiIsPlannedThisMonth = isKPIPlannedForMonth(k, year, month);
+
     // Pre-compute applicability/actual/target once per plant, reused by
     // either the single-row or split target/actual row layout below.
     const plantResults = plants.map(p=>{
       if(!kpiApplicable(k, p.name)) return { na:true, p };
+      if(!kpiIsPlannedThisMonth) return { na:false, p, notPlanned:true, actual:null, target:null, c:{text:'—',color:'#aaa',bg:'#e8e8e8'} };
       const { actual, target } = monthReportCellData(k, p.name, year, month);
       const c = cellDisplay(actual, target, k.dir, viewBy);
       return { na:false, p, actual, target, c };
@@ -7048,33 +7099,36 @@ function renderMonthReport(){
       // the identity columns and for any "not applicable" plant cell).
       const targetRowCells = plantResults.map(res=>{
         if(res.na) return `<td rowspan="2" title="Not applicable for ${res.p.name}" style="padding:6px 8px;text-align:center;background:var(--surface);color:var(--text3);border:0.5px dashed var(--border2);font-size:11px;vertical-align:middle">n/a</td>`;
+        if(res.notPlanned) return `<td rowspan="2" title="Not planned for ${month}" style="padding:6px 8px;text-align:center;background:#e8e8e8;color:#aaa;border:0.5px dashed #ccc;font-size:11px;vertical-align:middle;font-style:italic">not planned</td>`;
         const tgtTxt = res.target!=null ? res.target : '—';
         return `<td title="${res.p.name} · Target" style="padding:4px 8px;text-align:center;background:${TGT_BG};color:${TGT_CLR};font-size:11px;font-weight:600;border:0.5px solid var(--border)">${tgtTxt}</td>`;
       }).join('');
 
       // Lower row: actual/achievement values, colour-coded as usual.
       const actualRowCells = plantResults.map(res=>{
-        if(res.na) return ''; // already spanned by the target row's rowspan
+        if(res.na || res.notPlanned) return ''; // already spanned by the target row's rowspan
         return `<td title="${res.p.name}" style="padding:5px 8px;text-align:center;background:${res.c.bg};color:${res.c.color};font-weight:600;border:0.5px solid var(--border)">${res.c.text}</td>`;
       }).join('');
 
       // Total column: sum of all applicable targets (target row) and actuals (actual row)
-      const applicableTargets = plantResults.filter(r=>!r.na && r.target!=null);
-      const applicableActuals = plantResults.filter(r=>!r.na && r.actual!=null);
+      const applicableTargets = plantResults.filter(r=>!r.na && !r.notPlanned && r.target!=null);
+      const applicableActuals = plantResults.filter(r=>!r.na && !r.notPlanned && r.actual!=null);
       const totalTgt = applicableTargets.length ? parseFloat(applicableTargets.reduce((s,r)=>s+r.target,0).toFixed(1)) : null;
       const totalAct = applicableActuals.length ? parseFloat(applicableActuals.reduce((s,r)=>s+r.actual,0).toFixed(1)) : null;
-      const totalTgtTxt = totalTgt!=null ? totalTgt : '—';
+      const totalTgtTxt = !kpiIsPlannedThisMonth ? '<span style="color:#aaa;font-style:italic">not planned</span>' : (totalTgt!=null ? totalTgt : '—');
       const totalActDisplay = cellDisplay(totalAct, totalTgt, k.dir, viewBy);
-      const totalActCell = totalAct!=null
-        ? `<td style="padding:5px 8px;text-align:center;background:${totalActDisplay.bg};color:${totalActDisplay.color};font-weight:700;border:0.5px solid var(--border)">${totalActDisplay.text}</td>`
-        : `<td style="padding:5px 8px;text-align:center;color:var(--text3);border:0.5px solid var(--border)">—</td>`;
+      const totalActCell = !kpiIsPlannedThisMonth
+        ? `<td style="padding:5px 8px;text-align:center;background:#e8e8e8;color:#aaa;border:0.5px dashed #ccc">—</td>`
+        : (totalAct!=null
+          ? `<td style="padding:5px 8px;text-align:center;background:${totalActDisplay.bg};color:${totalActDisplay.color};font-weight:700;border:0.5px solid var(--border)">${totalActDisplay.text}</td>`
+          : `<td style="padding:5px 8px;text-align:center;color:var(--text3);border:0.5px solid var(--border)">—</td>`);
 
-      return `<tr style="background:${TGT_BG}">
+      return `<tr style="background:${kpiIsPlannedThisMonth ? TGT_BG : '#e8e8e8'}">
         <td rowspan="2" style="padding:5px 10px;text-align:center;color:var(--text3);border:0.5px solid var(--border);vertical-align:middle">${idx+1}</td>
-        <td rowspan="2" style="padding:5px 10px;font-weight:600;white-space:nowrap;border:0.5px solid var(--border);vertical-align:middle">${deptLabel}</td>
-        <td rowspan="2" style="padding:5px 10px;white-space:nowrap;border:0.5px solid var(--border);font-weight:500;vertical-align:middle">${k.name}</td>
+        <td rowspan="2" style="padding:5px 10px;font-weight:600;white-space:nowrap;border:0.5px solid var(--border);vertical-align:middle;${kpiIsPlannedThisMonth?'':'color:var(--text3)'}">${deptLabel}</td>
+        <td rowspan="2" style="padding:5px 10px;white-space:nowrap;border:0.5px solid var(--border);font-weight:500;vertical-align:middle;${kpiIsPlannedThisMonth?'':'color:var(--text3)'}">${k.name}</td>
         <td rowspan="2" style="padding:5px 10px;text-align:center;color:var(--text3);border:0.5px solid var(--border);vertical-align:middle">${k.unit}</td>
-        <td style="padding:4px 8px;text-align:center;background:#d0e8f8;color:#0f4880;font-size:11px;font-weight:700;border:0.5px solid #185FA5">${totalTgtTxt}</td>
+        <td style="padding:4px 8px;text-align:center;background:${kpiIsPlannedThisMonth?'#d0e8f8':'#e8e8e8'};color:${kpiIsPlannedThisMonth?'#0f4880':'#aaa'};font-size:11px;font-weight:700;border:0.5px solid ${kpiIsPlannedThisMonth?'#185FA5':'#ccc'}">${totalTgtTxt}</td>
         ${targetRowCells}
       </tr>
       <tr>
@@ -7086,24 +7140,27 @@ function renderMonthReport(){
     // Single row (targets hidden) — just the actual/achievement value.
     const plantCells = plantResults.map(res=>{
       if(res.na) return `<td title="Not applicable for ${res.p.name}" style="padding:6px 8px;text-align:center;background:var(--surface);color:var(--text3);border:0.5px dashed var(--border2);font-size:11px">n/a</td>`;
+      if(res.notPlanned) return `<td title="Not planned for ${month}" style="padding:6px 8px;text-align:center;background:#e8e8e8;color:#aaa;border:0.5px dashed #ccc;font-size:11px;font-style:italic">not planned</td>`;
       const tTitle = res.target!=null ? `${res.p.name} · Target: ${res.target}` : `${res.p.name} · No target set`;
       return `<td title="${tTitle}" style="padding:6px 8px;text-align:center;background:${res.c.bg};color:${res.c.color};font-weight:600;border:0.5px solid var(--border)">${res.c.text}</td>`;
     }).join('');
 
     // Total column for single-row: sum actuals across applicable plants
-    const applicableActualsSingle = plantResults.filter(r=>!r.na && r.actual!=null);
-    const applicableTargetsSingle = plantResults.filter(r=>!r.na && r.target!=null);
+    const applicableActualsSingle = plantResults.filter(r=>!r.na && !r.notPlanned && r.actual!=null);
+    const applicableTargetsSingle = plantResults.filter(r=>!r.na && !r.notPlanned && r.target!=null);
     const totalActSingle = applicableActualsSingle.length ? parseFloat(applicableActualsSingle.reduce((s,r)=>s+r.actual,0).toFixed(1)) : null;
     const totalTgtSingle = applicableTargetsSingle.length ? parseFloat(applicableTargetsSingle.reduce((s,r)=>s+r.target,0).toFixed(1)) : null;
     const totalDisplaySingle = cellDisplay(totalActSingle, totalTgtSingle, k.dir, viewBy);
-    const totalCellSingle = totalActSingle!=null
-      ? `<td style="padding:6px 8px;text-align:center;background:${totalDisplaySingle.bg};color:${totalDisplaySingle.color};font-weight:700;border:0.5px solid #185FA5">${totalDisplaySingle.text}</td>`
-      : `<td style="padding:6px 8px;text-align:center;color:var(--text3);border:0.5px solid #185FA5">—</td>`;
+    const totalCellSingle = !kpiIsPlannedThisMonth
+      ? `<td style="padding:6px 8px;text-align:center;background:#e8e8e8;color:#aaa;border:0.5px dashed #ccc;font-style:italic;font-size:11px">not planned</td>`
+      : (totalActSingle!=null
+        ? `<td style="padding:6px 8px;text-align:center;background:${totalDisplaySingle.bg};color:${totalDisplaySingle.color};font-weight:700;border:0.5px solid #185FA5">${totalDisplaySingle.text}</td>`
+        : `<td style="padding:6px 8px;text-align:center;color:var(--text3);border:0.5px solid #185FA5">—</td>`);
 
-    return `<tr>
+    return `<tr style="${kpiIsPlannedThisMonth ? '' : 'background:#f5f5f5;color:var(--text3)'}">
       <td style="padding:5px 10px;text-align:center;color:var(--text3);border:0.5px solid var(--border)">${idx+1}</td>
-      <td style="padding:5px 10px;font-weight:600;white-space:nowrap;border:0.5px solid var(--border)">${deptLabel}</td>
-      <td style="padding:5px 10px;white-space:nowrap;border:0.5px solid var(--border);font-weight:500">${k.name}</td>
+      <td style="padding:5px 10px;font-weight:600;white-space:nowrap;border:0.5px solid var(--border);${kpiIsPlannedThisMonth?'':'color:var(--text3)'}">${deptLabel}</td>
+      <td style="padding:5px 10px;white-space:nowrap;border:0.5px solid var(--border);font-weight:500;${kpiIsPlannedThisMonth?'':'color:var(--text3)'}">${k.name}</td>
       <td style="padding:5px 10px;text-align:center;color:var(--text3);border:0.5px solid var(--border)">${k.unit}</td>
       ${totalCellSingle}
       ${plantCells}
@@ -7748,28 +7805,80 @@ function renderTSMonthGrid(){
   const yTgt = k.yearTargets && k.yearTargets[yr] != null ? k.yearTargets[yr] : null;
   const mTgts = (k.monthTargets && k.monthTargets[yr]) || {};
 
+  // plannedMonths for this year: empty/missing = all planned
+  const plannedArr = (k.plannedMonths && k.plannedMonths[yr]) || [];
+  const allPlanned = !plannedArr || plannedArr.length === 0;
+
   // Determine which calendar year each month belongs to (for display hint)
   const fyInt = parseInt(yr);
 
   document.getElementById('tsMonthGrid').innerHTML = fy.map((mon,i)=>{
     const mVal = mTgts[mon] != null ? mTgts[mon] : '';
     const isOverride = mVal !== '';
+    const isPlanned = allPlanned || plannedArr.includes(mon);
     // In Apr-Mar mode, Jan/Feb/Mar belong to the next calendar year
     const calYear = (appSettings.fyMode === 'apr' && ['January','February','March'].includes(mon))
       ? fyInt + 1 : fyInt;
     const calHint = appSettings.fyMode === 'apr' ? `<span style="font-size:10px;color:var(--text3);margin-left:4px">(${calYear})</span>` : '';
-    return `<tr style="${i%2===0?'background:var(--surface2)':''}">
-      <td style="padding:6px 10px;font-weight:500">${mon}${calHint}</td>
+    const rowStyle = !isPlanned
+      ? `background:rgba(0,0,0,0.04);opacity:0.6;`
+      : (i%2===0?'background:var(--surface2)':'');
+    return `<tr style="${rowStyle}" id="tsMonthRow_${mon.replace(/ /g,'_')}">
+      <td style="padding:6px 10px;font-weight:500;color:${isPlanned?'var(--text)':'var(--text3)'}">${mon}${calHint}</td>
+      <td style="padding:6px 10px;text-align:center">
+        <input type="checkbox" class="ts-month-planned" data-month="${mon}" data-year="${yr}"
+          ${isPlanned?'checked':''}
+          onchange="_tsPlanToggle(this)"
+          style="width:16px;height:16px;cursor:pointer;accent-color:var(--blue)">
+      </td>
       <td style="padding:6px 10px;text-align:center">
         <input type="number" class="ts-month-target" data-month="${mon}" data-year="${yr}"
           value="${mVal}" placeholder="—"
-          style="width:110px;padding:5px 8px;border:0.5px solid ${isOverride?'var(--blue)':'var(--border2)'};border-radius:var(--r-md);background:var(--surface);color:var(--text);font-size:12px;text-align:center"
+          ${!isPlanned?'disabled':''}
+          style="width:110px;padding:5px 8px;border:0.5px solid ${isOverride?'var(--blue)':'var(--border2)'};border-radius:var(--r-md);background:${isPlanned?'var(--surface)':'var(--surface2)'};color:var(--text);font-size:12px;text-align:center;opacity:${isPlanned?1:0.5}"
           oninput="this.style.borderColor=this.value?'var(--blue)':'var(--border2)'">
       </td>
       <td style="padding:6px 10px;text-align:center;color:var(--text2);font-size:12px">${yTgt!=null?yTgt:'<span style="color:var(--text3)">—</span>'}</td>
       <td style="padding:6px 10px;text-align:center;color:var(--text3);font-size:12px">${k.target}</td>
     </tr>`;
   }).join('');
+}
+
+// Toggle planned state for a single month row
+function _tsPlanToggle(cb){
+  const mon = cb.dataset.month;
+  const row = cb.closest('tr');
+  const inp = row.querySelector('.ts-month-target');
+  if(cb.checked){
+    row.style.opacity = '';
+    if(inp){ inp.disabled = false; inp.style.opacity = '1'; inp.style.background = 'var(--surface)'; }
+    const nameTd = row.querySelector('td:first-child');
+    if(nameTd) nameTd.style.color = 'var(--text)';
+  } else {
+    row.style.opacity = '0.6';
+    if(inp){ inp.disabled = true; inp.style.opacity = '0.5'; inp.style.background = 'var(--surface2)'; }
+    const nameTd = row.querySelector('td:first-child');
+    if(nameTd) nameTd.style.color = 'var(--text3)';
+  }
+}
+
+function setTSAllPlanned(checked){
+  document.querySelectorAll('#tsMonthGrid .ts-month-planned').forEach(cb=>{
+    cb.checked = checked;
+    _tsPlanToggle(cb);
+  });
+}
+
+function setTSQuarterly(){
+  // April FY: planned = Apr, Jul, Oct, Jan (Q1–Q4)
+  // Jan FY: planned = Jan, Apr, Jul, Oct
+  const quarterly = appSettings.fyMode === 'apr'
+    ? ['April','July','October','January']
+    : ['January','April','July','October'];
+  document.querySelectorAll('#tsMonthGrid .ts-month-planned').forEach(cb=>{
+    cb.checked = quarterly.includes(cb.dataset.month);
+    _tsPlanToggle(cb);
+  });
 }
 
 function copyTSYearToMonths(){
@@ -7817,12 +7926,25 @@ async function saveTSModal(){
     }
   });
 
+  // Save planned months whitelist
+  if(!k.plannedMonths) k.plannedMonths = {};
+  const allPlanChecks = [...document.querySelectorAll('.ts-month-planned')];
+  const checkedMonths = allPlanChecks.filter(cb=>cb.checked).map(cb=>cb.dataset.month);
+  const fy = getFYMonths();
+  // If all months are checked, store empty array (means "all planned")
+  if(checkedMonths.length === fy.length){
+    k.plannedMonths[yr] = [];
+  } else {
+    k.plannedMonths[yr] = checkedMonths;
+  }
+
   // Persist to Firebase
   if(window.FB && window.FB.updateKPI && typeof k.id === 'string'){
     try{
       await window.FB.updateKPI(k.id, {
-        yearTargets:  k.yearTargets,
-        monthTargets: k.monthTargets
+        yearTargets:   k.yearTargets,
+        monthTargets:  k.monthTargets,
+        plannedMonths: k.plannedMonths
       });
     } catch(e){ console.warn('Firebase target settings save error:', e); }
   }
@@ -10874,8 +10996,64 @@ function _hideDataSkeleton() {
   });
 }
 
+// ── LocalStorage cache helpers (instant first-paint) ─────────────
+const _LS_CACHE_KEY = 'kpiDashCache_v2';
+function _saveCache(plants, depts, kpis, entries){
+  try{
+    const payload = { ts: Date.now(), plants, depts, kpis, entries };
+    localStorage.setItem(_LS_CACHE_KEY, JSON.stringify(payload));
+  }catch(e){ console.warn('[KPI cache] save failed:', e); }
+}
+function _restoreCache(){
+  try{
+    const raw = localStorage.getItem(_LS_CACHE_KEY);
+    if(!raw) return false;
+    const p = JSON.parse(raw);
+    // Max age: 30 minutes
+    if(!p || Date.now() - p.ts > 30*60*1000) return false;
+    // Restore plants
+    if(p.plants && p.plants.length){
+      plantsList.length = 0;
+      p.plants.forEach(pl => plantsList.push(pl));
+      refreshPlantSelectors();
+    }
+    // Restore depts
+    if(p.depts && p.depts.length){
+      deptList.length = 0;
+      p.depts.forEach(d => deptList.push(d));
+      refreshDeptSelectors();
+    }
+    // Restore KPI master
+    if(p.kpis && p.kpis.length){
+      kpiMaster.length = 0;
+      p.kpis.forEach(k => {
+        if(!k.plantOverrides) k.plantOverrides = {};
+        if(!k.yearTargets)    k.yearTargets    = {};
+        if(!k.monthTargets)   k.monthTargets   = {};
+        if(!k.plannedMonths)  k.plannedMonths  = {};
+        if(!k.ytdMethod)      k.ytdMethod      = 'auto';
+        kpiMaster.push(k);
+      });
+      renderKPIMaster();
+      resolveMatrixKPIOrder();
+      const tSel = document.getElementById('trendKPISelect');
+      if(tSel) tSel.innerHTML = kpiMaster.map(k=>`<option value="${k.id}">${k.name}</option>`).join('');
+    }
+    // Restore entries
+    if(p.entries && p.entries.length){
+      kpiData.length = 0;
+      recentEntries.length = 0;
+      mergeFirebaseEntries(p.entries);
+    }
+    refreshAll();
+    return true;
+  }catch(e){ console.warn('[KPI cache] restore failed:', e); return false; }
+}
+
 async function loadFirebaseData() {
-  _showDataSkeleton();
+  // ── Instant first-paint from cache ──────────────────────────────
+  const hadCache = _restoreCache();
+  if(!hadCache) _showDataSkeleton();
 
   // ── Phase 1: fire all independent fetches in parallel ───────────
   // Settings, Plants, Departments, KPI Master, Entries, My Entries,
@@ -11019,6 +11197,7 @@ async function loadFirebaseData() {
           yearTargets:    k.yearTargets    || {},
           monthTargets:   k.monthTargets   || {},
           ytdMethod:      k.ytdMethod      || 'auto',
+          plannedMonths:  k.plannedMonths  || {},  // { "2026": ["April","July","October","January"] }
           seq: k.seq != null ? k.seq : (i+1)*10,
           eventBased: !!k.eventBased,
           eventType:  k.eventType || 'generic'
@@ -11112,6 +11291,16 @@ async function loadFirebaseData() {
   // ── Final render pass — everything is in memory now ─────────────
   refreshAll();
   _hideDataSkeleton();
+
+  // ── Save to cache for instant next-load ─────────────────────────
+  try{
+    _saveCache(
+      plantsList.map(p=>({...p})),
+      deptList.map(d=>({...d})),
+      kpiMaster.map(k=>({...k})),
+      [...kpiData, ...recentEntries].slice(0, 2000) // cap cache size
+    );
+  }catch(e){ console.warn('[KPI cache] post-load save failed:', e); }
 }
 
 // Merge Firestore entries into local arrays — single source of truth.
