@@ -2363,6 +2363,7 @@ const SEED_DATA = [
 let currentUser = null;
 let darkMode    = false;
 let chartReg    = {};
+let _dashboardRenderToken = 0;
 let _visitsData = [];
 let _mailData   = [];
 let _usersData  = { ...DEFAULT_USERS };
@@ -2621,8 +2622,8 @@ function initFirestoreListeners() {
         const _ls = document.getElementById('loaderStatus'); if (_ls) _ls.textContent = 'Seeding sample data…';
         const batch = db.batch();
         SEED_DATA.forEach(v => batch.set(db.collection(VISITS_COL).doc(v.id), v));
-        batch.commit().then(() => { _visitsData = [...SEED_DATA]; bootApp(); if(!isLicenseExpired()) refreshActiveTab(); }).catch(() => { _visitsData = [...SEED_DATA]; bootApp(); if(!isLicenseExpired()) refreshActiveTab(); });
-      } else { bootApp(); if(!isLicenseExpired()) refreshActiveTab(); }
+        batch.commit().then(() => { _visitsData = [...SEED_DATA]; bootApp(); }).catch(() => { _visitsData = [...SEED_DATA]; bootApp(); });
+      } else { bootApp(); }
     } else {
       updateBadges();
       // ★ FIX: Always honour _guestDashboardPending regardless of data length.
@@ -2633,7 +2634,14 @@ function initFirestoreListeners() {
         _guestDashboardPending = false;
         if (isLicenseExpired()) { lockApp(_LIC.expiry); return; }
         const el = document.getElementById('mainContent');
-        if (el) { destroyCharts(); el.innerHTML = ''; renderDashboard(el); }
+        if (el) {
+          // Invalidate any requestAnimationFrame from the initial guest render
+          // before replacing its DOM.
+          _dashboardRenderToken++;
+          destroyCharts();
+          el.innerHTML = '';
+          renderDashboard(el);
+        }
         return;
       }
       const activeTab = document.querySelector('.nav-btn.active')?.id?.replace('tab-','') || 'dashboard';
@@ -3062,7 +3070,11 @@ function bootApp() {
       lockApp(_LIC.expiry);
       return;
     }
-    refreshActiveTab();
+    // Use requestAnimationFrame to ensure the loader is visually removed
+    // and mainContent is visible before we render/measure canvas elements.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => refreshActiveTab());
+    });
   }, 400);
 }
 
@@ -3764,6 +3776,11 @@ function setDashMonth(month) {
 }
 
 function renderDashboard(el) {
+  // Every dashboard render gets a unique token. Firestore can replace the
+  // dashboard DOM while an earlier requestAnimationFrame is still pending;
+  // stale callbacks must not touch the new DOM.
+  const renderToken = ++_dashboardRenderToken;
+
   // Last-resort license guard — never render content if expired
   if (isLicenseExpired()) { lockApp(_LIC.expiry); return; }
   const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -3976,7 +3993,14 @@ function renderDashboard(el) {
     <div class="table-wrap">${buildTable(visits.slice(0,5), false)}</div>
   </div>`;
 
-  setTimeout(() => {
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    // Ignore callbacks belonging to an older dashboard render.
+    if (renderToken !== _dashboardRenderToken) return;
+
+    // Also make sure this exact dashboard element is still mounted.
+    const currentMain = document.getElementById('mainContent');
+    if (!currentMain || !currentMain.contains(el)) return;
+
     // Register chartjs-plugin-datalabels globally (safe to call multiple times)
     if (window.ChartDataLabels) Chart.register(window.ChartDataLabels);
 
@@ -4000,7 +4024,21 @@ function renderDashboard(el) {
 
     const catKeys = Object.keys(byCat);
     const _c_cat = document.getElementById('c_cat');
-    if (!_c_cat) { console.warn('[PlantVisit] chart canvas c_cat not found'); return; }
+    if (!_c_cat) {
+      // The dashboard DOM can occasionally be committed one frame later.
+      // Retry only if this render is still current.
+      if (renderToken === _dashboardRenderToken) {
+        requestAnimationFrame(() => {
+          if (renderToken !== _dashboardRenderToken) return;
+          const retryCanvas = document.getElementById('c_cat');
+          if (!retryCanvas || !document.getElementById('mainContent')?.contains(el)) return;
+          destroyCharts();
+          el.innerHTML = '';
+          renderDashboard(el);
+        });
+      }
+      return;
+    }
     chartReg.cat = new Chart(_c_cat, {
       type:'bar',
       data:{ labels:catKeys, datasets:[{ data:Object.values(byCat), backgroundColor:catKeys.map((_,i)=>catColors[i%catColors.length]), borderRadius:4, borderSkipped:false }]},
@@ -4066,7 +4104,7 @@ function renderDashboard(el) {
     }
   // Build mini calendar
   setTimeout(() => buildMiniCal(visits), 80);
-  }, 60);
+  }));
 }
 
 /* ══════════════════════════════════════════════════════════
