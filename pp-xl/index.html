@@ -5071,11 +5071,18 @@ async function loadBulkHistory() {
 
 async function loadBrandingForApp() {
   try {
-    const snap = await db.collection('settings').doc('branding').get();
-    if (!snap.exists) return;
-    const b = snap.data();
+    const [snap, photoSnap] = await Promise.all([
+      db.collection('settings').doc('branding').get(),
+      db.collection('settings').doc('branding_photo').get()
+    ]);
+    const b = snap.exists ? snap.data() : {};
     applyBranding(b);
-    applyLoginWindowBranding(b); // ← applies login panel logo + background photo
+    // Login panel logo (stored in main branding doc)
+    applyLoginWindowBranding(b);
+    // Login panel background photo (stored in separate doc to avoid 1 MiB limit)
+    if (photoSnap.exists && photoSnap.data().loginPhotoData) {
+      _applyLoginPhoto(photoSnap.data().loginPhotoData);
+    }
   } catch (e) {
     console.error('Load application branding error:', e);
   }
@@ -5083,9 +5090,11 @@ async function loadBrandingForApp() {
 
 async function loadBranding() {
   try {
-    const snap = await db.collection('settings').doc('branding').get();
-    if (!snap.exists) return;
-    const b = snap.data() || {};
+    const [snap, photoSnap] = await Promise.all([
+      db.collection('settings').doc('branding').get(),
+      db.collection('settings').doc('branding_photo').get()
+    ]);
+    const b = snap.exists ? (snap.data() || {}) : {};
     document.getElementById('brand-org').value = b.orgName || '';
     document.getElementById('brand-tagline').value = b.tagline || '';
     if (b.color && /^#[0-9A-Fa-f]{6}$/.test(b.color)) {
@@ -5093,7 +5102,12 @@ async function loadBranding() {
       document.getElementById('brand-color-hex').value = b.color;
     }
     applyBranding(b);
-    applyLoginWindowBranding(b); // ← also refreshes the upload panel previews
+    applyLoginWindowBranding(b);
+    // Load background photo from separate doc + refresh preview
+    const photoData = photoSnap.exists ? photoSnap.data().loginPhotoData : '';
+    _applyLoginPhoto(photoData || '');
+    const removeBtn = document.getElementById('remove-login-photo-btn');
+    if (removeBtn) removeBtn.style.display = photoData ? '' : 'none';
   } catch (e) {
     console.error('Load branding error:', e);
     if (e.code === 'permission-denied') showToast('Cannot load branding. Check settings/branding read permission.', 'error');
@@ -5293,24 +5307,13 @@ function syncColor(hex) {
 //  Stored in Firestore: settings/branding → { loginLogoData, loginPhotoData }
 // ══════════════════════════════════════════════════════════════════════
 
-/** Apply stored login-window branding to the DOM */
+/** Apply stored login-window branding to the DOM (logo only — photo loaded separately) */
 function applyLoginWindowBranding(b) {
   if (!b) return;
-  // Left-panel logo (kpi-logo-img)
+  // Left-panel logo (kpi-logo-img) — stored in main branding doc
   const logoImg = document.getElementById('kpiLoginLogoImg');
-  if (b.loginLogoData && logoImg) {
-    logoImg.src = b.loginLogoData;
-  }
-  // Left-panel background photo (CSS background on kpiLoginLeft)
-  const leftPanel = document.getElementById('kpiLoginLeft');
-  if (b.loginPhotoData && leftPanel) {
-    leftPanel.style.backgroundImage = `url('${b.loginPhotoData}')`;
-    leftPanel.style.backgroundSize  = 'cover';
-    leftPanel.style.backgroundPosition = 'center';
-  } else if (leftPanel) {
-    leftPanel.style.backgroundImage = '';
-  }
-  // Update branding settings panel preview if open
+  if (b.loginLogoData && logoImg) logoImg.src = b.loginLogoData;
+  // Refresh settings panel logo preview
   _refreshLoginBrandingPreviews(b);
 }
 
@@ -5422,22 +5425,26 @@ async function uploadLoginLogo() {
   }
 }
 
-/** Upload login panel background photo → Firestore → apply to DOM */
+/** Upload login panel background photo → Firestore → apply to DOM
+ *  Stored in settings/branding_photo (separate doc) to avoid 1 MiB Firestore limit.
+ */
 async function uploadLoginPhoto() {
   if (currentProfile?.role !== 'superadmin') { showToast('Only Super Admin can change the login photo.', 'error'); return; }
   const file = document.getElementById('login-photo-file')?.files[0];
   if (!file) { _showLoginMsg('photo', 'Select a photo file first.', true); return; }
   _showLoginMsg('photo', 'Compressing & saving…');
   try {
-    // Compress to JPEG to keep under Firestore 1 MiB doc limit
+    if (!file.type.startsWith('image/')) throw new Error('Please select an image file.');
+    if (file.size > 5 * 1024 * 1024) throw new Error('Image must be under 5 MB.');
+
+    // Compress aggressively: max 800×600, JPEG quality stepping down until < 700 KB base64
     const dataUrl = await new Promise((resolve, reject) => {
-      if (!file.type.startsWith('image/')) { reject(new Error('Please select an image file.')); return; }
-      if (file.size > 2 * 1024 * 1024)    { reject(new Error('Image must be under 2 MB.')); return; }
       const reader = new FileReader();
       reader.onload = e => {
         const img = new Image();
         img.onload = () => {
-          const maxW = 1200, maxH = 900;
+          // Step 1: scale down
+          const maxW = 800, maxH = 600;
           let w = img.width, h = img.height;
           if (w > maxW || h > maxH) {
             const scale = Math.min(maxW / w, maxH / h);
@@ -5446,10 +5453,20 @@ async function uploadLoginPhoto() {
           const canvas = document.createElement('canvas');
           canvas.width = w; canvas.height = h;
           canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-          let q = 0.82, url = canvas.toDataURL('image/jpeg', q);
-          while (url.length > 800000 && q > 0.3) { q -= 0.1; url = canvas.toDataURL('image/jpeg', q); }
-          if (url.length > 900000) reject(new Error('Photo is too complex to compress small enough. Try a smaller or simpler image.'));
-          else resolve(url);
+
+          // Step 2: compress quality until base64 < 700 000 chars (~525 KB raw)
+          // Firestore doc limit is 1 048 576 bytes; keep well under with headroom for other fields
+          let q = 0.75;
+          let url = canvas.toDataURL('image/jpeg', q);
+          while (url.length > 700000 && q > 0.2) {
+            q = Math.round((q - 0.1) * 10) / 10;
+            url = canvas.toDataURL('image/jpeg', q);
+          }
+          if (url.length > 700000) {
+            reject(new Error('Photo is still too large after compression. Try a smaller or simpler image (ideally under 1 MB).'));
+          } else {
+            resolve(url);
+          }
         };
         img.onerror = () => reject(new Error('Could not load that image.'));
         img.src = e.target.result;
@@ -5458,18 +5475,14 @@ async function uploadLoginPhoto() {
       reader.readAsDataURL(file);
     });
 
-    await db.collection('settings').doc('branding').set({ loginPhotoData: dataUrl, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    // Apply immediately to login panel
-    const leftPanel = document.getElementById('kpiLoginLeft');
-    if (leftPanel) {
-      leftPanel.style.backgroundImage  = `url('${dataUrl}')`;
-      leftPanel.style.backgroundSize   = 'cover';
-      leftPanel.style.backgroundPosition = 'center';
-    }
-    const previewImg = document.getElementById('login-photo-preview-img');
-    if (previewImg) { previewImg.src = dataUrl; previewImg.style.display = ''; }
-    const ph = document.getElementById('login-photo-preview-ph');
-    if (ph) ph.style.display = 'none';
+    // Save to a SEPARATE Firestore doc so it never competes for space with branding text fields
+    await db.collection('settings').doc('branding_photo').set({
+      loginPhotoData: dataUrl,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      updatedBy: currentProfile?.name || currentUser?.email || 'superadmin'
+    });
+
+    _applyLoginPhoto(dataUrl);
     const removeBtn = document.getElementById('remove-login-photo-btn');
     if (removeBtn) removeBtn.style.display = '';
     _showLoginMsg('photo', '✓ Background photo saved.');
@@ -5478,6 +5491,19 @@ async function uploadLoginPhoto() {
     console.error('Login photo upload error:', e);
     _showLoginMsg('photo', 'Save failed: ' + (e.message || 'Unknown error'), true);
   }
+}
+
+function _applyLoginPhoto(dataUrl) {
+  const leftPanel = document.getElementById('kpiLoginLeft');
+  if (leftPanel) {
+    leftPanel.style.backgroundImage    = dataUrl ? `url('${dataUrl}')` : '';
+    leftPanel.style.backgroundSize     = 'cover';
+    leftPanel.style.backgroundPosition = 'center';
+  }
+  const previewImg = document.getElementById('login-photo-preview-img');
+  const ph         = document.getElementById('login-photo-preview-ph');
+  if (previewImg) { previewImg.src = dataUrl || ''; previewImg.style.display = dataUrl ? '' : 'none'; }
+  if (ph)         ph.style.display = dataUrl ? 'none' : '';
 }
 
 /** Remove login panel logo */
@@ -5503,13 +5529,8 @@ async function removeLoginPhoto() {
   if (currentProfile?.role !== 'superadmin') return;
   if (!confirm('Remove the login background photo? The default will be shown.')) return;
   try {
-    await db.collection('settings').doc('branding').update({ loginPhotoData: firebase.firestore.FieldValue.delete() });
-    const leftPanel = document.getElementById('kpiLoginLeft');
-    if (leftPanel) leftPanel.style.backgroundImage = '';
-    const previewImg = document.getElementById('login-photo-preview-img');
-    if (previewImg) previewImg.style.display = 'none';
-    const ph = document.getElementById('login-photo-preview-ph');
-    if (ph) ph.style.display = '';
+    await db.collection('settings').doc('branding_photo').delete();
+    _applyLoginPhoto('');
     const removeBtn = document.getElementById('remove-login-photo-btn');
     if (removeBtn) removeBtn.style.display = 'none';
     _showLoginMsg('photo', '✓ Background photo removed.');
