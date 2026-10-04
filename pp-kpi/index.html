@@ -2409,7 +2409,11 @@ body.sb-animating canvas{pointer-events:none}
             <option>2026</option><option>2025</option><option>2024</option>
           </select>
         </div>
-        <div style="font-size:12px;color:var(--text2);margin-top:18px">Set per-month targets. Overrides year-wise target for that month.</div>
+        <div class="field" style="min-width:160px;margin:0">
+          <label>Plant</label>
+          <select id="tsMonthPlant" onchange="renderTSMonthGrid()"></select>
+        </div>
+        <div style="font-size:12px;color:var(--text2);margin-top:18px">Per-month targets &amp; planned months. Pick a plant to give it its own months.</div>
       </div>
       <div style="font-size:11px;color:var(--text3);margin-bottom:8px;background:var(--blue-bg);color:var(--blue);padding:7px 10px;border-radius:var(--r-sm)">
         ✔ <strong>Planned</strong> checkbox: tick only the months this KPI is measured. Unticked months show as <em>grey (not planned)</em> in the matrix and are hidden from the data entry form.
@@ -2432,6 +2436,7 @@ body.sb-animating canvas{pointer-events:none}
         <button class="btn btn-sm" onclick="setTSQuarterly()" style="color:var(--blue);border-color:var(--blue)">Set quarterly (Apr/Jul/Oct/Jan)</button>
         <button class="btn btn-sm" onclick="setTSAllPlanned(true)" style="color:var(--green);border-color:var(--green)">Check all</button>
         <button class="btn btn-sm" onclick="setTSAllPlanned(false)" style="color:var(--text2);border-color:var(--border2)">Uncheck all</button>
+        <button class="btn btn-sm" onclick="resetTSPlantMonths()" style="color:var(--red);border-color:var(--red)">Reset plant to All-plants setting</button>
       </div>
     </div>
 
@@ -2890,7 +2895,7 @@ function resolveTarget(k, year, month, plant){
 //   - If k.plannedMonths[yr] is a non-empty array, only those months are planned.
 //   - If k.plannedMonths[yr] is empty/missing, treat ALL months as planned.
 //   - If k has a month-specific target (monthTargets[yr][mon]), it is always planned.
-function isKPIPlannedForMonth(k, year, month){
+function isKPIPlannedForMonth(k, year, month, plant){
   if(!k) return true;
   if(!month || month === 'All') return true;
 
@@ -2899,13 +2904,31 @@ function isKPIPlannedForMonth(k, year, month){
   if(appSettings.fyMode === 'apr' && ['January','February','March'].includes(month)) fyStartYear -= 1;
   const yr = String(fyStartYear);
 
-  // If a month-specific target is explicitly set, it is always planned
+  // No specific plant (or "All"): planned if ANY applicable plant plans it
+  if(!plant || plant === 'All'){
+    const names = (typeof plantsList !== 'undefined' && plantsList.length) ? plantsList.map(p=>p.name) : [];
+    const hasPlantRules = names.some(n=>{
+      const o = k.plantOverrides && k.plantOverrides[n];
+      return o && o.plannedMonths && Array.isArray(o.plannedMonths[yr]);
+    });
+    if(!hasPlantRules) return _isPlannedGlobal(k, yr, month);
+    return names.some(n=>kpiApplicable(k,n) && isKPIPlannedForMonth(k, year, month, n));
+  }
+
+  // Plant-specific rule (if defined) wins over the All-plants rule
+  const o = k.plantOverrides && k.plantOverrides[plant];
+  if(o && o.plannedMonths && Array.isArray(o.plannedMonths[yr])){
+    const pm = o.monthTargets && o.monthTargets[yr];
+    if(pm && pm[month] != null) return true;
+    return o.plannedMonths[yr].includes(month);
+  }
+  return _isPlannedGlobal(k, yr, month);
+}
+function _isPlannedGlobal(k, yr, month){
   const mTgts = k.monthTargets && k.monthTargets[yr];
   if(mTgts && mTgts[month] != null) return true;
-
-  // Check plannedMonths whitelist
   const planned = k.plannedMonths && k.plannedMonths[yr];
-  if(!planned || !Array.isArray(planned) || planned.length === 0) return true; // all planned
+  if(!planned || !Array.isArray(planned) || planned.length === 0) return true;
   return planned.includes(month);
 }
 
@@ -4608,7 +4631,7 @@ function updateKPIs(silent){
   // If a month is selected and a KPI is not planned for that month, hide it entirely.
   const allKpisForDept = kpiMaster.filter(k=>(k.dept===dept||k.dept==='All') && kpiApplicable(k,plant));
   const kpis = (month && month !== '')
-    ? allKpisForDept.filter(k => isKPIPlannedForMonth(k, year, month))
+    ? allKpisForDept.filter(k => isKPIPlannedForMonth(k, year, month, plant))
     : allKpisForDept;
 
   const sel=document.getElementById('entryKPI');
@@ -6010,7 +6033,7 @@ async function saveEditKPI(){
   k.ytdMethod = document.getElementById('editKPIYtdMethod').value || 'auto';
   k.eventBased = document.getElementById('editKPIEventBased').checked;
   k.eventType  = k.eventBased ? (document.getElementById('editKPIEventType').value || 'generic') : 'generic';
-  k.plantOverrides = readPlantMapTable('editKPIPlantMap');
+  k.plantOverrides = readPlantMapTable('editKPIPlantMap', k.plantOverrides);
 
   renderKPIMaster();
   closeModal('editKPIModal');
@@ -6597,6 +6620,7 @@ function cellDisplay(actual, target, dir, viewBy){
 
 function renderMatrix(){
   const {rows, plants, year, viewBy, orderedMonths} = getMatrixData();
+  const monthStartIdx = parseInt(document.getElementById('matrixMonthStart').value)||0;
   const head = document.getElementById('matrixHead');
   const body = document.getElementById('matrixBody');
   const plant = document.getElementById('matrixPlant').value;
@@ -6659,7 +6683,8 @@ function renderMatrix(){
 
     // Monthly target cells (blue, no status colour) — grey if not planned
     const monthTargetCells = _om.map(m=>{
-      const planned = isKPIPlannedForMonth(k, year, m);
+      const _dy = (monthStartIdx===3 && MONTHS.indexOf(m)<3) ? year+1 : year;
+      const planned = isKPIPlannedForMonth(k, _dy, m, plant);
       if(!planned){
         return `<td title="Not planned for ${m}" style="padding:4px 8px;text-align:center;background:#e8e8e8;color:#aaa;font-size:11px;border:0.5px dashed #ccc">—</td>`;
       }
@@ -6670,7 +6695,8 @@ function renderMatrix(){
 
     // Monthly actual cells — grey if not planned
     const monthActualCells = _om.map(m=>{
-      const planned = isKPIPlannedForMonth(k, year, m);
+      const _dy = (monthStartIdx===3 && MONTHS.indexOf(m)<3) ? year+1 : year;
+      const planned = isKPIPlannedForMonth(k, _dy, m, plant);
       if(!planned){
         return `<td title="Not planned for ${m}" style="padding:5px 8px;text-align:center;background:#e8e8e8;color:#aaa;border:0.5px dashed #ccc;font-size:11px">—</td>`;
       }
@@ -7082,13 +7108,13 @@ function renderMonthReport(){
     lastDept = k.dept;
 
     // Check if this KPI is planned for the selected month
-    const kpiIsPlannedThisMonth = isKPIPlannedForMonth(k, year, month);
+    const kpiIsPlannedThisMonth = isKPIPlannedForMonth(k, year, month, 'All');
 
     // Pre-compute applicability/actual/target once per plant, reused by
     // either the single-row or split target/actual row layout below.
     const plantResults = plants.map(p=>{
       if(!kpiApplicable(k, p.name)) return { na:true, p };
-      if(!kpiIsPlannedThisMonth) return { na:false, p, notPlanned:true, actual:null, target:null, c:{text:'—',color:'#aaa',bg:'#e8e8e8'} };
+      if(!isKPIPlannedForMonth(k, year, month, p.name)) return { na:false, p, notPlanned:true, actual:null, target:null, c:{text:'—',color:'#aaa',bg:'#e8e8e8'} };
       const { actual, target } = monthReportCellData(k, p.name, year, month);
       const c = cellDisplay(actual, target, k.dir, viewBy);
       return { na:false, p, actual, target, c };
@@ -7432,7 +7458,7 @@ function renderPlantMapTable(containerId, overrides, baseTarget){
   const btnId = containerId==='nKPIPlantMap' ? 'nKPIBulkToggle' : 'editKPIBulkToggle';
   syncBulkToggleBtn(containerId, btnId);
 }
-function readPlantMapTable(containerId){
+function readPlantMapTable(containerId, existing){
   const overrides = {};
   document.querySelectorAll('#'+containerId+' tr').forEach(tr=>{
     const cb = tr.querySelector('.pm-applicable');
@@ -7442,8 +7468,15 @@ function readPlantMapTable(containerId){
     const applicable = cb.checked;
     const targetVal = ti.value.trim();
     const target = targetVal === '' ? null : parseFloat(targetVal);
-    if(!applicable || target != null){
+    const old = existing && existing[plant];
+    const hasExtras = old && (old.plannedMonths || old.monthTargets || old.yearTargets);
+    if(!applicable || target != null || hasExtras){
       overrides[plant] = { applicable, target: applicable ? target : null };
+      if(old){
+        if(old.plannedMonths) overrides[plant].plannedMonths = old.plannedMonths;
+        if(old.monthTargets)  overrides[plant].monthTargets  = old.monthTargets;
+        if(old.yearTargets)   overrides[plant].yearTargets   = old.yearTargets;
+      }
     }
   });
   return overrides;
@@ -7751,6 +7784,9 @@ function openTargetSettings(kpiId){
   const myr  = document.getElementById('tsMonthYear');
   myr.innerHTML = [cur2, cur2-1, cur2-2].map(y=>`<option value="${y}">${fmtYear(y)}</option>`).join('');
   myr.value = String(cur2);
+  const mpl = document.getElementById('tsMonthPlant');
+  mpl.innerHTML = '<option value="All">All plants (default)</option>' + plantsList.map(p=>`<option value="${p.name}">${p.name}</option>`).join('');
+  mpl.value = 'All';
   renderTSMonthGrid();
 
   showTSTab('year');
@@ -7803,10 +7839,17 @@ function renderTSMonthGrid(){
   const yr  = document.getElementById('tsMonthYear').value; // FY start year
   const fy  = getFYMonths(); // months in FY order
   const yTgt = k.yearTargets && k.yearTargets[yr] != null ? k.yearTargets[yr] : null;
-  const mTgts = (k.monthTargets && k.monthTargets[yr]) || {};
+  const tsPlant = (document.getElementById('tsMonthPlant')||{}).value || 'All';
+  const pOvr = tsPlant !== 'All' ? (k.plantOverrides && k.plantOverrides[tsPlant]) : null;
+  const plantHasOwnPlan = !!(pOvr && pOvr.plannedMonths && Array.isArray(pOvr.plannedMonths[yr]));
+  const mTgts = tsPlant === 'All'
+    ? ((k.monthTargets && k.monthTargets[yr]) || {})
+    : ((pOvr && pOvr.monthTargets && pOvr.monthTargets[yr]) || {});
 
   // plannedMonths for this year: empty/missing = all planned
-  const plannedArr = (k.plannedMonths && k.plannedMonths[yr]) || [];
+  const plannedArr = tsPlant === 'All'
+    ? ((k.plannedMonths && k.plannedMonths[yr]) || [])
+    : (plantHasOwnPlan ? pOvr.plannedMonths[yr] : ((k.plannedMonths && k.plannedMonths[yr]) || []));
   const allPlanned = !plannedArr || plannedArr.length === 0;
 
   // Determine which calendar year each month belongs to (for display hint)
@@ -7862,6 +7905,19 @@ function _tsPlanToggle(cb){
   }
 }
 
+function resetTSPlantMonths(){
+  const plant = document.getElementById('tsMonthPlant').value;
+  const yr = document.getElementById('tsMonthYear').value;
+  if(plant === 'All'){ showToast('Select a plant first'); return; }
+  const o = _tsKPI.plantOverrides && _tsKPI.plantOverrides[plant];
+  if(o){
+    if(o.plannedMonths) delete o.plannedMonths[yr];
+    if(o.monthTargets)  delete o.monthTargets[yr];
+  }
+  renderTSMonthGrid();
+  showToast(plant + ' will follow the All-plants setting once you save');
+}
+
 function setTSAllPlanned(checked){
   document.querySelectorAll('#tsMonthGrid .ts-month-planned').forEach(cb=>{
     cb.checked = checked;
@@ -7911,31 +7967,30 @@ async function saveTSModal(){
   });
   k.yearTargets = yearTargets;
 
-  // Save month-wise targets — read ALL rendered month grids by collecting
-  // all .ts-month-target inputs (only one year is shown at a time)
+  // Save month-wise targets + planned months (All plants OR one specific plant)
   const yr = document.getElementById('tsMonthYear').value;
-  if(!k.monthTargets) k.monthTargets = {};
-  k.monthTargets[yr] = k.monthTargets[yr] || {};
+  const tsPlant = (document.getElementById('tsMonthPlant')||{}).value || 'All';
+  const fyAll = getFYMonths();
+  const tgtMap = {};
   document.querySelectorAll('.ts-month-target').forEach(inp=>{
-    const mon = inp.dataset.month;
-    const v   = inp.value.trim();
-    if(v !== '' && !isNaN(parseFloat(v))){
-      k.monthTargets[yr][mon] = parseFloat(v);
-    } else {
-      delete k.monthTargets[yr][mon];
-    }
+    const v = inp.value.trim();
+    if(v !== '' && !isNaN(parseFloat(v))) tgtMap[inp.dataset.month] = parseFloat(v);
   });
+  const checkedMonths = [...document.querySelectorAll('.ts-month-planned')].filter(cb=>cb.checked).map(cb=>cb.dataset.month);
 
-  // Save planned months whitelist
-  if(!k.plannedMonths) k.plannedMonths = {};
-  const allPlanChecks = [...document.querySelectorAll('.ts-month-planned')];
-  const checkedMonths = allPlanChecks.filter(cb=>cb.checked).map(cb=>cb.dataset.month);
-  const fy = getFYMonths();
-  // If all months are checked, store empty array (means "all planned")
-  if(checkedMonths.length === fy.length){
-    k.plannedMonths[yr] = [];
+  if(tsPlant === 'All'){
+    if(!k.monthTargets) k.monthTargets = {};
+    k.monthTargets[yr] = tgtMap;
+    if(!k.plannedMonths) k.plannedMonths = {};
+    // all months checked => empty array (means "all planned")
+    k.plannedMonths[yr] = checkedMonths.length === fyAll.length ? [] : checkedMonths;
   } else {
-    k.plannedMonths[yr] = checkedMonths;
+    if(!k.plantOverrides) k.plantOverrides = {};
+    const o = k.plantOverrides[tsPlant] = k.plantOverrides[tsPlant] || { applicable:true, target:null };
+    o.monthTargets = o.monthTargets || {};
+    o.monthTargets[yr] = tgtMap;
+    o.plannedMonths = o.plannedMonths || {};
+    o.plannedMonths[yr] = checkedMonths;   // plant has its own list for this year
   }
 
   // Persist to Firebase
@@ -7944,7 +7999,8 @@ async function saveTSModal(){
       await window.FB.updateKPI(k.id, {
         yearTargets:   k.yearTargets,
         monthTargets:  k.monthTargets,
-        plannedMonths: k.plannedMonths
+        plannedMonths: k.plannedMonths,
+        plantOverrides: k.plantOverrides || {}
       });
     } catch(e){ console.warn('Firebase target settings save error:', e); }
   }
