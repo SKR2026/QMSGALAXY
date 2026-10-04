@@ -1292,6 +1292,109 @@ function resolveLevelInput(raw){
   return hit?hit.id:String(raw).trim();
 }
 
+// ── Login window branding (Super Admin editable) ────────────────
+// settings/company → loginLogoUrl / loginPhotoUrl (base64 data URLs).
+// Empty = default artwork embedded in OC_LOGIN_LEFT_HTML.
+const _LOGIN_BRAND_CACHE='oc_login_brand';
+let _loginDefaults=null;
+function _getLoginDefaults(){
+  if(_loginDefaults) return _loginDefaults;
+  _loginDefaults={logo:'',photo:''};
+  try{
+    const tpl=document.createElement('template');
+    tpl.innerHTML=window.OC_LOGIN_LEFT_HTML||'';
+    const lg=tpl.content.querySelector('.kpi-logo-img');
+    const im=tpl.content.querySelector('image');
+    if(lg) _loginDefaults.logo=lg.getAttribute('src')||'';
+    if(im) _loginDefaults.photo=im.getAttribute('href')||im.getAttribute('xlink:href')||'';
+  }catch(e){}
+  return _loginDefaults;
+}
+function _loginBrandCfg(){
+  if(S._loginBrandLoaded) return {l:S.loginLogo||'', p:S.loginPhoto||''};
+  try{ const c=JSON.parse(localStorage.getItem(_LOGIN_BRAND_CACHE)||'null'); if(c) return c; }catch(e){}
+  return {l:'',p:''};
+}
+function applyLoginBranding(){
+  const cfg=_loginBrandCfg(), def=_getLoginDefaults();
+  const logo=document.querySelector('#kpi-left-panel .kpi-logo-img');
+  const photo=document.querySelector('#kpi-left-panel image');
+  if(logo)  logo.setAttribute('src', cfg.l||def.logo);
+  if(photo) photo.setAttribute('href', cfg.p||def.photo);
+  // Settings-page previews / reset buttons (if visible)
+  const lp=document.getElementById('login-logo-prev');   if(lp) lp.src=cfg.l||def.logo;
+  const pp=document.getElementById('login-photo-prev'); if(pp) pp.src=cfg.p||def.photo;
+  const lr=document.getElementById('login-logo-reset');  if(lr) lr.style.display=cfg.l?'':'none';
+  const pr=document.getElementById('login-photo-reset'); if(pr) pr.style.display=cfg.p?'':'none';
+  if(S._loginBrandLoaded){
+    try{
+      if(cfg.l||cfg.p) localStorage.setItem(_LOGIN_BRAND_CACHE, JSON.stringify(cfg));
+      else localStorage.removeItem(_LOGIN_BRAND_CACHE);
+    }catch(e){}
+  }
+}
+async function _saveLoginBrand(field,value,okMsg){
+  const st=document.getElementById('login-brand-status');
+  try{
+    await db.collection('settings').doc('company').set({[field]:value,updatedAt:new Date().toISOString()},{merge:true});
+    if(field==='loginLogoUrl') S.loginLogo=value; else S.loginPhoto=value;
+    S._loginBrandLoaded=true;
+    applyLoginBranding();
+    if(st){ st.style.color='var(--ok)'; st.textContent='✓ '+okMsg; }
+    toast(okMsg,'ok');
+  }catch(e){
+    if(st){ st.style.color='var(--err)'; st.textContent='Save failed: '+e.message; }
+    toast('Save failed: '+e.message,'er');
+  }
+}
+function uploadLoginBrand(kind,input){
+  const file=input.files&&input.files[0];
+  input.value='';
+  if(!file) return;
+  if(!file.type.startsWith('image/')){ toast('Please choose an image file','er'); return; }
+  if(file.size>5*1024*1024){ toast('Image must be under 5 MB','er'); return; }
+  const st=document.getElementById('login-brand-status');
+  if(st){ st.style.color='var(--g400)'; st.textContent='Processing image…'; }
+  const reader=new FileReader();
+  reader.onerror=()=>toast('Could not read that image file','er');
+  reader.onload=()=>{
+    const img=new Image();
+    img.onerror=()=>toast('Could not load that image','er');
+    img.onload=()=>{
+      let dataUrl;
+      if(kind==='logo'){
+        const w=Math.min(500,img.naturalWidth||500);
+        const h=Math.round(w*(img.naturalHeight||w)/(img.naturalWidth||w));
+        const cv=document.createElement('canvas'); cv.width=w; cv.height=h;
+        cv.getContext('2d').drawImage(img,0,0,w,h);
+        dataUrl=cv.toDataURL('image/png');
+        if(dataUrl.length>200*1024){ toast('Logo is too detailed/large — try a simpler or smaller image','er'); if(st)st.textContent=''; return; }
+      } else {
+        const W=1200,H=660,cv=document.createElement('canvas'); cv.width=W; cv.height=H;
+        const ctx=cv.getContext('2d');
+        const iw=img.naturalWidth, ih=img.naturalHeight;
+        const sc=Math.max(W/iw,H/ih), sw=W/sc, sh=H/sc;
+        ctx.fillStyle='#fff'; ctx.fillRect(0,0,W,H);
+        ctx.drawImage(img,(iw-sw)/2,(ih-sh)/2,sw,sh,0,0,W,H);
+        let q=0.85;
+        dataUrl=cv.toDataURL('image/jpeg',q);
+        while(dataUrl.length>300*1024&&q>0.4){ q-=0.1; dataUrl=cv.toDataURL('image/jpeg',q); }
+        if(dataUrl.length>330*1024){ toast('Picture is too complex to compress enough — try another image','er'); if(st)st.textContent=''; return; }
+      }
+      _saveLoginBrand(kind==='logo'?'loginLogoUrl':'loginPhotoUrl', dataUrl, kind==='logo'?'Login logo updated':'Login picture updated');
+    };
+    img.src=reader.result;
+  };
+  reader.readAsDataURL(file);
+}
+function resetLoginBrand(kind){
+  if(!confirm('Reset the login '+(kind==='logo'?'logo':'picture')+' to the default?')) return;
+  _saveLoginBrand(kind==='logo'?'loginLogoUrl':'loginPhotoUrl','', 'Default login '+(kind==='logo'?'logo':'picture')+' restored');
+}
+window.uploadLoginBrand=uploadLoginBrand;
+window.resetLoginBrand=resetLoginBrand;
+window.applyLoginBranding=applyLoginBranding;
+
 // ── Listeners ───────────────────────────────────────────────────
 function startListeners(){
   _unsubs.forEach(u=>u()); _unsubs=[];
@@ -1299,6 +1402,7 @@ function startListeners(){
   _unsubs.push(db.collection('settings').doc('company').onSnapshot(snap=>{
     const d=snap.exists?snap.data():{};
     S.companyLogo=d.logoURL||null;
+    S.loginLogo=d.loginLogoUrl||''; S.loginPhoto=d.loginPhotoUrl||''; S._loginBrandLoaded=true; try{applyLoginBranding();}catch(_e){}
     S.companyName=d.companyName||'';
     S.publicViewEnabled=d.publicViewEnabled!==false;
     S.publicContactEnabled=d.publicContactEnabled===true;
@@ -1355,6 +1459,7 @@ function startPublicListeners(){
   _unsubs.push(db.collection('settings').doc('company').onSnapshot(snap=>{
     const d=snap.exists?snap.data():{};
     S.companyLogo=d.logoURL||null;
+    S.loginLogo=d.loginLogoUrl||''; S.loginPhoto=d.loginPhotoUrl||''; S._loginBrandLoaded=true; try{applyLoginBranding();}catch(_e){}
     S.companyName=d.companyName||'';
     S.publicViewEnabled=d.publicViewEnabled!==false;
     S.publicContactEnabled=d.publicContactEnabled===true;
@@ -1947,6 +2052,7 @@ function bindLogin(){
   const leftInner = document.getElementById('kpi-left-inner');
   if(leftInner && window.OC_LOGIN_LEFT_HTML){
     leftInner.innerHTML = window.OC_LOGIN_LEFT_HTML;
+    try{ applyLoginBranding(); }catch(_e){}
   }
 
   // Public view button in split-login
@@ -2348,6 +2454,45 @@ ${licenseCardHTML()}
       </div>
       <div id="logo-status" style="font-size:12px;margin-top:6px;color:var(--g400)"></div>
     </div>
+  </div>
+</div>
+
+<!-- ── Login Window Branding Section ── -->
+<div class="card" style="margin-bottom:20px">
+  <div class="card-h">
+    <h3>🔐 Login Window</h3>
+    <span style="font-size:11px;color:var(--g400)">Logo and picture shown on the sign-in screen</span>
+  </div>
+  <div style="padding:20px 24px;display:flex;flex-direction:column;gap:22px">
+    <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap">
+      <div style="flex-shrink:0">
+        <div style="font-size:11px;font-weight:700;color:var(--g600);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Login Logo</div>
+        <div style="width:160px;height:80px;border:1.5px solid var(--g100);border-radius:10px;background:var(--g50);display:flex;align-items:center;justify-content:center;overflow:hidden"><img id="login-logo-prev" src="" alt="" style="max-width:150px;max-height:70px;object-fit:contain"/></div>
+      </div>
+      <div style="flex:1;min-width:220px">
+        <input type="file" id="login-logo-file" accept="image/png,image/jpeg,image/svg+xml,image/webp" style="display:none" onchange="uploadLoginBrand('logo',this)"/>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn bp bsm" onclick="document.getElementById('login-logo-file').click()">⬆ Upload Login Logo</button>
+          <button class="btn bd bsm" id="login-logo-reset" onclick="resetLoginBrand('logo')" style="display:none">↺ Reset to default</button>
+        </div>
+        <div style="font-size:11px;color:var(--g400);margin-top:6px">PNG with transparent background works best. Shown top-left of the login window.</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap">
+      <div style="flex-shrink:0">
+        <div style="font-size:11px;font-weight:700;color:var(--g600);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Login Picture</div>
+        <div style="width:160px;height:80px;border:1.5px solid var(--g100);border-radius:10px;background:var(--g50);overflow:hidden"><img id="login-photo-prev" src="" alt="" style="width:100%;height:100%;object-fit:cover;display:block"/></div>
+      </div>
+      <div style="flex:1;min-width:220px">
+        <input type="file" id="login-photo-file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadLoginBrand('photo',this)"/>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn bp bsm" onclick="document.getElementById('login-photo-file').click()">⬆ Upload Login Picture</button>
+          <button class="btn bd bsm" id="login-photo-reset" onclick="resetLoginBrand('photo')" style="display:none">↺ Reset to default</button>
+        </div>
+        <div style="font-size:11px;color:var(--g400);margin-top:6px">Landscape photo (e.g. your plant). Auto-cropped &amp; compressed; fades into the blue wave.</div>
+      </div>
+    </div>
+    <div id="login-brand-status" style="font-size:12px;color:var(--g400)"></div>
   </div>
 </div>
 <!-- ── Public View Setting ── -->
