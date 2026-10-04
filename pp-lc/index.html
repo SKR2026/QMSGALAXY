@@ -1916,6 +1916,8 @@ function LoginPage({ login, dk, toggleTheme, colourKey, changeColour, logoUrl })
   const [pwOpen,   setPwOpen]   = useState(true);
   const [loading,  setLoading]  = useState(false);
   const [status,   setStatus]   = useState({ text:'Touch Face ID or sign in with your password', cls:'' });
+  const [, _brandTick] = useState(0);
+  useEffect(() => { const h = () => _brandTick(n => n + 1); window.addEventListener('lc-login-brand', h); return () => window.removeEventListener('lc-login-brand', h); }, []);
 
   const handleLogin = async () => {
     if (!email || !password) { setInfo(''); setError('Please enter your credentials.'); return; }
@@ -1983,7 +1985,7 @@ function LoginPage({ login, dk, toggleTheme, colourKey, changeColour, logoUrl })
       <div className="bio-screen">
         <div className="login-window">
           {/* LEFT — logo, title, plant illustration, benefits (same artwork as KPI app) */}
-          <div className="kpi-login-left" dangerouslySetInnerHTML={{ __html: window.LC_LOGIN_LEFT_HTML || '' }} />
+          <div className="kpi-login-left" dangerouslySetInnerHTML={{ __html: lcLoginLeftHTML() }} />
 
           {/* RIGHT — form column */}
           <div className="kpi-login-right">
@@ -5803,6 +5805,8 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove, currentUser }) {
           </FormField>
         </div>
       </div>
+
+      <LoginBrandingCard card={card} sub={sub} />
 
       <div className={card}>
         <h3 className="font-semibold mb-1 flex items-center gap-2" style={{fontFamily:"'Outfit',sans-serif"}}>
@@ -9837,6 +9841,163 @@ function fbListen(col, cb) {
   return () => unsubscribe();
 }
 
+/* ── Login window branding (Super Admin editable) ────────────────────────
+   Firestore: legalcomp_login_brand/data → { loginLogoUrl, loginPhotoUrl } (base64 data URLs)
+   Kept in its own document so saving the main Settings form can never overwrite it.
+   Empty = default artwork embedded in window.LC_LOGIN_LEFT_HTML.            ── */
+const LC_BRAND_CACHE = 'lc_login_brand';
+window.LC_BRAND = (() => { try { return JSON.parse(localStorage.getItem(LC_BRAND_CACHE) || 'null') || { l:'', p:'' }; } catch(_) { return { l:'', p:'' }; } })();
+
+function lcLoginLeftHTML() {
+  let h = window.LC_LOGIN_LEFT_HTML || '';
+  const b = window.LC_BRAND || {};
+  if (b.l) h = h.replace(/(<img class="kpi-logo-img" src=")[^"]*(")/, (m, p1, p2) => p1 + b.l + p2);
+  if (b.p) h = h.replace(/(<image href=")[^"]*(")/,                   (m, p1, p2) => p1 + b.p + p2);
+  return h;
+}
+function lcSetLoginBrand(l, p) {
+  window.LC_BRAND = { l: l || '', p: p || '' };
+  try {
+    if (l || p) localStorage.setItem(LC_BRAND_CACHE, JSON.stringify(window.LC_BRAND));
+    else localStorage.removeItem(LC_BRAND_CACHE);
+  } catch(_) {}
+  window.dispatchEvent(new Event('lc-login-brand'));
+}
+function lcDefaultLoginArt() {
+  const h = window.LC_LOGIN_LEFT_HTML || '';
+  const lg = h.match(/<img class="kpi-logo-img" src="([^"]*)"/);
+  const im = h.match(/<image href="([^"]*)"/);
+  return { logo: lg ? lg[1] : '', photo: im ? im[1] : '' };
+}
+function fbListenLoginBrand() {
+  let unsubscribe = () => {};
+  fbEnsureAuth().then(() => {
+    try {
+      unsubscribe = window.db.collection('legalcomp_login_brand').doc('data').onSnapshot(snap => {
+        const d = snap.exists ? snap.data() : {};
+        lcSetLoginBrand(d.loginLogoUrl || '', d.loginPhotoUrl || '');
+      }, e => { console.warn('fbListenLoginBrand error', e); });
+    } catch(e) { console.warn('fbListenLoginBrand failed', e); }
+  }).catch(e => { console.warn('fbListenLoginBrand auth failed', e); });
+  return () => unsubscribe();
+}
+async function fbSaveLoginBrand(fields) {
+  await fbEnsureAuth();
+  await window.db.collection('legalcomp_login_brand').doc('data').set(
+    { ...fields, updatedAt: new Date().toISOString() }, { merge: true });
+}
+function lcProcessImage(file, kind) {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith('image/')) return reject(new Error('Please choose an image file.'));
+    if (file.size > 5 * 1024 * 1024)     return reject(new Error('Image must be under 5 MB.'));
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read that file.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Could not load that image.'));
+      img.onload = () => {
+        let dataUrl;
+        if (kind === 'logo') {
+          const w = Math.min(500, img.naturalWidth || 500);
+          const h = Math.round(w * (img.naturalHeight || w) / (img.naturalWidth || w));
+          const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+          cv.getContext('2d').drawImage(img, 0, 0, w, h);
+          dataUrl = cv.toDataURL('image/png');
+          if (dataUrl.length > 250 * 1024) return reject(new Error('Logo is too detailed/large — try a simpler or smaller image.'));
+        } else {
+          const W = 1200, H = 660, cv = document.createElement('canvas');
+          cv.width = W; cv.height = H;
+          const ctx = cv.getContext('2d');
+          const iw = img.naturalWidth, ih = img.naturalHeight;
+          const sc = Math.max(W / iw, H / ih), sw = W / sc, sh = H / sc;
+          ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
+          ctx.drawImage(img, (iw - sw) / 2, (ih - sh) / 2, sw, sh, 0, 0, W, H);
+          let q = 0.85;
+          dataUrl = cv.toDataURL('image/jpeg', q);
+          while (dataUrl.length > 300 * 1024 && q > 0.4) { q -= 0.1; dataUrl = cv.toDataURL('image/jpeg', q); }
+          if (dataUrl.length > 330 * 1024) return reject(new Error('Picture is too complex to compress enough — try another image.'));
+        }
+        resolve(dataUrl);
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function LoginBrandingCard({ card, sub }) {
+  const [, tick] = useState(0);
+  const [busy, setBusy] = useState('');
+  const [msg, setMsg] = useState(null); // {type:'ok'|'err', text}
+  useEffect(() => { const h = () => tick(n => n + 1); window.addEventListener('lc-login-brand', h); return () => window.removeEventListener('lc-login-brand', h); }, []);
+  const brand = window.LC_BRAND || { l:'', p:'' };
+  const def = lcDefaultLoginArt();
+
+  const upload = async (kind, file) => {
+    if (!file) return;
+    setBusy(kind); setMsg(null);
+    try {
+      const dataUrl = await lcProcessImage(file, kind);
+      const field = kind === 'logo' ? 'loginLogoUrl' : 'loginPhotoUrl';
+      await fbSaveLoginBrand({ [field]: dataUrl });
+      lcSetLoginBrand(kind === 'logo' ? dataUrl : brand.l, kind === 'photo' ? dataUrl : brand.p);
+      setMsg({ type:'ok', text: (kind === 'logo' ? 'Login logo' : 'Login picture') + ' updated — visible on all devices.' });
+    } catch(e) { setMsg({ type:'err', text: e.message || 'Save failed.' }); }
+    setBusy('');
+  };
+  const reset = async (kind) => {
+    if (!window.confirm('Reset the login ' + (kind === 'logo' ? 'logo' : 'picture') + ' to the default?')) return;
+    setBusy(kind); setMsg(null);
+    try {
+      const field = kind === 'logo' ? 'loginLogoUrl' : 'loginPhotoUrl';
+      await fbSaveLoginBrand({ [field]: '' });
+      lcSetLoginBrand(kind === 'logo' ? '' : brand.l, kind === 'photo' ? '' : brand.p);
+      setMsg({ type:'ok', text: 'Default login ' + (kind === 'logo' ? 'logo' : 'picture') + ' restored.' });
+    } catch(e) { setMsg({ type:'err', text: e.message || 'Reset failed.' }); }
+    setBusy('');
+  };
+
+  const btn = 'text-xs px-3 py-1.5 rounded-lg border transition-colors disabled:opacity-50';
+  const row = (kind, label, hint, current, fallback, isPhoto) => (
+    <div className="space-y-2">
+      <div className="text-xs font-semibold">{label}</div>
+      <div className="flex items-center gap-4 flex-wrap">
+        <div className="rounded-lg border border-gray-200 bg-gray-50 overflow-hidden flex items-center justify-center" style={{width:160,height:72}}>
+          <img src={current || fallback} alt={label}
+               style={isPhoto ? {width:'100%',height:'100%',objectFit:'cover'} : {maxWidth:148,maxHeight:62,objectFit:'contain'}} />
+        </div>
+        <div className="flex flex-col gap-2">
+          <button className={btn + ' bg-blue-50 text-blue-600 hover:bg-blue-100 border-blue-200'} disabled={!!busy}
+                  onClick={() => document.getElementById('lc-login-' + kind + '-input').click()}>
+            {busy === kind ? '⏳ Saving…' : '⬆ Upload ' + (isPhoto ? 'Picture' : 'Logo')}
+          </button>
+          {current ? (
+            <button className={btn + ' bg-red-50 text-red-600 hover:bg-red-100 border-red-200'} disabled={!!busy} onClick={() => reset(kind)}>↺ Reset to default</button>
+          ) : null}
+        </div>
+        <input id={'lc-login-' + kind + '-input'} type="file" className="hidden"
+               accept={isPhoto ? 'image/png,image/jpeg,image/webp' : 'image/png,image/jpeg,image/webp,image/svg+xml'}
+               onChange={e => { const f = e.target.files[0]; e.target.value = ''; if (f) upload(kind, f); }} />
+      </div>
+      <p className={`text-[11px] ${sub}`}>{hint}</p>
+    </div>
+  );
+
+  return (
+    <div className={card}>
+      <h3 className="font-semibold mb-1 flex items-center gap-2" style={{fontFamily:"'Outfit',sans-serif"}}>
+        <span>🔐</span> Login Window
+      </h3>
+      <p className={`text-xs mb-4 ${sub}`}>Logo and picture shown on the sign-in screen. Saved to Firestore — shared across all devices.</p>
+      <div className="space-y-5">
+        {row('logo',  'Login Logo',    'PNG with transparent background works best. Shown top-left of the login window.', brand.l, def.logo, false)}
+        {row('photo', 'Login Picture', 'Landscape photo (e.g. your plant). Auto-cropped & compressed; fades into the blue wave.', brand.p, def.photo, true)}
+        {msg && <p className={'text-xs font-medium ' + (msg.type === 'ok' ? 'text-green-600' : 'text-red-600')}>{msg.type === 'ok' ? '✅ ' : '❌ '}{msg.text}</p>}
+      </div>
+    </div>
+  );
+}
+
 /* ── Logo: now stored purely as base64 in Firestore (legalcomp_settings) ──
    Previously also had a Firebase Storage path, but that required a second,
    independently-configured security-rule system (Storage rules) plus an
@@ -9890,6 +10051,9 @@ function App() {
       return s.companyLogo || s.companyLogoUrl || '';
     } catch(_) { return ''; }
   });
+
+  // Login window branding (logo + picture) — live from Firestore, cached locally
+  useEffect(() => fbListenLoginBrand(), []);
 
   /* ── Logo real-time listener (mirrors Employee Pulse Survey pattern) ──
      Subscribes immediately on mount — no need to wait for 'ready'.
