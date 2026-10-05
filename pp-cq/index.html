@@ -1506,40 +1506,51 @@ window.FB = {
     const d=await getDoc(doc(db,USERS_COL,uid));
     if(d.exists()) return normPlant({id:d.id,...d.data()});
     if(!email) return null;
-    // No COPQ profile yet — check whether an admin granted access to this email
-    // (used when the login already existed for another app in this project).
+    // No COPQ profile yet — check whether an admin granted access to this email.
+    // The pending record is intentionally retained; the signed-in user claims it
+    // by creating their own UID document. This avoids an admin having to create
+    // a Firestore document whose UID belongs to a newly-created Auth account.
     const pref=doc(db,USERS_COL,pendingId(email));
     let p;
     try{ p=await getDoc(pref); }catch(e){ return null; }
     if(!p.exists()) return null;
     const {pending,...data}=p.data();
-    await setDoc(doc(db,USERS_COL,uid),{...data,claimedAt:serverTimestamp()});
-    await deleteDoc(pref);
+    await setDoc(doc(db,USERS_COL,uid),{...data,claimedAt:serverTimestamp(),...(COPQ_READY?{tenant:true}:{})});
     return normPlant({id:uid,...data});
   },
-  async getUsers(){ const s=await getDocs(collection(db,USERS_COL)); return s.docs.map(d=>normPlant({id:d.id,...d.data()})).filter(u=>!u.disabled); },
+  async getUsers(){
+    const s=await getDocs(collection(db,USERS_COL));
+    const raw=s.docs.map(d=>normPlant({id:d.id,...d.data()})).filter(u=>!u.disabled);
+    // Once a pending invite has been claimed, show only the real UID profile.
+    const activeEmails=new Set(raw.filter(u=>!u.pending && u.email).map(u=>String(u.email).toLowerCase()));
+    return raw.filter(u=>!(u.pending && u.email && activeEmails.has(String(u.email).toLowerCase())));
+  },
   async createUser(email,pw,data){
     email=String(email).trim().toLowerCase();
+    const inviteRef=doc(db,USERS_COL,pendingId(email));
     try{
-      const cred=await createUserWithEmailAndPassword(auth2,email,pw);
-      await setDoc(doc(db,USERS_COL,cred.user.uid),{...data,email,createdAt:serverTimestamp(),...(COPQ_READY?{tenant:true}:{})});
-      return {status:'created'};
-    }catch(err){
-      if(err.code!=='auth/email-already-in-use') throw err;
-      if(COPQ_READY){
-        // Separate COPQ project: this login belongs to COPQ. Re-enable if it was removed.
-        const all=await getDocs(collection(db,USERS_COL));
-        const hit=all.docs.find(d=>(d.data().email||'').toLowerCase()===email);
-        if(hit && hit.data().disabled){
-          await updateDoc(doc(db,USERS_COL,hit.id),{...data,email,disabled:false,reenabledAt:serverTimestamp()});
-          return {status:'reenabled'};
+      // IMPORTANT: create the invite first. The Plant Admin owns this write, so
+      // Firestore evaluates it against the admin's UID/role. We do NOT write
+      // /copqUsers/<new-auth-uid> from the admin session. The new user claims
+      // that document themselves on first COPQ login.
+      await setDoc(inviteRef,{...data,email,pending:true,createdAt:serverTimestamp(),...(COPQ_READY?{tenant:true}:{})});
+
+      try{
+        await createUserWithEmailAndPassword(auth2,email,pw);
+        return {status:'created'};
+      }catch(err){
+        if(err.code!=='auth/email-already-in-use') throw err;
+        if(COPQ_READY){
+          // Tenant login already exists. The invite remains and will be claimed
+          // by that account on its next COPQ sign-in.
+          return {status:'pending'};
         }
-        throw new Error('This email already has a COPQ login.');
+        return {status:'pending'};
       }
-      // Login already exists (e.g. created by another app in this project).
-      // Leave that account untouched; grant COPQ access on their next sign-in.
-      await setDoc(doc(db,USERS_COL,pendingId(email)),{...data,email,pending:true,createdAt:serverTimestamp()});
-      return {status:'pending'};
+    }catch(err){
+      // Do not hide the real Firestore error. It is now the admin/invite rule,
+      // rather than a write performed under the newly-created user's UID.
+      throw err;
     }finally{
       try{ await signOut(auth2); }catch(e){}
     }
@@ -1701,8 +1712,8 @@ window.FB.onAuth(async user=>{
       }
       refreshDashboard();
       showToast('Signed in ✓');
-      // Offer biometric registration if not yet enrolled on this device
-      try{ if(window._copqBioOfferAfterLogin) window._copqBioOfferAfterLogin(user.email); }catch(e){}
+      // Biometric registration is intentionally NOT triggered automatically.
+      // This prevents Windows Hello / Face ID prompts from appearing on every login.
     } else {
       currentUser=null; currentProfile=null;
       document.getElementById('authGate').style.display='flex';
@@ -3834,57 +3845,10 @@ async function _copqBioRegister(email){
 
 // ── Offer biometric registration after a successful password login ────
 function _copqBioOfferRegistration(email){
-  // Never trigger a Windows Hello / Face ID registration prompt on every login.
-  // Once the user has either registered OR dismissed the offer, remember that
-  // choice on this device for this email. Biometric sign-in remains available
-  // through the explicit biometric button whenever a credential exists.
-  if(!window.PublicKeyCredential) return;
-  email=String(email||'').trim().toLowerCase();
-  if(!email || _copqBioGetCred(email)) return; // already registered
-  const suppressKey='copq_bio_offer_suppressed:'+email;
-  try{ if(localStorage.getItem(suppressKey)==='1') return; }catch{}
-
-  PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(async avail=>{
-    if(!avail || _copqBioGetCred(email)) return;
-    const type=await _copqBioGetType();
-    if(!type) return;
-    setTimeout(()=>{
-      if(_copqBioGetCred(email)) return;
-      const existing=document.getElementById('copq-bio-offer-toast');
-      if(existing) existing.remove();
-      const toast=document.createElement('div');
-      toast.id='copq-bio-offer-toast';
-      toast.style.cssText='position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:10000;background:#fff;border:1.5px solid #C0392B;border-radius:14px;padding:16px 20px;min-width:280px;max-width:92vw;box-shadow:0 8px 32px rgba(192,57,43,.18);font-family:inherit;text-align:center';
-      toast.innerHTML=`
-        <div style="font-size:26px;margin-bottom:6px">${type.icon}</div>
-        <div style="font-weight:700;font-size:14px;color:#1a2a3a;margin-bottom:4px">Enable ${type.label}?</div>
-        <div style="font-size:12px;color:#6b84a0;margin-bottom:14px">Sign in faster next time — no password needed.</div>
-        <div style="display:flex;gap:8px;justify-content:center;">
-          <button id="copqBioEnableBtn" style="padding:9px 18px;border:none;border-radius:9px;background:#C0392B;color:#fff;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;">Enable</button>
-          <button id="copqBioNotNowBtn" style="padding:9px 14px;border:1.5px solid #dde5ef;border-radius:9px;background:#f4f8fc;color:#475569;font-size:13px;cursor:pointer;font-family:inherit;">Not now</button>
-        </div>`;
-      document.body.appendChild(toast);
-
-      const suppress=()=>{ try{localStorage.setItem(suppressKey,'1');}catch{}; toast.remove(); };
-      document.getElementById('copqBioNotNowBtn').onclick=suppress;
-      document.getElementById('copqBioEnableBtn').onclick=async()=>{
-        toast.innerHTML='<div style="font-size:13px;color:#6b84a0;padding:8px 0">⏳ Follow your device prompt…</div>';
-        const ok=await _copqBioRegister(email);
-        if(ok){
-          toast.innerHTML='<div style="font-size:13px;font-weight:700;color:#1E7E4A;padding:8px 0">✅ Enabled! Sign in with biometrics next time.</div>';
-        }else{
-          // A cancelled/failed registration must not cause the browser prompt
-          // to appear again on the next login.
-          try{localStorage.setItem(suppressKey,'1');}catch{}
-          toast.innerHTML='<div style="font-size:13px;color:#A32D2D;padding:8px 0">Registration cancelled. You can still use password sign-in.</div>';
-        }
-        setTimeout(()=>toast.remove(),3000);
-      };
-      setTimeout(()=>toast.remove(),15000);
-    },900);
-  }).catch(()=>{});
+  // Automatic biometric enrollment is disabled. Registration must never start
+  // from a normal password login, so Windows Hello cannot be invoked repeatedly.
+  return;
 }
-
 // ── MAIN: tap the biometric button ───────────────────────────────────
 window._copqBioLogin=async function(){
   const credMap=_copqBioGetCred(null);
@@ -3983,9 +3947,7 @@ window._copqBioLogin=async function(){
 // Hook into the FB onAuth: after the auth state fires and user profile loads,
 // offer biometric registration if not yet enrolled. We expose a small helper
 // that block-2 (auth state handler) can call.
-window._copqBioOfferAfterLogin = function(email){
-  if(email) _copqBioOfferRegistration(email);
-};
+window._copqBioOfferAfterLogin = function(){ return; };
 
 // ── Init ──────────────────────────────────────────────────────
 document.querySelectorAll('.modal-overlay').forEach(o=>o.addEventListener('click',e=>{if(e.target===o)o.classList.remove('open');}));
