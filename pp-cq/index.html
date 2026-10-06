@@ -1110,7 +1110,7 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
 
 <!-- Add/Edit User -->
 <div class="modal-overlay" id="userModal">
-  <div class="modal">
+  <div class="modal" style="max-width:660px">
     <div class="modal-header">
       <div class="modal-title" id="userModalTitle">Add User</div>
       <button class="modal-close" onclick="closeModal('userModal')">×</button>
@@ -1123,7 +1123,7 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
       </div>
       <div class="form-grid">
         <div class="field"><label class="required">Role</label>
-          <select id="uRole">
+          <select id="uRole" onchange="onUserRoleChange()">
             <option value="user">User</option>
             <option value="admin">Admin</option>
             <option value="super_admin">Super Admin</option>
@@ -1134,6 +1134,14 @@ input[type=checkbox]{accent-color:var(--blue);width:14px;height:14px;cursor:poin
         </div>
       </div>
       <div class="field" id="uPasswordRow"><label id="uPasswordLabel" class="required">Password</label><input type="password" id="uPassword" placeholder="Min 6 characters"></div>
+
+      <!-- Factor access — shown only when role = user -->
+      <div id="uFactorAccessSection" style="display:none">
+        <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px">COPQ Factor Access</div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:12px">Uncheck a factor to hide it entirely, or uncheck specific sub-categories to restrict access within it.</div>
+        <div id="uFactorList" style="display:flex;flex-direction:column;gap:10px;max-height:40vh;overflow-y:auto"></div>
+      </div>
+
       <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:6px">
         <button class="btn" onclick="closeModal('userModal')">Cancel</button>
         <button class="btn btn-primary" onclick="saveUser()">Save User</button>
@@ -1878,21 +1886,33 @@ window.saveUser=async function(){
     role='user';
     if(currentProfile.plant&&currentProfile.plant!=='All') plant=currentProfile.plant;
   }
+  // Collect factor access rights from the modal (only relevant for role=user)
+  let factors=null, subcats=null;
+  if(role==='user'){
+    factors=[...document.querySelectorAll('.ufa-cat-chk:checked')].map(c=>c.dataset.category);
+    if(!factors.length){ showToast('Select at least one COPQ factor for this user'); return; }
+    subcats={};
+    COPQ_FACTORS.forEach(cat=>{
+      const subChks=[...document.querySelectorAll('.ufa-sub-chk[data-category="'+cat+'"]')];
+      if(!subChks.length) return;
+      const checked=subChks.filter(c=>c.checked).map(c=>c.dataset.subcat);
+      if(checked.length<subChks.length) subcats[cat]=checked;
+    });
+  }
+  const userData={name,email,role,plant,...(factors?{factors,subcats}:{})};
   try{
     if(id){
-      // Include email in the Firestore update — updates the stored/displayed email.
-      // (Firebase Auth login credential is separate; only the Admin SDK can change that.)
-      const res=await window.FB.updateUser(id,{name,email,role,plant});
+      const res=await window.FB.updateUser(id,userData);
       const newId=(res&&res.newId)?res.newId:id;
       const idx=usersList.findIndex(u=>u.id===id);
-      if(idx!==-1) usersList[idx]={...usersList[idx],id:newId,name,email,role,plant};
+      if(idx!==-1) usersList[idx]={...usersList[idx],id:newId,...userData};
       showToast('User updated ✓');
     } else {
       const em=email.toLowerCase();
       if((usersList||[]).some(u=>(u.email||'').toLowerCase()===em)){
         showToast('This email already has COPQ access.'); return;
       }
-      const res=await window.FB.createUser(email,pw,{name,role,plant});
+      const res=await window.FB.createUser(email,pw,{name,role,plant,...(factors?{factors,subcats}:{})});
       if(res?.status==='reenabled'){
         showToast('User re-enabled. Their previous COPQ password still works — use "Send reset email" if they forgot it.',8000);
       } else if(res?.status==='copq_exists'){
@@ -3046,6 +3066,40 @@ function renderUsers(){
     </div></td>
   </tr>`).join('');
 }
+// Render factor+subcat checkboxes inside the user modal for a given user (or null = all checked)
+function renderUserFactorSection(u){
+  const sec=document.getElementById('uFactorAccessSection');
+  const listEl=document.getElementById('uFactorList');
+  const role=document.getElementById('uRole').value;
+  // Only show for role=user; admins/super_admins get full access
+  if(role!=='user'){ sec.style.display='none'; return; }
+  sec.style.display='';
+  const allowedFactors=u?getUserFactors(u):COPQ_FACTORS.slice();
+  listEl.innerHTML=COPQ_FACTORS.map(cat=>{
+    const subs=mastersList.filter(m=>m.category===cat).map(m=>m.subcat);
+    const allowedSubs=u?getUserSubcats(u,cat):subs.slice();
+    const subHtml=subs.length
+      ?subs.map(s=>`<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2)"><input type="checkbox" class="ufa-sub-chk" data-category="${cat.replace(/"/g,'&quot;')}" data-subcat="${s.replace(/"/g,'&quot;')}" ${allowedSubs.includes(s)?'checked':''}>${s}</label>`).join('')
+      :'<div style="font-size:11px;color:var(--text3)">No sub-categories defined</div>';
+    return `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--r-md);padding:10px 14px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:13px;cursor:pointer">
+          <input type="checkbox" class="ufa-cat-chk" data-category="${cat.replace(/"/g,'&quot;')}" ${allowedFactors.includes(cat)?'checked':''}>${cat}
+        </label>
+        ${subs.length?`<span style="font-size:11px;display:flex;gap:10px">
+          <a href="#" onclick="toggleUfaSubs('${cat.replace(/'/g,"\\'")}',true);return false" style="color:var(--blue)">All</a>
+          <a href="#" onclick="toggleUfaSubs('${cat.replace(/'/g,"\\'")}',false);return false" style="color:var(--text3)">None</a>
+        </span>`:''}
+      </div>
+      <div style="margin-top:8px;padding-left:24px;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:5px">${subHtml}</div>
+    </div>`;
+  }).join('');
+}
+function toggleUfaSubs(category, checked){
+  document.querySelectorAll('.ufa-sub-chk[data-category="'+category+'"]').forEach(c=>c.checked=checked);
+}
+function onUserRoleChange(){ renderUserFactorSection(null); }
+
 function openUserModal(){
   const isSA=currentProfile?.role==='super_admin';
   document.getElementById('editUserId').value='';
@@ -3057,13 +3111,11 @@ function openUserModal(){
   document.getElementById('uPasswordLabel').textContent='Password';
   document.getElementById('uPassword').placeholder='Min 6 characters';
   document.getElementById('userModalTitle').textContent='Add User';
-  // Role: admin can only create Users (not admin/super_admin)
   const roleEl=document.getElementById('uRole');
   roleEl.innerHTML=isSA
     ?'<option value="user">User</option><option value="admin">Admin</option><option value="super_admin">Super Admin</option>'
     :'<option value="user">User</option>';
   roleEl.value='user';
-  // Plant: admin is locked to their own plant
   const plantEl=document.getElementById('uPlant');
   if(!isSA&&currentProfile?.plant&&currentProfile.plant!=='All'){
     plantEl.value=currentProfile.plant;
@@ -3072,6 +3124,7 @@ function openUserModal(){
     plantEl.disabled=false;
     plantEl.value='All';
   }
+  renderUserFactorSection(null); // all checked by default for new user
   document.getElementById('userModal').classList.add('open');
 }
 function openEditUserModal(id){
@@ -3084,13 +3137,11 @@ function openEditUserModal(id){
   document.getElementById('uPassword').value='';
   document.getElementById('uPasswordRow').style.display='none';
   document.getElementById('userModalTitle').textContent='Edit User';
-  // Role: admin can only set/keep role as 'user'
   const roleEl=document.getElementById('uRole');
   roleEl.innerHTML=isSA
     ?'<option value="user">User</option><option value="admin">Admin</option><option value="super_admin">Super Admin</option>'
     :'<option value="user">User</option>';
   roleEl.value=u.role||'user';
-  // Plant: admin locked to their plant
   const plantEl=document.getElementById('uPlant');
   if(!isSA&&currentProfile?.plant&&currentProfile.plant!=='All'){
     plantEl.value=currentProfile.plant;
@@ -3099,6 +3150,7 @@ function openEditUserModal(id){
     plantEl.disabled=false;
     plantEl.value=u.plant||'All';
   }
+  renderUserFactorSection(u); // pre-fill existing access rights
   document.getElementById('userModal').classList.add('open');
 }
 async function runImportFromOld(){
@@ -3815,6 +3867,9 @@ window.exportReportsPDF      = exportReportsPDF;
 window.openUserModal         = openUserModal;
 window.openEditUserModal     = openEditUserModal;
 window.deleteUser            = deleteUser;
+window.renderUserFactorSection = renderUserFactorSection;
+window.toggleUfaSubs         = toggleUfaSubs;
+window.onUserRoleChange      = onUserRoleChange;
 window.sendUserReset         = sendUserReset;
 window.runImportFromOld      = runImportFromOld;
 window.openPlantModal        = openPlantModal;
