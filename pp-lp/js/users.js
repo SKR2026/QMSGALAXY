@@ -47,8 +47,14 @@ function renderUsersTable(users) {
   const tbody = document.getElementById('usersTableBody');
   if (!tbody) return;
 
+  const isSA = window.currentUser?.role === ROLES.SUPER_ADMIN;
+
+  // Show / hide the checkbox header column
+  document.getElementById('userSelectAllTh')?.classList.toggle('hidden', !isSA);
+  clearUserSelection();
+
   if (users.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="table-empty">No users found.</td></tr>';
+    tbody.innerHTML = `<tr><td colspan="${isSA ? 10 : 9}" class="table-empty">No users found.</td></tr>`;
     return;
   }
 
@@ -58,9 +64,13 @@ function renderUsersTable(users) {
       : '<span class="badge badge-cancelled">Inactive</span>';
 
     const actions = buildUserActions(u);
+    const cbCell  = isSA && u.id !== window.currentUser.uid
+      ? `<td class="col-check"><input type="checkbox" class="user-row-cb" data-uid="${u.id}" onchange="onUserRowCheck()" /></td>`
+      : `<td class="col-check"></td>`;
 
     return `
       <tr data-record-id="${u.id}">
+        ${isSA ? cbCell : ''}
         <td>
           <div style="display:flex;align-items:center;gap:8px">
             <div class="user-avatar" style="width:28px;height:28px;font-size:10px">${getInitials(u.name)}</div>
@@ -99,6 +109,8 @@ function buildUserActions(user) {
 
     if (cu.role === ROLES.SUPER_ADMIN) {
       btns.push(`<button class="btn btn-ghost btn-sm" onclick="resetUserAccess('${user.id}')">Reset</button>`);
+      const _dn = (user.name||user.email||user.id).replace(/'/g,"'");
+      btns.push(`<button class="btn btn-danger btn-sm" onclick="deleteSingleUser('${user.id}','${_dn}')">Delete</button>`);
     }
   }
 
@@ -417,6 +429,102 @@ async function resetUserAccess(userId) {
       await logActivity('user', `Password reset sent: ${email}`, userId, null);
       showToast(`Password reset email sent to ${email}`, 'success');
     }
+  } catch (e) {
+    showToast(friendlyFirebaseError(e), 'error');
+  }
+}
+
+
+/* ── Delete single user (Super Admin) ───────────────────── */
+async function deleteSingleUser(userId, displayName) {
+  requirePermission('manage_users');
+  if (window.currentUser.role !== ROLES.SUPER_ADMIN) {
+    showToast('Only Super Admin can delete users.', 'error'); return;
+  }
+  if (userId === window.currentUser.uid) {
+    showToast('You cannot delete your own account.', 'error'); return;
+  }
+
+  const result = await confirmAction({
+    title:       'Delete User',
+    message:     `Permanently delete "${displayName}"? This removes their LPA profile. Their Firebase Auth login must be removed separately in the Firebase Console.`,
+    confirmText: 'Delete',
+    dangerStyle: true
+  });
+  if (!result.confirmed) return;
+
+  try {
+    await col('users').doc(userId).delete();
+    try { if (typeof logActivity === 'function') await logActivity('user', `User deleted: ${displayName}`, userId, null); } catch(_) {}
+    showToast(`User "${displayName}" deleted.`, 'success');
+    await loadUsers();
+  } catch (e) {
+    showToast(friendlyFirebaseError(e), 'error');
+  }
+}
+
+/* ── Multi-select helpers ────────────────────────────────── */
+function onUserRowCheck() {
+  const checked = document.querySelectorAll('.user-row-cb:checked');
+  const total   = document.querySelectorAll('.user-row-cb');
+  const bar     = document.getElementById('userBulkBar');
+  const countEl = document.getElementById('userBulkCount');
+  const selAll  = document.getElementById('userSelectAll');
+
+  if (countEl) countEl.textContent = `${checked.length} selected`;
+  if (bar) bar.classList.toggle('hidden', checked.length === 0);
+  if (selAll) selAll.indeterminate = checked.length > 0 && checked.length < total.length;
+  if (selAll) selAll.checked = total.length > 0 && checked.length === total.length;
+}
+
+function toggleSelectAllUsers(checked) {
+  document.querySelectorAll('.user-row-cb').forEach(cb => { cb.checked = checked; });
+  onUserRowCheck();
+}
+
+function clearUserSelection() {
+  document.querySelectorAll('.user-row-cb').forEach(cb => { cb.checked = false; });
+  const selAll = document.getElementById('userSelectAll');
+  if (selAll) { selAll.checked = false; selAll.indeterminate = false; }
+  document.getElementById('userBulkBar')?.classList.add('hidden');
+}
+
+/* ── Bulk delete (Super Admin) ───────────────────────────── */
+async function deleteSelectedUsers() {
+  requirePermission('manage_users');
+  if (window.currentUser.role !== ROLES.SUPER_ADMIN) {
+    showToast('Only Super Admin can delete users.', 'error'); return;
+  }
+
+  const checkboxes = Array.from(document.querySelectorAll('.user-row-cb:checked'));
+  if (!checkboxes.length) { showToast('No users selected.', 'warning'); return; }
+
+  const ids = checkboxes.map(cb => cb.dataset.uid).filter(id => id !== window.currentUser.uid);
+  if (ids.length < checkboxes.length) showToast('Your own account was excluded from the selection.', 'warning');
+  if (!ids.length) return;
+
+  const names = ids.map(id => {
+    const u = allUsers.find(u => u.id === id);
+    return u ? (u.name || u.email || id) : id;
+  });
+
+  const result = await confirmAction({
+    title:       `Delete ${ids.length} User${ids.length > 1 ? 's' : ''}`,
+    message:     `Permanently delete: ${names.join(', ')}?
+
+This removes their LPA profiles. Firebase Auth accounts must be removed separately in the Firebase Console.`,
+    confirmText: `Delete ${ids.length} User${ids.length > 1 ? 's' : ''}`,
+    dangerStyle: true
+  });
+  if (!result.confirmed) return;
+
+  try {
+    const batch = db.batch();
+    ids.forEach(id => batch.delete(col('users').doc(id)));
+    await batch.commit();
+    try { if (typeof logActivity === 'function') await logActivity('user', `Bulk delete: ${ids.length} users`, null, { ids }); } catch(_) {}
+    showToast(`${ids.length} user${ids.length > 1 ? 's' : ''} deleted.`, 'success');
+    await loadUsers();
   } catch (e) {
     showToast(friendlyFirebaseError(e), 'error');
   }
