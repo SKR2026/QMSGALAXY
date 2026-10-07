@@ -5358,15 +5358,29 @@ function unlockEntry(id){
     showToast('Only Super Admin can unlock entries');
     return;
   }
-  entry.locked = false;
+  entry.locked      = false;
   entry.entryStatus = 'draft';
+  entry._unlockTs   = Date.now(); // guards against stale Firestore overwrite during propagation
   renderRecentEntries();
   renderMyEntries();
   showToast('Entry unlocked');
   const fsId = entry.fsId || (typeof entry.id === 'string' ? entry.id : null);
   if (window.FB && window.FB.updateKPIEntry && fsId) {
     window.FB.updateKPIEntry(fsId, { locked: false, entryStatus: 'draft' })
-      .catch(err=>console.warn('Firebase unlock failed:', err));
+      .then(() => {
+        // Firestore confirmed unlock — clear the guard timestamp
+        entry._unlockTs = null;
+      })
+      .catch(err => {
+        console.warn('Firebase unlock failed:', err);
+        // Revert local state if Firebase write failed
+        entry.locked      = true;
+        entry.entryStatus = 'submitted';
+        entry._unlockTs   = null;
+        renderRecentEntries();
+        renderMyEntries();
+        showToast('Unlock failed — please try again', 'error');
+      });
   }
 }
 
@@ -5432,8 +5446,9 @@ async function bulkUnlockMyEntries(){
       if(fsId && window.FB && window.FB.updateKPIEntry){
         await window.FB.updateKPIEntry(fsId, { locked: false, entryStatus: 'draft' });
       }
-      entry.locked = false;
+      entry.locked      = false;
       entry.entryStatus = 'draft';
+      entry._unlockTs   = Date.now(); // guard against stale Firestore overwrite
       ok++;
     }catch(err){
       console.error('Unlock failed for', entry.kpiId, entry.month, err);
@@ -11551,8 +11566,14 @@ function mergeFirebaseEntries(fsEntries) {
     // 1. Check if already in recentEntries by fsId — update in place
     const byFsId = recentEntries.findIndex(d => String(d.fsId) === String(fe.id));
     if (byFsId >= 0) {
+      const local = recentEntries[byFsId];
+      // Protect locally-unlocked entries: if Super Admin just unlocked this
+      // entry (_unlockTs set) but Firestore still returns locked=true, keep local.
+      if (local._unlockTs && !local.locked && fe.locked) {
+        return; // Firestore hasn't caught up yet — keep the unlocked state
+      }
       // If incoming is submitted/locked, always overwrite regardless of local state
-      if(fe.locked || fe.entryStatus==='submitted' || !recentEntries[byFsId].locked) {
+      if(fe.locked || fe.entryStatus==='submitted' || !local.locked) {
         recentEntries[byFsId] = mapped;
       }
       return;
@@ -11589,8 +11610,15 @@ function mergeFirebaseEntries(fsEntries) {
   });
 }
 
-// Like mergeFirebaseEntries but protects locally-submitted entries from being
-// overwritten by an incoming draft from Firestore (handles propagation delay).
+// Like mergeFirebaseEntries but protects locally-submitted OR locally-unlocked
+// entries from being overwritten by stale Firestore data.
+//
+// Two propagation-delay scenarios this handles:
+//   A) Super Admin SUBMITS  → local locked=true  → Firestore still says draft  → keep local
+//   B) Super Admin UNLOCKS  → local locked=false  → Firestore still says locked=true → keep local
+//
+// The _unlockTs timestamp is set by unlockEntry() so we can tell a deliberate
+// local unlock apart from an entry that simply hasn't been submitted yet.
 function mergeFirebaseEntriesKeepSubmitted(fsEntries) {
   fsEntries.forEach(fe => {
     const mapped = {
@@ -11622,19 +11650,28 @@ function mergeFirebaseEntriesKeepSubmitted(fsEntries) {
       submittedBy:  fe.submittedBy      || ''
     };
 
-    // Check by fsId first
+    // ── Check by fsId first ──────────────────────────────
     const byFsId = recentEntries.findIndex(d => String(d.fsId) === String(fe.id));
     if (byFsId >= 0) {
       const local = recentEntries[byFsId];
-      // If local is submitted but Firestore returns draft — Firestore hasn't caught up yet. Keep local.
-      if((local.locked || local.entryStatus==='submitted') && !mapped.locked && mapped.entryStatus!=='submitted'){
+
+      // Scenario A: local is submitted/locked, Firestore returns draft → Firestore lagging
+      if ((local.locked || local.entryStatus === 'submitted') &&
+          !mapped.locked && mapped.entryStatus !== 'submitted') {
         return; // keep local submitted state
       }
+
+      // Scenario B: Super Admin unlocked locally (_unlockTs set), but Firestore
+      // still returns locked=true → Firestore write hasn't propagated yet
+      if (local._unlockTs && !local.locked && mapped.locked) {
+        return; // keep local unlocked state
+      }
+
       recentEntries[byFsId] = mapped;
       return;
     }
 
-    // Business-key check
+    // ── Business-key check ───────────────────────────────
     const bizKey = d =>
       String(d.kpiId) === String(fe.kpiId) &&
       String(d.plant||'').trim().toLowerCase() === String(fe.plant||'').trim().toLowerCase() &&
@@ -11644,10 +11681,18 @@ function mergeFirebaseEntriesKeepSubmitted(fsEntries) {
     const byBiz = recentEntries.findIndex(fe.eventDate ? _evtLocalMatch(fe) : bizKey);
     if (byBiz >= 0) {
       const local = recentEntries[byBiz];
-      // Local submitted beats incoming draft
-      if((local.locked || local.entryStatus==='submitted') && !mapped.locked && mapped.entryStatus!=='submitted'){
+
+      // Scenario A: local submitted beats incoming draft
+      if ((local.locked || local.entryStatus === 'submitted') &&
+          !mapped.locked && mapped.entryStatus !== 'submitted') {
         return;
       }
+
+      // Scenario B: local was explicitly unlocked, Firestore still shows locked
+      if (local._unlockTs && !local.locked && mapped.locked) {
+        return;
+      }
+
       recentEntries[byBiz] = mapped;
       return;
     }
