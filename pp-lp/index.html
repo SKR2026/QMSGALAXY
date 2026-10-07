@@ -707,6 +707,7 @@
           <button class="tab-btn" onclick="switchMasterTab('questions',this)">Questions</button>
           <button class="tab-btn" onclick="switchMasterTab('categories',this)">Categories</button>
         </div>
+
         <div id="masterTabContent" class="card">
           <!-- Dynamically populated per tab -->
         </div>
@@ -1476,6 +1477,22 @@
 }
 @keyframes frSpin { to { transform: rotate(270deg); } }
 
+/* ── Questions Toolbar ───────────────────────────────────── */
+.q-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.q-toolbar-left { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+.q-toolbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
 /* ── Escalation Email Config ─────────────────────────────── */
 .esc-email-group { display: flex; flex-direction: column; gap: 5px; }
 .esc-level-dot {
@@ -1733,34 +1750,7 @@ function openBulkUploadModal() {
   openModal('bulkUploadModal');
 }
 
-/** 
- * Inject the Bulk Upload button next to the "+ Add Question" button.
- * Uses a MutationObserver on #masterTabContent so it works regardless
- * of how/when masterdata.js renders the tab (dynamic innerHTML, async, etc.)
- */
-function injectBulkUploadBtn() {
-  if (document.getElementById('btnBulkUploadQuestions')) return; // already present
 
-  // Look for any button whose text contains "Add Question" inside the tab content
-  const container = document.getElementById('masterTabContent');
-  if (!container) return;
-
-  const allBtns = container.querySelectorAll('button');
-  let addBtn = null;
-  allBtns.forEach(function(b) {
-    if (/add\s*question/i.test(b.textContent)) addBtn = b;
-  });
-
-  if (!addBtn) return; // not rendered yet
-
-  const btn = document.createElement('button');
-  btn.id = 'btnBulkUploadQuestions';
-  btn.className = 'btn btn-secondary btn-sm btn-bulk-upload';
-  btn.style.marginLeft = '8px';
-  btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Bulk Upload';
-  btn.onclick = openBulkUploadModal;
-  addBtn.parentNode.insertBefore(btn, addBtn.nextSibling);
-}
 
 
 
@@ -1931,34 +1921,72 @@ async function importBulkQuestions() {
   okEl.classList.add('hidden');
 
   try {
-    // Try Firestore first
-    const db = (typeof firebase !== 'undefined') ? firebase.firestore() : null;
-    const now = new Date().toISOString();
+    const db   = (typeof firebase !== 'undefined') ? firebase.firestore() : null;
     const user = db ? firebase.auth().currentUser : null;
-    const plant = (typeof window.currentPlantId !== 'undefined') ? window.currentPlantId : null;
+    const ts   = db ? firebase.firestore.FieldValue.serverTimestamp() : new Date().toISOString();
+
+    // Resolve plantId: use current plant selector or currentUser.plantId
+    const plantId = (typeof getActivePlantId === 'function' && getActivePlantId())
+      || (window.currentUser && window.currentUser.plantId)
+      || '';
+
+    // Pre-load audit levels so we can map level name → levelId
+    let levelMap = {}; // e.g. { 'Level 1': 'abc123', 'level 1 — supervisor': 'abc123' }
+    if (db) {
+      try {
+        const lvSnap = await db.collection('auditLevels').get();
+        lvSnap.docs.forEach(function(d) {
+          const l = d.data();
+          const key1 = ('Level ' + l.levelNumber).toLowerCase();
+          const key2 = (l.name || '').toLowerCase();
+          levelMap[key1] = d.id;
+          levelMap[key2] = d.id;
+          levelMap[d.id] = d.id; // allow passing ID directly
+        });
+      } catch(e) {}
+    }
+
+    // Pre-load / auto-create categories so we keep the categories collection clean
+    const ensuredCats = new Set();
+    async function ensureCategory(name) {
+      if (!db || !name || ensuredCats.has(name)) return;
+      try {
+        const snap = await db.collection('categories').where('name', '==', name).limit(1).get();
+        if (snap.empty) await db.collection('categories').add({ name, description: '', createdAt: ts });
+        ensuredCats.add(name);
+      } catch(e) {}
+    }
 
     let saved = 0;
     for (const row of validRows) {
+      // Resolve levelId
+      const levelKey = (row.auditLevel || '').toLowerCase();
+      const levelId  = levelMap[levelKey] || levelMap['level ' + levelKey] || '';
+
+      await ensureCategory(row.category);
+
       const doc = {
-        questionText: row.questionText,
-        category:     row.category,
-        auditLevel:   row.auditLevel,
-        department:   row.department,
-        maxScore:     row.maxScore,
-        isMandatory:  row.isMandatory,
-        notes:        row.notes,
-        plantId:      plant || '',
-        active:       true,
-        createdAt:    now,
+        question:     row.questionText,          // field name used by masterdata.js
+        category:     row.category || '',
+        levelId:      levelId,                   // Firestore doc ID of the audit level
+        plantId:      plantId,
+        criticality:  row.criticality || 'Minor',
+        questionType: row.questionType || 'Yes/No',
+        sortOrder:    row.sortOrder || 100,
+        requirement:  row.notes || '',
+        status:       'active',
+        revisionNumber: 1,
+        questionId:   'Q-BULK-' + Date.now() + '-' + saved,
+        createdAt:    ts,
         createdBy:    user ? user.uid : 'bulk-import',
         source:       'bulk_upload',
       };
+
       if (db) {
-        await db.collection('questions').add(doc);
+        await db.collection('questionMasters').add(doc);
       } else {
-        // Demo: persist to localStorage
         const store = JSON.parse(localStorage.getItem('lpa_questions') || '[]');
-        doc.id = 'q_' + Date.now() + '_' + saved;
+        doc.id = doc.questionId;
         store.push(doc);
         localStorage.setItem('lpa_questions', JSON.stringify(store));
       }
@@ -1969,9 +1997,9 @@ async function importBulkQuestions() {
     okEl.classList.remove('hidden');
     if (typeof showToast === 'function') showToast(saved + ' questions imported', 'success');
 
-    // Refresh questions list if the masterdata module exposes a reload function
-    if (typeof loadMasterDataQuestions === 'function') loadMasterDataQuestions();
-    else if (typeof loadMasterData === 'function') loadMasterData();
+    // Refresh the questions tab using masterdata.js's own function
+    if (typeof renderQuestionsTab === 'function') renderQuestionsTab();
+    else if (typeof loadQuestions === 'function') loadQuestions();
 
     setTimeout(function() { closeModal('bulkUploadModal'); }, 1800);
 
@@ -2731,39 +2759,233 @@ function saveEscalationEmails() {
   else observe();
 })();
 
+
+
 /* ═══════════════════════════════════════════════════════════
-   BULK UPLOAD — tab observer (same robust pattern)
+   QUESTIONS TOOLBAR + ADD QUESTION MODAL
 ═══════════════════════════════════════════════════════════ */
-(function startMasterDataObserver() {
-  function observe() {
-    const container = document.getElementById('masterTabContent');
-    if (!container) { setTimeout(observe, 300); return; }
 
-    new MutationObserver(function() {
-      // Remove any stale injected button before re-checking
-      const stale = document.getElementById('btnBulkUploadQuestions');
-      if (stale) stale.remove();
-      const activeTab = document.querySelector('#view-masterdata .tab-btn.active');
-      if (activeTab && /questions/i.test(activeTab.textContent)) {
-        setTimeout(injectBulkUploadBtn, 60);
-      }
-    }).observe(container, { childList: true, subtree: true });
+function qToolbarShow(visible) {
+  const tb = document.getElementById('questionsToolbar');
+  if (tb) tb.classList.toggle('hidden', !visible);
+}
+
+/** Populate category, level, dept dropdowns from Firestore or localStorage */
+async function populateAddQuestionDropdowns() {
+  const db = (typeof firebase !== 'undefined') ? firebase.firestore() : null;
+
+  // ── Categories ──────────────────────────────────────────
+  const catSel = document.getElementById('aqCategory');
+  if (catSel) {
+    catSel.innerHTML = '<option value="">Select category…</option>';
+    let cats = [];
+    if (db) {
+      try {
+        const snap = await db.collection('categories').orderBy('name').get();
+        cats = snap.docs.map(function(d) { return { id: d.id, name: d.data().name || d.id }; });
+      } catch(e) {}
+    }
+    // Fallback: pull from localStorage or use common defaults
+    if (!cats.length) {
+      try { cats = JSON.parse(localStorage.getItem('lpa_categories') || '[]'); } catch(e) {}
+    }
+    if (!cats.length) {
+      cats = [
+        { id: 'safety',      name: 'Safety' },
+        { id: 'quality',     name: 'Quality' },
+        { id: 'environment', name: 'Environment' },
+        { id: '5s',          name: '5S / Housekeeping' },
+        { id: 'process',     name: 'Process Compliance' },
+        { id: 'maintenance', name: 'Maintenance' },
+        { id: 'documentation', name: 'Documentation' },
+        { id: 'training',    name: 'Training & Competency' },
+      ];
+    }
+    cats.forEach(function(c) {
+      const o = document.createElement('option');
+      o.value = c.id || c.name;
+      o.textContent = c.name;
+      catSel.appendChild(o);
+    });
   }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', observe);
-  else observe();
-})();
 
-// Also patch switchMasterTab
-(function patchSwitchMasterTab() {
-  const _orig = window.switchMasterTab;
-  if (!_orig) { setTimeout(patchSwitchMasterTab, 250); return; }
-  window.switchMasterTab = function(tab, el) {
-    _orig(tab, el);
-    if (tab === 'questions') setTimeout(injectBulkUploadBtn, 80);
+  // ── Audit Levels ────────────────────────────────────────
+  const lvlSel = document.getElementById('aqLevel');
+  if (lvlSel) {
+    lvlSel.innerHTML = '<option value="">Select level…</option>';
+    let levels = [];
+    if (db) {
+      try {
+        const snap = await db.collection('auditLevels').orderBy('name').get();
+        levels = snap.docs.map(function(d) { return { id: d.id, name: d.data().name || d.id }; });
+      } catch(e) {}
+    }
+    if (!levels.length) {
+      levels = [
+        { id: 'level1', name: 'Level 1 — Supervisor' },
+        { id: 'level2', name: 'Level 2 — Manager' },
+        { id: 'level3', name: 'Level 3 — Plant Head' },
+      ];
+    }
+    levels.forEach(function(l) {
+      const o = document.createElement('option');
+      o.value = l.id || l.name;
+      o.textContent = l.name;
+      lvlSel.appendChild(o);
+    });
+  }
+
+  // ── Departments ─────────────────────────────────────────
+  const deptSel = document.getElementById('aqDept');
+  if (deptSel) {
+    deptSel.innerHTML = '<option value="">All Departments</option>';
+    let depts = [];
+    if (db) {
+      try {
+        const snap = await db.collection('departments').orderBy('name').get();
+        depts = snap.docs.map(function(d) { return { id: d.id, name: d.data().name || d.id }; });
+      } catch(e) {}
+    }
+    if (!depts.length) {
+      try { depts = JSON.parse(localStorage.getItem('lpa_departments') || '[]'); } catch(e) {}
+    }
+    depts.forEach(function(d) {
+      const o = document.createElement('option');
+      o.value = d.id || d.name;
+      o.textContent = d.name;
+      deptSel.appendChild(o);
+    });
+  }
+}
+
+function openAddQuestionModal(existingData) {
+  // Clear form
+  ['aqText','aqReference','aqNotes'].forEach(function(id) {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  const aqMax = document.getElementById('aqMaxScore');
+  if (aqMax) aqMax.value = 10;
+  const aqMand = document.getElementById('aqMandatory');
+  if (aqMand) aqMand.checked = false;
+  const aqActive = document.getElementById('aqActive');
+  if (aqActive) aqActive.checked = true;
+  document.getElementById('addQError')?.classList.add('hidden');
+
+  const title = document.getElementById('addQModalTitle');
+  if (title) title.textContent = existingData ? 'Edit Question' : 'Add Question';
+
+  // Store editing id
+  document.getElementById('addQuestionModal')._editId = existingData?.id || null;
+
+  // Pre-fill if editing
+  if (existingData) {
+    if (document.getElementById('aqText')) document.getElementById('aqText').value = existingData.questionText || '';
+    if (document.getElementById('aqMaxScore')) document.getElementById('aqMaxScore').value = existingData.maxScore || 10;
+    if (document.getElementById('aqMandatory')) document.getElementById('aqMandatory').checked = !!existingData.isMandatory;
+    if (document.getElementById('aqNotes')) document.getElementById('aqNotes').value = existingData.notes || '';
+    if (document.getElementById('aqReference')) document.getElementById('aqReference').value = existingData.reference || '';
+  }
+
+  populateAddQuestionDropdowns().then(function() {
+    // Set selects after populating
+    if (existingData) {
+      ['aqCategory','aqLevel','aqDept','aqCriticality','aqType'].forEach(function(selId) {
+        const fieldMap = { aqCategory:'category', aqLevel:'auditLevel', aqDept:'department', aqCriticality:'criticality', aqType:'type' };
+        const sel = document.getElementById(selId);
+        const val = existingData[fieldMap[selId]];
+        if (sel && val) sel.value = val;
+      });
+    }
+  });
+
+  openModal('addQuestionModal');
+  setTimeout(function() { document.getElementById('aqText')?.focus(); }, 120);
+}
+
+async function saveAddQuestion() {
+  const errEl = document.getElementById('addQError');
+  errEl?.classList.add('hidden');
+
+  const text  = document.getElementById('aqText')?.value.trim();
+  const cat   = document.getElementById('aqCategory')?.value;
+  const level = document.getElementById('aqLevel')?.value;
+
+  if (!text)  { showAddQError('Question text is required.'); return; }
+  if (!cat)   { showAddQError('Please select a category.'); return; }
+  if (!level) { showAddQError('Please select an audit level.'); return; }
+
+  const btn = document.getElementById('btnSaveQuestion');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+
+  const db    = (typeof firebase !== 'undefined') ? firebase.firestore() : null;
+  const user  = db ? firebase.auth().currentUser : null;
+  const now   = new Date().toISOString();
+  const modal = document.getElementById('addQuestionModal');
+  const editId = modal?._editId;
+
+  const doc = {
+    questionText: text,
+    category:     cat,
+    auditLevel:   level,
+    department:   document.getElementById('aqDept')?.value    || '',
+    criticality:  document.getElementById('aqCriticality')?.value || 'Minor',
+    type:         document.getElementById('aqType')?.value    || 'Yes/No',
+    maxScore:     parseInt(document.getElementById('aqMaxScore')?.value) || 10,
+    isMandatory:  document.getElementById('aqMandatory')?.checked || false,
+    active:       document.getElementById('aqActive')?.checked !== false,
+    reference:    document.getElementById('aqReference')?.value.trim() || '',
+    notes:        document.getElementById('aqNotes')?.value.trim()     || '',
+    updatedAt:    now,
+    updatedBy:    user ? user.uid : 'manual',
   };
-})();
+
+  try {
+    if (db) {
+      if (editId) {
+        await db.collection('questionMasters').doc(editId).update(doc);
+      } else {
+        doc.createdAt = now;
+        doc.createdBy = user ? user.uid : 'manual';
+        await db.collection('questionMasters').add(doc);
+      }
+    } else {
+      // localStorage fallback
+      const store = JSON.parse(localStorage.getItem('lpa_questions') || '[]');
+      if (editId) {
+        const idx = store.findIndex(function(q) { return q.id === editId; });
+        if (idx > -1) store[idx] = Object.assign(store[idx], doc);
+      } else {
+        doc.id = 'q_' + Date.now();
+        doc.createdAt = now;
+        store.push(doc);
+      }
+      localStorage.setItem('lpa_questions', JSON.stringify(store));
+    }
+
+    closeModal('addQuestionModal');
+    if (typeof showToast === 'function') showToast(editId ? 'Question updated' : 'Question saved', 'success');
+    // Refresh the questions list if masterdata.js exposes a reload
+    if (typeof loadMasterDataQuestions === 'function') loadMasterDataQuestions();
+    else if (typeof switchMasterTab === 'function') {
+      const activeBtn = document.querySelector('#view-masterdata .tab-btn.active');
+      if (activeBtn) switchMasterTab('questions', activeBtn);
+    }
+  } catch(e) {
+    showAddQError('Save failed: ' + (e.message || e));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save Question'; }
+  }
+}
+
+function showAddQError(msg) {
+  const el = document.getElementById('addQError');
+  if (el) { el.textContent = msg; el.classList.remove('hidden'); }
+}
 
 /* ── Expose all globals ──────────────────────────────────── */
+window.qToolbarShow             = qToolbarShow;
+window.openAddQuestionModal     = openAddQuestionModal;
+window.saveAddQuestion          = saveAddQuestion;
 window.openFactoryResetModal    = openFactoryResetModal;
 window.frCheckConfirm           = frCheckConfirm;
 window.executeFactoryReset      = executeFactoryReset;
