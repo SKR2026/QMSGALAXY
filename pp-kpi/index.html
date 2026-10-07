@@ -4404,6 +4404,23 @@ function filterActions(f, btn){
   renderActionPlans(f);
 }
 
+/**
+ * Resolve a valid Firestore document ID from a local entry object.
+ * Returns the ID string if valid (alphanumeric Firestore ID),
+ * or null if the entry only has a local numeric temp ID.
+ *
+ * Background: entries created locally before Firebase sync use a
+ * numeric Date.now() as their id. Firestore-loaded entries always have
+ * string IDs like "xK9mPqR2vT...". Using a numeric id with updateDoc
+ * silently fails or creates a wrong document.
+ */
+function resolveFsId(entry) {
+  const raw = entry.fsId || entry.id;
+  if (raw == null) return null;
+  const s = String(raw);
+  return (s && isNaN(Number(s))) ? s : null; // pure-numeric = local temp id, not Firestore
+}
+
 // Close an action plan — marks as closed locally and persists to Firestore
 function closeActionPlanEntry(id){
   const entry = [...recentEntries, ...kpiData].find(d => String(d.id) === String(id));
@@ -4412,14 +4429,13 @@ function closeActionPlanEntry(id){
   entry.actionStatus = 'closed';
   renderActionPlans(currentActionFilter);
   refreshAll();
-  // Persist to Firestore
-  const fsId = entry.fsId || (typeof entry.id === 'string' ? entry.id : null);
+  const fsId = resolveFsId(entry);
   if(fsId && window.FB && window.FB.updateKPIEntry){
     window.FB.updateKPIEntry(fsId, { actionStatus: 'closed' })
       .then(()=>showToast('Action plan closed ✓'))
       .catch(err=>{ console.error(err); showToast('Failed to close: '+err.message); });
   } else {
-    showToast('Action plan closed (locally)');
+    showToast('Action plan closed (locally only — no Firebase ID)');
   }
 }
 
@@ -4435,13 +4451,13 @@ function reopenActionPlanEntry(id){
   entry.actionStatus = 'in-progress';
   renderActionPlans(currentActionFilter);
   refreshAll();
-  const fsId = entry.fsId || (typeof entry.id === 'string' ? entry.id : null);
+  const fsId = resolveFsId(entry);
   if(fsId && window.FB && window.FB.updateKPIEntry){
     window.FB.updateKPIEntry(fsId, { actionStatus: 'in-progress' })
       .then(()=>showToast('Action plan reopened ✓'))
       .catch(err=>{ console.error(err); showToast('Failed to reopen: '+err.message); });
   } else {
-    showToast('Action plan reopened (locally)');
+    showToast('Action plan reopened (locally only — no Firebase ID)');
   }
 }
 
@@ -5363,23 +5379,32 @@ function unlockEntry(id){
   entry._unlockTs   = Date.now(); // guards against stale Firestore overwrite during propagation
   renderRecentEntries();
   renderMyEntries();
+
+  const fsId = resolveFsId(entry);
+
+  if (!fsId) {
+    showToast('Entry unlocked locally — this entry has no Firebase ID and will re-lock on reload. Please contact admin.');
+    console.warn('[Unlock] No valid Firestore ID for entry:', entry);
+    return;
+  }
+
   showToast('Entry unlocked');
-  const fsId = entry.fsId || (typeof entry.id === 'string' ? entry.id : null);
-  if (window.FB && window.FB.updateKPIEntry && fsId) {
+
+  if (window.FB && window.FB.updateKPIEntry) {
     window.FB.updateKPIEntry(fsId, { locked: false, entryStatus: 'draft' })
       .then(() => {
-        // Firestore confirmed unlock — clear the guard timestamp
+        // Firestore confirmed — clear the propagation guard
         entry._unlockTs = null;
       })
       .catch(err => {
-        console.warn('Firebase unlock failed:', err);
-        // Revert local state if Firebase write failed
+        console.error('[Unlock] Firebase write failed for', fsId, err);
+        // Revert local state
         entry.locked      = true;
         entry.entryStatus = 'submitted';
         entry._unlockTs   = null;
         renderRecentEntries();
         renderMyEntries();
-        showToast('Unlock failed — please try again', 'error');
+        showToast('Unlock failed: ' + (err.code || err.message || 'unknown error') + ' — try again or check permissions');
       });
   }
 }
@@ -5442,16 +5467,31 @@ async function bulkUnlockMyEntries(){
     const k2 = kpiMaster.find(k=>String(k.id)===String(entry.kpiId));
     if(subE) subE.textContent = `Unlocking ${k2 ? k2.name : 'entry'} — ${entry.month} ${entry.year}`;
     try{
-      const fsId = entry.fsId || (typeof entry.id === 'string' ? entry.id : null);
-      if(fsId && window.FB && window.FB.updateKPIEntry){
+      // Resolve Firestore doc ID — fsId is always set for Firebase-loaded entries.
+      // Fall back to entry.id but validate it's a real Firestore ID (alphanumeric, not a local numeric temp id).
+      const rawId  = entry.fsId || entry.id;
+      const fsId   = rawId != null ? String(rawId) : null;
+      const validFs = fsId && isNaN(Number(fsId)); // pure-numeric = local temp id, not Firestore
+
+      if(!validFs){
+        console.warn('[BulkUnlock] Skipping entry with no valid Firestore ID:', entry.kpiId, entry.month);
+        failed++;
+        done++;
+        setProg();
+        continue;
+      }
+
+      if(window.FB && window.FB.updateKPIEntry){
         await window.FB.updateKPIEntry(fsId, { locked: false, entryStatus: 'draft' });
       }
       entry.locked      = false;
       entry.entryStatus = 'draft';
       entry._unlockTs   = Date.now(); // guard against stale Firestore overwrite
+      // Clear guard once Firestore confirmed (already awaited above)
+      entry._unlockTs   = null;
       ok++;
     }catch(err){
-      console.error('Unlock failed for', entry.kpiId, entry.month, err);
+      console.error('[BulkUnlock] Failed for', entry.kpiId, entry.month, err);
       failed++;
     }
     done++;
