@@ -31,8 +31,8 @@ async function loadUsers() {
       query = query.where('plantId', '==', window.currentUser.plantId);
     }
 
-    const snap = await query.orderBy('name').get();
-    allUsers   = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const docs = await fetchSorted(query, 'name');
+    allUsers   = docs.map(d => ({ id: d.id, ...d.data() }));
 
     renderUsersTable(allUsers);
     countEl.textContent = `${allUsers.length} user${allUsers.length !== 1 ? 's' : ''}`;
@@ -53,7 +53,7 @@ function renderUsersTable(users) {
   }
 
   tbody.innerHTML = users.map(u => {
-    const statusBadge = u.status === 'active'
+    const statusBadge = (u.status === 'active' || u.active === true)
       ? '<span class="badge badge-verified">Active</span>'
       : '<span class="badge badge-cancelled">Inactive</span>';
 
@@ -91,7 +91,7 @@ function buildUserActions(user) {
   if (user.id !== cu.uid) {
     btns.push(`<button class="btn btn-secondary btn-sm" onclick="openEditUserModal('${user.id}')">Edit</button>`);
 
-    if (user.status === 'active') {
+    if (user.status === 'active' || user.active === true) {
       btns.push(`<button class="btn btn-ghost btn-sm" onclick="deactivateUser('${user.id}')">Deactivate</button>`);
     } else {
       btns.push(`<button class="btn btn-success btn-sm" onclick="activateUser('${user.id}')">Activate</button>`);
@@ -146,10 +146,16 @@ async function openCreateUserModal() {
   // Populate plant options
   const plantSel = document.getElementById('userPlant');
   await populatePlantOptions(plantSel, false);
+  wireUserPlantChange();
 
-  // Populate dept options
+  // Populate dept options (for the pre-selected plant of a plant admin, if any)
   const deptSel = document.getElementById('userDept');
   deptSel.innerHTML = '<option value="">None</option>';
+  if (plantSel.value) await populateDeptOptions(deptSel, plantSel.value, false);
+
+  if (plantSel.options.length <= 1) {
+    showToast('No active plants found. Add a plant in Master Data first.', 'warning');
+  }
 
   openModal('userModal');
 }
@@ -181,6 +187,7 @@ async function openEditUserModal(userId) {
 
   const plantSel = document.getElementById('userPlant');
   await populatePlantOptions(plantSel, false);
+  wireUserPlantChange();
   plantSel.value = u.plantId || '';
 
   if (u.plantId) {
@@ -192,6 +199,24 @@ async function openEditUserModal(userId) {
   onUserRoleChange(u.role);
 
   openModal('userModal');
+}
+
+/** Reload the Department list whenever the Plant dropdown changes. */
+function wireUserPlantChange() {
+  const plantSel = document.getElementById('userPlant');
+  const deptSel  = document.getElementById('userDept');
+  plantSel.onchange = async () => {
+    deptSel.innerHTML = '<option value="">None</option>';
+    if (plantSel.value) await populateDeptOptions(deptSel, plantSel.value, false);
+  };
+}
+
+/** Secondary Firebase app so creating an Auth user doesn't sign the admin out. */
+function getSecondaryAuth() {
+  let app;
+  try { app = firebase.app('lpaSecondary'); }
+  catch (e) { app = firebase.initializeApp(firebaseConfig, 'lpaSecondary'); }
+  return app.auth();
 }
 
 function onUserRoleChange(role) {
@@ -265,17 +290,12 @@ async function saveUser() {
       await logActivity('user', `User updated: ${email}`, editId, { oldValue: 'profile', newValue: role });
       showToast('User updated successfully', 'success');
     } else {
-      // CREATE: Call Cloud Function or provide instructions
-      // The Cloud Function `createLPAUser` accepts { email, password, profile }
-      // and creates both the Firebase Auth user and the Firestore profile atomically.
-      //
-      // If Cloud Functions are not yet deployed, we create the Firestore profile
-      // and instruct the Super Admin to also create the Auth account separately.
-
-      // Check for duplicate email in Firestore
-      const existing = await col('users').where('email', '==', email).limit(1).get();
-      if (!existing.empty) {
-        throw new UserFacingError('A user with this email already exists in the LPA system.');
+      // CREATE: create the Firebase Auth account (via a secondary app so the
+      // admin stays signed in), then write the profile at users/{uid}.
+      const cu = window.currentUser;
+      if (cu.role === ROLES.PLANT_ADMIN) {
+        if (role === ROLES.SUPER_ADMIN) throw new UserFacingError('Plant Admins cannot create Super Admins.');
+        if (plantId !== cu.plantId)     throw new UserFacingError('You can only create users for your own plant.');
       }
 
       const profileData = {
@@ -283,45 +303,46 @@ async function saveUser() {
         plantId: plantId || null, plantName,
         deptId: deptId || null, deptName, designation,
         status:    'active',
-        createdBy: window.currentUser.uid,
+        active:    true,
+        createdBy: cu.uid,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
         lastLogin: null,
         initials:  getInitials(name)
       };
 
-      // Try Cloud Function first, fall back to client-side creation guide
+      const sAuth = getSecondaryAuth();
+      let uid;
       try {
-        const fn = firebase.functions?.().httpsCallable('createLPAUser');
-        if (fn) {
-          await fn({ email, password, profile: profileData });
-          showToast(`User ${name} created successfully`, 'success');
-        } else {
-          // No Functions SDK loaded — store profile with a pending UID placeholder
-          // Admin must create the Firebase Auth account manually
-          const tempDocId = `pending_${Date.now()}`;
-          profileData.status  = 'pending_auth';
-          profileData.tempRef = tempDocId;
-          await col('users').doc(tempDocId).set(profileData);
-
-          showToast(`Profile saved. IMPORTANT: Create the Firebase Auth account for ${email} in the Firebase Console with the same UID, then update the document ID.`, 'warning', 10000);
-        }
-      } catch (fnErr) {
-        console.warn('[Users] Cloud Function unavailable, saving profile only:', fnErr.message);
-        // Save profile anyway — when the user signs in via Firebase Auth the profile will be found by UID
-        const tempDocId = `profile_${email.replace(/[^a-z0-9]/gi,'_')}`;
-        await col('users').doc(tempDocId).set(profileData);
-        showToast(`Profile saved for ${name}. Note: Firebase Auth account must be created separately.`, 'info', 8000);
+        const cred = await sAuth.createUserWithEmailAndPassword(email, password);
+        uid = cred.user.uid;
+      } finally {
+        try { await sAuth.signOut(); } catch (_) {}
       }
 
-      await logActivity('user', `User created: ${email} / ${role}`, null, { newValue: { name, email, role } });
+      try {
+        profileData.uid = uid;
+        await col('users').doc(uid).set(profileData);
+      } catch (profileErr) {
+        console.error('[Users] Auth user created but profile write failed:', profileErr);
+        throw new UserFacingError(`Login account for ${email} was created, but saving the profile failed (${friendlyFirebaseError(profileErr)}). Fix the cause and add the profile at apps/lpa/users/${uid}.`);
+      }
+
+      try { await logActivity('user', `User created: ${email} / ${role}`, uid, { newValue: { name, email, role } }); } catch (_) {}
+      showToast(`User ${name} created successfully`, 'success');
     }
 
     closeModal('userModal');
     await loadUsers();
 
   } catch (e) {
-    errorDiv.textContent = e.userMessage || friendlyFirebaseError(e);
+    const authMsgs = {
+      'auth/email-already-in-use': 'A login account with this email already exists.',
+      'auth/weak-password':        'Password is too weak. Use at least 8 characters.',
+      'auth/invalid-email':        'Please enter a valid email address.',
+      'auth/operation-not-allowed':'Email/Password sign-in is not enabled in Firebase Authentication.'
+    };
+    errorDiv.textContent = e.userMessage || authMsgs[e.code] || friendlyFirebaseError(e);
     errorDiv.classList.remove('hidden');
     console.error('[Users] Save error:', e);
   } finally {

@@ -135,14 +135,55 @@ function toggleSidebar() {
   }
 }
 
+/* ── Query helpers (avoid composite-index requirements) ──── */
+/**
+ * Firestore needs a composite index for "where(a) + orderBy(b)".
+ * Those indexes were never created, so every such query failed with
+ * "failed-precondition" and dropdowns/forms stayed empty.
+ * Fetch with equality filters only and sort in the browser instead.
+ */
+async function fetchSorted(query, field, dir = 'asc') {
+  const snap = await query.get();
+  const docs = snap.docs.slice();
+  docs.sort((a, b) => {
+    const x = a.data()[field], y = b.data()[field];
+    if (x === y) return 0;
+    if (x === undefined || x === null) return 1;
+    if (y === undefined || y === null) return -1;
+    const r = (typeof x === 'number' && typeof y === 'number')
+      ? x - y : String(x).localeCompare(String(y));
+    return dir === 'desc' ? -r : r;
+  });
+  return docs;
+}
+
+/**
+ * Plants the current user may see. Super Admin: all plants.
+ * Others: only their own plant document(s) (Firestore rules do not allow
+ * listing the whole collection for non-super-admins).
+ */
+async function fetchPlants(activeOnly = true) {
+  const user = window.currentUser;
+  let docs = [];
+  if (user.role === ROLES.SUPER_ADMIN) {
+    docs = await fetchSorted(col('plants'), 'name');
+  } else {
+    const ids = [...new Set([user.plantId, ...(user.plantIds || [])].filter(Boolean))];
+    const snaps = await Promise.all(ids.map(id => col('plants').doc(id).get()));
+    docs = snaps.filter(s => s.exists);
+  }
+  if (activeOnly) docs = docs.filter(d => (d.data().status || 'active') === 'active');
+  return docs;
+}
+
 /* ── Plant Selector (Super Admin) ────────────────────────── */
 async function populatePlantSelector() {
   try {
-    const snap = await col('plants').where('status', '==', 'active').orderBy('name').get();
+    const docsP = await fetchPlants(true);
     const sel  = document.getElementById('plantSelector');
     // Clear existing except "All Plants"
     sel.innerHTML = '<option value="all">🏭 All Plants</option>';
-    snap.forEach(doc => {
+    docsP.forEach(doc => {
       const opt = document.createElement('option');
       opt.value = doc.id;
       opt.textContent = doc.data().name;
@@ -346,13 +387,11 @@ function hideLoading() {
 async function populatePlantOptions(selectEl, includeAll = true) {
   if (!selectEl) return;
   try {
-    let query = col('plants').where('status', '==', 'active').orderBy('name');
     const user = window.currentUser;
-
-    const snap = await query.get();
+    const plantDocs = await fetchPlants(true);
     selectEl.innerHTML = includeAll ? '<option value="">All Plants</option>' : '<option value="">Select Plant</option>';
 
-    snap.forEach(doc => {
+    plantDocs.forEach(doc => {
       if (user.role !== ROLES.SUPER_ADMIN && !canAccessPlant(doc.id)) return;
       const opt = document.createElement('option');
       opt.value = doc.id;
@@ -377,8 +416,9 @@ async function populateDeptOptions(selectEl, plantId, includeAll = true) {
   if (!selectEl || !plantId) return;
   selectEl.innerHTML = includeAll ? '<option value="">All Departments</option>' : '<option value="">Select Department</option>';
   try {
-    const snap = await col('departments').where('plantId', '==', plantId).where('status', '==', 'active').orderBy('name').get();
-    snap.forEach(doc => {
+    const deptDocs = (await fetchSorted(col('departments').where('plantId', '==', plantId), 'name'))
+      .filter(d => (d.data().status || 'active') === 'active');
+    deptDocs.forEach(doc => {
       const opt = document.createElement('option');
       opt.value = doc.id;
       opt.textContent = doc.data().name;
@@ -393,8 +433,9 @@ async function populateProcessOptions(selectEl, deptId, includeAll = true) {
   if (!selectEl || !deptId) return;
   selectEl.innerHTML = includeAll ? '<option value="">All Processes</option>' : '<option value="">Select Process</option>';
   try {
-    const snap = await col('processes').where('departmentId', '==', deptId).where('status', '==', 'active').orderBy('name').get();
-    snap.forEach(doc => {
+    const procDocs = (await fetchSorted(col('processes').where('deptId', '==', deptId), 'name'))
+      .filter(d => (d.data().status || 'active') === 'active');
+    procDocs.forEach(doc => {
       const opt = document.createElement('option');
       opt.value = doc.id;
       opt.textContent = doc.data().name;
@@ -409,8 +450,9 @@ async function populateLevelOptions(selectEl, includeAll = true) {
   if (!selectEl) return;
   selectEl.innerHTML = includeAll ? '<option value="">All Levels</option>' : '<option value="">Select Level</option>';
   try {
-    const snap = await col('auditLevels').where('status', '==', 'active').orderBy('levelNumber').get();
-    snap.forEach(doc => {
+    const levelDocs = (await fetchSorted(col('auditLevels'), 'levelNumber'))
+      .filter(d => (d.data().status || 'active') === 'active');
+    levelDocs.forEach(doc => {
       const opt = document.createElement('option');
       opt.value = doc.id;
       opt.textContent = `Level ${doc.data().levelNumber} — ${doc.data().name}`;
@@ -428,8 +470,8 @@ async function populateUserOptions(selectEl, plantId, roleFilter) {
     let query = col('users').where('status', '==', 'active');
     if (plantId) query = query.where('plantId', '==', plantId);
     if (roleFilter) query = query.where('role', '==', roleFilter);
-    const snap = await query.orderBy('name').get();
-    snap.forEach(doc => {
+    const userDocs = await fetchSorted(query, 'name');
+    userDocs.forEach(doc => {
       const opt = document.createElement('option');
       opt.value = doc.id;
       opt.textContent = `${doc.data().name} (${doc.data().empId || doc.data().email})`;

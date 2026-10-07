@@ -128,14 +128,14 @@ async function savePlant(plantId) {
   try {
     if (plantId) {
       await col('plants').doc(plantId).update(data);
-      await logActivity('system', `Plant updated: ${name}`, plantId, null);
+      await safeLog('system', `Plant updated: ${name}`, plantId, null);
       showToast('Plant updated', 'success');
     } else {
       const newId = generateId('PLT');
       data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
       data.createdBy = window.currentUser.uid;
       await col('plants').doc(newId).set(data);
-      await logActivity('system', `Plant created: ${name}`, newId, null);
+      await safeLog('system', `Plant created: ${name}`, newId, null);
       showToast('Plant created', 'success');
       await populatePlantSelector();
     }
@@ -154,9 +154,12 @@ async function togglePlantStatus(plantId, status) {
     dangerStyle: status === 'inactive'
   });
   if (!result.confirmed) return;
-  await col('plants').doc(plantId).update({ status, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
-  showToast(`Plant ${verb}d`, 'success');
-  await renderPlantsTab();
+  try {
+    await col('plants').doc(plantId).update({ status, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+    showToast(`Plant ${verb}d`, 'success');
+    await populatePlantSelector();
+    await renderPlantsTab();
+  } catch (e) { showToast(friendlyFirebaseError(e), 'error'); }
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -164,9 +167,13 @@ async function togglePlantStatus(plantId, status) {
 ══════════════════════════════════════════════════════════ */
 async function renderDepartmentsTab() {
   const plantId = getActivePlantId() || window.currentUser.plantId;
-  const snap    = plantId
-    ? await col('departments').where('plantId', '==', plantId).orderBy('name').get()
-    : await col('departments').orderBy('name').limit(200).get();
+  let docs;
+  try {
+    docs = plantId
+      ? await fetchSorted(col('departments').where('plantId', '==', plantId), 'name')
+      : await fetchSorted(col('departments').limit(200), 'name');
+  } catch (e) { setMasterContent(`<div class="alert alert-error">${friendlyFirebaseError(e)}</div>`); return; }
+  const snap = { docs, size: docs.length };
 
   const rows = snap.docs.map(d => {
     const dept = d.data();
@@ -208,10 +215,13 @@ async function openDeptModal(deptId) {
   }
 
   let plantOpts = '';
-  const plantSnap = await col('plants').where('status','==','active').orderBy('name').get();
-  plantSnap.forEach(d => {
-    const sel = dept?.plantId === d.id ? 'selected' : '';
-    plantOpts += `<option value="${d.id}" ${sel}>${d.data().name}</option>`;
+  let plantDocs;
+  try { plantDocs = await fetchPlants(true); }
+  catch (e) { showToast(friendlyFirebaseError(e), 'error'); return; }
+  if (!plantDocs.length) { showToast('Add an active Plant first (Master Data → Plants).', 'warning'); return; }
+  plantDocs.forEach(d => {
+    const sel = (dept?.plantId === d.id || (!dept && plantDocs.length === 1)) ? 'selected' : '';
+    plantOpts += `<option value="${d.id}" ${sel}>${escapeHtml(d.data().name)}</option>`;
   });
 
   showInlineForm('deptForm', `
@@ -237,19 +247,19 @@ async function saveDept(deptId) {
   const head    = document.getElementById('dHead')?.value.trim();
   if (!name || !plantId) { showToast('Name and plant are required.', 'error'); return; }
 
-  const plantDoc  = await col('plants').doc(plantId).get();
-  const plantName = plantDoc.data()?.name || '';
-
-  const data = { name, plantId, plantName, head, status: 'active', updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
-
   try {
+    const plantDoc  = await col('plants').doc(plantId).get();
+    const plantName = plantDoc.data()?.name || '';
+    const data = { name, plantId, plantName, head, status: 'active', updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
+
     if (deptId) {
       await col('departments').doc(deptId).update(data);
     } else {
       data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+      data.createdBy = window.currentUser.uid;
       await col('departments').add(data);
     }
-    await logActivity('system', `Department ${deptId ? 'updated' : 'created'}: ${name}`, deptId || null, null);
+    await safeLog('system', `Department ${deptId ? 'updated' : 'created'}: ${name}`, deptId || null, null);
     showToast('Department saved', 'success');
     await renderDepartmentsTab();
   } catch (e) {
@@ -262,9 +272,13 @@ async function saveDept(deptId) {
 ══════════════════════════════════════════════════════════ */
 async function renderProcessesTab() {
   const plantId = getActivePlantId() || window.currentUser.plantId;
-  const snap    = plantId
-    ? await col('processes').where('plantId', '==', plantId).orderBy('name').get()
-    : await col('processes').orderBy('name').limit(200).get();
+  let docs;
+  try {
+    docs = plantId
+      ? await fetchSorted(col('processes').where('plantId', '==', plantId), 'name')
+      : await fetchSorted(col('processes').limit(200), 'name');
+  } catch (e) { setMasterContent(`<div class="alert alert-error">${friendlyFirebaseError(e)}</div>`); return; }
+  const snap = { docs, size: docs.length };
 
   const rows = snap.docs.map(d => {
     const p = d.data();
@@ -292,8 +306,11 @@ async function openProcessModal(processId) {
   if (processId) { const doc = await col('processes').doc(processId).get(); proc = doc.data(); }
 
   let plantOpts = '';
-  const plantSnap = await col('plants').where('status','==','active').orderBy('name').get();
-  plantSnap.forEach(d => { plantOpts += `<option value="${d.id}" ${proc?.plantId===d.id?'selected':''}>${d.data().name}</option>`; });
+  let plantDocs;
+  try { plantDocs = await fetchPlants(true); }
+  catch (e) { showToast(friendlyFirebaseError(e), 'error'); return; }
+  if (!plantDocs.length) { showToast('Add an active Plant first (Master Data → Plants).', 'warning'); return; }
+  plantDocs.forEach(d => { plantOpts += `<option value="${d.id}" ${proc?.plantId===d.id?'selected':''}>${escapeHtml(d.data().name)}</option>`; });
 
   showInlineForm('procForm', `
     <h4 style="margin-bottom:16px">${proc ? 'Edit Process' : 'Add Process'}</h4>
@@ -311,10 +328,11 @@ async function openProcessModal(processId) {
       <button class="btn btn-secondary" onclick="renderProcessesTab()">Cancel</button>
     </div>
   `);
-  if (proc?.plantId) {
-    document.getElementById('prPlant').value = proc.plantId;
-    await populateDeptOptions(document.getElementById('prDept'), proc.plantId, false);
-    document.getElementById('prDept').value = proc.deptId || '';
+  const initPlant = proc?.plantId || (plantDocs.length === 1 ? plantDocs[0].id : '');
+  if (initPlant) {
+    document.getElementById('prPlant').value = initPlant;
+    await populateDeptOptions(document.getElementById('prDept'), initPlant, false);
+    document.getElementById('prDept').value = proc?.deptId || '';
   }
 }
 
@@ -323,14 +341,14 @@ async function saveProcess(processId) {
   const plantId = document.getElementById('prPlant')?.value;
   const deptId  = document.getElementById('prDept')?.value;
   if (!name || !plantId) { showToast('Name and plant required.', 'error'); return; }
-  const plantDoc = await col('plants').doc(plantId).get();
-  const deptDoc  = deptId ? await col('departments').doc(deptId).get() : null;
-  const data = {
-    name, plantId, plantName: plantDoc.data()?.name||'',
-    deptId: deptId||null, deptName: deptDoc?.data()?.name||'',
-    status: 'active', updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-  };
   try {
+    const plantDoc = await col('plants').doc(plantId).get();
+    const deptDoc  = deptId ? await col('departments').doc(deptId).get() : null;
+    const data = {
+      name, plantId, plantName: plantDoc.data()?.name||'',
+      deptId: deptId||null, departmentId: deptId||null, deptName: deptDoc?.data()?.name||'',
+      status: 'active', updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    };
     if (processId) await col('processes').doc(processId).update(data);
     else { data.createdAt = firebase.firestore.FieldValue.serverTimestamp(); await col('processes').add(data); }
     showToast('Process saved', 'success');
@@ -446,20 +464,21 @@ async function loadQuestions() {
   const levelId  = document.getElementById('qLevelFilter')?.value;
   const statusF  = document.getElementById('qStatusFilter')?.value;
 
+  // Only ONE server-side filter (plant) so no composite index is needed.
+  // Level / status are filtered and sorted in the browser.
   if (plantId)  query = query.where('plantId', '==', plantId);
   else if (window.currentUser.role !== ROLES.SUPER_ADMIN) query = query.where('plantId', '==', window.currentUser.plantId);
-  if (levelId)  query = query.where('levelId', '==', levelId);
-  if (statusF)  query = query.where('status', '==', statusF);
-
-  query = query.orderBy('sortOrder').limit(200);
 
   try {
-    const snap = await query.get();
+    let qDocs = await fetchSorted(query, 'sortOrder');
+    if (levelId) qDocs = qDocs.filter(d => d.data().levelId === levelId);
+    if (statusF) qDocs = qDocs.filter(d => d.data().status === statusF);
+    const snap = { docs: qDocs.slice(0, 200) };
     const rows = snap.docs.map(d => {
       const q = d.data();
       return `<tr>
         <td style="font-family:var(--font-mono);font-size:11px">${q.questionId || d.id.substring(0,8)}</td>
-        <td style="max-width:280px">${escapeHtml(q.question?.substring(0,80)||'')}…</td>
+        <td style="max-width:280px">${escapeHtml((q.question||'').substring(0,80))}${(q.question||'').length>80?'…':''}</td>
         <td>${escapeHtml(q.category||'—')}</td>
         <td>${getCriticalityBadge(q.criticality)}</td>
         <td>${escapeHtml(q.questionType||'—')}</td>
@@ -487,13 +506,17 @@ async function openQuestionModal(questionId) {
   let q = null;
   if (questionId) { const doc = await col('questionMasters').doc(questionId).get(); q = doc.data(); }
 
-  let plantOpts = '';
-  const plantSnap = await col('plants').where('status','==','active').orderBy('name').get();
-  plantSnap.forEach(d => { plantOpts += `<option value="${d.id}" ${q?.plantId===d.id?'selected':''}>${d.data().name}</option>`; });
-
-  let levelOpts = '';
-  const levelSnap = await col('auditLevels').where('status','==','active').orderBy('levelNumber').get();
-  levelSnap.forEach(d => { levelOpts += `<option value="${d.id}" ${q?.levelId===d.id?'selected':''}>Level ${d.data().levelNumber} — ${d.data().name}</option>`; });
+  let plantOpts = '', levelOpts = '';
+  let plantDocs, levelDocs;
+  try {
+    plantDocs = await fetchPlants(true);
+    levelDocs = (await fetchSorted(col('auditLevels'), 'levelNumber'))
+      .filter(d => (d.data().status || 'active') === 'active');
+  } catch (e) { showToast(friendlyFirebaseError(e), 'error'); return; }
+  if (!plantDocs.length) { showToast('Add an active Plant first (Master Data → Plants).', 'warning'); return; }
+  if (!levelDocs.length) { showToast('Add at least one Audit Level first (Master Data → Audit Levels).', 'warning'); return; }
+  plantDocs.forEach(d => { plantOpts += `<option value="${d.id}" ${(q?.plantId===d.id || (!q && plantDocs.length===1))?'selected':''}>${escapeHtml(d.data().name)}</option>`; });
+  levelDocs.forEach(d => { levelOpts += `<option value="${d.id}" ${q?.levelId===d.id?'selected':''}>Level ${d.data().levelNumber} — ${escapeHtml(d.data().name)}</option>`; });
 
   showInlineForm('questionForm', `
     <h4 style="margin-bottom:16px">${q ? 'Edit Question' : 'Add Question'}</h4>
@@ -536,7 +559,6 @@ async function saveQuestion(questionId) {
   if (!plantId || !levelId || !question) { showToast('Plant, level, and question text are required.', 'error'); return; }
 
   const data = {
-    questionId:  generateId('Q'),
     plantId, levelId, question,
     category:    document.getElementById('qCat')?.value.trim(),
     criticality: document.getElementById('qCrit')?.value,
@@ -550,9 +572,12 @@ async function saveQuestion(questionId) {
 
   try {
     if (questionId) {
+      delete data.revisionNumber;
       data.revisionNumber = firebase.firestore.FieldValue.increment(1);
       await col('questionMasters').doc(questionId).update(data);
     } else {
+      data.questionId = generateId('Q');
+      data.createdBy  = window.currentUser.uid;
       data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
       await col('questionMasters').add(data);
     }
@@ -594,9 +619,11 @@ async function addCategory() {
   const name = document.getElementById('newCatName')?.value.trim();
   const desc = document.getElementById('newCatDesc')?.value.trim();
   if (!name) { showToast('Category name required.', 'error'); return; }
-  await col('categories').add({ name, description: desc, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
-  showToast('Category added', 'success');
-  await renderCategoriesTab();
+  try {
+    await col('categories').add({ name, description: desc, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+    showToast('Category added', 'success');
+    await renderCategoriesTab();
+  } catch (e) { showToast(friendlyFirebaseError(e), 'error'); }
 }
 
 async function deleteCategory(catId) {
@@ -619,6 +646,12 @@ async function toggleStatus(collectionName, docId, newStatus) {
   } catch (e) {
     showToast(friendlyFirebaseError(e), 'error');
   }
+}
+
+/* ── Safe activity logging (a log failure must never block a save) ── */
+async function safeLog(...args) {
+  try { if (typeof logActivity === 'function') await logActivity(...args); }
+  catch (e) { console.warn('[MasterData] Activity log failed:', e.message); }
 }
 
 /* ── UI Helpers ──────────────────────────────────────────── */
