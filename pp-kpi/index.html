@@ -5494,22 +5494,34 @@ async function bulkUnlockMyEntries(){
         continue;
       }
 
-      if(window.FB && window.FB.updateKPIEntry){
-        await window.FB.updateKPIEntry(fsId, { locked: false, entryStatus: 'draft' });
-      }
+      // Set the local unlock state BEFORE awaiting Firestore. This closes a race
+      // where onSnapshot() can deliver the old locked document between the write
+      // request and its acknowledgement.
       entry.locked      = false;
       entry.entryStatus = 'draft';
-      entry._unlockTs   = Date.now(); // guard against stale Firestore overwrite
+      entry._unlockTs   = Date.now();
 
-      // FIX: same as unlockEntry() — if this entry lives only in kpiData, upsert
-      // it into recentEntries so the _unlockTs propagation guard in
-      // mergeFirebaseEntriesKeepSubmitted protects it when the plant user's view
-      // re-fetches from Firestore and still sees locked=true.
+      // Keep the unlocked object in recentEntries so the stale-snapshot guard
+      // protects it even when the entry originally came from kpiData.
       const _ridx = recentEntries.findIndex(d => String(d.fsId || d.id) === String(entry.fsId || entry.id));
       if (_ridx >= 0) { recentEntries[_ridx] = entry; } else { recentEntries.unshift(entry); }
-      // Clear guard once Firestore confirmed (already awaited above)
-      entry._unlockTs   = null;
-      ok++;
+
+      if(window.FB && window.FB.updateKPIEntry){
+        try {
+          await window.FB.updateKPIEntry(fsId, { locked: false, entryStatus: 'draft' });
+          entry._unlockTs = null; // Firestore confirmed
+          ok++;
+        } catch(err) {
+          // Roll back this entry only if its Firestore write failed.
+          entry.locked = true;
+          entry.entryStatus = 'submitted';
+          entry._unlockTs = null;
+          throw err;
+        }
+      } else {
+        entry._unlockTs = null;
+        ok++;
+      }
     }catch(err){
       console.error('[BulkUnlock] Failed for', entry.kpiId, entry.month, err);
       failed++;
@@ -11497,12 +11509,15 @@ async function loadFirebaseData() {
           : `${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
         const existing = bizMap.get(key);
         if (!existing) { bizMap.set(key, fe); return; }
-        const feSubmitted = fe.locked || fe.entryStatus === 'submitted';
-        const exSubmitted = existing.locked || existing.entryStatus === 'submitted';
-        if (feSubmitted && !exSubmitted) { bizMap.set(key, fe); return; }
-        if (!feSubmitted && exSubmitted) { return; }
-        const feTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
-        const exTs = existing.updatedAt?.toMillis ? existing.updatedAt.toMillis() : 0;
+
+        // Select the newest Firestore state. Never prefer locked/submitted merely
+        // because it is locked: an explicit Super Admin unlock writes updatedAt,
+        // and that newer draft state must survive reload even if an older duplicate
+        // document for the same KPI/plant/month/year remains in the collection.
+        const feTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis()
+                    : (fe.createdAt?.toMillis ? fe.createdAt.toMillis() : 0);
+        const exTs = existing.updatedAt?.toMillis ? existing.updatedAt.toMillis()
+                    : (existing.createdAt?.toMillis ? existing.createdAt.toMillis() : 0);
         if (feTs >= exTs) bizMap.set(key, fe);
       });
       mergeFirebaseEntries([...bizMap.values()]);
@@ -11620,7 +11635,9 @@ function mergeFirebaseEntries(fsEntries) {
       empName:      fe.empName          || null,
       empDept:      fe.empDept          || null,
       attachments:  fe.attachments      || [],
-      submittedBy:  fe.submittedBy      || ''
+      submittedBy:  fe.submittedBy      || '',
+      _updatedAt:   fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0,
+      _updatedAtTs: fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0
     };
 
     // 1. Check if already in recentEntries by fsId — update in place
@@ -11649,18 +11666,19 @@ function mergeFirebaseEntries(fsEntries) {
     const byBizKey = recentEntries.findIndex(fe.eventDate ? _evtLocalMatch(fe) : bizKey);
     if (byBizKey >= 0) {
       const existing = recentEntries[byBizKey];
-      // Submitted/locked wins; if same status, latest updatedAt wins
-      const incomingLocked = fe.locked || fe.entryStatus === 'submitted';
-      const existingLocked = existing.locked || existing.entryStatus === 'submitted';
-      if (incomingLocked && !existingLocked) {
-        recentEntries[byBizKey] = mapped; // submitted overwrites draft
-      } else if (!incomingLocked && !existingLocked) {
-        // Both drafts — keep newer one (Firestore updatedAt)
-        const inTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
-        const exTs = existing._updatedAt || 0;
-        if (inTs >= exTs) { mapped._updatedAt = inTs; recentEntries[byBizKey] = mapped; }
+      // IMPORTANT: do NOT let locked/submitted status win over a newer record.
+      // An unlock changes locked=true -> false and updateKPIEntry() writes updatedAt.
+      // If duplicate business-key documents exist, always keep the newest state.
+      // The old logic preferred locked/submitted records, which caused an entry
+      // that was successfully unlocked by Super Admin to become locked again after
+      // reload when an older duplicate document still existed.
+      const inTs = fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0;
+      const exTs = existing._updatedAt || existing._updatedAtTs || 0;
+      if (inTs >= exTs) {
+        mapped._updatedAt = inTs;
+        mapped._updatedAtTs = inTs;
+        recentEntries[byBizKey] = mapped;
       }
-      // If existing is submitted and incoming is draft, keep existing — do nothing
       return;
     }
 
@@ -11707,7 +11725,9 @@ function mergeFirebaseEntriesKeepSubmitted(fsEntries) {
       empName:      fe.empName          || null,
       empDept:      fe.empDept          || null,
       attachments:  fe.attachments      || [],
-      submittedBy:  fe.submittedBy      || ''
+      submittedBy:  fe.submittedBy      || '',
+      _updatedAt:   fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0,
+      _updatedAtTs: fe.updatedAt?.toMillis ? fe.updatedAt.toMillis() : 0
     };
 
     // ── Check by fsId first ──────────────────────────────
