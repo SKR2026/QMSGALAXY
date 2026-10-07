@@ -2779,7 +2779,7 @@ function syncDeptTabs() {
 
 function getFiltered() {
   const fyPairs = getFYMonthYearPairs(filterState.year); // [{month, year}] correct cal-year per FY month
-  return [...kpiData, ...recentEntries].filter(d => {
+  return getCanonicalKPIData().filter(d => {
     // In Apr-Mar mode the FY spans two calendar years; check each month maps to its calendar year
     const pair = fyPairs.find(p => p.month === d.month && String(p.year) === String(d.year));
     if (!pair) return false; // not part of this FY
@@ -3466,7 +3466,7 @@ function refreshMetrics() {
 
   // Overdue = entries matching current year/plant filter that have an open past-due action
   const fyPairs = getFYMonthYearPairs(filterState.year);
-  const overdue = [...kpiData, ...recentEntries].filter(d => {
+  const overdue = getCanonicalKPIData().filter(d => {
     if(!isOverdue(d)) return false;
     // Must be within the selected fiscal year
     const inFY = fyPairs.some(p=>String(p.year)===String(d.year)&&p.month===d.month);
@@ -3560,7 +3560,7 @@ function rebuildCharts() {
 
   // Radar
   const depts=deptList.map(d=>d.name);
-  const all = [...kpiData,...recentEntries].filter(d=>String(d.year)===filterState.year && (filterState.plant==='All'||d.plant===filterState.plant));
+  const all = getCanonicalKPIData().filter(d=>String(d.year)===filterState.year && (filterState.plant==='All'||d.plant===filterState.plant));
   const radarVals=depts.map(dep=>{
     const dd=all.filter(d=>d.dept===dep);
     if(!dd.length)return 0;
@@ -3586,7 +3586,7 @@ function updateTrendChart() {
     }
     return;
   }
-  const allEntries = [...kpiData,...recentEntries].filter(d=>
+  const allEntries = getCanonicalKPIData().filter(d=>
     String(d.kpiId)===String(kpiId) &&
     (filterState.plant==='All' || d.plant===filterState.plant)
   );
@@ -3885,7 +3885,7 @@ function renderTrendPage() {
   // Performance: index entries once (year|kpi|month) instead of re-scanning
   // the whole dataset for every KPI x plant x month cell.
   const _entryIdx = new Map();
-  for (const d of [...kpiData,...recentEntries]) {
+  for (const d of getCanonicalKPIData()) {
     const key = d.year + '|' + d.kpiId + '|' + d.month;
     let arr = _entryIdx.get(key);
     if (!arr) { arr = []; _entryIdx.set(key, arr); }
@@ -4039,7 +4039,7 @@ function renderCumulativeTrends() {
   grid.innerHTML = '';
 
   // ── Year selector — populated from years that actually have data ──
-  const allData = [...kpiData, ...recentEntries];
+  const allData = getCanonicalKPIData();
   const yearSel = document.getElementById('cumYearFilter');
   let year = filterState.year;
   if (yearSel) {
@@ -4295,7 +4295,7 @@ function isOverdue(d){
 
 function renderActionPlans(filter) {
   currentActionFilter = filter;
-  let actions=[...kpiData,...recentEntries].filter(d=>d.reason&&d.action);
+  let actions=getCanonicalKPIData().filter(d=>d.reason&&d.action);
 
   // Apply the global Year/Month/Plant/Department filter tabs
   actions = actions.filter(d=>{
@@ -4480,7 +4480,7 @@ function editFromActionPlan(id){
 
 
 function showKPIDetail(id) {
-  const d=[...kpiData,...recentEntries].find(x=>String(x.id)===String(id));if(!d)return;
+  const d=getCanonicalKPIData().find(x=>String(x.id)===String(id));if(!d)return;
   const k=kpiMaster.find(k=>String(k.id)===String(d.kpiId));
   const tgt=liveTarget(d);
   const pct=calcAch(d.actual,tgt,k?k.dir:'lower');
@@ -4691,7 +4691,7 @@ function updateKPIs(silent){
   const prevKpi = sel ? sel.value : '';
 
   // Determine which KPI IDs already have a submitted/locked entry for this plant+year+month
-  const allEntries = [...kpiData, ...recentEntries];
+  const allEntries = getCanonicalKPIData();
   const filledKpiIds = new Set();
   const eventCounts = {};   // event-based KPIs: number of events logged this month
   const evtIds = new Set(kpiMaster.filter(k=>k.eventBased).map(k=>String(k.id)));
@@ -5595,10 +5595,7 @@ function renderMyEntries(){
 
   // Combine Firebase-loaded historical entries (kpiData) with newly entered ones (recentEntries)
   // De-duplicate by fsId so reloading doesn't double-count
-  const allEntries = [...kpiData, ...recentEntries].filter((d, i, arr) => {
-    if(!d.fsId) return true;
-    return arr.findIndex(x => x.fsId === d.fsId) === i;
-  });
+  const allEntries = getCanonicalKPIData();
 
   let rows = allEntries.filter(d=>{
     // Plant admins / dept users may only ever see their own plant's entries
@@ -6575,6 +6572,65 @@ function matrixYTD(vals, kOrUnit){
   return parseFloat(valid.reduce((s,v)=>s+v,0).toFixed(2));
 }
 
+
+/* ════════════════════════════════════════════════════════════════
+   CANONICAL KPI DATASET
+   Prevents the same Firestore document from being counted twice
+   when it exists in both kpiData and recentEntries.
+   ════════════════════════════════════════════════════════════════ */
+function getCanonicalKPIData(){
+  const byFsId = new Map();
+  const noFs = [];
+
+  for(const d of [...kpiData, ...recentEntries]){
+    const fsId = d && (d.fsId || (d.id && String(d.id)));
+    if(fsId){
+      const key = String(fsId);
+      const existing = byFsId.get(key);
+
+      if(!existing){
+        byFsId.set(key, d);
+        continue;
+      }
+
+      // A deliberate local unlock/submission must not be replaced by an
+      // older/stale copy while Firestore propagation is in progress.
+      if(d._unlockTs && !d.locked && existing.locked) {
+        byFsId.set(key, d);
+        continue;
+      }
+      if(existing._unlockTs && !existing.locked && d.locked) {
+        continue;
+      }
+
+      const dTs = Number(d._updatedAt || d._updatedAtTs || 0);
+      const eTs = Number(existing._updatedAt || existing._updatedAtTs || 0);
+      if(dTs >= eTs) byFsId.set(key, d);
+    }else{
+      noFs.push(d);
+    }
+  }
+
+  // Local-only entries have no Firestore ID. Keep event records distinct;
+  // for normal KPI records use the business key to avoid local duplicates.
+  const localMap = new Map();
+  for(const d of noFs){
+    const key = d.eventDate
+      ? `evt|${d.kpiId}|${d.plant}|${d.eventDate}|${d.eventRef||''}|${d.actual}`
+      : `kpi|${d.kpiId}|${d.plant}|${d.month}|${d.year}`;
+    const existing = localMap.get(key);
+    if(!existing){
+      localMap.set(key, d);
+      continue;
+    }
+    const dTs = Number(d._updatedAt || d._updatedAtTs || d._unlockTs || 0);
+    const eTs = Number(existing._updatedAt || existing._updatedAtTs || existing._unlockTs || 0);
+    if(dTs >= eTs) localMap.set(key, d);
+  }
+
+  return [...byFsId.values(), ...localMap.values()];
+}
+
 function getMatrixData(){
   const year   = parseInt(document.getElementById('matrixYear').value)||2026;
   const plant  = document.getElementById('matrixPlant').value;
@@ -6595,7 +6651,7 @@ function getMatrixData(){
     if(u.email) _emailToName[u.email.toLowerCase()] = (u.name || '').toLowerCase();
   });
 
-  const baseData = [...kpiData, ...recentEntries];
+  const baseData = getCanonicalKPIData();
   const allData = userSearchTerm
     ? baseData.filter(d => {
         const email = (d.submittedBy || '').toLowerCase();
@@ -7156,7 +7212,7 @@ function monthReportCellData(k, plantName, year, month){
   // In Apr-Mar FY mode, Jan/Feb/Mar data is stored under calendar year+1.
   // Use getFYDataYear so the data lookup uses the correct calendar year.
   const dataYear = getFYDataYear(year, month);
-  const baseData = [...kpiData, ...recentEntries];
+  const baseData = getCanonicalKPIData();
   // resolveTarget handles its own FY adjustment internally (Jan/Feb/Mar → fyStart-1),
   // but we pass year (the FY start year) for consistency with how targets are keyed.
   const target = resolveTarget(k, year, month, plantName);
@@ -7819,7 +7875,7 @@ function exportTrendsExcel(){
   const fyPairs= getFYMonthYearPairs(year);
   const fyMs   = getFYMonths();
   const plants = filterState.plant==='All' ? plantsList.map(p=>p.name) : [filterState.plant];
-  const allData= [...kpiData,...recentEntries];
+  const allData= getCanonicalKPIData();
 
   const wb   = XLSX.utils.book_new();
   const hdrS = {font:{bold:true,color:{rgb:'FFFFFF'}},fill:{patternType:'solid',fgColor:{rgb:'185FA5'}},alignment:{horizontal:'center'},border:{bottom:{style:'thin',color:{rgb:'CCCCCC'}}}};
@@ -11762,18 +11818,19 @@ function mergeFirebaseEntriesKeepSubmitted(fsEntries) {
     if (byBiz >= 0) {
       const local = recentEntries[byBiz];
 
-      // Scenario A: local submitted beats incoming draft
-      if ((local.locked || local.entryStatus === 'submitted') &&
-          !mapped.locked && mapped.entryStatus !== 'submitted') {
-        return;
-      }
-
-      // Scenario B: local was explicitly unlocked, Firestore still shows locked
+      // Preserve an explicit local unlock while Firestore is propagating.
       if (local._unlockTs && !local.locked && mapped.locked) {
         return;
       }
 
-      recentEntries[byBiz] = mapped;
+      // For duplicate Firestore business records, newest updatedAt wins.
+      // Do not let an older locked/submitted duplicate overwrite a newer
+      // unlocked/draft record.
+      const inTs = Number(mapped._updatedAt || mapped._updatedAtTs || 0);
+      const exTs = Number(local._updatedAt || local._updatedAtTs || 0);
+      if (inTs >= exTs) {
+        recentEntries[byBiz] = mapped;
+      }
       return;
     }
 
