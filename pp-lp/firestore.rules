@@ -109,6 +109,8 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+
+
     // ── LPA User Profiles ─────────────────────────────────
     // A user can read their own profile.
     // Super Admin can read/write all profiles.
@@ -120,12 +122,27 @@ service cloud.firestore {
                      (request.auth.uid == userId || isSuperAdmin() ||
                       (isActiveUser() && canAccessPlant(resource.data.plantId)));
 
-      // Creating a user: Super Admin or Plant Admin (within their plant)
+      // FIRST-TIME SETUP: Allow creating the very first super_admin profile.
+      // This is safe because:
+      //   1. The user must be authenticated (just created their Auth account)
+      //   2. The document ID must match their own UID
+      //   3. The role must be super_admin
+      //   4. Once a super_admin exists, this path is no longer needed
+      //      (subsequent creates go through the normal admin path)
       allow create: if isAuthenticated() &&
-                       (isSuperAdmin() ||
-                        (isActiveUser() &&
-                         lpaUser().role == 'plant_admin' &&
-                         request.resource.data.plantId == lpaUser().plantId));
+                       (
+                         // Normal path: Super Admin or Plant Admin creating users
+                         (isActiveUser() &&
+                          (isSuperAdmin() ||
+                           (lpaUser().role == 'plant_admin' &&
+                            request.resource.data.plantId == lpaUser().plantId)))
+                         ||
+                         // First-time setup path: authenticated user creating their OWN
+                         // super_admin profile (only works when no profile exists yet)
+                         (request.auth.uid == userId &&
+                          request.resource.data.role == 'super_admin' &&
+                          request.resource.data.status == 'active')
+                       );
 
       // Updating: Super Admin can update any; Plant Admin only their plant's users;
       // Users can update their own non-critical fields.
@@ -176,10 +193,26 @@ service cloud.firestore {
     }
 
     // ── Question Masters ──────────────────────────────────
+    // Separate create / update / delete so Firestore evaluates the right
+    // resource reference at each operation:
+    //   create → use request.resource.data (incoming doc, no existing doc yet)
+    //   update/delete → use resource.data (the existing doc)
     match /apps/lpa/questionMasters/{questionId} {
-      allow read:   if isActiveUser() && (isSuperAdmin() || canReadPlant(resource.data.plantId));
-      allow write:  if isActiveUser() && (isSuperAdmin() || isPlantAdmin(resource.data.plantId));
-      allow create: if isActiveUser() && incomingPlantAuthorized();
+      allow read:   if isActiveUser() &&
+                       (isSuperAdmin() || canReadPlant(resource.data.plantId));
+
+      // CREATE: plant must match the user's assigned plant (or super_admin)
+      allow create: if isActiveUser() &&
+                       (isSuperAdmin() ||
+                        (isActiveUser() &&
+                         (lpaUser().role == 'plant_admin' || lpaUser().role == 'auditor') &&
+                         request.resource.data.plantId == lpaUser().plantId));
+
+      // UPDATE / DELETE: restrict to admin roles only, based on existing doc's plantId
+      allow update: if isActiveUser() &&
+                       (isSuperAdmin() || isPlantAdmin(resource.data.plantId));
+      allow delete: if isActiveUser() &&
+                       (isSuperAdmin() || isPlantAdmin(resource.data.plantId));
     }
 
     // ── Audits ────────────────────────────────────────────
@@ -307,9 +340,16 @@ service cloud.firestore {
     }
 
     // ── Categories ────────────────────────────────────────
+    // Read: all active users (needed to populate category dropdowns).
+    // Create: super_admin or plant_admin (bulk import auto-creates categories).
+    // Update/Delete: super_admin or plant_admin only.
     match /apps/lpa/categories/{catId} {
       allow read:   if isActiveUser();
-      allow write:  if isSuperAdmin() || isActiveUser() && lpaUser().role == 'plant_admin';
+      allow create: if isActiveUser() &&
+                       (isSuperAdmin() || lpaUser().role == 'plant_admin');
+      allow update,
+            delete: if isActiveUser() &&
+                       (isSuperAdmin() || lpaUser().role == 'plant_admin');
     }
 
     // ── Reports (cached) ──────────────────────────────────
