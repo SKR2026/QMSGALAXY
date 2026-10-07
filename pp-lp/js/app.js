@@ -17,6 +17,9 @@ async function bootApp() {
   document.getElementById('sidebarUserRole').textContent = ROLE_LABELS[user.role] || user.role;
   document.getElementById('sidebarAvatar').textContent   = user.initials;
 
+  // Update power-menu header
+  if (typeof updatePowerMenuUser === 'function') updatePowerMenuUser(user);
+
   // Apply role-based UI
   applyRoleUI(user.role);
 
