@@ -436,7 +436,13 @@ async function renderQuestionsTab() {
   setMasterContent(`
     <div class="master-table-header">
       <h3 class="card-title">Question Master</h3>
-      <button class="btn btn-primary btn-sm" onclick="openQuestionModal()">+ Add Question</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn-secondary btn-sm" onclick="openBulkUploadModal()" title="Upload many questions at once from Excel or CSV">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Bulk Upload
+        </button>
+        <button class="btn btn-primary btn-sm" onclick="openQuestionModal()">+ Add Question</button>
+      </div>
     </div>
     <div class="filter-bar" style="padding:12px 20px 0">
       <select id="qPlantFilter" class="form-select-sm" onchange="loadQuestions()"></select>
@@ -506,68 +512,145 @@ async function openQuestionModal(questionId) {
   let q = null;
   if (questionId) { const doc = await col('questionMasters').doc(questionId).get(); q = doc.data(); }
 
-  let plantOpts = '', levelOpts = '';
-  let plantDocs, levelDocs;
+  let plantOpts = '', levelOpts = '', catOpts = '';
+  let plantDocs, levelDocs, catDocs;
   try {
     plantDocs = await fetchPlants(true);
     levelDocs = (await fetchSorted(col('auditLevels'), 'levelNumber'))
       .filter(d => (d.data().status || 'active') === 'active');
+    catDocs   = await fetchSorted(col('categories'), 'name');
   } catch (e) { showToast(friendlyFirebaseError(e), 'error'); return; }
+
   if (!plantDocs.length) { showToast('Add an active Plant first (Master Data → Plants).', 'warning'); return; }
   if (!levelDocs.length) { showToast('Add at least one Audit Level first (Master Data → Audit Levels).', 'warning'); return; }
-  plantDocs.forEach(d => { plantOpts += `<option value="${d.id}" ${(q?.plantId===d.id || (!q && plantDocs.length===1))?'selected':''}>${escapeHtml(d.data().name)}</option>`; });
-  levelDocs.forEach(d => { levelOpts += `<option value="${d.id}" ${q?.levelId===d.id?'selected':''}>Level ${d.data().levelNumber} — ${escapeHtml(d.data().name)}</option>`; });
+
+  plantDocs.forEach(d => {
+    const sel = (q?.plantId === d.id || (!q && plantDocs.length === 1)) ? 'selected' : '';
+    plantOpts += `<option value="${d.id}" ${sel}>${escapeHtml(d.data().name)}</option>`;
+  });
+  levelDocs.forEach(d => {
+    levelOpts += `<option value="${d.id}" ${q?.levelId === d.id ? 'selected' : ''}>Level ${d.data().levelNumber} — ${escapeHtml(d.data().name)}</option>`;
+  });
+
+  // Build category options from Firestore categories collection.
+  // Always include the question's current category even if it's not in the list,
+  // and add an "+ Add new…" sentinel so the user can type a new one without leaving.
+  const catNames = catDocs.map(d => d.data().name);
+  const currentCat = q?.category || '';
+  if (currentCat && !catNames.includes(currentCat)) catNames.unshift(currentCat); // keep existing value
+  catOpts = `<option value="">Select category…</option>`;
+  catNames.forEach(name => {
+    catOpts += `<option value="${escapeHtml(name)}" ${currentCat === name ? 'selected' : ''}>${escapeHtml(name)}</option>`;
+  });
+  catOpts += `<option value="__new__">＋ Add new category…</option>`;
 
   showInlineForm('questionForm', `
     <h4 style="margin-bottom:16px">${q ? 'Edit Question' : 'Add Question'}</h4>
     <div class="form-grid-2">
+
       <div class="form-group"><label class="form-label required">Plant</label>
         <select id="qPlant" class="form-select"><option value="">Select</option>${plantOpts}</select></div>
+
       <div class="form-group"><label class="form-label required">Audit Level</label>
         <select id="qLevel" class="form-select"><option value="">Select</option>${levelOpts}</select></div>
-      <div class="form-group"><label class="form-label">Category</label>
-        <input type="text" id="qCat" class="form-input" value="${escapeHtml(q?.category||'')}" placeholder="e.g. Safety, Quality" /></div>
+
+      <div class="form-group">
+        <label class="form-label">Category</label>
+        <select id="qCatSelect" class="form-select" onchange="onCatSelectChange(this)">
+          ${catOpts}
+        </select>
+        <input type="text" id="qCat" class="form-input" value="${escapeHtml(currentCat)}"
+          placeholder="Type new category name…"
+          style="margin-top:6px;display:${catNames.length ? 'none' : 'block'}" />
+        <p style="font-size:11px;color:#6b7280;margin:4px 0 0">
+          Manage categories: <a href="#" onclick="event.preventDefault();switchMasterTab('categories',null)" style="color:#1a56db">Master Data → Categories</a>
+        </p>
+      </div>
+
       <div class="form-group"><label class="form-label required">Criticality</label>
         <select id="qCrit" class="form-select">
-          <option value="Minor" ${q?.criticality==='Minor'?'selected':''}>Minor</option>
-          <option value="Major" ${q?.criticality==='Major'?'selected':''}>Major</option>
-          <option value="Critical" ${q?.criticality==='Critical'?'selected':''}>Critical</option>
+          <option value="Minor"    ${q?.criticality === 'Minor'    ? 'selected' : ''}>Minor</option>
+          <option value="Major"    ${q?.criticality === 'Major'    ? 'selected' : ''}>Major</option>
+          <option value="Critical" ${q?.criticality === 'Critical' ? 'selected' : ''}>Critical</option>
         </select></div>
+
       <div class="form-group"><label class="form-label required">Question Type</label>
         <select id="qType" class="form-select">
-          ${['Yes/No','Pass/Fail','Yes/No/NA','Numeric','Text','Multiple Choice'].map(t =>
-            `<option ${q?.questionType===t?'selected':''}>${t}</option>`).join('')}
+          ${['Yes/No', 'Pass/Fail', 'Yes/No/NA', 'Numeric', 'Text', 'Multiple Choice'].map(t =>
+            `<option ${q?.questionType === t ? 'selected' : ''}>${t}</option>`).join('')}
         </select></div>
+
       <div class="form-group"><label class="form-label">Sort Order</label>
-        <input type="number" id="qSort" class="form-input" value="${q?.sortOrder||100}" min="1" /></div>
+        <input type="number" id="qSort" class="form-input" value="${q?.sortOrder || 100}" min="1" /></div>
+
       <div class="form-group form-span-2"><label class="form-label required">Question Text</label>
-        <textarea id="qText" class="form-textarea" rows="3">${escapeHtml(q?.question||'')}</textarea></div>
+        <textarea id="qText" class="form-textarea" rows="3">${escapeHtml(q?.question || '')}</textarea></div>
+
       <div class="form-group form-span-2"><label class="form-label">Requirement / Standard</label>
-        <input type="text" id="qReq" class="form-input" value="${escapeHtml(q?.requirement||'')}" placeholder="e.g. ISO 9001:2015 Clause 8.5" /></div>
+        <input type="text" id="qReq" class="form-input" value="${escapeHtml(q?.requirement || '')}"
+          placeholder="e.g. ISO 9001:2015 Clause 8.5" /></div>
+
     </div>
     <div style="display:flex;gap:8px;margin-top:16px">
-      <button class="btn btn-primary" onclick="saveQuestion('${questionId||''}')">Save Question</button>
+      <button class="btn btn-primary" onclick="saveQuestion('${questionId || ''}')">Save Question</button>
       <button class="btn btn-secondary" onclick="renderQuestionsTab()">Cancel</button>
     </div>
   `);
 }
 
+/** Show/hide the free-text category input based on dropdown selection */
+function onCatSelectChange(sel) {
+  const input = document.getElementById('qCat');
+  if (!input) return;
+  if (sel.value === '__new__') {
+    input.style.display = 'block';
+    input.value = '';
+    input.focus();
+  } else {
+    input.style.display = 'none';
+    input.value = sel.value; // keep in sync so saveQuestion reads it
+  }
+}
+
 async function saveQuestion(questionId) {
-  const plantId = document.getElementById('qPlant')?.value;
-  const levelId = document.getElementById('qLevel')?.value;
-  const question= document.getElementById('qText')?.value.trim();
-  if (!plantId || !levelId || !question) { showToast('Plant, level, and question text are required.', 'error'); return; }
+  const plantId  = document.getElementById('qPlant')?.value;
+  const levelId  = document.getElementById('qLevel')?.value;
+  const question = document.getElementById('qText')?.value.trim();
+  if (!plantId || !levelId || !question) {
+    showToast('Plant, level, and question text are required.', 'error'); return;
+  }
+
+  // Category: if user picked "new", read the text input; otherwise read the dropdown value
+  // qCat is always kept in sync by onCatSelectChange, so just read it.
+  const catSel = document.getElementById('qCatSelect');
+  let category  = document.getElementById('qCat')?.value.trim() || '';
+  if (catSel && catSel.value !== '__new__' && catSel.value !== '') {
+    category = catSel.value; // from dropdown
+  }
+
+  // Auto-create the category in Firestore if it's a new one typed by the user
+  if (category && catSel?.value === '__new__') {
+    try {
+      const existing = await col('categories').where('name', '==', category).limit(1).get();
+      if (existing.empty) {
+        await col('categories').add({
+          name: category,
+          description: '',
+          createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+      }
+    } catch (e) { /* non-fatal */ }
+  }
 
   const data = {
-    plantId, levelId, question,
-    category:    document.getElementById('qCat')?.value.trim(),
-    criticality: document.getElementById('qCrit')?.value,
-    questionType:document.getElementById('qType')?.value,
-    sortOrder:   parseInt(document.getElementById('qSort')?.value)||100,
-    requirement: document.getElementById('qReq')?.value.trim(),
-    status:      'active',
+    plantId, levelId, question, category,
+    criticality:  document.getElementById('qCrit')?.value,
+    questionType: document.getElementById('qType')?.value,
+    sortOrder:    parseInt(document.getElementById('qSort')?.value) || 100,
+    requirement:  document.getElementById('qReq')?.value.trim(),
+    status:       'active',
     revisionNumber: 1,
-    updatedAt:   firebase.firestore.FieldValue.serverTimestamp()
+    updatedAt:    firebase.firestore.FieldValue.serverTimestamp()
   };
 
   try {
@@ -578,7 +661,7 @@ async function saveQuestion(questionId) {
     } else {
       data.questionId = generateId('Q');
       data.createdBy  = window.currentUser.uid;
-      data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+      data.createdAt  = firebase.firestore.FieldValue.serverTimestamp();
       await col('questionMasters').add(data);
     }
     showToast('Question saved', 'success');
