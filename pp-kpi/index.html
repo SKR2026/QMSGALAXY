@@ -2777,9 +2777,9 @@ function syncDeptTabs() {
   });
 }
 
-function getFiltered() {
+function getFiltered(includeDrafts) {
   const fyPairs = getFYMonthYearPairs(filterState.year); // [{month, year}] correct cal-year per FY month
-  return getCanonicalKPIData().filter(d => {
+  return (includeDrafts ? getCanonicalKPIData() : getSubmittedKPIData()).filter(d => {
     // In Apr-Mar mode the FY spans two calendar years; check each month maps to its calendar year
     const pair = fyPairs.find(p => p.month === d.month && String(p.year) === String(d.year));
     if (!pair) return false; // not part of this FY
@@ -2993,7 +2993,7 @@ function openKPIModal() {
 
 // Build a flat array of row objects from current filtered data (kpiData + recentEntries)
 function buildExportRows() {
-  const rows = getFiltered();
+  const rows = getFiltered(true);
   return rows.map(d => {
     const k = kpiMaster.find(k => k.id === d.kpiId);
     const target = d.target != null ? d.target : (k ? k.target : null);
@@ -3560,7 +3560,7 @@ function rebuildCharts() {
 
   // Radar
   const depts=deptList.map(d=>d.name);
-  const all = getCanonicalKPIData().filter(d=>String(d.year)===filterState.year && (filterState.plant==='All'||d.plant===filterState.plant));
+  const all = getSubmittedKPIData().filter(d=>String(d.year)===filterState.year && (filterState.plant==='All'||d.plant===filterState.plant));
   const radarVals=depts.map(dep=>{
     const dd=all.filter(d=>d.dept===dep);
     if(!dd.length)return 0;
@@ -3586,7 +3586,7 @@ function updateTrendChart() {
     }
     return;
   }
-  const allEntries = getCanonicalKPIData().filter(d=>
+  const allEntries = getSubmittedKPIData().filter(d=>
     String(d.kpiId)===String(kpiId) &&
     (filterState.plant==='All' || d.plant===filterState.plant)
   );
@@ -3885,7 +3885,7 @@ function renderTrendPage() {
   // Performance: index entries once (year|kpi|month) instead of re-scanning
   // the whole dataset for every KPI x plant x month cell.
   const _entryIdx = new Map();
-  for (const d of getCanonicalKPIData()) {
+  for (const d of getSubmittedKPIData()) {
     const key = d.year + '|' + d.kpiId + '|' + d.month;
     let arr = _entryIdx.get(key);
     if (!arr) { arr = []; _entryIdx.set(key, arr); }
@@ -4039,7 +4039,7 @@ function renderCumulativeTrends() {
   grid.innerHTML = '';
 
   // ── Year selector — populated from years that actually have data ──
-  const allData = getCanonicalKPIData();
+  const allData = getSubmittedKPIData();
   const yearSel = document.getElementById('cumYearFilter');
   let year = filterState.year;
   if (yearSel) {
@@ -6631,6 +6631,13 @@ function getCanonicalKPIData(){
   return [...byFsId.values(), ...localMap.values()];
 }
 
+// Reporting dataset: only SUBMITTED entries count in the matrix, dashboard,
+// charts, trends and their exports. Drafts (and entries a Super Admin unlocked
+// back to draft) stay visible in My Entries / entry forms / action plans only.
+function getSubmittedKPIData(){
+  return getCanonicalKPIData().filter(d => d.entryStatus === 'submitted' || d.locked === true);
+}
+
 function getMatrixData(){
   const year   = parseInt(document.getElementById('matrixYear').value)||2026;
   const plant  = document.getElementById('matrixPlant').value;
@@ -6651,7 +6658,7 @@ function getMatrixData(){
     if(u.email) _emailToName[u.email.toLowerCase()] = (u.name || '').toLowerCase();
   });
 
-  const baseData = getCanonicalKPIData();
+  const baseData = getSubmittedKPIData();
   const allData = userSearchTerm
     ? baseData.filter(d => {
         const email = (d.submittedBy || '').toLowerCase();
@@ -7212,7 +7219,7 @@ function monthReportCellData(k, plantName, year, month){
   // In Apr-Mar FY mode, Jan/Feb/Mar data is stored under calendar year+1.
   // Use getFYDataYear so the data lookup uses the correct calendar year.
   const dataYear = getFYDataYear(year, month);
-  const baseData = getCanonicalKPIData();
+  const baseData = getSubmittedKPIData();
   // resolveTarget handles its own FY adjustment internally (Jan/Feb/Mar → fyStart-1),
   // but we pass year (the FY start year) for consistency with how targets are keyed.
   const target = resolveTarget(k, year, month, plantName);
@@ -7875,7 +7882,7 @@ function exportTrendsExcel(){
   const fyPairs= getFYMonthYearPairs(year);
   const fyMs   = getFYMonths();
   const plants = filterState.plant==='All' ? plantsList.map(p=>p.name) : [filterState.plant];
-  const allData= getCanonicalKPIData();
+  const allData= getSubmittedKPIData();
 
   const wb   = XLSX.utils.book_new();
   const hdrS = {font:{bold:true,color:{rgb:'FFFFFF'}},fill:{patternType:'solid',fgColor:{rgb:'185FA5'}},alignment:{horizontal:'center'},border:{bottom:{style:'thin',color:{rgb:'CCCCCC'}}}};
@@ -10711,15 +10718,33 @@ export async function saveKPIEntry(entryData) {
     submittedBy:      entryData.submittedBy      || '',
     achievementPct:   pct,
     status,
+    // ROOT-CAUSE FIX: event-based KPI fields (Customer Complaint, Accident ...) were
+    // never written to Firestore, so every other account reloaded them without an
+    // eventDate and the events collapsed into a single record per month.
+    eventDate:        entryData.eventDate        || null,
+    eventRef:         entryData.eventRef         || null,
+    partName:         entryData.partName         || null,
+    partNo:           entryData.partNo           || null,
+    customer:         entryData.customer         || null,
+    empCode:          entryData.empCode          || null,
+    empName:          entryData.empName          || null,
+    empDept:          entryData.empDept          || null,
     updatedAt:        serverTimestamp()
   };
+  // Only touch attachments when the caller supplies them (don't wipe on later saves)
+  if (Array.isArray(entryData.attachments)) payload.attachments = entryData.attachments;
 
   // If a Firestore doc ID is provided, UPSERT (setDoc merge) the existing document.
   // Using setDoc with merge:true instead of updateDoc — this works even if the doc
   // was deleted (not-found error), creating it fresh with the correct ID.
   const fsId = entryData.id && isNaN(Number(entryData.id)) ? String(entryData.id) : null;
   if (fsId) {
-    await setDoc(doc(db, 'kpiData', fsId), { ...payload, createdAt: serverTimestamp() }, { merge: true });
+    // Update in place (keeps original createdAt). If the doc no longer exists, recreate it.
+    try {
+      await updateDoc(doc(db, 'kpiData', fsId), payload);
+    } catch (e) {
+      await setDoc(doc(db, 'kpiData', fsId), { ...payload, createdAt: serverTimestamp() }, { merge: true });
+    }
     try {
       await set(ref(rtdb, `kpiLive/${entryData.plant}/${entryData.year}/${entryData.month}/${fsId}`), {
         kpiName: entryData.kpiName, actual, target, status, achievementPct: pct,
@@ -10836,12 +10861,13 @@ export async function getKPIEntries(filters = {}) {
   // Only add orderBy when there are no equality filters — combining `where`
   // on multiple fields with `orderBy` requires a Firestore composite index.
   // Sort client-side instead so this works without any index setup.
-  if (constraints.length === 0) constraints.push(orderBy("createdAt", "desc"));
-
-  const snap = await getDocs(query(q, ...constraints));
+  // NOTE: no orderBy("createdAt") here — Firestore silently EXCLUDES documents that
+  // lack that field, so those entries were visible only to their author (via
+  // getMyEntries) and missing for everyone else. Always sort client-side.
+  const snap = await (constraints.length ? getDocs(query(q, ...constraints)) : getDocs(q));
   const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
 
-  if (constraints.length > 0) {
+  {
     docs.sort((a, b) => {
       const at = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
       const bt = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
@@ -10868,10 +10894,9 @@ export function listenKPIEntries(filters = {}, callback) {
   if (filters.department && filters.department !== "All")
                           constraints.push(where("department", "==", filters.department));
 
-  const hasFilters = constraints.length > 0;
-  if (!hasFilters) constraints.push(orderBy("createdAt", "desc"));
+  const hasFilters = true; // always sort client-side (see getKPIEntries)
 
-  return onSnapshot(query(q, ...constraints), snap => {
+  return onSnapshot(constraints.length ? query(q, ...constraints) : q, snap => {
     const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     if (hasFilters) {
       docs.sort((a, b) => {
@@ -11147,6 +11172,7 @@ function resetAppState() {
   plantsList.splice(0);
   deptList.splice(0);
   window._kpiAlerts     = [];
+  _clearAllCaches();   // never leak one user's cached data to the next login
   if (unsubEntries) { try{ unsubEntries(); }catch(e){} unsubEntries = null; }
   if (unsubAlerts)  { try{ unsubAlerts();  }catch(e){} unsubAlerts  = null; }
   if (unsubLive)    { try{ unsubLive();    }catch(e){} unsubLive    = null; }
@@ -11339,16 +11365,23 @@ function _hideDataSkeleton() {
 }
 
 // ── LocalStorage cache helpers (instant first-paint) ─────────────
-const _LS_CACHE_KEY = 'kpiDashCache_v2';
+const _LS_CACHE_PREFIX = 'kpiDashCache_v3_';
+function _cacheKey(){ return _LS_CACHE_PREFIX + ((currentUser && currentUser.uid) || 'anon'); }
+function _clearAllCaches(){
+  try{
+    Object.keys(localStorage).filter(k => k.indexOf('kpiDashCache') === 0)
+      .forEach(k => localStorage.removeItem(k));
+  }catch(e){}
+}
 function _saveCache(plants, depts, kpis, entries){
   try{
     const payload = { ts: Date.now(), plants, depts, kpis, entries };
-    localStorage.setItem(_LS_CACHE_KEY, JSON.stringify(payload));
+    localStorage.setItem(_cacheKey(), JSON.stringify(payload));
   }catch(e){ console.warn('[KPI cache] save failed:', e); }
 }
 function _restoreCache(){
   try{
-    const raw = localStorage.getItem(_LS_CACHE_KEY);
+    const raw = localStorage.getItem(_cacheKey());
     if(!raw) return false;
     const p = JSON.parse(raw);
     // Max age: 30 minutes
@@ -11385,7 +11418,10 @@ function _restoreCache(){
     if(p.entries && p.entries.length){
       kpiData.length = 0;
       recentEntries.length = 0;
-      mergeFirebaseEntries(p.entries);
+      // Cached entries are already in the app's mapped shape — push as-is.
+      // (Passing them through mergeFirebaseEntries, which expects raw Firestore
+      // docs, dropped dept/action/resp/updatedAt and corrupted first paint.)
+      p.entries.forEach(e => recentEntries.push(e));
     }
     refreshAll();
     return true;
@@ -11560,7 +11596,7 @@ async function loadFirebaseData() {
       let fsEntries = fsEntriesRaw.value;
       const bizMap = new Map();
       fsEntries.forEach(fe => {
-        const key = fe.eventDate
+        const key = (fe.eventDate || _isEventKpiId(fe.kpiId))
           ? `evt|${fe.id}`   // event-based: each Firestore doc is a separate event
           : `${fe.kpiId}|${(fe.plant||'').toLowerCase()}|${(fe.month||'').toLowerCase()}|${fe.year}`;
         const existing = bizMap.get(key);
@@ -11643,7 +11679,9 @@ async function loadFirebaseData() {
       plantsList.map(p=>({...p})),
       deptList.map(d=>({...d})),
       kpiMaster.map(k=>({...k})),
-      [...kpiData, ...recentEntries].slice(0, 2000) // cap cache size
+      // Never cache a truncated dataset (partial data = different numbers per user).
+      (() => { const all = [...kpiData, ...recentEntries].filter(e => e.fsId);
+               return all.length <= 3000 ? all : null; })()
     );
   }catch(e){ console.warn('[KPI cache] post-load save failed:', e); }
 }
@@ -11654,6 +11692,10 @@ async function loadFirebaseData() {
 // Event-based entries are never merged by month. An incoming Firestore event doc
 // only matches a local entry that hasn't received its Firestore id yet and has
 // the same KPI, plant, event date, ref no. and actual value.
+function _isEventKpiId(id){
+  const k = kpiMaster.find(k => String(k.id) === String(id));
+  return !!(k && k.eventBased);
+}
 function _evtLocalMatch(fe){
   return d => !d.fsId &&
     String(d.kpiId) === String(fe.kpiId) &&
@@ -11719,7 +11761,7 @@ function mergeFirebaseEntries(fsEntries) {
       String(d.month).trim().toLowerCase() === String(fe.month||'').trim().toLowerCase() &&
       String(d.year)    === String(fe.year);
 
-    const byBizKey = recentEntries.findIndex(fe.eventDate ? _evtLocalMatch(fe) : bizKey);
+    const byBizKey = recentEntries.findIndex((fe.eventDate || _isEventKpiId(fe.kpiId)) ? _evtLocalMatch(fe) : bizKey);
     if (byBizKey >= 0) {
       const existing = recentEntries[byBizKey];
       // IMPORTANT: do NOT let locked/submitted status win over a newer record.
@@ -11814,7 +11856,7 @@ function mergeFirebaseEntriesKeepSubmitted(fsEntries) {
       String(d.month||'').trim().toLowerCase() === String(fe.month||'').trim().toLowerCase() &&
       String(d.year) === String(fe.year);
 
-    const byBiz = recentEntries.findIndex(fe.eventDate ? _evtLocalMatch(fe) : bizKey);
+    const byBiz = recentEntries.findIndex((fe.eventDate || _isEventKpiId(fe.kpiId)) ? _evtLocalMatch(fe) : bizKey);
     if (byBiz >= 0) {
       const local = recentEntries[byBiz];
 
