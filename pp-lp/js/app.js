@@ -206,12 +206,41 @@ function onPlantSelectorChange(plantId) {
 /**
  * Get the effective plant ID filter.
  * Super Admin uses the selector; others are locked to their plant.
+ *
+ * SAFETY: always returns a plain string or null — never a DOM element.
+ * selectPlantPill() and onPlantSelectorChange() both write to
+ * window.selectedPlantFilter; if something accidentally stored a DOM node
+ * there we discard it and return null (= all plants).
  */
 function getActivePlantId() {
   if (window.currentUser?.role === ROLES.SUPER_ADMIN) {
-    return window.selectedPlantFilter || null; // null = all plants
+    const f = window.selectedPlantFilter;
+    // Guard: reject anything that is not a non-empty string
+    if (!f || typeof f !== 'string') return null;
+    return f === 'all' ? null : f;
   }
   return window.currentUser?.plantId || null;
+}
+
+/**
+ * Called by plant-pill buttons rendered in the sidebar or dashboard:
+ *   onclick="selectPlantPill(this, 'plantId')"
+ * Extracts the plant ID from data-plant and delegates to onPlantSelectorChange.
+ */
+function selectPlantPill(btnEl, plantId) {
+  // Visual: mark the clicked pill as active
+  document.querySelectorAll('.plant-pill').forEach(b => b.classList.remove('active'));
+  if (btnEl && btnEl.classList) btnEl.classList.add('active');
+
+  // Read the real value from the data attribute; fall back to the argument
+  const id = (btnEl && btnEl.dataset && btnEl.dataset.plant) || plantId || 'all';
+
+  // Sync the <select> if it exists
+  const sel = document.getElementById('plantSelector');
+  if (sel) sel.value = id;
+
+  // Delegate — stores a clean string (or null) in window.selectedPlantFilter
+  onPlantSelectorChange(id);
 }
 
 /* ── Global Search ───────────────────────────────────────── */
