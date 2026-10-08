@@ -17,7 +17,10 @@ async function loadDashboard() {
 
   try {
     // ── Audits KPIs ───────────────────────────────────────
-    let auditQuery = col('audits').where('createdAt', '>=', fromTs);
+    // NOTE: The compound query needs orderBy('createdAt','desc') so that Firestore uses
+    // the existing [plantId ASC, createdAt DESC] composite index rather than the implicit
+    // ASC direction that mismatches it and causes a missing-index / permission error.
+    let auditQuery = col('audits').where('createdAt', '>=', fromTs).orderBy('createdAt', 'desc');
     if (plantId) auditQuery = auditQuery.where('plantId', '==', plantId);
     else if (user.role !== ROLES.SUPER_ADMIN) auditQuery = auditQuery.where('plantId', '==', user.plantId);
 
@@ -38,7 +41,7 @@ async function loadDashboard() {
     setKpi('kpiAvgScore',  avgScore !== null ? avgScore.toFixed(1) + '%' : '—');
 
     // ── Findings / Actions KPIs ───────────────────────────
-    let findQuery = col('findings').where('createdAt', '>=', fromTs);
+    let findQuery = col('findings').where('createdAt', '>=', fromTs).orderBy('createdAt', 'desc');
     if (plantId) findQuery = findQuery.where('plantId', '==', plantId);
     else if (user.role !== ROLES.SUPER_ADMIN) findQuery = findQuery.where('plantId', '==', user.plantId);
 
@@ -48,7 +51,7 @@ async function loadDashboard() {
     const closedFind   = findings.filter(f => ['Closed','Verified'].includes(f.status)).length;
     const closureRate  = findings.length ? ((closedFind / findings.length) * 100).toFixed(1) + '%' : '—';
 
-    let actionQuery = col('correctiveActions').where('createdAt', '>=', fromTs);
+    let actionQuery = col('correctiveActions').where('createdAt', '>=', fromTs).orderBy('createdAt', 'desc');
     if (plantId) actionQuery = actionQuery.where('plantId', '==', plantId);
     else if (user.role !== ROLES.SUPER_ADMIN) actionQuery = actionQuery.where('plantId', '==', user.plantId);
 
@@ -91,19 +94,25 @@ async function loadPlantPerformanceTable(fromTs) {
   if (!tbody) return;
 
   try {
-    const plantsSnap = await col('plants').where('status', '==', 'active').orderBy('name').get();
-    const plants = plantsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Use fetchSorted to avoid orderBy-related index issues on the plants collection
+    const plantDocs = await fetchSorted(col('plants').where('status', '==', 'active'), 'name');
+    const plants = plantDocs.map(d => ({ id: d.id, ...d.data() }));
 
     if (plants.length === 0) {
       tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No plants configured.</td></tr>';
       return;
     }
 
-    // Load aggregate data for each plant in parallel
+    // Load aggregate data for each plant in parallel.
+    // IMPORTANT: avoid 'not-in' queries — they require a special composite index and
+    // behave inconsistently with security-rule list checks. Instead, fetch all actions
+    // for the plant and filter open/overdue client-side.
     const rows = await Promise.all(plants.map(async plant => {
       const [auditSnap, actionSnap] = await Promise.all([
-        col('audits').where('plantId', '==', plant.id).where('createdAt', '>=', fromTs).get(),
-        col('correctiveActions').where('plantId', '==', plant.id).where('status', 'not-in', ['Closed','Verified']).get()
+        col('audits').where('plantId', '==', plant.id)
+          .where('createdAt', '>=', fromTs).orderBy('createdAt', 'desc').get(),
+        col('correctiveActions').where('plantId', '==', plant.id)
+          .orderBy('createdAt', 'desc').get()
       ]);
 
       const audits   = auditSnap.docs.map(d => d.data());
@@ -112,8 +121,10 @@ async function loadPlantPerformanceTable(fromTs) {
       const compPct  = planned ? ((completed / planned) * 100).toFixed(0) + '%' : '—';
       const scores   = audits.filter(a => a.score != null).map(a => a.score);
       const avgScore = scores.length ? (scores.reduce((s,v) => s+v, 0) / scores.length).toFixed(1) + '%' : '—';
-      const openActs = actionSnap.size;
-      const overdueA = actionSnap.docs.filter(d => isOverdue(d.data().targetDate)).length;
+      // Filter open actions client-side — avoids the not-in query
+      const allActions = actionSnap.docs.map(d => d.data());
+      const openActs = allActions.filter(a => !['Closed','Verified'].includes(a.status)).length;
+      const overdueA = allActions.filter(a => !['Closed','Verified'].includes(a.status) && isOverdue(a.targetDate)).length;
 
       return { plant, planned, completed, compPct, avgScore, openActs, overdueA };
     }));
@@ -127,11 +138,11 @@ async function loadPlantPerformanceTable(fromTs) {
           <div style="display:flex;align-items:center;gap:8px">
             ${r.compPct}
             <div style="flex:1;height:4px;background:var(--color-border);border-radius:2px;min-width:60px">
-              <div style="height:100%;background:var(--color-primary);border-radius:2px;width:${r.compPct}"></div>
+              <div style="height:100%;background:var(--color-primary);border-radius:2px;width:${r.compPct === '—' ? '0%' : r.compPct}"></div>
             </div>
           </div>
         </td>
-        <td>${getScoreBadge(parseFloat(r.avgScore))}</td>
+        <td>${r.avgScore === '—' ? '—' : getScoreBadge(parseFloat(r.avgScore))}</td>
         <td>${r.openActs}</td>
         <td>${r.overdueA > 0 ? `<span style="color:var(--color-danger);font-weight:600">${r.overdueA}</span>` : '0'}</td>
         <td>

@@ -9,9 +9,8 @@ let masterTab = 'plants';
 async function initMasterData() {
   requirePermission('manage_master_data');
   await switchMasterTab('plants');
-
-  // Populate audit level / dept filter dropdowns for questions
-  await populateLevelOptions(document.getElementById('qLevelFilter'), true);
+  // Note: qLevelFilter lives inside the 'questions' tab HTML rendered by renderQuestionsTab(),
+  // so we cannot populate it here — it is populated lazily inside renderQuestionsTab() instead.
 }
 
 async function switchMasterTab(tab, btnEl) {
@@ -43,7 +42,10 @@ async function renderPlantsTab() {
     return;
   }
 
-  const snap = await col('plants').orderBy('name').get();
+  // Use fetchSorted to avoid orderBy composite-index requirement on 'plants'
+  const plantDocs = await fetchSorted(col('plants'), 'name');
+  const snap = { docs: plantDocs, size: plantDocs.length };
+
   const rows = snap.docs.map(d => {
     const p = d.data();
     return `
@@ -360,7 +362,10 @@ async function saveProcess(processId) {
    AUDIT LEVELS
 ══════════════════════════════════════════════════════════ */
 async function renderAuditLevelsTab() {
-  const snap = await col('auditLevels').orderBy('levelNumber').get();
+  // Use fetchSorted to avoid orderBy composite-index requirement on 'auditLevels'
+  const levelDocs = await fetchSorted(col('auditLevels'), 'levelNumber');
+  const snap = { docs: levelDocs, size: levelDocs.length };
+
   const rows = snap.docs.map(d => {
     const l = d.data();
     return `<tr>
@@ -673,7 +678,10 @@ async function saveQuestion(questionId) {
    CATEGORIES — simple list
 ══════════════════════════════════════════════════════════ */
 async function renderCategoriesTab() {
-  const snap = await col('categories').orderBy('name').get();
+  // Use fetchSorted to avoid orderBy composite-index requirement on 'categories'
+  const catDocs = await fetchSorted(col('categories'), 'name');
+  const snap = { docs: catDocs, size: catDocs.length };
+
   const rows = snap.docs.map(d => `
     <tr>
       <td>${escapeHtml(d.data().name)}</td>
