@@ -111,8 +111,20 @@ function clearAuditFilters() {
   loadAudits();
 }
 
-/* ── Create Audit Modal ──────────────────────────────────── */
+/* ── Create Audit — opens bulk planning table ────────────── */
 async function openCreateAuditModal(auditId) {
+  // For edits, use the original single-audit modal
+  if (auditId) {
+    _openSingleAuditModal(auditId);
+    return;
+  }
+  // For new audits, open the full-screen bulk planning table
+  if (typeof openAuditBulkModal === 'function') {
+    await openAuditBulkModal();
+  }
+}
+
+async function _openSingleAuditModal(auditId) {
   if (!can('create_audit') && !can('execute_audit')) {
     showToast('You do not have permission to create audits.', 'error');
     return;
@@ -125,15 +137,12 @@ async function openCreateAuditModal(auditId) {
   document.getElementById('btnSaveAudit').textContent = auditId ? 'Save Changes' : 'Create Audit';
   document.getElementById('btnSaveAudit').dataset.editId = auditId || '';
 
-  // Populate plant options
   const plantSel = document.getElementById('auditPlant');
   await populatePlantOptions(plantSel, false);
 
-  // Populate audit levels
   const levelSel = document.getElementById('auditLevel');
   await populateLevelOptions(levelSel, false);
 
-  // Pre-select plant for non-super-admin
   if (window.currentUser.role !== ROLES.SUPER_ADMIN) {
     plantSel.value = window.currentUser.plantId;
     plantSel.disabled = true;
@@ -142,14 +151,11 @@ async function openCreateAuditModal(auditId) {
     plantSel.disabled = false;
   }
 
-  // Populate auditors
   const auditorSel = document.getElementById('auditAuditor');
   const plantId = plantSel.value;
   if (plantId) await populateUserOptions(auditorSel, plantId, ROLES.AUDITOR);
 
-  // Set defaults
   document.getElementById('auditPlannedDate').value = todayISO();
-
   openModal('auditModal');
 }
 
