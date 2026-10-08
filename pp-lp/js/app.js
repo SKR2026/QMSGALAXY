@@ -617,6 +617,138 @@ function generateId(prefix) {
   return `${prefix}-${ts}-${rand}`;
 }
 
+/* ── Management Review ───────────────────────────────────── */
+async function loadMgmtReview() {
+  const user    = window.currentUser;
+  if (!user) return;
+
+  const period  = document.getElementById('mgmtPeriod')?.value || 'month';
+  const now     = new Date();
+  let fromDate  = new Date();
+
+  if (period === 'month')   fromDate.setMonth(now.getMonth() - 1);
+  else if (period === 'quarter') fromDate.setMonth(now.getMonth() - 3);
+  else if (period === 'year')    fromDate.setFullYear(now.getFullYear() - 1);
+  else                           fromDate.setMonth(now.getMonth() - 1); // custom fallback
+
+  const fromTs  = firebase.firestore.Timestamp.fromDate(fromDate);
+  const plantId = getActivePlantId();
+
+  try {
+    // ── Fetch data ────────────────────────────────────────
+    let auditQ  = col('audits').where('createdAt', '>=', fromTs);
+    let findQ   = col('findings').where('createdAt', '>=', fromTs);
+    let actionQ = col('correctiveActions').where('createdAt', '>=', fromTs);
+
+    if (plantId) {
+      auditQ  = auditQ.where('plantId',  '==', plantId);
+      findQ   = findQ.where('plantId',   '==', plantId);
+      actionQ = actionQ.where('plantId', '==', plantId);
+    } else if (user.role !== ROLES.SUPER_ADMIN) {
+      auditQ  = auditQ.where('plantId',  '==', user.plantId);
+      findQ   = findQ.where('plantId',   '==', user.plantId);
+      actionQ = actionQ.where('plantId', '==', user.plantId);
+    }
+
+    const [auditSnap, findSnap, actionSnap] = await Promise.all([
+      auditQ.get(), findQ.get(), actionQ.get()
+    ]);
+
+    const audits  = auditSnap.docs.map(d => d.data());
+    const findings= findSnap.docs.map(d => d.data());
+    const actions = actionSnap.docs.map(d => d.data());
+
+    // ── KPIs ──────────────────────────────────────────────
+    const total      = audits.length;
+    const completed  = audits.filter(a => ['Verified','Closed','Submitted'].includes(a.status)).length;
+    const compRate   = total ? ((completed / total) * 100).toFixed(1) + '%' : '—';
+    const scores     = audits.filter(a => a.score != null).map(a => a.score);
+    const avgScore   = scores.length ? (scores.reduce((s,v)=>s+v,0)/scores.length).toFixed(1)+'%' : '—';
+    const openFind   = findings.filter(f => !['Closed','Verified'].includes(f.status)).length;
+    const overdueAct = actions.filter(a => isOverdue(a.targetDate) && !['Closed','Verified'].includes(a.status)).length;
+    const closedAct  = actions.filter(a => ['Closed','Verified'].includes(a.status)).length;
+    const closureRate= actions.length ? ((closedAct/actions.length)*100).toFixed(1)+'%' : '—';
+
+    // ── Render KPI grid ───────────────────────────────────
+    const kpiGrid = document.getElementById('mgmtKpiGrid');
+    if (kpiGrid) {
+      kpiGrid.innerHTML = [
+        { label: 'Total Audits',       value: total,       icon: '📋', cls: 'kpi-blue'   },
+        { label: 'Completion Rate',    value: compRate,    icon: '✅', cls: 'kpi-green'  },
+        { label: 'Average Score',      value: avgScore,    icon: '📊', cls: 'kpi-purple' },
+        { label: 'Open Findings',      value: openFind,    icon: '⚠️', cls: 'kpi-orange' },
+        { label: 'Overdue Actions',    value: overdueAct,  icon: '🚨', cls: 'kpi-red'    },
+        { label: 'Action Closure Rate',value: closureRate, icon: '🔧', cls: 'kpi-teal'   },
+      ].map(k => `
+        <div class="kpi-card">
+          <div class="kpi-icon ${k.cls}" style="font-size:18px">${k.icon}</div>
+          <div class="kpi-body">
+            <div class="kpi-value">${k.value}</div>
+            <div class="kpi-label">${k.label}</div>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    // ── Monthly compliance trend chart ────────────────────
+    const compCanvas = document.getElementById('mgmtComplianceChart');
+    if (compCanvas && typeof Chart !== 'undefined') {
+      // Group audits by month
+      const monthMap = {};
+      audits.forEach(a => {
+        const d = a.actualDate || a.plannedDate;
+        if (!d) return;
+        const key = d.substring(0, 7); // YYYY-MM
+        if (!monthMap[key]) monthMap[key] = { total: 0, done: 0 };
+        monthMap[key].total++;
+        if (['Verified','Closed','Submitted'].includes(a.status)) monthMap[key].done++;
+      });
+      const labels = Object.keys(monthMap).sort();
+      const data   = labels.map(k => monthMap[k].total
+        ? parseFloat(((monthMap[k].done / monthMap[k].total) * 100).toFixed(1)) : 0);
+
+      if (window._mgmtCompChart) window._mgmtCompChart.destroy();
+      window._mgmtCompChart = new Chart(compCanvas, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [{ label: 'Completion %', data, borderColor: '#1a56db',
+            backgroundColor: 'rgba(26,86,219,.08)', tension: .4, fill: true, pointRadius: 4 }]
+        },
+        options: chartDefaults({ yMax: 100, yMin: 0, yLabel: 'Completion %' })
+      });
+    }
+
+    // ── Repeat findings chart ─────────────────────────────
+    const repeatCanvas = document.getElementById('mgmtRepeatChart');
+    if (repeatCanvas && typeof Chart !== 'undefined') {
+      // Count findings per department
+      const deptMap = {};
+      findings.forEach(f => {
+        const d = f.departmentName || 'Unknown';
+        deptMap[d] = (deptMap[d] || 0) + 1;
+      });
+      const dLabels = Object.keys(deptMap).slice(0, 8);
+      const dData   = dLabels.map(d => deptMap[d]);
+
+      if (window._mgmtRepeatChart) window._mgmtRepeatChart.destroy();
+      window._mgmtRepeatChart = new Chart(repeatCanvas, {
+        type: 'bar',
+        data: {
+          labels: dLabels,
+          datasets: [{ label: 'Findings', data: dData,
+            backgroundColor: '#dc2626', borderRadius: 4 }]
+        },
+        options: chartDefaults({ yLabel: 'Count' })
+      });
+    }
+
+  } catch (e) {
+    console.error('[MgmtReview] Error:', e);
+    showToast('Management Review error: ' + friendlyFirebaseError(e), 'error');
+  }
+}
+
 /**
  * Build searchTokens array for simple full-text-like search in Firestore.
  * Stores lowercase tokens so queries work with array-contains.
