@@ -34,6 +34,9 @@ async function bootApp() {
   // Show app
   showAppShell();
 
+  // Load company branding for all accounts
+  if (typeof loadCompanyLogo === 'function') loadCompanyLogo();
+
   // Load initial view
   navigate('dashboard');
 
