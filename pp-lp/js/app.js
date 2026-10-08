@@ -179,18 +179,26 @@ async function fetchPlants(activeOnly = true) {
   return docs;
 }
 
-/* ── Plant Selector (Super Admin) ────────────────────────── */
+/* ── Plant Selector (Super Admin) — pill tabs ────────────── */
 async function populatePlantSelector() {
   try {
-    const docsP = await fetchPlants(true);
-    const sel  = document.getElementById('plantSelector');
-    // Clear existing except "All Plants"
-    sel.innerHTML = '<option value="all">🏭 All Plants</option>';
+    const docsP    = await fetchPlants(true);
+    const pillsDiv = document.getElementById('plantPills');
+    if (!pillsDiv) return;
+
+    // "All" pill
+    pillsDiv.innerHTML =
+      '<button class="plant-pill active" data-plant="all" ' +
+      'onclick="selectPlantPill(this,\'all\')">All</button>';
+
     docsP.forEach(doc => {
-      const opt = document.createElement('option');
-      opt.value = doc.id;
-      opt.textContent = doc.data().name;
-      sel.appendChild(opt);
+      const btn = document.createElement('button');
+      btn.className        = 'plant-pill';
+      btn.dataset.plant    = doc.id;
+      btn.textContent      = doc.data().name;
+      btn.title            = doc.data().name;
+      btn.setAttribute('onclick', `selectPlantPill(this,'${doc.id}')`);
+      pillsDiv.appendChild(btn);
     });
   } catch (e) {
     console.warn('[App] Could not populate plant selector:', e.message);
@@ -199,7 +207,13 @@ async function populatePlantSelector() {
 
 function onPlantSelectorChange(plantId) {
   // Super Admin is switching plant scope
-  window.selectedPlantFilter = plantId === 'all' ? null : plantId;
+  window.selectedPlantFilter = (plantId === 'all' || !plantId) ? null : plantId;
+
+  // Keep pills in sync (in case called programmatically, e.g. from dashboard table)
+  document.querySelectorAll('.plant-pill').forEach(b => {
+    b.classList.toggle('active', b.dataset.plant === (plantId || 'all'));
+  });
+
   loadViewData(currentView);
 }
 
