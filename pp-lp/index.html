@@ -1433,6 +1433,43 @@
   };
 </script>
 
+<!-- ── LPA compat shims — must run BEFORE auth.js ── -->
+<script>
+// 1. Dummy #loginScreen so auth.js classList ops don't crash
+(function() {
+  var dummy = document.createElement('div');
+  dummy.id = 'loginScreen';
+  dummy.style.display = 'none';
+  document.body.insertBefore(dummy, document.body.firstChild);
+})();
+
+// 2. showLoginError — called by auth.js at line 23+
+window.showLoginError = function(msg) {
+  var el = document.getElementById('loginError');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.style.display = msg ? 'block' : 'none';
+};
+
+// 3. showLoginScreen — define BEFORE auth.js so it can't redefine non-configurable
+window.showLoginScreen = function() {
+  var overlay = document.getElementById('loginOverlay');
+  if (overlay) overlay.style.display = 'flex';
+  var shell = document.getElementById('appShell');
+  if (shell) shell.classList.add('hidden');
+  // Apply login branding if Firebase is ready
+  if (typeof _lpaApplyLoginBranding === 'function') {
+    _lpaApplyLoginBranding().catch(function(){});
+  }
+};
+
+// 4. hideLoginScreen — called by auth.js on successful login
+window.hideLoginScreen = function() {
+  var overlay = document.getElementById('loginOverlay');
+  if (overlay) overlay.style.display = 'none';
+};
+</script>
+
 <!-- Application Modules -->
 <script src="js/firebase-config.js"></script>
 <script src="js/permissions.js"></script>
@@ -4340,12 +4377,9 @@ window._lpaMgmtLogin = function() {
 // ── Enter key in login form ─────────────────────────────────
 document.addEventListener('DOMContentLoaded', function() {
   ['loginEmail','loginPassword'].forEach(function(id) {
-    const el = document.getElementById(id);
+    var el = document.getElementById(id);
     if (el) el.addEventListener('keydown', function(e) { if (e.key === 'Enter') handleLogin(); });
   });
-  // Hide loginScreen if it still exists (compat)
-  const old = document.getElementById('loginScreen');
-  if (old) old.style.display = 'none';
 });
 
 // ── Login branding from Firestore ───────────────────────────
@@ -4389,37 +4423,20 @@ async function _lpaApplyLoginBranding() {
   }
 }
 
-// ── Call branding load when overlay shown ───────────────────
+// ── Patch showLoginScreen AFTER auth.js to re-apply our version ──
+// auth.js may overwrite showLoginScreen; we restore it here
 (function() {
-  const orig = window.showLoginScreen || null;
-  // Override the auth.js showLoginScreen to also apply branding
-  window._lpaShowLogin = function() {
-    const overlay = document.getElementById('loginOverlay');
+  window.showLoginScreen = function() {
+    var overlay = document.getElementById('loginOverlay');
     if (overlay) overlay.style.display = 'flex';
-    const old = document.getElementById('loginScreen');
-    if (old) old.style.display = 'none';
-    // Apply branding asynchronously after Firebase is ready
-    if (window.firebase && firebase.apps && firebase.apps.length) {
-      _lpaApplyLoginBranding().catch(function(){});
-    } else {
-      // Wait for Firebase init
-      let tries = 0;
-      const chk = setInterval(function() {
-        if ((window.firebase && firebase.apps && firebase.apps.length) || tries++ > 20) {
-          clearInterval(chk);
-          _lpaApplyLoginBranding().catch(function(){});
-        }
-      }, 200);
-    }
+    var shell = document.getElementById('appShell');
+    if (shell) shell.classList.add('hidden');
+    _lpaApplyLoginBranding().catch(function(){});
   };
-  // Patch: intercept the auth.js show login trigger
-  // auth.js calls showLoginScreen() — we intercept it
-  const _origShowLoginScreen = window.showLoginScreen;
-  Object.defineProperty(window, 'showLoginScreen', {
-    get: function() { return window._lpaShowLogin; },
-    set: function(fn) { /* ignore auth.js setting it, we control it */ },
-    configurable: true
-  });
+  window.hideLoginScreen = function() {
+    var overlay = document.getElementById('loginOverlay');
+    if (overlay) overlay.style.display = 'none';
+  };
 })();
 
 // Trigger login overlay on page load (before auth.js fires)
@@ -4438,21 +4455,22 @@ window.addEventListener('load', function() {
 });
 
 // ── View-only role gating ───────────────────────────────────
-// Hook into currentUser setter to auto-apply view-only class
+// Poll currentUser periodically and apply view-only class when needed
+// (avoids Object.defineProperty clash with auth.js)
 (function() {
-  let _cu = null;
-  Object.defineProperty(window, 'currentUser', {
-    get: function() { return _cu; },
-    set: function(u) {
-      _cu = u;
-      if (u && (u.role === 'management' || u.role === 'top_management')) {
-        document.body.classList.add('lpa-view-only');
-      } else {
-        document.body.classList.remove('lpa-view-only');
-      }
-    },
-    configurable: true
-  });
+  var _lastRole = null;
+  setInterval(function() {
+    var u = window.currentUser;
+    if (!u) return;
+    var isViewOnly = u.role === 'management' || u.role === 'top_management';
+    if (isViewOnly && _lastRole !== 'view-only') {
+      document.body.classList.add('lpa-view-only');
+      _lastRole = 'view-only';
+    } else if (!isViewOnly && _lastRole === 'view-only') {
+      document.body.classList.remove('lpa-view-only');
+      _lastRole = u.role;
+    }
+  }, 500);
 })();
 
 // ── loginError display helper ───────────────────────────────
