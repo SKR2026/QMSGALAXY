@@ -4757,13 +4757,30 @@ async function _lpaLoadLoginBrandingToForm() {
   } catch(e) { console.warn('Login branding load:', e); }
 }
 
-// Convert image file → data URL
-function _lpaFileToDataUrl(file) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = e => res(e.target.result);
-    r.onerror = rej;
-    r.readAsDataURL(file);
+// Convert image file → compressed data URL (max ~200KB)
+function _lpaFileToDataUrl(file, maxPx) {
+  maxPx = maxPx || 800;
+  return new Promise(function(res, rej) {
+    var reader = new FileReader();
+    reader.onerror = rej;
+    reader.onload = function(e) {
+      var img = new Image();
+      img.onerror = rej;
+      img.onload = function() {
+        var w = img.width, h = img.height;
+        if (w > maxPx || h > maxPx) {
+          var ratio = Math.min(maxPx / w, maxPx / h);
+          w = Math.round(w * ratio);
+          h = Math.round(h * ratio);
+        }
+        var canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        res(canvas.toDataURL('image/jpeg', 0.82));
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
   });
 }
 
@@ -4771,65 +4788,92 @@ function _lpaFileToDataUrl(file) {
 window._lpaBrandingData = {};
 
 window._lpaUploadLoginBranding = async function(input, type) {
-  const file = input.files[0];
+  var file = input.files[0];
   if (!file) return;
-  const dataUrl = await _lpaFileToDataUrl(file);
+  var dataUrl = await _lpaFileToDataUrl(file, type === 'bg' ? 1200 : 600);
   window._lpaBrandingData[type] = dataUrl;
   if (type === 'logo') {
-    const prev = document.getElementById('brandingLogoPreview');
-    if(prev) { prev.src = dataUrl; prev.style.display = 'block'; }
-    // Live preview on login overlay
-    const img = document.getElementById('loginLogoImg');
-    if(img) { img.src = dataUrl; img.style.display = 'block'; }
+    var prev = document.getElementById('brandingLogoPreview');
+    if (prev) { prev.src = dataUrl; prev.style.display = 'block'; }
+    var img = document.getElementById('loginLogoImg');
+    if (img) { img.src = dataUrl; img.style.display = 'block'; }
   } else {
-    const prev = document.getElementById('brandingBgPreview');
-    if(prev) { prev.src = dataUrl; prev.style.display = 'block'; }
-    // Live preview on login overlay
-    const left = document.querySelector('#loginOverlay .kpi-login-left');
-    if(left) left.style.backgroundImage = 'url(' + dataUrl + ')';
+    var prev2 = document.getElementById('brandingBgPreview');
+    if (prev2) { prev2.src = dataUrl; prev2.style.display = 'block'; }
+    var left = document.querySelector('#loginOverlay .kpi-login-left');
+    if (left) left.style.backgroundImage = 'url(' + dataUrl + ')';
   }
 };
 
 window._lpaLoginBrandingSave = async function() {
-  const status = document.getElementById('brandingStatus');
-  const companyName = document.getElementById('brandingCompanyName')?.value.trim() || '';
-  const payload = { updatedAt: firebase.firestore.FieldValue.serverTimestamp() };
-  if (companyName) payload.companyName = companyName;
-  if (window._lpaBrandingData.logo) payload.loginLogoUrl = window._lpaBrandingData.logo;
-  if (window._lpaBrandingData.bg)   payload.leftPanelBg  = window._lpaBrandingData.bg;
+  var status = document.getElementById('brandingStatus');
+  var companyName = (document.getElementById('brandingCompanyName') || {}).value || '';
+  companyName = companyName.trim();
 
+  // Build payload matching existing branding save pattern
+  var payload = {
+    companyName: companyName,
+    updatedAt:   new Date().toISOString()
+  };
+  if (window._lpaBrandingData.logo) payload.loginLogoBase64 = window._lpaBrandingData.logo;
+  if (window._lpaBrandingData.bg)   payload.leftPanelBg     = window._lpaBrandingData.bg;
+
+  // Must have at least something to save
+  if (!payload.loginLogoBase64 && !payload.leftPanelBg && !companyName) {
+    if (status) { status.style.display='block'; status.style.color='#e53e3e'; status.textContent='Nothing to save — upload a logo or enter a company name.'; }
+    return;
+  }
+
+  if (status) { status.style.display='block'; status.style.color='#6b84a0'; status.textContent='Saving…'; }
+
+  // Save to localStorage first (instant, offline-safe)
+  try { localStorage.setItem('lpa_login_brand', JSON.stringify(payload)); } catch(e) {}
+
+  // Save to Firestore (same pattern as existing saveBranding())
   try {
-    if(status) { status.style.display='block'; status.style.color='#6b84a0'; status.textContent='Saving…'; }
-    await firebase.firestore().doc('apps/lpa/settings/loginBranding').set(payload, { merge: true });
-    // Update localStorage cache
-    try { localStorage.setItem('lpa_login_brand', JSON.stringify(payload)); } catch(e) {}
-    if(status) { status.style.color='#38a169'; status.textContent='✓ Login branding saved. Visible across all plants.'; }
-    // Apply live
-    if(companyName) { const nm = document.getElementById('loginCompanyName'); if(nm) nm.textContent = companyName; }
+    var db = (typeof firebase !== 'undefined') ? firebase.firestore() : null;
+    if (!db) throw new Error('Firebase not ready');
+    await db.collection('apps').doc('lpa')
+            .collection('settings').doc('loginBranding').set(payload);
+    if (status) { status.style.color='#38a169'; status.textContent='✓ Saved — visible across all plants on next login.'; }
+    // Apply live on current overlay
+    if (companyName) {
+      var nm = document.getElementById('loginCompanyName');
+      if (nm) nm.textContent = companyName;
+    }
+    if (payload.loginLogoBase64) {
+      var li = document.getElementById('loginLogoImg');
+      if (li) { li.src = payload.loginLogoBase64; li.style.display = 'block'; }
+    }
+    if (typeof showToast === 'function') showToast('Login branding saved', 'success');
   } catch(e) {
-    if(status) { status.style.color='#e53e3e'; status.textContent='Error: ' + e.message; }
+    console.error('[LPA] Login branding save error:', e);
+    if (status) { status.style.color='#e53e3e'; status.textContent='Error saving to Firestore: ' + e.message; }
   }
 };
 
 window._lpaLoginBrandingClear = async function() {
+  var payload = { companyName: '', loginLogoBase64: '', leftPanelBg: '', updatedAt: new Date().toISOString() };
   try {
-    await firebase.firestore().doc('apps/lpa/settings/loginBranding').delete();
+    var db = (typeof firebase !== 'undefined') ? firebase.firestore() : null;
+    if (db) await db.collection('apps').doc('lpa').collection('settings').doc('loginBranding').set(payload);
     localStorage.removeItem('lpa_login_brand');
-    // Reset UI
-    ['brandingLogoPreview','brandingBgPreview'].forEach(id => {
-      const el = document.getElementById(id);
-      if(el) { el.src=''; el.style.display='none'; }
+    ['brandingLogoPreview','brandingBgPreview'].forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) { el.src = ''; el.style.display = 'none'; }
     });
-    const nm = document.getElementById('loginCompanyName');
-    if(nm) nm.textContent = 'LPA System';
-    const img = document.getElementById('loginLogoImg');
-    if(img) { img.src=''; img.style.display='none'; }
-    const left = document.querySelector('#loginOverlay .kpi-login-left');
-    if(left) left.style.backgroundImage = '';
-    const status = document.getElementById('brandingStatus');
-    if(status) { status.style.display='block'; status.style.color='#6b84a0'; status.textContent='Branding cleared.'; }
+    var nm = document.getElementById('loginCompanyName');
+    if (nm) nm.textContent = 'LPA System';
+    var img = document.getElementById('loginLogoImg');
+    if (img) { img.src = ''; img.style.display = 'none'; }
+    var left = document.querySelector('#loginOverlay .kpi-login-left');
+    if (left) left.style.backgroundImage = '';
+    window._lpaBrandingData = {};
+    var status = document.getElementById('brandingStatus');
+    if (status) { status.style.display='block'; status.style.color='#6b84a0'; status.textContent='Branding cleared.'; }
+    if (typeof showToast === 'function') showToast('Login branding removed', 'info');
   } catch(e) {
-    console.error('Clear branding:', e);
+    console.error('[LPA] Clear branding error:', e);
   }
 };
 
