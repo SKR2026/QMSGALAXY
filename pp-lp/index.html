@@ -1672,10 +1672,10 @@ window.hideLoginScreen = function() {
 
 /* ── View-only amber banner ── */
 #lpaViewOnlyBanner{
-  display:none;position:fixed;top:0;left:0;right:0;z-index:8000;
+  display:none;position:fixed;bottom:0;left:0;right:0;z-index:8000;
   background:linear-gradient(90deg,#f59e0b,#d97706);
   color:#fff;text-align:center;padding:8px 16px;font-size:13px;font-weight:600;
-  box-shadow:0 2px 6px rgba(0,0,0,.15);
+  box-shadow:0 -2px 6px rgba(0,0,0,.15);
 }
 body.lpa-view-only #lpaViewOnlyBanner{display:block;}
 /* Hide all write/create/edit/delete buttons in view-only mode */
@@ -5879,11 +5879,28 @@ function _lpaGmailStatus(msg, color) {
 }
 
 // ── Auto-inject branding section when superadmin opens Settings ──
-// Hook after settings.js renders the tab
+// Also intercept mgmtreview navigation for guest viewers to load data safely
 (function() {
   const _origNav = window.navigate;
   window.navigate = function(view, el) {
+    // For guest management viewers, intercept mgmtreview and load data ourselves
+    if (view === 'mgmtreview' && window.currentUser && window.currentUser.isGuest) {
+      // Show the view (replicate what _origNav would do for showing the section)
+      document.querySelectorAll('.view').forEach(function(s) { s.classList.add('hidden'); });
+      const sec = document.getElementById('view-mgmtreview');
+      if (sec) sec.classList.remove('hidden');
+      document.querySelectorAll('.nav-item').forEach(function(a) { a.classList.remove('active'); });
+      if (el) el.classList.add('active');
+      else {
+        const navEl = document.querySelector('[data-view="mgmtreview"]');
+        if (navEl) navEl.classList.add('active');
+      }
+      _lpaLoadMgmtReviewAsGuest();
+      return; // skip _origNav which would crash on missing currentUser.plantId
+    }
+
     if (typeof _origNav === 'function') _origNav(view, el);
+
     if (view === 'settings') {
       setTimeout(function() {
         const u = window.currentUser;
@@ -5895,7 +5912,128 @@ function _lpaGmailStatus(msg, color) {
       }, 400);
     }
   };
+
+  // Also intercept DOMContentLoaded to override loadMgmtReview for guests
+  window.loadMgmtReview = function() {
+    if (window.currentUser && window.currentUser.isGuest) {
+      _lpaLoadMgmtReviewAsGuest();
+    } else if (typeof _origLoadMgmtReview === 'function') {
+      _origLoadMgmtReview();
+    }
+  };
 })();
+
+// ── Guest management review data loader ──────────────────────────
+// Runs Firestore queries directly (public read rules) without needing
+// currentUser.plantId or any auth-gated path.
+async function _lpaLoadMgmtReviewAsGuest() {
+  const kpiGrid    = document.getElementById('mgmtKpiGrid');
+  const chartsGrid = document.getElementById('mgmtChartsGrid');
+  if (!kpiGrid) return;
+
+  kpiGrid.innerHTML = '<p style="color:#6b7280;font-size:13px;padding:20px;">Loading…</p>';
+
+  try {
+    const db = firebase.firestore();
+    const period = (document.getElementById('mgmtPeriod')?.value) || 'month';
+
+    // Date range
+    const now   = new Date();
+    let start   = new Date(now.getFullYear(), now.getMonth(), 1);
+    if (period === 'quarter') start = new Date(now.getFullYear(), Math.floor(now.getMonth()/3)*3, 1);
+    if (period === 'year')    start = new Date(now.getFullYear(), 0, 1);
+    const startTs = firebase.firestore.Timestamp.fromDate(start);
+
+    // Fetch all audits (public read)
+    const [auditSnap, findingSnap, actionSnap, plantSnap] = await Promise.all([
+      db.collection('apps/lpa/audits').where('createdAt','>=',startTs).get(),
+      db.collection('apps/lpa/findings').where('createdAt','>=',startTs).get(),
+      db.collection('apps/lpa/correctiveActions').where('createdAt','>=',startTs).get(),
+      db.collection('apps/lpa/plants').get()
+    ]);
+
+    const audits   = auditSnap.docs.map(d => ({id:d.id,...d.data()}));
+    const findings = findingSnap.docs.map(d => ({id:d.id,...d.data()}));
+    const actions  = actionSnap.docs.map(d => ({id:d.id,...d.data()}));
+    const plants   = plantSnap.docs.map(d => ({id:d.id,...d.data()}));
+
+    const total      = audits.length;
+    const completed  = audits.filter(a => ['Submitted','Verified','Closed'].includes(a.status)).length;
+    const compliance = total ? Math.round((completed/total)*100) : 0;
+    const openActions= actions.filter(a => !['Closed','Verified'].includes(a.status)).length;
+    const overdueActions = actions.filter(a => {
+      if (['Closed','Verified'].includes(a.status)) return false;
+      const due = a.dueDate?.toDate?.() || (a.dueDate ? new Date(a.dueDate) : null);
+      return due && due < now;
+    }).length;
+    const critFindings = findings.filter(f => f.criticality === 'critical' || f.criticality === 'high').length;
+
+    // Build KPI cards
+    const kpis = [
+      { label:'Total Audits',       value: total,          icon:'📋', color:'#1a56db' },
+      { label:'Compliance Rate',    value: compliance+'%', icon:'✅', color:'#059669' },
+      { label:'Open Actions',       value: openActions,    icon:'🔧', color:'#d97706' },
+      { label:'Overdue Actions',    value: overdueActions, icon:'⚠️', color:'#ef4444' },
+      { label:'Total Findings',     value: findings.length,icon:'🔍', color:'#7c3aed' },
+      { label:'Critical Findings',  value: critFindings,   icon:'🚨', color:'#dc2626' },
+    ];
+
+    kpiGrid.innerHTML = kpis.map(k => `
+      <div class="kpi-card" style="background:#fff;border-radius:12px;padding:20px 24px;
+           box-shadow:0 1px 4px rgba(0,0,0,.08);border-left:4px solid ${k.color};">
+        <div style="font-size:24px;margin-bottom:6px;">${k.icon}</div>
+        <div style="font-size:28px;font-weight:700;color:${k.color};">${k.value}</div>
+        <div style="font-size:12px;color:#6b7280;margin-top:4px;">${k.label}</div>
+      </div>`).join('');
+
+    // Plant breakdown table
+    const plantMap = {};
+    plants.forEach(p => { plantMap[p.id] = p.name || p.id; });
+    const byPlant = {};
+    audits.forEach(a => {
+      const n = plantMap[a.plantId] || a.plantId || 'Unknown';
+      if (!byPlant[n]) byPlant[n] = { total:0, done:0 };
+      byPlant[n].total++;
+      if (['Submitted','Verified','Closed'].includes(a.status)) byPlant[n].done++;
+    });
+
+    const tableRows = Object.entries(byPlant).map(([plant, d]) => {
+      const comp = d.total ? Math.round((d.done/d.total)*100) : 0;
+      const color = comp >= 80 ? '#059669' : comp >= 50 ? '#d97706' : '#ef4444';
+      return `<tr>
+        <td style="padding:10px 12px;font-size:13px;color:#111827;">${plant}</td>
+        <td style="padding:10px 12px;font-size:13px;text-align:center;">${d.total}</td>
+        <td style="padding:10px 12px;font-size:13px;text-align:center;">${d.done}</td>
+        <td style="padding:10px 12px;font-size:13px;text-align:center;color:${color};font-weight:600;">${comp}%</td>
+      </tr>`;
+    }).join('');
+
+    if (chartsGrid) {
+      chartsGrid.innerHTML = `
+        <div class="card" style="grid-column:1/-1;">
+          <div class="card-header"><h3 class="card-title">Audit Compliance by Plant</h3></div>
+          <table style="width:100%;border-collapse:collapse;margin-top:8px;">
+            <thead>
+              <tr style="background:#f8fafc;">
+                <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">Plant</th>
+                <th style="padding:10px 12px;text-align:center;font-size:12px;color:#6b7280;font-weight:600;">Total Audits</th>
+                <th style="padding:10px 12px;text-align:center;font-size:12px;color:#6b7280;font-weight:600;">Completed</th>
+                <th style="padding:10px 12px;text-align:center;font-size:12px;color:#6b7280;font-weight:600;">Compliance</th>
+              </tr>
+            </thead>
+            <tbody>${tableRows || '<tr><td colspan="4" style="padding:20px;text-align:center;color:#9ca3af;font-size:13px;">No audits in this period</td></tr>'}</tbody>
+          </table>
+        </div>`;
+    }
+
+  } catch(err) {
+    console.warn('[LPA] mgmtreview load error:', err.message);
+    if (kpiGrid) kpiGrid.innerHTML = `
+      <div style="grid-column:1/-1;padding:24px;text-align:center;color:#ef4444;font-size:13px;">
+        Failed to load data: ${err.message}
+      </div>`;
+  }
+}
 </script>
 
 </body>
