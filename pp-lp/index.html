@@ -1690,6 +1690,12 @@ body.lpa-view-only [onclick*="save"],
 body.lpa-view-only [onclick*="Save"],
 body.lpa-view-only .fab-btn,
 body.lpa-view-only .add-btn{display:none!important;}
+/* ── Management view-only: hide entire Administration section ── */
+body.lpa-view-only .nav-admin-section,
+body.lpa-view-only .nav-admin-item { display: none !important; }
+
+/* ── Management view-only: hide logout button label, show read-only badge ── */
+body.lpa-view-only #lpaViewOnlyBanner { display: block !important; }
 </style>
 
 <style>
@@ -4479,95 +4485,146 @@ window._lpaMgmtLogin = function() {
 };
 
 // ── Firestore guard: silently handle permission-denied for guest viewers ──
-// Called once when management viewer logs in. Patches the Firestore
-// prototype so every .get() / .onSnapshot() that hits a permission error
-// returns an empty result instead of propagating the error to the UI.
 function _lpaInstallFirestoreGuard() {
-  // Run after Firebase is initialised
+
+  /* ── helpers ── */
+  function _isPermDenied(e) {
+    return e && (e.code === 'permission-denied' || e.code === 'PERMISSION_DENIED' ||
+                 /permission.denied|Missing or insufficient/i.test(e.message));
+  }
+  function _emptyQuerySnap() {
+    return {
+      docs: [], empty: true, size: 0,
+      forEach: function() {},
+      data:    function() { return {}; },
+      docChanges: function() { return []; }
+    };
+  }
+  function _emptyDocSnap(ref) {
+    return {
+      exists: false, id: (ref && ref.id) || '',
+      data:   function() { return null; },
+      get:    function() { return undefined; }
+    };
+  }
+
+  /* ── suppress permission-denied toasts / error messages ── */
+  const _origShowToast = window.showToast;
+  window.showToast = function(msg, type) {
+    if (window.currentUser && window.currentUser.isGuest &&
+        msg && /permission.denied|Missing or insufficient/i.test(msg)) return;
+    if (typeof _origShowToast === 'function') _origShowToast.apply(this, arguments);
+  };
+
+  /* ── suppress console.error for permission errors ── */
+  const _origConsoleError = console.error;
+  console.error = function() {
+    if (window.currentUser && window.currentUser.isGuest) {
+      const msg = Array.prototype.join.call(arguments, ' ');
+      if (/permission.denied|Missing or insufficient/i.test(msg)) return;
+    }
+    _origConsoleError.apply(console, arguments);
+  };
+
   function _install() {
     if (typeof firebase === 'undefined' || !firebase.apps || !firebase.apps.length) {
-      setTimeout(_install, 200); return;
+      setTimeout(_install, 150); return;
     }
     try {
       const db = firebase.firestore();
 
-      // ── Empty snapshot factory ────────────────────────────────
-      function _emptyQuerySnap() {
-        return { docs: [], empty: true, size: 0,
-          forEach: function() {},
-          data:    function() { return {}; } };
-      }
-      function _emptyDocSnap(ref) {
-        return { exists: false, id: (ref && ref.id) || '', data: function() { return null; },
-          get: function() { return undefined; } };
-      }
+      /* patch Query prototype (.where().get(), .collection().get(), collectionGroup) */
+      const QueryProto = Object.getPrototypeOf(db.collection('__g__'));
+      if (QueryProto && !QueryProto.__lpaGuarded) {
 
-      // ── Patch Query.prototype.get ─────────────────────────────
-      const QueryProto = Object.getPrototypeOf(db.collection('__guard_test__'));
-      if (QueryProto && QueryProto.get && !QueryProto.__lpaGuarded) {
-        const _origQGet = QueryProto.get.bind ? null : QueryProto.get;
-        const _origGet  = QueryProto.get;
+        /* .get() */
+        const _oGet = QueryProto.get;
         QueryProto.get = function() {
-          return _origGet.apply(this, arguments).catch(function(e) {
-            if (e && (e.code === 'permission-denied' || /permission/i.test(e.message))) {
-              return _emptyQuerySnap();
-            }
+          return _oGet.apply(this, arguments).catch(function(e) {
+            if (_isPermDenied(e)) return _emptyQuerySnap();
             throw e;
           });
         };
+
+        /* .onSnapshot() */
+        const _oSnap = QueryProto.onSnapshot;
+        QueryProto.onSnapshot = function(onNext, onError, onCompletion) {
+          const safeErr = function(e) {
+            if (_isPermDenied(e)) { if (typeof onNext === 'function') onNext(_emptyQuerySnap()); return; }
+            if (typeof onError === 'function') onError(e);
+          };
+          // onSnapshot(observer) or onSnapshot(onNext, onError, onCompletion)
+          if (onNext && typeof onNext === 'object') {
+            const obs = onNext;
+            return _oSnap.call(this, {
+              next:     obs.next  || function(){},
+              error:    function(e) { if (_isPermDenied(e)) { if (obs.next) obs.next(_emptyQuerySnap()); return; } if (obs.error) obs.error(e); },
+              complete: obs.complete || function(){}
+            });
+          }
+          return _oSnap.call(this, onNext, safeErr, onCompletion);
+        };
+
         QueryProto.__lpaGuarded = true;
       }
 
-      // ── Patch DocumentReference.prototype.get ────────────────
-      const testDocRef = db.collection('__guard_test__').doc('__guard_test__');
-      const DocProto   = Object.getPrototypeOf(testDocRef);
-      if (DocProto && DocProto.get && !DocProto.__lpaGuarded) {
-        const _origDGet = DocProto.get;
+      /* patch DocumentReference prototype */
+      const testRef  = db.collection('__g__').doc('__d__');
+      const DocProto = Object.getPrototypeOf(testRef);
+      if (DocProto && !DocProto.__lpaGuarded) {
+
+        /* .get() */
+        const _oDGet = DocProto.get;
         DocProto.get = function() {
           const self = this;
-          return _origDGet.apply(self, arguments).catch(function(e) {
-            if (e && (e.code === 'permission-denied' || /permission/i.test(e.message))) {
-              return _emptyDocSnap(self);
-            }
+          return _oDGet.apply(self, arguments).catch(function(e) {
+            if (_isPermDenied(e)) return _emptyDocSnap(self);
             throw e;
           });
         };
+
+        /* .onSnapshot() */
+        const _oDSnap = DocProto.onSnapshot;
+        DocProto.onSnapshot = function(onNext, onError, onCompletion) {
+          const self = this;
+          const safeErr = function(e) {
+            if (_isPermDenied(e)) { if (typeof onNext === 'function') onNext(_emptyDocSnap(self)); return; }
+            if (typeof onError === 'function') onError(e);
+          };
+          if (onNext && typeof onNext === 'object') {
+            const obs = onNext;
+            return _oDSnap.call(this, {
+              next:     obs.next  || function(){},
+              error:    function(e) { if (_isPermDenied(e)) { if (obs.next) obs.next(_emptyDocSnap(self)); return; } if (obs.error) obs.error(e); },
+              complete: obs.complete || function(){}
+            });
+          }
+          return _oDSnap.call(this, onNext, safeErr, onCompletion);
+        };
+
+        /* .set() / .update() / .delete() — silently no-op for guests */
+        ['set','update','delete'].forEach(function(m) {
+          const _o = DocProto[m];
+          DocProto[m] = function() {
+            if (window.currentUser && window.currentUser.isGuest) return Promise.resolve();
+            return _o.apply(this, arguments);
+          };
+        });
+
         DocProto.__lpaGuarded = true;
       }
 
-      // ── Patch onSnapshot to no-op on permission errors ────────
-      if (DocProto && DocProto.onSnapshot && !DocProto.__lpaSnapGuarded) {
-        const _origDocSnap = DocProto.onSnapshot;
-        DocProto.onSnapshot = function(onNext, onError, onCompletion) {
-          const _safeError = function(e) {
-            if (e && (e.code === 'permission-denied' || /permission/i.test(e.message))) {
-              if (typeof onNext === 'function') onNext(_emptyDocSnap(this));
-              return;
-            }
-            if (typeof onError === 'function') onError(e);
-          }.bind(this);
-          return _origDocSnap.call(this, onNext, _safeError, onCompletion);
-        };
-        DocProto.__lpaSnapGuarded = true;
-      }
-      if (QueryProto && QueryProto.onSnapshot && !QueryProto.__lpaSnapGuarded) {
-        const _origQSnap = QueryProto.onSnapshot;
-        QueryProto.onSnapshot = function(onNext, onError, onCompletion) {
-          const _safeError = function(e) {
-            if (e && (e.code === 'permission-denied' || /permission/i.test(e.message))) {
-              if (typeof onNext === 'function') onNext(_emptyQuerySnap());
-              return;
-            }
-            if (typeof onError === 'function') onError(e);
-          };
-          return _origQSnap.call(this, onNext, _safeError, onCompletion);
-        };
-        QueryProto.__lpaSnapGuarded = true;
-      }
+      /* patch collectionGroup (used by reports / analytics) */
+      const _oCG = db.collectionGroup.bind(db);
+      db.collectionGroup = function() {
+        const q = _oCG.apply(this, arguments);
+        // q is already a Query — its prototype is already patched above
+        return q;
+      };
 
-      console.info('[LPA] Firestore permission guard installed for management viewer.');
+      console.info('[LPA] Firestore permission guard active for management viewer.');
     } catch(e) {
-      console.warn('[LPA] Could not install Firestore guard:', e.message);
+      console.warn('[LPA] Firestore guard install error:', e.message);
     }
   }
   _install();
@@ -5142,6 +5199,319 @@ window._lpaLoginBrandingClear = async function() {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────
+// GMAIL CONFIG SECTION — Super Admin Settings
+// ─────────────────────────────────────────────────────────────────
+
+const GMAIL_BLOCK_ID = 'lpaGmailConfigSection';
+
+window.injectGmailConfigSection = async function(containerSelector) {
+  const container = document.querySelector(containerSelector || '#settingsTabContent');
+  if (!container) return;
+  if (document.getElementById(GMAIL_BLOCK_ID)) {
+    _lpaLoadGmailConfigToForm(); // refresh fields if already injected
+    return;
+  }
+
+  const sec = document.createElement('div');
+  sec.id = GMAIL_BLOCK_ID;
+  sec.innerHTML = `
+    <div class="settings-section" style="margin-top:28px;">
+      <h3 class="settings-section-title"
+          style="font-size:14px;font-weight:600;color:#123a63;margin-bottom:4px;
+                 padding-bottom:8px;border-bottom:1px solid #e0e7ef;
+                 display:flex;align-items:center;gap:8px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1a56db"
+             stroke-width="2" style="flex-shrink:0">
+          <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+          <polyline points="22,6 12,13 2,6"/>
+        </svg>
+        Gmail / Email Configuration
+      </h3>
+      <p style="font-size:12px;color:#6b7280;margin:0 0 18px;">
+        Configure a Gmail account to send audit reminders, escalation alerts and
+        finding notifications. Use a
+        <a href="https://support.google.com/accounts/answer/185833" target="_blank"
+           style="color:#1a56db;">Google App Password</a>
+        (recommended) or OAuth 2.0 for enhanced security.
+      </p>
+
+      <!-- Auth mode toggle -->
+      <div style="display:flex;gap:8px;margin-bottom:20px;">
+        <button id="gmailModeAppPwd" onclick="window._lpaGmailToggleMode('appPassword')"
+          class="btn btn-primary btn-sm" style="font-size:12px;">
+          App Password
+        </button>
+        <button id="gmailModeOAuth" onclick="window._lpaGmailToggleMode('oauth')"
+          class="btn btn-secondary btn-sm" style="font-size:12px;opacity:.7;">
+          OAuth 2.0
+        </button>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+        <div class="form-group">
+          <label class="form-label" style="font-size:12px;font-weight:600;color:#4f6680;">
+            Sender Gmail Address <span style="color:#ef4444">*</span>
+          </label>
+          <input id="gmailSenderEmail" type="email" class="form-input"
+            placeholder="yourname@gmail.com" style="margin-top:6px;">
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="font-size:12px;font-weight:600;color:#4f6680;">
+            Sender Display Name
+          </label>
+          <input id="gmailSenderName" type="text" class="form-input"
+            placeholder="LPA System" style="margin-top:6px;">
+        </div>
+      </div>
+
+      <!-- App Password fields -->
+      <div id="gmailAppPwdFields">
+        <div class="form-group" style="margin-bottom:16px;max-width:420px;">
+          <label class="form-label" style="font-size:12px;font-weight:600;color:#4f6680;">
+            Google App Password <span style="color:#ef4444">*</span>
+          </label>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+            <input id="gmailAppPassword" type="password" class="form-input"
+              placeholder="xxxx xxxx xxxx xxxx"
+              style="font-family:monospace;letter-spacing:.08em;flex:1;">
+            <button onclick="window._lpaGmailTogglePwd()"
+              class="btn btn-secondary btn-sm"
+              style="font-size:12px;padding:6px 10px;white-space:nowrap;" title="Show/hide">
+              👁
+            </button>
+          </div>
+          <p style="font-size:11px;color:#9ca3af;margin:5px 0 0;">
+            Generate at
+            <a href="https://myaccount.google.com/apppasswords" target="_blank"
+               style="color:#1a56db;">myaccount.google.com/apppasswords</a>
+            — requires 2-Step Verification enabled.
+          </p>
+        </div>
+      </div>
+
+      <!-- OAuth fields (hidden by default) -->
+      <div id="gmailOAuthFields" style="display:none;">
+        <div style="background:#fef9c3;border:1px solid #fde047;border-radius:8px;
+                    padding:12px 16px;margin-bottom:16px;font-size:12px;color:#854d0e;">
+          <strong>OAuth 2.0 Setup:</strong> Create a project in
+          <a href="https://console.cloud.google.com/apis/credentials" target="_blank"
+             style="color:#1a56db;">Google Cloud Console</a>,
+          enable the Gmail API, create OAuth credentials, and add
+          <code>https://developers.google.com/oauthplayground</code> as a redirect URI.
+          Then use the OAuth Playground to get a refresh token.
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+          <div class="form-group">
+            <label class="form-label" style="font-size:12px;font-weight:600;color:#4f6680;">
+              Client ID <span style="color:#ef4444">*</span>
+            </label>
+            <input id="gmailClientId" type="text" class="form-input"
+              placeholder="xxxxxxxx.apps.googleusercontent.com" style="margin-top:6px;font-size:11px;">
+          </div>
+          <div class="form-group">
+            <label class="form-label" style="font-size:12px;font-weight:600;color:#4f6680;">
+              Client Secret <span style="color:#ef4444">*</span>
+            </label>
+            <input id="gmailClientSecret" type="password" class="form-input"
+              placeholder="GOCSPX-…" style="margin-top:6px;font-size:11px;">
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom:16px;">
+          <label class="form-label" style="font-size:12px;font-weight:600;color:#4f6680;">
+            Refresh Token <span style="color:#ef4444">*</span>
+          </label>
+          <input id="gmailRefreshToken" type="password" class="form-input"
+            placeholder="1//04…" style="margin-top:6px;font-size:11px;font-family:monospace;">
+        </div>
+      </div>
+
+      <!-- Test recipient -->
+      <div class="form-group" style="margin-bottom:20px;max-width:360px;">
+        <label class="form-label" style="font-size:12px;font-weight:600;color:#4f6680;">
+          Send Test Email To
+        </label>
+        <input id="gmailTestTo" type="email" class="form-input"
+          placeholder="your@email.com (defaults to sender)" style="margin-top:6px;">
+      </div>
+
+      <!-- Action buttons -->
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <button onclick="window._lpaGmailSave()" class="btn btn-primary"
+          id="gmailSaveBtn" style="font-size:13px;">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2"
+               style="vertical-align:-2px;margin-right:4px">
+            <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
+            <polyline points="17 21 17 13 7 13 7 21"/>
+            <polyline points="7 3 7 8 15 8"/>
+          </svg>
+          Save Gmail Config
+        </button>
+        <button onclick="window._lpaGmailSendTest()" class="btn btn-secondary"
+          id="gmailTestBtn" style="font-size:13px;">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2"
+               style="vertical-align:-2px;margin-right:4px">
+            <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07
+                     A19.5 19.5 0 013.07 9.81a19.79 19.79 0 01-3.07-8.67
+                     A2 2 0 012 .18h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81
+                     a2 2 0 01-.45 2.11L6.09 7.91a16 16 0 006 6l1.27-1.27
+                     a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 14.92z"/>
+          </svg>
+          Send Test Email
+        </button>
+        <span id="gmailStatusMsg" style="font-size:12px;display:none;"></span>
+      </div>
+
+      <!-- Current config indicator -->
+      <div id="gmailCurrentCfg" style="display:none;margin-top:14px;padding:10px 14px;
+           background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;
+           font-size:12px;color:#166534;">
+        ✅ Gmail configured — <span id="gmailCfgEmail"></span>
+        <span id="gmailCfgMode" style="margin-left:8px;padding:1px 8px;background:#dcfce7;
+              border-radius:99px;font-size:11px;"></span>
+      </div>
+    </div>`;
+
+  container.appendChild(sec);
+  _lpaLoadGmailConfigToForm();
+};
+
+/** Toggle App Password ↔ OAuth UI */
+window._lpaGmailToggleMode = function(mode) {
+  const appPwd  = document.getElementById('gmailAppPwdFields');
+  const oauth   = document.getElementById('gmailOAuthFields');
+  const btnApp  = document.getElementById('gmailModeAppPwd');
+  const btnOath = document.getElementById('gmailModeOAuth');
+  if (!appPwd) return;
+  const isOAuth = mode === 'oauth';
+  appPwd.style.display  = isOAuth ? 'none' : 'block';
+  oauth.style.display   = isOAuth ? 'block' : 'none';
+  if (btnApp)  { btnApp.className  = isOAuth ? 'btn btn-secondary btn-sm' : 'btn btn-primary btn-sm'; btnApp.style.opacity = isOAuth ? '.7' : '1'; }
+  if (btnOath) { btnOath.className = isOAuth ? 'btn btn-primary btn-sm'   : 'btn btn-secondary btn-sm'; btnOath.style.opacity = isOAuth ? '1' : '.7'; }
+  window._lpaGmailCurrentMode = mode;
+};
+window._lpaGmailCurrentMode = 'appPassword';
+
+/** Show/hide app password field */
+window._lpaGmailTogglePwd = function() {
+  const inp = document.getElementById('gmailAppPassword');
+  if (inp) inp.type = inp.type === 'password' ? 'text' : 'password';
+};
+
+/** Load existing config from Firestore (mask the password) */
+async function _lpaLoadGmailConfigToForm() {
+  try {
+    const db = (typeof firebase !== 'undefined') ? firebase.firestore() : null;
+    if (!db) return;
+    const snap = await db.collection('apps').doc('lpa')
+                         .collection('settings').doc('gmailConfig').get();
+    if (!snap.exists) return;
+    const d = snap.data();
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+    setVal('gmailSenderEmail', d.senderEmail);
+    setVal('gmailSenderName',  d.senderName);
+    // Never return the real password/token — just show a placeholder
+    if (!d.useOAuth) {
+      setVal('gmailAppPassword', d.appPassword ? '••••••••••••••••' : '');
+    } else {
+      window._lpaGmailToggleMode('oauth');
+      setVal('gmailClientId',     d.clientId);
+      setVal('gmailClientSecret', d.clientSecret ? '••••••••••' : '');
+      setVal('gmailRefreshToken', d.refreshToken  ? '••••••••••' : '');
+    }
+    // Show current config badge
+    const badge = document.getElementById('gmailCurrentCfg');
+    const eml   = document.getElementById('gmailCfgEmail');
+    const modeEl= document.getElementById('gmailCfgMode');
+    if (badge) badge.style.display = 'block';
+    if (eml)   eml.textContent     = d.senderEmail || '';
+    if (modeEl)modeEl.textContent  = d.useOAuth ? 'OAuth 2.0' : 'App Password';
+  } catch(e) { console.warn('[LPA] Gmail config load:', e); }
+}
+
+/** Save Gmail config via Cloud Function */
+window._lpaGmailSave = async function() {
+  const btn    = document.getElementById('gmailSaveBtn');
+  const status = document.getElementById('gmailStatusMsg');
+  const isOAuth = window._lpaGmailCurrentMode === 'oauth';
+
+  const senderEmail = (document.getElementById('gmailSenderEmail')?.value || '').trim();
+  const senderName  = (document.getElementById('gmailSenderName')?.value  || '').trim();
+
+  if (!senderEmail) {
+    _lpaGmailStatus('⚠️ Sender email is required.', '#ef4444'); return;
+  }
+
+  let payload = { senderEmail, senderName, useOAuth: isOAuth };
+
+  if (isOAuth) {
+    payload.clientId     = (document.getElementById('gmailClientId')?.value     || '').trim();
+    payload.clientSecret = (document.getElementById('gmailClientSecret')?.value || '').trim();
+    payload.refreshToken = (document.getElementById('gmailRefreshToken')?.value || '').trim();
+    if (!payload.clientId || !payload.clientSecret || !payload.refreshToken) {
+      _lpaGmailStatus('⚠️ All OAuth fields are required.', '#ef4444'); return;
+    }
+    // Don't overwrite with masked placeholder
+    if (payload.clientSecret === '••••••••••') delete payload.clientSecret;
+    if (payload.refreshToken  === '••••••••••') delete payload.refreshToken;
+  } else {
+    const pwd = (document.getElementById('gmailAppPassword')?.value || '').trim();
+    if (!pwd) { _lpaGmailStatus('⚠️ App password is required.', '#ef4444'); return; }
+    if (pwd === '••••••••••••••••') {
+      // unchanged — save only non-secret fields via Firestore directly
+      try {
+        const db = firebase.firestore();
+        await db.collection('apps').doc('lpa').collection('settings').doc('gmailConfig')
+          .set({ senderEmail, senderName, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        _lpaGmailStatus('✅ Sender info updated.', '#059669');
+      } catch(e) { _lpaGmailStatus('❌ ' + e.message, '#ef4444'); }
+      return;
+    }
+    payload.appPassword = pwd;
+  }
+
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    const fn = firebase.functions().httpsCallable('saveGmailConfig');
+    await fn(payload);
+    _lpaGmailStatus('✅ Gmail config saved successfully.', '#059669');
+    _lpaLoadGmailConfigToForm();
+    if (typeof showToast === 'function') showToast('Gmail configuration saved', 'success');
+  } catch(e) {
+    _lpaGmailStatus('❌ ' + (e.message || 'Save failed.'), '#ef4444');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save Gmail Config'; }
+  }
+};
+
+/** Send a test email via Cloud Function */
+window._lpaGmailSendTest = async function() {
+  const btn    = document.getElementById('gmailTestBtn');
+  const testTo = (document.getElementById('gmailTestTo')?.value || '').trim();
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  try {
+    const fn = firebase.functions().httpsCallable('sendTestEmail');
+    const res = await fn({ to: testTo || undefined });
+    _lpaGmailStatus(`✅ Test email sent to ${res.data.sentTo}`, '#059669');
+    if (typeof showToast === 'function') showToast('Test email sent!', 'success');
+  } catch(e) {
+    _lpaGmailStatus('❌ ' + (e.message || 'Send failed. Check your Gmail config.'), '#ef4444');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Send Test Email'; }
+  }
+};
+
+function _lpaGmailStatus(msg, color) {
+  const el = document.getElementById('gmailStatusMsg');
+  if (!el) return;
+  el.textContent   = msg;
+  el.style.color   = color || '#374151';
+  el.style.display = 'inline';
+  setTimeout(function() { if (el) el.style.display = 'none'; }, 5000);
+}
+
 // ── Auto-inject branding section when superadmin opens Settings ──
 // Hook after settings.js renders the tab
 (function() {
@@ -5153,6 +5523,7 @@ window._lpaLoginBrandingClear = async function() {
         const u = window.currentUser;
         if (u && u.role === 'super_admin') {
           window.injectLoginBrandingSection('#settingsTabContent');
+          window.injectGmailConfigSection('#settingsTabContent');
         }
       }, 400);
     }
