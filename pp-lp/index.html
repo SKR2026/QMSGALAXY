@@ -1041,6 +1041,11 @@
           <input type="text" id="auditAuditee" class="form-input" placeholder="Name of auditee" />
         </div>
         <div class="form-group">
+          <label class="form-label">Auditee Email</label>
+          <input type="email" id="auditAuditeeEmail" class="form-input" placeholder="auditee@company.com" />
+          <p class="form-hint">Email notification will be sent when audit is assigned</p>
+        </div>
+        <div class="form-group">
           <label class="form-label required">Planned Date</label>
           <input type="date" id="auditPlannedDate" class="form-input" required />
         </div>
@@ -1107,6 +1112,7 @@
             <option value="super_admin">Super Admin</option>
             <option value="plant_admin">Plant Admin</option>
             <option value="auditor">Auditor</option>
+            <option value="auditee">Auditee</option>
             <option value="management">Management / Viewer</option>
             <!-- Note: option values are internal role keys (snake_case).
                  Use window.formatRole(role) in JS to display labels. -->
@@ -1408,6 +1414,7 @@
     'super_admin' : 'Super Admin',
     'plant_admin' : 'Plant Admin',
     'auditor'     : 'Auditor',
+    'auditee'     : 'Auditee',
     'management'  : 'Management / Viewer'
   };
 
@@ -4121,7 +4128,7 @@ function abAddRow() {
       </select>
     </td>
     <td><select class="ab-auditor" disabled><option value="">Select Plant first</option></select></td>
-    <td><input type="text" class="ab-auditee" placeholder="Auditee name" /></td>
+    <td><input type="text" class="ab-auditee" placeholder="Auditee name" /><input type="email" class="ab-auditee-email" placeholder="Email (optional)" style="margin-top:4px;width:100%;font-size:11px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;" /></td>
     <td><input type="date" class="ab-date" value="${today}" /></td>
     <td>
       <select class="ab-shift">
@@ -4249,6 +4256,7 @@ async function saveAllBulkAudits() {
 
     return { tr, plantId, deptId, procId, levelId, auditorId,
       auditee: tr.querySelector('.ab-auditee').value.trim(),
+      auditeeEmail: (tr.querySelector('.ab-auditee-email')?.value || '').trim(),
       date, shift: tr.querySelector('.ab-shift').value,
       area: tr.querySelector('.ab-area').value.trim() };
   });
@@ -4291,6 +4299,7 @@ async function saveAllBulkAudits() {
         auditorId:      row.auditorId,
         auditorName:    auditorDoc.data()?.name || '',
         auditee:        row.auditee,
+        auditeeEmail:   row.auditeeEmail || '',
         plannedDate:    row.date,
         actualDate:     null,
         shift:          row.shift,
@@ -4305,6 +4314,23 @@ async function saveAllBulkAudits() {
                           deptDoc.data()?.name, procDoc.data()?.name, auditorDoc.data()?.name)
       });
 
+      // Send email notification to auditee
+      if (row.auditeeEmail) {
+        try {
+          const fn = firebase.functions().httpsCallable('sendAuditAssignedEmail');
+          await fn({
+            auditeeEmail: row.auditeeEmail,
+            auditeeName:  row.auditee,
+            auditId,
+            plantName:    plantDoc.data()?.name || '',
+            deptName:     deptDoc.data()?.name  || '',
+            processName:  procDoc.data()?.name  || '',
+            levelName:    levelDoc.data()?.name || '',
+            plannedDate:  row.date,
+            auditorName:  auditorDoc.data()?.name || ''
+          });
+        } catch(eml) { console.warn('[BulkAudit] Email notify failed:', eml.message); }
+      }
       // Mark row green
       row.tr.classList.add('ab-row-ok');
       saved++;
@@ -6171,6 +6197,259 @@ async function _lpaLoadMgmtReviewAsGuest() {
       </div>`;
   }
 }
+</script>
+
+<!-- ═══════════════════════════════════════════════════════════
+     AUDITEE ACTION PLAN MAGIC LINK VIEW
+     URL: ?audit=<auditId>&auditeetok=<token>
+═══════════════════════════════════════════════════════════ -->
+<div id="auditeeActionView" style="display:none;position:fixed;inset:0;z-index:10001;background:#f0f4f8;overflow:auto;padding:24px 16px;">
+  <div style="max-width:740px;margin:0 auto;">
+    <div style="background:#1a56db;border-radius:16px 16px 0 0;padding:20px 28px;display:flex;align-items:center;gap:14px;">
+      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+      <div>
+        <div style="color:#fff;font-size:18px;font-weight:700;">LPA — Action Plan Submission</div>
+        <div style="color:rgba(255,255,255,.7);font-size:12px;margin-top:2px;">Fill your corrective action plans for the assigned audit</div>
+      </div>
+    </div>
+    <div style="background:#fff;border-radius:0 0 16px 16px;box-shadow:0 12px 40px rgba(23,70,115,.14);padding:28px;">
+      <div id="auditeeActionContent">
+        <div style="text-align:center;padding:40px 0;color:#6b84a0;">Loading audit details…</div>
+      </div>
+      <div style="margin-top:20px;padding-top:16px;border-top:1px solid #e0e7ef;font-size:11px;color:#9aaec4;">
+        This link allows you to submit action plans for your assigned audit.
+        For full system access, <a href="javascript:void(0)" onclick="document.getElementById('auditeeActionView').style.display='none';document.getElementById('loginOverlay').style.display='flex';" style="color:#1a76c2;">sign in here</a>.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Auditee Action Plan Magic Link ───────────────────────────
+(function() {
+  const params   = new URLSearchParams(location.search);
+  const auditId  = params.get('audit');
+  const auditTok = params.get('auditeetok');
+  if (!auditId && !auditTok) return;
+
+  document.addEventListener('DOMContentLoaded', function() {
+    const av = document.getElementById('auditeeActionView');
+    const lo = document.getElementById('loginOverlay');
+    if (av) av.style.display = 'block';
+    if (lo) lo.style.display = 'none';
+  });
+
+  async function waitForFirebase() {
+    let tries = 0;
+    while (!(window.firebase && firebase.apps && firebase.apps.length) && tries++ < 40) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  function escH(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+  async function loadAuditeeView() {
+    const el = document.getElementById('auditeeActionContent');
+    if (!el) return;
+    try {
+      await waitForFirebase();
+      const db = firebase.firestore();
+
+      // Find the audit
+      let auditDoc = null;
+      if (auditId) {
+        const snap = await db.collectionGroup('audits').where('id','==',auditId).limit(1).get();
+        if (!snap.empty) auditDoc = snap.docs[0];
+        else {
+          const d = await db.collection('audits').doc(auditId).get();
+          if (d.exists) auditDoc = d;
+        }
+      }
+      if (!auditDoc && auditTok) {
+        const snap = await db.collectionGroup('audits').where('auditeeToken','==',auditTok).limit(1).get();
+        if (!snap.empty) auditDoc = snap.docs[0];
+      }
+
+      if (!auditDoc) {
+        el.innerHTML = '<div style="text-align:center;padding:40px;color:#e53e3e;font-size:14px;">Audit not found or link has expired.</div>';
+        return;
+      }
+
+      const a = auditDoc.data();
+      const realAuditId = auditDoc.id;
+
+      // Load existing findings for this audit
+      let findings = [];
+      try {
+        const fSnap = await db.collection('audits').doc(realAuditId).collection('findings').get();
+        findings = fSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+      } catch(e) { /* no findings yet */ }
+
+      const statusColor = {'Assigned':'#2563eb','In Progress':'#d97706','Submitted':'#059669','Closed':'#6b7280'}[a.status]||'#6b7280';
+
+      el.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;flex-wrap:wrap;gap:10px;">
+          <div>
+            <div style="font-size:11px;color:#6b84a0;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">AUDIT ASSIGNMENT</div>
+            <div style="font-size:20px;font-weight:700;color:#123a63;margin-top:4px;">${escH(a.processName||a.levelName||'Audit')} — ${escH(a.plantName||'')}</div>
+          </div>
+          <span style="padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;background:${statusColor}20;color:${statusColor};white-space:nowrap;">${escH(a.status||'Assigned')}</span>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:20px;">
+          ${[['Department',a.departmentName||'—'],['Process',a.processName||'—'],['Level',a.levelName||'—'],['Auditor',a.auditorName||'—'],['Planned Date',a.plannedDate||'—'],['Shift',a.shift||'—']].map(([k,v])=>`
+            <div style="background:#f7f9fc;border-radius:10px;padding:10px 12px;">
+              <div style="font-size:10px;color:#6b84a0;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px;">${k}</div>
+              <div style="font-size:13px;font-weight:500;color:#1a2a3a;">${escH(v)}</div>
+            </div>`).join('')}
+        </div>
+
+        ${findings.length ? `
+        <div style="margin-bottom:24px;">
+          <div style="font-size:13px;font-weight:700;color:#1a2a3a;margin-bottom:12px;">📋 Findings Requiring Action Plans (${findings.length})</div>
+          <div id="findingActionsList">
+            ${findings.map((f,i) => `
+            <div style="background:#fafaf8;border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin-bottom:12px;">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:6px;">
+                <div style="font-size:13px;font-weight:600;color:#1a2a3a;">${i+1}. ${escH(f.title||f.description?.substring(0,80)||'Finding')}</div>
+                <span style="font-size:11px;padding:3px 10px;border-radius:12px;background:${{Open:'#fef2f2',InProgress:'#fffbeb',Closed:'#f0fdf4'}[f.status?.replace(' ','')]||'#f3f4f6'};color:${{Open:'#dc2626',InProgress:'#d97706',Closed:'#16a34a'}[f.status?.replace(' ','')]||'#6b7280'};font-weight:600;">${escH(f.status||'Open')}</span>
+              </div>
+              ${f.description ? `<div style="font-size:12px;color:#4b5563;margin-bottom:10px;line-height:1.6;">${escH(f.description)}</div>` : ''}
+              <div style="margin-bottom:8px;">
+                <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Corrective Action Plan *</label>
+                <textarea id="ap_action_${f.id}" rows="2" style="width:100%;padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;" placeholder="Describe the corrective action taken or planned…">${escH(f.correctiveAction||'')}</textarea>
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                <div>
+                  <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Responsible Person</label>
+                  <input id="ap_resp_${f.id}" type="text" value="${escH(f.responsiblePerson||a.auditee||'')}" style="width:100%;padding:7px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;" placeholder="Name" />
+                </div>
+                <div>
+                  <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Target Date</label>
+                  <input id="ap_date_${f.id}" type="date" value="${escH(f.targetDate||'')}" style="width:100%;padding:7px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;" />
+                </div>
+              </div>
+            </div>`).join('')}
+          </div>
+          <div id="auditeeSubmitMsg" style="display:none;padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:12px;"></div>
+          <button onclick="window._submitAuditeeActionPlans('${realAuditId}', ${JSON.stringify(findings.map(f=>f.id))})"
+            style="width:100%;padding:14px;background:linear-gradient(135deg,#2472cc,#1a56db);color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:600;font-family:inherit;cursor:pointer;box-shadow:0 4px 16px rgba(26,86,219,.25);">
+            Submit Action Plans
+          </button>
+        </div>` : `
+        <div style="text-align:center;padding:32px;background:#f7f9fc;border-radius:12px;color:#6b84a0;font-size:13px;">
+          No findings recorded yet for this audit. Please check back after the audit is conducted.
+        </div>`}
+      `;
+    } catch(err) {
+      el.innerHTML = '<div style="text-align:center;padding:40px;color:#e53e3e;font-size:13px;">Error loading audit: ' + err.message + '</div>';
+    }
+  }
+
+  loadAuditeeView();
+})();
+
+// Submit action plans (called from auditee magic link view)
+window._submitAuditeeActionPlans = async function(auditId, findingIds) {
+  const msgEl = document.getElementById('auditeeSubmitMsg');
+  const btn = event.target;
+  btn.disabled = true; btn.textContent = 'Submitting…';
+  try {
+    await window._waitForFirebase_lpa();
+    const db = firebase.firestore();
+    const batch = db.batch();
+    let hasError = false;
+
+    for (const fid of findingIds) {
+      const action = document.getElementById('ap_action_'+fid)?.value.trim();
+      const resp   = document.getElementById('ap_resp_'+fid)?.value.trim();
+      const date   = document.getElementById('ap_date_'+fid)?.value;
+      if (!action) { hasError = true; continue; }
+      const ref = db.collection('audits').doc(auditId).collection('findings').doc(fid);
+      batch.update(ref, {
+        correctiveAction:  action,
+        responsiblePerson: resp  || '',
+        targetDate:        date  || '',
+        status:            'In Progress',
+        actionUpdatedAt:   firebase.firestore.FieldValue.serverTimestamp(),
+        actionUpdatedVia:  'magic_link'
+      });
+    }
+
+    if (hasError) {
+      if (msgEl) { msgEl.style.display='block'; msgEl.style.background='#fef2f2'; msgEl.style.color='#dc2626'; msgEl.textContent='Please fill in all corrective action fields.'; }
+      btn.disabled = false; btn.textContent = 'Submit Action Plans';
+      return;
+    }
+
+    // Update audit status to In Progress
+    batch.update(db.collection('audits').doc(auditId), {
+      status: 'In Progress',
+      auditeeSubmittedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+
+    await batch.commit();
+
+    if (msgEl) {
+      msgEl.style.display='block';
+      msgEl.style.background='#f0fdf4';
+      msgEl.style.color='#16a34a';
+      msgEl.textContent='✅ Action plans submitted successfully! The auditor has been notified.';
+    }
+    btn.textContent = '✅ Submitted';
+  } catch(err) {
+    if (msgEl) { msgEl.style.display='block'; msgEl.style.background='#fef2f2'; msgEl.style.color='#dc2626'; msgEl.textContent='Error: ' + err.message; }
+    btn.disabled = false; btn.textContent = 'Submit Action Plans';
+  }
+};
+
+// Helper to wait for Firebase (reusable)
+window._waitForFirebase_lpa = async function() {
+  let t = 0;
+  while (!(window.firebase && firebase.apps && firebase.apps.length) && t++ < 40)
+    await new Promise(r => setTimeout(r, 200));
+};
+
+// ── Patch saveAudit to capture auditeeEmail & send notification ──
+(function() {
+  // Wait for audits.js to define window.saveAudit, then wrap it
+  function patchSaveAudit() {
+    const orig = window.saveAudit;
+    if (typeof orig !== 'function') return;
+    window.saveAudit = async function() {
+      // Capture auditee email before calling original (which clears the form)
+      const auditeeEmail = (document.getElementById('auditAuditeeEmail')?.value || '').trim();
+      const auditeeName  = (document.getElementById('auditAuditee')?.value || '').trim();
+
+      // Call original save
+      const result = await orig.apply(this, arguments);
+
+      // After save, send email if provided
+      if (auditeeEmail) {
+        try {
+          const fn = firebase.functions().httpsCallable('sendAuditAssignedEmail');
+          await fn({
+            auditeeEmail,
+            auditeeName,
+            plantName:   document.getElementById('auditPlant')?.options[document.getElementById('auditPlant')?.selectedIndex]?.text || '',
+            plannedDate: document.getElementById('auditPlannedDate')?.value || '',
+          });
+        } catch(e) { console.warn('[LPA] Auditee email notify failed:', e.message); }
+      }
+      return result;
+    };
+  }
+
+  // Retry until audits.js loads
+  let attempts = 0;
+  const interval = setInterval(function() {
+    if (window.saveAudit && window.saveAudit._auditeePatched) { clearInterval(interval); return; }
+    if (window.saveAudit || attempts++ > 30) {
+      patchSaveAudit();
+      if (window.saveAudit) window.saveAudit._auditeePatched = true;
+      clearInterval(interval);
+    }
+  }, 300);
+})();
 </script>
 
 </body>
