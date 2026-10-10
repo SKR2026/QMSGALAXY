@@ -4437,39 +4437,26 @@ window._lpaLoginTab = function(tab) {
 };
 
 // ── Management / Top Management guest viewer ────────────────
-window._lpaMgmtLogin = async function() {
-  const btn = document.querySelector('#loginPanelGuest button');
-  if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
-
-  try {
-    // Must have a real Firebase session so Firestore security rules allow reads.
-    // Anonymous auth gives a uid without exposing any credentials.
-    if (typeof firebase !== 'undefined' && firebase.auth) {
-      const alreadyIn = firebase.auth().currentUser;
-      if (!alreadyIn) {
-        await firebase.auth().signInAnonymously();
-      }
-    }
-  } catch (e) {
-    console.warn('[LPA] Anonymous sign-in failed:', e.message);
-    // Continue anyway — app may have open read rules or offline mode
-  }
-
-  // Create a synthetic user object that flags view-only management role
-  const fbUser = (typeof firebase !== 'undefined' && firebase.auth)
-    ? firebase.auth().currentUser : null;
-
+window._lpaMgmtLogin = function() {
+  // Set a synthetic user object for the view-only management role.
+  // No Firebase Auth sign-in — anonymous auth is disabled in this project.
+  // Instead, we patch Firestore to silently swallow permission-denied errors.
   window.currentUser = {
-    uid:         fbUser ? fbUser.uid : 'guest-management',
-    email:       fbUser ? fbUser.email || 'guest@management' : 'guest@management',
+    uid:         'guest-management',
+    email:       'guest@management',
     role:        'management',
     isGuest:     true,
-    isAnonymous: true,
     plantId:     null,
     name:        'Management Viewer',
     displayName: 'Management Viewer',
     initials:    'MV'
   };
+
+  // ── Firestore permission-denied interceptor ──────────────────
+  // Wraps every Firestore Query/DocumentReference .get() so that
+  // "permission-denied" errors return an empty snapshot instead of
+  // throwing, keeping the dashboard/audits/findings views alive.
+  _lpaInstallFirestoreGuard();
 
   document.body.classList.add('lpa-view-only');
 
@@ -4487,11 +4474,104 @@ window._lpaMgmtLogin = async function() {
   const shell = document.getElementById('appShell');
   if (shell) shell.classList.remove('hidden');
 
-  if (btn) { btn.disabled = false; btn.textContent = 'Enter as Viewer'; }
-
   // Navigate to dashboard
   if (typeof navigate === 'function') navigate('dashboard');
 };
+
+// ── Firestore guard: silently handle permission-denied for guest viewers ──
+// Called once when management viewer logs in. Patches the Firestore
+// prototype so every .get() / .onSnapshot() that hits a permission error
+// returns an empty result instead of propagating the error to the UI.
+function _lpaInstallFirestoreGuard() {
+  // Run after Firebase is initialised
+  function _install() {
+    if (typeof firebase === 'undefined' || !firebase.apps || !firebase.apps.length) {
+      setTimeout(_install, 200); return;
+    }
+    try {
+      const db = firebase.firestore();
+
+      // ── Empty snapshot factory ────────────────────────────────
+      function _emptyQuerySnap() {
+        return { docs: [], empty: true, size: 0,
+          forEach: function() {},
+          data:    function() { return {}; } };
+      }
+      function _emptyDocSnap(ref) {
+        return { exists: false, id: (ref && ref.id) || '', data: function() { return null; },
+          get: function() { return undefined; } };
+      }
+
+      // ── Patch Query.prototype.get ─────────────────────────────
+      const QueryProto = Object.getPrototypeOf(db.collection('__guard_test__'));
+      if (QueryProto && QueryProto.get && !QueryProto.__lpaGuarded) {
+        const _origQGet = QueryProto.get.bind ? null : QueryProto.get;
+        const _origGet  = QueryProto.get;
+        QueryProto.get = function() {
+          return _origGet.apply(this, arguments).catch(function(e) {
+            if (e && (e.code === 'permission-denied' || /permission/i.test(e.message))) {
+              return _emptyQuerySnap();
+            }
+            throw e;
+          });
+        };
+        QueryProto.__lpaGuarded = true;
+      }
+
+      // ── Patch DocumentReference.prototype.get ────────────────
+      const testDocRef = db.collection('__guard_test__').doc('__guard_test__');
+      const DocProto   = Object.getPrototypeOf(testDocRef);
+      if (DocProto && DocProto.get && !DocProto.__lpaGuarded) {
+        const _origDGet = DocProto.get;
+        DocProto.get = function() {
+          const self = this;
+          return _origDGet.apply(self, arguments).catch(function(e) {
+            if (e && (e.code === 'permission-denied' || /permission/i.test(e.message))) {
+              return _emptyDocSnap(self);
+            }
+            throw e;
+          });
+        };
+        DocProto.__lpaGuarded = true;
+      }
+
+      // ── Patch onSnapshot to no-op on permission errors ────────
+      if (DocProto && DocProto.onSnapshot && !DocProto.__lpaSnapGuarded) {
+        const _origDocSnap = DocProto.onSnapshot;
+        DocProto.onSnapshot = function(onNext, onError, onCompletion) {
+          const _safeError = function(e) {
+            if (e && (e.code === 'permission-denied' || /permission/i.test(e.message))) {
+              if (typeof onNext === 'function') onNext(_emptyDocSnap(this));
+              return;
+            }
+            if (typeof onError === 'function') onError(e);
+          }.bind(this);
+          return _origDocSnap.call(this, onNext, _safeError, onCompletion);
+        };
+        DocProto.__lpaSnapGuarded = true;
+      }
+      if (QueryProto && QueryProto.onSnapshot && !QueryProto.__lpaSnapGuarded) {
+        const _origQSnap = QueryProto.onSnapshot;
+        QueryProto.onSnapshot = function(onNext, onError, onCompletion) {
+          const _safeError = function(e) {
+            if (e && (e.code === 'permission-denied' || /permission/i.test(e.message))) {
+              if (typeof onNext === 'function') onNext(_emptyQuerySnap());
+              return;
+            }
+            if (typeof onError === 'function') onError(e);
+          };
+          return _origQSnap.call(this, onNext, _safeError, onCompletion);
+        };
+        QueryProto.__lpaSnapGuarded = true;
+      }
+
+      console.info('[LPA] Firestore permission guard installed for management viewer.');
+    } catch(e) {
+      console.warn('[LPA] Could not install Firestore guard:', e.message);
+    }
+  }
+  _install();
+}
 
 // ── Enter key in login form ─────────────────────────────────
 document.addEventListener('DOMContentLoaded', function() {
@@ -4589,9 +4669,19 @@ async function _lpaApplyLoginBranding() {
 }
 
 // ── Patch showLoginScreen AFTER auth.js to re-apply our version ──
-// auth.js may overwrite showLoginScreen; we restore it here
+// auth.js may overwrite showLoginScreen; we restore it here.
+// IMPORTANT: when a management guest is active, showLoginScreen must
+// be a no-op — auth.js's setup-rules check fires "permission-denied"
+// and calls showLoginScreen, which would kick the viewer back to login.
 (function() {
   window.showLoginScreen = function() {
+    // If a management guest is already in the app, ignore any attempt
+    // by auth.js / app.js to redirect back to login due to Firestore errors.
+    var u = window.currentUser;
+    if (u && u.isGuest) {
+      console.info('[LPA] showLoginScreen suppressed — management viewer active.');
+      return;
+    }
     var overlay = document.getElementById('loginOverlay');
     if (overlay) overlay.style.display = 'flex';
     var shell = document.getElementById('appShell');
