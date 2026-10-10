@@ -4494,7 +4494,129 @@ function _lpaEnterManagementView() {
   if (overlay) overlay.style.display = 'none';
   const shell = document.getElementById('appShell');
   if (shell) shell.classList.remove('hidden');
+
+  // Show plant pills and populate from Firestore (public read)
+  _lpaInitGuestPlantPills();
+
   if (typeof navigate === 'function') navigate('dashboard');
+}
+
+/** Populate the plant selector pills for the management viewer */
+async function _lpaInitGuestPlantPills() {
+  try {
+    const db = firebase.firestore();
+    const snap = await db.collection('apps/lpa/plants').orderBy('name').get();
+    const plants = snap.docs.map(d => ({ id: d.id, name: d.data().name || d.id }));
+
+    const wrapper = document.getElementById('plantSelectorWrapper');
+    const pills   = document.getElementById('plantPills');
+    if (!wrapper || !pills) return;
+
+    // Build pill buttons
+    let html = `<button class="plant-pill active" data-plant="all"
+                  onclick="_lpaGuestSelectPlant(this,'all')">All</button>`;
+    plants.forEach(function(p) {
+      html += `<button class="plant-pill" data-plant="${p.id}"
+                 onclick="_lpaGuestSelectPlant(this,'${p.id}')">${p.name}</button>`;
+    });
+    pills.innerHTML = html;
+    wrapper.classList.remove('hidden');
+
+    // Store plants list for dashboard filter
+    window._lpaGuestPlants = plants;
+  } catch(e) {
+    console.warn('[LPA] plant pills load error:', e.message);
+  }
+}
+
+/** Plant pill click handler for guest viewer */
+window._lpaGuestSelectPlant = function(el, plantId) {
+  document.querySelectorAll('#plantPills .plant-pill').forEach(function(b) {
+    b.classList.remove('active');
+  });
+  el.classList.add('active');
+  window._lpaGuestSelectedPlant = plantId === 'all' ? null : plantId;
+
+  // Reload dashboard data for this plant
+  _lpaLoadGuestDashboard(window._lpaGuestSelectedPlant);
+};
+
+/** Load dashboard KPIs for management viewer (all plants or filtered) */
+async function _lpaLoadGuestDashboard(plantId) {
+  // Find the KPI cards and update them
+  try {
+    const db  = firebase.firestore();
+    const now = new Date();
+    const filterDate = new Date(now.getFullYear(), now.getMonth() - 1, now.getDate());
+    const startTs = firebase.firestore.Timestamp.fromDate(filterDate);
+
+    let auditQ  = db.collection('apps/lpa/audits');
+    let findQ   = db.collection('apps/lpa/findings');
+    let actionQ = db.collection('apps/lpa/correctiveActions');
+
+    if (plantId) {
+      auditQ  = auditQ.where('plantId',  '==', plantId);
+      findQ   = findQ.where('plantId',   '==', plantId);
+      actionQ = actionQ.where('plantId', '==', plantId);
+    }
+
+    const [auditSnap, findSnap, actionSnap] = await Promise.all([
+      auditQ.get(), findQ.get(), actionQ.get()
+    ]);
+
+    const audits  = auditSnap.docs.map(d => d.data());
+    const findings= findSnap.docs.map(d => d.data());
+    const actions = actionSnap.docs.map(d => d.data());
+
+    const total     = audits.length;
+    const completed = audits.filter(a => ['Submitted','Verified','Closed'].includes(a.status)).length;
+    const pending   = audits.filter(a => a.status === 'Pending' || a.status === 'Scheduled').length;
+    const overdue   = audits.filter(a => {
+      const due = a.scheduledDate?.toDate?.() || (a.scheduledDate ? new Date(a.scheduledDate) : null);
+      return due && due < now && !['Submitted','Verified','Closed'].includes(a.status);
+    }).length;
+
+    const scores = audits.filter(a => typeof a.score === 'number').map(a => a.score);
+    const avgScore = scores.length ? (scores.reduce((s,v)=>s+v,0)/scores.length).toFixed(1)+'%' : '—';
+
+    const openFindings   = findings.filter(f => f.status !== 'Closed').length;
+    const overdueActions = actions.filter(a => {
+      if (['Closed','Verified'].includes(a.status)) return false;
+      const due = a.dueDate?.toDate?.() || (a.dueDate ? new Date(a.dueDate) : null);
+      return due && due < now;
+    }).length;
+    const closedActions = actions.filter(a => ['Closed','Verified'].includes(a.status)).length;
+    const closureRate   = actions.length ? Math.round((closedActions/actions.length)*100)+'%' : '—';
+
+    // Patch KPI card values using their label text to find them
+    function setKpi(label, value) {
+      document.querySelectorAll('.kpi-card, .stat-card, [class*="kpi"]').forEach(function(card) {
+        if (card.textContent.includes(label)) {
+          const valEl = card.querySelector('[class*="value"],[class*="number"],[class*="stat-value"]')
+                     || card.querySelector('h2,h3,.kpi-value,.stat-number');
+          if (valEl) valEl.textContent = value;
+        }
+      });
+    }
+    // Also try direct element IDs the original dashboard uses
+    const map = {
+      'totalAudits': total, 'statTotal': total,
+      'completedAudits': completed, 'statCompleted': completed,
+      'pendingAudits': pending, 'statPending': pending,
+      'overdueAudits': overdue, 'statOverdue': overdue,
+      'avgScore': avgScore, 'statAvgScore': avgScore,
+      'openFindings': openFindings, 'statOpenFindings': openFindings,
+      'overdueActions': overdueActions, 'statOverdueActions': overdueActions,
+      'closureRate': closureRate, 'statClosureRate': closureRate
+    };
+    Object.entries(map).forEach(function([id, val]) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = val;
+    });
+
+  } catch(e) {
+    console.warn('[LPA] guest dashboard load error:', e.message);
+  }
 }
 
 /** Show a one-time setup dialog when no viewer account is configured */
@@ -5883,6 +6005,15 @@ function _lpaGmailStatus(msg, color) {
 (function() {
   const _origNav = window.navigate;
   window.navigate = function(view, el) {
+    // For guest management viewers, reload dashboard data after original nav
+    if (view === 'dashboard' && window.currentUser && window.currentUser.isGuest) {
+      if (typeof _origNav === 'function') _origNav(view, el);
+      setTimeout(function() {
+        _lpaLoadGuestDashboard(window._lpaGuestSelectedPlant || null);
+      }, 300);
+      return;
+    }
+
     // For guest management viewers, intercept mgmtreview and load data ourselves
     if (view === 'mgmtreview' && window.currentUser && window.currentUser.isGuest) {
       // Show the view (replicate what _origNav would do for showing the section)
