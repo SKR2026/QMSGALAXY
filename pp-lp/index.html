@@ -4444,9 +4444,7 @@ window._lpaLoginTab = function(tab) {
 
 // ── Management / Top Management guest viewer ────────────────
 window._lpaMgmtLogin = function() {
-  // Set a synthetic user object for the view-only management role.
-  // No Firebase Auth sign-in — anonymous auth is disabled in this project.
-  // Instead, we patch Firestore to silently swallow permission-denied errors.
+  // Set synthetic user FIRST so guard checks work immediately
   window.currentUser = {
     uid:         'guest-management',
     email:       'guest@management',
@@ -4458,11 +4456,16 @@ window._lpaMgmtLogin = function() {
     initials:    'MV'
   };
 
-  // ── Firestore permission-denied interceptor ──────────────────
-  // Wraps every Firestore Query/DocumentReference .get() so that
-  // "permission-denied" errors return an empty snapshot instead of
-  // throwing, keeping the dashboard/audits/findings views alive.
-  _lpaInstallFirestoreGuard();
+  // Install guard SYNCHRONOUSLY right now (Firebase is already loaded
+  // at this point because the login screen is already showing).
+  // navigate('dashboard') is called only AFTER the guard is confirmed active.
+  _lpaInstallFirestoreGuard(function onGuardReady() {
+    const overlay = document.getElementById('loginOverlay');
+    if (overlay) overlay.style.display = 'none';
+    const shell = document.getElementById('appShell');
+    if (shell) shell.classList.remove('hidden');
+    if (typeof navigate === 'function') navigate('dashboard');
+  });
 
   document.body.classList.add('lpa-view-only');
 
@@ -4474,23 +4477,18 @@ window._lpaMgmtLogin = function() {
   if (sidebarRole) sidebarRole.textContent = 'Management / Viewer';
   if (sidebarAva)  sidebarAva.textContent  = 'MV';
   if (typeof updatePowerMenuUser === 'function') updatePowerMenuUser(window.currentUser);
-
-  const overlay = document.getElementById('loginOverlay');
-  if (overlay) overlay.style.display = 'none';
-  const shell = document.getElementById('appShell');
-  if (shell) shell.classList.remove('hidden');
-
-  // Navigate to dashboard
-  if (typeof navigate === 'function') navigate('dashboard');
 };
 
 // ── Firestore guard: silently handle permission-denied for guest viewers ──
-function _lpaInstallFirestoreGuard() {
+// onReady callback fires once the guard is patched and it's safe to navigate.
+function _lpaInstallFirestoreGuard(onReady) {
 
   /* ── helpers ── */
   function _isPermDenied(e) {
-    return e && (e.code === 'permission-denied' || e.code === 'PERMISSION_DENIED' ||
-                 /permission.denied|Missing or insufficient/i.test(e.message));
+    return e && (
+      e.code === 'permission-denied' || e.code === 'PERMISSION_DENIED' ||
+      /permission.denied|Missing or insufficient|do not have permission|not have permission/i.test(e.message || '')
+    );
   }
   function _emptyQuerySnap() {
     return {
@@ -4509,29 +4507,42 @@ function _lpaInstallFirestoreGuard() {
   }
 
   /* ── suppress permission-denied toasts / error messages ── */
-  const _origShowToast = window.showToast;
-  window.showToast = function(msg, type) {
-    if (window.currentUser && window.currentUser.isGuest &&
-        msg && /permission.denied|Missing or insufficient/i.test(msg)) return;
-    if (typeof _origShowToast === 'function') _origShowToast.apply(this, arguments);
-  };
+  function _isPermMsg(msg) {
+    return msg && /permission.denied|Missing or insufficient|do not have permission|not have permission|Dashboard error|Firestore.*error/i.test(String(msg));
+  }
+  if (!window.showToast.__lpaPatched) {
+    const _origShowToast = window.showToast;
+    window.showToast = function(msg, type) {
+      if (window.currentUser && window.currentUser.isGuest && _isPermMsg(msg)) return;
+      if (typeof _origShowToast === 'function') _origShowToast.apply(this, arguments);
+    };
+    window.showToast.__lpaPatched = true;
+  }
 
-  /* ── suppress console.error for permission errors ── */
-  const _origConsoleError = console.error;
-  console.error = function() {
-    if (window.currentUser && window.currentUser.isGuest) {
-      const msg = Array.prototype.join.call(arguments, ' ');
-      if (/permission.denied|Missing or insufficient/i.test(msg)) return;
-    }
-    _origConsoleError.apply(console, arguments);
-  };
+  /* ── suppress console.error for permission errors in guest mode ── */
+  if (!console.error.__lpaPatched) {
+    const _origConsoleError = console.error;
+    console.error = function() {
+      if (window.currentUser && window.currentUser.isGuest) {
+        const msg = Array.prototype.join.call(arguments, ' ');
+        if (_isPermMsg(msg)) return;
+      }
+      _origConsoleError.apply(console, arguments);
+    };
+    console.error.__lpaPatched = true;
+  }
 
   function _install() {
     if (typeof firebase === 'undefined' || !firebase.apps || !firebase.apps.length) {
-      setTimeout(_install, 150); return;
+      setTimeout(_install, 80); return;
     }
     try {
       const db = firebase.firestore();
+      // Disable Firestore network for unauthenticated guest so no real
+      // round-trips are made (all .get() will resolve via guard with empty snaps).
+      if (window.currentUser && window.currentUser.isGuest) {
+        try { db.disableNetwork(); } catch(_) {}
+      }
 
       /* patch Query prototype (.where().get(), .collection().get(), collectionGroup) */
       const QueryProto = Object.getPrototypeOf(db.collection('__g__'));
@@ -4626,6 +4637,8 @@ function _lpaInstallFirestoreGuard() {
     } catch(e) {
       console.warn('[LPA] Firestore guard install error:', e.message);
     }
+    // Guard is now active — safe to navigate
+    if (typeof onReady === 'function') onReady();
   }
   _install();
 }
