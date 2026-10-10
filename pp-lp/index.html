@@ -4443,72 +4443,43 @@ window._lpaLoginTab = function(tab) {
 };
 
 // ── Management / Top Management guest viewer ────────────────
-window._lpaMgmtLogin = async function() {
+window._lpaMgmtLogin = function() {
+  // No credentials required — Firestore public-read rules allow the
+  // management viewer to read all LPA data without Firebase Auth.
+  // Just sign out any existing session and enter the view-only dashboard.
   const btn = document.getElementById('mgmtLoginBtn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
 
-  // ── Try to sign in with the stored viewer account ─────────
-  // Super admin saves viewer credentials via Settings → Viewer Account.
-  // Stored in localStorage (set by super admin on this domain) as fallback,
-  // or in Firestore at apps/lpa/settings/viewerAccount (readable without auth
-  // when Firestore rules include: allow read: if true for that path).
-  let viewerEmail = null, viewerPassword = null;
-
-  // 1. Check localStorage first (fastest, set by super admin on same browser)
-  try {
-    const stored = JSON.parse(localStorage.getItem('lpa_viewer_account') || '{}');
-    viewerEmail    = stored.email    || null;
-    viewerPassword = stored.password || null;
-  } catch(_) {}
-
-  // 2. Try Firestore public path (works cross-device once rule is set)
-  if (!viewerEmail && typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length) {
-    try {
-      const snap = await firebase.firestore()
-        .collection('apps').doc('lpa')
-        .collection('settings').doc('viewerAccount').get();
-      if (snap.exists) {
-        viewerEmail    = snap.data().email    || null;
-        viewerPassword = snap.data().password || null;
-      }
-    } catch(_) {}
-  }
-
-  // ── If viewer account is configured, sign in with it ──────
-  if (viewerEmail && viewerPassword) {
-    try {
-      const cred = await firebase.auth()
-        .signInWithEmailAndPassword(viewerEmail, viewerPassword);
-
-      const fbUser = cred.user;
-      window.currentUser = {
-        uid:         fbUser.uid,
-        email:       fbUser.email,
-        role:        'management',
-        isGuest:     true,
-        plantId:     null,
-        name:        'Management Viewer',
-        displayName: 'Management Viewer',
-        initials:    'MV'
-      };
+  // Sign out any existing authenticated user so we operate unauthenticated
+  const signOutAndEnter = function() {
+    window.currentUser = {
+      uid:         'guest',
+      email:       '',
+      role:        'management',
+      isGuest:     true,
+      plantId:     null,
+      name:        'Management Viewer',
+      displayName: 'Management Viewer',
+      initials:    'MV'
+    };
+    _lpaInstallFirestoreGuard(function() {
       _lpaEnterManagementView();
-      return;
-    } catch(signInErr) {
-      console.warn('[LPA] Viewer account sign-in failed:', signInErr.message);
-      // Fall through to unconfigured state
-    }
-  }
+    });
+  };
 
-  // ── Viewer account not configured — show setup prompt ─────
-  if (btn) { btn.disabled = false; btn.textContent = 'Enter as Viewer'; }
-  _lpaShowViewerSetupPrompt();
+  try {
+    if (typeof firebase !== 'undefined' && firebase.auth && firebase.auth().currentUser) {
+      firebase.auth().signOut().then(signOutAndEnter).catch(signOutAndEnter);
+    } else {
+      signOutAndEnter();
+    }
+  } catch(e) {
+    signOutAndEnter();
+  }
 };
 
-/** After successful auth, switch to management view */
+/** Enter management view — call only after guard is installed */
 function _lpaEnterManagementView() {
-  // Install error guard (now just a safety net — real auth handles reads)
-  _lpaInstallFirestoreGuard();
-
   document.body.classList.add('lpa-view-only');
 
   const sidebarName = document.getElementById('sidebarUserName');
@@ -5403,6 +5374,198 @@ window._lpaLoginBrandingClear = async function() {
 };
 
 // ─────────────────────────────────────────────────────────────────
+// VIEWER ACCOUNT CONFIG — Super Admin Settings
+// ─────────────────────────────────────────────────────────────────
+const VIEWER_ACCOUNT_BLOCK_ID = 'lpaViewerAccountSection';
+
+window.injectViewerAccountSection = async function(containerSelector) {
+  const container = document.querySelector(containerSelector || '#settingsTabContent');
+  if (!container || document.getElementById(VIEWER_ACCOUNT_BLOCK_ID)) return;
+
+  const sec = document.createElement('div');
+  sec.id = VIEWER_ACCOUNT_BLOCK_ID;
+  sec.innerHTML = `
+    <div class="settings-section" style="margin-top:28px;">
+      <h3 class="settings-section-title"
+          style="font-size:14px;font-weight:600;color:#123a63;margin-bottom:4px;
+                 padding-bottom:8px;border-bottom:1px solid #e0e7ef;
+                 display:flex;align-items:center;gap:8px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1a56db"
+             stroke-width="2" style="flex-shrink:0">
+          <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+          <circle cx="9" cy="7" r="4"/>
+          <path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/>
+        </svg>
+        Management Viewer Account
+      </h3>
+      <p style="font-size:12px;color:#6b7280;margin:0 0 16px;line-height:1.6;">
+        Create a dedicated read-only user in
+        <a href="https://console.firebase.google.com" target="_blank" style="color:#1a56db;">
+          Firebase Console → Authentication</a>
+        (e.g. <code>viewer@yourcompany.com</code>), then save its credentials here.
+        Management viewers auto sign-in with this account — they see all data but cannot change anything.
+      </p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+        <div class="form-group">
+          <label class="form-label" style="font-size:12px;font-weight:600;color:#4f6680;">
+            Viewer Email <span style="color:#ef4444">*</span>
+          </label>
+          <input id="viewerAccountEmail" type="email" class="form-input"
+            placeholder="viewer@yourcompany.com" style="margin-top:6px;">
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="font-size:12px;font-weight:600;color:#4f6680;">
+            Password <span style="color:#ef4444">*</span>
+          </label>
+          <div style="display:flex;gap:8px;margin-top:6px;">
+            <input id="viewerAccountPwd" type="password" class="form-input"
+              placeholder="••••••••" style="flex:1;">
+            <button onclick="(function(){var i=document.getElementById('viewerAccountPwd');if(i)i.type=i.type==='password'?'text':'password';})()"
+              class="btn btn-secondary btn-sm" style="font-size:12px;padding:6px 10px;" title="Show/hide">👁</button>
+          </div>
+        </div>
+      </div>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;
+                  padding:12px 16px;margin-bottom:16px;font-size:12px;color:#166534;">
+        <strong>Required Firestore rule</strong> — add this so viewer credentials
+        can be fetched before sign-in:
+        <pre style="margin:6px 0 0;background:#dcfce7;padding:8px 10px;border-radius:6px;
+                    font-size:11px;overflow-x:auto;">match /apps/lpa/settings/viewerAccount {
+  allow read: if true;   // public — safe (read-only account credentials)
+  allow write: if request.auth.token.role == "super_admin";
+}</pre>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <button onclick="window._lpaViewerAccountSave()" class="btn btn-primary"
+          id="viewerAccountSaveBtn" style="font-size:13px;">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px">
+            <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
+            <polyline points="17 21 17 13 7 13 7 21"/>
+            <polyline points="7 3 7 8 15 8"/>
+          </svg>
+          Save Viewer Account
+        </button>
+        <button onclick="window._lpaViewerAccountTest()" class="btn btn-secondary"
+          id="viewerAccountTestBtn" style="font-size:13px;">
+          ▶ Test Sign-In
+        </button>
+        <span id="viewerAccountStatus" style="font-size:12px;display:none;"></span>
+      </div>
+      <div id="viewerAccountBadge" style="display:none;margin-top:12px;padding:10px 14px;
+           background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;
+           font-size:12px;color:#166534;">
+        ✅ Viewer account configured — <span id="viewerAccountCfgEmail"></span>
+      </div>
+    </div>`;
+
+  container.appendChild(sec);
+  _lpaLoadViewerAccountToForm();
+};
+
+async function _lpaLoadViewerAccountToForm() {
+  // Pre-fill from localStorage
+  try {
+    const stored = JSON.parse(localStorage.getItem('lpa_viewer_account') || '{}');
+    if (stored.email) {
+      const el = document.getElementById('viewerAccountEmail');
+      if (el) el.value = stored.email;
+      const el2 = document.getElementById('viewerAccountPwd');
+      if (el2) el2.value = stored.password || '';
+      const badge = document.getElementById('viewerAccountBadge');
+      const emailSpan = document.getElementById('viewerAccountCfgEmail');
+      if (badge) badge.style.display = 'block';
+      if (emailSpan) emailSpan.textContent = stored.email;
+    }
+  } catch(_) {}
+  // Also try Firestore
+  try {
+    const db = (typeof firebase !== 'undefined') ? firebase.firestore() : null;
+    if (!db) return;
+    const snap = await db.collection('apps').doc('lpa')
+                         .collection('settings').doc('viewerAccount').get();
+    if (snap.exists && snap.data().email) {
+      const d = snap.data();
+      const el = document.getElementById('viewerAccountEmail');
+      if (el && !el.value) el.value = d.email || '';
+      const badge = document.getElementById('viewerAccountBadge');
+      const emailSpan = document.getElementById('viewerAccountCfgEmail');
+      if (badge) badge.style.display = 'block';
+      if (emailSpan) emailSpan.textContent = d.email;
+    }
+  } catch(_) {}
+}
+
+window._lpaViewerAccountSave = async function() {
+  const email = (document.getElementById('viewerAccountEmail')?.value || '').trim();
+  const pwd   = (document.getElementById('viewerAccountPwd')?.value  || '').trim();
+  const btn   = document.getElementById('viewerAccountSaveBtn');
+
+  if (!email || !pwd) {
+    _lpaViewerAccountStatus('⚠️ Email and password are required.', '#ef4444'); return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+
+  try {
+    // Save to localStorage for this device
+    localStorage.setItem('lpa_viewer_account', JSON.stringify({ email, password: pwd }));
+
+    // Save to Firestore for cross-device access
+    const db = (typeof firebase !== 'undefined') ? firebase.firestore() : null;
+    if (db) {
+      await db.collection('apps').doc('lpa').collection('settings').doc('viewerAccount')
+        .set({ email, password: pwd,
+               updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+               updatedBy: window.currentUser?.uid || '' }, { merge: true });
+    }
+    _lpaViewerAccountStatus('✅ Viewer account saved.', '#059669');
+    const badge = document.getElementById('viewerAccountBadge');
+    const emailSpan = document.getElementById('viewerAccountCfgEmail');
+    if (badge) badge.style.display = 'block';
+    if (emailSpan) emailSpan.textContent = email;
+    if (typeof showToast === 'function') showToast('Viewer account configured', 'success');
+  } catch(e) {
+    _lpaViewerAccountStatus('❌ ' + e.message, '#ef4444');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save Viewer Account'; }
+  }
+};
+
+window._lpaViewerAccountTest = async function() {
+  const email = (document.getElementById('viewerAccountEmail')?.value || '').trim();
+  const pwd   = (document.getElementById('viewerAccountPwd')?.value  || '').trim();
+  const btn   = document.getElementById('viewerAccountTestBtn');
+  if (!email || !pwd) {
+    _lpaViewerAccountStatus('⚠️ Fill in email and password first.', '#ef4444'); return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Testing…'; }
+  try {
+    // Sign in, then immediately sign back in as super admin
+    const adminUser = firebase.auth().currentUser;
+    await firebase.auth().signInWithEmailAndPassword(email, pwd);
+    _lpaViewerAccountStatus('✅ Sign-in successful! Viewer account works.', '#059669');
+    // Restore super admin session
+    if (adminUser && adminUser.email && window._lpaLastSuperAdminPwd) {
+      await firebase.auth().signInWithEmailAndPassword(adminUser.email, window._lpaLastSuperAdminPwd);
+    } else {
+      // Can't restore — show warning
+      _lpaViewerAccountStatus('✅ Works! ⚠️ Please log in again as Super Admin.', '#f59e0b');
+    }
+  } catch(e) {
+    _lpaViewerAccountStatus('❌ ' + (e.message || 'Sign-in failed.'), '#ef4444');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Test Sign-In'; }
+  }
+};
+
+function _lpaViewerAccountStatus(msg, color) {
+  const el = document.getElementById('viewerAccountStatus');
+  if (!el) return;
+  el.textContent = msg; el.style.color = color || '#374151'; el.style.display = 'inline';
+  setTimeout(function() { if (el) el.style.display = 'none'; }, 5000);
+}
+
+// ─────────────────────────────────────────────────────────────────
 // GMAIL CONFIG SECTION — Super Admin Settings
 // ─────────────────────────────────────────────────────────────────
 
@@ -5726,6 +5889,7 @@ function _lpaGmailStatus(msg, color) {
         const u = window.currentUser;
         if (u && u.role === 'super_admin') {
           window.injectLoginBrandingSection('#settingsTabContent');
+          window.injectViewerAccountSection('#settingsTabContent');
           window.injectGmailConfigSection('#settingsTabContent');
         }
       }, 400);
