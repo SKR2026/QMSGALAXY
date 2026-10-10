@@ -4443,33 +4443,74 @@ window._lpaLoginTab = function(tab) {
 };
 
 // ── Management / Top Management guest viewer ────────────────
-window._lpaMgmtLogin = function() {
-  // Set synthetic user FIRST so guard checks work immediately
-  window.currentUser = {
-    uid:         'guest-management',
-    email:       'guest@management',
-    role:        'management',
-    isGuest:     true,
-    plantId:     null,
-    name:        'Management Viewer',
-    displayName: 'Management Viewer',
-    initials:    'MV'
-  };
+window._lpaMgmtLogin = async function() {
+  const btn = document.getElementById('mgmtLoginBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
 
-  // Install guard SYNCHRONOUSLY right now (Firebase is already loaded
-  // at this point because the login screen is already showing).
-  // navigate('dashboard') is called only AFTER the guard is confirmed active.
-  _lpaInstallFirestoreGuard(function onGuardReady() {
-    const overlay = document.getElementById('loginOverlay');
-    if (overlay) overlay.style.display = 'none';
-    const shell = document.getElementById('appShell');
-    if (shell) shell.classList.remove('hidden');
-    if (typeof navigate === 'function') navigate('dashboard');
-  });
+  // ── Try to sign in with the stored viewer account ─────────
+  // Super admin saves viewer credentials via Settings → Viewer Account.
+  // Stored in localStorage (set by super admin on this domain) as fallback,
+  // or in Firestore at apps/lpa/settings/viewerAccount (readable without auth
+  // when Firestore rules include: allow read: if true for that path).
+  let viewerEmail = null, viewerPassword = null;
+
+  // 1. Check localStorage first (fastest, set by super admin on same browser)
+  try {
+    const stored = JSON.parse(localStorage.getItem('lpa_viewer_account') || '{}');
+    viewerEmail    = stored.email    || null;
+    viewerPassword = stored.password || null;
+  } catch(_) {}
+
+  // 2. Try Firestore public path (works cross-device once rule is set)
+  if (!viewerEmail && typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length) {
+    try {
+      const snap = await firebase.firestore()
+        .collection('apps').doc('lpa')
+        .collection('settings').doc('viewerAccount').get();
+      if (snap.exists) {
+        viewerEmail    = snap.data().email    || null;
+        viewerPassword = snap.data().password || null;
+      }
+    } catch(_) {}
+  }
+
+  // ── If viewer account is configured, sign in with it ──────
+  if (viewerEmail && viewerPassword) {
+    try {
+      const cred = await firebase.auth()
+        .signInWithEmailAndPassword(viewerEmail, viewerPassword);
+
+      const fbUser = cred.user;
+      window.currentUser = {
+        uid:         fbUser.uid,
+        email:       fbUser.email,
+        role:        'management',
+        isGuest:     true,
+        plantId:     null,
+        name:        'Management Viewer',
+        displayName: 'Management Viewer',
+        initials:    'MV'
+      };
+      _lpaEnterManagementView();
+      return;
+    } catch(signInErr) {
+      console.warn('[LPA] Viewer account sign-in failed:', signInErr.message);
+      // Fall through to unconfigured state
+    }
+  }
+
+  // ── Viewer account not configured — show setup prompt ─────
+  if (btn) { btn.disabled = false; btn.textContent = 'Enter as Viewer'; }
+  _lpaShowViewerSetupPrompt();
+};
+
+/** After successful auth, switch to management view */
+function _lpaEnterManagementView() {
+  // Install error guard (now just a safety net — real auth handles reads)
+  _lpaInstallFirestoreGuard();
 
   document.body.classList.add('lpa-view-only');
 
-  // Update sidebar & power-menu user info
   const sidebarName = document.getElementById('sidebarUserName');
   const sidebarRole = document.getElementById('sidebarUserRole');
   const sidebarAva  = document.getElementById('sidebarAvatar');
@@ -4477,6 +4518,161 @@ window._lpaMgmtLogin = function() {
   if (sidebarRole) sidebarRole.textContent = 'Management / Viewer';
   if (sidebarAva)  sidebarAva.textContent  = 'MV';
   if (typeof updatePowerMenuUser === 'function') updatePowerMenuUser(window.currentUser);
+
+  const overlay = document.getElementById('loginOverlay');
+  if (overlay) overlay.style.display = 'none';
+  const shell = document.getElementById('appShell');
+  if (shell) shell.classList.remove('hidden');
+  if (typeof navigate === 'function') navigate('dashboard');
+}
+
+/** Show a one-time setup dialog when no viewer account is configured */
+function _lpaShowViewerSetupPrompt() {
+  // Remove existing prompt if any
+  const existing = document.getElementById('viewerSetupPrompt');
+  if (existing) existing.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'viewerSetupPrompt';
+  modal.style.cssText = `
+    position:fixed;inset:0;z-index:10001;display:flex;align-items:center;
+    justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(3px);`;
+  modal.innerHTML = `
+    <div style="background:#fff;border-radius:16px;padding:32px;max-width:460px;width:90%;
+                box-shadow:0 20px 60px rgba(0,0,0,.25);">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+        <div style="width:40px;height:40px;background:#fef3c7;border-radius:10px;
+                    display:flex;align-items:center;justify-content:center;font-size:20px;">⚙️</div>
+        <h2 style="margin:0;font-size:18px;font-weight:700;color:#111827;">Viewer Account Not Set Up</h2>
+      </div>
+      <p style="color:#6b7280;font-size:13px;margin:0 0 20px;line-height:1.6;">
+        The Management Viewer requires a dedicated read-only Firebase account.<br>
+        A <strong>Super Admin</strong> must configure it once in
+        <strong>Settings → Viewer Account</strong>.
+      </p>
+      <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;
+                  padding:14px 16px;margin-bottom:20px;font-size:12px;color:#0c4a6e;">
+        <strong>Quick setup (3 steps):</strong>
+        <ol style="margin:8px 0 0;padding-left:18px;line-height:2;">
+          <li>Go to <strong>Firebase Console → Authentication → Add user</strong></li>
+          <li>Create <code>viewer@yourcompany.com</code> with any password</li>
+          <li>Log in as Super Admin → <strong>Settings → Viewer Account</strong> → save credentials</li>
+        </ol>
+      </div>
+      <div style="display:flex;gap:10px;">
+        <button onclick="document.getElementById('viewerSetupPrompt').remove()"
+          style="flex:1;padding:10px;border:1px solid #d1d5db;border-radius:8px;
+                 background:#fff;font-size:13px;cursor:pointer;color:#374151;">
+          Cancel
+        </button>
+        <button onclick="document.getElementById('viewerSetupPrompt').remove();window._lpaQuickViewerLogin()"
+          style="flex:1;padding:10px;border:none;border-radius:8px;
+                 background:#1a56db;color:#fff;font-size:13px;cursor:pointer;font-weight:600;">
+          Enter Credentials Now
+        </button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+/** Inline credential entry for first-time setup */
+window._lpaQuickViewerLogin = function() {
+  const existing = document.getElementById('viewerCredPrompt');
+  if (existing) existing.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'viewerCredPrompt';
+  modal.style.cssText = `
+    position:fixed;inset:0;z-index:10002;display:flex;align-items:center;
+    justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(3px);`;
+  modal.innerHTML = `
+    <div style="background:#fff;border-radius:16px;padding:32px;max-width:400px;width:90%;
+                box-shadow:0 20px 60px rgba(0,0,0,.25);">
+      <h2 style="margin:0 0 4px;font-size:18px;font-weight:700;color:#111827;">
+        Viewer Account Login
+      </h2>
+      <p style="color:#6b7280;font-size:13px;margin:0 0 20px;">
+        Enter the read-only viewer Firebase account credentials.
+      </p>
+      <div style="display:grid;gap:14px;margin-bottom:20px;">
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#4f6680;display:block;margin-bottom:5px;">
+            Viewer Email
+          </label>
+          <input id="quickViewerEmail" type="email" placeholder="viewer@yourcompany.com"
+            style="width:100%;padding:9px 12px;border:1px solid #d1d5db;border-radius:8px;
+                   font-size:13px;box-sizing:border-box;">
+        </div>
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#4f6680;display:block;margin-bottom:5px;">
+            Password
+          </label>
+          <input id="quickViewerPwd" type="password" placeholder="••••••••"
+            style="width:100%;padding:9px 12px;border:1px solid #d1d5db;border-radius:8px;
+                   font-size:13px;box-sizing:border-box;">
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:#374151;cursor:pointer;">
+          <input type="checkbox" id="quickViewerSave" checked style="accent-color:#1a56db;">
+          Remember on this device
+        </label>
+      </div>
+      <div id="quickViewerErr" style="display:none;color:#ef4444;font-size:12px;margin-bottom:12px;"></div>
+      <div style="display:flex;gap:10px;">
+        <button onclick="document.getElementById('viewerCredPrompt').remove()"
+          style="flex:1;padding:10px;border:1px solid #d1d5db;border-radius:8px;
+                 background:#fff;font-size:13px;cursor:pointer;color:#374151;">Cancel</button>
+        <button onclick="window._lpaQuickViewerSignIn()"
+          id="quickViewerSignInBtn"
+          style="flex:1;padding:10px;border:none;border-radius:8px;
+                 background:#1a56db;color:#fff;font-size:13px;cursor:pointer;font-weight:600;">
+          Sign In
+        </button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  setTimeout(function() { document.getElementById('quickViewerEmail')?.focus(); }, 100);
+};
+
+window._lpaQuickViewerSignIn = async function() {
+  const emailEl = document.getElementById('quickViewerEmail');
+  const pwdEl   = document.getElementById('quickViewerPwd');
+  const saveEl  = document.getElementById('quickViewerSave');
+  const errEl   = document.getElementById('quickViewerErr');
+  const btn     = document.getElementById('quickViewerSignInBtn');
+
+  const email = (emailEl?.value || '').trim();
+  const pwd   = (pwdEl?.value  || '').trim();
+  if (!email || !pwd) {
+    if (errEl) { errEl.textContent = 'Email and password are required.'; errEl.style.display = 'block'; }
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
+  if (errEl) errEl.style.display = 'none';
+
+  try {
+    const cred = await firebase.auth().signInWithEmailAndPassword(email, pwd);
+    const fbUser = cred.user;
+
+    // Save to localStorage if checked
+    if (saveEl && saveEl.checked) {
+      try { localStorage.setItem('lpa_viewer_account', JSON.stringify({ email, password: pwd })); } catch(_) {}
+    }
+
+    document.getElementById('viewerCredPrompt')?.remove();
+
+    window.currentUser = {
+      uid: fbUser.uid, email: fbUser.email,
+      role: 'management', isGuest: true, plantId: null,
+      name: 'Management Viewer', displayName: 'Management Viewer', initials: 'MV'
+    };
+    _lpaEnterManagementView();
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Sign In'; }
+    const msg = e.code === 'auth/wrong-password' || e.code === 'auth/user-not-found'
+      ? 'Invalid email or password.'
+      : (e.message || 'Sign-in failed.');
+    if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+  }
 };
 
 // ── Firestore guard: silently handle permission-denied for guest viewers ──
@@ -4538,12 +4734,6 @@ function _lpaInstallFirestoreGuard(onReady) {
     }
     try {
       const db = firebase.firestore();
-      // Disable Firestore network for unauthenticated guest so no real
-      // round-trips are made (all .get() will resolve via guard with empty snaps).
-      if (window.currentUser && window.currentUser.isGuest) {
-        try { db.disableNetwork(); } catch(_) {}
-      }
-
       /* patch Query prototype (.where().get(), .collection().get(), collectionGroup) */
       const QueryProto = Object.getPrototypeOf(db.collection('__g__'));
       if (QueryProto && !QueryProto.__lpaGuarded) {
