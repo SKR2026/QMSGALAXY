@@ -4702,6 +4702,16 @@ window.saveAndSyncSchedules = async function() {
 window.saveAllSuperadminSettings = async function() {
   const form = readSuperadminForm();
 
+  // Build the full list of plant admin emails from plants + user accounts
+  const plantAdminEmailsFromPlants = (S.plants || [])
+    .map(p => (p.plantAdminEmail || '').trim())
+    .filter(e => e.includes('@'));
+  const plantAdminEmailsFromUsers = (S.users || [])
+    .filter(u => u.role === 'plant_admin' && u.email)
+    .map(u => u.email.trim())
+    .filter(e => e.includes('@'));
+  const plantAdminEmails = [...new Set([...plantAdminEmailsFromPlants, ...plantAdminEmailsFromUsers])];
+
   // Update local state
   S.notifConfig = {
     ...(S.notifConfig || {}),
@@ -4739,15 +4749,46 @@ window.saveAllSuperadminSettings = async function() {
     if (S.companyLogo) brandUpdate.companyLogo = S.companyLogo;
     await setDoc(doc(db, 'vems_settings', 'branding'), brandUpdate, { merge: true });
   } catch(err) { console.warn('Branding save error:', err); }
-  // Store function URL + secret in Firestore so top-mgmt magic-link users can submit escalation requests
+  // Save ALL notification settings directly to Firestore — including topMgmtEmails and plantAdminEmails.
+  // This is the authoritative save: the cloud function reads from here.
+  // Do NOT rely solely on the cloud function API (/api/vems-update-schedule) for this —
+  // if the cloud function URL is misconfigured those settings would never reach Firestore.
   try {
+    // Also store localStorage vems_topmgmt so magic-link top-mgmt login picks it up
+    localStorage.setItem('vems_topmgmt', JSON.stringify(form.topMgmtEmails));
+    TOP_MGMT_EMAILS.length = 0;
+    form.topMgmtEmails.forEach(e => TOP_MGMT_EMAILS.push(e));
+
     await setDoc(doc(db, 'vems_settings', 'data'), {
-      notifFunctionUrl: form.notifFunctionUrl || '',
-      vemsSecret:       form.vemsSecret || '',
+      notifFunctionUrl:      form.notifFunctionUrl || '',
+      vemsSecret:            form.vemsSecret || '',
+      // Notification recipients — written here so the cloud function always has the latest list
+      topMgmtEmails:         form.topMgmtEmails,
+      plantAdminEmails:      plantAdminEmails,
+      superadminEmail:       form.superadminEmail || '',
+      gmailUser:             form.gmailUser || '',
+      // Schedule settings
+      dailyTime:             form.dailyTime,
+      weeklyTime:            form.weeklyTime,
+      invoiceTime:           form.invoiceTime,
+      dailyEnabled:          form.dailyEnabled,
+      weeklyEnabled:         form.weeklyEnabled,
+      invoiceEnabled:        form.invoiceEnabled,
+      alertThreshold:        form.alertThreshold,
+      highExpenseThreshold:  form.highExpenseThreshold,
+      poorMileageThreshold:  form.poorMileageThreshold,
+      escalationEnabled:     form.escalationEnabled,
+      escalateDailyAlerts:   form.escalateDailyAlerts,
+      escalateWeeklySummary: form.escalateWeeklySummary,
+      escalateInvoice:       form.escalateInvoice,
+      escalationThreshold:   form.escalationThreshold,
       updatedAt: serverTimestamp(),
       updatedBy: S.user?.email,
     }, { merge: true });
-  } catch(err) { console.warn('Settings (notifFunctionUrl) save error:', err); }
+    console.log('[saveAllSuperadminSettings] Settings saved to Firestore ✅',
+      `topMgmtEmails: [${form.topMgmtEmails.join(', ')}]`,
+      `plantAdminEmails: [${plantAdminEmails.join(', ')}]`);
+  } catch(err) { console.warn('Settings save error:', err); }
 
   // Also write to notifConfig so getCloudFnConfig() finds it on every login
   try {
