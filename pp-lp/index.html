@@ -894,6 +894,11 @@
               <option value="system">System Events</option>
             </select>
             <input type="date" id="logDateFilter" class="form-input-sm" onchange="loadActivityLog()" />
+            <button onclick="window._lpaClearActivityLog()" class="btn btn-secondary btn-sm"
+              id="clearLogsBtn"
+              style="font-size:12px;padding:5px 12px;color:#ef4444;border-color:#fca5a5;display:none;">
+              🗑 Clear Logs
+            </button>
           </div>
         </div>
         <div class="card">
@@ -2052,6 +2057,37 @@ body.lpa-view-only #lpaViewOnlyBanner { display: block !important; }
 #plantSummaryTable .data-table td {
   padding: 7px 10px !important;
   font-size: 12px !important;
+}
+
+/* ── Activity Log — compact, single-row timestamp ──────────── */
+#view-activitylog .data-table th,
+#view-activitylog .data-table td {
+  padding: 5px 10px !important;
+  font-size: 12px !important;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+/* Timestamp column: wider so date+time fit on one line */
+#view-activitylog .data-table th:first-child,
+#view-activitylog .data-table td:first-child {
+  min-width: 140px;
+  white-space: nowrap;
+}
+/* Event column: allow wrapping if long */
+#view-activitylog .data-table th:nth-child(5),
+#view-activitylog .data-table td:nth-child(5) {
+  white-space: normal;
+  min-width: 160px;
+}
+/* Details column: allow wrapping */
+#view-activitylog .data-table th:last-child,
+#view-activitylog .data-table td:last-child {
+  white-space: normal;
+  min-width: 180px;
+}
+/* Tighten row height */
+#view-activitylog .data-table tr {
+  line-height: 1.3;
 }
 
 /* View header on dashboard */
@@ -4538,6 +4574,31 @@ window._lpaMgmtLogin = async function() {
 };
 
 /** Enter management view — call only after guard is installed */
+// ── Overlay lock: prevent auth.js from flashing login screen on viewers ──
+// auth.js's onAuthStateChanged fires when signInAnonymously() completes. It finds
+// no user doc in Firestore and calls showLoginScreen() — or sets overlay.style.display
+// directly. We block both with a MutationObserver that fires synchronously.
+var _lpaOverlayLockObserver = null;
+function _lpaLockOverlayForGuest() {
+  var overlay = document.getElementById('loginOverlay');
+  if (!overlay || _lpaOverlayLockObserver) return;
+  _lpaOverlayLockObserver = new MutationObserver(function() {
+    if (!window.currentUser || !window.currentUser.isGuest) {
+      // Guest no longer active — release the lock
+      _lpaOverlayLockObserver.disconnect();
+      _lpaOverlayLockObserver = null;
+      return;
+    }
+    // Synchronously re-hide if anything tried to show it
+    if (overlay.style.display !== 'none') {
+      overlay.style.display = 'none';
+      var shell = document.getElementById('appShell');
+      if (shell) shell.classList.remove('hidden');
+    }
+  });
+  _lpaOverlayLockObserver.observe(overlay, { attributes: true, attributeFilter: ['style','class'] });
+}
+
 function _lpaEnterManagementView() {
   document.body.classList.add('lpa-view-only');
 
@@ -4554,11 +4615,46 @@ function _lpaEnterManagementView() {
   const shell = document.getElementById('appShell');
   if (shell) shell.classList.remove('hidden');
 
+  // Lock overlay so auth.js cannot flash it back during its async Firestore checks
+  _lpaLockOverlayForGuest();
+
   // Show plant pills and populate from Firestore (public read)
   _lpaInitGuestPlantPills();
 
   if (typeof navigate === 'function') navigate('dashboard');
 }
+
+// ── Clear Activity Logs (Super Admin only) ──────────────────────
+window._lpaClearActivityLog = async function() {
+  const u = window.currentUser;
+  if (!u || u.role !== 'super_admin' || u.isGuest) return;
+  if (!confirm('Delete ALL activity logs? This cannot be undone.')) return;
+  const btn = document.getElementById('clearLogsBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Clearing…'; }
+  try {
+    const db = firebase.firestore();
+    // Batch-delete in pages of 400
+    let deleted = 0;
+    let snap;
+    do {
+      snap = await db.collection('apps/lpa/activityLogs').limit(400).get();
+      if (snap.empty) break;
+      const batch = db.batch();
+      snap.docs.forEach(function(d) { batch.delete(d.ref); });
+      await batch.commit();
+      deleted += snap.docs.length;
+    } while (!snap.empty);
+    const tbody = document.getElementById('activityLogBody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="table-empty">No activity logs.</td></tr>';
+    const count = document.getElementById('logCount');
+    if (count) count.textContent = '';
+    if (typeof showToast === 'function') showToast('Activity logs cleared (' + deleted + ' entries)', 'success');
+  } catch(e) {
+    alert('Clear failed: ' + (e.message || e));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🗑 Clear Logs'; }
+  }
+};
 
 /** Populate the plant selector pills for the management viewer */
 async function _lpaInitGuestPlantPills() {
@@ -5738,6 +5834,14 @@ function _lpaGmailStatus(msg, color) {
           window.injectGmailConfigSection('#settingsTabContent');
         }
       }, 400);
+    }
+
+    // Show Clear Logs button only for super_admin on the activity log view
+    var clearBtn = document.getElementById('clearLogsBtn');
+    if (clearBtn) {
+      var cu = window.currentUser;
+      clearBtn.style.display = (view === 'activitylog' && cu && cu.role === 'super_admin' && !cu.isGuest)
+        ? 'inline-flex' : 'none';
     }
   };
 
