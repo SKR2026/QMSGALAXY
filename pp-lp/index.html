@@ -2539,7 +2539,7 @@ async function submitChangePassword() {
     const msgs = {
       'auth/wrong-password':     'Current password is incorrect.',
       'auth/too-many-requests':  'Too many attempts. Please wait and try again.',
-      'auth/weak-password':      'New password is too weak. Use at least 8 characters.',
+      'auth/weak-password':      'New password is too weak. Use at least 6 characters.',
       'auth/requires-recent-login':'Session expired. Please sign out and sign back in first.'
     };
     errEl.textContent = msgs[e.code] || 'An error occurred. Please try again.';
@@ -6377,6 +6377,12 @@ window._submitAuditeeActionPlans = async function(auditId, findingIds) {
 
     await batch.commit();
 
+    // Notify auditor by email
+    try {
+      const fn = firebase.app().functions('asia-south1').httpsCallable('lpaSendAuditEmail');
+      await fn({ type: 'auditee_submitted', auditId });
+    } catch(e) { console.warn('[LPA] Auditor email notify failed:', e.message); }
+
     if (msgEl) {
       msgEl.style.display='block';
       msgEl.style.background='#f0fdf4';
@@ -6396,6 +6402,61 @@ window._waitForFirebase_lpa = async function() {
   while (!(window.firebase && firebase.apps && firebase.apps.length) && t++ < 40)
     await new Promise(r => setTimeout(r, 200));
 };
+
+// ── Track current audit ID from execute panel ─────────────────────
+// audits.js populates #auditExecContent; observe it to capture the audit ID
+(function() {
+  function observeExecPanel() {
+    const el = document.getElementById('auditExecContent');
+    if (!el) { setTimeout(observeExecPanel, 500); return; }
+    const obs = new MutationObserver(function() {
+      // audits.js typically sets data-audit-id on the container or first child
+      const id = el.dataset.auditId ||
+        el.querySelector('[data-audit-id]')?.dataset?.auditId ||
+        (el.innerHTML.match(/data-audit-id=["']([^"']+)["']/) || [])[1] ||
+        null;
+      if (id) window._lpaCurrentAuditId = id;
+    });
+    obs.observe(el, { childList: true, subtree: false });
+  }
+  document.addEventListener('DOMContentLoaded', observeExecPanel);
+})();
+
+// ── Patch submitAudit to email auditee with all findings ─────────
+(function() {
+  function patchSubmitAudit() {
+    const orig = window.submitAudit;
+    if (typeof orig !== 'function') return;
+    window.submitAudit = async function() {
+      // Capture audit ID — audits.js stores it in window._lpaCurrentAuditId (set below),
+      // or fall back to data attributes injected into the execute panel
+      const auditId = window._lpaCurrentAuditId ||
+        document.getElementById('auditExecContent')?.dataset?.auditId ||
+        document.querySelector('#auditExecContent [data-audit-id]')?.dataset?.auditId ||
+        null;
+      const result = await orig.apply(this, arguments);
+      // Email auditee with all findings after successful submit
+      try {
+        if (auditId) {
+          const fn = firebase.app().functions('asia-south1').httpsCallable('lpaSendAuditEmail');
+          await fn({ type: 'audit_submitted', auditId });
+          console.log('[LPA] Auditee findings email sent for audit', auditId);
+        }
+      } catch(e) { console.warn('[LPA] Auditee findings email failed:', e.message); }
+      return result;
+    };
+    window.submitAudit._submitPatched = true;
+  }
+
+  let attempts2 = 0;
+  const interval2 = setInterval(function() {
+    if (window.submitAudit && window.submitAudit._submitPatched) { clearInterval(interval2); return; }
+    if (window.submitAudit || attempts2++ > 30) {
+      patchSubmitAudit();
+      clearInterval(interval2);
+    }
+  }, 300);
+})();
 
 // ── Patch saveAudit to capture auditeeEmail & send notification ──
 (function() {
