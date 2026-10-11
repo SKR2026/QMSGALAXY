@@ -520,6 +520,7 @@
             <table class="data-table">
               <thead>
                 <tr>
+                  <th id="auditChkTh" style="display:none;width:36px;padding:8px 6px;"><input type="checkbox" id="auditSelectAll" title="Select all" style="cursor:pointer;width:15px;height:15px;"></th>
                   <th>Audit ID</th>
                   <th>Plant</th>
                   <th>Department</th>
@@ -615,6 +616,7 @@
             <table class="data-table">
               <thead>
                 <tr>
+                  <th id="findingChkTh" style="display:none;width:36px;padding:8px 6px;"><input type="checkbox" id="findingSelectAll" title="Select all" style="cursor:pointer;width:15px;height:15px;"></th>
                   <th>Finding ID</th>
                   <th>Audit</th>
                   <th>Plant</th>
@@ -6499,6 +6501,247 @@ window._waitForFirebase_lpa = async function() {
       clearInterval(interval);
     }
   }, 300);
+})();
+</script>
+
+<!-- ── Multi-Select Delete Toolbar ───────────────────────────────── -->
+<div id="lpaDeleteToolbar" style="display:none;position:fixed;bottom:28px;left:50%;transform:translateX(-50%);z-index:8000;background:#1e293b;color:#fff;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.35);padding:12px 20px;align-items:center;gap:16px;font-size:14px;min-width:320px;max-width:90vw;">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+  <span id="lpaDeleteToolbarCount" style="font-weight:600;color:#e2e8f0;flex:1;"></span>
+  <button onclick="window._lpaConfirmBulkDelete()" style="background:#ef4444;color:#fff;border:none;border-radius:8px;padding:7px 18px;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s;" onmouseover="this.style.background='#dc2626'" onmouseout="this.style.background='#ef4444'">🗑 Delete Selected</button>
+  <button onclick="window._lpaCancelBulkSelect()" style="background:transparent;color:#94a3b8;border:1px solid #475569;border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer;">Cancel</button>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+//  MULTI-SELECT DELETE  (Super Admin only)
+// ═══════════════════════════════════════════════════════════════════
+(function() {
+
+  // ── State ─────────────────────────────────────────────────────
+  let _mode    = null;      // 'audits' | 'findings' | null
+  let _selected = new Set(); // doc IDs currently checked
+
+  // ── Helpers ───────────────────────────────────────────────────
+  function isSuperAdmin() {
+    return window.currentUser && window.currentUser.role === 'super_admin' && !window.currentUser.isGuest;
+  }
+
+  function updateToolbar() {
+    const tb = document.getElementById('lpaDeleteToolbar');
+    if (!tb) return;
+    if (_selected.size === 0) {
+      tb.style.display = 'none';
+    } else {
+      tb.style.display  = 'flex';
+      const label = _mode === 'audits' ? 'audit' : 'finding';
+      document.getElementById('lpaDeleteToolbarCount').textContent =
+        `${_selected.size} ${label}${_selected.size !== 1 ? 's' : ''} selected`;
+    }
+  }
+
+  // Extract doc ID from a rendered table row.
+  // audits.js / findings.js put the ID on the row as data-id, data-doc-id,
+  // or encode it inside an onclick="deleteAudit('XYZ')" / deleteFinding('XYZ')
+  function extractDocId(tr) {
+    if (tr.dataset.id)    return tr.dataset.id;
+    if (tr.dataset.docId) return tr.dataset.docId;
+    // Scan onclick attrs in all buttons of this row
+    const btns = tr.querySelectorAll('button[onclick],a[onclick]');
+    for (const b of btns) {
+      const m = (b.getAttribute('onclick') || '').match(/delete(?:Audit|Finding)\s*\(\s*['"]([^'"]+)['"]/);
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  // Inject a checkbox into the first cell of a <tr> (or prepend a new cell)
+  function injectCheckbox(tr, mode) {
+    if (tr.querySelector('.lpa-sel-chk')) return; // already done
+    const docId = extractDocId(tr);
+    if (!docId) return;
+
+    tr.dataset.docId = docId; // cache it
+
+    const td = document.createElement('td');
+    td.style.cssText = 'padding:8px 6px;text-align:center;vertical-align:middle;';
+    const chk = document.createElement('input');
+    chk.type  = 'checkbox';
+    chk.className = 'lpa-sel-chk';
+    chk.dataset.docId = docId;
+    chk.style.cssText = 'cursor:pointer;width:15px;height:15px;';
+    chk.addEventListener('change', function() {
+      if (this.checked) { _selected.add(docId); }
+      else              { _selected.delete(docId); }
+      updateToolbar();
+      syncSelectAll(mode);
+    });
+    td.appendChild(chk);
+    tr.insertBefore(td, tr.firstChild);
+  }
+
+  function syncSelectAll(mode) {
+    const allId = mode === 'audits' ? 'auditSelectAll' : 'findingSelectAll';
+    const allChk = document.getElementById(allId);
+    if (!allChk) return;
+    const rows = document.querySelectorAll(
+      mode === 'audits' ? '#auditsTableBody .lpa-sel-chk' : '#findingsTableBody .lpa-sel-chk'
+    );
+    const total   = rows.length;
+    const checked = [...rows].filter(c => c.checked).length;
+    allChk.indeterminate = checked > 0 && checked < total;
+    allChk.checked       = total > 0 && checked === total;
+  }
+
+  // ── Observe a table body and inject checkboxes on re-render ───
+  function watchTable(tbodyId, chkThId, selectAllId, mode) {
+    function ensureCheckboxes() {
+      if (!isSuperAdmin()) return;
+      const tbody = document.getElementById(tbodyId);
+      if (!tbody) return;
+      // Show the checkbox column header
+      const th = document.getElementById(chkThId);
+      if (th) th.style.display = '';
+      // Inject into all existing rows
+      tbody.querySelectorAll('tr').forEach(tr => {
+        if (!tr.querySelector('td')) return; // skip empty/loading rows
+        injectCheckbox(tr, mode);
+      });
+    }
+
+    // Wire "Select All" checkbox
+    function wireSelectAll() {
+      const allChk = document.getElementById(selectAllId);
+      if (!allChk || allChk._lpaBound) return;
+      allChk._lpaBound = true;
+      allChk.addEventListener('change', function() {
+        const rows = document.querySelectorAll(`#${tbodyId} .lpa-sel-chk`);
+        rows.forEach(c => {
+          c.checked = this.checked;
+          const id = c.dataset.docId;
+          if (this.checked) _selected.add(id); else _selected.delete(id);
+        });
+        updateToolbar();
+      });
+    }
+
+    // MutationObserver: fires whenever audits.js / findings.js rewrites tbody
+    function startObserver() {
+      const tbody = document.getElementById(tbodyId);
+      if (!tbody) { setTimeout(startObserver, 400); return; }
+      const obs = new MutationObserver(function() {
+        // Clear selections that no longer exist in the DOM
+        const existing = new Set(
+          [...tbody.querySelectorAll('.lpa-sel-chk')].map(c => c.dataset.docId)
+        );
+        for (const id of [..._selected]) {
+          if (!existing.has(id) && _mode === mode) _selected.delete(id);
+        }
+        ensureCheckboxes();
+        wireSelectAll();
+        updateToolbar();
+      });
+      obs.observe(tbody, { childList: true, subtree: false });
+      ensureCheckboxes();
+      wireSelectAll();
+    }
+
+    document.addEventListener('DOMContentLoaded', startObserver);
+    if (document.readyState !== 'loading') startObserver();
+  }
+
+  watchTable('auditsTableBody',  'auditChkTh',   'auditSelectAll',   'audits');
+  watchTable('findingsTableBody','findingChkTh',  'findingSelectAll', 'findings');
+
+  // Track which view is active so Delete knows what to delete
+  const _navOrig = window.navigate;
+  if (typeof _navOrig === 'function') {
+    window.navigate = function(view) {
+      _lpaCancelBulkSelect();
+      if (view === 'audits')   _mode = 'audits';
+      if (view === 'findings') _mode = 'findings';
+      return _navOrig.apply(this, arguments);
+    };
+  }
+  // Also detect from nav clicks directly
+  document.addEventListener('click', function(e) {
+    const nav = e.target.closest('[data-view]');
+    if (!nav) return;
+    const v = nav.dataset.view;
+    if (v === 'audits')   _mode = 'audits';
+    if (v === 'findings') _mode = 'findings';
+  });
+
+  // ── Cancel selection ──────────────────────────────────────────
+  window._lpaCancelBulkSelect = function() {
+    _selected.clear();
+    document.querySelectorAll('.lpa-sel-chk').forEach(c => { c.checked = false; });
+    ['auditSelectAll','findingSelectAll'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) { el.checked = false; el.indeterminate = false; }
+    });
+    updateToolbar();
+  };
+
+  // ── Confirm & Execute Bulk Delete ─────────────────────────────
+  window._lpaConfirmBulkDelete = async function() {
+    if (!isSuperAdmin()) return;
+    if (_selected.size === 0) return;
+    const label  = _mode === 'audits' ? 'audit' : 'finding';
+    const plural = _selected.size !== 1 ? `${label}s` : label;
+    if (!confirm(`Permanently delete ${_selected.size} ${plural}? This cannot be undone.`)) return;
+
+    const ids = [..._selected];
+    const db  = window.db || (window.firebase && firebase.firestore());
+    if (!db) { alert('Firestore not ready. Try again.'); return; }
+
+    const appRoot    = 'apps/lpa';
+    const collection = _mode === 'audits' ? 'audits' : 'findings';
+    const refPath    = `${appRoot}/${collection}`;
+
+    // Batch delete (Firestore max 500 per batch)
+    let failed = 0;
+    const BATCH = 400;
+    for (let i = 0; i < ids.length; i += BATCH) {
+      const chunk = ids.slice(i, i + BATCH);
+      try {
+        const batch = db.batch();
+        chunk.forEach(id => batch.delete(db.doc(`${refPath}/${id}`)));
+        await batch.commit();
+      } catch(err) {
+        console.error('[LPA] Bulk delete error:', err);
+        failed += chunk.length;
+      }
+    }
+
+    // Log activity
+    try {
+      const u = window.currentUser;
+      await db.collection(`${appRoot}/activityLogs`).add({
+        userId:    u.uid,
+        userName:  u.name || u.email,
+        userRole:  u.role,
+        plantId:   u.plantId || null,
+        type:      collection,
+        action:    `Bulk deleted ${ids.length - failed} ${collection} by super admin`,
+        recordId:  null,
+        timestamp: firebase.firestore.FieldValue.serverTimestamp()
+      });
+    } catch(_) {}
+
+    _lpaCancelBulkSelect();
+
+    if (failed > 0) {
+      window.showToast && showToast(`Deleted ${ids.length - failed}; ${failed} failed.`, 'warning');
+    } else {
+      window.showToast && showToast(`${ids.length} ${plural} deleted.`, 'success');
+    }
+
+    // Reload the table
+    if (_mode === 'audits'   && typeof loadAudits   === 'function') loadAudits();
+    if (_mode === 'findings' && typeof loadFindings  === 'function') loadFindings();
+  };
+
 })();
 </script>
 
