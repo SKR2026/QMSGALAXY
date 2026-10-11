@@ -5900,62 +5900,80 @@ window._lpaGmailSendTest = async function() {
       return;
     }
 
-    // Force-refresh token to pick up any custom claim changes
-    // Retry up to 3 times with a short wait — token propagation can take a moment
-    let idTokenResult = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        await authUser.getIdToken(true);
-        idTokenResult = await authUser.getIdTokenResult();
-        if (idTokenResult && idTokenResult.claims && idTokenResult.claims.role === 'super_admin') break;
-      } catch(_) {}
-      if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
+    // Check Firestore role — the LPA app uses Firestore role, not custom claims
+    const db = firebase.firestore();
+    const userDoc = await db.collection('apps/lpa/users').doc(authUser.uid).get();
+    if (!userDoc.exists || userDoc.data().role !== 'super_admin') {
+      _lpaGmailStatus('❌ Super Admin access required.', '#ef4444');
+      return;
     }
 
-    const hasClaim = idTokenResult && idTokenResult.claims && idTokenResult.claims.role === 'super_admin';
-
-    if (!hasClaim) {
-      // Try calling a setUserRole / syncClaims Cloud Function if one exists in this project
-      let claimSetViaFunction = false;
-      const fnNames = ['setUserRole', 'syncUserClaims', 'assignRole', 'setCustomClaim'];
-      for (const fnName of fnNames) {
-        try {
-          const tryFn = firebase.app().functions('asia-south1').httpsCallable(fnName);
-          await tryFn({ uid: authUser.uid, role: 'super_admin' });
-          await new Promise(r => setTimeout(r, 1500));
-          await authUser.getIdToken(true);
-          idTokenResult = await authUser.getIdTokenResult();
-          if (idTokenResult && idTokenResult.claims && idTokenResult.claims.role === 'super_admin') {
-            claimSetViaFunction = true;
-            break;
-          }
-        } catch(_) { /* function doesn't exist or failed — try next */ }
+    // Read Gmail config (super_admin only)
+    let gmailUser = '', gmailPass = '';
+    try {
+      const cfg = await db.collection('apps/lpa/settings').doc('gmailConfig').get();
+      if (cfg.exists) {
+        gmailUser = cfg.data().gmailUser || cfg.data().email || '';
+        gmailPass = cfg.data().gmailAppPassword || cfg.data().appPassword || cfg.data().password || '';
       }
+    } catch(_) {}
 
-      if (!claimSetViaFunction) {
-        // Claim cannot be set automatically — show the fix modal with exact steps
-        _lpaGmailStatus('❌ Auth claim not set — see instructions popup.', '#ef4444');
-        _lpaShowClaimFixModal(authUser.uid, authUser.email);
+    if (!gmailUser) {
+      _lpaGmailStatus('❌ Gmail not configured — save Gmail config first.', '#ef4444');
+      return;
+    }
+
+    const recipient = testTo || authUser.email || gmailUser;
+
+    // Write a test-email request to Firestore — LPA Cloud Function picks it up
+    // Falls back gracefully if no function is listening
+    try {
+      await db.collection('apps/lpa/emailTestRequests').add({
+        to:          recipient,
+        requestedBy: authUser.uid,
+        requestedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        status:      'pending'
+      });
+      // Poll for up to 10s for the function to mark it done
+      let sent = false;
+      for (let i = 0; i < 10; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const snap = await db.collection('apps/lpa/emailTestRequests')
+          .where('requestedBy', '==', authUser.uid)
+          .where('status', '==', 'sent')
+          .orderBy('requestedAt', 'desc').limit(1).get();
+        if (!snap.empty) { sent = true; break; }
+      }
+      if (sent) {
+        _lpaGmailStatus(`✅ Test email sent to ${recipient}`, '#059669');
+        if (typeof showToast === 'function') showToast('Test email sent!', 'success');
         return;
       }
+    } catch(_) {}
+
+    // Firestore trigger not available — try LPA-specific callable functions
+    const lpaFnNames = ['lpaTestGmail', 'lpaSendTestEmail', 'sendLpaTestEmail'];
+    for (const fnName of lpaFnNames) {
+      try {
+        const fn = firebase.app().functions('asia-south1').httpsCallable(fnName);
+        const res = await fn({ to: recipient });
+        _lpaGmailStatus(`✅ Test email sent to ${res.data.sentTo || recipient}`, '#059669');
+        if (typeof showToast === 'function') showToast('Test email sent!', 'success');
+        return;
+      } catch(_) {}
     }
 
-    // Call the Cloud Function — token now has the claim
-    const fn = firebase.app().functions('asia-south1').httpsCallable('testGmailNotification');
-    const res = await fn({ to: testTo || undefined });
-    _lpaGmailStatus(`✅ Test email sent to ${res.data.sentTo}`, '#059669');
-    if (typeof showToast === 'function') showToast('Test email sent!', 'success');
-  } catch(e) {
-    const msg = e.message || 'Send failed.';
-    if (/super.admin|permission|unauthenticated/i.test(msg)) {
-      const authUser = firebase.auth ? firebase.auth().currentUser : null;
-      _lpaGmailStatus('❌ Auth claim still missing — see instructions popup.', '#ef4444');
-      if (authUser) _lpaShowClaimFixModal(authUser.uid, authUser.email);
-    } else if (/not.found|404/i.test(msg)) {
-      _lpaGmailStatus('❌ Cloud Function not deployed. Deploy testGmailNotification to asia-south1.', '#ef4444');
-    } else {
-      _lpaGmailStatus('❌ ' + msg, '#ef4444');
+    // No Cloud Function available — show clear instructions
+    _lpaGmailStatus(
+      `⚠️ Gmail is configured (${gmailUser}). To enable Send Test Email, deploy an LPA Cloud Function named "lpaTestGmail".`,
+      '#d97706'
+    );
+    if (typeof showToast === 'function') {
+      showToast(`Gmail configured as ${gmailUser} — deploy lpaTestGmail function to enable test.`, 'warning');
     }
+
+  } catch(e) {
+    _lpaGmailStatus('❌ ' + (e.message || 'Send failed.'), '#ef4444');
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Send Test Email'; }
   }
