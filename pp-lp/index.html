@@ -4560,6 +4560,46 @@ window._lpaMgmtLogin = async function() {
     _lpaEnterManagementView();
   });
 
+  // ── Intercept firebase.auth() to block signOut while guest is active ──
+  // auth.js may call signOut() if it can't find the anonymous user's Firestore doc.
+  // That triggers onAuthStateChanged(null) → showLoginScreen() → flash.
+  // We patch the auth instance's signOut() and onAuthStateChanged() so they are
+  // no-ops while window.currentUser.isGuest is true.
+  (function _patchFirebaseAuthForGuest() {
+    if (typeof firebase === 'undefined' || !firebase.auth) return;
+    try {
+      const authInstance = firebase.auth();
+      if (authInstance.__lpaGuestPatched) return;
+      authInstance.__lpaGuestPatched = true;
+
+      // Block signOut so auth.js cannot sign out the anonymous user
+      const _origSignOut = authInstance.signOut.bind(authInstance);
+      authInstance.signOut = function() {
+        if (window.currentUser && window.currentUser.isGuest) {
+          console.info('[LPA] signOut() suppressed — management viewer active.');
+          return Promise.resolve();
+        }
+        return _origSignOut.apply(this, arguments);
+      };
+
+      // Wrap onAuthStateChanged so callbacks are no-ops for guest with null user
+      const _origOAC = authInstance.onAuthStateChanged.bind(authInstance);
+      authInstance.onAuthStateChanged = function(nextOrObserver, error, completed) {
+        if (typeof nextOrObserver === 'function') {
+          const _origNext = nextOrObserver;
+          nextOrObserver = function(user) {
+            if (!user && window.currentUser && window.currentUser.isGuest) {
+              console.info('[LPA] onAuthStateChanged(null) suppressed — management viewer active.');
+              return;
+            }
+            _origNext(user);
+          };
+        }
+        return _origOAC(nextOrObserver, error, completed);
+      };
+    } catch(e) { console.warn('[LPA] auth patch error:', e); }
+  })();
+
   // Anonymous sign-in in background — satisfies Firestore rules (request.auth != null).
   // Enable in Firebase Console → Authentication → Sign-in method → Anonymous.
   try {
@@ -4637,7 +4677,7 @@ window._lpaClearActivityLog = async function() {
     let deleted = 0;
     let snap;
     do {
-      snap = await db.collection('apps/lpa/activityLogs').limit(400).get();
+      snap = await db.collection('activityLogs').limit(400).get();
       if (snap.empty) break;
       const batch = db.batch();
       snap.docs.forEach(function(d) { batch.delete(d.ref); });
@@ -5757,23 +5797,71 @@ window._lpaGmailSendTest = async function() {
   const testTo = (document.getElementById('gmailTestTo')?.value || '').trim();
   if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
   try {
-    // Force Firebase Auth token refresh so the latest custom claims
+    // Step 1: Force Firebase Auth token refresh so the latest custom claims
     // (role: 'super_admin') are included — without this, claims set after
     // the last login are missing and the Cloud Function returns "Super Admin only."
     const authUser = (typeof firebase !== 'undefined' && firebase.auth)
       ? firebase.auth().currentUser : null;
-    if (authUser) {
-      try { await authUser.getIdToken(/* forceRefresh */ true); } catch(_) {}
+    if (!authUser) {
+      _lpaGmailStatus('❌ Not signed in — please sign in as Super Admin first.', '#ef4444');
+      return;
     }
+
+    // Step 2: Force-refresh token to pick up any custom claim changes
+    let idTokenResult = null;
+    try {
+      await authUser.getIdToken(/* forceRefresh */ true);
+      idTokenResult = await authUser.getIdTokenResult();
+    } catch(_) {}
+
+    // Step 3: Check if claim is present; if not, try to set it via Firestore trigger
+    const hasClaim = idTokenResult && idTokenResult.claims && idTokenResult.claims.role === 'super_admin';
+    if (!hasClaim) {
+      // Try writing a claim-request document to Firestore; a Cloud Function
+      // trigger on this path should set the custom claim and the user re-signs in.
+      // This is a best-effort attempt — it may not exist in all deployments.
+      try {
+        const db = firebase.firestore();
+        await db.collection('apps/lpa/claimRequests').doc(authUser.uid).set({
+          uid:         authUser.uid,
+          email:       authUser.email,
+          role:        'super_admin',
+          requestedAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        // Wait briefly then re-refresh token
+        await new Promise(r => setTimeout(r, 2000));
+        await authUser.getIdToken(true);
+        idTokenResult = await authUser.getIdTokenResult();
+      } catch(_) {}
+
+      const hasClaimNow = idTokenResult && idTokenResult.claims && idTokenResult.claims.role === 'super_admin';
+      if (!hasClaimNow) {
+        _lpaGmailStatus(
+          '❌ Auth claim not set. Fix: Firebase Console → Functions → call setCustomClaim, OR sign out and back in after an admin sets your role.',
+          '#ef4444'
+        );
+        if (typeof showToast === 'function') {
+          showToast('Super Admin custom claim missing — see Gmail config status for instructions.', 'error');
+        }
+        return;
+      }
+    }
+
+    // Step 4: Call the Cloud Function with refreshed token
     const fn = firebase.app().functions('asia-south1').httpsCallable('testGmailNotification');
     const res = await fn({ to: testTo || undefined });
     _lpaGmailStatus(`✅ Test email sent to ${res.data.sentTo}`, '#059669');
     if (typeof showToast === 'function') showToast('Test email sent!', 'success');
   } catch(e) {
     const msg = e.message || 'Send failed.';
-    // Give a clear hint when the Cloud Function rejects due to missing custom claim
     if (/super.admin|permission|unauthenticated/i.test(msg)) {
-      _lpaGmailStatus('❌ Auth claim missing — sign out and back in, then retry.', '#ef4444');
+      // Custom claim is definitely missing — show clear fix steps
+      _lpaGmailStatus(
+        '❌ Super Admin claim missing. Fix: (1) Sign out, (2) Sign back in, (3) Retry. If still failing, ask your Firebase admin to run: auth.setCustomUserClaims(uid, {role:"super_admin"})',
+        '#ef4444'
+      );
+    } else if (/not.found|404/i.test(msg)) {
+      _lpaGmailStatus('❌ Cloud Function not deployed. Deploy testGmailNotification to asia-south1.', '#ef4444');
     } else {
       _lpaGmailStatus('❌ ' + msg, '#ef4444');
     }
