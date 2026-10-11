@@ -3421,7 +3421,7 @@ function ensureFactoryResetTab() {
     // Also watch the section itself in case settings.js rebuilds the whole section
     new MutationObserver(function() {
       ensureFactoryResetTab();
-      injectEscalationEmails();
+      // injectEscalationEmails is handled by settingsTabContent observer below
     }).observe(settingsSection, { childList: true, subtree: true });
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', observe);
@@ -3441,9 +3441,30 @@ function ensureFactoryResetTab() {
       renderFactoryResetPanel();
       return;
     }
+    // When switching tabs, remove injected blocks so they re-inject correctly
+    // on the right tab only (prevents Gmail/branding appearing on Escalation tab etc.)
+    if (tab !== 'general') {
+      var gmailBlock    = document.getElementById('lpaGmailConfigSection');
+      var brandingBlock = document.getElementById('loginBrandingSection');
+      if (gmailBlock)    gmailBlock.remove();
+      if (brandingBlock) brandingBlock.remove();
+    }
+    if (tab !== 'escalation') {
+      var escBlock = document.getElementById('escEmailConfigBlock');
+      if (escBlock) escBlock.remove();
+    }
     _orig(tab, el);
-    // After settings.js renders, try to inject escalation emails
+    // After settings.js renders the tab, inject our matching block
     if (tab === 'escalation') setTimeout(injectEscalationEmails, 80);
+    if (tab === 'general') {
+      var u = window.currentUser;
+      if (u && u.role === 'super_admin') {
+        setTimeout(function() {
+          window.injectLoginBrandingSection('#settingsTabContent');
+          window.injectGmailConfigSection('#settingsTabContent');
+        }, 100);
+      }
+    }
   };
 })();
 
@@ -3457,9 +3478,13 @@ const ESC_EMAIL_BLOCK_ID = 'escEmailConfigBlock';
 function injectEscalationEmails() {
   const container = document.getElementById('settingsTabContent');
   if (!container) return;
-  // Only inject when the Escalation tab content is showing
-  // Detect by looking for known Escalation text
-  if (!/escalation|reminder/i.test(container.textContent)) return;
+  // Only inject when the Escalation tab is ACTIVE — check the active tab button,
+  // NOT container.textContent (which matches "escalation alerts" in the Gmail section
+  // and causes these fields to appear on the General tab too).
+  const settingsSection = document.getElementById('view-settings');
+  const activeTab = settingsSection && settingsSection.querySelector('.tab-btn.active');
+  const activeTabKey = activeTab ? (activeTab.getAttribute('data-tab') || activeTab.textContent || '') : '';
+  if (!/escalation/i.test(activeTabKey)) return;
   if (document.getElementById(ESC_EMAIL_BLOCK_ID)) return; // already injected
 
   // Load saved email config
@@ -4476,16 +4501,8 @@ window._lpaMgmtLogin = async function() {
   const btn = document.querySelector('[onclick*="_lpaMgmtLogin"]');
   if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
 
-  try {
-    // Anonymous sign-in satisfies Firestore rules (request.auth != null)
-    // without requiring any email or password from management users.
-    if (typeof firebase !== 'undefined' && firebase.auth) {
-      await firebase.auth().signInAnonymously().catch(function() {
-        // If anonymous auth is not yet enabled in Firebase Console, continue anyway
-      });
-    }
-  } catch(e) { /* ignore — enter read-only view regardless */ }
-
+  // Set currentUser and hide the overlay IMMEDIATELY — before any async work —
+  // so auth.js's onAuthStateChanged cannot re-show the login screen mid-flight.
   window.currentUser = {
     uid:         'guest-anon-' + Date.now(),
     email:       '',
@@ -4496,12 +4513,28 @@ window._lpaMgmtLogin = async function() {
     displayName: 'Management Viewer',
     initials:    'MV'
   };
+  // Hide login overlay immediately to prevent flash
+  const overlay = document.getElementById('loginOverlay');
+  if (overlay) overlay.style.display = 'none';
+  const shell = document.getElementById('appShell');
+  if (shell) shell.classList.remove('hidden');
 
-  if (btn) { btn.disabled = false; btn.textContent = 'Enter as Viewer'; }
-
+  // Install write-guard first so any Firestore calls fired by navigation are safe
   _lpaInstallFirestoreGuard(function() {
     _lpaEnterManagementView();
   });
+
+  // Anonymous sign-in in background — satisfies Firestore rules (request.auth != null).
+  // Enable in Firebase Console → Authentication → Sign-in method → Anonymous.
+  try {
+    if (typeof firebase !== 'undefined' && firebase.auth) {
+      await firebase.auth().signInAnonymously().catch(function() {
+        // If anonymous auth not yet enabled in Firebase Console, silently continue
+      });
+    }
+  } catch(e) { /* ignore */ }
+
+  if (btn) { btn.disabled = false; btn.textContent = 'Enter as Viewer'; }
 };
 
 /** Enter management view — call only after guard is installed */
@@ -5195,6 +5228,11 @@ function _lpaGetBioCred(email) {
 window.injectLoginBrandingSection = function(containerSelector) {
   const container = document.querySelector(containerSelector || '#settingsTabContent');
   if (!container) return;
+  // Only inject when the General tab is active
+  const settingsSection = document.getElementById('view-settings');
+  const activeTab = settingsSection && settingsSection.querySelector('.tab-btn.active');
+  const activeTabKey = activeTab ? (activeTab.getAttribute('data-tab') || activeTab.textContent || '') : 'general';
+  if (activeTab && !/general/i.test(activeTabKey)) return;
   const existing = document.getElementById('loginBrandingSection');
   if (existing) return; // already injected
 
@@ -5413,6 +5451,11 @@ const GMAIL_BLOCK_ID = 'lpaGmailConfigSection';
 window.injectGmailConfigSection = async function(containerSelector) {
   const container = document.querySelector(containerSelector || '#settingsTabContent');
   if (!container) return;
+  // Only inject when the General tab is active (not Escalation, Notifications, etc.)
+  const settingsSection = document.getElementById('view-settings');
+  const activeTab = settingsSection && settingsSection.querySelector('.tab-btn.active');
+  const activeTabKey = activeTab ? (activeTab.getAttribute('data-tab') || activeTab.textContent || '') : 'general';
+  if (activeTab && !/general/i.test(activeTabKey)) return;
   if (document.getElementById(GMAIL_BLOCK_ID)) {
     _lpaLoadGmailConfigToForm(); // refresh fields if already injected
     return;
@@ -5618,12 +5661,26 @@ window._lpaGmailSendTest = async function() {
   const testTo = (document.getElementById('gmailTestTo')?.value || '').trim();
   if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
   try {
+    // Force Firebase Auth token refresh so the latest custom claims
+    // (role: 'super_admin') are included — without this, claims set after
+    // the last login are missing and the Cloud Function returns "Super Admin only."
+    const authUser = (typeof firebase !== 'undefined' && firebase.auth)
+      ? firebase.auth().currentUser : null;
+    if (authUser) {
+      try { await authUser.getIdToken(/* forceRefresh */ true); } catch(_) {}
+    }
     const fn = firebase.app().functions('asia-south1').httpsCallable('testGmailNotification');
     const res = await fn({ to: testTo || undefined });
     _lpaGmailStatus(`✅ Test email sent to ${res.data.sentTo}`, '#059669');
     if (typeof showToast === 'function') showToast('Test email sent!', 'success');
   } catch(e) {
-    _lpaGmailStatus('❌ ' + (e.message || 'Send failed. Check your Gmail config.'), '#ef4444');
+    const msg = e.message || 'Send failed.';
+    // Give a clear hint when the Cloud Function rejects due to missing custom claim
+    if (/super.admin|permission|unauthenticated/i.test(msg)) {
+      _lpaGmailStatus('❌ Auth claim missing — sign out and back in, then retry.', '#ef4444');
+    } else {
+      _lpaGmailStatus('❌ ' + msg, '#ef4444');
+    }
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Send Test Email'; }
   }
