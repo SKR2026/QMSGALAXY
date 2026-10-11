@@ -6541,16 +6541,21 @@ window._waitForFirebase_lpa = async function() {
   }
 
   // Extract doc ID from a rendered table row.
-  // audits.js / findings.js put the ID on the row as data-id, data-doc-id,
-  // or encode it inside an onclick="deleteAudit('XYZ')" / deleteFinding('XYZ')
+  // Try data attributes first, then ANY onclick string param, then first-cell text.
   function extractDocId(tr) {
     if (tr.dataset.id)    return tr.dataset.id;
     if (tr.dataset.docId) return tr.dataset.docId;
-    // Scan onclick attrs in all buttons of this row
-    const btns = tr.querySelectorAll('button[onclick],a[onclick]');
-    for (const b of btns) {
-      const m = (b.getAttribute('onclick') || '').match(/delete(?:Audit|Finding)\s*\(\s*['"]([^'"]+)['"]/);
+    // Scan ALL onclick attrs for any function('someId') pattern
+    const clickEls = tr.querySelectorAll('[onclick]');
+    for (const el of clickEls) {
+      const m = (el.getAttribute('onclick') || '').match(/\(\s*['"]([A-Za-z0-9_\-]{6,})['"]/);
       if (m) return m[1];
+    }
+    // Fallback: first <td> text that looks like an audit/finding ID
+    const firstTd = tr.querySelector('td');
+    if (firstTd) {
+      const txt = (firstTd.textContent || '').trim().replace(/\s+/g,'');
+      if (/^(AUD|FIND)-[A-Z0-9]{4,}/.test(txt)) return txt;
     }
     return null;
   }
@@ -6652,6 +6657,67 @@ window._waitForFirebase_lpa = async function() {
 
   watchTable('auditsTableBody',  'auditChkTh',   'auditSelectAll',   'audits');
   watchTable('findingsTableBody','findingChkTh',  'findingSelectAll', 'findings');
+
+  // ── Stamp real Firestore doc IDs onto rows after each load ────
+  // audits.js / findings.js may render rows without data-doc-id;
+  // we query Firestore for the visible IDs and back-fill the rows.
+  function stampDocIds(tbodyId, collection, displayField) {
+    const tbody = document.getElementById(tbodyId);
+    if (!tbody) return;
+    const rows = [...tbody.querySelectorAll('tr')].filter(tr => tr.querySelector('td') && !tr.dataset.docId);
+    if (!rows.length) return;
+    const db = window.db || (window.firebase && firebase.firestore && firebase.firestore());
+    if (!db) return;
+    // Collect display IDs visible in first cell
+    const displayIds = rows.map(tr => {
+      const td = tr.querySelector('td');
+      return td ? (td.textContent||'').trim().replace(/\s+/g,'') : null;
+    }).filter(Boolean);
+    if (!displayIds.length) return;
+    // Query in batches of 10 (Firestore 'in' limit)
+    const chunks = [];
+    for (let i = 0; i < displayIds.length; i += 10) chunks.push(displayIds.slice(i, i+10));
+    chunks.forEach(async chunk => {
+      try {
+        const snap = await db.collection(`apps/lpa/${collection}`)
+          .where(displayField, 'in', chunk).get();
+        snap.docs.forEach(doc => {
+          const dispId = doc.data()[displayField];
+          const row = rows.find(tr => {
+            const td = tr.querySelector('td');
+            return td && (td.textContent||'').trim().replace(/\s+/g,'') === dispId;
+          });
+          if (row) {
+            row.dataset.docId = doc.id;
+            const chk = row.querySelector('.lpa-sel-chk');
+            if (chk) chk.dataset.docId = doc.id;
+          }
+        });
+      } catch(e) { /* silent */ }
+    });
+  }
+
+  // Wrap loadAudits / loadFindings to stamp IDs after render
+  function wrapLoader(fnName, tbodyId, collection, displayField) {
+    function tryWrap() {
+      const orig = window[fnName];
+      if (typeof orig !== 'function' || orig._stampWrapped) return;
+      window[fnName] = async function() {
+        const r = await orig.apply(this, arguments);
+        setTimeout(() => stampDocIds(tbodyId, collection, displayField), 400);
+        return r;
+      };
+      window[fnName]._stampWrapped = true;
+    }
+    let att = 0;
+    const iv = setInterval(() => {
+      if (window[fnName] && !window[fnName]._stampWrapped) tryWrap();
+      if (window[fnName]?._stampWrapped || att++ > 40) clearInterval(iv);
+    }, 300);
+  }
+
+  wrapLoader('loadAudits',   'auditsTableBody',   'audits',   'auditId');
+  wrapLoader('loadFindings', 'findingsTableBody',  'findings', 'findingId');
 
   // Track which view is active so Delete knows what to delete
   const _navOrig = window.navigate;
