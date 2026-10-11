@@ -9,7 +9,7 @@ async function loadActions() {
   const user    = window.currentUser;
   if (!user || !tbody) return;
 
-  tbody.innerHTML = '<tr><td colspan="10" class="table-empty">Loading…</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="11" class="table-empty">Loading…</td></tr>';
 
   try {
     let query = col('correctiveActions');
@@ -29,22 +29,66 @@ async function loadActions() {
     const snap    = await query.get();
     const actions = snap.docs.map(d => ({ id: d.id, ...d.data() }));
 
+    const isSA = user.role === ROLES.SUPER_ADMIN;
+
+    // ── Toolbar: bulk-delete button (super_admin only) ──────────────────
+    let toolbar = document.getElementById('actionsToolbar');
+    if (!toolbar) {
+      toolbar = document.createElement('div');
+      toolbar.id = 'actionsToolbar';
+      toolbar.style.cssText = 'display:flex;align-items:center;gap:10px;margin-bottom:10px;min-height:32px';
+      const card = tbody.closest('.card');
+      card.insertBefore(toolbar, card.firstChild);
+    }
+    if (isSA && actions.length > 0) {
+      toolbar.innerHTML = `
+        <label style="font-size:13px;color:var(--color-text-muted);cursor:pointer;display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="actionSelectAll" onchange="toggleAllActions(this)">
+          Select all
+        </label>
+        <button class="btn btn-danger btn-sm" id="btnDeleteSelectedActions"
+                style="display:none" onclick="deleteSelectedActions()">
+          🗑 Delete Selected
+        </button>
+        <span id="actionsSelCount" style="font-size:12px;color:var(--color-text-muted)"></span>`;
+    } else {
+      toolbar.innerHTML = '';
+    }
+
     countEl.textContent = `${actions.length} action${actions.length !== 1 ? 's' : ''}`;
 
     if (actions.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="10" class="table-empty">No actions found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="11" class="table-empty">No actions found.</td></tr>';
       return;
     }
 
+    // Update table header to include checkbox column for super_admin
+    const thead = tbody.closest('table').querySelector('thead tr');
+    if (isSA && !thead.querySelector('.action-chk-th')) {
+      const th = document.createElement('th');
+      th.className = 'action-chk-th';
+      th.style.width = '36px';
+      thead.insertBefore(th, thead.firstChild);
+    } else if (!isSA) {
+      const chkTh = thead.querySelector('.action-chk-th');
+      if (chkTh) chkTh.remove();
+    }
+
     tbody.innerHTML = actions.map(a => {
-      const overdue    = a.status !== 'Closed' && a.status !== 'Verified' && isOverdue(a.targetDate);
-      const daysDiff   = daysUntil(a.targetDate);
+      const overdue  = a.status !== 'Closed' && a.status !== 'Verified' && isOverdue(a.targetDate);
+      const daysDiff = daysUntil(a.targetDate);
       let dueCls = '';
       if (overdue) dueCls = 'color:var(--color-danger);font-weight:600';
       else if (daysDiff !== null && daysDiff <= 3) dueCls = 'color:var(--color-warning);font-weight:600';
 
+      const chkCell = isSA
+        ? `<td style="width:36px;text-align:center"><input type="checkbox" class="action-row-chk"
+            data-id="${a.id}" onchange="onActionCheckChange()"></td>`
+        : '';
+
       return `
         <tr data-record-id="${a.id}">
+          ${chkCell}
           <td style="font-family:var(--font-mono);font-size:12px">${escapeHtml(a.id)}</td>
           <td style="font-family:var(--font-mono);font-size:11px">${escapeHtml(a.findingId || '—')}</td>
           <td>${escapeHtml(a.plantName || '—')}</td>
@@ -66,11 +110,60 @@ async function loadActions() {
     }).join('');
 
   } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${friendlyFirebaseError(e)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" class="table-empty">${friendlyFirebaseError(e)}</td></tr>`;
     console.error('[Actions] Load error:', e);
   }
 }
 
+/* ── Bulk-select helpers (super_admin only) ──────────────────────────────── */
+function onActionCheckChange() {
+  const checked = document.querySelectorAll('.action-row-chk:checked');
+  const all     = document.querySelectorAll('.action-row-chk');
+  const selAll  = document.getElementById('actionSelectAll');
+  const btn     = document.getElementById('btnDeleteSelectedActions');
+  const cntEl   = document.getElementById('actionsSelCount');
+
+  if (selAll) selAll.checked = (checked.length === all.length && all.length > 0);
+  if (btn)    btn.style.display = checked.length > 0 ? '' : 'none';
+  if (cntEl)  cntEl.textContent = checked.length > 0 ? `${checked.length} selected` : '';
+}
+
+function toggleAllActions(masterChk) {
+  document.querySelectorAll('.action-row-chk').forEach(c => { c.checked = masterChk.checked; });
+  onActionCheckChange();
+}
+
+async function deleteSelectedActions() {
+  const checked = [...document.querySelectorAll('.action-row-chk:checked')];
+  if (!checked.length) return;
+
+  const ids = checked.map(c => c.dataset.id);
+  const result = await confirmAction({
+    title:       'Delete Corrective Actions',
+    message:     `Permanently delete ${ids.length} corrective action${ids.length > 1 ? 's' : ''}? This cannot be undone.`,
+    confirmText: 'Delete',
+    dangerStyle: true
+  });
+  if (!result.confirmed) return;
+
+  showLoading('Deleting…');
+  let failed = 0;
+  for (const id of ids) {
+    try {
+      await col('correctiveActions').doc(id).delete();
+      await logActivity('action', `Action deleted: ${id}`, id, null);
+    } catch (e) {
+      console.error('[Actions] Delete failed for', id, e);
+      failed++;
+    }
+  }
+  hideLoading();
+  if (failed > 0) showToast(`${ids.length - failed} deleted, ${failed} failed.`, 'warning');
+  else            showToast(`${ids.length} action${ids.length > 1 ? 's' : ''} deleted.`, 'success');
+  await loadActions();
+}
+
+/* ── Action buttons per row ──────────────────────────────────────────────── */
 function buildActionButtons(action, user) {
   const btns = [];
 
@@ -79,7 +172,7 @@ function buildActionButtons(action, user) {
     btns.push(`<button class="btn btn-primary btn-sm" onclick="submitActionUpdate('${action.id}')">Update</button>`);
   }
 
-  // Plant admin / super admin can verify
+  // Auditor / plant admin / super admin can verify submitted actions
   if (action.status === 'Submitted' && can('verify_action')) {
     btns.push(`<button class="btn btn-success btn-sm" onclick="approveAction('${action.id}')">Approve</button>`);
     btns.push(`<button class="btn btn-ghost btn-sm" onclick="returnAction('${action.id}')">Return</button>`);
@@ -233,8 +326,10 @@ async function submitActionUpdate(actionId, fromModal = false) {
       updatedAt:       firebase.firestore.FieldValue.serverTimestamp()
     });
 
-    // Notify plant admin
-    await notifyPlantAdmins(actionId, 'action_submitted', 'Action Submitted', `Action ${actionId} has been submitted for verification.`);
+    // Notify plant admin AND auditor assigned to this finding's audit
+    await notifyVerifiers(actionId, 'action_submitted',
+      'Action Plan Submitted',
+      `Action ${actionId} has been submitted for verification.`);
 
     await logActivity('action', `Action submitted: ${actionId}`, actionId, null);
     showToast('Action submitted for verification', 'success');
@@ -270,13 +365,22 @@ async function approveAction(actionId) {
       updatedAt:       firebase.firestore.FieldValue.serverTimestamp()
     });
 
-    // Notify submitter
+    // Notify submitter / creator
     if (action?.createdBy) {
       await createNotification(
         action.createdBy, 'action_verified',
-        'Action Approved', `Your corrective action ${actionId} has been approved.`,
+        'Action Approved', `Your corrective action ${actionId} has been approved and verified.`,
         'action', actionId, action.plantId,
         `action_verified_${actionId}`
+      );
+    }
+    // Also notify responsible person if different from creator
+    if (action?.responsibleUserId && action.responsibleUserId !== action?.createdBy) {
+      await createNotification(
+        action.responsibleUserId, 'action_verified',
+        'Action Approved', `Corrective action ${actionId} you are responsible for has been approved.`,
+        'action', actionId, action.plantId,
+        `action_verified_resp_${actionId}`
       );
     }
 
@@ -314,13 +418,22 @@ async function returnAction(actionId) {
       updatedAt:    firebase.firestore.FieldValue.serverTimestamp()
     });
 
-    // Notify action creator/responsible
+    // Notify creator
     if (action?.createdBy) {
       await createNotification(
         action.createdBy, 'action_returned',
         'Action Returned', `Action ${actionId} was returned: ${result.reason}`,
         'action', actionId, action.plantId,
         `action_returned_${actionId}_${Date.now()}`
+      );
+    }
+    // Also notify responsible person if different from creator
+    if (action?.responsibleUserId && action.responsibleUserId !== action?.createdBy) {
+      await createNotification(
+        action.responsibleUserId, 'action_returned',
+        'Action Returned', `Action ${actionId} you are responsible for was returned: ${result.reason}`,
+        'action', actionId, action.plantId,
+        `action_returned_resp_${actionId}_${Date.now()}`
       );
     }
 
@@ -360,26 +473,73 @@ async function closeAction(actionId) {
   }
 }
 
-/* ── Notification Helper ─────────────────────────────────── */
-async function notifyPlantAdmins(recordId, type, title, message) {
+/* ── Notification Helpers ────────────────────────────────── */
+
+/**
+ * Notify everyone who needs to verify this action:
+ *  - plant_admin(s) for this plant
+ *  - the auditor assigned to the audit that generated this finding
+ *  - super_admin(s)
+ */
+async function notifyVerifiers(actionId, type, title, message) {
   try {
-    const actionDoc  = await col('correctiveActions').doc(recordId).get();
-    const plantId    = actionDoc.data()?.plantId;
-    if (!plantId) return;
+    const actionDoc = await col('correctiveActions').doc(actionId).get();
+    const actionData = actionDoc.data();
+    if (!actionData) return;
 
-    const adminsSnap = await col('users')
-      .where('plantId', '==', plantId)
-      .where('role', 'in', [ROLES.PLANT_ADMIN, ROLES.SUPER_ADMIN])
-      .where('status', '==', 'active')
-      .get();
+    const plantId   = actionData.plantId;
+    const findingId = actionData.findingId;
 
-    for (const doc of adminsSnap.docs) {
+    // Collect recipient UIDs (deduplicated)
+    const recipientIds = new Set();
+
+    // 1. Plant admins + super admins
+    if (plantId) {
+      const adminsSnap = await col('users')
+        .where('plantId', '==', plantId)
+        .where('role', 'in', [ROLES.PLANT_ADMIN, ROLES.SUPER_ADMIN])
+        .where('status', '==', 'active')
+        .get();
+      adminsSnap.docs.forEach(d => recipientIds.add(d.id));
+    }
+
+    // 2. Auditor from the audit linked to this finding
+    if (findingId) {
+      try {
+        const findingDoc = await col('findings').doc(findingId).get();
+        const auditId    = findingDoc.exists ? findingDoc.data()?.auditId : null;
+        if (auditId) {
+          const auditDoc = await col('audits').doc(auditId).get();
+          const auditorId = auditDoc.exists ? auditDoc.data()?.auditorId : null;
+          if (auditorId) recipientIds.add(auditorId);
+        }
+      } catch (e) {
+        console.warn('[Actions] Could not resolve auditor for finding', findingId, e.message);
+      }
+    }
+
+    // 3. Also try auditId directly on the action (if stored)
+    if (actionData.auditId) {
+      try {
+        const auditDoc  = await col('audits').doc(actionData.auditId).get();
+        const auditorId = auditDoc.exists ? auditDoc.data()?.auditorId : null;
+        if (auditorId) recipientIds.add(auditorId);
+      } catch (_) {}
+    }
+
+    // Send in-app notification to all recipients
+    for (const uid of recipientIds) {
       await createNotification(
-        doc.id, type, title, message, 'action', recordId, plantId,
-        `${type}_${recordId}_${doc.id}`
+        uid, type, title, message, 'action', actionId, plantId,
+        `${type}_${actionId}_${uid}`
       );
     }
   } catch (e) {
-    console.warn('[Actions] notifyPlantAdmins error:', e.message);
+    console.warn('[Actions] notifyVerifiers error:', e.message);
   }
+}
+
+/** Legacy alias kept for backward compat */
+async function notifyPlantAdmins(recordId, type, title, message) {
+  return notifyVerifiers(recordId, type, title, message);
 }
