@@ -557,6 +557,7 @@
           <div class="view-actions">
             <button class="btn btn-secondary btn-sm" onclick="saveAuditDraft()">Save Draft</button>
             <button class="btn btn-primary btn-sm" onclick="submitAudit()" id="btnSubmitAudit">Submit Audit</button>
+            <button id="btnReviewActionPlans" class="btn btn-sm" onclick="window._lpaOpenActionPlanReview()" style="display:none;background:#059669;color:#fff;border:none;">📋 Review Action Plans</button>
           </div>
         </div>
 
@@ -6292,9 +6293,10 @@ async function _lpaLoadMgmtReviewAsGuest() {
                 <span style="font-size:11px;padding:3px 10px;border-radius:12px;background:${{Open:'#fef2f2',InProgress:'#fffbeb',Closed:'#f0fdf4'}[f.status?.replace(' ','')]||'#f3f4f6'};color:${{Open:'#dc2626',InProgress:'#d97706',Closed:'#16a34a'}[f.status?.replace(' ','')]||'#6b7280'};font-weight:600;">${escH(f.status||'Open')}</span>
               </div>
               ${f.description ? `<div style="font-size:12px;color:#4b5563;margin-bottom:10px;line-height:1.6;">${escH(f.description)}</div>` : ''}
+              ${f.status === 'Revision Required' && f.auditorComment ? `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:12px;color:#92400e;"><strong>🔄 Auditor's comment:</strong> ${escH(f.auditorComment)}</div>` : ''}
               <div style="margin-bottom:8px;">
                 <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Corrective Action Plan *</label>
-                <textarea id="ap_action_${f.id}" rows="2" style="width:100%;padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;" placeholder="Describe the corrective action taken or planned…">${escH(f.correctiveAction||'')}</textarea>
+                <textarea id="ap_action_${f.id}" rows="2" style="width:100%;padding:8px 10px;border:1px solid ${f.status==='Revision Required'?'#fde68a':'#d1d5db'};border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;" placeholder="Describe the corrective action taken or planned…">${escH(f.correctiveAction||'')}</textarea>
               </div>
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
                 <div>
@@ -6473,6 +6475,25 @@ window._waitForFirebase_lpa = async function() {
   }, 300);
 })();
 </script>
+
+<!-- ── Action Plan Review Modal ─────────────────────────────────── -->
+<div id="actionPlanReviewModal" style="display:none;position:fixed;inset:0;z-index:9000;background:rgba(15,23,42,.55);backdrop-filter:blur(4px);overflow:auto;padding:24px 16px;">
+  <div style="max-width:720px;margin:0 auto;background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.25);overflow:hidden;">
+    <div style="background:linear-gradient(135deg,#1a56db,#2472cc);padding:22px 28px;display:flex;justify-content:space-between;align-items:center;">
+      <div>
+        <div style="color:#fff;font-size:18px;font-weight:700;">📋 Review Action Plans</div>
+        <div style="color:rgba(255,255,255,.75);font-size:12px;margin-top:3px;">Verify or return each finding's corrective action plan</div>
+      </div>
+      <button onclick="document.getElementById('actionPlanReviewModal').style.display='none'" style="background:rgba(255,255,255,.15);border:none;color:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;font-size:18px;line-height:1;">✕</button>
+    </div>
+    <div id="actionPlanReviewBody" style="padding:24px;max-height:70vh;overflow-y:auto;">
+      <div style="text-align:center;padding:40px;color:#6b7280;">Loading…</div>
+    </div>
+    <div style="padding:16px 24px;border-top:1px solid #e5e7eb;display:flex;justify-content:flex-end;gap:10px;">
+      <button onclick="document.getElementById('actionPlanReviewModal').style.display='none'" style="background:#f3f4f6;color:#374151;border:none;border-radius:8px;padding:9px 20px;font-size:13px;cursor:pointer;">Close</button>
+    </div>
+  </div>
+</div>
 
 <!-- ── Multi-Select Delete Toolbar ───────────────────────────────── -->
 <div id="lpaDeleteToolbar" style="display:none;position:fixed;bottom:28px;left:50%;transform:translateX(-50%);z-index:8000;background:#1e293b;color:#fff;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.35);padding:12px 20px;align-items:center;gap:16px;font-size:14px;min-width:320px;max-width:90vw;">
@@ -6776,6 +6797,171 @@ window._waitForFirebase_lpa = async function() {
     // Reload the table
     if (_mode === 'audits'   && typeof loadAudits   === 'function') loadAudits();
     if (_mode === 'findings' && typeof loadFindings  === 'function') loadFindings();
+  };
+
+})();
+</script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+//  ACTION PLAN REVIEW (Auditor: Verify / Return to Auditee)
+// ═══════════════════════════════════════════════════════════════════
+(function() {
+
+  // Watch auditExecContent: when audit changes, check if review button should show
+  function checkReviewButton() {
+    const auditId = window._lpaCurrentAuditId;
+    const btn = document.getElementById('btnReviewActionPlans');
+    if (!btn) return;
+    if (!auditId) { btn.style.display = 'none'; return; }
+
+    const db = window.db || (window.firebase && firebase.firestore && firebase.firestore());
+    if (!db) return;
+
+    db.doc(`apps/lpa/audits/${auditId}`).get().then(doc => {
+      if (!doc.exists) { btn.style.display = 'none'; return; }
+      const status = doc.data().status;
+      // Show button when there are action plans to review
+      btn.style.display = ['Action Required', 'Submitted', 'Under Review'].includes(status) ? '' : 'none';
+    }).catch(() => { btn.style.display = 'none'; });
+  }
+
+  // Observe auditExecContent for audit ID changes
+  function startReviewObserver() {
+    const el = document.getElementById('auditExecContent');
+    if (!el) { setTimeout(startReviewObserver, 500); return; }
+    const obs = new MutationObserver(function() {
+      setTimeout(checkReviewButton, 300);
+    });
+    obs.observe(el, { childList: true, subtree: false });
+  }
+  document.addEventListener('DOMContentLoaded', startReviewObserver);
+  if (document.readyState !== 'loading') startReviewObserver();
+
+  // ── Open Review Modal ─────────────────────────────────────────
+  window._lpaOpenActionPlanReview = async function() {
+    const modal = document.getElementById('actionPlanReviewModal');
+    const body  = document.getElementById('actionPlanReviewBody');
+    const auditId = window._lpaCurrentAuditId;
+    if (!modal || !body || !auditId) return;
+
+    modal.style.display = 'block';
+    body.innerHTML = '<div style="text-align:center;padding:40px;color:#6b7280;">Loading findings…</div>';
+
+    try {
+      await window._waitForFirebase_lpa();
+      const db = window.db || firebase.firestore();
+
+      const [auditDoc, fSnap] = await Promise.all([
+        db.doc(`apps/lpa/audits/${auditId}`).get(),
+        db.collection('apps/lpa/findings').where('auditId', '==', auditId).get()
+      ]);
+
+      const audit    = auditDoc.data() || {};
+      const findings = fSnap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .filter(f => f.correctiveAction); // only show findings with submitted plans
+
+      if (!findings.length) {
+        body.innerHTML = '<div style="text-align:center;padding:40px;color:#6b7280;font-size:14px;">No action plans submitted yet for this audit.</div>';
+        return;
+      }
+
+      body.innerHTML = findings.map(f => {
+        const isVerified  = f.status === 'Closed' || f.status === 'Verified';
+        const isReturned  = f.status === 'Revision Required';
+        const statusColor = isVerified ? '#059669' : isReturned ? '#d97706' : '#1a56db';
+        const statusLabel = isVerified ? '✅ Verified' : isReturned ? '🔄 Returned' : '⏳ Pending Review';
+
+        return `<div id="apcard_${f.id}" style="border:1px solid #e5e7eb;border-radius:12px;padding:18px;margin-bottom:16px;background:${isVerified?'#f0fdf4':isReturned?'#fffbeb':'#fafafa'};">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;gap:10px;flex-wrap:wrap;">
+            <div style="font-size:14px;font-weight:600;color:#1a2a3a;flex:1;">${escH(f.title||f.description?.substring(0,80)||'Finding')}</div>
+            <span style="font-size:11px;padding:3px 10px;border-radius:12px;background:${statusColor}18;color:${statusColor};font-weight:600;white-space:nowrap;">${statusLabel}</span>
+          </div>
+          ${f.description ? `<div style="font-size:12px;color:#6b7280;margin-bottom:10px;line-height:1.6;">${escH(f.description)}</div>` : ''}
+          <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:12px;margin-bottom:12px;">
+            <div style="font-size:10px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;">Corrective Action Plan</div>
+            <div style="font-size:13px;color:#111827;line-height:1.6;">${escH(f.correctiveAction||'—')}</div>
+            ${f.responsiblePerson ? `<div style="font-size:12px;color:#6b7280;margin-top:6px;">👤 ${escH(f.responsiblePerson)}${f.targetDate ? ' · 📅 ' + escH(f.targetDate) : ''}</div>` : ''}
+          </div>
+          ${isReturned && f.auditorComment ? `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:12px;color:#92400e;"><strong>Previously returned:</strong> ${escH(f.auditorComment)}</div>` : ''}
+          ${!isVerified ? `
+          <div id="returnBox_${f.id}" style="display:none;margin-bottom:10px;">
+            <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Return Reason / Comment *</label>
+            <textarea id="returnComment_${f.id}" rows="2" style="width:100%;padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box;" placeholder="Explain what needs to be corrected…"></textarea>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button onclick="window._lpaVerifyFinding('${auditId}','${f.id}')" style="background:#059669;color:#fff;border:none;border-radius:8px;padding:8px 18px;font-size:13px;font-weight:600;cursor:pointer;">✅ Verify & Close</button>
+            <button id="btnReturn_${f.id}" onclick="window._lpaToggleReturnBox('${f.id}')" style="background:#f59e0b;color:#fff;border:none;border-radius:8px;padding:8px 18px;font-size:13px;font-weight:600;cursor:pointer;">🔄 Return to Auditee</button>
+          </div>` : `<div style="font-size:12px;color:#059669;font-weight:600;">✅ Action plan accepted and finding closed.</div>`}
+          <div id="apMsg_${f.id}" style="display:none;font-size:12px;margin-top:8px;padding:8px 12px;border-radius:6px;"></div>
+        </div>`;
+      }).join('');
+
+    } catch(err) {
+      body.innerHTML = `<div style="text-align:center;padding:40px;color:#e53e3e;font-size:13px;">Error: ${err.message}</div>`;
+    }
+  };
+
+  // Toggle return comment box
+  window._lpaToggleReturnBox = function(findingId) {
+    const box = document.getElementById('returnBox_'+findingId);
+    const btn = document.getElementById('btnReturn_'+findingId);
+    if (!box) return;
+    if (box.style.display === 'none') {
+      box.style.display = 'block';
+      btn.textContent = '✉️ Send Return';
+      btn.onclick = function() { window._lpaReturnFinding(window._lpaCurrentAuditId, findingId); };
+    } else {
+      box.style.display = 'none';
+      btn.textContent = '🔄 Return to Auditee';
+      btn.onclick = function() { window._lpaToggleReturnBox(findingId); };
+    }
+  };
+
+  // ── Verify Finding ────────────────────────────────────────────
+  window._lpaVerifyFinding = async function(auditId, findingId) {
+    const msgEl = document.getElementById('apMsg_'+findingId);
+    try {
+      const db = window.db || firebase.firestore();
+      await db.doc(`apps/lpa/findings/${findingId}`).update({
+        status:     'Closed',
+        verifiedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        verifiedBy: window.currentUser?.name || window.currentUser?.uid || 'Auditor'
+      });
+      // Check if all findings are verified → close audit
+      const fSnap = await db.collection('apps/lpa/findings').where('auditId','==',auditId).get();
+      const allClosed = fSnap.docs.every(d => ['Closed','Verified'].includes(d.data().status));
+      if (allClosed) await db.doc(`apps/lpa/audits/${auditId}`).update({ status: 'Closed' });
+      // Refresh card
+      document.getElementById('apcard_'+findingId).style.background = '#f0fdf4';
+      if (msgEl) { msgEl.style.display='block'; msgEl.style.background='#f0fdf4'; msgEl.style.color='#059669'; msgEl.textContent='✅ Finding verified and closed.'; }
+      showToast && showToast('Finding verified ✅', 'success');
+      setTimeout(() => window._lpaOpenActionPlanReview(), 800);
+    } catch(err) {
+      if (msgEl) { msgEl.style.display='block'; msgEl.style.background='#fef2f2'; msgEl.style.color='#dc2626'; msgEl.textContent='Error: '+err.message; }
+    }
+  };
+
+  // ── Return Finding to Auditee ─────────────────────────────────
+  window._lpaReturnFinding = async function(auditId, findingId) {
+    const comment = document.getElementById('returnComment_'+findingId)?.value.trim();
+    const msgEl   = document.getElementById('apMsg_'+findingId);
+    if (!comment) {
+      if (msgEl) { msgEl.style.display='block'; msgEl.style.background='#fef2f2'; msgEl.style.color='#dc2626'; msgEl.textContent='Please enter a return reason.'; }
+      return;
+    }
+    const btn = document.getElementById('btnReturn_'+findingId);
+    if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+    try {
+      const fn = firebase.app().functions('asia-south1').httpsCallable('lpaReturnActionPlan');
+      await fn({ auditId, findingId, comment, baseUrl: location.origin + location.pathname });
+      if (msgEl) { msgEl.style.display='block'; msgEl.style.background='#fffbeb'; msgEl.style.color='#92400e'; msgEl.textContent='🔄 Returned to auditee. They will receive an email with your comment.'; }
+      showToast && showToast('Action plan returned to auditee', 'warning');
+      setTimeout(() => window._lpaOpenActionPlanReview(), 1000);
+    } catch(err) {
+      if (btn) { btn.disabled = false; btn.textContent = '✉️ Send Return'; }
+      if (msgEl) { msgEl.style.display='block'; msgEl.style.background='#fef2f2'; msgEl.style.color='#dc2626'; msgEl.textContent='Error: '+err.message; }
+    }
   };
 
 })();
