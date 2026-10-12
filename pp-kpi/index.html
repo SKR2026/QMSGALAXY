@@ -6939,48 +6939,51 @@ function getMatrixData(){
         ).toFixed(2))
       : null;
 
-    // CY Annual Target:
-    // If ALL 12 months have a specific monthly target defined → aggregate them
-    // (average for Days/Hrs/Nos/ratio/% units, sum for all other absolute units).
-    // Otherwise fall back to the year-level annual target.
-    const allMonthsHaveTarget = MONTHS.every(m => {
-      const dataYear = (monthStartIdx===3 && MONTHS.indexOf(m)<3) ? year+1 : year;
-      // Check whether the value came from a *monthly* target specifically (not just
-      // falling through to the annual / base). Must check BOTH plant-specific monthly
-      // targets AND global monthly targets, since resolveTarget now prefers plant-specific.
-      const y = String(dataYear);
-      // Fixed mapGetL: use numKey (not obj[n] which was a typo referencing an undeclared variable)
+    // Helper: compute the "effective annual target" for any FY start year,
+    // using the same monthly-aggregation logic as CY Annual Target.
+    // If all 12 months have explicit monthly targets → aggregate (sum or avg).
+    // Otherwise → fall back to the stored year-level annual target.
+    function computeEffectiveAnnualTarget(tgtYear, resolvedPlant){
       function mapGetL(obj,key){ if(!obj)return undefined; if(obj[key]!=null)return obj[key]; const numKey=parseInt(key); if(!isNaN(numKey)&&obj[numKey]!=null)return obj[numKey]; return undefined; }
-      const resolvedPlant = plant === 'All' ? null : plant;
-      // Priority mirrors resolveTarget: plant-specific monthly → global monthly
-      const plantOvrL = resolvedPlant ? (k.plantOverrides && k.plantOverrides[resolvedPlant]) : null;
-      if(plantOvrL && plantOvrL.monthTargets){
-        const pYearMap = mapGetL(plantOvrL.monthTargets, y);
-        if(pYearMap && pYearMap[m] != null) return true;
+      const allHave = MONTHS.every(m => {
+        const dataYear = (monthStartIdx===3 && MONTHS.indexOf(m)<3) ? tgtYear+1 : tgtYear;
+        let fyKey = dataYear;
+        if(appSettings.fyMode === 'apr' && ['January','February','March'].includes(m)) fyKey = dataYear - 1;
+        const y = String(fyKey);
+        if(resolvedPlant){
+          const pOvr = k.plantOverrides && k.plantOverrides[resolvedPlant];
+          if(!pOvr || !pOvr.monthTargets) return false;
+          const pMap = mapGetL(pOvr.monthTargets, y);
+          return pMap && pMap[m] != null;
+        }
+        const yearMap = k.monthTargets ? mapGetL(k.monthTargets, y) : null;
+        return yearMap && yearMap[m] != null;
+      });
+      if(allHave){
+        const mVals = MONTHS.map(m=>{
+          const dataYear = (monthStartIdx===3 && MONTHS.indexOf(m)<3) ? tgtYear+1 : tgtYear;
+          return resolveTarget(k, dataYear, m, resolvedPlant);
+        }).filter(v=>v!=null);
+        return shouldAverage(k)
+          ? parseFloat((mVals.reduce((s,v)=>s+v,0)/mVals.length).toFixed(2))
+          : parseFloat(mVals.reduce((s,v)=>s+v,0).toFixed(2));
       }
-      const yearMap = k.monthTargets ? mapGetL(k.monthTargets, y) : null;
-      return yearMap && yearMap[m] != null;
-    });
-
-    let cyAnnualTarget;
-    if(allMonthsHaveTarget){
-      // Aggregate the 12 monthly targets
-      const mVals = MONTHS.map(m=>{
-        const dataYear = (monthStartIdx===3 && MONTHS.indexOf(m)<3) ? year+1 : year;
-        return resolveTarget(k, dataYear, m, plant==='All' ? null : plant);
-      }).filter(v=>v!=null);
-      cyAnnualTarget = shouldAverage(k)
-        ? parseFloat((mVals.reduce((s,v)=>s+v,0)/mVals.length).toFixed(2))
-        : parseFloat(mVals.reduce((s,v)=>s+v,0).toFixed(2));
-    } else {
-      cyAnnualTarget = resolveTarget(k, year, null, plant==='All' ? null : plant);
+      return resolveTarget(k, tgtYear, null, resolvedPlant);
     }
 
-    // Annual target for CY (used for reference, not LY)
-    const annualTarget = resolveTarget(k, year, null, plant==='All' ? null : plant);
+    const resolvedPlantKey = plant === 'All' ? null : plant;
 
-    // LY target — resolve for the PREVIOUS fiscal year, not the current one
-    const lyTarget = resolveTarget(k, year - 1, null, plant==='All' ? null : plant);
+    // CY Annual Target — uses monthly aggregation when all months are set
+    const cyAnnualTarget = computeEffectiveAnnualTarget(year, resolvedPlantKey);
+
+    // Annual target for CY (used for reference, not LY)
+    const annualTarget = resolveTarget(k, year, null, resolvedPlantKey);
+
+    // LY target — use the SAME monthly-aggregation logic as CY Annual Target but
+    // for the previous FY. A plain resolveTarget(year-1) would return the raw stored
+    // base/annual target which can differ from the aggregated monthly total shown in
+    // last year's CY Annual Target column.
+    const lyTarget = computeEffectiveAnnualTarget(year - 1, resolvedPlantKey);
 
     return { idx:idx+1, k, annualTarget, cyAnnualTarget, ytdTarget, lyTarget, lyActual,
              ytdActual, monthActuals, monthTargets, viewBy, orderedMonths };
@@ -8327,11 +8330,13 @@ function renderTSMonthGrid(){
   const tsPlant = (document.getElementById('tsMonthPlant')||{}).value || 'All';
   const pOvr = tsPlant !== 'All' ? (k.plantOverrides && k.plantOverrides[tsPlant]) : null;
 
-  // Year target: prefer plant-specific year target, then plant-specific base, then global year target, then global base
+  // Year target: for a specific plant, use ONLY that plant's own year target (no fallback to global sum).
+  // Falling back to k.yearTargets[yr] would show the sum of all plants' targets on every plant that
+  // lacks its own year target, which is misleading.
   const yTgt = tsPlant !== 'All'
     ? (pOvr && pOvr.yearTargets && pOvr.yearTargets[yr] != null
         ? pOvr.yearTargets[yr]
-        : (k.yearTargets && k.yearTargets[yr] != null ? k.yearTargets[yr] : null))
+        : null)
     : (k.yearTargets && k.yearTargets[yr] != null ? k.yearTargets[yr] : null);
 
   // Base target: prefer plant-specific base override, else global base
@@ -8559,9 +8564,11 @@ function _tsDistGetContext(){
   let yTgt = null;
   if(plant !== 'All'){
     const pOvr = k.plantOverrides && k.plantOverrides[plant];
+    // Use ONLY this plant's own year target — do NOT fall back to k.yearTargets[yr]
+    // (which is the sum of all plants and would incorrectly appear on every other plant).
     yTgt = (pOvr && pOvr.yearTargets && pOvr.yearTargets[yr] != null)
       ? pOvr.yearTargets[yr]
-      : (k.yearTargets && k.yearTargets[yr] != null ? k.yearTargets[yr] : k.target);
+      : null;
   } else {
     yTgt = (k.yearTargets && k.yearTargets[yr] != null) ? k.yearTargets[yr] : k.target;
   }
