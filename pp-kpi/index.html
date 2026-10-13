@@ -12028,8 +12028,8 @@ function _restoreCache(){
     const raw = localStorage.getItem(_cacheKey());
     if(!raw) return false;
     const p = JSON.parse(raw);
-    // Max age: 30 minutes
-    if(!p || Date.now() - p.ts > 30*60*1000) return false;
+    // Max age: 2 hours (KPI master / plants / depts change rarely; entries refresh on every login)
+    if(!p || Date.now() - p.ts > 120*60*1000) return false;
     // Restore plants
     if(p.plants && p.plants.length){
       plantsList.length = 0;
@@ -12078,18 +12078,31 @@ async function loadFirebaseData() {
   if(!hadCache) _showDataSkeleton();
 
   // ── Phase 1: fire all independent fetches in parallel ───────────
-  // Settings, Plants, Departments, KPI Master, Entries, My Entries,
-  // Action Plans, and Users all go out simultaneously.
+  // Settings, Plants, Departments, KPI Master, and Entries (current year only)
+  // go out simultaneously. My Entries and Action Plans are derived client-side
+  // from the fetched entries — no extra round-trips. Users load only for roles
+  // that need them (superadmin / plant admin).
   const email = (window._fbProfile && window._fbProfile.email) || (currentUser && currentUser.email);
+  const role  = window._roleInfo;
+
+  // Determine the current FY start-year to limit the entry fetch to one year.
+  // This is the single biggest load-time reduction: instead of fetching ALL
+  // historical entries, we only fetch the active fiscal year on login.
+  const _nowYear = new Date().getFullYear();
+  const _nowMonth = new Date().getMonth(); // 0-based
+  // For Apr-Mar FY the year rolls in April (month 3); otherwise January (month 0).
+  const _fyStartYear = (appSettings.fyMode === 'apr' && _nowMonth < 3) ? _nowYear - 1 : _nowYear;
+  // Fetch current year AND previous year so LY comparisons work immediately.
+  const _cyYear = _fyStartYear;
+  const _lyYear = _fyStartYear - 1;
 
   const [
     _settings,
     fsPlants,
     fsDepts,
     fsKPIs,
-    fsEntriesRaw,
-    mineRaw,
-    actionsRaw,
+    fsCYEntriesRaw,
+    fsLYEntriesRaw,
     fsUsers
   ] = await Promise.allSettled([
     // 0. Settings
@@ -12100,15 +12113,26 @@ async function loadFirebaseData() {
     getDepts(),
     // 1. KPI Master
     getKPIMaster(),
-    // 2. KPI Entries
-    getKPIEntries({}),
-    // 2b. My entries
-    (email && window.FB && window.FB.getMyEntries) ? getMyEntries(email) : Promise.resolve([]),
-    // 3. Action plans
-    getOpenActionPlans(),
-    // 4. Users
-    getAllUsers()
+    // 2. KPI Entries — current year only (biggest bottleneck reduction)
+    getKPIEntries({ year: _cyYear }),
+    // 2b. Previous year entries for LY column (parallel, not blocking)
+    getKPIEntries({ year: _lyYear }),
+    // 3. Users — only load for admin roles that need the full list
+    (role && (role.isSuperAdmin || role.isPlantAdmin))
+      ? getAllUsers()
+      : Promise.resolve([])
   ]);
+
+  // ── Synthesise my-entries and action-plans client-side ───────────
+  // Both are subsets of what we already fetched — no extra Firestore reads.
+  const _allFetchedEntries = [
+    ...(fsCYEntriesRaw.status === 'fulfilled' ? fsCYEntriesRaw.value : []),
+    ...(fsLYEntriesRaw.status === 'fulfilled' ? fsLYEntriesRaw.value : [])
+  ];
+  const mineRaw     = { status: 'fulfilled', value: email ? _allFetchedEntries.filter(e => e.submittedBy === email) : [] };
+  const actionsRaw  = { status: 'fulfilled', value: _allFetchedEntries.filter(e => ['open','in-progress','overdue'].includes(e.actionStatus)) };
+  // Merge CY + LY into one deduplicated set for the existing Phase 2 logic
+  const fsEntriesRaw = { status: fsCYEntriesRaw.status, value: _allFetchedEntries };
 
   // ── Phase 2: process each result in dependency order ────────────
 
