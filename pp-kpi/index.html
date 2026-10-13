@@ -12123,16 +12123,33 @@ async function loadFirebaseData() {
       : Promise.resolve([])
   ]);
 
-  // ── Synthesise my-entries and action-plans client-side ───────────
-  // Both are subsets of what we already fetched — no extra Firestore reads.
+  // ── Synthesise action-plans client-side ─────────────────────────
+  // Action plans are a subset of what we already fetched — no extra reads.
+  // NOTE: mineRaw is intentionally NOT re-merged here. All entries (including
+  // the current user's) are already in fsEntriesRaw and will be processed once
+  // by the main merge block. A second mergeFirebaseEntriesKeepSubmitted(mine)
+  // pass on the same raw docs caused event-based KPIs (Customer Complaint) to
+  // appear as duplicates because _evtLocalMatch only skips entries that lack an
+  // fsId — entries already in recentEntries have one, so the byFsId path updated
+  // them in-place (no duplication). But for plant-restricted users receiving
+  // other-plant entries in the combined fetch, count inflated vs superadmin view.
   const _allFetchedEntries = [
     ...(fsCYEntriesRaw.status === 'fulfilled' ? fsCYEntriesRaw.value : []),
     ...(fsLYEntriesRaw.status === 'fulfilled' ? fsLYEntriesRaw.value : [])
   ];
-  const mineRaw     = { status: 'fulfilled', value: email ? _allFetchedEntries.filter(e => e.submittedBy === email) : [] };
-  const actionsRaw  = { status: 'fulfilled', value: _allFetchedEntries.filter(e => ['open','in-progress','overdue'].includes(e.actionStatus)) };
-  // Merge CY + LY into one deduplicated set for the existing Phase 2 logic
-  const fsEntriesRaw = { status: fsCYEntriesRaw.status, value: _allFetchedEntries };
+
+  // Apply plant restriction client-side for plant-scoped roles so they only
+  // see their own plant's data — even though the Firestore query is unfiltered.
+  const _plantFilter = (role && (role.isPlantAdmin || role.isDeptUser) && role.plant) ? role.plant : null;
+  const _scopedEntries = _plantFilter
+    ? _allFetchedEntries.filter(e => String(e.plant||'').trim().toLowerCase() === _plantFilter.trim().toLowerCase())
+    : _allFetchedEntries;
+
+  // mineRaw — skip re-merge (entries already in fsEntriesRaw; re-merging causes duplicates)
+  const mineRaw     = { status: 'fulfilled', value: [] };
+  const actionsRaw  = { status: 'fulfilled', value: _scopedEntries.filter(e => ['open','in-progress','overdue'].includes(e.actionStatus)) };
+  // Main entry set — plant-scoped where appropriate
+  const fsEntriesRaw = { status: fsCYEntriesRaw.status, value: _scopedEntries };
 
   // ── Phase 2: process each result in dependency order ────────────
 
