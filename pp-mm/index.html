@@ -854,8 +854,11 @@ function loadPersistedTasks(){
     if(saved && Array.isArray(saved) && saved.length > 0){
       TASKS.length = 0;
       saved.forEach(t => {
-        // Ensure uid is a number (or null) to match USERS[].id after JSON round-trip
-        if(t.uid !== null && t.uid !== undefined) t.uid = Number(t.uid);
+        // Ensure uid is a number for internal users, but preserve 'ext-N' strings for external assignees
+        if(t.uid !== null && t.uid !== undefined){
+          if(typeof t.uid === 'string' && t.uid.startsWith('ext-')) { /* keep as-is */ }
+          else t.uid = Number(t.uid);
+        }
         // Normalise legacy status values
         if(t.status === 'done') t.status = 'completed';
         if(t.status === 'escalated') t.status = 'overdue';
@@ -1021,9 +1024,26 @@ function doUserEmailLogin(){
   if(!email){ if(errEl){errEl.textContent='Please enter your email address.';errEl.style.display='block';} return; }
   const _try=(users)=>{
     const u=users.find(x=>(x.email||'').toLowerCase()===email);
-    if(!u){ if(errEl){errEl.textContent='No account found for this email.';errEl.style.display='block';} return; }
-    if(errEl) errEl.style.display='none';
-    loginAsUser(u.id, /*taskOnly=*/true);
+    if(u){
+      if(errEl) errEl.style.display='none';
+      loginAsUser(u.id, /*taskOnly=*/true);
+      return;
+    }
+    // Not found in USERS — check external attendees across all meetings
+    let extName='', extOrg='';
+    const hasExtTasks=MEETINGS.some(m=>(m.externalAttendees||[]).some((ea,i)=>{
+      if((ea.email||'').toLowerCase()===email){
+        extName=ea.name; extOrg=ea.org||'External';
+        return true;
+      }
+      return false;
+    }));
+    if(hasExtTasks){
+      if(errEl) errEl.style.display='none';
+      loginAsExternalAssignee(email, extName, extOrg);
+      return;
+    }
+    if(errEl){errEl.textContent='No account found for this email.';errEl.style.display='block';}
   };
   const col=typeof FS_USERS==='function'?FS_USERS():null;
   if(col&&_authFs&&_authFs.currentUser){
@@ -1268,6 +1288,16 @@ async function _validateAndLogin(matchUser, pVal, errEl, _resetBtn){
   hideLoginScreen();
   applySession(matchUser.name,matchUser.dept,matchUser.ini,matchUser.col,matchUser.tc,true);
   checkLicenseAfterLogin(); // check license AFTER login for ALL roles
+}
+
+function loginAsExternalAssignee(email, name, org){
+  const ini=(name||'?').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+  loggedInAs={id:null, name:name||email, email:email, role:'assignee', isExternal:true, extEmail:email.toLowerCase(), ini:ini, col:'#fff3cd', tc:'#856404', dept:org||'External'};
+  currentRole='assignee';
+  baseRole='assignee';
+  hideLoginScreen();
+  applySession(loggedInAs.name, loggedInAs.dept, ini, '#fff3cd', '#856404', true);
+  checkLicenseAfterLogin();
 }
 
 function loginAsUser(uid, taskOnly=false){
@@ -2471,6 +2501,18 @@ function getDashboardTasks(){
   // assignee: own tasks only
   const uid = (loggedInAs && loggedInAs.id != null) ? Number(loggedInAs.id) : null;
   if(currentRole==='assignee'){
+    // External attendee session — match by email stored in meeting's externalAttendees
+    if(loggedInAs && loggedInAs.isExternal){
+      const extEmail=loggedInAs.extEmail;
+      return TASKS.filter(t=>{
+        if(!t.uid||!String(t.uid).startsWith('ext-')) return false;
+        const m=MEETINGS.find(x=>x.id===t.mid);
+        if(!m) return false;
+        const idx=parseInt(String(t.uid).replace('ext-',''),10);
+        const ea=m.externalAttendees&&m.externalAttendees[idx];
+        return ea&&(ea.email||'').toLowerCase()===extEmail;
+      });
+    }
     return uid != null ? TASKS.filter(t=>Number(t.uid)===uid) : [];
   }
   return getVisibleTasks();
