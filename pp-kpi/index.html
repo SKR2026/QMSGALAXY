@@ -2877,19 +2877,46 @@ function getTotalSales(plant, year, month){
   // 2. Any kpiMaster entry whose name is exactly "Total Sales" (covers Firebase-added KPIs)
   const salesIds = new Set(
     kpiMaster
-      .filter(k => k.isTotalSales || k.name === 'Total Sales')
+      .filter(k => k.isTotalSales || String(k.name||'').trim().toLowerCase() === 'total sales')
       .map(k => String(k.id))
   );
   if(!salesIds.size) return null;
   const yearStr = String(year).split('-')[0]; // handle "2026-27" → "2026"
+  const _n = s => String(s==null?'':s).trim().toLowerCase();
   const entries = allData.filter(d =>
     salesIds.has(String(d.kpiId)) &&
-    d.plant === plant &&
+    _n(d.plant) === _n(plant) &&
     String(d.year).split('-')[0] === yearStr &&
-    d.month === month
+    _n(d.month) === _n(month)
   );
   if(!entries.length) return null;
   return parseFloat(entries[entries.length - 1].actual) || null;
+}
+
+// A Finance "% of Total Sales" KPI: amount is typed in Crores, shown/stored as %.
+function isFinancePctKPI(k){
+  if(!k) return false;
+  return !!(k.salesRatioPct || k.ytdMethod === 'sales-ratio' || (k.dept === 'Finance' && k.unit === '%'));
+}
+
+// SINGLE SOURCE OF TRUTH — turn one stored Finance % entry into its % value.
+//  • New entries store actualRs (Crores typed) + totalSalesRs (Crores) + actual (= the %).
+//    → % = actualRs ÷ totalSalesRs × 100
+//  • Legacy entries (no actualRs) store the raw typed amount in `actual`
+//    → % = actual ÷ Total Sales (looked up for that plant/month) × 100
+//  • If no Total Sales can be found, pct is null (shown as "—") — never a raw amount posing as %.
+function financeEntryPct(e){
+  const r2 = v => parseFloat(v.toFixed(2));
+  const raw = parseFloat(e.actual);
+  const rs  = (e.actualRs != null && e.actualRs !== '') ? parseFloat(e.actualRs) : NaN;
+  let ts = parseFloat(e.totalSalesRs);
+  if(!(ts > 0)) ts = getTotalSales(e.plant, e.year, e.month) || 0;
+  if(!isNaN(rs)){
+    if(ts > 0) return { pct: r2(rs / ts * 100), rs, ts, src: 'saved' };
+    return { pct: isNaN(raw) ? null : r2(raw), rs, ts: 0, src: 'saved (no sales)' }; // actual already holds the %
+  }
+  if(ts > 0 && !isNaN(raw)) return { pct: r2(raw / ts * 100), rs: raw, ts, src: 'legacy' };
+  return { pct: null, rs: raw, ts: 0, src: 'no Total Sales found' };
 }
 
 // For Finance % KPIs stored in ₹ — convert to % for display in matrix
@@ -5082,9 +5109,8 @@ function _updateFinanceSalesRowVisibility(){
   const dept  = document.getElementById('entryDept').value;
   // Show for Finance dept always (all Finance KPIs need Total Sales as denominator)
   // Also show if the selected KPI explicitly has salesRatioPct flag
-  const isFinanceDept = (dept === 'Finance');
   let k = kpiMaster.find(k=>String(k.id)===String(kpiId));
-  const isSalesRatio = isFinanceDept || !!(k && k.salesRatioPct);
+  const isSalesRatio = isFinancePctKPI(k);
   // Inline Total Sales field (between Unit and Actual)
   const inlineWrap = document.getElementById('entryTotalSalesInlineWrap');
   if(inlineWrap) inlineWrap.style.display = isSalesRatio ? '' : 'none';
@@ -5295,7 +5321,7 @@ function calcAchievement(){
   // ── Finance sales-ratio KPI: actual entered in ₹ Lakh, compared as % ─────────
   // Triggered for: (a) kpiMaster KPIs with salesRatioPct:true, OR (b) any Finance dept KPI
   const dept_ = document.getElementById('entryDept').value;
-  const isFinanceEntry = !!(k && k.salesRatioPct) || (dept_ === 'Finance');
+  const isFinanceEntry = isFinancePctKPI(k);
   if(isFinanceEntry){
     // Read from inline field (between Unit & Actual) first; fall back to panel field
     const inlineEl = document.getElementById('entryTotalSalesInline');
@@ -5626,7 +5652,7 @@ function saveEntry(mode){
   let actual;
   let actualRs = null;  // the raw ₹ amount (stored alongside for YTD calculation)
   let totalSalesRs = null;
-  const isSalesRatioSave = k.salesRatioPct || (dept === 'Finance');
+  const isSalesRatioSave = isFinancePctKPI(k);
   if(isSalesRatioSave){
     const inlineEl2 = document.getElementById('entryTotalSalesInline');
     const panelEl2  = document.getElementById('entryTotalSales');
@@ -5822,7 +5848,7 @@ function saveEntry(mode){
       // Pass fsId as 'id' so saveKPIEntry uses updateDoc for existing entries
       id: entry.fsId || null,
       year: entry.year, month: entry.month, plant, department: dept,
-      kpiId: k.id, kpiName: k.name, target, actual, unit: k.unit, direction: k.dir,
+      kpiId: k.id, kpiName: k.name, target, actual, actualRs, totalSalesRs, unit: k.unit, direction: k.dir,
       reason, actionPlan: action, responsiblePerson: entry.resp, targetDate: entry.dueDate,
       actionStatus: entry.actionStatus || '', entryStatus, locked: entry.locked,
       submittedBy: (window._fbProfile && window._fbProfile.email) || '',
@@ -5887,7 +5913,7 @@ function editEntry(id){
   document.getElementById('entryKPI').value = entry.kpiId;
   loadKPITarget();
   document.getElementById('entryTarget').value = entry.target;
-  document.getElementById('entryActual').value = entry.actual;
+  document.getElementById('entryActual').value = (entry.actualRs != null && entry.actualRs !== '') ? entry.actualRs : entry.actual;
   calcAchievement();
   document.getElementById('entryReason').value = entry.reason || '';
   document.getElementById('entryAction').value = entry.action || '';
@@ -6392,6 +6418,8 @@ async function bulkSubmitMyEntries(){
           kpiName:           k2 ? k2.name : '',
           target:            liveTarget(entry),
           actual:            entry.actual,
+          actualRs:          entry.actualRs     ?? null,
+          totalSalesRs:      entry.totalSalesRs ?? null,
           unit:              k2 ? k2.unit : '',
           direction:         k2 ? k2.dir : 'lower',
           reason:            entry.reason       || '',
@@ -6488,6 +6516,8 @@ function submitSingleEntry(id){
       kpiName:           k2 ? k2.name : '',
       target:            tgt,
       actual:            entry.actual,
+      actualRs:          entry.actualRs     ?? null,
+      totalSalesRs:      entry.totalSalesRs ?? null,
       unit:              k2 ? k2.unit : '',
       direction:         k2 ? k2.dir : 'lower',
       reason:            entry.reason       || '',
@@ -7212,7 +7242,7 @@ function matrixYTD(vals, kOrUnit, salesVals){
       }
     }
     if(sumSales === 0) return null;
-    return parseFloat(((sumRs / sumSales) * 100).toFixed(4));
+    return parseFloat(((sumRs / sumSales) * 100).toFixed(2));
   }
 
   const avg = k ? shouldAverage(k) : isAverageUnit(kOrUnit);
@@ -7349,6 +7379,7 @@ function getMatrixData(){
     const monthTargets  = {};
     // For sales-ratio KPIs: store per-month Total Sales (₹) for correct weighted YTD
     const monthSalesRs  = {};
+    const finDebug      = []; // per-entry audit trail for Finance % KPIs (shown under the matrix)
     // Treat as sales-ratio if: explicit ytdMethod, OR Finance dept % KPI (Firebase-added)
     const kIsSalesRatio = k.ytdMethod === 'sales-ratio' || (k.dept === 'Finance' && k.unit === '%');
 
@@ -7366,41 +7397,22 @@ function getMatrixData(){
       );
       if(entries.length){
         if(kIsSalesRatio){
-          // Normalize Finance % entries to computed %.
-          // Key heuristic: if actual ≈ actualRs (both the same raw Cr value), old-format entry
-          //   → must recompute using totalSalesRs or DB Total Sales lookup.
-          // If actual ≠ actualRs, new-format entry stored actual=% → use actual directly.
-          const _isSameVal = (a, b) => Math.abs(a - b) < 0.001 * Math.max(1, Math.abs(b)) + 0.001;
-          const normalizedActuals = entries.map(e => {
-            const raw  = parseFloat(e.actual||0);
-            const aRs  = parseFloat(e.actualRs ?? 'NaN');
-            const tsSaved = parseFloat(e.totalSalesRs||0);
-            if(!isNaN(aRs)){
-              if(!_isSameVal(raw, aRs)){
-                // actual ≠ actualRs → actual IS the computed % (new-format save) — use it
-                return parseFloat(raw.toFixed(2));
-              }
-              // actual == actualRs → old-format save: stored raw Cr in actual; recompute
-              const ts = tsSaved > 0 ? tsSaved : (getTotalSales(e.plant, e.year, m) || 0);
-              if(ts > 0) return parseFloat(((aRs / ts) * 100).toFixed(2));
-              return parseFloat(raw.toFixed(2)); // no sales, show as-is
-            }
-            if(tsSaved > 0){
-              // No actualRs but has totalSalesRs — actual is raw Cr
-              return parseFloat(((raw / tsSaved) * 100).toFixed(2));
-            }
-            // No sales info — lookup DB; if found treat actual as raw Cr; else use as-is
-            const tsDb = getTotalSales(e.plant, e.year, m) || 0;
-            return tsDb > 0 ? parseFloat(((raw / tsDb) * 100).toFixed(2)) : parseFloat(raw.toFixed(2));
-          });
-          monthActuals[m] = parseFloat((normalizedActuals.reduce((s,v)=>s+v,0)/normalizedActuals.length).toFixed(2));
-          // Aggregate sales for weighted YTD: use stored totalSalesRs or DB lookup
-          const salesSum = entries.reduce((s,e)=>{
-            const tsSaved = parseFloat(e.totalSalesRs||0);
-            const ts = tsSaved > 0 ? tsSaved : (!isNaN(parseFloat(e.actualRs ?? 'NaN')) ? getTotalSales(e.plant,e.year,m)||0 : 0);
-            return s + ts;
-          },0);
-          monthSalesRs[m] = salesSum > 0 ? salesSum : null;
+          // Convert every stored entry to its % via the single helper (see financeEntryPct).
+          const parts = entries.map(e => ({ e, ...financeEntryPct(e) }));
+          const valid = parts.filter(p => p.pct !== null);
+          if(valid.length){
+            // Weighted (Σ amount ÷ Σ sales) when every entry has both; else simple average of %
+            const weighted = valid.every(p => p.ts > 0 && !isNaN(p.rs) && p.src !== 'saved (no sales)');
+            monthActuals[m] = weighted
+              ? parseFloat((valid.reduce((s,p)=>s+p.rs,0) / valid.reduce((s,p)=>s+p.ts,0) * 100).toFixed(2))
+              : parseFloat((valid.reduce((s,p)=>s+p.pct,0) / valid.length).toFixed(2));
+            const salesSum = valid.reduce((s,p)=>s+p.ts,0);
+            monthSalesRs[m] = salesSum > 0 ? salesSum : null;
+          } else {
+            monthActuals[m] = null;
+            monthSalesRs[m] = null;
+          }
+          parts.forEach(p => finDebug.push({ m, plant: p.e.plant, rawActual: p.e.actual, actualRs: p.e.actualRs, ts: p.ts, pct: p.pct, src: p.src }));
         } else if(shouldAverage(k)){
           monthActuals[m] = parseFloat((entries.reduce((s,e)=>s+parseFloat(e.actual||0),0)/entries.length).toFixed(2));
         } else {
@@ -7442,7 +7454,10 @@ function getMatrixData(){
       );
       lyMonthEntries.push(...entries);
     });
-    const lyActual = lyMonthEntries.length
+    const lyFinPcts = kIsSalesRatio ? lyMonthEntries.map(e => financeEntryPct(e).pct).filter(v => v !== null) : null;
+    const lyActual = kIsSalesRatio
+      ? (lyFinPcts.length ? parseFloat((lyFinPcts.reduce((s,v)=>s+v,0)/lyFinPcts.length).toFixed(2)) : null)
+      : lyMonthEntries.length
       ? parseFloat((shouldAverage(k)
           ? lyMonthEntries.reduce((s,e)=>s+parseFloat(e.actual||0),0)/lyMonthEntries.length
           : lyMonthEntries.reduce((s,e)=>s+parseFloat(e.actual||0),0)
@@ -7508,7 +7523,7 @@ function getMatrixData(){
     const lyTarget = computeEffectiveAnnualTarget(year - 1, resolvedPlantKey, /*allowBaseFallback=*/false);
 
     return { idx:idx+1, k, annualTarget, cyAnnualTarget, ytdTarget, lyTarget, lyActual,
-             ytdActual, monthActuals, monthTargets, viewBy, orderedMonths };
+             ytdActual, monthActuals, monthTargets, viewBy, orderedMonths, finDebug };
   });
 
   return { rows, plants, year, viewBy, orderedMonths };
@@ -7656,6 +7671,19 @@ function renderMatrix(){
       ${monthActualCells}
     </tr>`;
   }).join('');
+
+  // ── Finance % audit trail: how each cell's % was derived ──────────────
+  const auditRows = [];
+  rows.forEach(r => (r.finDebug||[]).forEach(d => auditRows.push({ kpi: r.k.name, ...d })));
+  if(auditRows.length){
+    const f = v => (v==null || v==='' || (typeof v==='number' && isNaN(v))) ? '—' : v;
+    body.innerHTML += `<tr><td colspan="${totalCols}" style="padding:8px 14px;background:var(--surface2);border:0.5px solid var(--border)">
+      <details><summary style="cursor:pointer;font-size:12px;font-weight:600;color:var(--blue)">Finance % calculation check — ${auditRows.length} entries (Amount ÷ Total Sales × 100, both in Crores)</summary>
+      <div style="overflow-x:auto;margin-top:6px"><table style="font-size:11px;border-collapse:collapse;width:100%">
+        <tr style="color:var(--text3);text-align:left"><th style="padding:3px 8px">KPI</th><th style="padding:3px 8px">Month</th><th style="padding:3px 8px">Plant</th><th style="padding:3px 8px">Amount (Cr)</th><th style="padding:3px 8px">Total Sales (Cr)</th><th style="padding:3px 8px">Result %</th><th style="padding:3px 8px">Source</th></tr>
+        ${auditRows.map(a=>`<tr style="border-top:0.5px solid var(--border)"><td style="padding:3px 8px">${a.kpi}</td><td style="padding:3px 8px">${a.m}</td><td style="padding:3px 8px">${a.plant}</td><td style="padding:3px 8px">${f(a.actualRs != null ? a.actualRs : a.rawActual)}</td><td style="padding:3px 8px">${a.ts>0?a.ts:'<span style="color:#A32D2D">not found</span>'}</td><td style="padding:3px 8px;font-weight:600">${a.pct==null?'—':a.pct+'%'}</td><td style="padding:3px 8px;color:var(--text3)">${a.src}</td></tr>`).join('')}
+      </table></div></details></td></tr>`;
+  }
 }
 
 function exportMatrixExcel(){
@@ -7996,32 +8024,24 @@ function monthReportCellData(k, plantName, year, month){
     String(d.year) === String(dataYear) && d.month === month &&
     String(d.kpiId) === String(k.id) && d.plant === plantName
   );
-  // Finance % KPIs: normalize old-format entries to %.
-  // New format (actualRs set): actual IS the %. Old format: only recompute if totalSalesRs
-  // is explicitly stored — otherwise use actual as-is to avoid double-dividing already-%-data.
-  const kIsFinancePct = k.ytdMethod === 'sales-ratio' || (k.dept === 'Finance' && k.unit === '%');
+  // Finance % KPIs: one shared conversion (financeEntryPct) — same maths as the KPI Matrix.
+  const kIsFinancePct = isFinancePctKPI(k);
   let actual = null;
   if(entries.length){
-    const normalizedActuals = entries.map(e => {
-      const raw = parseFloat(e.actual || 0);
-      if(!kIsFinancePct) return raw;
-      const aRs = parseFloat(e.actualRs ?? 'NaN');
-      const tsSaved = parseFloat(e.totalSalesRs || 0);
-      const _same = (a,b) => Math.abs(a-b) < 0.001*Math.max(1,Math.abs(b))+0.001;
-      if(!isNaN(aRs)){
-        if(!_same(raw, aRs)) return parseFloat(raw.toFixed(2)); // actual IS %
-        // old-format: actual==actualRs (raw Cr) — recompute
-        const ts = tsSaved > 0 ? tsSaved : (getTotalSales(e.plant, e.year, month) || 0);
-        if(ts > 0) return parseFloat(((aRs / ts) * 100).toFixed(2));
-        return parseFloat(raw.toFixed(2));
+    if(kIsFinancePct){
+      const parts = entries.map(e => financeEntryPct(e)).filter(p => p.pct !== null);
+      if(parts.length){
+        const weighted = parts.every(p => p.ts > 0 && !isNaN(p.rs) && p.src !== 'saved (no sales)');
+        actual = weighted
+          ? parseFloat((parts.reduce((s,p)=>s+p.rs,0) / parts.reduce((s,p)=>s+p.ts,0) * 100).toFixed(2))
+          : parseFloat((parts.reduce((s,p)=>s+p.pct,0) / parts.length).toFixed(2));
       }
-      if(tsSaved > 0) return parseFloat(((raw / tsSaved) * 100).toFixed(2));
-      const tsDb = getTotalSales(e.plant, e.year, month) || 0;
-      return tsDb > 0 ? parseFloat(((raw / tsDb) * 100).toFixed(2)) : parseFloat(raw.toFixed(2));
-    });
-    actual = shouldAverage(k)
-      ? parseFloat((normalizedActuals.reduce((s,v)=>s+v,0)/normalizedActuals.length).toFixed(2))
-      : parseFloat(normalizedActuals.reduce((s,v)=>s+v,0).toFixed(2));
+    } else {
+      const vals = entries.map(e => parseFloat(e.actual || 0));
+      actual = shouldAverage(k)
+        ? parseFloat((vals.reduce((s,v)=>s+v,0)/vals.length).toFixed(2))
+        : parseFloat(vals.reduce((s,v)=>s+v,0).toFixed(2));
+    }
   }
   return { actual, target };
 }
@@ -11953,6 +11973,9 @@ export async function saveKPIEntry(entryData) {
     kpiName:          entryData.kpiName,
     target:           entryData.target,
     actual:           entryData.actual,
+    // Finance % KPIs: raw Crore amounts kept so every report can re-derive the %
+    actualRs:         entryData.actualRs     ?? null,
+    totalSalesRs:     entryData.totalSalesRs ?? null,
     unit:             entryData.unit,
     direction:        entryData.direction,
     reason:           entryData.reason           || '',
@@ -13060,6 +13083,8 @@ function mergeFirebaseEntries(fsEntries) {
       kpiId:        fe.kpiId,
       target:       fe.target,
       actual:       fe.actual,
+      actualRs:     fe.actualRs     ?? null,
+      totalSalesRs: fe.totalSalesRs ?? null,
       reason:       fe.reason           || '',
       action:       fe.actionPlan       || '',
       resp:         fe.responsiblePerson|| '',
@@ -13150,6 +13175,8 @@ function mergeFirebaseEntriesKeepSubmitted(fsEntries) {
       kpiId:        fe.kpiId,
       target:       fe.target,
       actual:       fe.actual,
+      actualRs:     fe.actualRs     ?? null,
+      totalSalesRs: fe.totalSalesRs ?? null,
       reason:       fe.reason           || '',
       action:       fe.actionPlan       || '',
       resp:         fe.responsiblePerson|| '',
@@ -13272,12 +13299,26 @@ window.saveEntry = async function(mode) {
   const plant  = document.getElementById('entryPlant').value;
   const dept   = document.getElementById('entryDept').value;
   const kpiId  = document.getElementById('entryKPI').value;
-  const actual = parseFloat(document.getElementById('entryActual').value);
+  let actual = parseFloat(document.getElementById('entryActual').value);
 
   if (!plant || !kpiId || isNaN(actual)) { showToast('Please fill all required fields'); return; }
 
   const k = kpiMaster.find(k => String(k.id) === String(kpiId));
   if (!k) { showToast('KPI not found'); return; }
+
+  // ── Finance "% of Total Sales" KPI ─────────────────────────────────────
+  // The user types the amount in Crores. Save: actual = % (amount ÷ Total Sales × 100),
+  // plus the raw Crore amounts (actualRs / totalSalesRs) so every report can re-derive it.
+  let actualRs = null, totalSalesRs = null;
+  if (isFinancePctKPI(k)) {
+    const _inl = document.getElementById('entryTotalSalesInline');
+    const _pnl = document.getElementById('entryTotalSales');
+    const _sv  = parseFloat((_inl && _inl.value) ? _inl.value : (_pnl ? _pnl.value : ''));
+    if (isNaN(_sv) || _sv <= 0) { showToast('Please enter Actual value (Crores) and ensure Total Sales (Crores) is set'); return; }
+    actualRs     = actual;
+    totalSalesRs = _sv;
+    actual       = parseFloat(((actualRs / totalSalesRs) * 100).toFixed(2));
+  }
 
   // Event-based KPIs (Customer Complaints, Accidents, ...) allow many entries per
   // month and carry extra fields (event date, ref no., part, customer, attachments).
@@ -13329,6 +13370,8 @@ window.saveEntry = async function(mode) {
     kpiName:           k.name,
     target,
     actual,
+    actualRs,
+    totalSalesRs,
     unit:              k.unit,
     direction:         k.dir,
     reason,
@@ -13354,7 +13397,7 @@ window.saveEntry = async function(mode) {
       const updatedFsId = await saveKPIEntry({ id: fsId, ...payload });
       if(updatedFsId && !existing.fsId) existing.fsId = updatedFsId;
       Object.assign(existing, {
-        year, month, plant, dept, kpiId: k.id, target, actual,
+        year, month, plant, dept, kpiId: k.id, target, actual, actualRs, totalSalesRs,
         reason, action, resp: payload.responsiblePerson, dueDate: payload.targetDate,
         actionStatus: payload.actionStatus || null, entryStatus, locked
       });
@@ -13369,7 +13412,7 @@ window.saveEntry = async function(mode) {
         fsId:         fsId,
         year, month, plant, dept,
         kpiId:        k.id,
-        target, actual,
+        target, actual, actualRs, totalSalesRs,
         reason,
         action,
         resp:         payload.responsiblePerson,
