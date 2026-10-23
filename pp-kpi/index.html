@@ -7364,18 +7364,21 @@ function getMatrixData(){
       );
       if(entries.length){
         if(kIsSalesRatio){
-          // Normalize entries: old-format entries (actualRs=null) were saved as raw ₹ Lakh.
-          // Detect and fix by looking up Total Sales for that plant/month/year.
+          // Normalize entries to %. New-format entries store actual=% and actualRs=raw Cr.
+          // Old-format entries (actualRs=null): if totalSalesRs is explicitly saved, compute %;
+          // otherwise use actual as-is (it was saved as % by earlier code — do NOT re-divide).
           const normalizedActuals = entries.map(e => {
-            if(e.actualRs != null) return parseFloat(e.actual||0); // already stored as %
-            // Old format — actual is raw ₹ Lakh; recalculate % using stored or DB Total Sales
-            const ts = parseFloat(e.totalSalesRs||0) || getTotalSales(e.plant, e.year, m) || 0;
-            return ts > 0 ? parseFloat(((parseFloat(e.actual||0) / ts) * 100).toFixed(4)) : parseFloat(e.actual||0);
+            if(e.actualRs != null) return parseFloat(e.actual||0); // new format: actual IS %
+            // Old format — only recompute if totalSalesRs was explicitly stored in this entry
+            const tsSaved = parseFloat(e.totalSalesRs||0);
+            if(tsSaved > 0) return parseFloat(((parseFloat(e.actual||0) / tsSaved) * 100).toFixed(4));
+            // No sales stored: treat actual as already-computed % (avoid double-division)
+            return parseFloat(e.actual||0);
           });
           monthActuals[m] = parseFloat((normalizedActuals.reduce((s,v)=>s+v,0)/normalizedActuals.length).toFixed(4));
-          // Aggregate sales: sum across plants, keep last for single-plant
+          // Aggregate sales for weighted YTD: only use explicitly-stored totalSalesRs
           const salesSum = entries.reduce((s,e)=>{
-            const ts = parseFloat(e.totalSalesRs||0) || (e.actualRs==null ? getTotalSales(e.plant,e.year,m)||0 : 0);
+            const ts = parseFloat(e.totalSalesRs||0);
             return s + ts;
           },0);
           monthSalesRs[m] = salesSum > 0 ? salesSum : null;
@@ -7974,16 +7977,19 @@ function monthReportCellData(k, plantName, year, month){
     String(d.year) === String(dataYear) && d.month === month &&
     String(d.kpiId) === String(k.id) && d.plant === plantName
   );
-  // Finance % KPIs: normalize old-format entries (actual=raw Cr, actualRs=null) to %
+  // Finance % KPIs: normalize old-format entries to %.
+  // New format (actualRs set): actual IS the %. Old format: only recompute if totalSalesRs
+  // is explicitly stored — otherwise use actual as-is to avoid double-dividing already-%-data.
   const kIsFinancePct = k.ytdMethod === 'sales-ratio' || (k.dept === 'Finance' && k.unit === '%');
   let actual = null;
   if(entries.length){
     const normalizedActuals = entries.map(e => {
       const raw = parseFloat(e.actual || 0);
       if(!kIsFinancePct) return raw;
-      if(e.actualRs != null) return raw; // already stored as %
-      const ts = parseFloat(e.totalSalesRs || 0) || getTotalSales(e.plant, e.year, month) || 0;
-      return ts > 0 ? parseFloat(((raw / ts) * 100).toFixed(4)) : raw;
+      if(e.actualRs != null) return raw; // new format: actual IS %
+      const tsSaved = parseFloat(e.totalSalesRs || 0);
+      if(tsSaved > 0) return parseFloat(((raw / tsSaved) * 100).toFixed(4));
+      return raw; // old format, no sales stored: treat as already-computed %
     });
     actual = shouldAverage(k)
       ? parseFloat((normalizedActuals.reduce((s,v)=>s+v,0)/normalizedActuals.length).toFixed(2))
