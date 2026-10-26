@@ -3167,6 +3167,55 @@ function calcAch(actual, target, dir) {
   if (actual === 0) return 0;                            // nothing achieved
   return Math.min(100, Math.round((actual / target) * 100));
 }
+// ── Global helper: effective annual target for any FY year + plant ──────────
+// Mirrors KPI Matrix computeEffectiveAnnualTarget exactly so Dashboard and
+// KPI Trend stat boxes always agree with the Matrix.
+// allowBaseFallback=true  → CY (falls back to k.target when nothing explicit)
+// allowBaseFallback=false → LY (returns null when nothing explicit)
+function getEffectiveAnnualTarget(k, tgtYear, resolvedPlant, allowBaseFallback) {
+  function mapGetL(obj, key) {
+    if (!obj) return undefined;
+    if (obj[key] != null) return obj[key];
+    const n = parseInt(key);
+    return (!isNaN(n) && obj[n] != null) ? obj[n] : undefined;
+  }
+  const yr = String(tgtYear);
+  const fyMonthStartIdx = (appSettings && appSettings.fyMode === 'apr') ? 3 : 0;
+  const allHave = MONTHS.every(m => {
+    const mIdx = MONTHS.indexOf(m);
+    const dataYear = (fyMonthStartIdx === 3 && mIdx < 3) ? tgtYear + 1 : tgtYear;
+    let fyKey = dataYear;
+    if (appSettings && appSettings.fyMode === 'apr' && ['January','February','March'].includes(m)) fyKey = dataYear - 1;
+    const y = String(fyKey);
+    if (resolvedPlant) {
+      const pOvr = k.plantOverrides && k.plantOverrides[resolvedPlant];
+      if (!pOvr || !pOvr.monthTargets) return false;
+      const pMap = mapGetL(pOvr.monthTargets, y);
+      return pMap && pMap[m] != null;
+    }
+    const yearMap = k.monthTargets ? mapGetL(k.monthTargets, y) : null;
+    return yearMap && yearMap[m] != null;
+  });
+  if (allHave) {
+    const mVals = MONTHS.map(m => {
+      const mIdx = MONTHS.indexOf(m);
+      const dataYear = (fyMonthStartIdx === 3 && mIdx < 3) ? tgtYear + 1 : tgtYear;
+      return resolveTarget(k, dataYear, m, resolvedPlant);
+    }).filter(v => v != null);
+    return shouldAverage(k)
+      ? parseFloat((mVals.reduce((s,v)=>s+v,0)/mVals.length).toFixed(2))
+      : parseFloat(mVals.reduce((s,v)=>s+v,0).toFixed(2));
+  }
+  // Explicit year-level target (plant override first, then global)
+  if (resolvedPlant) {
+    const pOvr = k.plantOverrides && k.plantOverrides[resolvedPlant];
+    if (pOvr && pOvr.yearTargets) { const yt = mapGetL(pOvr.yearTargets, yr); if (yt != null) return yt; }
+    if (pOvr && pOvr.target != null) return allowBaseFallback ? pOvr.target : null;
+  }
+  if (k.yearTargets) { const yt = mapGetL(k.yearTargets, yr); if (yt != null) return yt; }
+  return allowBaseFallback ? k.target : null;
+}
+
 // Raw (uncapped) achievement — used for KPI card stat boxes so values >100% are visible.
 function calcAchRaw(actual, target, dir) {
   if (actual == null || target == null || isNaN(actual) || isNaN(target) || target === 0) return null;
@@ -4311,22 +4360,10 @@ function renderTrendPage() {
 
     if (notApplicable) return;
 
-    // ── CY Annual Target — mirrors KPI Matrix computeEffectiveAnnualTarget logic ──
-    // Respects plant selection: single plant uses its targets; All → global.
+    // ── CY Annual Target — uses global helper; respects plant selection ──
     const trendFYYear = parseInt(year);
     const resolvedTrendPlant = singlePlant || null;
-    const annualTrendTarget = (() => {
-      const fyMonthTargets = fyPairs.map(({month: mon, year: dataYear}) =>
-        resolveTarget(k, dataYear, mon, resolvedTrendPlant)
-      );
-      const allSet = fyMonthTargets.every(v => v != null);
-      if (allSet) {
-        return shouldAverage(k)
-          ? parseFloat((fyMonthTargets.reduce((s,v)=>s+v,0)/fyMonthTargets.length).toFixed(2))
-          : parseFloat(fyMonthTargets.reduce((s,v)=>s+v,0).toFixed(2));
-      }
-      return resolveTarget(k, trendFYYear, null, resolvedTrendPlant) || displayTarget;
-    })();
+    const annualTrendTarget = getEffectiveAnnualTarget(k, trendFYYear, resolvedTrendPlant, /*allowBaseFallback=*/true) || displayTarget;
 
     // ── Sales-ratio flag (Finance % KPIs) ──
     const kIsSalesRatioTrend = k.ytdMethod === 'sales-ratio' || (k.dept === 'Finance' && k.unit === '%');
@@ -4372,28 +4409,8 @@ function renderTrendPage() {
     // LY last actual for stat box
     const lyLastIdx = lySeriesData.reduceRight((f,v,i)=>f===-1&&v!==null?i:f,-1);
     const lyLastVal = lyLastIdx >= 0 ? lySeriesData[lyLastIdx] : null;
-    // LY Annual Target — mirrors KPI Matrix computeEffectiveAnnualTarget for (year-1)
-    // Respects plant selection; no base fallback (show — if not explicitly set for LY).
-    const lyAnnualTargetTrend = (() => {
-      const lyYear = trendFYYear - 1;
-      const lyFYPairs = getFYMonthYearPairs(lyYear);
-      const lyFYMonthTargets = lyFYPairs.map(({month: mon, year: dataYear}) =>
-        resolveTarget(k, dataYear, mon, resolvedTrendPlant)
-      );
-      const allSet = lyFYMonthTargets.every(v => v != null);
-      if (allSet) {
-        return shouldAverage(k)
-          ? parseFloat((lyFYMonthTargets.reduce((s,v)=>s+v,0)/lyFYMonthTargets.length).toFixed(2))
-          : parseFloat(lyFYMonthTargets.reduce((s,v)=>s+v,0).toFixed(2));
-      }
-      // Explicit year-level target for LY (plant override first, then global; no base fallback)
-      if (resolvedTrendPlant) {
-        const pOvr = k.plantOverrides && k.plantOverrides[resolvedTrendPlant];
-        if (pOvr && pOvr.yearTargets) { const yt = pOvr.yearTargets[String(lyYear)]; if (yt != null) return yt; }
-      }
-      const yt = k.yearTargets && k.yearTargets[String(lyYear)];
-      return yt != null ? yt : null;
-    })();
+    // LY Annual Target — uses global helper; respects plant selection; no base fallback
+    const lyAnnualTargetTrend = getEffectiveAnnualTarget(k, trendFYYear - 1, resolvedTrendPlant, /*allowBaseFallback=*/false);
 
     const canvasId = 'tCanvas_'+k.id;
 
@@ -4651,22 +4668,8 @@ function renderCumulativeTrends() {
     const lastStatus = lastPct !== null ? statusOf(lastPct, lastVal, displayTarget, k.dir) : 'pending';
     const statMonthLabel = statMonthIdx >= 0 ? fyMonths[statMonthIdx].slice(0, 3) : '—';
 
-    // ── CY Annual Target — mirrors KPI Matrix computeEffectiveAnnualTarget logic ──
-    // If all 12 FY months have explicit monthly targets → sum/avg them.
-    // Otherwise use yearTargets[year] (the "All Plants" annual value) directly.
-    // Dashboard is always all-plants aggregate; never changes with plant filter.
-    const annualCYTarget = (() => {
-      const fyMonthTargets = fyPairs.map(({month: mon, year: dataYear}) =>
-        resolveTarget(k, dataYear, mon, null)   // null = global / all-plants
-      );
-      const allSet = fyMonthTargets.every(v => v != null);
-      if (allSet) {
-        return shouldAverage(k)
-          ? parseFloat((fyMonthTargets.reduce((s,v)=>s+v,0)/fyMonthTargets.length).toFixed(2))
-          : parseFloat(fyMonthTargets.reduce((s,v)=>s+v,0).toFixed(2));
-      }
-      return resolveTarget(k, parseInt(year), null, null) || displayTarget;
-    })();
+    // ── CY Annual Target — uses global helper (matches KPI Matrix exactly) ──
+    const annualCYTarget = getEffectiveAnnualTarget(k, parseInt(year), null, /*allowBaseFallback=*/true) || displayTarget;
 
     // YTD Actual — uses matrixYTD so sales-ratio KPIs (EBITDA etc.) get correct weighted average
     const ytdSlice      = statMonthIdx >= 0 ? monthlyAvg.slice(0, statMonthIdx + 1) : [];
@@ -4692,23 +4695,8 @@ function renderCumulativeTrends() {
     // LY last actual for stat box (latest month with LY data)
     const lyLastIdx = lyAvg.reduceRight((f,v,i)=>f===-1&&v!==null?i:f,-1);
     const lyLastVal = lyLastIdx >= 0 ? lyAvg[lyLastIdx] : null;
-    // LY Annual Target — mirrors KPI Matrix computeEffectiveAnnualTarget for (year-1), no base fallback
-    const lyAnnualTarget = (() => {
-      const lyYear = parseInt(year) - 1;
-      const lyFYPairs = getFYMonthYearPairs(lyYear);
-      const lyFYMonthTargets = lyFYPairs.map(({month: mon, year: dataYear}) =>
-        resolveTarget(k, dataYear, mon, null)   // all-plants
-      );
-      const allSet = lyFYMonthTargets.every(v => v != null);
-      if (allSet) {
-        return shouldAverage(k)
-          ? parseFloat((lyFYMonthTargets.reduce((s,v)=>s+v,0)/lyFYMonthTargets.length).toFixed(2))
-          : parseFloat(lyFYMonthTargets.reduce((s,v)=>s+v,0).toFixed(2));
-      }
-      // explicit year-level target for LY (no base fallback — if not set, show —)
-      const yt = k.yearTargets && k.yearTargets[String(lyYear)];
-      return yt != null ? yt : null;
-    })();
+    // LY Annual Target — uses global helper (no base fallback, matching KPI Matrix LY column)
+    const lyAnnualTarget = getEffectiveAnnualTarget(k, parseInt(year) - 1, null, /*allowBaseFallback=*/false);
 
     const canvasId = 'cumCanvas_' + k.id;
     const card = document.createElement('div');
