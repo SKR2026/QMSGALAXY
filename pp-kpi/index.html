@@ -4328,17 +4328,32 @@ function renderTrendPage() {
       return resolveTarget(k, trendFYYear, null, resolvedTrendPlant) || displayTarget;
     })();
 
-    // YTD Actual — aggregate actuals from start of FY up to latest month with data
+    // ── Sales-ratio flag (Finance % KPIs) ──
+    const kIsSalesRatioTrend = k.ytdMethod === 'sales-ratio' || (k.dept === 'Finance' && k.unit === '%');
+
+    // YTD Actual — uses matrixYTD so Finance % KPIs (EBITDA etc.) get correct weighted average
     const statMonthFYIdx = fyPairs.findIndex(p => p.month === statMonth && String(p.year) === String(statYear));
-    const ytdValsTrend = fyPairs.slice(0, statMonthFYIdx + 1).map(({month: mon, year: dataYear}) => {
-      const pts = allPts.filter(d => d.month === mon && String(d.year) === String(dataYear));
-      return pts.length ? aggregateMonthlyValues(pts, k) : null;
-    }).filter(v => v !== null);
-    const ytdActualTrend = ytdValsTrend.length
-      ? (shouldAverage(k)
-          ? Math.round(ytdValsTrend.reduce((s,v)=>s+v,0)/ytdValsTrend.length*10)/10
-          : Math.round(ytdValsTrend.reduce((s,v)=>s+v,0)*10)/10)
-      : null;
+    const ytdRawData = statMonthFYIdx >= 0
+      ? fyPairs.slice(0, statMonthFYIdx + 1).map(({month: mon, year: dataYear}) => {
+          const pts = allPts.filter(d => d.month === mon && String(d.year) === String(dataYear));
+          if (!pts.length) return { val: null, salesRs: null };
+          if (kIsSalesRatioTrend) {
+            const parts = pts.map(e => ({ e, ...financeEntryPct(e) }));
+            const valid = parts.filter(p => p.pct !== null);
+            if (!valid.length) return { val: null, salesRs: null };
+            const weighted = valid.every(p => p.ts > 0 && !isNaN(p.rs) && p.src !== 'saved (no sales)');
+            const val = weighted
+              ? parseFloat((valid.reduce((s,p)=>s+p.rs,0) / valid.reduce((s,p)=>s+p.ts,0) * 100).toFixed(2))
+              : parseFloat((valid.reduce((s,p)=>s+p.pct,0) / valid.length).toFixed(2));
+            const salesSum = valid.reduce((s,p)=>s+p.ts,0);
+            return { val, salesRs: salesSum > 0 ? salesSum : null };
+          }
+          return { val: aggregateMonthlyValues(pts, k), salesRs: null };
+        })
+      : [];
+    const ytdValsForMatrix  = ytdRawData.map(d => d.val);
+    const ytdSalesForMatrix = kIsSalesRatioTrend ? ytdRawData.map(d => d.salesRs) : null;
+    const ytdActualTrend    = matrixYTD(ytdValsForMatrix, k, ytdSalesForMatrix);
     // ── YTD Target — mirrors KPI Matrix: aggregate per-month targets for months-with-data only ──
     const ytdMonthTargetsTrend = statMonthFYIdx >= 0
       ? resolvedMonthTargets.slice(0, statMonthFYIdx + 1).filter(v => v !== null)
@@ -4573,26 +4588,44 @@ function renderCumulativeTrends() {
       String(d.kpiId) === String(k.id) &&
       d.month === mon;
 
-    // CY per-month average across ALL plants
-    const monthlyAvg = fyPairs.map(({month: mon, year: dataYear}) => {
+    // ── Sales-ratio KPI flag (Finance % KPIs: EBITDA, P&F, R&M, Overhead) ──
+    const kIsSalesRatioCum = k.ytdMethod === 'sales-ratio' || (k.dept === 'Finance' && k.unit === '%');
+    // Helper: compute monthly actual using the same logic as the KPI Matrix.
+    // For sales-ratio KPIs uses weighted Σ(₹) / Σ(Total Sales ₹) × 100.
+    // For normal KPIs uses aggregateMonthlyValues (sum or avg across plants).
+    function cumMonthlyActual(pts) {
+      if (!pts.length) return { val: null, salesRs: null };
+      if (kIsSalesRatioCum) {
+        const parts = pts.map(e => ({ e, ...financeEntryPct(e) }));
+        const valid = parts.filter(p => p.pct !== null);
+        if (!valid.length) return { val: null, salesRs: null };
+        const weighted = valid.every(p => p.ts > 0 && !isNaN(p.rs) && p.src !== 'saved (no sales)');
+        const val = weighted
+          ? parseFloat((valid.reduce((s,p)=>s+p.rs,0) / valid.reduce((s,p)=>s+p.ts,0) * 100).toFixed(2))
+          : parseFloat((valid.reduce((s,p)=>s+p.pct,0) / valid.length).toFixed(2));
+        const salesSum = valid.reduce((s,p)=>s+p.ts,0);
+        return { val, salesRs: salesSum > 0 ? salesSum : null };
+      }
+      return { val: aggregateMonthlyValues(pts, k), salesRs: null };
+    }
+
+    // CY per-month actual + sales ₹ (for sales-ratio YTD computation)
+    const monthlyActualData = fyPairs.map(({month: mon, year: dataYear}) => {
       const pts = _pts(dataYear, k.id, mon);
-      if (!pts.length) return null;
-      return aggregateMonthlyValues(pts, k);
+      if (!pts.length) return { val: null, salesRs: null };
+      return cumMonthlyActual(pts);
     });
+    const monthlyAvg    = monthlyActualData.map(d => d.val);
+    const monthlySalesRs = monthlyActualData.map(d => d.salesRs);
 
     const hasAnyData = monthlyAvg.some(v => v !== null);
     if (!hasAnyData) return;
 
-    // Resolve target respecting plant filter: if a single plant is selected via
-    // filterState.plant, use that plant's override; otherwise average all plants'
-    // individual targets so plant-specific values (e.g. KKD Manpower) are shown.
-    const cumSinglePlant = filterState.plant !== 'All' ? filterState.plant : null;
-    const allPlantNamesCum = plantsList.map(p=>p.name);
+    // Dashboard targets always use the global "All Plants" target (null plant).
+    // cumResolveTarget kept for the chart's dashed target line (cosmetic).
+    const cumSinglePlant = null;  // Dashboard always all-plants; plant filter ignored
     function cumResolveTarget(k, dataYear, mon){
-      if(cumSinglePlant) return resolveTarget(k, dataYear, mon, cumSinglePlant);
-      // All-plants view: average each plant's target so overrides are included
-      const vals = allPlantNamesCum.map(p => resolveTarget(k, dataYear, mon, p)).filter(v => v != null);
-      return vals.length ? parseFloat((vals.reduce((s,v)=>s+v,0)/vals.length).toFixed(2)) : resolveTarget(k, dataYear, mon, null);
+      return resolveTarget(k, dataYear, mon, null);
     }
 
     const monthlyTargets = fyPairs.map(({month: mon, year: dataYear})=>
@@ -4600,11 +4633,12 @@ function renderCumulativeTrends() {
     );
 
     // LY per-month actual across ALL plants
-    const lyAvg = lyPairs.map(({month: mon, year: dataYear}) => {
+    const lyActualData = lyPairs.map(({month: mon, year: dataYear}) => {
       const pts = _pts(dataYear, k.id, mon);
-      if (!pts.length) return null;
-      return aggregateMonthlyValues(pts, k);
+      if (!pts.length) return { val: null, salesRs: null };
+      return cumMonthlyActual(pts);
     });
+    const lyAvg = lyActualData.map(d => d.val);
     const lyTargets = lyPairs.map(({month: mon, year: dataYear})=>
       cumResolveTarget(k, dataYear, mon)
     );
@@ -4634,15 +4668,12 @@ function renderCumulativeTrends() {
       return resolveTarget(k, parseInt(year), null, null) || displayTarget;
     })();
 
-    // YTD Actual — aggregate months from start of FY up to latest data month
-    const ytdCumVals = statMonthIdx >= 0
-      ? monthlyAvg.slice(0, statMonthIdx + 1).filter(v => v !== null)
-      : [];
-    const ytdCumActual = ytdCumVals.length
-      ? (shouldAverage(k)
-          ? Math.round(ytdCumVals.reduce((s,v)=>s+v,0)/ytdCumVals.length*10)/10
-          : Math.round(ytdCumVals.reduce((s,v)=>s+v,0)*10)/10)
+    // YTD Actual — uses matrixYTD so sales-ratio KPIs (EBITDA etc.) get correct weighted average
+    const ytdSlice      = statMonthIdx >= 0 ? monthlyAvg.slice(0, statMonthIdx + 1) : [];
+    const ytdSalesSlice = kIsSalesRatioCum && statMonthIdx >= 0
+      ? monthlySalesRs.slice(0, statMonthIdx + 1)
       : null;
+    const ytdCumActual = matrixYTD(ytdSlice, k, ytdSalesSlice);
     // ── YTD Target — mirrors KPI Matrix: aggregate per-month targets for months-with-data only ──
     const ytdCumMonthTargets = statMonthIdx >= 0
       ? monthlyTargets.slice(0, statMonthIdx + 1).filter(v => v !== null)
