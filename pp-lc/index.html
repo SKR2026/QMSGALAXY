@@ -6,7 +6,7 @@
   <meta http-equiv="X-Content-Type-Options" content="nosniff" />
   <meta name="referrer" content="no-referrer" />
   <meta name="robots" content="noindex, nofollow" />
-  <title>Polyplastics — Legal Compliance v35 (Cloud Reminders)</title>
+  <title>Polyplastics — Legal Compliance v76 (Per-User Reminders)</title>
 
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -1021,6 +1021,7 @@ const mkRequirements = (plants, users) => {
         status,
         dueDate: new Date(Date.now() + (ti - 2) * 21 * 86400000).toISOString().split('T')[0],
         reminderFrequency: REM_FREQS[ti % 4],
+        reminderLeadDays: [30, 60, 90, 180][ti % 4],
         escalationLevel: (ti % 3) + 1,
         escalationEmail: 'ceo@legalcomp.com',
         escalationEmails: { 1:['planthead@legalcomp.com'], 2:['regional@legalcomp.com'], 3:['ceo@legalcomp.com'] },
@@ -2224,6 +2225,7 @@ function AdminOverview({ dk, plants, users, requirements, categories: catsProp, 
         'Assigned To': assignees || 'Unassigned',
         'Due Date': r.dueDate || '—',
         'Reminder Frequency': r.reminderFrequency || '—',
+        'Reminder Lead Days': r.reminderLeadDays || 30,
         'Escalation Level': r.escalationLevel ? `Level ${r.escalationLevel}` : '—',
         'Applicable Rule': r.applicableRule || '—',
         'Completion Date': r.completionDate || '—',
@@ -2447,7 +2449,7 @@ function AdminOverview({ dk, plants, users, requirements, categories: catsProp, 
                     </div>
                     <p className={`leading-relaxed ${dk?'text-gray-300':'text-gray-700'}`}>{req.description}</p>
                     <div className="grid grid-cols-2 gap-3">
-                      {[['🏭 Plant',plant?.name||'—'],['📍 State',plant?.state||'—'],['👤 Assigned To',assignees.length>0?assignees.map(a=>a.name).join(', '):'Unassigned'],['📅 Due Date',formatDate(req.dueDate)],['⌛ Days Left',dl<0?`${Math.abs(dl)}d overdue`:dl===0?'Today':`${dl}d`],['🔔 Reminder',req.reminderFrequency]].map(([l,v])=>(
+                      {[['🏭 Plant',plant?.name||'—'],['📍 State',plant?.state||'—'],['👤 Assigned To',assignees.length>0?assignees.map(a=>a.name).join(', '):'Unassigned'],['📅 Due Date',formatDate(req.dueDate)],['⌛ Days Left',dl<0?`${Math.abs(dl)}d overdue`:dl===0?'Today':`${dl}d`],['🔔 Reminder',`${req.reminderFrequency||'—'} (${req.reminderLeadDays||30}d before)`]].map(([l,v])=>(
                         <div key={l} className={`p-3 rounded-xl ${dk?'bg-gray-700':'bg-gray-50'}`}>
                           <p className={`text-xs uppercase tracking-wide font-semibold mb-0.5 ${sub2}`}>{l}</p>
                           <p className={`font-medium text-xs ${dk?'text-white':'text-gray-800'}`}>{v||'—'}</p>
@@ -3102,7 +3104,7 @@ async function sendComplianceMail({ trigger, req, plant, assignee, oldAssignee, 
         ['📅','Due Date',     fmtDate(req?.dueDate)],
         ['✅','Completion Date', req?.completionDate ? fmtDate(req.completionDate) : null],
         ['⌛','Days Left',    req?.dueDate ? `${calcDays(req.dueDate)} days` : null],
-        ['🔔','Reminder',     req?.reminderFrequency],
+        ['🔔','Reminder',     req?.reminderFrequency ? `${req.reminderFrequency} (starts ${req.reminderLeadDays||30} days before due)` : null],
         ['🔁','Compliance Cycle', req?.complianceFrequency ? (COMPLIANCE_FREQS.find(f=>f.value===req.complianceFrequency)||{label:req.complianceFrequency}).label : null],
         ['📅','Next Due Date',
           req?.nextDueDate && req?.complianceFrequency!=='one_time'
@@ -3353,6 +3355,40 @@ function logDigestActivity({ trigger, req, plant, assignee, oldStatus, changedBy
  * Sends a single consolidated "last 24 hours" digest email.
  * Clears the digest log after sending.
  */
+/* ─────────────────────────────────────────────────────────────────────
+   shouldSendReminderToday(req)
+   Returns true when a reminder should fire today for this requirement,
+   based on:
+     1. daysLeft(dueDate) <= req.reminderLeadDays  (within the lead window)
+     2. Frequency gate: Daily always, Weekly on Mon, Bi-Weekly on Mon of odd ISO-weeks,
+        Monthly on the 1st of the month.
+   If the requirement is already Completed, no reminder is sent.
+   ───────────────────────────────────────────────────────────────────── */
+function shouldSendReminderToday(req) {
+  if (req.status === 'Completed') return false;
+  if (!req.dueDate) return false;
+  const dl      = Math.ceil((new Date(req.dueDate) - Date.now()) / 86400000);
+  const lead    = req.reminderLeadDays || 30;
+  // Only remind if within lead window (also catch overdue items: dl < 0)
+  if (dl > lead) return false;
+  const freq    = (req.reminderFrequency || 'Weekly').toLowerCase();
+  const today   = new Date();
+  const dow     = today.getDay(); // 0=Sun, 1=Mon…
+  const dom     = today.getDate();
+  // ISO week number helper
+  const isoWeek = (d) => {
+    const tmp = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+    tmp.setUTCDate(tmp.getUTCDate() + 4 - (tmp.getUTCDay() || 7));
+    const yearStart = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 1));
+    return Math.ceil((((tmp - yearStart) / 86400000) + 1) / 7);
+  };
+  if (freq === 'daily')                               return true;
+  if (freq === 'weekly')                              return dow === 1;      // every Monday
+  if (freq === 'bi-weekly' || freq === 'fortnightly') return dow === 1 && isoWeek(today) % 2 === 1; // Mon of odd weeks
+  if (freq === 'monthly')                             return dom === 1;      // 1st of month
+  return true; // unknown freq → always send
+}
+
 async function sendDailyDigestMail(requirements, plants, users) {
   try {
     const raw = localStorage.getItem('adminSettings');
@@ -3375,10 +3411,10 @@ async function sendDailyDigestMail(requirements, plants, users) {
     // ── Snapshot current state for the digest sections ───────────────────
     const now        = Date.now();
     const cutoff     = now - 24 * 60 * 60 * 1000;
-    const overdue    = requirements.filter(r => r.status === 'Overdue');
-    const dueSoon    = requirements.filter(r => r.status !== 'Completed' && r.status !== 'Overdue' && r.dueDate && daysLeft(r.dueDate) >= 0 && daysLeft(r.dueDate) <= 7);
-    const due30      = requirements.filter(r => r.status !== 'Completed' && r.status !== 'Overdue' && r.dueDate && daysLeft(r.dueDate) > 7  && daysLeft(r.dueDate) <= 30);
-    const due30plus  = requirements.filter(r => r.status !== 'Completed' && r.status !== 'Overdue' && r.dueDate && daysLeft(r.dueDate) > 30);
+    const overdue    = requirements.filter(r => r.status === 'Overdue' || isEffectivelyOverdue(r));
+    const dueSoon    = requirements.filter(r => r.status !== 'Completed' && !isEffectivelyOverdue(r) && r.dueDate && daysLeft(r.dueDate) >= 0 && daysLeft(r.dueDate) <= 7);
+    const due30      = requirements.filter(r => r.status !== 'Completed' && !isEffectivelyOverdue(r) && r.dueDate && daysLeft(r.dueDate) > 7  && daysLeft(r.dueDate) <= 30);
+    const due30plus  = requirements.filter(r => r.status !== 'Completed' && !isEffectivelyOverdue(r) && r.dueDate && daysLeft(r.dueDate) > 30);
     const completed24= requirements.filter(r => r.status === 'Completed' && r.completionDate && new Date(r.completionDate).getTime() >= cutoff);
     const created24  = requirements.filter(r => r.createdAt && new Date(r.createdAt).getTime() >= cutoff);
     // Activity log captured during the last 24h
@@ -3702,8 +3738,208 @@ async function sendDailyDigestMail(requirements, plants, users) {
     localStorage.setItem('lastDailyDigestSent', new Date().toISOString());
     console.log('📬 Daily digest dispatched and log cleared.');
 
+    // ── Per-user reminder emails: each assignee gets ONLY their own list ──
+    await sendPerUserReminderEmails({ requirements, plants, users, cfg, graphReady, ejsReady, portalLink, sentDate, fmtDate, daysLeft });
+
   } catch(e) {
     console.warn('⚠️ sendDailyDigestMail error:', e?.message||e);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   PER-USER REMINDER EMAILS
+   Each assigned user receives their own list of:
+     • Reminders — requirements within their lead window today (per frequency gate)
+     • Overdues  — requirements that are past due and not yet completed
+   The digest admin email (msToEmail) gets the full overview; this function
+   sends ADDITIONAL targeted emails to each user's own address.
+   ═══════════════════════════════════════════════════════════════════════ */
+async function sendPerUserReminderEmails({ requirements, plants, users, cfg, graphReady, ejsReady, portalLink, sentDate, fmtDate, daysLeft }) {
+  try {
+    // Build a map: userId → { user, reminders[], overdues[] }
+    const userMap = {};
+
+    requirements.forEach(req => {
+      if (req.status === 'Completed') return;
+      const assignedIds = Array.isArray(req.assignedTo) ? req.assignedTo : (req.assignedTo ? [req.assignedTo] : []);
+      if (!assignedIds.length) return;
+
+      const isOverdue  = isEffectivelyOverdue(req);
+      const isReminder = !isOverdue && shouldSendReminderToday(req);
+      if (!isOverdue && !isReminder) return;
+
+      assignedIds.forEach(uid => {
+        if (!userMap[uid]) userMap[uid] = { reminders: [], overdues: [] };
+        if (isOverdue)  userMap[uid].overdues.push(req);
+        else            userMap[uid].reminders.push(req);
+      });
+    });
+
+    // Acquire Graph token once (reused across all users)
+    let accessToken = null;
+    if (graphReady) {
+      try { accessToken = await getMSGraphToken(cfg); }
+      catch(e) { console.warn('⚠️ Per-user reminders: MS Graph token failed:', e?.message||e); }
+    }
+
+    // Send one email per user
+    for (const [uid, { reminders, overdues }] of Object.entries(userMap)) {
+      const user = users.find(u => u.id === uid);
+      if (!user?.email) continue;
+
+      const totalItems = reminders.length + overdues.length;
+      if (!totalItems) continue;
+
+      const toEmail = user.email;
+      const subject = `[LegalComp] Your Compliance Reminders — ${new Date().toLocaleDateString('en-IN',{weekday:'long',day:'2-digit',month:'short',year:'numeric'})}`;
+
+      // ── Build per-user HTML ─────────────────────────────────────────────
+      const priorityColor = p => ({Critical:'#ef4444',High:'#f97316',Medium:'#f59e0b',Low:'#22c55e'}[p]||'#6b7280');
+      const badge = (text, color) => `<span style="display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;background:${color}22;color:${color};">${text}</span>`;
+      const reqRow = (r) => {
+        const p  = plants.find(pl => pl.id === r.plantId);
+        const dl = daysLeft(r.dueDate);
+        const leadDays = r.reminderLeadDays || 30;
+        return `<tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;font-weight:500;color:#111827;">${r.title}</td>
+          <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#6b7280;">${p?.name||'—'}</td>
+          <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;">${badge(r.priority, priorityColor(r.priority))}</td>
+          <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:${dl<0?'#ef4444':dl<7?'#f59e0b':'#2563eb'};">${fmtDate(r.dueDate)}${dl<0?` <b style="color:#ef4444">(${Math.abs(dl)}d overdue)</b>`:` <span style="color:#6b7280">(${dl}d left)</span>`}</td>
+          <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#6b7280;">${r.reminderFrequency||'—'} · ${leadDays}d window</td>
+        </tr>`;
+      };
+      const tableHdr = `<thead><tr style="background:#f8fafc;">
+        <th style="text-align:left;padding:10px 12px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Requirement</th>
+        <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Plant</th>
+        <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Priority</th>
+        <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Due Date</th>
+        <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Reminder</th>
+      </tr></thead>`;
+
+      const htmlBody = `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:'Segoe UI',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;padding:28px 12px;">
+<tr><td align="center">
+<table width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%;background:#fff;border-radius:18px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+
+  <!-- Header -->
+  <tr><td style="background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 100%);padding:28px 32px;">
+    <div style="font-size:13px;font-weight:700;color:#93c5fd;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px;">POLYPLASTICS — LEGALCOMP</div>
+    <div style="font-size:22px;font-weight:800;color:#fff;line-height:1.2;">Your Compliance Reminders</div>
+    <div style="font-size:13px;color:#bfdbfe;margin-top:6px;">👤 ${user.name || user.email} · ${sentDate}</div>
+  </td></tr>
+
+  <!-- Greeting -->
+  <tr><td style="padding:20px 32px 8px;">
+    <p style="font-size:14px;color:#374151;margin:0;">Hi <strong>${user.name||'Team'}</strong>,</p>
+    <p style="font-size:13px;color:#6b7280;margin:8px 0 0;">Here is your personalised compliance summary for today. This list contains only the requirements assigned to you.</p>
+  </td></tr>
+
+  <!-- Summary chips -->
+  <tr><td style="padding:12px 32px;">
+    <table cellpadding="0" cellspacing="0"><tr>
+      ${overdues.length  ? `<td style="padding-right:8px;"><span style="display:inline-block;padding:6px 14px;border-radius:20px;font-size:12px;font-weight:700;background:#fee2e2;color:#b91c1c;">🚨 ${overdues.length} Overdue</span></td>` : ''}
+      ${reminders.length ? `<td style="padding-right:8px;"><span style="display:inline-block;padding:6px 14px;border-radius:20px;font-size:12px;font-weight:700;background:#eff6ff;color:#1d4ed8;">🔔 ${reminders.length} Due Reminder${reminders.length>1?'s':''}</span></td>` : ''}
+    </tr></table>
+  </td></tr>
+
+  <tr><td style="padding:0 32px 24px;">
+  <table width="100%" cellpadding="0" cellspacing="0">
+
+  ${overdues.length ? `
+    <!-- Overdue -->
+    <tr><td style="padding:16px 0 8px;">
+      <div style="border-left:4px solid #ef4444;padding-left:12px;">
+        <span style="font-size:13px;font-weight:700;color:#b91c1c;text-transform:uppercase;letter-spacing:.04em;">🚨 Overdue Requirements</span>
+      </div>
+    </td></tr>
+    <tr><td>
+      <div style="overflow-x:auto;border-radius:10px;border:1px solid #fee2e2;">
+      <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+        ${tableHdr}
+        <tbody>${overdues.map(reqRow).join('')}</tbody>
+      </table></div>
+    </td></tr>` : ''}
+
+  ${reminders.length ? `
+    <!-- Reminders -->
+    <tr><td style="padding:20px 0 8px;">
+      <div style="border-left:4px solid #2563eb;padding-left:12px;">
+        <span style="font-size:13px;font-weight:700;color:#1d4ed8;text-transform:uppercase;letter-spacing:.04em;">🔔 Upcoming Reminders</span>
+      </div>
+    </td></tr>
+    <tr><td>
+      <div style="overflow-x:auto;border-radius:10px;border:1px solid #bfdbfe;">
+      <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+        ${tableHdr}
+        <tbody>${reminders.map(reqRow).join('')}</tbody>
+      </table></div>
+    </td></tr>` : ''}
+
+  </table>
+  </td></tr>
+
+  <!-- CTA -->
+  <tr><td style="padding:4px 32px 20px;" align="center">
+    <a href="${portalLink}" style="display:inline-block;background:#2563eb;color:#fff;font-weight:700;font-size:13px;padding:12px 28px;border-radius:10px;text-decoration:none;">
+      📋 Open My Tasks →
+    </a>
+  </td></tr>
+
+  <!-- Footer -->
+  <tr><td style="background:#f8fafc;padding:16px 32px;border-top:1px solid #e5e7eb;">
+    <p style="font-size:11px;color:#9ca3af;margin:0;"><strong>Polyplastics — LegalComp</strong> · Auto-generated · ${sentDate}<br/>This reminder is sent only to you and contains only your assigned requirements.</p>
+  </td></tr>
+
+</table>
+</td></tr>
+</table>
+</body></html>`;
+
+      // ── Send via Graph ──
+      if (graphReady && accessToken) {
+        try {
+          await sendGraphMail(accessToken, { toEmail, subject, htmlBody });
+          console.log(`✅ [MS Graph] Per-user reminder → ${toEmail} (${reminders.length} reminders, ${overdues.length} overdue)`);
+        } catch(e) { console.warn(`⚠️ Per-user reminder Graph error for ${toEmail}:`, e?.message||e); }
+      }
+
+      // ── Send via EmailJS ──
+      if (ejsReady) {
+        const plainText = `Hi ${user.name||''},\n\nYour Compliance Reminders — ${sentDate}\n\nOverdue (${overdues.length}): ${overdues.map(r=>r.title).join(', ')||'None'}\nUpcoming Reminders (${reminders.length}): ${reminders.map(r=>`${r.title} (due ${fmtDate(r.dueDate)})`).join(', ')||'None'}\n\nOpen portal: ${portalLink}`;
+        try {
+          await sendEmailJsMail(cfg, {
+            toEmail, subject, plainText,
+            templateParams: {
+              to_name:        user.name || '',
+              from_name:      'Polyplastics',
+              trigger_label:  'Personal Reminder',
+              opening_line:   `Your personalised compliance reminder for ${sentDate}.`,
+              closing_remark: `You have ${overdues.length} overdue and ${reminders.length} upcoming item(s). Please take action.`,
+              portal_link:    portalLink,
+              sent_date:      sentDate,
+              req_title:      overdues.concat(reminders).map(r=>r.title).join(', '),
+              req_status:     `${overdues.length} overdue / ${reminders.length} due reminder`,
+              req_priority:   '',
+              req_category:   '',
+              req_due_date:   reminders[0]?.dueDate || overdues[0]?.dueDate || '',
+              req_description:plainText,
+              plant_name:     '',
+              plant_state:    '',
+              assignee_name:  user.name || '',
+              assignee_email: toEmail,
+              changed_by:     'System',
+              old_status:     '',
+            },
+          });
+          console.log(`✅ [EmailJS] Per-user reminder → ${toEmail}`);
+        } catch(e) { console.warn(`⚠️ Per-user reminder EmailJS error for ${toEmail}:`, e?.message||e); }
+      }
+    }
+
+    console.log(`📨 Per-user reminders sent to ${Object.keys(userMap).length} user(s).`);
+  } catch(e) {
+    console.warn('⚠️ sendPerUserReminderEmails error:', e?.message||e);
   }
 }
 
@@ -3858,7 +4094,7 @@ function EscalationLevelPanel({ level, allEmails, onUpdate, dk, compact, wrapCls
 ═══════════════════════════════════════════ */
 function RequirementModal({ open, onClose, onSave, initial, plants, users, dk, categories: catsProp }) {
   const cats = catsProp || CATEGORIES;
-  const blank = { title:'', description:'', category: (catsProp||CATEGORIES)[0]||'', priority:'High', plantId:'', plantIds:[], assignedTo:[], status:'Pending', dueDate:'', completionDate:'', nextDueDate:'', complianceFrequency:'annual', reminderFrequency:'Weekly', escalationLevel:1, escalationEmail:'', escalationEmails:{ 1:[], 2:[], 3:[] }, applicableRule:'', legalClause:'' };
+  const blank = { title:'', description:'', category: (catsProp||CATEGORIES)[0]||'', priority:'High', plantId:'', plantIds:[], assignedTo:[], status:'Pending', dueDate:'', completionDate:'', nextDueDate:'', complianceFrequency:'annual', reminderFrequency:'Weekly', reminderLeadDays:30, escalationLevel:1, escalationEmail:'', escalationEmails:{ 1:[], 2:[], 3:[] }, applicableRule:'', legalClause:'' };
   const [form, setForm] = useState(blank);
   const [saving, setSaving] = useState(false);
   useEffect(()=>{
@@ -4082,10 +4318,17 @@ function RequirementModal({ open, onClose, onSave, initial, plants, users, dk, c
             );
           })() : <div className="hidden md:block col-span-2" />}
 
-          <FormField compact label="Reminder Frequency" className="col-span-1 md:col-span-2">
+          <FormField compact label="Reminder Frequency" className="col-span-1 md:col-span-1">
             <select value={form.reminderFrequency} onChange={e=>set('reminderFrequency',e.target.value)} className={sc}>
               {REM_FREQS.map(r=><option key={r}>{r}</option>)}
             </select>
+          </FormField>
+          <FormField compact label="Remind (Days Before Due)" className="col-span-1 md:col-span-1">
+            <input type="number" min="1" max="365" value={form.reminderLeadDays||30}
+              onChange={e=>set('reminderLeadDays', Math.max(1,+e.target.value||30))}
+              className={ic}
+              title="Reminders start this many days before the due date. E.g. 180 for 6-month advance notice, then repeat at the set frequency." />
+            <p className="text-[10px] text-gray-400 mt-0.5">Frequency repeats within this window. E.g. 180 days + Weekly = weekly emails starting 180 days before due.</p>
           </FormField>
           <FormField compact label="Escalation Level" className="col-span-1 md:col-span-2">
             <select value={form.escalationLevel} onChange={e=>set('escalationLevel',+e.target.value)} className={sc}>
@@ -4776,7 +5019,7 @@ function AdminRequirements({ dk, plants, users, requirements, updateRequirements
               </div>
               <p className={`leading-relaxed ${dk?'text-gray-300':'text-gray-700'}`}>{viewReq.description}</p>
               <div className="grid grid-cols-2 gap-4">
-                {[['Plant',plant?.name],['State',plant?.state],['Assigned To',assigneeStr],['Due Date',formatDate(viewReq.dueDate)],['Completion Date',viewReq.completionDate?formatDate(viewReq.completionDate):'—'],['Reminder',viewReq.reminderFrequency]].map(([l,v])=>(
+                {[['Plant',plant?.name],['State',plant?.state],['Assigned To',assigneeStr],['Due Date',formatDate(viewReq.dueDate)],['Completion Date',viewReq.completionDate?formatDate(viewReq.completionDate):'—'],['Reminder',`${viewReq.reminderFrequency||'—'} (${viewReq.reminderLeadDays||30}d before)`]].map(([l,v])=>(
                   <div key={l} className={`p-3 rounded-xl ${dk?'bg-gray-700':'bg-gray-50'}`}>
                     <p className={`text-xs uppercase tracking-wide font-semibold mb-0.5 ${sub}`}>{l}</p>
                     <p className={`font-medium ${dk?'text-white':'text-gray-800'}`}>{v||'—'}</p>
@@ -6946,7 +7189,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
   const sub  = dk?'text-gray-400':'text-gray-500';
 
   /* ── CSV template columns ── */
-  const COLS = ['title','description','category','priority','status','plant_id','state','due_date','compliance_frequency','reminder_frequency','escalation_level','escalation_email','assigned_email','applicable_rule','legal_clause'];
+  const COLS = ['title','description','category','priority','status','plant_id','state','due_date','compliance_frequency','reminder_frequency','reminder_lead_days','escalation_level','escalation_email','assigned_email','applicable_rule','legal_clause'];
 
   /* ── Download template ── */
   const downloadTemplate = () => {
@@ -6999,6 +7242,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       { key:'due_date',           label:'due_date *',           width:14, note:'Required. Format: YYYY-MM-DD (e.g. 2025-12-31).' },
       { key:'compliance_frequency',label:'compliance_frequency', width:22, note:`One of: ${COMPLIANCE_FREQS.map(f=>f.value).join(', ')} — controls how often the requirement recurs after completion.` },
       { key:'reminder_frequency', label:'reminder_frequency',   width:20, note:`One of: ${REM_FREQS.join(', ')}` },
+      { key:'reminder_lead_days', label:'reminder_lead_days',   width:20, note:'Days before due date to start reminders. E.g. 180 = start reminders 6 months before. Then frequency (Daily/Weekly etc.) repeats within that window. Default: 30.' },
       { key:'escalation_level',   label:'escalation_level',     width:18, note:'1, 2 or 3.' },
       { key:'escalation_email',   label:'escalation_email',     width:28, note:'Email address for escalation alerts.' },
       { key:'assigned_email',     label:'assigned_email',        width:36, note:'Email of the user to assign this to. For MULTI-PLANT: comma-separate emails matching plant_id order, e.g. ravi@co.com,suresh@co.com,anand@co.com — if fewer emails than plants, the last email repeats.' },
@@ -7032,6 +7276,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         new Date(Date.now() + (i + 1) * 30 * 86400000).toISOString().split('T')[0],
         COMPLIANCE_FREQS[(i + 1) % COMPLIANCE_FREQS.length].value,
         REM_FREQS[i % 4],
+        [30, 60, 180][i % 3],   // reminder_lead_days
         (i % 3) + 1,
         'ceo@legalcomp.com',
         '',
@@ -7055,6 +7300,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         new Date(Date.now() + 90 * 86400000).toISOString().split('T')[0],
         'annual',
         'Monthly',
+        180,            // reminder_lead_days — 6 months advance notice for annual items
         1,
         'ceo@legalcomp.com',
         mpEmails,       // e.g.  ram@p1.com,shyam@p2.com,hari@p3.com
@@ -7160,6 +7406,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       ['status',             STATUSES.join(' | ')],
       ['compliance_frequency', COMPLIANCE_FREQS.map(f=>`${f.value} (${f.label})`).join(' | ')],
       ['reminder_frequency', REM_FREQS.join(' | ')],
+      ['reminder_lead_days', 'Number of days before due date to start reminders. Default: 30. Range: 1–365. E.g. 180 = start 6 months before due, then repeat at the chosen frequency.'],
       ['escalation_level',   '1 | 2 | 3'],
       ['due_date format',    'YYYY-MM-DD  (e.g. 2025-12-31)'],
     ];
@@ -7192,6 +7439,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
     const escLvl    = [1, 2, 3].includes(+obj.escalation_level) ? +obj.escalation_level : 1;
     const compFreq  = normalizeFrequency(obj.compliance_frequency);
     const remFreq   = normalizeReminderFreq(obj.reminder_frequency);
+    const remLead   = obj.reminder_lead_days ? Math.max(1, Math.min(365, +obj.reminder_lead_days || 30)) : 30;
 
     plantIds.forEach((pid, idx) => {
       const rowErrs = [];
@@ -7234,6 +7482,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         dueDate:           obj.due_date,
         complianceFrequency: compFreq,
         reminderFrequency: remFreq,
+        reminderLeadDays:  remLead,
         escalationLevel:   escLvl,
         escalationEmail:   obj.escalation_email || '',
         assignedTo:        assignedTo ? [assignedTo] : [],
@@ -7255,6 +7504,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       due:'due_date', deadline:'due_date',
       compliance_freq:'compliance_frequency', recurrence:'compliance_frequency',
       reminder:'reminder_frequency', reminder_freq:'reminder_frequency',
+      lead_days:'reminder_lead_days', days_before:'reminder_lead_days', advance_days:'reminder_lead_days',
       escalation:'escalation_level', esc_level:'escalation_level',
       rule:'applicable_rule', regulation:'applicable_rule',
       clause:'legal_clause', provision:'legal_clause',
@@ -7294,6 +7544,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       due:'due_date', deadline:'due_date',
       compliance_freq:'compliance_frequency', recurrence:'compliance_frequency',
       reminder:'reminder_frequency', reminder_freq:'reminder_frequency',
+      lead_days:'reminder_lead_days', days_before:'reminder_lead_days', advance_days:'reminder_lead_days',
       escalation:'escalation_level', esc_level:'escalation_level',
       rule:'applicable_rule', regulation:'applicable_rule',
       clause:'legal_clause', provision:'legal_clause',
@@ -7387,6 +7638,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
         assignedEmailPending: r._assignedEmailRaw || '', // email that didn't match a user yet
         dueDate:           r.dueDate,
         reminderFrequency: r.reminderFrequency,
+        reminderLeadDays:  r.reminderLeadDays || 30,
         escalationLevel:   r.escalationLevel,
         escalationEmail:   r.escalationEmail,
         complianceFrequency: r.complianceFrequency || 'annual',
@@ -7511,7 +7763,8 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
                     ['state','Text','⚡ Or plant_id','State name — auto-matches plant (single plant only)'],
                     ['due_date','YYYY-MM-DD','✅ Yes','e.g. 2025-09-30'],
                     ['compliance_frequency','Enum','No','monthly / quarterly / half_yearly / annual / one_time — also accepts: Monthly, Quarterly, Half-Yearly, Yearly, Bi-Annual etc.'],
-                    ['reminder_frequency','Enum','No','Daily / Weekly / Fortnightly / Monthly — also accepts: daily, bi-weekly etc.'],
+                    ['reminder_frequency','Enum','No','Daily / Weekly / Bi-Weekly / Monthly — also accepts: daily, fortnightly etc.'],
+                    ['reminder_lead_days','Number','No','Days before due date when reminders begin (default 30). E.g. 180 = start 6 months early, then repeat per frequency.'],
                     ['escalation_level','1/2/3','No','1=Plant Head, 2=Regional, 3=Top Mgmt'],
                     ['escalation_email','Email','No','Override escalation email'],
                     ['assigned_email','Email / CSV','No','Single email OR comma-separated per plant: ram@p1.com,shyam@p2.com — matches plant_id order; last email repeats if fewer'],
@@ -7820,7 +8073,7 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
                             );
                           })()}
                         </td>
-                        <td className={`px-3 py-2 ${sub} whitespace-nowrap`}>{row.reminderFrequency||'—'}</td>
+                        <td className={`px-3 py-2 ${sub} whitespace-nowrap`}>{row.reminderFrequency||'—'} · {row.reminderLeadDays||30}d</td>
                         <td className="px-3 py-2">
                           {assignee
                             ? <span className="text-[color:var(--p600)] font-medium text-xs">{assignee.name}</span>
@@ -9359,7 +9612,7 @@ function PlantHeadDashboard({ dk, toggleTheme, colourKey, cycleColour, changeCol
           </div>
           <p className={`leading-relaxed ${dk?'text-gray-200':'text-gray-700'}`}>{selPHReq.description}</p>
           <div className="grid grid-cols-2 gap-3">
-            {[['📅 Due Date',formatDate(selPHReq.dueDate)],['⌛ Days Left',dl<0?`${Math.abs(dl)}d overdue`:dl===0?'Today':`${dl}d`],['🔔 Reminder',selPHReq.reminderFrequency],['🏭 Plant',plant?.name||'—'],['📍 State',plant?.state||'—'],['👤 Assigned To',assignees.length>0?assignees.map(a=>a.name).join(', '):'Unassigned']].map(([l,v])=>(
+            {[['📅 Due Date',formatDate(selPHReq.dueDate)],['⌛ Days Left',dl<0?`${Math.abs(dl)}d overdue`:dl===0?'Today':`${dl}d`],['🔔 Reminder',`${selPHReq.reminderFrequency||'—'} (${selPHReq.reminderLeadDays||30}d before)`],['🏭 Plant',plant?.name||'—'],['📍 State',plant?.state||'—'],['👤 Assigned To',assignees.length>0?assignees.map(a=>a.name).join(', '):'Unassigned']].map(([l,v])=>(
               <div key={l} className={`p-3 rounded-xl ${dk?'bg-gray-700':'bg-gray-50'}`}>
                 <p className={`text-xs mb-0.5 ${sub2}`}>{l}</p>
                 <p className={`font-medium text-xs ${dk?'text-gray-100':'text-gray-800'}`}>{v}</p>
@@ -9506,7 +9759,7 @@ function UserTaskModal({ selReq, setSelReq, dk, users, requirements, updateRequi
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:5}}>
                 <Tile icon="📅" label="Due Date"        value={formatDate(selReq.dueDate)} />
                 <Tile icon="🏭" label="Plant"           value={myPlant?.name||'—'} />
-                <Tile icon="🔔" label="Reminder"        value={selReq.reminderFrequency||'—'} />
+                <Tile icon="🔔" label="Reminder"        value={selReq.reminderFrequency ? `${selReq.reminderFrequency} (${selReq.reminderLeadDays||30}d before)` : '—'} />
                 <Tile icon="📍" label="State"           value={myPlant?.state||'—'} />
                 <Tile icon="🔁" label="Frequency"       value={freqLabel} />
                 <Tile icon="⚖️" label="Applicable Rule" value={selReq.applicableRule||'—'} />
