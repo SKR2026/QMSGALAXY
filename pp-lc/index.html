@@ -781,19 +781,48 @@
     '</div>'
   ].join('');
 
-  // ── Shell login: authenticate against Firestore directly (no React needed) ──
+  // ── Shell login: authenticate against Firestore directly (no React/Babel needed) ──
   var btn   = document.getElementById('iShellBtn');
   var errEl = document.getElementById('iShellErr');
 
-  function showErr(msg) {
+  function showMsg(msg, color) {
     if (!errEl) return;
     errEl.style.display = 'block';
+    errEl.style.color   = color || '';
     errEl.textContent   = msg;
   }
   function setBusy(busy) {
     if (!btn) return;
-    btn.disabled    = busy;
-    btn.textContent = busy ? 'Signing in…' : 'Sign In';
+    btn.disabled      = busy;
+    btn.textContent   = busy ? 'Signing in…' : 'Sign In';
+    btn.style.opacity = busy ? '0.7' : '1';
+  }
+  function setDot(color) {
+    // Update the amber loading dot color
+    var els = document.querySelectorAll('#instant-login-shell span');
+    for (var i = 0; i < els.length; i++) {
+      var s = els[i].style.background || '';
+      if (s.indexOf('f59e0b') !== -1 || s.indexOf('amber') !== -1 || s.indexOf('22c55e') !== -1 || s.indexOf('ef4444') !== -1) {
+        els[i].style.background = color;
+        els[i].style.animation  = color === '#f59e0b' ? '' : 'none';
+      }
+    }
+  }
+
+  // ── Firestore helpers (vanilla JS, mirrors fbEnsureAuth + fbLoad in React) ──
+  async function shellEnsureAuth() {
+    try {
+      if (window.fbAuth && !window.fbAuth.currentUser) {
+        await window.fbAuth.signInAnonymously();
+      }
+    } catch(_) { /* anonymous auth might be disabled — Firestore may still allow reads */ }
+  }
+  async function shellLoadUsers() {
+    await shellEnsureAuth();
+    // Data is stored as: collection('legalcomp_users').doc('data') → { items: [...] }
+    var snap = await window.db.collection('legalcomp_users').doc('data').get();
+    if (snap.exists) return snap.data().items || [];
+    return [];
   }
 
   async function handleShellLogin() {
@@ -801,25 +830,34 @@
     var pwEl    = document.getElementById('iShellPw');
     var email   = ((emailEl && emailEl.value) || '').toLowerCase().trim();
     var pw      = (pwEl && pwEl.value) || '';
-    if (!email || !pw) { showErr('Please enter your email and password.'); return; }
+    if (!email || !pw) { showMsg('Please enter your email and password.'); return; }
 
     setBusy(true);
-    if (errEl) errEl.style.display = 'none';
+    errEl && (errEl.style.display = 'none');
 
     try {
-      // Ensure Firebase anonymous auth (Firestore security rules require auth)
-      if (window.fbAuth) {
-        if (!window.fbAuth.currentUser) {
-          await window.fbAuth.signInAnonymously().catch(function(){});
-        }
+      var users = await shellLoadUsers();
+
+      // Try cached users as fallback if Firestore returns nothing
+      if (!users.length) {
+        try {
+          var cached = localStorage.getItem('lc_shell_users');
+          if (cached) users = JSON.parse(cached);
+        } catch(_) {}
+      } else {
+        // Cache for offline use
+        try { localStorage.setItem('lc_shell_users', JSON.stringify(users)); } catch(_) {}
       }
 
-      // Query Firestore for the user
-      var snap = await window.db.collection('legalcomp_users').get();
-      var users = [];
-      snap.forEach(function(doc) { users.push(doc.data()); });
+      if (!users.length) {
+        // Nothing from Firestore or cache — hand off to React when it loads
+        window.__instant_creds = { email: email, pw: pw };
+        showMsg('⏳ Checking credentials once app fully loads…', '#d97706');
+        setBusy(false);
+        return;
+      }
 
-      // Match by email + password (plain-text, same as React login)
+      // Match by email + password (plain-text match, same logic as React login)
       var u = null;
       for (var i = 0; i < users.length; i++) {
         var x = users[i];
@@ -829,39 +867,41 @@
       }
 
       if (u) {
-        // Stash the authenticated user — React picks this up on mount and skips re-login
         window.__instant_user = u;
-        // Also cache users so React boot is instant
-        try { localStorage.setItem('lc_users_cache', JSON.stringify({ value: JSON.stringify(users), ts: Date.now() })); } catch(_) {}
-        showErr('✅ Signed in! Loading dashboard…');
-        if (errEl) errEl.style.color = '#16a34a';
-        // React is still loading in the background; when it mounts it will call login() automatically.
-        // In the meantime update the status dot to green.
-        var dot = document.querySelector('#instant-login-shell [style*="amber"], #instant-login-shell [style*="f59e0b"]');
-        if (dot) { dot.style.background = '#22c55e'; dot.style.animation = 'none'; }
-        var loadTxt = document.querySelector('#instant-login-shell [style*="Loading app"]');
+        showMsg('✅ Signed in! Loading dashboard…', '#16a34a');
+        setDot('#22c55e');
+        var loadTxt = document.querySelector('#instant-login-shell div[style*="Loading"], #instant-login-shell div[style*="loading"]');
         if (loadTxt) loadTxt.textContent = 'Dashboard loading…';
+        // Keep button disabled — React will take over soon
         return;
       }
 
-      // Top-management users use magic link — no password
-      var tm = users.find(function(x){ return (x.email||'').toLowerCase()===email && x.role==='top_management'; });
-      if (tm) {
-        showErr('⚠️ Top Management accounts use the magic link. Ask your admin for the link.');
+      var isTM = users.some(function(x){ return (x.email||'').toLowerCase()===email && x.role==='top_management'; });
+      if (isTM) {
+        showMsg('⚠️ Top Management — use the magic link provided by your admin.');
         setBusy(false);
         return;
       }
 
-      showErr('❌ Invalid email or password.');
+      showMsg('❌ Invalid email or password. Check and try again.');
       setBusy(false);
 
     } catch(e) {
-      console.error('Shell login error:', e);
-      // Firebase/network failed — fall back to stashing creds for React to handle
+      console.error('[Shell login]', e);
+      // Firestore unreachable — stash creds, React will retry on mount
       window.__instant_creds = { email: email, pw: pw };
-      showErr('⏳ Network slow — still loading app. Please wait…');
-      if (errEl) errEl.style.color = '#d97706';
+      showMsg('⏳ Network issue — will retry once app loads…', '#d97706');
+      setBusy(false);
     }
+  }
+
+  // ── View Only tab → redirect to ?view=overview (React handles it on load) ──
+  var viewOnlyTab = document.querySelectorAll('#instant-login-shell [style*="cursor:pointer"]');
+  // The second pill div is View Only
+  if (viewOnlyTab.length >= 2) {
+    viewOnlyTab[1].addEventListener('click', function() {
+      window.location.href = window.location.pathname + '?view=overview';
+    });
   }
 
   if (btn) btn.addEventListener('click', handleShellLogin);
@@ -870,16 +910,20 @@
     if (el) el.addEventListener('keydown', function(e) { if (e.key === 'Enter') handleShellLogin(); });
   });
 
-  // After 30s without React mounting, tell the user to reload
+  // After 40s still no React — show reload hint (only if user hasn't logged in)
   setTimeout(function() {
-    if (!document.getElementById('instant-login-shell')) return; // React took over
-    var loadTxt = document.querySelector('#instant-login-shell [style*="Loading app"], #instant-login-shell [style*="Dashboard loading"]');
-    if (loadTxt && loadTxt.textContent.indexOf('Dashboard') === -1) {
-      loadTxt.textContent = '⚠️ App taking long to load — try reloading the page.';
-      var dot = document.querySelector('#instant-login-shell [style*="amber"], #instant-login-shell [style*="f59e0b"]');
-      if (dot) { dot.style.background = '#ef4444'; dot.style.animation = 'none'; }
+    if (!document.getElementById('instant-login-shell')) return;
+    if (errEl && errEl.textContent.indexOf('✅') !== -1) return; // already signed in
+    setDot('#ef4444');
+    var rows = document.querySelectorAll('#instant-login-shell div');
+    for (var i = rows.length - 1; i >= 0; i--) {
+      var t = rows[i].textContent || '';
+      if (t.indexOf('Loading') !== -1 || t.indexOf('loading') !== -1) {
+        rows[i].textContent = '⚠️ App slow to load — try reloading the page.';
+        break;
+      }
     }
-  }, 30000);
+  }, 40000);
 })();
 </script>
 
