@@ -1074,6 +1074,8 @@ let S = {
   selectedVehicleId: null, selectedExpenses: new Set(), _selectedVehicleBar: null,
   modal: null, loading: false, dataLoaded: false, notifications: [],
   companyLogo: localStorage.getItem('vems_logo') || '',
+  companyLogoNatW: parseInt(localStorage.getItem('vems_logo_w')||'0')||0,
+  companyLogoNatH: parseInt(localStorage.getItem('vems_logo_h')||'0')||0,
   orgName: localStorage.getItem('vems_orgname') || '',
   schedulerCrons: JSON.parse(localStorage.getItem('vems_crons')||'{"daily":"0 8 * * *","weekly":"0 8 * * 1","invoice":"0 9 * * *"}'),
   notifConfig: JSON.parse(localStorage.getItem('vems_notif_config') || '{}'),
@@ -1283,7 +1285,19 @@ async function loadFirestoreData() {
       const brandDoc = await getDoc(doc(db, 'vems_settings', 'branding'));
       if (brandDoc.exists()) {
         const b = brandDoc.data();
-        if (b.companyLogo) { S.companyLogo = b.companyLogo; localStorage.setItem('vems_logo', b.companyLogo); }
+        if (b.companyLogo) {
+          S.companyLogo = b.companyLogo;
+          localStorage.setItem('vems_logo', b.companyLogo);
+          // Measure natural dimensions for proportion-safe PDF rendering
+          const _li = new Image();
+          _li.onload = () => {
+            S.companyLogoNatW = _li.naturalWidth;
+            S.companyLogoNatH = _li.naturalHeight;
+            localStorage.setItem('vems_logo_w', _li.naturalWidth);
+            localStorage.setItem('vems_logo_h', _li.naturalHeight);
+          };
+          _li.src = b.companyLogo;
+        }
         if (b.orgName)     { S.orgName = b.orgName;         localStorage.setItem('vems_orgname', b.orgName); }
       }
     } catch {}
@@ -2462,6 +2476,15 @@ window.handleLogoUpload = async function(input) {
   reader.onload = async e => {
     S.companyLogo = e.target.result;
     localStorage.setItem('vems_logo', e.target.result);
+    // Capture natural dimensions so PDF rendering preserves original proportions
+    const _imgDim = new Image();
+    _imgDim.onload = () => {
+      S.companyLogoNatW = _imgDim.naturalWidth;
+      S.companyLogoNatH = _imgDim.naturalHeight;
+      localStorage.setItem('vems_logo_w', _imgDim.naturalWidth);
+      localStorage.setItem('vems_logo_h', _imgDim.naturalHeight);
+    };
+    _imgDim.src = e.target.result;
     // Update preview immediately
     const wrap = document.getElementById('logo-preview-wrap');
     if (wrap) wrap.innerHTML = `<img src="${e.target.result}" id="logo-preview-img" style="max-width:76px;max-height:76px;object-fit:contain"/>`;
@@ -2747,6 +2770,8 @@ function sidebarHTML() {
     ]},
     { section:'Analytics', items:[
       {id:'co2',label:'CO₂ Emissions',icon:'🌱'},
+      {id:'summary',label:'Summary Report',icon:'📋'},
+      {id:'maintenance',label:'Maintenance Report',icon:'🔧'},
     ]},
     { section:'Admin', items:[
       {id:'plants',label:'Plants',icon:'🏭'},
@@ -2798,6 +2823,8 @@ function pageHTML() {
     case 'expenses':    return isUser() ? userExpensesHTML() : expensesHTML();
     case 'co2':         return co2HTML();
     case 'reports':     return reportsHTML();
+    case 'summary':     return summaryReportHTML();
+    case 'maintenance': return maintenanceReportHTML();
     case 'plants':      return plantsHTML();
     case 'users':       return (isSA()||isPlantAdmin())?usersHTML():dashboardHTML();
     case 'emfactors':          return isSA()?emFactorsHTML():dashboardHTML();
@@ -5389,7 +5416,9 @@ function topMgmtSidebarHTML() {
       {id:'expenses',  label:'Expenses',          icon:'₹'},
     ]},
     { section:'Analytics', items:[
-      {id:'co2',       label:'CO₂ Emissions',     icon:'🌱'},
+      {id:'co2',         label:'CO₂ Emissions',      icon:'🌱'},
+      {id:'summary',     label:'Summary Report',      icon:'📋'},
+      {id:'maintenance', label:'Maintenance Report',  icon:'🔧'},
     ]},
   ];
   const page = S.page === 'topmgmt' ? 'topmgmt' : S.page;
@@ -5440,6 +5469,8 @@ function topMgmtPageHTML() {
     case 'expenses':       return expensesReadOnlyHTML();
     case 'co2':            return co2HTML();
     case 'reports':        return reportsHTML();
+    case 'summary':        return summaryReportHTML();
+    case 'maintenance':    return maintenanceReportHTML();
     default:               return dashboardHTML();
   }
 }
@@ -7445,20 +7476,28 @@ window.bulkDeleteExpenses = async function() {
 // ── MAINTENANCE EXPORTS ───────────────────────────────────────────
 // ── PDF helper: rupee-safe amount string (jsPDF default fonts lack ₹) ──
 function pdfAmt(n){ return 'Rs.' + Number(n||0).toLocaleString('en-IN'); }
-// ── PDF logo helper: auto-detects format from data URL, works for PNG/JPEG/etc ──
-function pdfAddLogo(doc, x, y, w, h) {
+// ── PDF logo helper: detects format, preserves original aspect ratio (contain fit) ──
+function pdfAddLogo(doc, x, y, maxW, maxH) {
   if (!S.companyLogo) return;
   try {
     const src = S.companyLogo;
-    // Detect format from data URI header; fall back to JPEG (most common for photos)
     let fmt = 'JPEG';
-    if (src.startsWith('data:image/png')) fmt = 'PNG';
-    else if (src.startsWith('data:image/gif')) fmt = 'GIF';
+    if (src.startsWith('data:image/png'))  fmt = 'PNG';
+    else if (src.startsWith('data:image/gif'))  fmt = 'GIF';
     else if (src.startsWith('data:image/webp')) fmt = 'WEBP';
-    // Pass the full data URL — jsPDF v2.5 accepts data URIs directly
-    doc.addImage(src, fmt, x, y, w, h);
+    else if (src.startsWith('data:image/svg'))  fmt = 'SVG';
+    // Compute contain dimensions — never stretch, always honour original ratio
+    const natW = S.companyLogoNatW || maxW;
+    const natH = S.companyLogoNatH || maxH;
+    const ratio = natW / natH;
+    let dw = maxW, dh = maxH;
+    if (dw / dh > ratio) { dw = dh * ratio; } else { dh = dw / ratio; }
+    // Centre within the reserved box
+    const dx = x + (maxW - dw) / 2;
+    const dy = y + (maxH - dh) / 2;
+    doc.addImage(src, fmt, dx, dy, dw, dh);
   } catch(e) {
-    try { doc.addImage(S.companyLogo, 'PNG', x, y, w, h); } catch(e2) {}
+    try { doc.addImage(S.companyLogo, 'PNG', x, y, maxW, maxH); } catch(e2) {}
   }
 }
 function pdfHdr(doc, pageW, title, sub) {
@@ -8224,6 +8263,657 @@ window.exportAllReportsPDF = function() {
     console.error(e);
     showToast('PDF export failed: '+e.message, 'error');
   }
+};
+
+// ══════════════════════════════════════════════════════════════════
+// ── SUMMARY REPORT PAGE ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+function summaryReportHTML() {
+  const exps = filteredExpenses();
+  const vehicles = myVehicles();
+  const plants = myPlants();
+  const MAINT_CATS = ['Maintenance','Repair','Tyres','Battery','Spare Parts','Breakdown','Washing'];
+
+  // Build per-vehicle summary rows
+  const rows = vehicles.map(v => {
+    const ve = exps.filter(e => e.vehicleId === v.id);
+    const fuelExps = ve.filter(e => isFuelCat(e.category));
+    const maintExps = ve.filter(e => MAINT_CATS.includes(e.category));
+    const totalFuel   = fuelExps.reduce((s,e)=>s+(e.fuelQty||0),0);
+    const totalDist   = fuelExps.reduce((s,e)=>s+(e.distanceTravelled||0),0);
+    const petrolCost  = ve.filter(e=>e.category==='Petrol'||e.category==='Fuel').reduce((s,e)=>s+e.amount,0);
+    const cngCost     = ve.filter(e=>e.category==='CNG').reduce((s,e)=>s+e.amount,0);
+    const dieselCost  = ve.filter(e=>e.category==='Diesel').reduce((s,e)=>s+e.amount,0);
+    const fuelCost    = petrolCost+cngCost+dieselCost;
+    const maintCost   = maintExps.reduce((s,e)=>s+e.amount,0);
+    const totalCost   = ve.reduce((s,e)=>s+e.amount,0);
+    const avgMileage  = totalFuel>0 ? (totalDist/totalFuel).toFixed(2) : '—';
+    const costPerKm   = totalDist>0 ? (totalCost/totalDist).toFixed(2) : '—';
+    const co2         = getCO2Total(v.id);
+    const plant       = plants.find(p=>p.id===v.plantId);
+    return { v, plant, totalFuel, totalDist, petrolCost, cngCost, dieselCost, fuelCost, maintCost, totalCost, avgMileage, costPerKm, co2 };
+  }).filter(r => r.totalCost > 0 || r.totalFuel > 0);
+
+  const grandFuel    = rows.reduce((s,r)=>s+r.totalFuel,0);
+  const grandDist    = rows.reduce((s,r)=>s+r.totalDist,0);
+  const grandFuelC   = rows.reduce((s,r)=>s+r.fuelCost,0);
+  const grandMaint   = rows.reduce((s,r)=>s+r.maintCost,0);
+  const grandTotal   = rows.reduce((s,r)=>s+r.totalCost,0);
+  const grandCO2     = rows.reduce((s,r)=>s+r.co2,0);
+
+  // Group by plant/location
+  const byPlant = {};
+  rows.forEach(r => {
+    const loc = r.plant?.name || 'Unknown';
+    if (!byPlant[loc]) byPlant[loc] = [];
+    byPlant[loc].push(r);
+  });
+
+  const yearLabel = S.filterMode==='FY'?`FY ${S.filterYear}`:String(S.filterYear);
+  const monthLabel = S.filterMonth ? ` · ${MONTHS.find(m=>m.val===S.filterMonth)?.label||''}` : '';
+  const plantLabel = S.filterPlant ? ` · ${plantName(S.filterPlant)}` : '';
+
+  return `<div class="page">
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">📋 Fleet Summary Report</h1>
+        <p class="page-subtitle">Vehicle-wise fuel, running & cost summary · ${yearLabel}${monthLabel}${plantLabel}</p>
+      </div>
+      <div class="page-actions">
+        <button class="btn btn-secondary" onclick="exportSummaryPDF()">⬇ PDF</button>
+        <button class="btn btn-secondary" style="color:#16a34a;border-color:#16a34a" onclick="exportSummaryExcel()">⬇ Excel</button>
+      </div>
+    </div>
+    <div class="kpi-grid">
+      ${kpi('Total Vehicles',rows.length+'','With data','#1a56a0','🚗')}
+      ${kpi('Total Fuel',grandFuel.toFixed(1)+' L','Consumed','#d97706','⛽')}
+      ${kpi('Total Distance',Math.round(grandDist)+' km','Covered','#7c3aed','📍')}
+      ${kpi('Fuel Cost',fmtR(grandFuelC),'Petrol+CNG+Diesel','#dc2626','₹')}
+      ${kpi('Maintenance',fmtR(grandMaint),'M&R cost','#f59e0b','🔧')}
+      ${kpi('Total Cost',fmtR(grandTotal),'All expenses','#0ea5e9','💰')}
+      ${kpi('CO₂ Emitted',grandCO2.toFixed(0)+' kg','Emissions','#16a34a','🌱')}
+      ${kpi('Avg Mileage',grandFuel>0?(grandDist/grandFuel).toFixed(1)+' km/L':'—','Fleet avg','#6b7280','📊')}
+    </div>
+
+    <div class="card" style="overflow-x:auto">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+        <span>Vehicle-wise Summary</span>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-secondary btn-sm" onclick="exportSummaryPDF()">⬇ PDF</button>
+          <button class="btn btn-secondary btn-sm" style="color:#16a34a;border-color:#16a34a" onclick="exportSummaryExcel()">⬇ Excel</button>
+        </div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="background:#0f1724;color:#fff">
+            <th style="padding:8px 10px;text-align:left">Location</th>
+            <th style="padding:8px 10px;text-align:left">Vehicle No</th>
+            <th style="padding:8px 10px;text-align:left">Vehicle Name</th>
+            <th style="padding:8px 10px;text-align:left">Model Year</th>
+            <th style="padding:8px 10px;text-align:left">Fuel Type</th>
+            <th style="padding:8px 10px;text-align:right">Fuel (L)</th>
+            <th style="padding:8px 10px;text-align:right">Running (km)</th>
+            <th style="padding:8px 10px;text-align:right">Petrol/Diesel Cost</th>
+            <th style="padding:8px 10px;text-align:right">CNG Cost</th>
+            <th style="padding:8px 10px;text-align:right">Avg (km/L)</th>
+            <th style="padding:8px 10px;text-align:right">Cost/km</th>
+            <th style="padding:8px 10px;text-align:right">Maint. Exp.</th>
+            <th style="padding:8px 10px;text-align:right">Total Cost</th>
+            <th style="padding:8px 10px;text-align:right">CO₂ (kg)</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${Object.entries(byPlant).map(([loc,pRows],gi)=>
+            pRows.map((r,ri)=>`
+            <tr style="background:${(gi+ri)%2===0?'#f9fafb':'#fff'};border-bottom:1px solid #e5e7eb">
+              <td style="padding:7px 10px;font-weight:${ri===0?600:400};color:${ri===0?'#1a56a0':'#6b7280'}">${ri===0?loc:''}</td>
+              <td style="padding:7px 10px;font-weight:600">${r.v.regNo}</td>
+              <td style="padding:7px 10px">${r.v.make} ${r.v.model}</td>
+              <td style="padding:7px 10px">${r.v.year||'—'}</td>
+              <td style="padding:7px 10px">${r.v.fuel||'—'}</td>
+              <td style="padding:7px 10px;text-align:right">${r.totalFuel>0?r.totalFuel.toFixed(1):'—'}</td>
+              <td style="padding:7px 10px;text-align:right">${r.totalDist>0?Math.round(r.totalDist):'—'}</td>
+              <td style="padding:7px 10px;text-align:right">${(r.petrolCost+r.dieselCost)>0?fmtR(r.petrolCost+r.dieselCost):'—'}</td>
+              <td style="padding:7px 10px;text-align:right">${r.cngCost>0?fmtR(r.cngCost):'—'}</td>
+              <td style="padding:7px 10px;text-align:right">${r.avgMileage}</td>
+              <td style="padding:7px 10px;text-align:right">${r.costPerKm}</td>
+              <td style="padding:7px 10px;text-align:right">${r.maintCost>0?fmtR(r.maintCost):'—'}</td>
+              <td style="padding:7px 10px;text-align:right;font-weight:600">${fmtR(r.totalCost)}</td>
+              <td style="padding:7px 10px;text-align:right">${r.co2>0?r.co2.toFixed(1):'—'}</td>
+            </tr>`).join('')
+          ).join('')}
+          <tr style="background:#1a56a0;color:#fff;font-weight:700">
+            <td style="padding:8px 10px" colspan="5">Grand Total</td>
+            <td style="padding:8px 10px;text-align:right">${grandFuel.toFixed(1)}</td>
+            <td style="padding:8px 10px;text-align:right">${Math.round(grandDist)}</td>
+            <td style="padding:8px 10px;text-align:right">${fmtR(rows.reduce((s,r)=>s+r.petrolCost+r.dieselCost,0))}</td>
+            <td style="padding:8px 10px;text-align:right">${fmtR(rows.reduce((s,r)=>s+r.cngCost,0))}</td>
+            <td style="padding:8px 10px;text-align:right">${grandFuel>0?(grandDist/grandFuel).toFixed(2):'—'}</td>
+            <td style="padding:8px 10px;text-align:right">${grandDist>0?(grandTotal/grandDist).toFixed(2):'—'}</td>
+            <td style="padding:8px 10px;text-align:right">${fmtR(grandMaint)}</td>
+            <td style="padding:8px 10px;text-align:right">${fmtR(grandTotal)}</td>
+            <td style="padding:8px 10px;text-align:right">${grandCO2.toFixed(1)}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ── MAINTENANCE REPORT PAGE ──────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+function maintenanceReportHTML() {
+  const exps = filteredExpenses();
+  const vehicles = myVehicles();
+  const MAINT_CATS = ['Maintenance','Repair','Tyres','Battery','Spare Parts','Breakdown','Washing'];
+  const LEGAL_CATS = ['Insurance','Pollution Certificate','Registration / Permit'];
+
+  const rows = vehicles.map(v => {
+    const ve = exps.filter(e => e.vehicleId === v.id);
+    const fuelCost  = ve.filter(e=>isFuelCat(e.category)).reduce((s,e)=>s+e.amount,0);
+    const maintCost = ve.filter(e=>MAINT_CATS.includes(e.category)).reduce((s,e)=>s+e.amount,0);
+    const legalCost = ve.filter(e=>LEGAL_CATS.includes(e.category)).reduce((s,e)=>s+e.amount,0);
+    const total     = fuelCost + maintCost + legalCost;
+    const catBreak  = MAINT_CATS.map(c=>({cat:c, amt:ve.filter(e=>e.category===c).reduce((s,e)=>s+e.amount,0)}));
+    const plant     = S.plants.find(p=>p.id===v.plantId);
+    return { v, plant, fuelCost, maintCost, legalCost, total, catBreak, life:v.year?new Date().getFullYear()-parseInt(v.year):0 };
+  }).filter(r=>r.total>0);
+
+  const grandFuel   = rows.reduce((s,r)=>s+r.fuelCost,0);
+  const grandMaint  = rows.reduce((s,r)=>s+r.maintCost,0);
+  const grandLegal  = rows.reduce((s,r)=>s+r.legalCost,0);
+  const grandTotal  = rows.reduce((s,r)=>s+r.total,0);
+
+  const byPlant = {};
+  rows.forEach(r=>{
+    const loc = r.plant?.name || 'Unknown';
+    if (!byPlant[loc]) byPlant[loc] = [];
+    byPlant[loc].push(r);
+  });
+
+  const yearLabel = S.filterMode==='FY'?`FY ${S.filterYear}`:String(S.filterYear);
+  const monthLabel = S.filterMonth ? ` · ${MONTHS.find(m=>m.val===S.filterMonth)?.label||''}` : '';
+  const plantLabel = S.filterPlant ? ` · ${plantName(S.filterPlant)}` : '';
+
+  return `<div class="page">
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">🔧 Maintenance Report</h1>
+        <p class="page-subtitle">Vehicle maintenance, repair & legal expense breakdown · ${yearLabel}${monthLabel}${plantLabel}</p>
+      </div>
+      <div class="page-actions">
+        <button class="btn btn-secondary" onclick="exportMaintenancePDF()">⬇ PDF</button>
+        <button class="btn btn-secondary" style="color:#16a34a;border-color:#16a34a" onclick="exportMaintenanceExcel()">⬇ Excel</button>
+      </div>
+    </div>
+    <div class="kpi-grid">
+      ${kpi('Fuel Cost',fmtR(grandFuel),'Petrol/CNG/Diesel','#1a56a0','⛽')}
+      ${kpi('Maintenance Cost',fmtR(grandMaint),'Repair & upkeep','#d97706','🔧')}
+      ${kpi('Legal Cost',fmtR(grandLegal),'PUC/Ins/Permit','#7c3aed','📄')}
+      ${kpi('Grand Total',fmtR(grandTotal),'All categories','#dc2626','💰')}
+    </div>
+
+    <div class="card" style="overflow-x:auto">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+        <span>Vehicle Maintenance Expenses</span>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-secondary btn-sm" onclick="exportMaintenancePDF()">⬇ PDF</button>
+          <button class="btn btn-secondary btn-sm" style="color:#16a34a;border-color:#16a34a" onclick="exportMaintenanceExcel()">⬇ Excel</button>
+        </div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="background:#0f1724;color:#fff">
+            <th style="padding:8px 10px;text-align:left">Location</th>
+            <th style="padding:8px 10px;text-align:left">Vehicle No</th>
+            <th style="padding:8px 10px;text-align:left">Vehicle Name</th>
+            <th style="padding:8px 10px;text-align:left">Model Year</th>
+            <th style="padding:8px 10px;text-align:left">Vehicle Life</th>
+            <th style="padding:8px 10px;text-align:left">Fuel Type</th>
+            <th style="padding:8px 10px;text-align:right">Fuel Cost</th>
+            <th style="padding:8px 10px;text-align:right">Maintenance Cost</th>
+            <th style="padding:8px 10px;text-align:right">Legal Cost</th>
+            <th style="padding:8px 10px;text-align:right">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${Object.entries(byPlant).map(([loc,pRows],gi)=>
+            pRows.map((r,ri)=>`
+            <tr style="background:${(gi+ri)%2===0?'#f9fafb':'#fff'};border-bottom:1px solid #e5e7eb">
+              <td style="padding:7px 10px;font-weight:${ri===0?600:400};color:${ri===0?'#1a56a0':'#6b7280'}">${ri===0?loc:''}</td>
+              <td style="padding:7px 10px;font-weight:600">${r.v.regNo}</td>
+              <td style="padding:7px 10px">${r.v.make} ${r.v.model}</td>
+              <td style="padding:7px 10px">${r.v.year||'—'}</td>
+              <td style="padding:7px 10px">${r.life>0?r.life+' yr':'—'}</td>
+              <td style="padding:7px 10px">${r.v.fuel||'—'}</td>
+              <td style="padding:7px 10px;text-align:right">${r.fuelCost>0?fmtR(r.fuelCost):'—'}</td>
+              <td style="padding:7px 10px;text-align:right">${r.maintCost>0?fmtR(r.maintCost):'—'}</td>
+              <td style="padding:7px 10px;text-align:right">${r.legalCost>0?fmtR(r.legalCost):'—'}</td>
+              <td style="padding:7px 10px;text-align:right;font-weight:600">${fmtR(r.total)}</td>
+            </tr>`).join('')
+          ).join('')}
+          <tr style="background:#1a56a0;color:#fff;font-weight:700">
+            <td style="padding:8px 10px" colspan="6">Grand Total</td>
+            <td style="padding:8px 10px;text-align:right">${fmtR(grandFuel)}</td>
+            <td style="padding:8px 10px;text-align:right">${fmtR(grandMaint)}</td>
+            <td style="padding:8px 10px;text-align:right">${fmtR(grandLegal)}</td>
+            <td style="padding:8px 10px;text-align:right">${fmtR(grandTotal)}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Maintenance breakdown by category -->
+    <div class="card" style="overflow-x:auto;margin-top:16px">
+      <div class="card-title">Maintenance Category Breakdown</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="background:#0f1724;color:#fff">
+            <th style="padding:8px 10px;text-align:left">Location</th>
+            <th style="padding:8px 10px;text-align:left">Vehicle No</th>
+            <th style="padding:8px 10px;text-align:left">Name</th>
+            ${MAINT_CATS.map(c=>`<th style="padding:8px 10px;text-align:right">${c}</th>`).join('')}
+            <th style="padding:8px 10px;text-align:right">Total M&amp;R</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.filter(r=>r.maintCost>0).map((r,i)=>`
+          <tr style="background:${i%2===0?'#f9fafb':'#fff'};border-bottom:1px solid #e5e7eb">
+            <td style="padding:7px 10px;color:#6b7280">${r.plant?.name||'—'}</td>
+            <td style="padding:7px 10px;font-weight:600">${r.v.regNo}</td>
+            <td style="padding:7px 10px">${r.v.make} ${r.v.model}</td>
+            ${MAINT_CATS.map(c=>{const a=r.catBreak.find(x=>x.cat===c)?.amt||0;return`<td style="padding:7px 10px;text-align:right">${a>0?fmtR(a):'—'}</td>`;}).join('')}
+            <td style="padding:7px 10px;text-align:right;font-weight:600">${fmtR(r.maintCost)}</td>
+          </tr>`).join('')}
+          <tr style="background:#1a56a0;color:#fff;font-weight:700">
+            <td style="padding:8px 10px" colspan="3">Grand Total</td>
+            ${MAINT_CATS.map(c=>{const t=rows.reduce((s,r)=>s+(r.catBreak.find(x=>x.cat===c)?.amt||0),0);return`<td style="padding:8px 10px;text-align:right">${t>0?fmtR(t):'—'}</td>`;}).join('')}
+            <td style="padding:8px 10px;text-align:right">${fmtR(grandMaint)}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ── SUMMARY PDF EXPORT ───────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+window.exportSummaryPDF = function() {
+  try {
+    const {jsPDF} = window.jspdf;
+    const doc = new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
+    const pageW = doc.internal.pageSize.getWidth();
+    const pageH = doc.internal.pageSize.getHeight();
+    const exps = filteredExpenses();
+    const vehicles = myVehicles();
+    const MAINT_CATS = ['Maintenance','Repair','Tyres','Battery','Spare Parts','Breakdown','Washing'];
+    const yearLabel = S.filterMode==='FY'?`FY ${S.filterYear}`:String(S.filterYear);
+    const monthLabel = S.filterMonth?` · ${MONTHS.find(m=>m.val===S.filterMonth)?.label||''}` : '';
+    const plantLabel = S.filterPlant?' · '+plantName(S.filterPlant):'';
+    let y = 0;
+
+    // ── Cover page ──
+    doc.setFillColor(255,255,255); doc.rect(0,0,pageW,pageH,'F');
+    doc.setFillColor(15,23,36); doc.rect(0,0,pageW,6,'F');
+    const lbW=90,lbH=52,lbX=pageW/2-45,lbY=22;
+    doc.setFillColor(255,255,255); doc.setDrawColor(229,231,235); doc.setLineWidth(0.4);
+    doc.roundedRect(lbX,lbY,lbW,lbH,4,4,'FD');
+    pdfAddLogo(doc, pageW/2-28, lbY+6, 56, 40);
+    const lbBot = lbY+lbH+14;
+    doc.setDrawColor(26,86,160); doc.setLineWidth(0.6);
+    doc.line(pageW/2-40,lbBot-6,pageW/2+40,lbBot-6);
+    doc.setTextColor(15,23,36); doc.setFontSize(36); doc.setFont(undefined,'bold');
+    doc.text('VEMS', pageW/2, lbBot+4, {align:'center'});
+    doc.setFontSize(18); doc.setFont(undefined,'normal'); doc.setTextColor(26,86,160);
+    doc.text('Fleet Summary Report', pageW/2, lbBot+16, {align:'center'});
+    doc.setFontSize(11); doc.setTextColor(75,85,99);
+    doc.text(yearLabel+monthLabel+plantLabel, pageW/2, lbBot+28, {align:'center'});
+    doc.setFontSize(8); doc.setTextColor(148,163,184);
+    doc.text(`Generated: ${new Date().toLocaleString('en-IN')}`, pageW/2, pageH-8, {align:'center'});
+    doc.setFillColor(15,23,36); doc.rect(0,pageH-4,pageW,4,'F');
+
+    // ── Data page ──
+    doc.addPage();
+    pdfHdr(doc, pageW, 'VEMS — Fleet Summary Report', `${yearLabel}${monthLabel}${plantLabel}   |   Generated: ${new Date().toLocaleString('en-IN')}`);
+    y = 36;
+
+    const rows = vehicles.map(v => {
+      const ve = exps.filter(e=>e.vehicleId===v.id);
+      const fuelExps = ve.filter(e=>isFuelCat(e.category));
+      const totalFuel = fuelExps.reduce((s,e)=>s+(e.fuelQty||0),0);
+      const totalDist = fuelExps.reduce((s,e)=>s+(e.distanceTravelled||0),0);
+      const petrolCost= ve.filter(e=>e.category==='Petrol'||e.category==='Fuel').reduce((s,e)=>s+e.amount,0);
+      const cngCost   = ve.filter(e=>e.category==='CNG').reduce((s,e)=>s+e.amount,0);
+      const dieselCost= ve.filter(e=>e.category==='Diesel').reduce((s,e)=>s+e.amount,0);
+      const maintCost = ve.filter(e=>MAINT_CATS.includes(e.category)).reduce((s,e)=>s+e.amount,0);
+      const totalCost = ve.reduce((s,e)=>s+e.amount,0);
+      const plant     = S.plants.find(p=>p.id===v.plantId);
+      return {v, plant, totalFuel, totalDist, petrolCost, cngCost, dieselCost, maintCost, totalCost};
+    }).filter(r=>r.totalCost>0||r.totalFuel>0);
+
+    const gFuel  = rows.reduce((s,r)=>s+r.totalFuel,0);
+    const gDist  = rows.reduce((s,r)=>s+r.totalDist,0);
+    const gPet   = rows.reduce((s,r)=>s+r.petrolCost+r.dieselCost,0);
+    const gCng   = rows.reduce((s,r)=>s+r.cngCost,0);
+    const gMaint = rows.reduce((s,r)=>s+r.maintCost,0);
+    const gTotal = rows.reduce((s,r)=>s+r.totalCost,0);
+
+    pdfKpiRow(doc, [
+      ['Vehicles', String(rows.length)],
+      ['Total Fuel', gFuel.toFixed(1)+' L'],
+      ['Distance', Math.round(gDist)+' km'],
+      ['Fuel Cost', pdfAmt(gPet+gCng)],
+      ['Maint Cost', pdfAmt(gMaint)],
+      ['Grand Total', pdfAmt(gTotal)],
+      ['Avg Mileage', gFuel>0?(gDist/gFuel).toFixed(1)+' km/L':'—'],
+    ], y, pageW);
+    y += 22;
+
+    y = pdfSectionTitle(doc, 'Vehicle-wise Summary', y, pageW);
+    const cols = ['Location','Vehicle No','Vehicle','Yr','Fuel Type','Fuel(L)','Dist(km)','Petrol/Diesel','CNG Cost','Avg(km/L)','Cost/km','Maint.','Total'];
+    const wds  = [24,        20,          26,       10,  18,         14,       16,        22,             16,        16,        12,       16,      18];
+    doc.setFontSize(6.5); doc.setFont(undefined,'bold'); doc.setTextColor(255,255,255);
+    doc.setFillColor(26,86,160); doc.rect(14,y-4,pageW-28,7,'F');
+    let cx=14; cols.forEach((c,i)=>{doc.text(c,cx,y);cx+=wds[i];}); y+=6;
+    doc.setFont(undefined,'normal'); doc.setTextColor(31,41,55);
+    rows.forEach((r,ri)=>{
+      if(y>pageH-12){doc.addPage();pdfHdr(doc,pageW,'Fleet Summary (cont.)','');y=36;}
+      if(ri%2===0){doc.setFillColor(248,250,252);doc.rect(14,y-4,pageW-28,7,'F');}
+      const avgMile = r.totalFuel>0?(r.totalDist/r.totalFuel).toFixed(1):'—';
+      const costKm  = r.totalDist>0?(r.totalCost/r.totalDist).toFixed(2):'—';
+      const vals=[
+        (r.plant?.name||'').slice(0,10), r.v.regNo, (r.v.make+' '+r.v.model).slice(0,12),
+        String(r.v.year||''), r.v.fuel||'',
+        r.totalFuel>0?r.totalFuel.toFixed(1):'—',
+        r.totalDist>0?String(Math.round(r.totalDist)):'—',
+        (r.petrolCost+r.dieselCost)>0?pdfAmt(r.petrolCost+r.dieselCost):'—',
+        r.cngCost>0?pdfAmt(r.cngCost):'—',
+        avgMile, costKm,
+        r.maintCost>0?pdfAmt(r.maintCost):'—',
+        pdfAmt(r.totalCost),
+      ];
+      let vx=14; vals.forEach((v,i)=>{doc.text(String(v),vx,y);vx+=wds[i];}); y+=6;
+    });
+    // Total row
+    doc.setFillColor(26,86,160); doc.rect(14,y-4,pageW-28,7,'F');
+    doc.setTextColor(255,255,255); doc.setFont(undefined,'bold');
+    const totVals=['TOTAL','','','','',gFuel.toFixed(1),String(Math.round(gDist)),pdfAmt(gPet),pdfAmt(gCng),gFuel>0?(gDist/gFuel).toFixed(1):'—',gDist>0?(gTotal/gDist).toFixed(2):'—',pdfAmt(gMaint),pdfAmt(gTotal)];
+    let tx=14; totVals.forEach((v,i)=>{doc.text(v,tx,y);tx+=wds[i];}); y+=10;
+
+    doc.save(`VEMS_Summary_Report_${yearLabel.replace(' ','_')}.pdf`);
+    showToast('Summary PDF exported!','success');
+  } catch(err){ showToast('PDF export failed: '+err.message,'error'); }
+};
+
+// ══════════════════════════════════════════════════════════════════
+// ── SUMMARY EXCEL EXPORT ─────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+window.exportSummaryExcel = function() {
+  try {
+    const exps = filteredExpenses();
+    const vehicles = myVehicles();
+    const MAINT_CATS = ['Maintenance','Repair','Tyres','Battery','Spare Parts','Breakdown','Washing'];
+    const yearLabel = S.filterMode==='FY'?`FY ${S.filterYear}`:String(S.filterYear);
+    const monthLabel = S.filterMonth?` · ${MONTHS.find(m=>m.val===S.filterMonth)?.label||''}` : '';
+    const plantLabel = S.filterPlant?' · '+plantName(S.filterPlant):'';
+    const WB = XLSX.utils.book_new();
+
+    const rows = vehicles.map(v => {
+      const ve = exps.filter(e=>e.vehicleId===v.id);
+      const fuelExps = ve.filter(e=>isFuelCat(e.category));
+      const totalFuel = fuelExps.reduce((s,e)=>s+(e.fuelQty||0),0);
+      const totalDist = fuelExps.reduce((s,e)=>s+(e.distanceTravelled||0),0);
+      const petrolCost= ve.filter(e=>e.category==='Petrol'||e.category==='Fuel').reduce((s,e)=>s+e.amount,0);
+      const cngCost   = ve.filter(e=>e.category==='CNG').reduce((s,e)=>s+e.amount,0);
+      const dieselCost= ve.filter(e=>e.category==='Diesel').reduce((s,e)=>s+e.amount,0);
+      const maintCost = ve.filter(e=>MAINT_CATS.includes(e.category)).reduce((s,e)=>s+e.amount,0);
+      const totalCost = ve.reduce((s,e)=>s+e.amount,0);
+      const plant     = S.plants.find(p=>p.id===v.plantId);
+      const avgMile   = totalFuel>0?(totalDist/totalFuel).toFixed(2):'';
+      const costKm    = totalDist>0?(totalCost/totalDist).toFixed(2):'';
+      return {v, plant, totalFuel, totalDist, petrolCost, cngCost, dieselCost, maintCost, totalCost, avgMile, costKm};
+    }).filter(r=>r.totalCost>0||r.totalFuel>0);
+
+    // Sheet 1: Summary
+    const sumData = [
+      ['VEMS — Fleet Summary Report'],
+      [`Period: ${yearLabel}${monthLabel}${plantLabel}`],
+      [`Generated: ${new Date().toLocaleString('en-IN')}`],
+      [],
+      ['Location','Vehicle No','Vehicle Name','Model Year','Fuel Type','Fuel Qty (L)','Running (km)','Petrol/Diesel Cost (₹)','CNG Cost (₹)','Avg Mileage (km/L)','Cost/km (₹)','Maint. Exp. (₹)','Total Cost (₹)','CO₂ (kg)'],
+    ];
+    rows.forEach(r=>{
+      sumData.push([
+        r.plant?.name||'',r.v.regNo,r.v.make+' '+r.v.model,r.v.year||'',r.v.fuel||'',
+        r.totalFuel>0?Number(r.totalFuel.toFixed(1)):0,
+        r.totalDist>0?Math.round(r.totalDist):0,
+        r.petrolCost+r.dieselCost, r.cngCost,
+        r.avgMile?Number(r.avgMile):0,
+        r.costKm?Number(r.costKm):0,
+        r.maintCost, r.totalCost,
+        Number(getCO2Total(r.v.id).toFixed(1)),
+      ]);
+    });
+    // Total row
+    const gFuel=rows.reduce((s,r)=>s+r.totalFuel,0);
+    const gDist=rows.reduce((s,r)=>s+r.totalDist,0);
+    const gTotal=rows.reduce((s,r)=>s+r.totalCost,0);
+    sumData.push(['Grand Total','','','','',
+      Number(gFuel.toFixed(1)),Math.round(gDist),
+      rows.reduce((s,r)=>s+r.petrolCost+r.dieselCost,0),
+      rows.reduce((s,r)=>s+r.cngCost,0),
+      gFuel>0?Number((gDist/gFuel).toFixed(2)):0,
+      gDist>0?Number((gTotal/gDist).toFixed(2)):0,
+      rows.reduce((s,r)=>s+r.maintCost,0),gTotal,
+      Number(rows.reduce((s,r)=>s+getCO2Total(r.v.id),0).toFixed(1)),
+    ]);
+
+    const ws = XLSX.utils.aoa_to_sheet(sumData);
+    ws['!cols']=[{wch:20},{wch:14},{wch:22},{wch:12},{wch:14},{wch:12},{wch:14},{wch:20},{wch:14},{wch:18},{wch:12},{wch:16},{wch:14},{wch:10}];
+    XLSX.utils.book_append_sheet(WB, ws, 'Summary');
+
+    XLSX.writeFile(WB, `VEMS_Summary_Report_${yearLabel.replace(' ','_')}.xlsx`);
+    showToast('Summary Excel exported!','success');
+  } catch(err){ showToast('Excel export failed: '+err.message,'error'); }
+};
+
+// ══════════════════════════════════════════════════════════════════
+// ── MAINTENANCE PDF EXPORT ───────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+window.exportMaintenancePDF = function() {
+  try {
+    const {jsPDF} = window.jspdf;
+    const doc = new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
+    const pageW = doc.internal.pageSize.getWidth();
+    const pageH = doc.internal.pageSize.getHeight();
+    const exps = filteredExpenses();
+    const vehicles = myVehicles();
+    const MAINT_CATS = ['Maintenance','Repair','Tyres','Battery','Spare Parts','Breakdown','Washing'];
+    const LEGAL_CATS = ['Insurance','Pollution Certificate','Registration / Permit'];
+    const yearLabel = S.filterMode==='FY'?`FY ${S.filterYear}`:String(S.filterYear);
+    const monthLabel = S.filterMonth?` · ${MONTHS.find(m=>m.val===S.filterMonth)?.label||''}` : '';
+    const plantLabel = S.filterPlant?' · '+plantName(S.filterPlant):'';
+    let y = 0;
+
+    // ── Cover page ──
+    doc.setFillColor(255,255,255); doc.rect(0,0,pageW,pageH,'F');
+    doc.setFillColor(15,23,36); doc.rect(0,0,pageW,6,'F');
+    const lbW=90,lbH=52,lbX=pageW/2-45,lbY=22;
+    doc.setFillColor(255,255,255); doc.setDrawColor(229,231,235); doc.setLineWidth(0.4);
+    doc.roundedRect(lbX,lbY,lbW,lbH,4,4,'FD');
+    pdfAddLogo(doc, pageW/2-28, lbY+6, 56, 40);
+    const lbBot = lbY+lbH+14;
+    doc.setDrawColor(26,86,160); doc.setLineWidth(0.6);
+    doc.line(pageW/2-40,lbBot-6,pageW/2+40,lbBot-6);
+    doc.setTextColor(15,23,36); doc.setFontSize(36); doc.setFont(undefined,'bold');
+    doc.text('VEMS', pageW/2, lbBot+4, {align:'center'});
+    doc.setFontSize(18); doc.setFont(undefined,'normal'); doc.setTextColor(26,86,160);
+    doc.text('Maintenance Report', pageW/2, lbBot+16, {align:'center'});
+    doc.setFontSize(11); doc.setTextColor(75,85,99);
+    doc.text(yearLabel+monthLabel+plantLabel, pageW/2, lbBot+28, {align:'center'});
+    doc.setFontSize(8); doc.setTextColor(148,163,184);
+    doc.text(`Generated: ${new Date().toLocaleString('en-IN')}`, pageW/2, pageH-8, {align:'center'});
+    doc.setFillColor(15,23,36); doc.rect(0,pageH-4,pageW,4,'F');
+
+    // ── Data page ──
+    doc.addPage();
+    pdfHdr(doc, pageW, 'VEMS — Maintenance Report', `${yearLabel}${monthLabel}${plantLabel}   |   Generated: ${new Date().toLocaleString('en-IN')}`);
+    y = 36;
+
+    const rows = vehicles.map(v => {
+      const ve = exps.filter(e=>e.vehicleId===v.id);
+      const fuelCost  = ve.filter(e=>isFuelCat(e.category)).reduce((s,e)=>s+e.amount,0);
+      const maintCost = ve.filter(e=>MAINT_CATS.includes(e.category)).reduce((s,e)=>s+e.amount,0);
+      const legalCost = ve.filter(e=>LEGAL_CATS.includes(e.category)).reduce((s,e)=>s+e.amount,0);
+      const total     = fuelCost+maintCost+legalCost;
+      const catBreak  = MAINT_CATS.map(c=>ve.filter(e=>e.category===c).reduce((s,e)=>s+e.amount,0));
+      const plant     = S.plants.find(p=>p.id===v.plantId);
+      const life      = v.year?new Date().getFullYear()-parseInt(v.year):0;
+      return {v,plant,fuelCost,maintCost,legalCost,total,catBreak,life};
+    }).filter(r=>r.total>0);
+
+    const gFuel  = rows.reduce((s,r)=>s+r.fuelCost,0);
+    const gMaint = rows.reduce((s,r)=>s+r.maintCost,0);
+    const gLegal = rows.reduce((s,r)=>s+r.legalCost,0);
+    const gTotal = rows.reduce((s,r)=>s+r.total,0);
+
+    pdfKpiRow(doc, [
+      ['Fuel Cost', pdfAmt(gFuel)],
+      ['Maintenance Cost', pdfAmt(gMaint)],
+      ['Legal Cost', pdfAmt(gLegal)],
+      ['Grand Total', pdfAmt(gTotal)],
+      ['Vehicles', String(rows.length)],
+    ], y, pageW);
+    y += 22;
+
+    // Table 1: Main totals
+    y = pdfSectionTitle(doc, 'Vehicle Maintenance Expenses', y, pageW);
+    const cols1 = ['Location','Vehicle No','Name','Yr','Life','Fuel Type','Fuel Cost','Maint. Cost','Legal Cost','Total'];
+    const wds1  = [28,        18,          26,    10,   10,    18,         24,         24,           20,         22];
+    doc.setFontSize(6.5); doc.setFont(undefined,'bold'); doc.setTextColor(255,255,255);
+    doc.setFillColor(26,86,160); doc.rect(14,y-4,pageW-28,7,'F');
+    let cx=14; cols1.forEach((c,i)=>{doc.text(c,cx,y);cx+=wds1[i];}); y+=6;
+    doc.setFont(undefined,'normal'); doc.setTextColor(31,41,55);
+    rows.forEach((r,ri)=>{
+      if(y>pageH-12){doc.addPage();pdfHdr(doc,pageW,'Maintenance Report (cont.)','');y=36;}
+      if(ri%2===0){doc.setFillColor(248,250,252);doc.rect(14,y-4,pageW-28,7,'F');}
+      const vals=[
+        (r.plant?.name||'').slice(0,10), r.v.regNo, (r.v.make+' '+r.v.model).slice(0,12),
+        String(r.v.year||''), r.life>0?r.life+' yr':'—', r.v.fuel||'',
+        r.fuelCost>0?pdfAmt(r.fuelCost):'—',
+        r.maintCost>0?pdfAmt(r.maintCost):'—',
+        r.legalCost>0?pdfAmt(r.legalCost):'—',
+        pdfAmt(r.total),
+      ];
+      let vx=14; vals.forEach((v,i)=>{doc.text(String(v),vx,y);vx+=wds1[i];}); y+=6;
+    });
+    doc.setFillColor(26,86,160); doc.rect(14,y-4,pageW-28,7,'F');
+    doc.setTextColor(255,255,255); doc.setFont(undefined,'bold');
+    const t1=['TOTAL','','','','','',pdfAmt(gFuel),pdfAmt(gMaint),pdfAmt(gLegal),pdfAmt(gTotal)];
+    let tx=14; t1.forEach((v,i)=>{doc.text(v,tx,y);tx+=wds1[i];}); y+=14;
+
+    // Table 2: M&R category breakdown
+    if(rows.filter(r=>r.maintCost>0).length>0){
+      if(y>pageH-40){doc.addPage();pdfHdr(doc,pageW,'Maintenance Category Breakdown','');y=36;}
+      y = pdfSectionTitle(doc, 'Maintenance Category Breakdown', y, pageW);
+      const shortCats = ['Maint.','Repair','Tyres','Battery','Spare Parts','Breakdown','Washing'];
+      const cw = 14;
+      const cols2=['Location','Vehicle No','Name',...shortCats,'Total M&R'];
+      const wds2=[24,18,22,...shortCats.map(()=>cw),18];
+      doc.setFontSize(6); doc.setFont(undefined,'bold'); doc.setTextColor(255,255,255);
+      doc.setFillColor(26,86,160); doc.rect(14,y-4,pageW-28,7,'F');
+      let cx2=14; cols2.forEach((c,i)=>{doc.text(c,cx2,y);cx2+=wds2[i];}); y+=6;
+      doc.setFont(undefined,'normal'); doc.setTextColor(31,41,55);
+      rows.filter(r=>r.maintCost>0).forEach((r,ri)=>{
+        if(y>pageH-12){doc.addPage();pdfHdr(doc,pageW,'Maintenance Breakdown (cont.)','');y=36;}
+        if(ri%2===0){doc.setFillColor(248,250,252);doc.rect(14,y-4,pageW-28,7,'F');}
+        const vals=[(r.plant?.name||'').slice(0,8),r.v.regNo,(r.v.make+' '+r.v.model).slice(0,10),
+          ...r.catBreak.map(a=>a>0?pdfAmt(a):'—'),pdfAmt(r.maintCost)];
+        let vx=14; vals.forEach((v,i)=>{doc.text(String(v),vx,y);vx+=wds2[i];}); y+=6;
+      });
+      doc.setFillColor(26,86,160); doc.rect(14,y-4,pageW-28,7,'F');
+      doc.setTextColor(255,255,255); doc.setFont(undefined,'bold');
+      const catTotals=MAINT_CATS.map((_,ci)=>rows.reduce((s,r)=>s+r.catBreak[ci],0));
+      const t2=['TOTAL','','',...catTotals.map(a=>a>0?pdfAmt(a):'—'),pdfAmt(gMaint)];
+      let tx2=14; t2.forEach((v,i)=>{doc.text(v,tx2,y);tx2+=wds2[i];});
+    }
+
+    doc.save(`VEMS_Maintenance_Report_${yearLabel.replace(' ','_')}.pdf`);
+    showToast('Maintenance PDF exported!','success');
+  } catch(err){ showToast('PDF export failed: '+err.message,'error'); }
+};
+
+// ══════════════════════════════════════════════════════════════════
+// ── MAINTENANCE EXCEL EXPORT ─────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+window.exportMaintenanceExcel = function() {
+  try {
+    const exps = filteredExpenses();
+    const vehicles = myVehicles();
+    const MAINT_CATS = ['Maintenance','Repair','Tyres','Battery','Spare Parts','Breakdown','Washing'];
+    const LEGAL_CATS = ['Insurance','Pollution Certificate','Registration / Permit'];
+    const yearLabel = S.filterMode==='FY'?`FY ${S.filterYear}`:String(S.filterYear);
+    const monthLabel = S.filterMonth?` · ${MONTHS.find(m=>m.val===S.filterMonth)?.label||''}` : '';
+    const plantLabel = S.filterPlant?' · '+plantName(S.filterPlant):'';
+    const WB = XLSX.utils.book_new();
+
+    const rows = vehicles.map(v => {
+      const ve = exps.filter(e=>e.vehicleId===v.id);
+      const fuelCost  = ve.filter(e=>isFuelCat(e.category)).reduce((s,e)=>s+e.amount,0);
+      const maintCost = ve.filter(e=>MAINT_CATS.includes(e.category)).reduce((s,e)=>s+e.amount,0);
+      const legalCost = ve.filter(e=>LEGAL_CATS.includes(e.category)).reduce((s,e)=>s+e.amount,0);
+      const total     = fuelCost+maintCost+legalCost;
+      const catBreak  = MAINT_CATS.map(c=>ve.filter(e=>e.category===c).reduce((s,e)=>s+e.amount,0));
+      const plant     = S.plants.find(p=>p.id===v.plantId);
+      const life      = v.year?new Date().getFullYear()-parseInt(v.year):0;
+      return {v,plant,fuelCost,maintCost,legalCost,total,catBreak,life};
+    }).filter(r=>r.total>0);
+
+    // Sheet 1: Main expense table
+    const mainData = [
+      ['VEMS — Vehicle Maintenance Expenses'],
+      [`Period: ${yearLabel}${monthLabel}${plantLabel}`],
+      [`Generated: ${new Date().toLocaleString('en-IN')}`],
+      [],
+      ['Location','Vehicle No','Vehicle Name','Model Year','Vehicle Life (yr)','Fuel Type','Fuel Cost (₹)','Maintenance Cost (₹)','Legal Cost (₹)','Total (₹)'],
+    ];
+    rows.forEach(r => mainData.push([
+      r.plant?.name||'', r.v.regNo, r.v.make+' '+r.v.model,
+      r.v.year||'', r.life>0?r.life:'', r.v.fuel||'',
+      r.fuelCost, r.maintCost, r.legalCost, r.total,
+    ]));
+    mainData.push(['Grand Total','','','','','',
+      rows.reduce((s,r)=>s+r.fuelCost,0),
+      rows.reduce((s,r)=>s+r.maintCost,0),
+      rows.reduce((s,r)=>s+r.legalCost,0),
+      rows.reduce((s,r)=>s+r.total,0),
+    ]);
+    const ws1 = XLSX.utils.aoa_to_sheet(mainData);
+    ws1['!cols']=[{wch:22},{wch:14},{wch:22},{wch:12},{wch:14},{wch:14},{wch:16},{wch:18},{wch:14},{wch:14}];
+    XLSX.utils.book_append_sheet(WB, ws1, 'Maintenance Summary');
+
+    // Sheet 2: Category breakdown
+    const catData = [
+      ['VEMS — Maintenance Category Breakdown'],
+      [`Period: ${yearLabel}${monthLabel}${plantLabel}`],
+      [],
+      ['Location','Vehicle No','Vehicle Name',...MAINT_CATS,'Total M&R'],
+    ];
+    rows.filter(r=>r.maintCost>0).forEach(r => catData.push([
+      r.plant?.name||'', r.v.regNo, r.v.make+' '+r.v.model,
+      ...r.catBreak,
+      r.maintCost,
+    ]));
+    catData.push(['Grand Total','','',...MAINT_CATS.map((_,i)=>rows.reduce((s,r)=>s+r.catBreak[i],0)),rows.reduce((s,r)=>s+r.maintCost,0)]);
+    const ws2 = XLSX.utils.aoa_to_sheet(catData);
+    ws2['!cols']=[{wch:22},{wch:14},{wch:22},...MAINT_CATS.map(()=>({wch:14})),{wch:14}];
+    XLSX.utils.book_append_sheet(WB, ws2, 'Category Breakdown');
+
+    XLSX.writeFile(WB, `VEMS_Maintenance_Report_${yearLabel.replace(' ','_')}.xlsx`);
+    showToast('Maintenance Excel exported!','success');
+  } catch(err){ showToast('Excel export failed: '+err.message,'error'); }
 };
 
 function downloadCSV(rows, filename) {
