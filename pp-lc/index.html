@@ -781,42 +781,105 @@
     '</div>'
   ].join('');
 
-  // Wire up the login button: stash credentials for React to pick up
-  var btn = document.getElementById('iShellBtn');
+  // ── Shell login: authenticate against Firestore directly (no React needed) ──
+  var btn   = document.getElementById('iShellBtn');
   var errEl = document.getElementById('iShellErr');
-  function handleShellLogin() {
-    var email = (document.getElementById('iShellEmail') || {}).value || '';
-    var pw    = (document.getElementById('iShellPw')    || {}).value || '';
-    if (!email || !pw) {
-      errEl.style.display = 'block';
-      errEl.textContent = 'Please enter your email and password.';
-      return;
-    }
-    window.__instant_creds = { email: email, pw: pw };
+
+  function showErr(msg) {
+    if (!errEl) return;
     errEl.style.display = 'block';
-    errEl.textContent = '⏳ App is still loading — please hold a moment…';
-    if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+    errEl.textContent   = msg;
   }
+  function setBusy(busy) {
+    if (!btn) return;
+    btn.disabled    = busy;
+    btn.textContent = busy ? 'Signing in…' : 'Sign In';
+  }
+
+  async function handleShellLogin() {
+    var emailEl = document.getElementById('iShellEmail');
+    var pwEl    = document.getElementById('iShellPw');
+    var email   = ((emailEl && emailEl.value) || '').toLowerCase().trim();
+    var pw      = (pwEl && pwEl.value) || '';
+    if (!email || !pw) { showErr('Please enter your email and password.'); return; }
+
+    setBusy(true);
+    if (errEl) errEl.style.display = 'none';
+
+    try {
+      // Ensure Firebase anonymous auth (Firestore security rules require auth)
+      if (window.fbAuth) {
+        if (!window.fbAuth.currentUser) {
+          await window.fbAuth.signInAnonymously().catch(function(){});
+        }
+      }
+
+      // Query Firestore for the user
+      var snap = await window.db.collection('legalcomp_users').get();
+      var users = [];
+      snap.forEach(function(doc) { users.push(doc.data()); });
+
+      // Match by email + password (plain-text, same as React login)
+      var u = null;
+      for (var i = 0; i < users.length; i++) {
+        var x = users[i];
+        if ((x.email || '').toLowerCase() === email && x.password === pw && x.role !== 'top_management') {
+          u = x; break;
+        }
+      }
+
+      if (u) {
+        // Stash the authenticated user — React picks this up on mount and skips re-login
+        window.__instant_user = u;
+        // Also cache users so React boot is instant
+        try { localStorage.setItem('lc_users_cache', JSON.stringify({ value: JSON.stringify(users), ts: Date.now() })); } catch(_) {}
+        showErr('✅ Signed in! Loading dashboard…');
+        if (errEl) errEl.style.color = '#16a34a';
+        // React is still loading in the background; when it mounts it will call login() automatically.
+        // In the meantime update the status dot to green.
+        var dot = document.querySelector('#instant-login-shell [style*="amber"], #instant-login-shell [style*="f59e0b"]');
+        if (dot) { dot.style.background = '#22c55e'; dot.style.animation = 'none'; }
+        var loadTxt = document.querySelector('#instant-login-shell [style*="Loading app"]');
+        if (loadTxt) loadTxt.textContent = 'Dashboard loading…';
+        return;
+      }
+
+      // Top-management users use magic link — no password
+      var tm = users.find(function(x){ return (x.email||'').toLowerCase()===email && x.role==='top_management'; });
+      if (tm) {
+        showErr('⚠️ Top Management accounts use the magic link. Ask your admin for the link.');
+        setBusy(false);
+        return;
+      }
+
+      showErr('❌ Invalid email or password.');
+      setBusy(false);
+
+    } catch(e) {
+      console.error('Shell login error:', e);
+      // Firebase/network failed — fall back to stashing creds for React to handle
+      window.__instant_creds = { email: email, pw: pw };
+      showErr('⏳ Network slow — still loading app. Please wait…');
+      if (errEl) errEl.style.color = '#d97706';
+    }
+  }
+
   if (btn) btn.addEventListener('click', handleShellLogin);
   ['iShellEmail','iShellPw'].forEach(function(id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener('keydown', function(e) { if (e.key === 'Enter') handleShellLogin(); });
   });
 
-  // If the React app hasn't mounted after 20 s, show a network-error hint
+  // After 30s without React mounting, tell the user to reload
   setTimeout(function() {
-    var still = document.getElementById('instant-login-shell');
-    if (!still) return; // React already took over — all good
-    var dots = still.querySelector('[style*="amber"]');
-    if (dots) dots.style.background = '#ef4444';
-    var loadTxt = still.querySelector('[style*="Loading app"]');
-    if (loadTxt) loadTxt.textContent = '⚠️ Taking longer than usual — check your internet connection and reload.';
-    // Unlock the button so the user can try again after reload
-    if (btn) { btn.disabled = false; btn.innerHTML = 'Sign In'; }
-    if (errEl && errEl.textContent.includes('still loading')) {
-      errEl.textContent = '⚠️ App failed to load. Please reload the page.';
+    if (!document.getElementById('instant-login-shell')) return; // React took over
+    var loadTxt = document.querySelector('#instant-login-shell [style*="Loading app"], #instant-login-shell [style*="Dashboard loading"]');
+    if (loadTxt && loadTxt.textContent.indexOf('Dashboard') === -1) {
+      loadTxt.textContent = '⚠️ App taking long to load — try reloading the page.';
+      var dot = document.querySelector('#instant-login-shell [style*="amber"], #instant-login-shell [style*="f59e0b"]');
+      if (dot) { dot.style.background = '#ef4444'; dot.style.animation = 'none'; }
     }
-  }, 20000);
+  }, 30000);
 })();
 </script>
 
@@ -10452,12 +10515,21 @@ function App() {
   useEffect(() => {
     const shell = document.getElementById('instant-login-shell');
     if (shell) shell.remove();
-    // If user typed credentials before React was ready, auto-submit now
+    // Case A: shell already authenticated the user against Firestore
+    if (window.__instant_user) {
+      const u = window.__instant_user;
+      delete window.__instant_user;
+      if (page === 'login') {
+        setCurrentUser(u);
+        setPage(u.role);
+      }
+      return;
+    }
+    // Case B: user typed creds but shell Firestore call failed — let React handle it
     if (window.__instant_creds) {
       const { email, pw } = window.__instant_creds;
       delete window.__instant_creds;
       if (email && pw && page === 'login') {
-        // Small delay to ensure login function refs are stable
         setTimeout(() => login(email, pw), 50);
       }
     }
