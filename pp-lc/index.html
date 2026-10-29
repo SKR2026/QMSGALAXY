@@ -3061,16 +3061,13 @@ async function sendComplianceMail({ trigger, req, plant, assignee, oldAssignee, 
     if (!raw) return;
     const cfg = JSON.parse(raw);
 
-    const provider = cfg.emailProvider || 'graph'; // 'graph' | 'emailjs' | 'both'
-    // BUG FIX: previously `|| cfg.msEnabled` caused Graph to run even when provider='emailjs',
-    // which triggered a popup that browsers block in automated flows, silently killing everything.
-    const useGraph  = provider === 'graph'  || provider === 'both';
-    const useEjs    = provider === 'emailjs' || provider === 'both';
-
-    // Quick-exit if neither provider is configured
-    const graphReady = useGraph  && cfg.msClientId && cfg.msTenantId && cfg.msToEmail;
-    const ejsReady   = (useEjs || cfg.ejsEnabled) && cfg.ejsServiceId && cfg.ejsTemplateId && cfg.ejsPublicKey && cfg.msToEmail;
-    if (!graphReady && !ejsReady) return;
+    // ── Cloud-only path: all mail goes via Gmail SMTP through the cloud function ──
+    const cloudUrl    = (cfg.cloudFnUrl    || '').trim();
+    const cloudSecret = (cfg.cloudFnSecret || '').trim();
+    if (!cloudUrl || !cloudSecret) {
+      console.warn('⚠️ sendComplianceMail: cloud function URL / secret not configured — email skipped.');
+      return;
+    }
 
     // ── Shared helpers ──────────────────────────────────────────────────
     const fmtDate  = d => d ? new Date(d).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) : '—';
@@ -3201,30 +3198,18 @@ async function sendComplianceMail({ trigger, req, plant, assignee, oldAssignee, 
       return;
     }
 
-    // ── Acquire Graph token once (if needed) ────────────────────────────
-    let accessToken = null;
-    if (graphReady) {
-      try {
-        accessToken = await getMSGraphToken(cfg);
-      } catch(e) {
-        console.warn('⚠️ MS Graph token acquisition failed:', e?.message || e);
-        if (!ejsReady) return; // nothing else to fall back to
-      }
-    }
-
     // ── Collect recipients ──────────────────────────────────────────────
-    const recipients = new Set([cfg.msToEmail]);
+    // Admin digest recipients + assignee + plant admins + escalation emails
+    const digestList = (cfg.digestRecipients || '')
+      .split(',').map(e => e.trim()).filter(Boolean);
+    const recipients = new Set(digestList);
     if (assignee?.email) recipients.add(assignee.email);
     if (oldAssignee?.email && trigger === 'reassignment') recipients.add(oldAssignee.email);
-    // ── Add plant admins for the relevant plant ───────────────────────────
     if (plant?.id && Array.isArray(users)) {
-      users
-        .filter(u => u.role === 'plant_admin' && u.plantId === plant.id && u.email)
-        .forEach(u => recipients.add(u.email));
+      users.filter(u => u.role === 'plant_admin' && u.plantId === plant.id && u.email)
+           .forEach(u => recipients.add(u.email));
     }
-    // ── Add per-level escalation emails ──────────────────────────────────
     if (req) {
-      // Per-requirement emails take precedence; fall back to global adminSettings map
       const perReqEmails = req.escalationEmails && typeof req.escalationEmails === 'object'
         ? req.escalationEmails
         : (req.escalationEmail ? { 1:[req.escalationEmail], 2:[], 3:[] } : null);
@@ -3233,91 +3218,64 @@ async function sendComplianceMail({ trigger, req, plant, assignee, oldAssignee, 
         : { 1: cfg.escalation1?[cfg.escalation1]:[], 2: cfg.escalation2?[cfg.escalation2]:[], 3: cfg.escalation3?[cfg.escalation3]:[] };
       const escEmails = perReqEmails || globalMap;
       const currentLevel = req.escalationLevel || 1;
-      // Send to all levels up to and including current escalation level
       for (let lv = 1; lv <= currentLevel; lv++) {
-        const lvEmails = escEmails[lv] || [];
-        lvEmails.forEach(e => { if(e) recipients.add(e); });
+        (escEmails[lv] || []).forEach(e => { if(e) recipients.add(e); });
       }
     }
 
-    // ── Fire one send per recipient ─────────────────────────────────────
-    for (const toEmail of recipients) {
-      const overrides  = extrasByRecipient[toEmail] || {};
-      const finalRows  = [...baseRows, ...(overrides.extraRows || [])];
-      const finalGreeting    = overrides.greeting    || greeting;
-      const finalOpeningLine = overrides.openingLine || openingLine;
+    // ── Send via cloud function (Gmail SMTP) ────────────────────────────
+    const reqObj   = req   || {};
+    const plantObj = plant || {};
+    const escEmails3 = req?.escalationEmails?.[3] || [];
+    const payload = {
+      type:            'compliance_notification',
+      trigger,
+      subject,
+      triggerLabel,
+      greeting,
+      openingLine,
+      sectionTitle,
+      closingRemark,
+      sentDate,
+      portalLink,
+      magicLink,
+      escEmails3,
+      recipients:      [...recipients],
+      extrasByRecipient,
+      req: {
+        title:               reqObj.title        || '',
+        category:            reqObj.category     || '',
+        priority:            reqObj.priority     || '',
+        status:              reqObj.status       || '',
+        dueDate:             reqObj.dueDate      || '',
+        description:         reqObj.description  || '',
+        reminderFrequency:   reqObj.reminderFrequency  || '',
+        reminderLeadDays:    reqObj.reminderLeadDays   || 30,
+        complianceFrequency: reqObj.complianceFrequency || '',
+        nextDueDate:         reqObj.nextDueDate   || '',
+        completionDate:      reqObj.completionDate || '',
+        escalationLevel:     reqObj.escalationLevel || 1,
+      },
+      plant:     { name: plantObj.name || '', state: plantObj.state || '' },
+      assignee:  { name: assignee?.name  || '', email: assignee?.email  || '', dept: assignee?.dept  || '' },
+      oldAssignee: { name: oldAssignee?.name || '', email: oldAssignee?.email || '' },
+      changedBy: changedBy?.name || 'System',
+      oldStatus: oldStatus || '',
+      smtpProvider: cfg.smtpProvider || 'gmail',
+      gmailFromName: cfg.gmailFromName || 'Polyplastics Legal Compliance',
+    };
 
-      // Level 3 Top Management recipients get the magic link for direct no-login access
-      const escEmails3 = req?.escalationEmails?.[3] || [];
-      const isL3Recipient = escEmails3.includes(toEmail);
-      const effectivePortalLink = isL3Recipient ? magicLink : portalLink;
-
-      // ── Microsoft Graph send ──────────────────────────────────────────
-      if (graphReady && accessToken) {
-        try {
-          const htmlBody = buildComplianceHtml({
-            subject,
-            greeting:    finalGreeting,
-            openingLine: finalOpeningLine,
-            sectionTitle,
-            triggerLabel,
-            rows:        finalRows,
-            closingRemark: isL3Recipient ? closingRemark + ' Use the secure link below to open the dashboard without logging in.' : closingRemark,
-            portalLink:  effectivePortalLink,
-            sentDate,
-          });
-          await sendGraphMail(accessToken, { toEmail, subject, htmlBody });
-          console.log(`✅ [MS Graph] ${trigger} → ${toEmail}`);
-        } catch(e) {
-          console.warn(`⚠️ MS Graph send failed for ${toEmail}:`, e?.message || e);
-        }
-      }
-
-      // ── EmailJS send ──────────────────────────────────────────────────
-      if (ejsReady) {
-        try {
-          const plainText = buildEmailJsPlainText({
-            greeting:    finalGreeting,
-            openingLine: finalOpeningLine,
-            rows:        finalRows,
-            closingRemark,
-            portalLink:  effectivePortalLink,
-            sentDate,
-          });
-          // Build a rich templateParams map for flexible EmailJS templates
-          const reqObj = req || {};
-          const plantObj = plant || {};
-          await sendEmailJsMail(cfg, {
-            toEmail,
-            subject,
-            plainText,
-            templateParams: {
-              to_name:         overrides.greeting ? overrides.greeting.replace(/^Dear\s+/i,'').replace(/,$/,'') : 'Compliance Team',
-              from_name:       'Polyplastics',
-              trigger_label:   triggerLabel,
-              opening_line:    finalOpeningLine,
-              closing_remark:  closingRemark,
-              portal_link:     effectivePortalLink,
-              sent_date:       sentDate,
-              req_title:       reqObj.title        || '',
-              req_category:    reqObj.category      || '',
-              req_priority:    reqObj.priority      || '',
-              req_status:      reqObj.status        || '',
-              req_due_date:    reqObj.dueDate        ? new Date(reqObj.dueDate).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) : '',
-              req_description: reqObj.description   || '',
-              plant_name:      plantObj.name         || '',
-              plant_state:     plantObj.state        || '',
-              assignee_name:   assignee?.name        || '',
-              assignee_email:  assignee?.email       || '',
-              changed_by:      changedBy?.name       || 'System',
-              old_status:      oldStatus             || '',
-            },
-          });
-          console.log(`✅ [EmailJS] ${trigger} → ${toEmail}`);
-        } catch(e) {
-          console.warn(`⚠️ EmailJS send failed for ${toEmail}:`, e?.message || e);
-        }
-      }
+    try {
+      const res = await fetch(cloudUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-internal-secret': cloudSecret },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      console.log(`✅ [Cloud/Gmail] ${trigger} → ${[...recipients].join(', ')}`);
+    } catch(e) {
+      console.warn(`⚠️ sendComplianceMail cloud error [${trigger}]:`, e?.message || e);
     }
 
   } catch (e) {
@@ -3396,12 +3354,10 @@ async function sendDailyDigestMail(requirements, plants, users) {
     const cfg = JSON.parse(raw);
     if (!cfg.dailyDigestEnabled) return;
 
-    const provider  = cfg.emailProvider || 'graph';
-    const useGraph  = provider === 'graph'  || provider === 'both';
-    const useEjs    = provider === 'emailjs' || provider === 'both';
-    const graphReady = useGraph  && cfg.msClientId && cfg.msTenantId && cfg.msToEmail;
-    const ejsReady   = (useEjs || cfg.ejsEnabled) && cfg.ejsServiceId && cfg.ejsTemplateId && cfg.ejsPublicKey && cfg.msToEmail;
-    if (!graphReady && !ejsReady) { console.warn('⚠️ Daily digest: no email provider configured.'); return; }
+    // ── Cloud-only path ──
+    const cloudUrl    = (cfg.cloudFnUrl    || '').trim();
+    const cloudSecret = (cfg.cloudFnSecret || '').trim();
+    if (!cloudUrl || !cloudSecret) { console.warn('⚠️ Daily digest: cloud function URL / secret not configured.'); return; }
 
     const portalLink = window.location.href.split('?')[0];
     const sentDate   = new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});
@@ -3685,61 +3641,46 @@ async function sendDailyDigestMail(requirements, plants, users) {
 </body></html>`;
     };
 
-    // ── Acquire Graph token ───────────────────────────────────────────────
-    let accessToken = null;
-    if (graphReady) {
-      try { accessToken = await getMSGraphToken(cfg); }
-      catch(e) { console.warn('⚠️ Daily digest: MS Graph token failed:', e?.message||e); }
-    }
+    // ── Build recipient list (digestRecipients field) ────────────────────
+    const digestList = (cfg.digestRecipients || '')
+      .split(',').map(e => e.trim()).filter(Boolean);
+    const htmlBody = buildDigestHtml();
 
-    const toEmail   = cfg.msToEmail;
-    const htmlBody  = buildDigestHtml();
-    const plainText = `LEGALCOMP DAILY DIGEST – ${sentDate}\n\nCompliance: ${compliance}% (${completedAll}/${total})\nOverdue: ${overdue.length} | Due in 7d: ${dueSoon.length} | Added today: ${created24.length}\n\nActivity (last 24h): ${actLog.length} events\n\nOpen portal: ${portalLink}`;
-
-    if (graphReady && accessToken) {
-      try {
-        await sendGraphMail(accessToken, { toEmail, subject, htmlBody });
-        console.log('✅ [MS Graph] Daily digest sent →', toEmail);
-      } catch(e) { console.warn('⚠️ Daily digest Graph send error:', e?.message||e); }
-    }
-
-    if (ejsReady) {
-      try {
-        await sendEmailJsMail(cfg, {
-          toEmail, subject, plainText,
-          templateParams: {
-            to_name:        'Compliance Team',
-            from_name:      'Polyplastics',
-            trigger_label:  'Daily Digest',
-            opening_line:   `Your consolidated 24-hour compliance summary for ${sentDate}.`,
-            closing_remark: 'Please review overdue and upcoming items in the compliance portal.',
-            portal_link:    portalLink,
-            sent_date:      sentDate,
-            req_title:      `${overdue.length} overdue / ${total} total`,
-            req_status:     `${compliance}% compliance`,
-            req_priority:   '',
-            req_category:   '',
-            req_due_date:   '',
-            req_description:plainText,
-            plant_name:     `${plants.length} plants`,
-            plant_state:    '',
-            assignee_name:  '',
-            assignee_email: '',
-            changed_by:     'System',
-            old_status:     '',
+    // ── Send daily digest via cloud function (Gmail SMTP) ─────────────────
+    try {
+      const res = await fetch(cloudUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-internal-secret': cloudSecret },
+        body: JSON.stringify({
+          type:          'daily_digest',
+          recipients:    digestList,
+          subject,
+          htmlBody,
+          smtpProvider:  cfg.smtpProvider  || 'gmail',
+          gmailFromName: cfg.gmailFromName || 'Polyplastics Legal Compliance',
+          stats: {
+            compliance, total, completedAll,
+            overdue:    overdue.length,
+            dueSoon:    dueSoon.length,
+            created24:  created24.length,
+            actLog:     actLog.length,
           },
-        });
-        console.log('✅ [EmailJS] Daily digest sent →', toEmail);
-      } catch(e) { console.warn('⚠️ Daily digest EmailJS send error:', e?.message||e); }
-    }
+          portalLink,
+          sentDate,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      console.log('✅ [Cloud/Gmail] Daily digest sent →', digestList.join(', '));
+    } catch(e) { console.warn('⚠️ Daily digest cloud error:', e?.message||e); }
 
-    // ── Clear the activity log after successful dispatch ─────────────────
+    // ── Clear the activity log after dispatch ─────────────────────────────
     window.__digestLog = [];
     localStorage.setItem('lastDailyDigestSent', new Date().toISOString());
     console.log('📬 Daily digest dispatched and log cleared.');
 
     // ── Per-user reminder emails: each assignee gets ONLY their own list ──
-    await sendPerUserReminderEmails({ requirements, plants, users, cfg, graphReady, ejsReady, portalLink, sentDate, fmtDate, daysLeft });
+    await sendPerUserReminderEmails({ requirements, plants, users, cfg, cloudUrl, cloudSecret, portalLink, sentDate, fmtDate, daysLeft });
 
   } catch(e) {
     console.warn('⚠️ sendDailyDigestMail error:', e?.message||e);
@@ -3747,76 +3688,96 @@ async function sendDailyDigestMail(requirements, plants, users) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   PER-USER REMINDER EMAILS
-   Each assigned user receives their own list of:
-     • Reminders — requirements within their lead window today (per frequency gate)
-     • Overdues  — requirements that are past due and not yet completed
-   The digest admin email (msToEmail) gets the full overview; this function
-   sends ADDITIONAL targeted emails to each user's own address.
+   PER-USER REMINDER EMAILS — Cloud / Gmail only
+   Each assigned user receives their own list via the cloud function.
    ═══════════════════════════════════════════════════════════════════════ */
-async function sendPerUserReminderEmails({ requirements, plants, users, cfg, graphReady, ejsReady, portalLink, sentDate, fmtDate, daysLeft }) {
+async function sendPerUserReminderEmails({ requirements, plants, users, cfg, cloudUrl, cloudSecret, portalLink, sentDate, fmtDate, daysLeft }) {
   try {
+    if (!cloudUrl || !cloudSecret) { console.warn('⚠️ Per-user reminders: cloud function not configured.'); return; }
+
     // Build a map: userId → { user, reminders[], overdues[] }
     const userMap = {};
-
     requirements.forEach(req => {
       if (req.status === 'Completed') return;
       const assignedIds = Array.isArray(req.assignedTo) ? req.assignedTo : (req.assignedTo ? [req.assignedTo] : []);
       if (!assignedIds.length) return;
-
       const isOverdue  = isEffectivelyOverdue(req);
       const isReminder = !isOverdue && shouldSendReminderToday(req);
       if (!isOverdue && !isReminder) return;
-
       assignedIds.forEach(uid => {
         if (!userMap[uid]) userMap[uid] = { reminders: [], overdues: [] };
-        if (isOverdue)  userMap[uid].overdues.push(req);
-        else            userMap[uid].reminders.push(req);
+        if (isOverdue) userMap[uid].overdues.push(req);
+        else           userMap[uid].reminders.push(req);
       });
     });
 
-    // Acquire Graph token once (reused across all users)
-    let accessToken = null;
-    if (graphReady) {
-      try { accessToken = await getMSGraphToken(cfg); }
-      catch(e) { console.warn('⚠️ Per-user reminders: MS Graph token failed:', e?.message||e); }
-    }
-
-    // Send one email per user
+    // Send one cloud-function call per user
     for (const [uid, { reminders, overdues }] of Object.entries(userMap)) {
       const user = users.find(u => u.id === uid);
       if (!user?.email) continue;
+      if (!reminders.length && !overdues.length) continue;
 
-      const totalItems = reminders.length + overdues.length;
-      if (!totalItems) continue;
-
-      const toEmail = user.email;
       const subject = `[LegalComp] Your Compliance Reminders — ${new Date().toLocaleDateString('en-IN',{weekday:'long',day:'2-digit',month:'short',year:'numeric'})}`;
-
-      // ── Build per-user HTML ─────────────────────────────────────────────
-      const priorityColor = p => ({Critical:'#ef4444',High:'#f97316',Medium:'#f59e0b',Low:'#22c55e'}[p]||'#6b7280');
-      const badge = (text, color) => `<span style="display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;background:${color}22;color:${color};">${text}</span>`;
-      const reqRow = (r) => {
-        const p  = plants.find(pl => pl.id === r.plantId);
+      const mapReq = r => {
+        const p = plants.find(pl => pl.id === r.plantId);
         const dl = daysLeft(r.dueDate);
-        const leadDays = r.reminderLeadDays || 30;
-        return `<tr>
-          <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;font-weight:500;color:#111827;">${r.title}</td>
-          <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#6b7280;">${p?.name||'—'}</td>
-          <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;">${badge(r.priority, priorityColor(r.priority))}</td>
-          <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:${dl<0?'#ef4444':dl<7?'#f59e0b':'#2563eb'};">${fmtDate(r.dueDate)}${dl<0?` <b style="color:#ef4444">(${Math.abs(dl)}d overdue)</b>`:` <span style="color:#6b7280">(${dl}d left)</span>`}</td>
-          <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#6b7280;">${r.reminderFrequency||'—'} · ${leadDays}d window</td>
-        </tr>`;
+        return { title: r.title, plantName: p?.name||'—', priority: r.priority, dueDate: fmtDate(r.dueDate), daysLeft: dl, reminderFrequency: r.reminderFrequency||'—', reminderLeadDays: r.reminderLeadDays||30 };
       };
-      const tableHdr = `<thead><tr style="background:#f8fafc;">
-        <th style="text-align:left;padding:10px 12px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Requirement</th>
-        <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Plant</th>
-        <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Priority</th>
-        <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Due Date</th>
-        <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Reminder</th>
-      </tr></thead>`;
 
-      const htmlBody = `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head>
+      try {
+        const res = await fetch(cloudUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-internal-secret': cloudSecret },
+          body: JSON.stringify({
+            type:          'per_user_reminder',
+            toEmail:       user.email,
+            userName:      user.name || user.email,
+            subject,
+            overdues:      overdues.map(mapReq),
+            reminders:     reminders.map(mapReq),
+            portalLink,
+            sentDate,
+            smtpProvider:  cfg.smtpProvider  || 'gmail',
+            gmailFromName: cfg.gmailFromName || 'Polyplastics Legal Compliance',
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        console.log(`✅ [Cloud/Gmail] Per-user reminder → ${user.email}`);
+      } catch(e) { console.warn(`⚠️ Per-user reminder cloud error for ${user.email}:`, e?.message||e); }
+    }
+
+    console.log(`📨 Per-user reminders sent to ${Object.keys(userMap).length} user(s).`);
+  } catch(e) {
+    console.warn('⚠️ sendPerUserReminderEmails error:', e?.message||e);
+  }
+}
+
+/* ── STUB: old per-user HTML builder (kept for cloud function reference only — not used client-side) ── */
+function _unusedPerUserHtmlStub(user, overdues, reminders, sentDate, portalLink, plants, daysLeft, fmtDate) {
+  const priorityColor = p => ({Critical:'#ef4444',High:'#f97316',Medium:'#f59e0b',Low:'#22c55e'}[p]||'#6b7280');
+  const badge = (text, color) => `<span style="display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;background:${color}22;color:${color};">${text}</span>`;
+  const reqRow = (r) => {
+    const p  = plants.find(pl => pl.id === r.plantId);
+    const dl = daysLeft(r.dueDate);
+    const leadDays = r.reminderLeadDays || 30;
+    return `<tr>
+      <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;font-weight:500;color:#111827;">${r.title}</td>
+      <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#6b7280;">${p?.name||'—'}</td>
+      <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;">${badge(r.priority, priorityColor(r.priority))}</td>
+      <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:${dl<0?'#ef4444':dl<7?'#f59e0b':'#2563eb'};">${fmtDate(r.dueDate)}${dl<0?` <b style="color:#ef4444">(${Math.abs(dl)}d overdue)</b>`:` <span style="color:#6b7280">(${dl}d left)</span>`}</td>
+      <td style="padding:10px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#6b7280;">${r.reminderFrequency||'—'} · ${leadDays}d window</td>
+    </tr>`;
+  };
+  const tableHdr = `<thead><tr style="background:#f8fafc;">
+    <th style="text-align:left;padding:10px 12px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Requirement</th>
+    <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Plant</th>
+    <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Priority</th>
+    <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Due Date</th>
+    <th style="text-align:left;padding:10px 8px;font-size:11px;font-weight:700;color:#374151;text-transform:uppercase;">Reminder</th>
+  </tr></thead>`;
+
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head>
 <body style="margin:0;padding:0;background:#f8fafc;font-family:'Segoe UI',Arial,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;padding:28px 12px;">
 <tr><td align="center">
@@ -3896,51 +3857,8 @@ async function sendPerUserReminderEmails({ requirements, plants, users, cfg, gra
 </table>
 </body></html>`;
 
-      // ── Send via Graph ──
-      if (graphReady && accessToken) {
-        try {
-          await sendGraphMail(accessToken, { toEmail, subject, htmlBody });
-          console.log(`✅ [MS Graph] Per-user reminder → ${toEmail} (${reminders.length} reminders, ${overdues.length} overdue)`);
-        } catch(e) { console.warn(`⚠️ Per-user reminder Graph error for ${toEmail}:`, e?.message||e); }
-      }
-
-      // ── Send via EmailJS ──
-      if (ejsReady) {
-        const plainText = `Hi ${user.name||''},\n\nYour Compliance Reminders — ${sentDate}\n\nOverdue (${overdues.length}): ${overdues.map(r=>r.title).join(', ')||'None'}\nUpcoming Reminders (${reminders.length}): ${reminders.map(r=>`${r.title} (due ${fmtDate(r.dueDate)})`).join(', ')||'None'}\n\nOpen portal: ${portalLink}`;
-        try {
-          await sendEmailJsMail(cfg, {
-            toEmail, subject, plainText,
-            templateParams: {
-              to_name:        user.name || '',
-              from_name:      'Polyplastics',
-              trigger_label:  'Personal Reminder',
-              opening_line:   `Your personalised compliance reminder for ${sentDate}.`,
-              closing_remark: `You have ${overdues.length} overdue and ${reminders.length} upcoming item(s). Please take action.`,
-              portal_link:    portalLink,
-              sent_date:      sentDate,
-              req_title:      overdues.concat(reminders).map(r=>r.title).join(', '),
-              req_status:     `${overdues.length} overdue / ${reminders.length} due reminder`,
-              req_priority:   '',
-              req_category:   '',
-              req_due_date:   reminders[0]?.dueDate || overdues[0]?.dueDate || '',
-              req_description:plainText,
-              plant_name:     '',
-              plant_state:    '',
-              assignee_name:  user.name || '',
-              assignee_email: toEmail,
-              changed_by:     'System',
-              old_status:     '',
-            },
-          });
-          console.log(`✅ [EmailJS] Per-user reminder → ${toEmail}`);
-        } catch(e) { console.warn(`⚠️ Per-user reminder EmailJS error for ${toEmail}:`, e?.message||e); }
-      }
     }
-
-    console.log(`📨 Per-user reminders sent to ${Object.keys(userMap).length} user(s).`);
-  } catch(e) {
-    console.warn('⚠️ sendPerUserReminderEmails error:', e?.message||e);
-  }
+    // (end of old stub — sends are handled by the new sendPerUserReminderEmails above)
 }
 
 /**
@@ -5987,79 +5905,62 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove, currentUser }) {
 
   useEffect(()=>{ if(settings.toast) setTimeout(()=>set('toast',false),3000); },[settings.toast]);
 
-  /* ── Send a real test email via Microsoft Graph API ── */
+  /* ── Send a test email via Cloud Function (Gmail) ── */
   const sendTestEmail = async () => {
-    if (!settings.msClientId || !settings.msTenantId) {
-      setEmailTestMsg('Enter your Azure App (Client) ID and Tenant ID first.');
+    const cloudUrl    = (settings.cloudFnUrl    || '').trim();
+    const cloudSecret = (settings.cloudFnSecret || '').trim();
+    const toEmail     = (settings.digestRecipients || '').split(',').map(e=>e.trim()).filter(Boolean)[0] || '';
+    if (!cloudUrl || !cloudSecret) {
+      setEmailTestMsg('Configure the Cloud Function URL and Secret first (see Cloud Reminders section above).');
       setEmailTestStatus('error');
-      setTimeout(()=>setEmailTestStatus(null), 4000);
+      setTimeout(()=>setEmailTestStatus(null), 5000);
       return;
     }
-    if (!settings.msToEmail) {
-      setEmailTestMsg('Enter a recipient email address.');
+    if (!toEmail) {
+      setEmailTestMsg('Add at least one address in Digest Recipients below.');
       setEmailTestStatus('error');
-      setTimeout(()=>setEmailTestStatus(null), 4000);
+      setTimeout(()=>setEmailTestStatus(null), 5000);
       return;
     }
     setEmailTestStatus('sending');
     setEmailTestMsg('');
     try {
-      // Uses the singleton getMSGraphToken — ensure the redirect URI shown in console matches Azure AD registration
-      const accessToken = await getMSGraphToken({ msClientId: settings.msClientId, msTenantId: settings.msTenantId });
-      const htmlBody = `<p>Hello,</p><p>This is a test email sent from <strong>Polyplastics</strong> via Microsoft Graph API on ${new Date().toLocaleString('en-IN')}.</p><p>Your Microsoft Graph email integration is working correctly.</p><p>— Polyplastics Compliance System</p>`;
-      await sendGraphMail(accessToken, {
-        toEmail: settings.msToEmail,
-        subject: 'Polyplastics – Microsoft Graph Email Test',
-        htmlBody,
+      const res = await fetch(cloudUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-internal-secret': cloudSecret },
+        body: JSON.stringify({
+          type: 'compliance_notification',
+          recipients: [toEmail],
+          subject: 'Polyplastics – Cloud Function Email Test',
+          trigger: 'Test',
+          triggerLabel: 'Test Email',
+          greeting: `Hello,`,
+          openingLine: 'This is a test email sent via the Polyplastics Cloud Function (Gmail SMTP).',
+          sectionTitle: 'Test Details',
+          closingRemark: 'Your cloud function email integration is working correctly.',
+          sentDate: new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}),
+          portalLink: window.location.href.split('?')[0],
+          smtpProvider: settings.smtpProvider || 'gmail',
+          gmailFromName: settings.gmailFromName || 'Polyplastics Legal Compliance',
+          req: { title: 'Test', category: '—', priority: '—', status: '—', dueDate: '—', description: 'This is a test.' },
+          plant: { name: '—', state: '—' },
+          assignee: { name: '—', email: toEmail, dept: '—' },
+          changedBy: 'Admin',
+        }),
       });
+      const data = await res.json().catch(()=>({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       setEmailTestStatus('success');
-      setEmailTestMsg(`Email delivered to ${settings.msToEmail}`);
+      setEmailTestMsg(`Test email sent to ${toEmail} via cloud function ✓`);
     } catch (err) {
       setEmailTestStatus('error');
       setEmailTestMsg(`Failed: ${err?.message || String(err)}`);
     }
-    setTimeout(()=>setEmailTestStatus(null), 6000);
+    setTimeout(()=>setEmailTestStatus(null), 7000);
   };
 
-  /* ── Send a real test email via EmailJS ── */
-  const sendTestEmailJs = async () => {
-    if (!settings.ejsServiceId || !settings.ejsTemplateId || !settings.ejsPublicKey) {
-      setEjsTestMsg('Enter your Service ID, Template ID, and Public Key first.');
-      setEjsTestStatus('error');
-      setTimeout(()=>setEjsTestStatus(null), 4000);
-      return;
-    }
-    if (!settings.msToEmail) {
-      setEjsTestMsg('Enter a recipient email address in the "Recipient Email (To)" field above.');
-      setEjsTestStatus('error');
-      setTimeout(()=>setEjsTestStatus(null), 4000);
-      return;
-    }
-    setEjsTestStatus('sending');
-    setEjsTestMsg('');
-    try {
-      await sendEmailJsMail(settings, {
-        toEmail: settings.msToEmail,
-        subject: 'Polyplastics – EmailJS Test',
-        plainText: `Hello,\n\nThis is a test email from Polyplastics via EmailJS sent on ${new Date().toLocaleString('en-IN')}.\n\nYour EmailJS integration is working correctly.\n\n— Polyplastics Compliance System`,
-        templateParams: {
-          to_name:      'Compliance Team',
-          from_name:    'Polyplastics',
-          trigger_label:'Test',
-          opening_line: 'This is a test email from Polyplastics via EmailJS.',
-          closing_remark:'Your EmailJS integration is working correctly.',
-          portal_link:  window.location.href.split('?')[0],
-          sent_date:    new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}),
-        },
-      });
-      setEjsTestStatus('success');
-      setEjsTestMsg(`Email delivered to ${settings.msToEmail}`);
-    } catch (err) {
-      setEjsTestStatus('error');
-      setEjsTestMsg(`Failed: ${err?.message || String(err)}`);
-    }
-    setTimeout(()=>setEjsTestStatus(null), 6000);
-  };
+  /* ── Stub: EmailJS test no longer used ── */
+  const sendTestEmailJs = async () => { /* removed — all email via cloud function */ };
 
   const testFirebase = async () => {
     setFbTestStatus('testing');
@@ -6338,8 +6239,9 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove, currentUser }) {
                       cfg2.dailyDigestEnabled = true;
                       localStorage.setItem('adminSettings', JSON.stringify(cfg2));
                       // We need requirements/plants/users from parent — signal via custom event
-                      window.dispatchEvent(new CustomEvent('legalcomp:send_daily_digest'));
-                      showToast('📬 Daily digest send triggered! Check email in a moment.', 'success');
+                      // Pass currentUser so the handler can send personalised (user-only) digest
+                      window.dispatchEvent(new CustomEvent('legalcomp:send_daily_digest', { detail: { manualUser: currentUser } }));
+                      showToast('📬 Your personal digest triggered! Check email in a moment.', 'success');
                     }}
                     className="px-5 py-2.5 text-white rounded-xl text-sm font-semibold transition-colors flex items-center gap-2" style={{background:"var(--p600)"}}
                   >
@@ -6354,216 +6256,25 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove, currentUser }) {
       </div>
 
       {/* ══════════════════════════════════════════════════════
-          DUAL COMMUNICATION — SHARED HEADER CARD
+          EMAIL ROUTING — Gmail via Cloud Function only
       ══════════════════════════════════════════════════════ */}
-      <div className={card}>
-        <h3 className="font-semibold mb-1 flex items-center gap-2" style={{fontFamily:"'Outfit',sans-serif"}}>
-          <span>📮</span> Dual Email Communication
-        </h3>
-        <p className={`text-xs mb-5 ${sub}`}>
-          Both providers are always available. Enable one or both independently — when both are on, every notification is delivered through <strong>Microsoft Graph</strong> <em>and</em> <strong>EmailJS</strong> simultaneously for maximum redundancy.
-        </p>
-
-        {/* ── Status strip ── */}
-        <div className={`flex items-center gap-3 p-3 rounded-xl mb-5 flex-wrap ${dk?'bg-gray-700':'bg-gray-50'}`}>
-          <div className="flex items-center gap-2">
-            <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${settings.msEnabled && settings.msClientId && settings.msTenantId ? 'bg-green-500' : settings.msEnabled ? 'bg-amber-400 animate-pulse' : 'bg-gray-300'}`} />
-            <span className={`text-xs font-semibold ${settings.msEnabled && settings.msClientId && settings.msTenantId ? 'text-green-600 dark:text-green-400' : settings.msEnabled ? 'text-amber-600 dark:text-amber-400' : sub}`}>
-              MS Graph: {settings.msEnabled ? (settings.msClientId && settings.msTenantId ? 'Ready ✓' : 'Enabled — keys missing') : 'Disabled'}
-            </span>
+      <div className={`rounded-2xl border shadow-sm overflow-hidden ${dk?'border-green-800/50 bg-gray-800':'border-green-200 bg-white'}`}>
+        <div className={`px-6 py-4 flex items-center gap-3 border-b ${dk?'border-green-800/40 bg-green-900/20':'border-green-100 bg-green-50'}`}>
+          <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-xl font-bold ${dk?'bg-green-900/40':'bg-green-100'}`}>📮</div>
+          <div>
+            <p className="font-semibold text-sm">Email Routing — Gmail via Cloud Function</p>
+            <p className={`text-xs ${sub}`}>All notifications (compliance events, daily digests, per-user reminders) are sent exclusively through the cloud function configured above. No browser-side email is used.</p>
           </div>
-          <span className={`text-xs font-bold ${sub}`}>+</span>
-          <div className="flex items-center gap-2">
-            <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${settings.ejsEnabled && settings.ejsServiceId && settings.ejsTemplateId && settings.ejsPublicKey ? 'bg-green-500' : settings.ejsEnabled ? 'bg-amber-400 animate-pulse' : 'bg-gray-300'}`} />
-            <span className={`text-xs font-semibold ${settings.ejsEnabled && settings.ejsServiceId && settings.ejsTemplateId && settings.ejsPublicKey ? 'text-green-600 dark:text-green-400' : settings.ejsEnabled ? 'text-amber-600 dark:text-amber-400' : sub}`}>
-              EmailJS: {settings.ejsEnabled ? (settings.ejsServiceId && settings.ejsTemplateId && settings.ejsPublicKey ? 'Ready ✓' : 'Enabled — keys missing') : 'Disabled'}
-            </span>
-          </div>
-          <span className={`ml-auto text-xs px-2.5 py-1 rounded-full font-semibold ${
-            (settings.msEnabled && settings.msClientId && settings.msTenantId) && (settings.ejsEnabled && settings.ejsServiceId && settings.ejsTemplateId && settings.ejsPublicKey)
-              ? 'bg-green-100 text-green-700'
-              : (settings.msEnabled || settings.ejsEnabled)
-                ? 't-badge-admin'
-                : 'bg-gray-100 text-gray-500'
-          }`}>
-            {(settings.msEnabled && settings.ejsEnabled) ? '🔀 Dual-send active' : (settings.msEnabled || settings.ejsEnabled) ? '📨 Single provider' : '⛔ All disabled'}
+          <span className={`ml-auto text-xs px-3 py-1.5 rounded-full font-semibold flex items-center gap-1.5 ${settings.cloudFnUrl && settings.cloudFnSecret ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
+            <span className={`w-2 h-2 rounded-full ${settings.cloudFnUrl && settings.cloudFnSecret ? 'bg-green-500' : 'bg-amber-400'}`} />
+            {settings.cloudFnUrl && settings.cloudFnSecret ? 'Cloud function configured ✓' : 'Cloud function not configured'}
           </span>
         </div>
-
-        {/* ── Shared recipient fields ── */}
-        <div className="grid grid-cols-2 gap-4 mb-2">
-          <FormField label="Sender Email (From / Office 365)">
-            <input type="email" value={settings.fromEmail} onChange={e=>set('fromEmail',e.target.value)} className={inputCls} placeholder="you@company.com" />
-          </FormField>
-          <FormField label="Recipient Email (To — shared by both)">
-            <input type="email" value={settings.msToEmail} onChange={e=>set('msToEmail',e.target.value)} className={inputCls} placeholder="compliance@company.com" />
-          </FormField>
-        </div>
-        <p className={`text-xs mb-5 ${sub}`}>↑ These fields are shared — both providers send to the same recipient.</p>
-      </div>
-
-      {/* ══════════════════════════════════════════════════════
-          PROVIDER 1 — MICROSOFT GRAPH API
-      ══════════════════════════════════════════════════════ */}
-      <div className={`rounded-2xl border shadow-sm overflow-hidden ${dk?'border-blue-800/50 bg-gray-800':'border-blue-200 bg-white'}`}>
-        {/* Header with enable toggle */}
-        <div className={`px-6 py-4 flex items-center justify-between border-b ${dk?'border-blue-800/40 bg-blue-900/20':'border-blue-100 bg-blue-50'}`}>
-          <div className="flex items-center gap-3">
-            <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-xl font-bold ${dk?'bg-blue-900/40':'bg-blue-100'}`}>📊</div>
-            <div>
-              <p className="font-semibold text-sm">Provider 1 — Microsoft Graph API</p>
-              <p className={`text-xs ${sub}`}>Send directly from your Office 365 mailbox via Azure Active Directory</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className={`text-xs font-semibold ${settings.msEnabled ? 'text-blue-600 dark:text-blue-400' : sub}`}>
-              {settings.msEnabled ? 'Enabled' : 'Disabled'}
-            </span>
-            <button onClick={()=>set('msEnabled',!settings.msEnabled)}
-              className={`w-12 h-6 rounded-full transition-colors relative flex-shrink-0 ${settings.msEnabled?'bg-blue-600':'bg-gray-300 dark:bg-gray-600'}`}>
-              <div className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all ${settings.msEnabled?'left-6':'left-0.5'}`} />
-            </button>
-          </div>
-        </div>
-
-        <div className={`p-6 space-y-5 transition-opacity ${settings.msEnabled?'opacity-100':'opacity-40 pointer-events-none'}`}>
-          {/* Setup guide */}
-          <div className={`p-4 rounded-xl border text-xs space-y-1.5 ${dk?'bg-blue-900/20 border-blue-800/40 text-blue-300':'bg-blue-50 border-blue-100 text-blue-700'}`}>
-            <p className="font-semibold text-sm mb-2">⚡ Azure App Registration — one-time setup (~5 min)</p>
-            <p><strong>Step 1.</strong> Go to <strong>portal.azure.com</strong> → Azure Active Directory → App registrations → New registration.</p>
-            <p className="pl-4">Name: <code className="font-mono bg-blue-900/20 px-1 rounded">Polyplastics</code> · Account types: <em>This organizational directory only</em></p>
-            <p className="pl-4">Redirect URI: <code className="font-mono bg-blue-900/20 px-1 rounded">Single-page application (SPA)</code> → paste your app URL</p>
-            <p><strong>Step 2.</strong> After registration, copy the <strong>Application (Client) ID</strong> and <strong>Directory (Tenant) ID</strong>.</p>
-            <p><strong>Step 3.</strong> API permissions → Add permission → Microsoft Graph → Delegated → add <code className="font-mono bg-blue-900/20 px-1 rounded">Mail.Send</code> and <code className="font-mono bg-blue-900/20 px-1 rounded">User.Read</code> → Grant admin consent.</p>
-            <p><strong>Step 4.</strong> Paste credentials below → Save → Test. A Microsoft login popup appears on first use.</p>
-          </div>
-
-          {/* Azure credentials */}
-          <div className={`p-4 rounded-xl border space-y-4 ${dk?'bg-gray-700/50 border-gray-600':'bg-gray-50 border-gray-200'}`}>
-            <p className="text-xs font-semibold uppercase tracking-wider text-blue-500">Azure AD Credentials</p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <FormField label="Application (Client) ID" required>
-                <input value={settings.msClientId} onChange={e=>set('msClientId',e.target.value)}
-                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" className={inputCls} />
-              </FormField>
-              <FormField label="Directory (Tenant) ID" required>
-                <input value={settings.msTenantId} onChange={e=>set('msTenantId',e.target.value)}
-                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" className={inputCls} />
-              </FormField>
-            </div>
-          </div>
-
-          {/* Status + test */}
-          <div className="flex flex-wrap items-center gap-3">
-            <div className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full ${settings.msClientId && settings.msTenantId ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
-              <span className={`w-2 h-2 rounded-full ${settings.msClientId && settings.msTenantId ? 'bg-green-500' : 'bg-amber-400'}`} />
-              {settings.msClientId && settings.msTenantId ? 'Credentials configured' : 'Credentials missing'}
-            </div>
-            <button onClick={sendTestEmail} disabled={emailTestStatus==='sending'}
-              className={`px-5 py-2.5 rounded-xl text-sm font-semibold transition-colors flex items-center gap-2
-                ${emailTestStatus==='sending'?'bg-blue-400 text-white cursor-wait':'bg-blue-600 hover:bg-blue-700 text-white shadow-md shadow-blue-200'}`}>
-              {emailTestStatus==='sending'
-                ? <><span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin inline-block"/>Sending…</>
-                : '📧 Send Test via MS Graph'}
-            </button>
-            {emailTestStatus==='success' && <span className="flex items-center gap-1.5 text-sm font-medium text-green-600 dark:text-green-400">✅ {emailTestMsg}</span>}
-            {emailTestStatus==='error'   && <span className="flex items-center gap-1.5 text-sm font-medium text-red-500 max-w-sm">❌ {emailTestMsg}</span>}
-          </div>
-        </div>
-      </div>
-
-      {/* ══════════════════════════════════════════════════════
-          PROVIDER 2 — EMAILJS
-      ══════════════════════════════════════════════════════ */}
-      <div className={`rounded-2xl border shadow-sm overflow-hidden ${dk?'border-yellow-800/50 bg-gray-800':'border-yellow-200 bg-white'}`}>
-        {/* Header with enable toggle */}
-        <div className={`px-6 py-4 flex items-center justify-between border-b ${dk?'border-yellow-800/40 bg-yellow-900/20':'border-yellow-100 bg-yellow-50'}`}>
-          <div className="flex items-center gap-3">
-            <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-xl font-bold ${dk?'bg-yellow-900/40':'bg-yellow-100'}`}>✉️</div>
-            <div>
-              <p className="font-semibold text-sm">Provider 2 — EmailJS</p>
-              <p className={`text-xs ${sub}`}>Client-side browser email — no backend or server required</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className={`text-xs font-semibold ${settings.ejsEnabled ? 'text-yellow-600 dark:text-yellow-400' : sub}`}>
-              {settings.ejsEnabled ? 'Enabled' : 'Disabled'}
-            </span>
-            <button onClick={()=>set('ejsEnabled',!settings.ejsEnabled)}
-              className={`w-12 h-6 rounded-full transition-colors relative flex-shrink-0 ${settings.ejsEnabled?'bg-yellow-500':'bg-gray-300 dark:bg-gray-600'}`}>
-              <div className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all ${settings.ejsEnabled?'left-6':'left-0.5'}`} />
-            </button>
-          </div>
-        </div>
-
-        <div className={`p-6 space-y-5 transition-opacity ${settings.ejsEnabled?'opacity-100':'opacity-40 pointer-events-none'}`}>
-          {/* Setup guide */}
-          <div className={`p-4 rounded-xl border text-xs space-y-1.5 ${dk?'bg-yellow-900/20 border-yellow-800/40 text-yellow-300':'bg-yellow-50 border-yellow-100 text-yellow-700'}`}>
-            <p className="font-semibold text-sm mb-2">⚡ EmailJS Setup — one-time setup (~3 min)</p>
-            <p><strong>Step 1.</strong> Go to <strong>emailjs.com</strong> → Sign up free (200 emails/month) → Email Services → connect Gmail, Outlook, or custom SMTP.</p>
-            <p><strong>Step 2.</strong> Email Templates → New Template. Use these dynamic variables in your template:</p>
-            <div className="font-mono text-xs p-3 rounded-lg mt-1 bg-gray-900 text-green-400 leading-relaxed">
-              {'{{to_name}}'} &nbsp;{'{{to_email}}'} &nbsp;{'{{subject}}'} &nbsp;{'{{trigger_label}}'}<br/>
-              {'{{opening_line}}'} &nbsp;{'{{closing_remark}}'} &nbsp;{'{{portal_link}}'} &nbsp;{'{{sent_date}}'}<br/>
-              {'{{req_title}}'} &nbsp;{'{{req_status}}'} &nbsp;{'{{req_priority}}'} &nbsp;{'{{req_due_date}}'}<br/>
-              {'{{req_description}}'} &nbsp;{'{{req_category}}'} &nbsp;{'{{old_status}}'}<br/>
-              {'{{plant_name}}'} &nbsp;{'{{plant_state}}'} &nbsp;{'{{assignee_name}}'} &nbsp;{'{{assignee_email}}'}<br/>
-              {'{{changed_by}}'} &nbsp;{'{{from_name}}'} &nbsp;{'{{message}}'}
-            </div>
-            <p><strong>Step 3.</strong> Account → API Keys → copy <strong>Public Key</strong>. Also copy the <strong>Service ID</strong> and <strong>Template ID</strong> → paste below.</p>
-          </div>
-
-          {/* EmailJS credentials */}
-          <div className={`p-4 rounded-xl border space-y-4 ${dk?'bg-gray-700/50 border-gray-600':'bg-gray-50 border-gray-200'}`}>
-            <p className="text-xs font-semibold uppercase tracking-wider text-yellow-600 dark:text-yellow-400">EmailJS Credentials</p>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <FormField label="Service ID" required>
-                <input value={settings.ejsServiceId} onChange={e=>set('ejsServiceId',e.target.value)}
-                  placeholder="service_xxxxxxx" className={inputCls} />
-              </FormField>
-              <FormField label="Template ID" required>
-                <input value={settings.ejsTemplateId} onChange={e=>set('ejsTemplateId',e.target.value)}
-                  placeholder="template_xxxxxxx" className={inputCls} />
-              </FormField>
-              <FormField label="Public Key" required>
-                <div className="relative">
-                  <input
-                    type={ejsShowPass?'text':'password'}
-                    value={settings.ejsPublicKey}
-                    onChange={e=>set('ejsPublicKey',e.target.value)}
-                    placeholder="xxxxxxxxxxxxxxxxxxxx"
-                    className={inputCls + ' pr-10'}
-                  />
-                  <button type="button" onClick={()=>setEjsShowPass(v=>!v)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-xs select-none">
-                    {ejsShowPass?'🙈':'👁️'}
-                  </button>
-                </div>
-              </FormField>
-            </div>
-          </div>
-
-          {/* Status + test */}
-          <div className="flex flex-wrap items-center gap-3">
-            <div className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full ${settings.ejsServiceId && settings.ejsTemplateId && settings.ejsPublicKey ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
-              <span className={`w-2 h-2 rounded-full ${settings.ejsServiceId && settings.ejsTemplateId && settings.ejsPublicKey ? 'bg-green-500' : 'bg-amber-400'}`} />
-              {settings.ejsServiceId && settings.ejsTemplateId && settings.ejsPublicKey ? 'Credentials configured' : 'Credentials missing'}
-            </div>
-            <button onClick={sendTestEmailJs} disabled={ejsTestStatus==='sending'}
-              className={`px-5 py-2.5 rounded-xl text-sm font-semibold transition-colors flex items-center gap-2
-                ${ejsTestStatus==='sending'?'bg-yellow-400 text-white cursor-wait':'bg-yellow-500 hover:bg-yellow-600 text-white shadow-md shadow-yellow-200'}`}>
-              {ejsTestStatus==='sending'
-                ? <><span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin inline-block"/>Sending…</>
-                : '✉️ Send Test via EmailJS'}
-            </button>
-            {ejsTestStatus==='success' && <span className="flex items-center gap-1.5 text-sm font-medium text-green-600 dark:text-green-400">✅ {ejsTestMsg}</span>}
-            {ejsTestStatus==='error'   && <span className="flex items-center gap-1.5 text-sm font-medium text-red-500 max-w-sm">❌ {ejsTestMsg}</span>}
-          </div>
-
-          <div className={`p-3 rounded-xl text-xs flex items-start gap-2 ${dk?'bg-gray-700 text-gray-300 border border-gray-600':'bg-gray-50 border border-gray-200 text-gray-600'}`}>
-            <span>💡</span>
-            <span>EmailJS runs entirely in the browser — no server or backend needed. Free tier: <strong>200 emails/month</strong>. Upgrade at emailjs.com for higher volume. The shared "Recipient Email (To)" above is used as the delivery address.</span>
-          </div>
+        <div className={`p-5 text-xs ${sub}`}>
+          ✅ <strong>Sender:</strong> configured in your cloud function (Gmail SMTP / Nodemailer) — see <em>Cloud Reminders</em> section above.<br/>
+          ✅ <strong>Digest recipients:</strong> set in <em>Notification Recipients</em> below.<br/>
+          ✅ <strong>Per-user reminders:</strong> sent to each user's own email address automatically.<br/>
+          ℹ️ MS Graph and EmailJS providers have been removed — the cloud function is the sole delivery path.
         </div>
       </div>
 
@@ -6841,13 +6552,17 @@ function AdminSettings({ dk, onLogoSave, onLogoRemove, currentUser }) {
                 <p className="text-xs font-bold uppercase tracking-wider text-indigo-500">📬 Recipients & Schedule</p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <FormField label="Digest & Summary Recipients" required>
-                    <input value={settings.digestRecipients||''} onChange={e=>set('digestRecipients',e.target.value)}
-                      placeholder="admin@co.com, ceo@co.com" className={inputCls} />
+                    <textarea value={settings.digestRecipients||''} onChange={e=>set('digestRecipients',e.target.value)}
+                      placeholder="admin@co.com, ceo@co.com" className={inputCls}
+                      rows={Math.max(2, (settings.digestRecipients||'').split(',').filter(Boolean).length + 1)}
+                      style={{resize:'vertical',minHeight:'2.5rem',fontFamily:'inherit',fontSize:'inherit',lineHeight:1.5}} />
                     <p className={`text-xs mt-1 ${sub}`}>Comma-separated. Gets daily digest, weekly & monthly reports.</p>
                   </FormField>
                   <FormField label="Overdue Alert Recipients" required>
-                    <input value={settings.overdueRecipients||''} onChange={e=>set('overdueRecipients',e.target.value)}
-                      placeholder="admin@co.com, md@co.com" className={inputCls} />
+                    <textarea value={settings.overdueRecipients||''} onChange={e=>set('overdueRecipients',e.target.value)}
+                      placeholder="admin@co.com, md@co.com" className={inputCls}
+                      rows={Math.max(2, (settings.overdueRecipients||'').split(',').filter(Boolean).length + 1)}
+                      style={{resize:'vertical',minHeight:'2.5rem',fontFamily:'inherit',fontSize:'inherit',lineHeight:1.5}} />
                     <p className={`text-xs mt-1 ${sub}`}>Comma-separated. Gets urgent overdue alerts at 09:00 IST.</p>
                   </FormField>
                   <FormField label="Lead-day reminder thresholds">
@@ -7555,7 +7270,9 @@ function BulkUpload({ dk, plants, users, requirements, updateRequirements, categ
       const obj = {};
       Object.keys(rawRow).forEach(k => {
         const v = rawRow[k];
-        obj[norm(k)] = v instanceof Date ? v.toISOString().split('T')[0] : String(v ?? '').trim();
+        obj[norm(k)] = v instanceof Date
+          ? `${v.getFullYear()}-${String(v.getMonth()+1).padStart(2,'0')}-${String(v.getDate()).padStart(2,'0')}`
+          : String(v ?? '').trim();
       });
       expandMultiPlantRow(obj, li, errs, rows);
     });
@@ -10890,8 +10607,51 @@ function App() {
 
   /* ── "Send Now" custom event listener (from Settings test button) ── */
   useEffect(() => {
-    const handler = () => {
-      if (requirements && plants && users) {
+    const handler = (e) => {
+      if (!requirements || !plants || !users) return;
+      const manualUser = e?.detail?.manualUser;
+      if (manualUser) {
+        // Manual "Send Now": send only this user's personal reminder email
+        // Uses the SMTP cloud function path (sushil@polyplasticsindia.com sender)
+        const raw = localStorage.getItem('adminSettings');
+        if (!raw) return;
+        const cfg = JSON.parse(raw);
+        cfg.dailyDigestEnabled = true;
+        // Force cloud function path for manual send so it goes via correct sender
+        const fmtDate = d => d ? new Date(d).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) : '—';
+        const daysLeft = d => Math.ceil((new Date(d) - Date.now()) / 86400000);
+        const isOv = r => r.status !== 'Completed' && r.dueDate && daysLeft(r.dueDate) < 0;
+        const userReqs = requirements.filter(r => {
+          const ids = Array.isArray(r.assignedTo) ? r.assignedTo : (r.assignedTo ? [r.assignedTo] : []);
+          return ids.includes(manualUser.id);
+        });
+        const overdues  = userReqs.filter(r => r.status !== 'Completed' && isOv(r));
+        const reminders = userReqs.filter(r => r.status !== 'Completed' && !isOv(r) && r.dueDate && daysLeft(r.dueDate) <= (r.reminderLeadDays || 30));
+        const sentDate  = new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});
+        const portalLink = window.location.href.split('?')[0];
+
+        // If cloud function is configured, use it (sends from sushil@polyplasticsindia.com)
+        if (cfg.cloudFnUrl && cfg.cloudFnSecret) {
+          fetch(cfg.cloudFnUrl, {
+            method: 'POST',
+            headers: { 'Content-Type':'application/json', 'x-internal-secret': cfg.cloudFnSecret },
+            body: JSON.stringify({
+              type: 'personal_reminder',
+              toEmail: manualUser.email,
+              userName: manualUser.name || manualUser.email,
+              overdues: overdues.map(r=>({ title:r.title, dueDate:fmtDate(r.dueDate) })),
+              reminders: reminders.map(r=>({ title:r.title, dueDate:fmtDate(r.dueDate), daysLeft:daysLeft(r.dueDate) })),
+              portalLink, sentDate,
+            }),
+          }).catch(err => console.warn('⚠️ Personal digest cloud fn error:', err));
+        } else {
+          // Fallback: per-user reminder via cloud function
+          const cloudUrl    = (cfg.cloudFnUrl    || '').trim();
+          const cloudSecret = (cfg.cloudFnSecret || '').trim();
+          sendPerUserReminderEmails({ requirements, plants, users, cfg, cloudUrl, cloudSecret, portalLink, sentDate, fmtDate, daysLeft });
+        }
+      } else {
+        // Scheduled/automated: full admin digest
         sendDailyDigestMail(requirements, plants, users);
       }
     };
