@@ -5880,7 +5880,7 @@ window.topMgmtRequestEscalation = async function() {
     <div class="modal" style="max-width:480px">
       <div class="modal-header"><h2>🚨 Request Immediate Action</h2><button onclick="closeModal()">✕</button></div>
       <div class="modal-body">
-        <div class="alert alert-warning mb-4">⚠️ This will send an <b>urgent escalation notification</b> to the Fleet Administrator and Superadmin, requesting immediate action on the current fleet status.</div>
+        <div class="alert alert-warning mb-4">⚠️ This will send an <b>urgent escalation notification</b> to the Fleet Administrator and Superadmin, requesting immediate action on the current fleet status. Plant admins responsible for affected vehicles will also be notified.</div>
         <div class="form-group">
           <label class="form-label">Your remarks / reason for escalation <span class="req">*</span></label>
           <textarea id="esc-remarks" class="form-textarea" rows="3" placeholder="e.g. Insurance expired for Plant A vehicles — action required immediately"></textarea>
@@ -5933,6 +5933,34 @@ window.submitTopMgmtEscalation = async function() {
   const yearExp  = myExpenses().filter(e=>e.date.startsWith(new Date().getFullYear())).reduce((s,e)=>s+e.amount,0);
   const missingInv = myExpenses().filter(e=>!e.hasBill).length;
 
+  // ── Collect affected vehicles & their plant admin emails ──────────────────
+  const alertVehicleIds = [...new Set(alerts.map(a => a.vehicleId).filter(Boolean))];
+  const affectedVehicles = (S.vehicles || [])
+    .filter(v => alertVehicleIds.includes(v.id))
+    .map(v => {
+      const plant = (S.plants || []).find(p => p.id === v.plantId) || {};
+      return {
+        regNo:            v.regNo || '',
+        make:             v.make  || '',
+        model:            v.model || '',
+        plantName:        plant.name || v.plantId || '',
+        plantAdminEmail:  (plant.plantAdminEmail || '').trim(),
+        driverName:       v.driverName    || '',
+        driverContact:    v.driverContact || '',
+        issues: alerts
+          .filter(a => a.vehicleId === v.id)
+          .map(a => `${a.label} — ${a.severity} (${a.daysLeft != null ? a.daysLeft + 'd' : 'expired'})`)
+      };
+    });
+
+  const plantAdminEmails = [
+    ...new Set(
+      affectedVehicles
+        .map(v => v.plantAdminEmail)
+        .filter(Boolean)
+    )
+  ];
+
   // Submit escalation request via backend (Admin SDK bypasses Firestore security rules)
   try {
     // Try localStorage first, then fall back to Firestore vems_settings/data
@@ -5970,10 +5998,12 @@ window.submitTopMgmtEscalation = async function() {
       body: JSON.stringify({
         remarks,
         priority,
-        expiredDocs:     expired,
-        criticalDocs:    critical,
-        ytdExpenses:     yearExp,
-        missingInvoices: missingInv,
+        expiredDocs:       expired,
+        criticalDocs:      critical,
+        ytdExpenses:       yearExp,
+        missingInvoices:   missingInv,
+        plantAdminEmails,                 // backend CCs these on the escalation email
+        affectedVehicles,                 // vehicle + driver details for email body
       }),
     });
 
@@ -5982,10 +6012,16 @@ window.submitTopMgmtEscalation = async function() {
 
     if (res.ok && data.ok) {
       setStatus('Request submitted! Closing…', 'success');
-      addAudit('Top Mgmt Escalation Request', priorityLabel[priority], remarks);
+      const auditNote = plantAdminEmails.length
+        ? `${remarks} | CC'd plant admins: ${plantAdminEmails.join(', ')}`
+        : remarks;
+      addAudit('Top Mgmt Escalation Request', priorityLabel[priority], auditNote);
       setTimeout(() => {
         closeModal();
-        showToast(`✅ Escalation request (${priorityLabel[priority]}) submitted to Fleet Administrator!`, 'success');
+        const ccNote = plantAdminEmails.length
+          ? ` · CC'd ${plantAdminEmails.length} plant admin(s)`
+          : '';
+        showToast(`✅ Escalation request (${priorityLabel[priority]}) submitted to Fleet Administrator${ccNote}!`, 'success');
       }, 900);
     } else {
       setStatus('Failed: ' + (data.error || `HTTP ${res.status}`), 'error');
