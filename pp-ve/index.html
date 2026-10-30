@@ -2773,6 +2773,7 @@ function sidebarHTML() {
       {id:'co2',label:'CO₂ Emissions',icon:'🌱'},
       {id:'summary',label:'Summary Report',icon:'📋'},
       {id:'maintenance',label:'Maintenance Report',icon:'🔧'},
+      {id:'monthly',label:'Monthly Report',icon:'📅'},
     ]},
     { section:'Admin', items:[
       {id:'plants',label:'Plants',icon:'🏭'},
@@ -2826,6 +2827,7 @@ function pageHTML() {
     case 'reports':     return reportsHTML();
     case 'summary':     return summaryReportHTML();
     case 'maintenance': return maintenanceReportHTML();
+    case 'monthly':     return monthlyReportHTML();
     case 'plants':      return plantsHTML();
     case 'users':       return (isSA()||isPlantAdmin())?usersHTML():dashboardHTML();
     case 'emfactors':          return isSA()?emFactorsHTML():dashboardHTML();
@@ -5420,6 +5422,7 @@ function topMgmtSidebarHTML() {
       {id:'co2',         label:'CO₂ Emissions',      icon:'🌱'},
       {id:'summary',     label:'Summary Report',      icon:'📋'},
       {id:'maintenance', label:'Maintenance Report',  icon:'🔧'},
+      {id:'monthly',     label:'Monthly Report',      icon:'📅'},
     ]},
   ];
   const page = S.page === 'topmgmt' ? 'topmgmt' : S.page;
@@ -5472,6 +5475,7 @@ function topMgmtPageHTML() {
     case 'reports':        return reportsHTML();
     case 'summary':        return summaryReportHTML();
     case 'maintenance':    return maintenanceReportHTML();
+    case 'monthly':        return monthlyReportHTML();
     default:               return dashboardHTML();
   }
 }
@@ -8999,6 +9003,399 @@ window.exportMaintenanceExcel = function() {
     XLSX.writeFile(WB, `VEMS_Maintenance_Report_${yearLabel.replace(' ','_')}.xlsx`);
     showToast('Maintenance Excel exported!','success');
   } catch(err){ showToast('Excel export failed: '+err.message,'error'); }
+};
+
+// ══════════════════════════════════════════════════════════════════
+// ── MONTHLY EXPENSE REPORT ───────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+const MONTHLY_FILTER_KEY = 'vems_monthly_exptype';
+const FUEL_CATS  = ['Petrol','Fuel','CNG','Diesel'];
+const MAINT_CATS2= ['Maintenance','Repair','Tyres','Battery','Spare Parts','Breakdown','Washing'];
+const LEGAL_CATS2= ['Insurance','Pollution Certificate','Registration / Permit'];
+
+function monthlyExpType() { return sessionStorage.getItem(MONTHLY_FILTER_KEY) || 'all'; }
+window.setMonthlyExpType = function(t) { sessionStorage.setItem(MONTHLY_FILTER_KEY, t); render(); };
+
+function getMonthCols() {
+  // Returns array of {label:'Apr-25', yearMonth:'2025-04'} in FY or CY order
+  const isFY = S.filterMode === 'FY';
+  const fy = S.filterYear; // e.g. '2026' means FY2026 = Apr-25..Mar-26
+  if (isFY) {
+    const endY = parseInt(fy);
+    return [
+      {val:'04',l:'Apr'},{val:'05',l:'May'},{val:'06',l:'Jun'},
+      {val:'07',l:'Jul'},{val:'08',l:'Aug'},{val:'09',l:'Sep'},
+      {val:'10',l:'Oct'},{val:'11',l:'Nov'},{val:'12',l:'Dec'},
+      {val:'01',l:'Jan'},{val:'02',l:'Feb'},{val:'03',l:'Mar'},
+    ].map(m => {
+      const y = parseInt(m.val) >= 4 ? endY-1 : endY;
+      return { label: `${m.l}-${String(y).slice(2)}`, yearMonth: `${y}-${m.val}` };
+    });
+  } else {
+    return MONTHS.map(m => ({
+      label: `${m.label}-${String(S.filterYear).slice(2)}`,
+      yearMonth: `${S.filterYear}-${m.val}`,
+    }));
+  }
+}
+
+function matchesExpType(e, type) {
+  if (type === 'fuel')  return FUEL_CATS.includes(e.category);
+  if (type === 'maint') return MAINT_CATS2.includes(e.category);
+  if (type === 'legal') return LEGAL_CATS2.includes(e.category);
+  return true; // 'all'
+}
+
+function monthlyReportHTML() {
+  const allExps = myExpenses(); // unfiltered by month — we show all months as columns
+  const vehicles = myVehicles();
+  const expType  = monthlyExpType();
+  const monthCols= getMonthCols();
+  const isFY     = S.filterMode === 'FY';
+  const fy       = S.filterYear;
+
+  // Apply plant + vehicle + year/FY filters but NOT month (month is shown as columns)
+  const baseExps = allExps.filter(e => {
+    if (S.filterPlant && e.plantId !== S.filterPlant) return false;
+    if (S.filterVehicle && e.vehicleId !== S.filterVehicle) return false;
+    if (isFY) { if (!inFY(e.date, fy)) return false; }
+    else { if (!e.date.startsWith(fy)) return false; }
+    return matchesExpType(e, expType);
+  });
+
+  // Build vehicle rows
+  const filteredVehicles = (S.filterPlant ? vehicles.filter(v=>v.plantId===S.filterPlant) : vehicles)
+    .filter(v => S.filterVehicle ? v.id===S.filterVehicle : true);
+
+  const rows = filteredVehicles.map(v => {
+    const ve = baseExps.filter(e => e.vehicleId === v.id);
+    const monthAmts = monthCols.map(mc => ve.filter(e=>e.date.startsWith(mc.yearMonth)).reduce((s,e)=>s+e.amount,0));
+    const total = monthAmts.reduce((s,a)=>s+a,0);
+    const plant = S.plants.find(p=>p.id===v.plantId);
+    const life  = v.year ? new Date().getFullYear()-parseInt(v.year) : 0;
+    return {v, plant, monthAmts, total, life};
+  }).filter(r => r.total > 0);
+
+  // Column totals
+  const colTotals = monthCols.map((_,ci) => rows.reduce((s,r)=>s+r.monthAmts[ci],0));
+  const grandTotal = rows.reduce((s,r)=>s+r.total,0);
+
+  const yearLabel  = isFY ? `FY ${fy}` : fy;
+  const plantLabel = S.filterPlant ? ` · ${plantName(S.filterPlant)}` : '';
+  const vehLabel   = S.filterVehicle ? ` · ${vehicleReg(S.filterVehicle)}` : '';
+
+  const expTypeLabel = {all:'All Expenses',fuel:'Fuel Expenses',maint:'Maintenance Expenses',legal:'Legal Expenses'}[expType];
+
+  const typeBtn = (t,lbl) => `<button class="pill ${expType===t?'active':''}" style="${expType===t?'background:#1a56a0;color:#fff;border-color:#1a56a0':''}" onclick="setMonthlyExpType('${t}')">${lbl}</button>`;
+
+  // Group by plant for display
+  const byPlant = {};
+  rows.forEach(r => {
+    const loc = r.plant?.name || 'Unknown';
+    if (!byPlant[loc]) byPlant[loc] = [];
+    byPlant[loc].push(r);
+  });
+
+  // Zebra: alternate by plant group
+  let rowIdx = 0;
+
+  return `<div class="page">
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">📅 Monthly Expense Report</h1>
+        <p class="page-subtitle">Vehicle-wise month-on-month expense breakdown · ${yearLabel}${plantLabel}${vehLabel}</p>
+      </div>
+      <div class="page-actions">
+        <button class="btn btn-secondary" onclick="exportMonthlyPDF()">⬇ PDF</button>
+        <button class="btn btn-secondary" style="color:#16a34a;border-color:#16a34a" onclick="exportMonthlyExcel()">⬇ Excel</button>
+      </div>
+    </div>
+
+    ${reportFilterBarHTML()}
+
+    <!-- Expense type filter -->
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px;padding:10px 14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px">
+      <span style="font-size:11px;font-weight:600;color:#64748b;letter-spacing:.3px;white-space:nowrap">💰 EXPENSE TYPE</span>
+      ${typeBtn('all','All Expenses')}
+      ${typeBtn('fuel','⛽ Fuel')}
+      ${typeBtn('maint','🔧 Maintenance')}
+      ${typeBtn('legal','📄 Legal')}
+    </div>
+
+    <!-- KPI row -->
+    <div class="kpi-grid" style="margin-bottom:16px">
+      ${kpi('Vehicles',rows.length+'','With expenses','#1a56a0','🚗')}
+      ${kpi('Grand Total',fmtR(grandTotal),expTypeLabel,'#dc2626','💰')}
+      ${kpi('Active Months',monthCols.filter((_,i)=>colTotals[i]>0).length+'/'+monthCols.length,'Months with data','#7c3aed','📅')}
+      ${kpi('Avg / Month',grandTotal>0?fmtR(Math.round(grandTotal/Math.max(1,monthCols.filter((_,i)=>colTotals[i]>0).length))):'—','Per active month','#d97706','📊')}
+    </div>
+
+    <div class="card" style="overflow-x:auto">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+        <span>📅 ${expTypeLabel} — Month-wise Breakdown · ${yearLabel}</span>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-secondary btn-sm" onclick="exportMonthlyPDF()">⬇ PDF</button>
+          <button class="btn btn-secondary btn-sm" style="color:#16a34a;border-color:#16a34a" onclick="exportMonthlyExcel()">⬇ Excel</button>
+        </div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:11.5px;min-width:${220+monthCols.length*76}px">
+        <thead>
+          <tr style="background:#f1f5f9;color:#1e293b;border-bottom:2px solid #cbd5e1">
+            <th style="padding:8px 10px;text-align:left;white-space:nowrap;position:sticky;left:0;background:#f1f5f9;z-index:2">Location</th>
+            <th style="padding:8px 10px;text-align:left;white-space:nowrap">Vehicle No</th>
+            <th style="padding:8px 10px;text-align:left;white-space:nowrap">Vehicle Name</th>
+            <th style="padding:8px 10px;text-align:left;white-space:nowrap">Model Year</th>
+            <th style="padding:8px 10px;text-align:left;white-space:nowrap">Life (yr)</th>
+            <th style="padding:8px 10px;text-align:left;white-space:nowrap">Fuel Type</th>
+            <th style="padding:8px 10px;text-align:right;white-space:nowrap;background:#e0f2fe;color:#0369a1;font-weight:700">Total</th>
+            ${monthCols.map(mc=>`<th style="padding:8px 10px;text-align:right;white-space:nowrap">${mc.label}</th>`).join('')}
+          </tr>
+        </thead>
+        <tbody>
+          ${Object.entries(byPlant).map(([loc,pRows])=>{
+            return pRows.map((r,ri)=>{
+              const bg = (rowIdx++ % 2 === 0) ? '#f9fafb' : '#fff';
+              return `<tr style="background:${bg};border-bottom:1px solid #e5e7eb">
+                <td style="padding:7px 10px;font-weight:${ri===0?600:400};color:${ri===0?'#1a56a0':'#94a3b8'};white-space:nowrap;position:sticky;left:0;background:${bg};z-index:1">${ri===0?loc:''}</td>
+                <td style="padding:7px 10px;font-weight:600;white-space:nowrap">${r.v.regNo}</td>
+                <td style="padding:7px 10px;white-space:nowrap">${r.v.make} ${r.v.model}</td>
+                <td style="padding:7px 10px;white-space:nowrap">${r.v.year||'—'}</td>
+                <td style="padding:7px 10px;white-space:nowrap">${r.life>0?r.life+' yr':'—'}</td>
+                <td style="padding:7px 10px;white-space:nowrap">${r.v.fuel||'—'}</td>
+                <td style="padding:7px 10px;text-align:right;font-weight:700;color:#0369a1;background:#f0f9ff;white-space:nowrap">${fmtR(r.total)}</td>
+                ${r.monthAmts.map(a=>`<td style="padding:7px 10px;text-align:right;white-space:nowrap">${a>0?fmtR(a):'—'}</td>`).join('')}
+              </tr>`;
+            }).join('');
+          }).join('')}
+          <!-- Grand total row -->
+          <tr style="background:#1a56a0;color:#fff;font-weight:700">
+            <td style="padding:8px 10px;position:sticky;left:0;background:#1a56a0;z-index:1" colspan="6">Grand Total</td>
+            <td style="padding:8px 10px;text-align:right;background:#1565c0">${fmtR(grandTotal)}</td>
+            ${colTotals.map(t=>`<td style="padding:8px 10px;text-align:right;white-space:nowrap">${t>0?fmtR(t):'—'}</td>`).join('')}
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// ── MONTHLY PDF EXPORT ────────────────────────────────────────────
+window.exportMonthlyPDF = function() {
+  try {
+    const {jsPDF} = window.jspdf;
+    const doc = new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
+    const pageW = doc.internal.pageSize.getWidth();
+    const pageH = doc.internal.pageSize.getHeight();
+    const expType   = monthlyExpType();
+    const monthCols = getMonthCols();
+    const isFY      = S.filterMode === 'FY';
+    const fy        = S.filterYear;
+    const expTypeLabel = {all:'All Expenses',fuel:'Fuel Expenses',maint:'Maintenance Expenses',legal:'Legal Expenses'}[expType];
+    const yearLabel = isFY ? `FY ${fy}` : fy;
+    const plantLabel= S.filterPlant?' · '+plantName(S.filterPlant):'';
+    const vehLabel  = S.filterVehicle?' · '+vehicleReg(S.filterVehicle):'';
+
+    // Build data
+    const allExps   = myExpenses();
+    const vehicles  = myVehicles();
+    const baseExps  = allExps.filter(e=>{
+      if(S.filterPlant && e.plantId!==S.filterPlant) return false;
+      if(S.filterVehicle && e.vehicleId!==S.filterVehicle) return false;
+      if(isFY){if(!inFY(e.date,fy))return false;}
+      else{if(!e.date.startsWith(fy))return false;}
+      return matchesExpType(e,expType);
+    });
+    const filtVehs = (S.filterPlant?vehicles.filter(v=>v.plantId===S.filterPlant):vehicles)
+      .filter(v=>S.filterVehicle?v.id===S.filterVehicle:true);
+    const rows = filtVehs.map(v=>{
+      const ve = baseExps.filter(e=>e.vehicleId===v.id);
+      const monthAmts = monthCols.map(mc=>ve.filter(e=>e.date.startsWith(mc.yearMonth)).reduce((s,e)=>s+e.amount,0));
+      const total = monthAmts.reduce((s,a)=>s+a,0);
+      const plant = S.plants.find(p=>p.id===v.plantId);
+      const life  = v.year?new Date().getFullYear()-parseInt(v.year):0;
+      return{v,plant,monthAmts,total,life};
+    }).filter(r=>r.total>0);
+    const colTotals = monthCols.map((_,ci)=>rows.reduce((s,r)=>s+r.monthAmts[ci],0));
+    const grandTotal= rows.reduce((s,r)=>s+r.total,0);
+
+    // ── Cover page ──
+    doc.setFillColor(255,255,255); doc.rect(0,0,pageW,pageH,'F');
+    doc.setFillColor(15,23,36); doc.rect(0,0,pageW,6,'F');
+    const lbW=90,lbH=52,lbX=pageW/2-45,lbY=22;
+    doc.setFillColor(255,255,255); doc.setDrawColor(229,231,235); doc.setLineWidth(0.4);
+    doc.roundedRect(lbX,lbY,lbW,lbH,4,4,'FD');
+    pdfAddLogo(doc,pageW/2-28,lbY+6,56,40);
+    const lbBot=lbY+lbH+14;
+    doc.setDrawColor(26,86,160); doc.setLineWidth(0.6);
+    doc.line(pageW/2-40,lbBot-6,pageW/2+40,lbBot-6);
+    doc.setTextColor(15,23,36); doc.setFontSize(36); doc.setFont(undefined,'bold');
+    doc.text('VEMS',pageW/2,lbBot+4,{align:'center'});
+    doc.setFontSize(18); doc.setFont(undefined,'normal'); doc.setTextColor(26,86,160);
+    doc.text('Monthly Expense Report',pageW/2,lbBot+16,{align:'center'});
+    doc.setFontSize(11); doc.setTextColor(75,85,99);
+    doc.text(`${expTypeLabel} · ${yearLabel}${plantLabel}${vehLabel}`,pageW/2,lbBot+28,{align:'center'});
+    doc.setFontSize(8); doc.setTextColor(148,163,184);
+    doc.text(`Generated: ${new Date().toLocaleString('en-IN')}`,pageW/2,pageH-8,{align:'center'});
+    doc.setFillColor(15,23,36); doc.rect(0,pageH-4,pageW,4,'F');
+
+    // ── Data pages — split months into chunks (max 7 per page) ──
+    const CHUNK = 7;
+    for(let ci=0; ci<monthCols.length; ci+=CHUNK) {
+      const chunk = monthCols.slice(ci, ci+CHUNK);
+      const chunkTotals = chunk.map((_,i)=>colTotals[ci+i]);
+      doc.addPage();
+      pdfHdr(doc,pageW,`VEMS — Monthly ${expTypeLabel}`,`${yearLabel}${plantLabel}${vehLabel}   |   Generated: ${new Date().toLocaleString('en-IN')}`);
+      let y = 36;
+
+      // KPI row (only first chunk)
+      if(ci===0){
+        pdfKpiRow(doc,[
+          ['Vehicles',String(rows.length)],
+          ['Grand Total',pdfAmt(grandTotal)],
+          ['Active Months',String(monthCols.filter((_,i)=>colTotals[i]>0).length)+'/'+monthCols.length],
+          ['Expense Type',expTypeLabel],
+        ],y,pageW);
+        y+=22;
+      }
+
+      y = pdfSectionTitle(doc,`${expTypeLabel} · Months ${chunk[0].label} – ${chunk[chunk.length-1].label}`,y,pageW);
+
+      // Dynamic column widths
+      const fixedW = [24,18,22,10,10,16,18]; // Location,VehNo,Name,Yr,Life,Fuel,Total
+      const fixedTotal = fixedW.reduce((s,w)=>s+w,0);
+      const availW = pageW-28-fixedTotal;
+      const mw = Math.min(availW/chunk.length, 22);
+      const cols = ['Location','Veh No','Name','Yr','Life','Fuel','Total',...chunk.map(m=>m.label)];
+      const wds  = [...fixedW, ...chunk.map(()=>mw)];
+
+      doc.setFontSize(6); doc.setFont(undefined,'bold'); doc.setTextColor(31,41,55);
+      doc.setFillColor(241,245,249); doc.rect(14,y-4,pageW-28,7,'F');
+      doc.setDrawColor(203,213,225); doc.setLineWidth(0.3); doc.rect(14,y-4,pageW-28,7,'S');
+      let cx=14; cols.forEach((c,i)=>{
+        const align=i>=6?'right':'left';
+        doc.text(c, align==='right'?cx+wds[i]-1:cx, y, {align});
+        cx+=wds[i];
+      }); y+=6;
+
+      doc.setFont(undefined,'normal'); doc.setTextColor(31,41,55);
+      rows.forEach((r,ri)=>{
+        if(y>pageH-12){doc.addPage();pdfHdr(doc,pageW,`Monthly ${expTypeLabel} (cont.)`,'');y=36;}
+        if(ri%2===0){doc.setFillColor(249,250,251);doc.rect(14,y-4,pageW-28,7,'F');}
+        const chunkAmts=chunk.map((_,i)=>r.monthAmts[ci+i]);
+        const vals=[
+          (r.plant?.name||'').slice(0,9),r.v.regNo,(r.v.make+' '+r.v.model).slice(0,10),
+          String(r.v.year||''),r.life>0?r.life+'yr':'—',r.v.fuel||'',
+          pdfAmt(r.total),
+          ...chunkAmts.map(a=>a>0?pdfAmt(a):'—'),
+        ];
+        let vx=14; vals.forEach((v,i)=>{
+          doc.text(String(v),i>=6?vx+wds[i]-1:vx,y,{align:i>=6?'right':'left'});
+          vx+=wds[i];
+        }); y+=6;
+      });
+
+      // Total row
+      doc.setFillColor(26,86,160); doc.rect(14,y-4,pageW-28,7,'F');
+      doc.setTextColor(255,255,255); doc.setFont(undefined,'bold');
+      const totVals=['TOTAL','','','','','',pdfAmt(grandTotal),...chunkTotals.map(t=>t>0?pdfAmt(t):'—')];
+      let tx=14; totVals.forEach((v,i)=>{
+        doc.text(v,i>=6?tx+wds[i]-1:tx,y,{align:i>=6?'right':'left'});
+        tx+=wds[i];
+      });
+    }
+
+    doc.save(`VEMS_Monthly_${expType}_${yearLabel.replace(' ','_')}.pdf`);
+    showToast('Monthly PDF exported!','success');
+  } catch(err){ showToast('PDF export failed: '+err.message,'error'); console.error(err); }
+};
+
+// ── MONTHLY EXCEL EXPORT ─────────────────────────────────────────
+window.exportMonthlyExcel = function() {
+  try {
+    const expType   = monthlyExpType();
+    const monthCols = getMonthCols();
+    const isFY      = S.filterMode === 'FY';
+    const fy        = S.filterYear;
+    const expTypeLabel = {all:'All Expenses',fuel:'Fuel Expenses',maint:'Maintenance Expenses',legal:'Legal Expenses'}[expType];
+    const yearLabel = isFY ? `FY ${fy}` : fy;
+    const plantLabel= S.filterPlant?' · '+plantName(S.filterPlant):'';
+    const vehLabel  = S.filterVehicle?' · '+vehicleReg(S.filterVehicle):'';
+
+    const allExps   = myExpenses();
+    const vehicles  = myVehicles();
+    const baseExps  = allExps.filter(e=>{
+      if(S.filterPlant && e.plantId!==S.filterPlant) return false;
+      if(S.filterVehicle && e.vehicleId!==S.filterVehicle) return false;
+      if(isFY){if(!inFY(e.date,fy))return false;}
+      else{if(!e.date.startsWith(fy))return false;}
+      return matchesExpType(e,expType);
+    });
+    const filtVehs = (S.filterPlant?vehicles.filter(v=>v.plantId===S.filterPlant):vehicles)
+      .filter(v=>S.filterVehicle?v.id===S.filterVehicle:true);
+    const rows = filtVehs.map(v=>{
+      const ve = baseExps.filter(e=>e.vehicleId===v.id);
+      const monthAmts = monthCols.map(mc=>ve.filter(e=>e.date.startsWith(mc.yearMonth)).reduce((s,e)=>s+e.amount,0));
+      const total = monthAmts.reduce((s,a)=>s+a,0);
+      const plant = S.plants.find(p=>p.id===v.plantId);
+      const life  = v.year?new Date().getFullYear()-parseInt(v.year):0;
+      return{v,plant,monthAmts,total,life};
+    }).filter(r=>r.total>0);
+    const colTotals = monthCols.map((_,ci)=>rows.reduce((s,r)=>s+r.monthAmts[ci],0));
+    const grandTotal= rows.reduce((s,r)=>s+r.total,0);
+
+    const WB = XLSX.utils.book_new();
+    const sheetData = [
+      [`VEMS — Monthly ${expTypeLabel}`],
+      [`Period: ${yearLabel}${plantLabel}${vehLabel}`],
+      [`Generated: ${new Date().toLocaleString('en-IN')}`],
+      [],
+      ['Location','Vehicle No','Vehicle Name','Model Year','Life (yr)','Fuel Type','Total (₹)',...monthCols.map(m=>m.label)],
+    ];
+    rows.forEach(r=>{
+      sheetData.push([
+        r.plant?.name||'', r.v.regNo, r.v.make+' '+r.v.model,
+        r.v.year||'', r.life>0?r.life:'', r.v.fuel||'',
+        r.total, ...r.monthAmts.map(a=>a||0),
+      ]);
+    });
+    sheetData.push(['Grand Total','','','','','',grandTotal,...colTotals]);
+
+    const ws = XLSX.utils.aoa_to_sheet(sheetData);
+    ws['!cols']=[{wch:20},{wch:14},{wch:22},{wch:10},{wch:10},{wch:16},{wch:14},...monthCols.map(()=>({wch:12}))];
+    XLSX.utils.book_append_sheet(WB,ws,'Monthly Expenses');
+
+    // One sheet per expense type breakdown (only if 'all')
+    if(expType==='all'){
+      ['fuel','maint','legal'].forEach(t=>{
+        const tLabel={fuel:'Fuel',maint:'Maintenance',legal:'Legal'}[t];
+        const tExps = allExps.filter(e=>{
+          if(S.filterPlant && e.plantId!==S.filterPlant) return false;
+          if(S.filterVehicle && e.vehicleId!==S.filterVehicle) return false;
+          if(isFY){if(!inFY(e.date,fy))return false;}
+          else{if(!e.date.startsWith(fy))return false;}
+          return matchesExpType(e,t);
+        });
+        const tRows = filtVehs.map(v=>{
+          const ve=tExps.filter(e=>e.vehicleId===v.id);
+          const ma=monthCols.map(mc=>ve.filter(e=>e.date.startsWith(mc.yearMonth)).reduce((s,e)=>s+e.amount,0));
+          return{v,plant:S.plants.find(p=>p.id===v.plantId),ma,total:ma.reduce((s,a)=>s+a,0)};
+        }).filter(r=>r.total>0);
+        if(!tRows.length) return;
+        const tSheet=[
+          [`${tLabel} Expenses`],[],
+          ['Location','Vehicle No','Vehicle Name','Total (₹)',...monthCols.map(m=>m.label)],
+          ...tRows.map(r=>[r.plant?.name||'',r.v.regNo,r.v.make+' '+r.v.model,r.total,...r.ma]),
+          ['Grand Total','','',tRows.reduce((s,r)=>s+r.total,0),...monthCols.map((_,ci)=>tRows.reduce((s,r)=>s+r.ma[ci],0))],
+        ];
+        const tw=XLSX.utils.aoa_to_sheet(tSheet);
+        tw['!cols']=[{wch:20},{wch:14},{wch:22},{wch:14},...monthCols.map(()=>({wch:12}))];
+        XLSX.utils.book_append_sheet(WB,tw,tLabel);
+      });
+    }
+
+    XLSX.writeFile(WB,`VEMS_Monthly_${expType}_${yearLabel.replace(' ','_')}.xlsx`);
+    showToast('Monthly Excel exported!','success');
+  } catch(err){ showToast('Excel export failed: '+err.message,'error'); console.error(err); }
 };
 
 function downloadCSV(rows, filename) {
