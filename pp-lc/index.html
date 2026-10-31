@@ -1433,8 +1433,56 @@ await sendPerUserReminderEmails({requirements,plants,users,cfg,cloudUrl,cloudSec
    ═══════════════════════════════════════════════════════════════════════ */async function sendPerUserReminderEmails({requirements,plants,users,cfg,cloudUrl,cloudSecret,portalLink,sentDate,fmtDate,daysLeft,forDigest=false}){try{if(!cloudUrl||!cloudSecret){console.warn('⚠️ Per-user reminders: cloud function not configured.');return;}// Build a map: userId → { user, reminders[], overdues[] }
 // forDigest=true → include ALL non-completed requirements (no frequency/lead-day filter)
 // forDigest=false (default) → only include requirements matching shouldSendReminderToday()
-const userMap={};requirements.forEach(req=>{if(req.status==='Completed')return;const assignedIds=Array.isArray(req.assignedTo)?req.assignedTo:req.assignedTo?[req.assignedTo]:[];if(!assignedIds.length)return;const isOverdue=isEffectivelyOverdue(req);const isReminder=forDigest?!isOverdue:(!isOverdue&&shouldSendReminderToday(req));if(!isOverdue&&!isReminder)return;assignedIds.forEach(uid=>{if(!userMap[uid])userMap[uid]={reminders:[],overdues:[]};if(isOverdue)userMap[uid].overdues.push(req);else userMap[uid].reminders.push(req);});});// Send one cloud-function call per user
-for(const[uid,{reminders,overdues}]of Object.entries(userMap)){const user=users.find(u=>u.id===uid);if(!user?.email)continue;if(!reminders.length&&!overdues.length)continue;const subject=`[LegalComp] Your Compliance Reminders — ${new Date().toLocaleDateString('en-IN',{weekday:'long',day:'2-digit',month:'short',year:'numeric'})}`;const mapReq=r=>{const p=plants.find(pl=>pl.id===r.plantId);const dl=daysLeft(r.dueDate);return{title:r.title,plantName:p?.name||'—',priority:r.priority,dueDate:fmtDate(r.dueDate),daysLeft:dl,reminderFrequency:r.reminderFrequency||'—',reminderLeadDays:r.reminderLeadDays||30};};try{const res=await fetch(cloudUrl,{method:'POST',headers:{'Content-Type':'application/json','x-internal-secret':cloudSecret},body:JSON.stringify({type:'per_user_reminder',toEmail:user.email,userName:user.name||user.email,subject,overdues:overdues.map(mapReq),reminders:reminders.map(mapReq),portalLink,sentDate,smtpProvider:cfg.smtpProvider||'gmail',gmailFromName:cfg.gmailFromName||'Polyplastics Legal Compliance'})});const data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);console.log(`✅ [Cloud/Gmail] Per-user reminder → ${user.email}`);}catch(e){console.warn(`⚠️ Per-user reminder cloud error for ${user.email}:`,e?.message||e);}}console.log(`📨 Per-user reminders sent to ${Object.keys(userMap).length} user(s).`);}catch(e){console.warn('⚠️ sendPerUserReminderEmails error:',e?.message||e);}}/**
+// ── Build per-user requirement map (forDigest → 5 buckets; else → 2 buckets) ─
+const userMap={};
+requirements.forEach(req=>{
+  if(req.status==='Completed')return;
+  const assignedIds=Array.isArray(req.assignedTo)?req.assignedTo:req.assignedTo?[req.assignedTo]:[];
+  if(!assignedIds.length)return;
+  if(forDigest){
+    // 5-bucket categorisation for digest (all non-completed, no frequency filter)
+    const dl=req.dueDate?Math.ceil((new Date(req.dueDate)-Date.now())/86400000):null;
+    const bucket=dl===null||dl<0?'overdue':dl<=15?'within15':dl<=30?'within30':dl<=60?'within60':'beyond60';
+    assignedIds.forEach(uid=>{
+      if(!userMap[uid])userMap[uid]={overdue:[],within15:[],within30:[],within60:[],beyond60:[]};
+      userMap[uid][bucket].push(req);
+    });
+  }else{
+    // Standard 2-bucket: overdue vs upcoming (frequency-filtered)
+    const isOverdue=isEffectivelyOverdue(req);
+    const isReminder=!isOverdue&&shouldSendReminderToday(req);
+    if(!isOverdue&&!isReminder)return;
+    assignedIds.forEach(uid=>{
+      if(!userMap[uid])userMap[uid]={reminders:[],overdues:[]};
+      if(isOverdue)userMap[uid].overdues.push(req);else userMap[uid].reminders.push(req);
+    });
+  }
+});
+// ── Send one cloud-function call per user ─────────────────────────────────
+const mapReq=r=>{const p=plants.find(pl=>pl.id===r.plantId);const dl=daysLeft(r.dueDate);return{title:r.title,plantName:p?.name||'—',priority:r.priority,dueDate:fmtDate(r.dueDate),daysLeft:dl,reminderFrequency:r.reminderFrequency||'—',reminderLeadDays:r.reminderLeadDays||30};};
+for(const[uid,data]of Object.entries(userMap)){
+  const user=users.find(u=>u.id===uid);if(!user?.email)continue;
+  try{
+    let body;
+    if(forDigest){
+      // 5-bucket digest payload → type: per_user_digest
+      const cats={overdue:(data.overdue||[]).map(mapReq),within15:(data.within15||[]).map(mapReq),within30:(data.within30||[]).map(mapReq),within60:(data.within60||[]).map(mapReq),beyond60:(data.beyond60||[]).map(mapReq)};
+      const totalItems=Object.values(cats).reduce((s,a)=>s+a.length,0);if(!totalItems)continue;
+      const subject=`[LegalComp] Your Daily Compliance Digest — ${new Date().toLocaleDateString('en-IN',{weekday:'long',day:'2-digit',month:'short',year:'numeric'})}`;
+      body=JSON.stringify({type:'per_user_digest',toEmail:user.email,userName:user.name||user.email,subject,cats,portalLink,sentDate,smtpProvider:cfg.smtpProvider||'gmail',gmailFromName:cfg.gmailFromName||'Polyplastics Legal Compliance'});
+    }else{
+      // Standard 2-bucket reminder payload → type: per_user_reminder
+      const{overdues=[],reminders=[]}=data;if(!overdues.length&&!reminders.length)continue;
+      const subject=`[LegalComp] Your Compliance Reminders — ${new Date().toLocaleDateString('en-IN',{weekday:'long',day:'2-digit',month:'short',year:'numeric'})}`;
+      body=JSON.stringify({type:'per_user_reminder',toEmail:user.email,userName:user.name||user.email,subject,overdues:overdues.map(mapReq),reminders:reminders.map(mapReq),portalLink,sentDate,smtpProvider:cfg.smtpProvider||'gmail',gmailFromName:cfg.gmailFromName||'Polyplastics Legal Compliance'});
+    }
+    const res=await fetch(cloudUrl,{method:'POST',headers:{'Content-Type':'application/json','x-internal-secret':cloudSecret},body});
+    const resData=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(resData.error||`HTTP ${res.status}`);
+    console.log(`✅ [Cloud] ${forDigest?'Digest':'Reminder'} → ${user.email}`);
+  }catch(e){console.warn(`⚠️ Per-user ${forDigest?'digest':'reminder'} error for ${user.email}:`,e?.message||e);}
+}
+console.log(`📨 Per-user ${forDigest?'digest':'reminders'} sent to ${Object.keys(userMap).length} user(s).`);}catch(e){console.warn('⚠️ sendPerUserReminderEmails error:',e?.message||e);}}/**
  * useDailyDigestScheduler – React hook (v35: Cloud-aware).
  *
  * PRIMARY path  → Firebase Cloud Function (Office 365 SMTP via Nodemailer).
