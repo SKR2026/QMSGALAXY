@@ -2480,9 +2480,102 @@ function goPage(p) {
 // ── DASHBOARD ────────────────────────────────────────────────
 var _dashActivePlant = ''; // '' = All Plants
 var _dashActiveExam  = ''; // '' = All Exams
+var _dashActiveYear  = ''; // '' = All Years
+var _dashActiveMonth = ''; // '' = All Months  (format: '0'..'11')
+var _resActiveYear   = ''; // '' = All Years (Results page)
+var _resActiveMonth  = ''; // '' = All Months (Results page)
+
+/* ── Year / Month pill helpers ───────────────────────────────── */
+var MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+/** Extract {year, month} from a Firestore Timestamp or Date. Returns null if invalid. */
+function _attDate(a) {
+  try {
+    var ts = a.submittedAt || a.startedAt;
+    if (!ts) return null;
+    var d = ts.toDate ? ts.toDate() : new Date(ts);
+    return { year: d.getFullYear(), month: d.getMonth() }; // month 0-11
+  } catch(e){ return null; }
+}
+
+/**
+ * Build HTML for year + month pill rows given a list of attempts.
+ * @param {Array}  atts        - filtered attempts (plant/exam already applied)
+ * @param {string} activeYear  - currently selected year string or ''
+ * @param {string} activeMonth - currently selected month string ('0'..'11') or ''
+ * @param {string} setYrFn     - JS expression called with (year) to set year, e.g. 'dashSetYear'
+ * @param {string} setMoFn     - JS expression called with (month) to set month, e.g. 'dashSetMonth'
+ */
+function buildYearMonthPills(atts, activeYear, activeMonth, setYrFn, setMoFn) {
+  // Collect unique years from ALL attempts (not yet year-filtered)
+  var yearSet = {};
+  atts.forEach(function(a){ var d=_attDate(a); if(d) yearSet[d.year]=true; });
+  var years = Object.keys(yearSet).map(Number).sort(function(a,b){return b-a;}); // newest first
+  if (!years.length) return '';
+
+  // Year pills
+  var yrPills =
+    '<button class="dash-plant-tab'+(activeYear===''?' dash-plant-tab-act':'')+'" '+
+      'onclick="'+setYrFn+'(\'\')">All Years</button>';
+  years.forEach(function(y){
+    yrPills +=
+      '<button class="dash-plant-tab'+(activeYear===String(y)?' dash-plant-tab-act':'')+'" '+
+        'onclick="'+setYrFn+'(\''+y+'\')">'+y+'</button>';
+  });
+
+  // Month pills — only show months that exist in the selected year (or all years if none selected)
+  var moSet = {};
+  atts.forEach(function(a){
+    var d=_attDate(a); if(!d) return;
+    if (activeYear && String(d.year)!==activeYear) return;
+    moSet[d.month]=true;
+  });
+  var months = Object.keys(moSet).map(Number).sort(function(a,b){return a-b;});
+
+  var moPills = '';
+  if (months.length > 1) { // only show month row if there's more than one month
+    moPills =
+      '<button class="dash-plant-tab'+(activeMonth===''?' dash-plant-tab-act':'')+'" '+
+        'onclick="'+setMoFn+'(\'\')">All Months</button>';
+    months.forEach(function(m){
+      moPills +=
+        '<button class="dash-plant-tab'+(activeMonth===String(m)?' dash-plant-tab-act':'')+'" '+
+          'onclick="'+setMoFn+'(\''+m+'\')">'+MONTH_NAMES[m]+'</button>';
+    });
+  }
+
+  return (
+    '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">'+
+      '<span style="font-size:10px;font-weight:700;color:var(--tx3);text-transform:uppercase;letter-spacing:.6px;white-space:nowrap;flex-shrink:0">📅 Year</span>'+
+      yrPills+
+    '</div>'+
+    (moPills
+      ? '<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap">'+
+          '<span style="font-size:10px;font-weight:700;color:var(--tx3);text-transform:uppercase;letter-spacing:.6px;white-space:nowrap;flex-shrink:0">🗓 Month</span>'+
+          moPills+
+        '</div>'
+      : '<div style="margin-bottom:8px"></div>')
+  );
+}
+
+/** Filter attempts by active year/month state variables */
+function filterAttsByYearMonth(atts, year, month) {
+  return atts.filter(function(a){
+    var d = _attDate(a);
+    if (!d) return year==='' && month===''; // keep if no filter
+    if (year  && String(d.year)  !== year)  return false;
+    if (month !== '' && String(d.month) !== month) return false;
+    return true;
+  });
+}
 
 function pgDash(plantFilter) {
-  if (plantFilter !== undefined) _dashActivePlant = plantFilter;
+  if (plantFilter !== undefined) {
+    _dashActivePlant = plantFilter;
+    // Changing plant resets year/month selection
+    _dashActiveYear  = '';
+    _dashActiveMonth = '';
+  }
   setHtml('vPgCnt', loading());
   Promise.all([
     DB().collection('questions').where('isActive','==',true).get(),
@@ -2581,6 +2674,15 @@ function pgDash(plantFilter) {
     if (_dashActiveExam) {
       atts = atts.filter(function(a){ return a.examId === _dashActiveExam; });
     }
+
+    // ── Year / Month pills ────────────────────────────────────
+    // Build pills from exam-filtered (but NOT yet year/month-filtered) attempts
+    // so user can see all available years/months for the current exam
+    var ymPillsHtml = buildYearMonthPills(atts, _dashActiveYear, _dashActiveMonth, 'dashSetYear', 'dashSetMonth');
+
+    // ── Filter by selected year / month ───────────────────────
+    atts = filterAttsByYearMonth(atts, _dashActiveYear, _dashActiveMonth);
+
     var pass=atts.filter(function(a){return a.result==='pass';}).length;
     var fail=atts.length-pass;
     var pr=atts.length?Math.round(pass/atts.length*100):0;
@@ -2693,6 +2795,9 @@ function pgDash(plantFilter) {
       // ── Exam search ──
       examSearchHtml+
 
+      // ── Year / Month pills ──
+      ymPillsHtml+
+
       // ── Stat strip ──
       '<div class="sg" style="grid-template-columns:repeat(6,1fr)">'+
         sc('Questions','color:var(--bl)',qS.size,Object.keys(depts).length+' depts')+
@@ -2765,10 +2870,24 @@ function dashExamSearchInput(val) {
 
 function dashSetExam(id) {
   _dashActiveExam = id || '';
+  // Changing exam resets year/month selection
+  _dashActiveYear  = '';
+  _dashActiveMonth = '';
   // Close dropdown
   var dd = G('dashExamDropdown');
   if (dd) dd.classList.add('h');
   // Re-render dashboard (preserve plant filter)
+  pgDash();
+}
+
+function dashSetYear(yr) {
+  _dashActiveYear  = yr || '';
+  _dashActiveMonth = ''; // reset month when year changes
+  pgDash();
+}
+
+function dashSetMonth(mo) {
+  _dashActiveMonth = mo !== undefined ? String(mo) : '';
   pgDash();
 }
 
@@ -4605,6 +4724,9 @@ function saveOrphanFixes() {
 
 // ── RESULTS ───────────────────────────────────────────────────
 function pgResults() {
+  // Reset year/month filter on each fresh load of Results page
+  _resActiveYear  = '';
+  _resActiveMonth = '';
   var pubStatus = myPlantPublished();
   var pubLabel = pubStatus ? '\uD83D\uDD12 Unpublish' : '\uD83D\uDE80 Publish Results';
   if (!isSuperAdmin()) pubLabel += ' (' + CURRENT_USER.plant + ')';
@@ -4685,8 +4807,15 @@ function pgResults() {
     examNames.sort(function(a,b){return (a.name||'').localeCompare(b.name||'');});
     var examFilterOpts = '<option value="">All Exams</option>' + examNames.map(function(e){return '<option value="'+esc(e.id)+'">'+esc(e.name)+'</option>';}).join('');
 
+    // Store all atts for year/month pill generation (before year/month filter)
+    window._raAll = atts; // full set (pre-year/month filter)
+
+    // Build year/month pills for Results (uses all atts, exam filter applied above via rApplyFilters)
+    var resYmPills = buildYearMonthPills(atts, _resActiveYear, _resActiveMonth, 'resSetYear', 'resSetMonth');
+
     // Tab bar
     var tabBar=
+      '<div id="resYmPillsWrap" style="background:var(--bg3);border:1px solid var(--bd);border-radius:10px;padding:10px 14px;margin-bottom:12px'+(resYmPills?'':';display:none')+'">'+resYmPills+'</div>'+
       '<div style="display:flex;gap:0;border-bottom:2px solid var(--bd);margin-bottom:20px;align-items:flex-end;flex-wrap:wrap">'+
         '<button id="rtab-overview" class="rtab rtab-act" onclick="rSwitchTab(\'overview\')">\uD83D\uDCCA Responses Overview</button>'+
         '<button id="rtab-detailed" class="rtab" onclick="rSwitchTab(\'detailed\')">\uD83D\uDCCB Detailed Results</button>'+
@@ -4789,7 +4918,19 @@ function rApplyFilters() {
   var cands = window._rc || {};
   var qStats = window._rq || {};
 
-  var filtered = examId ? atts.filter(function(a){ return a.examId === examId; }) : atts;
+  // Apply exam filter first
+  var afterExam = examId ? atts.filter(function(a){ return a.examId === examId; }) : atts;
+
+  // Update year/month pills to reflect the exam-scoped set
+  var ymWrap = document.getElementById('resYmPillsWrap');
+  if (ymWrap) {
+    var newPills = buildYearMonthPills(afterExam, _resActiveYear, _resActiveMonth, 'resSetYear', 'resSetMonth');
+    ymWrap.innerHTML = newPills;
+    ymWrap.style.display = newPills ? '' : 'none';
+  }
+
+  // Apply year/month filter
+  var filtered = filterAttsByYearMonth(afterExam, _resActiveYear, _resActiveMonth);
 
   var pass = filtered.filter(function(a){return a.result==='pass';}).length;
   var avg = filtered.length ? (filtered.reduce(function(s,a){return s+(a.percentage||0);},0)/filtered.length).toFixed(1) : 0;
@@ -4810,6 +4951,17 @@ function rApplyFilters() {
   var pd = document.getElementById('rpanel-detailed');
   if (po) po.innerHTML = buildOverview(filtered,pass,avg,avgTime,deptMap,plantMap,qStats);
   if (pd) pd.innerHTML = buildDetailedResults(filtered,exams,cands);
+}
+
+function resSetYear(yr) {
+  _resActiveYear  = yr || '';
+  _resActiveMonth = ''; // reset month when year changes
+  rApplyFilters();
+}
+
+function resSetMonth(mo) {
+  _resActiveMonth = mo !== undefined ? String(mo) : '';
+  rApplyFilters();
 }
 
 function buildOverview(atts,pass,avg,avgTime,deptMap,plantMap,qStats) {
