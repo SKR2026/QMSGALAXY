@@ -2901,7 +2901,28 @@ async function loadFromFirestore() {
     const i = (DB.incidents || []).filter(e => !e.id || !e.title);
     i.length && (console.warn(`[IncidentPro] Purging ${i.length} blank/ghost incident(s) from Firestore`), i.forEach(e => {
       e.id && _fsDeleteIncident(e.id)
-    }), DB.incidents = DB.incidents.filter(e => e.id && e.title)), _saveLocalCache(), _fsLoaded = !0, console.log(`[IncidentPro] Loaded ${DB.incidents.length} incidents, ${DB.users.length} users`)
+    }), DB.incidents = DB.incidents.filter(e => e.id && e.title));
+    // ── Dedup: same incidentNo → keep oldest record, delete the rest from Firestore
+    (function _deduplicateIncidentNos() {
+      const seenNo = new Map(); // incidentNo → earliest incident
+      DB.incidents
+        .slice()
+        .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0))
+        .forEach(inc => {
+          const key = String(inc.incidentNo || "").trim().toUpperCase();
+          if (!key) return;
+          if (!seenNo.has(key)) { seenNo.set(key, inc); return; }
+          // Duplicate found — delete the later one from Firestore and memory
+          console.warn(`[IncidentPro] Duplicate incidentNo ${key} detected (id=${inc.id}); auto-deleting duplicate`);
+          _fsDeleteIncident(inc.id);
+        });
+      const keepIds = new Set(Array.from(seenNo.values()).map(x => x.id));
+      const before = DB.incidents.length;
+      DB.incidents = DB.incidents.filter(x => keepIds.has(x.id) || !seenNo.has(String(x.incidentNo || "").trim().toUpperCase()));
+      if (DB.incidents.length < before)
+        console.warn(`[IncidentPro] Removed ${before - DB.incidents.length} duplicate incident(s)`);
+    })();
+    _saveLocalCache(), _fsLoaded = !0, console.log(`[IncidentPro] Loaded ${DB.incidents.length} incidents, ${DB.users.length} users`)
   } catch (e) {
     console.error("[IncidentPro] Firestore load error (using local cache):", e)
   } finally {
@@ -2934,7 +2955,29 @@ function startRealtimeSync() {
           if (delete t._t, "removed" === e.type) DB.incidents = DB.incidents.filter(e => e.id !== t.id);
           else if (t.id && t.title) {
             const e = DB.incidents.findIndex(e => e.id === t.id);
-            e >= 0 ? DB.incidents[e] = t : DB.incidents.unshift(t)
+            if (e >= 0) {
+              DB.incidents[e] = t;
+            } else {
+              // Before inserting, check for a duplicate incidentNo already in memory
+              const _dupIdx = DB.incidents.findIndex(x =>
+                x.id !== t.id &&
+                String(x.incidentNo || "").trim().toUpperCase() === String(t.incidentNo || "").trim().toUpperCase()
+              );
+              if (_dupIdx >= 0) {
+                const _existing = DB.incidents[_dupIdx];
+                // Keep the older record; delete the newer one from Firestore
+                if (new Date(t.createdAt || 0) > new Date(_existing.createdAt || 0)) {
+                  console.warn(`[IncidentPro] Realtime: duplicate incidentNo ${t.incidentNo} rejected (keeping id=${_existing.id})`);
+                  _fsDeleteIncident(t.id);
+                } else {
+                  console.warn(`[IncidentPro] Realtime: duplicate incidentNo ${t.incidentNo} — replacing older id=${_existing.id}`);
+                  _fsDeleteIncident(_existing.id);
+                  DB.incidents[_dupIdx] = t;
+                }
+              } else {
+                DB.incidents.unshift(t);
+              }
+            }
           }
           DB.incidents.sort((e, t) => new Date(t.createdAt) - new Date(e.createdAt)), n = !0
         }
@@ -4725,9 +4768,12 @@ async function saveIncident(e) {
           (o !== f && ["major", "minor"].includes(o) || !0 === s && !0 !== b && !o) && notifyIncidentCreated(v), saveDB(), document.getElementById('ifc-panel')?.remove();
           closeModal(), showToast("Incident updated.", "ok"), openIncident(e)
         } else {
-          const e=nextIncidentNumber(),
-            v = uid(),
-            f = {
+          const v = uid(),
+            _photos = await uploadPhotosToStorage(v);
+          // ── Assign INC number and tracking number as late as possible (just
+          //    before unshift) so concurrent submissions can't grab the same number.
+          const e = nextIncidentNumber();
+          const f = {
               id: v,
               incidentNo: e,
               trackingNo: generateTrackingNumber(),
@@ -4770,7 +4816,7 @@ async function saveIncident(e) {
               incidentDt: g,
               loggingDt: _loggingDt,
               status: "open",
-              photos: await uploadPhotosToStorage(v),
+              photos: _photos,
               createdAt: now(),
               updatedAt: now(),
               updates: [],
@@ -4917,13 +4963,15 @@ async function submitPublicHazard() {
   if (_phLabel) _phLabel.textContent = "Preparing submission…";
 
   const reporter = publicSession.name + (publicSession.dept ? ` (${publicSession.dept})` : "");
-  const incNo = nextIncidentNumber();
-  const trackingNo = generateTrackingNumber();
   const incId = uid();
 
   if (_phFill) _phFill.style.width = "25%";
   if (_phLabel) _phLabel.textContent = _pendingPhotos.length ? `Uploading ${_pendingPhotos.length} photo(s)…` : "Saving report…";
   const photos = await uploadPhotosToStorage(incId);
+  // ── Assign INC number and tracking number as late as possible (just before
+  //    unshift) so a concurrent submission cannot grab the same number.
+  const incNo = nextIncidentNumber();
+  const trackingNo = generateTrackingNumber();
   if (_phFill) _phFill.style.width = "80%";
   if (_phLabel) _phLabel.textContent = "Saving to database…";
 
@@ -5000,6 +5048,11 @@ async function submitPublicHazard() {
 
 
 async function submitPublicIncident() {
+  // ── Double-submit guard ──────────────────────────────────────────────────
+  const _piBtn = document.querySelector('#pub-view button.btn.bp[onclick*="submitPublicIncident"]');
+  if (_piBtn && _piBtn.disabled) return;
+  if (_piBtn) { _piBtn.disabled = true; _piBtn.style.opacity = "0.6"; _piBtn.textContent = "Submitting…"; }
+  // ────────────────────────────────────────────────────────────────────────
   const e = document.getElementById("pf-title").value.trim(),
     _rawPfType = document.getElementById("pf-type").value,
     _pfTypeOther = document.getElementById("pf-type-other")?.value.trim() || "",
@@ -5014,19 +5067,23 @@ async function submitPublicIncident() {
     r="yes" === document.querySelector('input[name="pf-accident"]:checked')?.value,
     _pfAccType = r ? (document.querySelector('[name="pf-acc-type"]:checked')?.value || "factory") : "factory",
     _pubLoggingDt = document.getElementById("pf-log-dt")?.value || now();
-  if (!e) return void showToast("Please enter a title.", "warn");
-  if (!publicSession?.plantId || !(DB.plants || []).some(p => p.id === publicSession.plantId))
+  if (!e) { if(_piBtn){_piBtn.disabled=false;_piBtn.style.opacity="";_piBtn.textContent="Submit Incident Report →";} return void showToast("Please enter a title.", "warn"); }
+  if (!publicSession?.plantId || !(DB.plants || []).some(p => p.id === publicSession.plantId)) {
+    if(_piBtn){_piBtn.disabled=false;_piBtn.style.opacity="";_piBtn.textContent="Submit Incident Report →";}
     return void showToast("Session error: plant not identified. Please log out and try again.", "warn");
+  }
   const c = document.getElementById("pf-dt")?.value;
-  if (c && new Date(c) > new Date()) return void showToast("Incident date cannot be in the future.", "warn");
-  if (!s) return void showToast("Please describe the incident.", "warn");
+  if (c && new Date(c) > new Date()) { if(_piBtn){_piBtn.disabled=false;_piBtn.style.opacity="";_piBtn.textContent="Submit Incident Report →";} return void showToast("Incident date cannot be in the future.", "warn"); }
+  if (!s) { if(_piBtn){_piBtn.disabled=false;_piBtn.style.opacity="";_piBtn.textContent="Submit Incident Report →";} return void showToast("Please describe the incident.", "warn"); }
+  const u = publicSession.name + (publicSession.dept ? ` (${publicSession.dept})` : ""),
+    m = uid(),
+    g = await uploadPhotosToStorage(m);
+  // ── Assign INC number and tracking number as late as possible (just before
+  //    unshift) so a concurrent submission cannot grab the same number.
   const _pubSerialNo = DB.incidents.reduce((mx, inc) => Math.max(mx, Number(inc.serialNo) || 0), 0) + 1;
   const p = nextIncidentNumber(),
     _pubTrackingNo = generateTrackingNumber();
-  const u = publicSession.name + (publicSession.dept ? ` (${publicSession.dept})` : ""),
-    m = uid(),
-    g = await uploadPhotosToStorage(m),
-    v = {
+  const v = {
       id: m,
       serialNo: _pubSerialNo,
       incidentNo: p,
