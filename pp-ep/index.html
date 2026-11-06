@@ -7242,8 +7242,43 @@ function doEntry() {
   }
   var btn = G('vEntBtn'); if (btn) { btn.disabled=true; btn.textContent='Starting…'; }
   hide('vEntErr');
-  DB().collection('attempts').where('examId','==',S.exam.id).get()
-    .then(function(aSnap){
+  // ── Monthly restriction: fetch all completed attempts for this employee ──
+  Promise.all([
+    DB().collection('attempts').where('examId','==',S.exam.id).get(),
+    DB().collection('attempts').where('employeeCode','==',ec).where('status','==','completed').get()
+  ]).then(function(results){
+    var aSnap = results[0], allEmpSnap = results[1];
+
+    // Check if the employee already completed ANY exam this calendar month
+    var now = new Date();
+    var curYear = now.getFullYear(), curMonth = now.getMonth();
+    var monthlyAtt = null;
+    allEmpSnap.docs.forEach(function(d){
+      var dat = d.data();
+      var ts = dat.submittedAt;
+      if (!ts) return;
+      var dt = ts.toDate ? ts.toDate() : new Date(ts);
+      if (dt.getFullYear()===curYear && dt.getMonth()===curMonth) {
+        monthlyAtt = Object.assign({id:d.id}, dat);
+      }
+    });
+    if (monthlyAtt) {
+      var moName = MONTH_NAMES[curMonth];
+      setHtml('vEntBd',
+        '<div style="background:var(--ambg);border:1px solid var(--ambd);border-radius:9px;padding:20px;text-align:center">'+
+          '<div style="font-size:32px;margin-bottom:8px">🗓️</div>'+
+          '<div style="font-size:15px;font-weight:700;color:var(--am)">Monthly Limit Reached</div>'+
+          '<div style="font-size:13px;color:var(--tx2);margin-top:8px;line-height:1.65">'+
+            'You have already completed an exam in <strong>'+moName+' '+curYear+'</strong>.<br>'+
+            'Only one exam attempt is allowed per calendar month.<br>'+
+            'Please check back next month or contact your administrator.'+
+          '</div>'+
+        '</div>'
+      );
+      if (btn) { btn.disabled=false; btn.textContent='📝 Start Exam →'; }
+      return;
+    }
+
       var matchDoc = null;
       aSnap.docs.forEach(function(d){
         var storedCode = (d.data().employeeCode||'').toUpperCase().trim();
@@ -7294,11 +7329,10 @@ function doEntry() {
           if (btn) { btn.disabled=false; btn.textContent='📝 Start Exam →'; }
         });
       }
-    })
-    .catch(function(e){
-      showEntErr('Error: '+e.message);
-      if (btn) { btn.disabled=false; btn.textContent='📝 Start Exam →'; }
-    });
+  }).catch(function(e){
+    showEntErr('Error: '+e.message);
+    if (btn) { btn.disabled=false; btn.textContent='📝 Start Exam →'; }
+  });
 }
 
 function createAttempt(allQs,exam,ec,en,ed,ep){
@@ -7772,6 +7806,9 @@ function fetchEmployeeResult() {
   var errEl = document.getElementById('rpErr');
   if(errEl){ errEl.classList.remove('show'); }
   hide('rpPersonal');
+  // Reset year/month filter on each fresh fetch
+  _portalActiveYear  = '';
+  _portalActiveMonth = '';
   Promise.all([
     DB().collection('settings').doc('config').get(),
     DB().collection('attempts').where('employeeCode','==',code).where('status','==','completed').get()
@@ -7791,6 +7828,10 @@ function fetchEmployeeResult() {
       .then(function(eds){
         var exams={};
         eds.forEach(function(ed){if(ed.exists)exams[ed.id]=Object.assign({id:ed.id},ed.data());});
+        // Store globally for year/month filter re-render
+        window._portalAttsAll = atts;
+        window._portalExams   = exams;
+        window._portalCode    = code;
         renderPersonalResults(atts, exams, code);
       });
   }).catch(function(e){ showRpErr('Error fetching results: '+e.message); });
@@ -7808,13 +7849,33 @@ function rpGradeLabel(pct){
   return'NEED IMPROVEMENT';
 }
 
+function portalSetYear(yr) {
+  _portalActiveYear  = yr || '';
+  _portalActiveMonth = '';
+  renderPersonalResults(window._portalAttsAll, window._portalExams, window._portalCode);
+}
+function portalSetMonth(mo) {
+  _portalActiveMonth = mo !== undefined ? String(mo) : '';
+  renderPersonalResults(window._portalAttsAll, window._portalExams, window._portalCode);
+}
+
 function renderPersonalResults(atts, exams, code) {
   var emp = atts[0];
   var initials = (emp.candidateName||code).split(' ').map(function(n){return n[0]||'';}).join('').slice(0,2).toUpperCase();
   var deptTag = (emp.department||'').toUpperCase().replace(/\s+/g,'').slice(0,3);
 
+  // ── Year/Month pills ─────────────────────────────────────────
+  var ymPills = buildYearMonthPills(atts, _portalActiveYear, _portalActiveMonth, 'portalSetYear', 'portalSetMonth');
+  var pillHtml = ymPills
+    ? '<div style="background:#f1f5f0;border:1px solid #c8d8c8;border-radius:10px;padding:10px 14px;margin-bottom:16px;font-family:var(--fn,\'Segoe UI\',sans-serif)">'+ymPills+'</div>'
+    : '';
+
+  // Apply filter
+  var filteredAtts = filterAttsByYearMonth(atts, _portalActiveYear, _portalActiveMonth);
+
   // Employee header
   var html =
+    pillHtml+
     '<div class="ep-result-card" style="border-left-color:#1a4040">'+
       '<div class="ep-result-header">'+
         '<div style="display:flex;align-items:center;gap:14px;flex:1;flex-wrap:wrap">'+
@@ -7829,13 +7890,19 @@ function renderPersonalResults(atts, exams, code) {
           '</div>'+
         '</div>'+
         '<div style="font-family:\'IBM Plex Mono\',monospace;font-size:9px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:#7a8f8f;text-align:right">'+
-          atts.length+' Exam'+(atts.length>1?'s':'')+' Completed'+
+          filteredAtts.length+' Exam'+(filteredAtts.length!==1?'s':'')+' Completed'+
+          (filteredAtts.length !== atts.length ? ' <span style="opacity:.6">(of '+atts.length+' total)</span>' : '')+
         '</div>'+
       '</div>'+
     '</div>';
 
+  // No results for this period
+  if (!filteredAtts.length) {
+    html += '<div style="text-align:center;padding:32px 16px;color:#7a8f8f;font-size:14px">No exams found for the selected period.</div>';
+  }
+
   // One card per exam
-  atts.forEach(function(a, idx){
+  filteredAtts.forEach(function(a, idx){
     var ex = exams[a.examId]||{};
     var isPass = a.result==='pass';
     var marks = a.marksObtained||0;
@@ -7913,6 +7980,8 @@ function renderPersonalResults(atts, exams, code) {
 }
 
 var _portalActivePlant = ''; // '' = All Plants
+var _portalActiveYear  = ''; // '' = All Years (employee portal)
+var _portalActiveMonth = ''; // '' = All Months (employee portal)
 
 function setPortalPlantFilter(plant) {
   _portalActivePlant = plant || '';
