@@ -1,0 +1,154 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+    function isSignedIn() { return request.auth != null; }
+    function userDoc()    { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function role()       { return userDoc().role; }
+    function plant()      { return userDoc().plant; }
+    function isSuperAdmin()  { return role() == 'Super Admin'; }
+    function isPlantAdmin()  { return role() == 'Plant Admin'; }
+    function isAuditor()     { return role() == 'Auditor'; }
+    function isDeptHead()    { return role() == 'Dept Head'; }
+    function isViewer()      { return role() == 'Viewer'; }
+    function canWrite()      { return isSuperAdmin() || isPlantAdmin() || isAuditor(); }
+    // Plant-scoped check: Super Admin sees all; others see only their plant
+    function myPlant(res)    { return isSuperAdmin() || plant() == 'All Plants' || res.data.plant == plant(); }
+
+    // ── Users ─────────────────────────────────────────────────────────────
+    match /users/{uid} {
+      allow read:  if isSignedIn() && (request.auth.uid == uid || isSuperAdmin());
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin() || request.auth.uid == uid;
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── App Settings ──────────────────────────────────────────────────────
+    match /appSettings/{doc} {
+      allow read:  if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    // ── Plants ────────────────────────────────────────────────────────────
+    match /plants/{id} {
+      allow read:  if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    // ── Departments ───────────────────────────────────────────────────────
+    match /departments/{id} {
+      allow read:  if isSignedIn();
+      allow write: if isSuperAdmin() || isPlantAdmin();
+    }
+
+    // ── Audit Types / Standards ───────────────────────────────────────────
+    match /auditTypes/{id}      { allow read: if isSignedIn(); allow write: if isSuperAdmin(); }
+    match /standards/{id}       { allow read: if isSignedIn(); allow write: if isSuperAdmin(); }
+    match /standardClauses/{id} { allow read: if isSignedIn(); allow write: if isSuperAdmin(); }
+
+    // ── Audit Checklists ──────────────────────────────────────────────────
+    match /auditChecklists/{id} {
+      allow read:  if isSignedIn();
+      allow create: if canWrite();
+      allow update: if canWrite() && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['version','uploadedBy','uploadedAt']);
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Checklist Upload Logs ─────────────────────────────────────────────
+    match /checklistUploadLogs/{id} {
+      allow read:  if isSignedIn();
+      allow create: if canWrite();
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // ── Audit Plans ───────────────────────────────────────────────────────
+    match /auditPlans/{id} {
+      allow read:  if isSignedIn() && myPlant(resource);
+      allow create: if canWrite();
+      allow update: if canWrite() && myPlant(resource);
+      allow delete: if isSuperAdmin() || (isPlantAdmin() && myPlant(resource));
+    }
+
+    // ── Audits ────────────────────────────────────────────────────────────
+    match /audits/{id} {
+      allow read:  if isSignedIn() && myPlant(resource);
+      allow create: if canWrite();
+      allow update: if canWrite() && myPlant(resource);
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Audit Responses (checklist answers) ───────────────────────────────
+    match /auditResponses/{id} {
+      allow read:  if isSignedIn();
+      allow write: if isAuditor() || isPlantAdmin() || isSuperAdmin();
+    }
+
+    // ── Findings ──────────────────────────────────────────────────────────
+    match /findings/{id} {
+      allow read:  if isSignedIn() && myPlant(resource);
+      allow create: if canWrite();
+      allow update: if canWrite() && myPlant(resource);
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Root Cause Analyses ───────────────────────────────────────────────
+    match /rootCauseAnalyses/{id} {
+      allow read:  if isSignedIn();
+      allow write: if canWrite();
+    }
+
+    // ── Corrective Actions (CAPA) ─────────────────────────────────────────
+    match /correctiveActions/{id} {
+      allow read:  if isSignedIn() && myPlant(resource);
+      allow create: if canWrite();
+      allow update: if isSignedIn() && (
+        canWrite() ||
+        // Dept head can update status of their own CAPAs
+        (isDeptHead() && resource.data.assignedTo == request.auth.uid)
+      );
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Verification Records ──────────────────────────────────────────────
+    match /verificationRecords/{id} {
+      allow read:  if isSignedIn();
+      allow write: if canWrite();
+    }
+
+    // ── LPA ───────────────────────────────────────────────────────────────
+    match /lpaAudits/{id} {
+      allow read:  if isSignedIn() && myPlant(resource);
+      allow write: if canWrite();
+    }
+
+    // ── Supplier Audits ───────────────────────────────────────────────────
+    match /suppliers/{id}      { allow read: if isSignedIn(); allow write: if canWrite(); }
+    match /supplierAudits/{id} { allow read: if isSignedIn(); allow write: if canWrite(); }
+
+    // ── Notifications ─────────────────────────────────────────────────────
+    match /notifications/{id} {
+      allow read:  if isSignedIn() && (resource.data.userId == request.auth.uid || isSuperAdmin());
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Email Queue / Logs ────────────────────────────────────────────────
+    match /emailQueue/{id} { allow read, write: if false; } // Cloud Functions only
+    match /emailLogs/{id}  { allow read: if isSuperAdmin(); allow write: if false; }
+
+    // ── My Actions ────────────────────────────────────────────────────────
+    match /myActions/{id} {
+      allow read:  if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false; // Cloud Functions only — generated automatically
+    }
+
+    // ── Activity Logs ─────────────────────────────────────────────────────
+    match /activityLogs/{id} {
+      allow read:  if isSuperAdmin() || isPlantAdmin();
+      allow create: if isSignedIn();
+      allow update, delete: if false;
+    }
+  }
+}
