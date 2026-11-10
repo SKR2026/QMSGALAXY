@@ -1034,6 +1034,22 @@ firebase functions:secrets:set APP_URL</code>
   </div>
 </div>
 
+<!-- Escalation Policy — superadmin only -->
+<div class="card" style="margin-top:16px">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+    <div class="card-title" style="margin:0">NC / CAPA Escalation Policy</div>
+    <button class="btn btn-primary btn-sm" onclick="addEscalationLevel()"><span class="material-icons" style="font-size:14px;vertical-align:middle">add</span> Add Level</button>
+  </div>
+  <p style="font-size:12px;color:var(--text-muted);margin-bottom:16px">When an NC or CAPA remains unresolved for the specified days, escalation emails are sent automatically to the configured recipients.</p>
+  <div id="escalationLevels" style="display:flex;flex-direction:column;gap:10px">
+    <div style="text-align:center;padding:20px;color:var(--text-muted);font-size:13px"><div class="spinner" style="margin:0 auto 8px"></div>Loading…</div>
+  </div>
+  <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+    <button class="btn btn-primary btn-sm" onclick="saveEscalationPolicy()"><span class="material-icons" style="font-size:13px;vertical-align:middle">save</span> Save Policy</button>
+    <span id="escalationSaveStatus" style="font-size:12px;color:var(--text-muted)"></span>
+  </div>
+</div>
+
 <!-- Plant Management — full width card -->
 <div class="card" style="margin-top:16px">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
@@ -4274,6 +4290,7 @@ async function renderSettings() {
   renderShiftMgmt();
   renderAuditTypesMgmt();
   loadGmailConfig();
+  loadEscalationPolicy();
   _loadDummyStatus();
   // Show dummy data card for superadmin only
   const _dCard=document.getElementById('dummyDataCard');
@@ -4635,6 +4652,106 @@ async function clearLoginBg() {
 }
 
 /* ---- Gmail / Email Config ---- */
+// ─── ESCALATION POLICY ────────────────────────────────────────────────────────
+async function loadEscalationPolicy() {
+  const container = document.getElementById('escalationLevels');
+  if (!container) return;
+  const snap = await db.collection('appSettings').doc('escalationPolicy').get().catch(()=>null);
+  const levels = (snap && snap.exists && snap.data().levels) ? snap.data().levels : [
+    { days: 7,  emails: '' },
+    { days: 14, emails: '' },
+    { days: 30, emails: '' },
+  ];
+  _renderEscalationLevels(levels);
+}
+
+function _renderEscalationLevels(levels) {
+  const container = document.getElementById('escalationLevels');
+  if (!container) return;
+  if (!levels.length) {
+    container.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);font-size:13px">No escalation levels configured. Click <strong>Add Level</strong>.</div>';
+    return;
+  }
+  container.innerHTML = levels.map(function(lvl, i) {
+    return '<div class="escalation-level-row" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px 16px;position:relative">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">'
+      + '<div style="display:flex;align-items:center;gap:8px">'
+      + '<span style="width:26px;height:26px;border-radius:50%;background:var(--accent);color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0">' + (i+1) + '</span>'
+      + '<span style="font-size:13px;font-weight:700;color:var(--text-primary)">Level ' + (i+1) + ' Escalation</span>'
+      + '</div>'
+      + '<button onclick="removeEscalationLevel(this)" title="Remove level" style="background:none;border:none;cursor:pointer;color:#DC2626;padding:4px;display:flex;align-items:center"><span class="material-icons" style="font-size:18px">delete_outline</span></button>'
+      + '</div>'
+      + '<div style="display:grid;grid-template-columns:180px 1fr;gap:16px;align-items:start">'
+      + '<div>'
+      + '<label class="form-label">Trigger After (days)</label>'
+      + '<input class="form-input esc-days" type="number" min="1" value="' + (lvl.days||'') + '" placeholder="e.g. 7" style="width:100%">'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Days since NC/CAPA opened</div>'
+      + '</div>'
+      + '<div>'
+      + '<label class="form-label">Email Recipients <span style="font-weight:400;color:var(--text-muted)">(comma-separated)</span></label>'
+      + '<textarea class="form-input esc-emails" rows="2" placeholder="manager@company.com, director@company.com" style="resize:vertical;width:100%">' + (lvl.emails||'') + '</textarea>'
+      + '</div>'
+      + '</div>'
+      + '</div>';
+  }).join('');
+}
+
+function addEscalationLevel() {
+  const rows = document.querySelectorAll('.escalation-level-row');
+  const levels = _collectEscalationLevels();
+  const lastDays = levels.length ? (levels[levels.length-1].days||0) : 0;
+  levels.push({ days: lastDays + 7, emails: '' });
+  _renderEscalationLevels(levels);
+}
+
+function removeEscalationLevel(btn) {
+  const row = btn.closest('.escalation-level-row');
+  if (row) row.remove();
+  // Re-number remaining rows
+  document.querySelectorAll('.escalation-level-row').forEach(function(r, i) {
+    var spans = r.querySelectorAll('span');
+    spans.forEach(function(s) {
+      if (s.style.borderRadius === '50%' || s.style.borderRadius === '') {
+        if (/^\d+$/.test(s.textContent.trim())) s.textContent = i+1;
+      }
+      if (s.textContent.includes('Level ') && s.style.fontWeight === '700') s.textContent = 'Level ' + (i+1) + ' Escalation';
+    });
+  });
+}
+
+function _collectEscalationLevels() {
+  const levels = [];
+  document.querySelectorAll('.escalation-level-row').forEach(function(row) {
+    const days   = parseInt(row.querySelector('.esc-days')?.value) || 0;
+    const emails = (row.querySelector('.esc-emails')?.value || '').trim();
+    levels.push({ days: days, emails: emails });
+  });
+  return levels;
+}
+
+async function saveEscalationPolicy() {
+  const levels = _collectEscalationLevels();
+  const statusEl = document.getElementById('escalationSaveStatus');
+  // Basic validation
+  for (var i=0; i<levels.length; i++) {
+    if (!levels[i].days || levels[i].days < 1) { showToast('Level ' + (i+1) + ': days must be ≥ 1', 'error'); return; }
+    if (!levels[i].emails) { showToast('Level ' + (i+1) + ': at least one email required', 'error'); return; }
+  }
+  if (statusEl) statusEl.textContent = 'Saving…';
+  await db.collection('appSettings').doc('escalationPolicy').set({
+    levels: levels,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    updatedBy: S.user?.uid || '',
+    updatedByName: S.userDoc?.name || S.user?.email || ''
+  }).catch(function(e) { showToast('Save failed: ' + e.message, 'error'); });
+  showToast('Escalation policy saved!', 'success');
+  if (statusEl) {
+    statusEl.textContent = '✓ Saved';
+    statusEl.style.color = '#16A34A';
+    setTimeout(function() { statusEl.textContent = ''; }, 3000);
+  }
+}
+
 async function loadGmailConfig() {
   const isSA = S.userDoc?.role==='superadmin'||S.userDoc?.role==='Super Admin';
   const card = document.getElementById('gmailConfigCard');
