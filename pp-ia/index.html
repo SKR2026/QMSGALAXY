@@ -507,8 +507,13 @@ select.form-input{cursor:pointer}
   <div class="tab" onclick="switchTab(this,'plan-annual');renderPlanning()">Annual Plan</div>
 </div>
 <div id="plan-list" class="tab-content active">
-  <div class="toolbar"><div class="search-bar"><span class="material-icons">search</span><input type="text" placeholder="Search audits..."></div><select class="filter-select"><option>All Status</option><option>Planned</option><option>In Progress</option><option>Completed</option></select><button class="btn btn-primary" onclick="showAddAuditModal()"><span class="material-icons">add</span>Schedule Audit</button></div>
-  <table><thead><tr><th>Audit Name</th><th>Type</th><th>Plant</th><th>Dept</th><th>Auditor</th><th>Planned Date</th><th>Status</th><th>Actions</th></tr></thead><tbody id="planningTbl"></tbody></table>
+  <div class="toolbar">
+    <div class="search-bar"><span class="material-icons">search</span><input type="text" id="auditSearchInput" placeholder="Search audits..." oninput="filterAuditList()"></div>
+    <select class="filter-select" id="auditStatusFilter" onchange="filterAuditList()"><option>All Status</option><option>Planned</option><option>In Progress</option><option>Completed</option></select>
+    <button class="btn btn-primary" onclick="showAddAuditModal()"><span class="material-icons">add</span>Schedule Audit</button>
+    <button id="bulkDeleteAuditBtn" class="btn btn-sm" style="display:none;background:#FEF2F2;color:#DC2626;border:1px solid #FECACA" onclick="bulkDeleteAuditPlans()"><span class="material-icons" style="font-size:14px;vertical-align:middle">delete_sweep</span> Delete Selected (<span id="bulkDeleteAuditCount">0</span>)</button>
+  </div>
+  <table><thead><tr id="planningTblHead"><th style="width:36px"><input type="checkbox" id="selectAllAudits" onchange="toggleSelectAllAudits(this)" title="Select All" style="display:none"></th><th>Audit Name</th><th>Type</th><th>Plant</th><th>Dept</th><th>Auditor</th><th>Planned Date</th><th>Status</th><th>Actions</th></tr></thead><tbody id="planningTbl"></tbody></table>
 </div>
 <div id="plan-calendar" class="tab-content"><div class="card"><div id="calendarView" style="min-height:300px"></div></div></div>
 <div id="plan-annual" class="tab-content"><div class="card"><div class="card-title">Annual Audit Plan 2026</div><table><thead><tr><th>Audit Type</th><th>Jan</th><th>Feb</th><th>Mar</th><th>Apr</th><th>May</th><th>Jun</th><th>Jul</th><th>Aug</th><th>Sep</th><th>Oct</th><th>Nov</th><th>Dec</th></tr></thead><tbody id="annualTbl"></tbody></table></div></div>
@@ -2060,19 +2065,46 @@ function openAction(id, sourceRef) {
 
 // ─── AUDIT PLANNING ───────────────────────────────────────────────────────────
 async function renderPlanning() {
-  document.getElementById('planningTbl').innerHTML = loadingRow(8);
+  document.getElementById('planningTbl').innerHTML = loadingRow(9);
   let q = db.collection('auditPlans').orderBy('plannedDate','desc').limit(200);
   if (S.selectedPlant !== 'All Plants') q = q.where('plant','==',S.selectedPlant);
   const snap = await q.get().catch(() => null);
   if (!snap) return;
-  const audits = snap.docs.map(d => ({id:d.id,...d.data()}));
+  S._allAuditPlans = snap.docs.map(d => ({id:d.id,...d.data()}));
 
-  // ── Audit List ──
-  document.getElementById('planningTbl').innerHTML = audits.length === 0
-    ? '<tr><td colspan="8" style="text-align:center;padding:40px;color:var(--text-muted)">No audit plans found</td></tr>'
-    : audits.map(a => {
-        const canDelete = S.role === 'SuperAdmin' || S.role === 'PlantAdmin';
+  // Show/hide checkbox column for SuperAdmin
+  const isSA = S.role === 'SuperAdmin';
+  const cb = document.getElementById('selectAllAudits');
+  if (cb) cb.style.display = isSA ? 'inline-block' : 'none';
+  const bulkBtn = document.getElementById('bulkDeleteAuditBtn');
+  if (bulkBtn && !isSA) bulkBtn.style.display = 'none';
+
+  _renderFilteredAuditList();
+
+  // ── Calendar View ──
+  _renderPlanningCalendar(S._allAuditPlans);
+
+  // ── Annual Plan ──
+  _renderAnnualPlan(S._allAuditPlans);
+}
+
+function filterAuditList() { _renderFilteredAuditList(); }
+
+function _renderFilteredAuditList() {
+  const audits = S._allAuditPlans || [];
+  const search = (document.getElementById('auditSearchInput')?.value||'').toLowerCase();
+  const statusF = document.getElementById('auditStatusFilter')?.value||'All Status';
+  const filtered = audits.filter(a => {
+    const matchSearch = !search || (a.name||'').toLowerCase().includes(search) || (a.plant||'').toLowerCase().includes(search) || (a.auditType||'').toLowerCase().includes(search);
+    const matchStatus = statusF === 'All Status' || a.status === statusF;
+    return matchSearch && matchStatus;
+  });
+  const isSA = S.role === 'SuperAdmin';
+  document.getElementById('planningTbl').innerHTML = filtered.length === 0
+    ? '<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text-muted)">No audit plans found</td></tr>'
+    : filtered.map(a => {
         return '<tr>'
+          + '<td style="text-align:center">' + (isSA ? '<input type="checkbox" class="audit-plan-cb" data-id="' + a.id + '" data-name="' + (a.name||'').replace(/"/g,'&quot;') + '" onchange="_updateBulkAuditBtn()">' : '') + '</td>'
           + '<td><strong>' + a.name + '</strong><br><small style="color:var(--text-muted)">' + a.id + '</small></td>'
           + '<td><span class="badge badge-blue">' + (a.auditType||'-') + '</span></td>'
           + '<td>' + a.plant + '</td>'
@@ -2082,15 +2114,43 @@ async function renderPlanning() {
           + '<td><span class="badge ' + (a.status==='Planned'?'badge-grey':a.status==='In Progress'?'badge-blue':a.status==='Completed'?'badge-green':'badge-red') + '">' + a.status + '</span></td>'
           + '<td style="display:flex;gap:6px;align-items:center">'
           + '<button class="btn btn-sm btn-secondary" onclick="viewAuditPlan(\'' + a.id + '\')">View</button>'
-          + (canDelete ? '<button class="btn btn-sm" style="background:#FEF2F2;color:#DC2626;border:1px solid #FECACA" onclick="deleteAuditPlan(\'' + a.id + '\',\'' + (a.name||'').replace(/'/g,"\\'") + '\')"><span class="material-icons" style="font-size:13px;vertical-align:middle">delete</span></button>' : '')
+          + (isSA ? '<button class="btn btn-sm" style="background:#FEF2F2;color:#DC2626;border:1px solid #FECACA" onclick="deleteAuditPlan(\'' + a.id + '\',\'' + (a.name||'').replace(/'/g,"\\'") + '\')"><span class="material-icons" style="font-size:13px;vertical-align:middle">delete</span></button>' : '')
           + '</td></tr>';
       }).join('');
+  _updateBulkAuditBtn();
+}
 
-  // ── Calendar View ──
-  _renderPlanningCalendar(audits);
+function toggleSelectAllAudits(cb) {
+  document.querySelectorAll('.audit-plan-cb').forEach(c => c.checked = cb.checked);
+  _updateBulkAuditBtn();
+}
 
-  // ── Annual Plan ──
-  _renderAnnualPlan(audits);
+function _updateBulkAuditBtn() {
+  const checked = document.querySelectorAll('.audit-plan-cb:checked');
+  const btn = document.getElementById('bulkDeleteAuditBtn');
+  const countEl = document.getElementById('bulkDeleteAuditCount');
+  if (!btn) return;
+  if (checked.length > 0) { btn.style.display = ''; if(countEl) countEl.textContent = checked.length; }
+  else { btn.style.display = 'none'; }
+  const allCbs = document.querySelectorAll('.audit-plan-cb');
+  const selectAll = document.getElementById('selectAllAudits');
+  if (selectAll && allCbs.length > 0) selectAll.checked = checked.length === allCbs.length;
+}
+
+async function bulkDeleteAuditPlans() {
+  const checked = document.querySelectorAll('.audit-plan-cb:checked');
+  if (!checked.length) return;
+  const names = Array.from(checked).map(c => c.dataset.name).join(', ');
+  if (!confirm('Delete ' + checked.length + ' audit(s)?\n' + names + '\n\nThis cannot be undone.')) return;
+  const ids = Array.from(checked).map(c => c.dataset.id);
+  try {
+    const batch = db.batch();
+    ids.forEach(id => batch.delete(db.collection('auditPlans').doc(id)));
+    await batch.commit();
+    showToast(ids.length + ' audit(s) deleted', 'success');
+    logActivity('Bulk deleted ' + ids.length + ' audit plans', 'Planning', '');
+    renderPlanning();
+  } catch(e) { showToast('Delete failed: ' + e.message, 'error'); }
 }
 
 function viewAuditPlan(id) {
@@ -2242,6 +2302,7 @@ function _openPlanTable(panelId, title, collection, plantOpts, shiftOpts, today,
             <th style="padding:8px 6px;text-align:left;font-weight:600;color:var(--text-secondary);white-space:nowrap">DEPARTMENT <span style="color:var(--red)">*</span></th>
             <th style="padding:8px 6px;text-align:left;font-weight:600;color:var(--text-secondary);white-space:nowrap">PROCESS <span style="color:var(--red)">*</span></th>
             ${lpaExtraHead}
+            <th style="padding:8px 6px;text-align:left;font-weight:600;color:var(--text-secondary);white-space:nowrap">AUDIT TYPE <span style="color:var(--red)">*</span></th>
             <th style="padding:8px 6px;text-align:left;font-weight:600;color:var(--text-secondary);white-space:nowrap">AUDITOR <span style="color:var(--red)">*</span></th>
             <th style="padding:8px 6px;text-align:left;font-weight:600;color:var(--text-secondary)">AUDITEE</th>
             <th style="padding:8px 6px;text-align:left;font-weight:600;color:var(--text-secondary);white-space:nowrap">PLANNED DATE <span style="color:var(--red)">*</span></th>
@@ -2287,6 +2348,9 @@ function addPlanRow() {
       +`<td style="padding:6px 4px;min-width:150px;vertical-align:top"><input style="${inp}" class="pr-area" placeholder="Area / sub-process"></td>`
     : '';
 
+  const auditTypeOpts = ['Product','Process','5S','System','Internal','LPA','Supplier Audit','EHS','IATF 16949','ISO 9001','ISO 14001','ISO 45001','Fire Safety','Energy Management','TPM','Legal Compliance']
+    .map(t=>`<option value="${t}">${t}</option>`).join('');
+
   const tr = document.createElement('tr');
   tr.id = 'planRow_'+idx;
   tr.style.cssText = 'border-bottom:1px solid var(--border)';
@@ -2296,6 +2360,7 @@ function addPlanRow() {
     <td style="padding:6px 4px;min-width:130px;vertical-align:top"><select style="${sel}" class="pr-dept" disabled><option value="">Select Plant first</option></select></td>
     <td style="padding:6px 4px;min-width:130px;vertical-align:top"><select style="${sel}" class="pr-process" disabled><option value="">Select Dept first</option></select></td>
     ${lpaExtraCells}
+    <td style="padding:6px 4px;min-width:130px;vertical-align:top"><select style="${sel}" class="pr-type"><option value="">— Type</option>${auditTypeOpts}</select></td>
     <td style="padding:6px 4px;min-width:140px;vertical-align:top"><select style="${sel}" class="pr-auditor" disabled><option value="">Select Plant first</option></select></td>
     <td style="padding:6px 4px;min-width:150px;vertical-align:top"><select style="${sel}" class="pr-auditee" onchange="_onAuditeeChange(this)" disabled><option value="">Select Plant first</option></select></td>
     <td style="padding:6px 4px;min-width:120px;vertical-align:top"><input type="date" style="${inp}" class="pr-date" value="${today}"></td>
@@ -2391,6 +2456,7 @@ async function saveAllAuditPlans(panelId, collection, isLPA) {
       auditeeEmail:(()=>{const s=tr.querySelector('.pr-auditee');return s?.options[s?.selectedIndex]?.dataset?.email||'';})(),
       plannedDate:firebase.firestore.Timestamp.fromDate(new Date(dateV)),
       shift:tr.querySelector('.pr-shift')?.value||'',
+      auditType:tr.querySelector('.pr-type')?.value||'',
       status:'Planned', published:false,
       createdBy:S.user?.uid||'',
       createdByName:S.userDoc?.name||S.user?.email||'',
@@ -3797,25 +3863,62 @@ async function exportAllReportsPDF() {
   showToast('Preparing PDF — please wait…','info');
   const snap = await db.collection('findings').orderBy('createdAt','desc').limit(300).get().catch(()=>null);
   const rows = snap ? snap.docs.map(d=>{const f={id:d.id,...d.data()};return `<tr><td>${f.findingNo||f.id}</td><td>${(f.description||'').substring(0,60)}</td><td>${f.severity||'-'}</td><td>${f.plant||'-'}</td><td>${f.status||'-'}</td><td>${formatDateStr(f.createdAt)}</td></tr>`;}).join('') : '';
-  const html=`<html><head><title>Group Audit Report</title><style>body{font-family:Arial,sans-serif;padding:20px;font-size:12px}h1{color:#0C1A2E;font-size:18px}h2{color:#1a76c2;font-size:14px;margin-top:20px}table{width:100%;border-collapse:collapse;margin-top:8px}th{background:#0C1A2E;color:#fff;padding:7px 10px;text-align:left;font-size:11px}td{padding:6px 10px;border-bottom:1px solid #eee}tr:nth-child(even)td{background:#f7f9fc}.footer{margin-top:30px;font-size:10px;color:#999;text-align:right}</style></head>
-  <body><h1>Group Internal Audit — Management Report</h1><p style="color:#666">Generated: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})}</p>
+  const html=`<!DOCTYPE html><html><head><title>Group Audit Report</title><style>
+    *{box-sizing:border-box}body{font-family:Arial,sans-serif;padding:20px;font-size:12px;margin:0}
+    h1{color:#0C1A2E;font-size:18px;margin-bottom:4px}h2{color:#1a76c2;font-size:14px;margin-top:20px}
+    p.gen{color:#666;font-size:11px;margin:0 0 8px}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th{background:#0C1A2E;color:#fff;padding:7px 10px;text-align:left;font-size:11px}
+    td{padding:6px 10px;border-bottom:1px solid #eee;font-size:11px}
+    tr:nth-child(even) td{background:#f7f9fc}
+    .footer{margin-top:30px;font-size:10px;color:#999;text-align:right;border-top:1px solid #eee;padding-top:8px}
+    @media print{.footer{position:fixed;bottom:10px;right:10px}}
+  </style></head>
+  <body><h1>Group Internal Audit — Management Report</h1><p class="gen">Generated: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})}</p>
   <h2>Findings Summary</h2><table><thead><tr><th>Finding ID</th><th>Description</th><th>Severity</th><th>Plant</th><th>Status</th><th>Date</th></tr></thead><tbody>${rows}</tbody></table>
-  <div class="footer">Group Audit System · Powered by QMS Galaxy</div></body></html>`;
-  const w=window.open('','_blank');
-  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),600);}
-  else showToast('Allow pop-ups to print PDF','error');
+  <div class="footer">Group Audit System · Powered by QMS Galaxy</div>
+  <script>window.onload=function(){window.print();}<\/script></body></html>`;
+  _printHtmlInIframe(html);
 }
 
 function printReport(title, tbodyId, headers) {
   const tbody=document.getElementById(tbodyId);
   if(!tbody){showToast('No data to print','error');return;}
-  const html=`<html><head><title>${title}</title><style>body{font-family:Arial,sans-serif;padding:20px;font-size:12px}h1{color:#0C1A2E}table{width:100%;border-collapse:collapse;margin-top:12px}th{background:#0C1A2E;color:#fff;padding:7px 10px;text-align:left;font-size:11px}td{padding:6px 10px;border-bottom:1px solid #eee}.footer{margin-top:20px;font-size:10px;color:#999;text-align:right}</style></head>
-  <body><h1>${title}</h1><p style="color:#666">Generated: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})}</p>
-  <table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${tbody.innerHTML.replace(/<button[^>]*>.*?<\/button>/gs,'')}</tbody></table>
-  <div class="footer">Group Audit System · Powered by QMS Galaxy</div></body></html>`;
-  const w=window.open('','_blank');
-  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),400);}
-  else showToast('Allow pop-ups to print PDF','error');
+  const cleanBody = tbody.innerHTML
+    .replace(/<button[^>]*>[\s\S]*?<\/button>/gi,'')
+    .replace(/<input[^>]*>/gi,'')
+    .replace(/<span class="material-icons"[^>]*>[\s\S]*?<\/span>/gi,'');
+  const html=`<!DOCTYPE html><html><head><title>${title}</title><style>
+    *{box-sizing:border-box}body{font-family:Arial,sans-serif;padding:20px;font-size:12px;margin:0}
+    h1{color:#0C1A2E;font-size:17px;margin-bottom:4px}
+    p.gen{color:#666;font-size:11px;margin:0 0 12px}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th{background:#0C1A2E;color:#fff;padding:7px 10px;text-align:left;font-size:11px}
+    td{padding:6px 10px;border-bottom:1px solid #eee;font-size:11px}
+    tr:nth-child(even) td{background:#f7f9fc}
+    .footer{margin-top:24px;font-size:10px;color:#999;text-align:right;border-top:1px solid #eee;padding-top:8px}
+    @media print{body{padding:10px}.footer{position:fixed;bottom:10px;right:10px}}
+  </style></head>
+  <body><h1>${title}</h1><p class="gen">Generated: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})}</p>
+  <table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${cleanBody}</tbody></table>
+  <div class="footer">Group Audit System · Powered by QMS Galaxy</div>
+  <script>window.onload=function(){window.print();}<\/script></body></html>`;
+  _printHtmlInIframe(html);
+}
+
+function _printHtmlInIframe(html) {
+  // Remove any existing print iframe
+  const old = document.getElementById('__printFrame');
+  if (old) old.remove();
+  const iframe = document.createElement('iframe');
+  iframe.id = '__printFrame';
+  iframe.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;border:none';
+  document.body.appendChild(iframe);
+  const doc = iframe.contentDocument || iframe.contentWindow.document;
+  doc.open(); doc.write(html); doc.close();
+  // Fallback: if onload in iframe doesn't trigger print, trigger from outside
+  iframe.onload = function() { try { iframe.contentWindow.focus(); iframe.contentWindow.print(); } catch(e){ showToast('Print failed — try allowing pop-ups','error'); } };
+  setTimeout(function(){ try { iframe.contentWindow.focus(); iframe.contentWindow.print(); } catch(e){} }, 800);
 }
 
 function formatDateStr(ts) {
