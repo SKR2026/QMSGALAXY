@@ -1660,8 +1660,24 @@ async function initDashboardCharts() {
 
 // ─── AUDIT REPORT ─────────────────────────────────────────────────────────────
 // ISO clause groups used for the matrix header
-const AR_CLAUSES = ['4.1','4.2','5.1','5.2','5.3','6.1','6.2','7.1','7.2','7.3','7.4','7.5',
-                    '8.1','8.2','8.3','8.4','8.5','8.6','8.7','9.1','9.2','9.3','10.1','10.2','10.3'];
+// Fixed clause groups for Audit Report matrix (Polyplastics template)
+const AR_GROUPS = [
+  { group:'7.*', subs:['7.2','7.4'] },
+  { group:'8.*', subs:['8.1','8.5'] },
+  { group:'9.*', subs:['9.1'] },
+  { group:'10.*', subs:['10.2'] },
+];
+// Flat list of all sub-clauses in order
+const AR_SUBS = AR_GROUPS.flatMap(g=>g.subs);
+// Map a raw clause string to the nearest AR_SUBS key (prefix match)
+function _arClauseKey(raw){
+  const s = String(raw||'').trim();
+  for(const sub of AR_SUBS){ if(s===sub||s.startsWith(sub+'.')||s.startsWith(sub+' ')) return sub; }
+  // fallback: try first two segments
+  const twoSeg = s.split('.').slice(0,2).join('.');
+  if(AR_SUBS.includes(twoSeg)) return twoSeg;
+  return null;
+}
 
 async function renderAuditReport() {
   const plantSel  = document.getElementById('arPlantFilter');
@@ -1725,109 +1741,151 @@ async function renderAuditReport() {
     <div class="kpi-body"><div class="kpi-value">${c.value!=null?c.value:'—'}</div><div class="kpi-label">${c.label}</div></div>
   </div>`).join('');
 
-  // ── Build dept × clause matrix ────────────────────────────────────────────────
+  // ── Build dept × sub-clause matrix ───────────────────────────────────────────
   const deptAbbr = {};
+  // matrix[dept][subClause] = {mi, obs, ma}
   const matrix = {};
   findings.forEach(f=>{
-    const dept  = f.department||f.dept||'Unknown';
-    const raw   = String(f.clause||f.clauseNo||f.isoClause||'—');
-    const n     = parseFloat(raw);
-    const clause= isNaN(n)?raw:n.toFixed(1);
-    const sev   = (f.severity||f.type||'').toLowerCase();
-    if(!matrix[dept]){matrix[dept]={total:0};deptAbbr[dept]=f.deptAbbr||dept.substring(0,3).toUpperCase();}
-    if(!matrix[dept][clause])matrix[dept][clause]={mi:0,obs:0,ma:0};
-    if(sev.includes('major')||sev==='ma') matrix[dept][clause].ma++;
-    else if(sev.includes('obs')||sev==='o') matrix[dept][clause].obs++;
-    else matrix[dept][clause].mi++;
-    matrix[dept].total++;
+    const dept = f.department||f.dept||'Unknown';
+    const raw  = String(f.clause||f.clauseNo||f.isoClause||'');
+    const key  = _arClauseKey(raw);
+    const sev  = (f.severity||f.ncType||f.type||'').toLowerCase();
+    if(!matrix[dept]){ matrix[dept]={}; deptAbbr[dept]=f.deptAbbr||dept.substring(0,3).toUpperCase(); }
+    if(key){
+      if(!matrix[dept][key]) matrix[dept][key]={mi:0,obs:0,ma:0};
+      if(sev.includes('major')||sev==='ma'||sev==='major nc') matrix[dept][key].ma++;
+      else if(sev.includes('obs')||sev==='observation'||sev==='o/i') matrix[dept][key].obs++;
+      else matrix[dept][key].mi++; // minor / default
+    }
   });
   const depts = Object.keys(matrix).sort();
 
-  // ── Sample data if empty ──────────────────────────────────────────────────────
+  // ── Sample data if no live findings ──────────────────────────────────────────
   const useSample = depts.length===0;
   let renderDepts=depts, renderMatrix=matrix;
   if(useSample){
     renderDepts=['Moulding','Electroplating','Painting','Assembly','Quality Assurance'];
     renderMatrix={
-      'Moulding':    {'8.1':{mi:1,obs:0,ma:0},'9.1':{mi:0,obs:0,ma:1},total:2},
-      'Electroplating':{'7.2':{mi:0,obs:0,ma:1},'8.5':{mi:0,obs:0,ma:1},'10.2':{mi:0,obs:0,ma:1},total:3},
-      'Painting':    {'7.4':{mi:0,obs:0,ma:2},total:2},
-      'Assembly':    {'7.2':{mi:0,obs:0,ma:2},total:2},
-      'Quality Assurance':{'8.1':{mi:0,obs:0,ma:1},total:1},
+      'Moulding':         {'8.1':{mi:1,obs:1,ma:0},'9.1':{mi:0,obs:0,ma:1}},
+      'Electroplating':   {'7.2':{mi:0,obs:1,ma:1},'8.5':{mi:1,obs:0,ma:0},'10.2':{mi:0,obs:0,ma:1}},
+      'Painting':         {'7.4':{mi:0,obs:1,ma:1},'8.1':{mi:1,obs:0,ma:0}},
+      'Assembly':         {'7.2':{mi:1,obs:1,ma:0},'9.1':{mi:0,obs:1,ma:0}},
+      'Quality Assurance':{'8.5':{mi:0,obs:0,ma:1},'10.2':{mi:1,obs:0,ma:0}},
     };
-    renderDepts.forEach(d=>{deptAbbr[d]=d.substring(0,3).toUpperCase();});
+    renderDepts.forEach(d=>{ deptAbbr[d]=d.substring(0,3).toUpperCase(); });
   }
 
-  // Active clauses = union of what's in data, intersected with AR_CLAUSES order
-  const clauseSet=new Set();
-  renderDepts.forEach(d=>Object.keys(renderMatrix[d]||{}).forEach(k=>{if(k!=='total')clauseSet.add(k);}));
-  const renderClauses = clauseSet.size>0 ? AR_CLAUSES.filter(c=>clauseSet.has(c)) : AR_CLAUSES.slice(6);
+  // ── Matrix table HTML (Polyplastics template) ─────────────────────────────────
+  // Styles
+  const TH_BASE = 'border:1px solid #c8972a;padding:3px 5px;text-align:center;font-size:10px;font-weight:700;white-space:nowrap;vertical-align:middle;';
+  const TH_HEAD = TH_BASE+'background:#F5D090;';
+  const TH_GRP  = TH_BASE+'background:#FAE0A0;';
+  const TH_SUB  = TH_BASE+'background:#FEF3C7;';
+  const TH_COL  = TH_BASE+'background:#FFFBEB;font-weight:600;';
+  const TD_BASE = 'border:1px solid #ddb85a;padding:2px 4px;text-align:center;font-size:11px;vertical-align:middle;';
+  const TD_ROW0 = TD_BASE+'background:#FFFDE7;';
+  const TD_ROW1 = TD_BASE+'background:#FFF8DC;';
+  const TD_TOT  = TH_BASE+'background:#F5D090;';
 
-  // ── Matrix table HTML ─────────────────────────────────────────────────────────
-  const TH='border:1px solid #d4a853;padding:3px 4px;text-align:center;background:#FAEBD0;font-size:10px;font-weight:600;white-space:nowrap;';
-  const TD='border:1px solid #e8c97a;padding:2px 3px;text-align:center;font-size:10px;';
-  const BASE='border:1px solid #e8c97a;padding:4px 6px;font-size:11px;background:#FFFDE7;';
+  // Total NC sub-columns span
+  const totalNcCols = AR_SUBS.length * 3;
 
-  // Group by first digit for span header
-  const groupOrder=[...new Set(renderClauses.map(c=>c.split('.')[0]))];
-  const groupCount={};
-  renderClauses.forEach(c=>{const g=c.split('.')[0];groupCount[g]=(groupCount[g]||0)+1;});
+  // ── Header: 4 rows ────────────────────────────────────────────────────────────
+  // Row 1: S.NO (rs4), SECTION/PROCESS (rs4), ABBR. (rs4), NON-CONFORMANCES (cs=totalNcCols), TOTAL MI|O/I|MA (cs3)
+  let thead = '<tr>'
+    +'<th rowspan="4" style="'+TH_HEAD+'min-width:30px">S.NO</th>'
+    +'<th rowspan="4" style="'+TH_HEAD+'min-width:120px">SECTION / PROCESS</th>'
+    +'<th rowspan="4" style="'+TH_HEAD+'min-width:40px">ABBR.</th>'
+    +'<th colspan="'+totalNcCols+'" style="'+TH_HEAD+'font-size:11px">NON-CONFORMANCES (AGAINST APPLICABLE CLAUSES)</th>'
+    +'<th colspan="3" rowspan="2" style="'+TH_HEAD+'background:#FFD54F">TOTAL</th>'
+    +'</tr>';
 
-  let thead='<tr>'
-    +'<th rowspan="3" style="'+TH+'background:#F5D8B0">S.No.</th>'
-    +'<th rowspan="3" style="'+TH+'background:#F5D8B0;min-width:110px">Section / Process</th>'
-    +'<th rowspan="3" style="'+TH+'background:#F5D8B0">Abbr.</th>'
-    +'<th colspan="'+(renderClauses.length*3)+'" style="'+TH+'background:#F5D8B0;font-size:11px">NON-CONFORMANCES (AGAINST APPLICABLE CLAUSES)</th>'
-    +'<th rowspan="3" style="'+TH+'background:#FFD54F">TOTAL</th></tr><tr>';
-  groupOrder.forEach(g=>{thead+='<th colspan="'+(groupCount[g]*3)+'" style="'+TH+'">'+g+'.*</th>';});
-  thead+='</tr><tr>';
-  renderClauses.forEach(c=>{thead+='<th colspan="3" style="'+TH+'">'+c+'*</th>';});
-  thead+='</tr><tr><th style="'+TH+'"></th><th style="'+TH+'"></th><th style="'+TH+'"></th>';
-  renderClauses.forEach(()=>{thead+='<th style="'+TH+'">Mi</th><th style="'+TH+'">O/I</th><th style="'+TH+'">Ma</th>';});
-  thead+='<th style="'+TH+'">Mi</th><th style="'+TH+'">O/I</th><th style="'+TH+'">Ma</th></tr>';
+  // Row 2: group headers (7.*, 8.*, 9.*, 10.*)
+  thead += '<tr>';
+  AR_GROUPS.forEach(g=>{
+    thead += '<th colspan="'+(g.subs.length*3)+'" style="'+TH_GRP+'">'+g.group+'</th>';
+  });
+  thead += '</tr>';
+
+  // Row 3: sub-clause headers (7.2*, 7.4*, 8.1*, 8.5*, 9.1*, 10.2*) + TOTAL sub-cols
+  thead += '<tr>';
+  AR_SUBS.forEach(s=>{ thead += '<th colspan="3" style="'+TH_SUB+'">'+s+'*</th>'; });
+  thead += '<th style="'+TH_COL+'">MA</th><th style="'+TH_COL+'">MI</th><th style="'+TH_COL+'">O/I</th>';
+  thead += '</tr>';
+
+  // Row 4: MA | MI | O/I per sub-clause
+  thead += '<tr>';
+  AR_SUBS.forEach(()=>{
+    thead += '<th style="'+TH_COL+'color:#B71C1C">MA</th>'
+           + '<th style="'+TH_COL+'color:#1565C0">MI</th>'
+           + '<th style="'+TH_COL+'color:#E65100">O/I</th>';
+  });
+  thead += '</tr>';
+
   document.getElementById('arMatrixHead').innerHTML=thead;
 
-  let totalMi=0,totalObs=0,totalMa=0;
-  let tbody=renderDepts.map((dept,idx)=>{
-    const row=renderMatrix[dept]||{total:0};
-    let mi=0,obs=0,ma=0;
-    const cells=renderClauses.map(c=>{
-      const d=row[c]||{mi:0,obs:0,ma:0};
-      mi+=d.mi;obs+=d.obs;ma+=d.ma;
-      const hasNC=d.mi+d.obs+d.ma>0;
-      const bg=hasNC?'background:#FFE0B2;':'';
-      return '<td style="'+TD+bg+'">'+(d.mi?'<span style="color:#1565C0;font-weight:700">'+d.mi+'</span>':'')+'</td>'
-            +'<td style="'+TD+bg+'">'+(d.obs?'<span style="color:#E65100;font-weight:700">'+d.obs+'</span>':'')+'</td>'
-            +'<td style="'+TD+bg+'">'+(d.ma?'<span style="color:#B71C1C;font-weight:700">'+d.ma+'</span>':'')+'</td>';
+  // ── Data rows ─────────────────────────────────────────────────────────────────
+  let grandMi=0, grandObs=0, grandMa=0;
+  // Accumulate per-sub-clause column totals for the footer
+  const colTotals = {}; AR_SUBS.forEach(s=>{ colTotals[s]={mi:0,obs:0,ma:0}; });
+
+  let tbody = renderDepts.map((dept,idx)=>{
+    const row = renderMatrix[dept]||{};
+    const tdBg = idx%2===0 ? TD_ROW0 : TD_ROW1;
+    let rowMi=0, rowObs=0, rowMa=0;
+
+    const cells = AR_SUBS.map(sub=>{
+      const d = row[sub]||{mi:0,obs:0,ma:0};
+      rowMi  += d.mi;  rowObs += d.obs||0;  rowMa += d.ma;
+      colTotals[sub].mi  += d.mi;
+      colTotals[sub].obs += d.obs||0;
+      colTotals[sub].ma  += d.ma;
+      const hasNC = d.mi+d.obs+d.ma>0;
+      const bg = hasNC ? 'background:#FFE0B2;' : '';
+      return '<td style="'+TD_BASE+bg+'">'+(d.ma ?'<b style="color:#B71C1C">'+d.ma +'</b>':'')+'</td>'
+           + '<td style="'+TD_BASE+bg+'">'+(d.mi ?'<b style="color:#1565C0">'+d.mi +'</b>':'')+'</td>'
+           + '<td style="'+TD_BASE+bg+'">'+(d.obs?'<b style="color:#E65100">'+d.obs+'</b>':'')+'</td>';
     }).join('');
-    totalMi+=mi;totalObs+=obs;totalMa+=ma;
-    const rowBg=idx%2===0?'background:#FFFDE7;':'background:#FFF9C4;';
-    const tot=mi+obs+ma;
+
+    grandMi+=rowMi; grandObs+=rowObs; grandMa+=rowMa;
+    const abbr = deptAbbr[dept]||dept.substring(0,3).toUpperCase();
     return '<tr>'
-      +'<td style="'+BASE+rowBg+'text-align:center">'+(idx+1)+'</td>'
-      +'<td style="'+BASE+rowBg+'font-weight:600">'+dept+'</td>'
-      +'<td style="'+BASE+rowBg+'text-align:center;font-weight:600">'+(deptAbbr[dept]||dept.substring(0,3).toUpperCase())+'</td>'
+      +'<td style="'+tdBg+'">'+(idx+1)+'</td>'
+      +'<td style="'+tdBg+'font-weight:600;text-align:left;padding-left:8px">'+dept+'</td>'
+      +'<td style="'+tdBg+'font-weight:700">'+abbr+'</td>'
       +cells
-      +'<td style="'+BASE+'background:#FFD54F;font-weight:800;text-align:center">'+(tot||'')+'</td>'
+      +'<td style="'+TD_BASE+'background:#FFF3CD;font-weight:700;color:#B71C1C">'+(rowMa||'')+'</td>'
+      +'<td style="'+TD_BASE+'background:#FFF3CD;font-weight:700;color:#1565C0">'+(rowMi||'')+'</td>'
+      +'<td style="'+TD_BASE+'background:#FFF3CD;font-weight:700;color:#E65100">'+(rowObs||'')+'</td>'
       +'</tr>';
   }).join('');
 
-  // Totals row
-  tbody+='<tr><td colspan="3" style="'+TH+'background:#F5D8B0;text-align:right;font-size:11px">TOTAL</td>';
-  renderClauses.forEach(c=>{
-    let cMi=0,cObs=0,cMa=0;
-    renderDepts.forEach(d=>{const r=(renderMatrix[d]||{})[c]||{};cMi+=r.mi||0;cObs+=r.obs||0;cMa+=r.ma||0;});
-    tbody+='<td style="'+TD+'background:#F5D8B0;font-weight:700">'+(cMi||'')+'</td>'
-          +'<td style="'+TD+'background:#F5D8B0;font-weight:700">'+(cObs||'')+'</td>'
-          +'<td style="'+TD+'background:#F5D8B0;font-weight:700">'+(cMa||'')+'</td>';
+  // ── Footer TOTAL row ──────────────────────────────────────────────────────────
+  tbody += '<tr>'
+    +'<td colspan="3" style="'+TD_TOT+'text-align:right;font-size:11px">TOTAL</td>';
+  AR_SUBS.forEach(sub=>{
+    const t=colTotals[sub];
+    tbody += '<td style="'+TD_TOT+'color:#B71C1C">'+(t.ma||'')+'</td>'
+           + '<td style="'+TD_TOT+'color:#1565C0">'+(t.mi||'')+'</td>'
+           + '<td style="'+TD_TOT+'color:#E65100">'+(t.obs||'')+'</td>';
   });
-  tbody+='<td style="'+TH+'background:#FFD54F;font-size:12px">'+(totalMi+totalObs+totalMa)+'</td></tr>';
+  tbody += '<td style="'+TD_TOT+'color:#B71C1C">'+(grandMa||'')+'</td>'
+         + '<td style="'+TD_TOT+'color:#1565C0">'+(grandMi||'')+'</td>'
+         + '<td style="'+TD_TOT+'color:#E65100">'+(grandObs||'')+'</td>'
+         + '</tr>';
+
   document.getElementById('arMatrixBody').innerHTML=tbody;
+  if(useSample){
+    const note=document.createElement('div');
+    note.style.cssText='margin-top:8px;padding:6px 12px;background:#FEF9C3;border:1px solid #F59E0B;border-radius:6px;font-size:12px;color:#92400E;';
+    note.textContent='⚠ Showing sample data. No findings found for the selected filters.';
+    document.getElementById('arMatrixBody').parentElement.after(note);
+  }
 
   // ── Charts ────────────────────────────────────────────────────────────────────
   const chartDepts=renderDepts;
-  const openVals  =chartDepts.map(d=>{const r=renderMatrix[d]||{};return Object.entries(r).filter(([k])=>k!=='total').reduce((s,[,v])=>s+(v.mi||0)+(v.obs||0),0);});
-  const maVals    =chartDepts.map(d=>{const r=renderMatrix[d]||{};return Object.entries(r).filter(([k])=>k!=='total').reduce((s,[,v])=>s+(v.ma||0),0);});
+  const openVals  =chartDepts.map(d=>{const r=renderMatrix[d]||{};return Object.values(r).reduce((s,v)=>s+(v.mi||0)+(v.obs||0),0);});
+  const maVals    =chartDepts.map(d=>{const r=renderMatrix[d]||{};return Object.values(r).reduce((s,v)=>s+(v.ma||0),0);});
   const deptDaysMap={};
   findings.forEach(f=>{
     const d=f.department||f.dept||'Unknown';
