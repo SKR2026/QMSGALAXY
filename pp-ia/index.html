@@ -2323,7 +2323,9 @@ async function showPlanLPAModal() {
 }
 
 async function _loadShiftOpts() {
-  const snap = await db.collection('shifts').where('active','==',true).orderBy('order').get().catch(()=>null);
+  // Try with orderBy first (requires index), fall back to plain query
+  let snap = await db.collection('shifts').where('active','==',true).orderBy('order').get().catch(()=>null);
+  if (!snap) snap = await db.collection('shifts').where('active','==',true).get().catch(()=>null);
   if (snap && !snap.empty) {
     return snap.docs.map(d=>`<option value="${d.data().name}">${d.data().name}</option>`).join('');
   }
@@ -5029,13 +5031,14 @@ function showAddProcessModal() {
   const plantOpts=S.plants.slice(1).map(p=>`<option value="${p}">${p}</option>`).join('');
   showModal(`<div class="modal-title">Add Process <button onclick="closeModal()" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>
     <div class="form-row">
-      <div class="form-group"><label class="form-label">Process Name *</label><input class="form-input" id="prName" placeholder="e.g. Injection Moulding"></div>
+      <div class="form-group"><label class="form-label">Process Name *</label><input class="form-input" id="prName" placeholder="e.g. Injection Moulding" autofocus></div>
       <div class="form-group"><label class="form-label">Plant *</label>
-        <select class="form-input" id="prPlant" onchange="loadDeptsForProcess(this.value,'prDept')"><option value="">— Select Plant</option>${plantOpts}</select>
+        <select class="form-input" id="prPlant" onchange="loadDeptsForProcess(this.value,'prDept','prDeptCustom')"><option value="">— Select Plant</option>${plantOpts}</select>
       </div>
     </div>
-    <div class="form-group"><label class="form-label">Department *</label>
-      <select class="form-input" id="prDept"><option value="">Select Plant first</option></select>
+    <div class="form-group"><label class="form-label">Department <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
+      <select class="form-input" id="prDept" style="margin-bottom:4px"><option value="">— Select Plant first</option></select>
+      <input class="form-input" id="prDeptCustom" placeholder="Or type department name…" style="font-size:12px">
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -5043,22 +5046,31 @@ function showAddProcessModal() {
     </div>`);
 }
 
-async function loadDeptsForProcess(plant, deptSelId) {
+async function loadDeptsForProcess(plant, deptSelId, customInputId) {
   const sel=document.getElementById(deptSelId); if(!sel) return;
   sel.innerHTML='<option>Loading…</option>'; sel.disabled=true;
-  if(!plant){sel.innerHTML='<option>Select Plant first</option>'; sel.disabled=false; return;}
+  if(!plant){sel.innerHTML='<option value="">— Select Plant first</option>'; sel.disabled=false; return;}
   const snap=await db.collection('departments').where('plant','==',plant).get().catch(()=>null);
-  const depts=snap?snap.docs.map(d=>d.data().name||d.id):[];
-  sel.innerHTML='<option value="">— Dept</option>'+depts.map(d=>`<option>${d}</option>`).join('');
+  const depts=snap&&!snap.empty?snap.docs.map(d=>d.data().name||d.id):[];
+  if(depts.length===0){
+    sel.innerHTML='<option value="">— No depts configured</option>';
+    if(customInputId){ const ci=document.getElementById(customInputId); if(ci){ ci.style.display=''; ci.placeholder='Type department name'; } }
+  } else {
+    sel.innerHTML='<option value="">— Select Dept</option>'+depts.map(d=>`<option value="${d}">${d}</option>`).join('');
+  }
   sel.disabled=false;
 }
 
 async function saveProcess() {
   const name=document.getElementById('prName').value.trim();
   const plant=document.getElementById('prPlant').value;
-  const dept=document.getElementById('prDept').value;
-  if(!name||!plant||!dept){showToast('Name, plant and department are required','error');return;}
-  await db.collection('processes').add({name,plant,department:dept,active:true,createdAt:firebase.firestore.FieldValue.serverTimestamp(),createdBy:S.user?.uid}).catch(()=>{});
+  const deptSel=document.getElementById('prDept')?.value||'';
+  const deptCustom=document.getElementById('prDeptCustom')?.value?.trim()||'';
+  const dept=deptSel||deptCustom; // dept is optional now
+  if(!name){showToast('Process name is required','error');return;}
+  if(!plant){showToast('Please select a plant','error');return;}
+  const result = await db.collection('processes').add({name,plant,department:dept||'',active:true,createdAt:firebase.firestore.FieldValue.serverTimestamp(),createdBy:S.user?.uid}).catch(e=>{showToast('Save failed: '+e.message,'error');return null;});
+  if(!result) return;
   closeModal(); showToast(`Process "${name}" added!`,'success'); renderProcessMgmt();
 }
 
@@ -5106,7 +5118,9 @@ async function deleteProcess(id,name) {
 async function renderShiftMgmt() {
   const wrap=document.getElementById('shiftMgmtList'); if(!wrap) return;
   wrap.innerHTML='<span style="color:var(--text-muted);font-size:13px">Loading…</span>';
-  const snap=await db.collection('shifts').orderBy('order').get().catch(()=>null);
+  // orderBy('order') needs an index; fall back to unordered if it fails
+  let snap=await db.collection('shifts').orderBy('order').get().catch(()=>null);
+  if(!snap) snap=await db.collection('shifts').get().catch(()=>null);
   if(!snap||snap.empty){
     wrap.innerHTML='<span style="color:var(--text-muted);font-size:13px">No shifts configured. Add shifts to populate the planning dropdown.</span>';
     return;
@@ -5139,7 +5153,8 @@ async function saveShift() {
   const name=document.getElementById('shiftName').value.trim();
   const order=parseInt(document.getElementById('shiftOrder').value)||10;
   if(!name){showToast('Shift name required','error');return;}
-  await db.collection('shifts').add({name,order,active:true,createdAt:firebase.firestore.FieldValue.serverTimestamp(),createdBy:S.user?.uid}).catch(()=>{});
+  const result = await db.collection('shifts').add({name,order,active:true,createdAt:firebase.firestore.FieldValue.serverTimestamp(),createdBy:S.user?.uid}).catch(e=>{showToast('Save failed: '+e.message,'error');console.error('saveShift error:',e);return null;});
+  if(!result) return;
   closeModal(); showToast(`Shift "${name}" added!`,'success'); renderShiftMgmt();
 }
 
