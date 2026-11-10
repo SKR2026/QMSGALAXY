@@ -1669,22 +1669,42 @@ async function initDashboardCharts() {
 // ─── AUDIT REPORT ─────────────────────────────────────────────────────────────
 // ISO clause groups used for the matrix header
 // Fixed clause groups for Audit Report matrix (Polyplastics template)
-const AR_GROUPS = [
-  { group:'7.*', subs:['7.2','7.4'] },
-  { group:'8.*', subs:['8.1','8.5'] },
-  { group:'9.*', subs:['9.1'] },
-  { group:'10.*', subs:['10.2'] },
-];
-// Flat list of all sub-clauses in order
-const AR_SUBS = AR_GROUPS.flatMap(g=>g.subs);
-// Map a raw clause string to the nearest AR_SUBS key (prefix match)
+// AR_GROUPS and AR_SUBS are built dynamically from live findings inside renderAuditReport()
+// _arClauseKey uses the live AR_SUBS computed per render
+let AR_GROUPS = [], AR_SUBS = [];
 function _arClauseKey(raw){
   const s = String(raw||'').trim();
   for(const sub of AR_SUBS){ if(s===sub||s.startsWith(sub+'.')||s.startsWith(sub+' ')) return sub; }
-  // fallback: try first two segments
   const twoSeg = s.split('.').slice(0,2).join('.');
   if(AR_SUBS.includes(twoSeg)) return twoSeg;
   return null;
+}
+function _buildArGroups(findings){
+  // Collect all unique 2-segment clause keys from findings
+  const subSet = new Set();
+  findings.forEach(f=>{
+    const raw = String(f.clause||f.clauseNo||f.isoClause||'').trim();
+    if(!raw) return;
+    const twoSeg = raw.split('.').slice(0,2).join('.');
+    if(/^\d+\.\d+/.test(twoSeg)) subSet.add(twoSeg);
+  });
+  if(!subSet.size) return; // keep existing if no findings
+  // Sort numerically
+  const allSubs = [...subSet].sort((a,b)=>{
+    const [am,as_]=a.split('.').map(Number);
+    const [bm,bs_]=b.split('.').map(Number);
+    return am!==bm?am-bm:as_-bs_;
+  });
+  // Group by major clause number
+  const groupMap = {};
+  allSubs.forEach(sub=>{
+    const major = sub.split('.')[0];
+    if(!groupMap[major]) groupMap[major]=[];
+    groupMap[major].push(sub);
+  });
+  AR_GROUPS = Object.keys(groupMap).sort((a,b)=>Number(a)-Number(b))
+    .map(m=>({ group:m+'.*', subs:groupMap[m] }));
+  AR_SUBS = AR_GROUPS.flatMap(g=>g.subs);
 }
 
 async function renderAuditReport() {
@@ -1750,6 +1770,7 @@ async function renderAuditReport() {
   </div>`).join('');
 
   // ── Build dept × sub-clause matrix ───────────────────────────────────────────
+  _buildArGroups(findings); // derive clause columns from live findings
   const deptAbbr = {};
   // matrix[dept][subClause] = {mi, obs, ma}
   const matrix = {};
@@ -1768,9 +1789,13 @@ async function renderAuditReport() {
   });
   const depts = Object.keys(matrix).sort();
 
-  // ── Sample data if no live findings ──────────────────────────────────────────
-  const useSample = false; // never show sample data — show empty matrix when no findings
+  // ── No findings: show empty state ────────────────────────────────────────────
+  const useSample = false;
   const renderDepts=depts, renderMatrix=matrix;
+  if(!AR_SUBS.length){
+    document.getElementById('arMatrixBody').innerHTML='<tr><td colspan="4" style="padding:16px;text-align:center;color:#64748B;font-size:13px">ℹ No findings found for the selected filters. Clause columns will appear automatically once findings are recorded.</td></tr>';
+    return;
+  }
 
   // ── Matrix table HTML (Polyplastics template) ─────────────────────────────────
   // Styles
@@ -4736,16 +4761,18 @@ async function clearDummyData() {
     // Clear the meta doc
     await db.collection('appSettings').doc('dummyMeta').delete().catch(()=>{});
 
-    // Also wipe all kpiSnapshots (not tagged _isDummy but created by dummy fill)
-    _dummyProg('Clearing kpiSnapshots…');
-    let ksnap = await db.collection('kpiSnapshots').limit(400).get().catch(()=>null);
-    while(ksnap && !ksnap.empty){
-      const b=db.batch();
-      ksnap.docs.forEach(d=>b.delete(d.ref));
-      await b.commit();
-      total+=ksnap.size;
-      ksnap=await db.collection('kpiSnapshots').limit(400).get().catch(()=>null);
-    }
+    // Also wipe kpiSnapshots if permitted
+    try {
+      _dummyProg('Clearing kpiSnapshots…');
+      let ksnap = await db.collection('kpiSnapshots').limit(400).get().catch(()=>null);
+      while(ksnap && !ksnap.empty){
+        const b=db.batch();
+        ksnap.docs.forEach(d=>b.delete(d.ref));
+        await b.commit();
+        total+=ksnap.size;
+        ksnap=await db.collection('kpiSnapshots').limit(400).get().catch(()=>null);
+      }
+    } catch(e){ console.warn('kpiSnapshots clear skipped:',e.message); }
 
     if(prog) prog.style.display='none';
     if(clearBtn) clearBtn.disabled=false;
