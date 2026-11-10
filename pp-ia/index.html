@@ -541,7 +541,7 @@ select.form-input{cursor:pointer}
 <div id="ncListView">
 <div class="page-title">Non-Conformities</div>
 <div class="page-sub">Track and manage non-conformance reports</div>
-<div class="toolbar"><div class="search-bar"><span class="material-icons">search</span><input type="text" placeholder="Search NCs..."></div><select class="filter-select"><option>All Type</option><option>Major NC</option><option>Minor NC</option></select><button class="btn btn-primary" onclick="showRaiseNCModal()"><span class="material-icons">add</span>Raise NC</button></div>
+<div class="toolbar"><div class="search-bar"><span class="material-icons">search</span><input type="text" placeholder="Search NCs..."></div><select class="filter-select"><option>All Type</option><option>Major NC</option><option>Minor NC</option></select><button class="btn btn-secondary" id="publishNcBtn" onclick="showPublishNCsModal()" style="display:none"><span class="material-icons" style="font-size:14px;vertical-align:middle">send</span> Publish NCs <span id="publishNcCount" style="background:#DC2626;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px">0</span></button><button class="btn btn-primary" onclick="showRaiseNCModal()"><span class="material-icons">add</span>Raise NC</button></div>
 <table><thead><tr><th>NC ID</th><th>Description</th><th>Clause</th><th>Plant</th><th>Type</th><th>Date</th><th>Auditee</th><th>Stage</th><th>Actions</th></tr></thead><tbody id="ncTbl"></tbody></table>
 </div><!-- /ncListView -->
 
@@ -2801,7 +2801,8 @@ async function renderNC() {
   document.getElementById('ncListView').style.display='';
   document.getElementById('ncDetailView').style.display='none';
   document.getElementById('ncTbl').innerHTML = loadingRow(9);
-  let q = db.collection('findings').where('type','in',['Major NC','Minor NC']).orderBy('createdAt','desc').limit(100);
+  _refreshPublishNcBtn();
+  let q = db.collection('findings').where('type','in',['Major NC','Minor NC','OI']).orderBy('createdAt','desc').limit(100);
   if (S.selectedPlant !== 'All Plants') q = q.where('plant','==',S.selectedPlant);
   const snap = await q.get().catch(()=>null);
   if (!snap) { document.getElementById('ncTbl').innerHTML = loadingRow(9); return; }
@@ -3979,8 +3980,9 @@ function showRaiseNCModal() {
     <div class="form-group"><label class="form-label">Description *</label><textarea class="form-input" id="ncDesc" rows="3" placeholder="Describe the non-conformity in detail..."></textarea></div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Department</label><input class="form-input" id="ncDept" placeholder="e.g. Quality"></div>
-      <div class="form-group"><label class="form-label">Assigned To</label><input class="form-input" id="ncAssignee" placeholder="Name or email"></div>
+      <div class="form-group"><label class="form-label">Assigned To (Name)</label><input class="form-input" id="ncAssignee" placeholder="Name"></div>
     </div>
+    <div class="form-group"><label class="form-label">Assignee Email</label><input class="form-input" type="email" id="ncAssigneeEmail" placeholder="auditee@company.com"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" onclick="saveNC()">Raise NC</button>
@@ -3999,13 +4001,124 @@ async function saveNC() {
     clause:  document.getElementById('ncClause')?.value||'',
     department: document.getElementById('ncDept')?.value||'',
     assigneeName: document.getElementById('ncAssignee')?.value||'',
-    status: 'Open', severity: type==='Major NC'?'Major':'Minor',
+    assigneeEmail: document.getElementById('ncAssigneeEmail')?.value?.trim()||'',
+    status: 'Open', severity: type==='Major NC'?'Major':type==='Minor NC'?'Minor':'OI',
     raisedBy: S.user?.uid, raisedByName: S.userDoc?.name||S.user?.email||'',
     createdAt: firebase.firestore.FieldValue.serverTimestamp(),
     findingNo: 'NC-' + Date.now().toString(36).toUpperCase(),
+    published: false,
   };
   await db.collection('findings').add(data).catch(e=>{ showToast('Error: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent='Raise NC';} return; });
-  closeModal(); showToast('NC raised successfully!','success'); renderNC();
+  closeModal();
+  showToast('NC saved — click "Publish NCs" to send notification email', 'info');
+  renderNC();
+  _refreshPublishNcBtn();
+}
+
+async function _refreshPublishNcBtn() {
+  const snap = await db.collection('findings').where('published','==',false).get().catch(()=>null);
+  const count = snap ? snap.size : 0;
+  const btn = document.getElementById('publishNcBtn');
+  const badge = document.getElementById('publishNcCount');
+  if (btn) btn.style.display = count > 0 ? '' : 'none';
+  if (badge) badge.textContent = count;
+}
+
+async function showPublishNCsModal() {
+  const snap = await db.collection('findings').where('published','==',false).get().catch(()=>null);
+  if (!snap || snap.empty) { showToast('No unpublished NCs','info'); return; }
+  const ncs = snap.docs.map(d=>({id:d.id,...d.data()}));
+
+  // Collect unique assignee emails from NCs
+  const emails = [...new Set(ncs.map(n=>n.assigneeEmail).filter(Boolean))];
+
+  const rows = ncs.map((n,i)=>
+    '<tr style="font-size:12px">'
+    + '<td style="padding:5px 8px;border-bottom:1px solid #eee">' + (n.findingNo||n.id) + '</td>'
+    + '<td style="padding:5px 8px;border-bottom:1px solid #eee"><span style="background:' + (n.type==='Major NC'?'#FEF2F2':n.type==='Minor NC'?'#FFFBEB':'#EFF6FF') + ';color:' + (n.type==='Major NC'?'#DC2626':n.type==='Minor NC'?'#D97706':'#2563EB') + ';padding:1px 7px;border-radius:10px;font-size:11px">' + (n.type||'NC') + '</span></td>'
+    + '<td style="padding:5px 8px;border-bottom:1px solid #eee">' + (n.plant||'—') + '</td>'
+    + '<td style="padding:5px 8px;border-bottom:1px solid #eee">' + (n.department||'—') + '</td>'
+    + '<td style="padding:5px 8px;border-bottom:1px solid #eee;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + (n.description||'—') + '</td>'
+    + '</tr>'
+  ).join('');
+
+  showModal(
+    '<div class="modal-title">Publish NC Notifications <button onclick="closeModal()" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>'
+    + '<p style="font-size:13px;color:var(--text-muted);margin:0 0 12px">The following <strong>' + ncs.length + ' NC(s)</strong> will be published and a single consolidated notification email will be sent.</p>'
+    + '<div style="overflow-x:auto;border:1px solid var(--border);border-radius:8px;margin-bottom:14px"><table style="width:100%;border-collapse:collapse"><thead><tr style="background:#F8FAFC;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase"><th style="padding:6px 8px;text-align:left">NC ID</th><th style="padding:6px 8px;text-align:left">Type</th><th style="padding:6px 8px;text-align:left">Plant</th><th style="padding:6px 8px;text-align:left">Dept</th><th style="padding:6px 8px;text-align:left">Description</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+    + '<div class="form-group"><label class="form-label">Recipient Email(s) <span style="color:var(--text-muted);font-weight:400">(comma-separated; leave blank to skip email)</span></label>'
+    + '<input class="form-input" id="publishNcEmails" placeholder="dept-head@company.com, mr@company.com" value="' + emails.join(', ') + '"></div>'
+    + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">'
+    + '<button class="btn btn-secondary" onclick="closeModal()">Cancel</button>'
+    + '<button class="btn btn-primary" onclick="publishNCs(' + JSON.stringify(ncs.map(n=>n.id)).replace(/"/g,"'") + ')"><span class="material-icons" style="font-size:14px;vertical-align:middle">send</span> Publish & Notify</button>'
+    + '</div>'
+  );
+}
+
+async function publishNCs(ids) {
+  const emailsVal = document.getElementById('publishNcEmails')?.value?.trim()||'';
+  const btn = document.querySelector('#modalBody .btn-primary');
+  if (btn) { btn.disabled=true; btn.textContent='Publishing...'; }
+
+  // Fetch NC details
+  const ncs = [];
+  for (const id of ids) {
+    const d = await db.collection('findings').doc(id).get().catch(()=>null);
+    if (d && d.exists) ncs.push({id:d.id,...d.data()});
+  }
+
+  // Send consolidated email if recipients provided
+  if (emailsVal) {
+    const recipients = emailsVal.split(',').map(e=>e.trim()).filter(Boolean);
+    const rows = ncs.map(n=>
+      '<tr>'
+      + '<td style="padding:6px 10px;border-bottom:1px solid #eee;font-weight:600">' + (n.findingNo||n.id) + '</td>'
+      + '<td style="padding:6px 10px;border-bottom:1px solid #eee">' + (n.type||'NC') + '</td>'
+      + '<td style="padding:6px 10px;border-bottom:1px solid #eee">' + (n.plant||'—') + '</td>'
+      + '<td style="padding:6px 10px;border-bottom:1px solid #eee">' + (n.department||'—') + '</td>'
+      + '<td style="padding:6px 10px;border-bottom:1px solid #eee">' + (n.clause||'—') + '</td>'
+      + '<td style="padding:6px 10px;border-bottom:1px solid #eee">' + (n.description||'—') + '</td>'
+      + '</tr>'
+    ).join('');
+
+    const html = '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#f4f4f4;margin:0;padding:20px">'
+      + '<div style="max-width:680px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08)">'
+      + '<div style="background:#1e3a8a;padding:20px 24px;color:#fff"><div style="font-size:18px;font-weight:700">NC Audit Findings — Consolidated Report</div>'
+      + '<div style="font-size:12px;opacity:.8;margin-top:4px">Group Audit Management System · ' + new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) + '</div></div>'
+      + '<div style="padding:24px">'
+      + '<p style="margin:0 0 16px;color:#374151">The following <strong>' + ncs.length + ' Non-Conformit' + (ncs.length===1?'y':'ies') + '</strong> ha' + (ncs.length===1?'s':'ve') + ' been raised and require your attention and corrective action.</p>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:13px;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden">'
+      + '<thead><tr style="background:#f9fafb;font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase">'
+      + '<th style="padding:8px 10px;text-align:left">NC ID</th><th style="padding:8px 10px;text-align:left">Type</th>'
+      + '<th style="padding:8px 10px;text-align:left">Plant</th><th style="padding:8px 10px;text-align:left">Dept</th>'
+      + '<th style="padding:8px 10px;text-align:left">Clause</th><th style="padding:8px 10px;text-align:left">Description</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>'
+      + '<p style="margin:20px 0 0;font-size:12px;color:#9ca3af">Please log in to the Audit Management System to initiate corrective actions. This is an automated notification — do not reply.</p>'
+      + '</div></div></body></html>';
+
+    try {
+      const cfgSnap = await db.collection('appSettings').doc('emailConfig').get().catch(()=>null);
+      const cfg = cfgSnap?.data()||{};
+      if (cfg.gmailAddress && cfg.gmailAppPwd) {
+        const fnR = firebase.app().functions('asia-south1');
+        const fn = fnR.httpsCallable('sendAuditScheduleEmail');
+        for (const to of recipients) {
+          await fn({to, subject:'Audit NC Findings — ' + ncs.length + ' Non-Conformit' + (ncs.length===1?'y':'ies') + ' Raised', html, gmailAddress:cfg.gmailAddress, gmailAppPwd:cfg.gmailAppPwd}).catch(e=>console.error('Email failed:',e));
+        }
+      }
+    } catch(e) { console.error('Email error:',e); }
+  }
+
+  // Mark all as published
+  const batch = db.batch();
+  ids.forEach(id => batch.update(db.collection('findings').doc(id), {published:true, publishedAt:firebase.firestore.FieldValue.serverTimestamp(), publishedBy:S.user?.uid||''}));
+  await batch.commit().catch(e=>showToast('Error: '+e.message,'error'));
+
+  closeModal();
+  showToast(emailsVal ? 'NCs published & notification sent!' : 'NCs published (no email — no recipients entered)', 'success');
+  logActivity('Published ' + ids.length + ' NC(s)', 'NC', '');
+  renderNC();
+  _refreshPublishNcBtn();
 }
 
 // ─── SCHEDULE SUPPLIER AUDIT MODAL ────────────────────────────────────────────
