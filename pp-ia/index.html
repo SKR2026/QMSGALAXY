@@ -537,10 +537,31 @@ select.form-input{cursor:pointer}
 
 <!-- NC -->
 <div id="panel-nc" class="module-panel">
+<div id="ncListView">
 <div class="page-title">Non-Conformities</div>
 <div class="page-sub">Track and manage non-conformance reports</div>
 <div class="toolbar"><div class="search-bar"><span class="material-icons">search</span><input type="text" placeholder="Search NCs..."></div><select class="filter-select"><option>All Type</option><option>Major NC</option><option>Minor NC</option></select><button class="btn btn-primary" onclick="showRaiseNCModal()"><span class="material-icons">add</span>Raise NC</button></div>
-<table><thead><tr><th>NC ID</th><th>Description</th><th>Standard Clause</th><th>Plant</th><th>Type</th><th>Date</th><th>Owner</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ncTbl"></tbody></table>
+<table><thead><tr><th>NC ID</th><th>Description</th><th>Clause</th><th>Plant</th><th>Type</th><th>Date</th><th>Auditee</th><th>Stage</th><th>Actions</th></tr></thead><tbody id="ncTbl"></tbody></table>
+</div><!-- /ncListView -->
+
+<!-- NC DETAIL VIEW -->
+<div id="ncDetailView" style="display:none">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
+    <button class="btn btn-secondary btn-sm" onclick="closeNCDetail()"><span class="material-icons" style="font-size:16px;vertical-align:middle">arrow_back</span> Back to NC List</button>
+    <span id="ncDetailTitle" style="font-size:18px;font-weight:700;color:var(--text-primary)"></span>
+    <span id="ncDetailStage" class="badge" style="margin-left:auto"></span>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 340px;gap:20px;align-items:start">
+    <!-- Left: NC info + action form -->
+    <div>
+      <div class="card" id="ncInfoCard" style="margin-bottom:16px"></div>
+      <div class="card" id="ncActionCard" style="display:none"></div>
+      <div class="card" id="ncApprovalCard" style="display:none;margin-top:16px"></div>
+    </div>
+    <!-- Right: Timeline -->
+    <div class="card" id="ncTimelineCard"></div>
+  </div>
+</div>
 </div>
 
 <!-- RCA -->
@@ -2307,7 +2328,7 @@ function _showPlanSavedBanner(docs, collection) {
       </div>
 
       <div style="display:flex;gap:12px;justify-content:center">
-        <button class="btn btn-secondary" onclick="renderPlanning()">Back to Planning</button>
+        <button class="btn btn-secondary" onclick="navigate('planning')">Back to Planning</button>
         <button class="btn btn-primary" id="publishScheduleBtn" onclick="publishAuditSchedule(${JSON.stringify(docs.map(d=>d.id)).replace(/"/g,"'")}, '${collection}')"
           style="background:#7c3aed;border-color:#7c3aed;gap:6px">
           <span class="material-icons" style="font-size:16px;vertical-align:middle">send</span>
@@ -2652,21 +2673,246 @@ async function deleteFinding(id, label) {
 }
 
 // ─── NC ───────────────────────────────────────────────────────────────────────
+const NC_STAGES = ['Open','Auditee Action','Dept Head Review','Auditor Review','MR Review','Closed'];
+const NC_STAGE_COLOR = { 'Open':'badge-amber','Auditee Action':'badge-blue','Dept Head Review':'badge-blue','Auditor Review':'badge-blue','MR Review':'badge-blue','Closed':'badge-green' };
+
 async function renderNC() {
+  document.getElementById('ncListView').style.display='';
+  document.getElementById('ncDetailView').style.display='none';
   document.getElementById('ncTbl').innerHTML = loadingRow(9);
-  let q = db.collection('findings').where('type','in',['Major NC','Minor NC']).orderBy('createdAt','desc').limit(50);
+  let q = db.collection('findings').where('type','in',['Major NC','Minor NC']).orderBy('createdAt','desc').limit(100);
   if (S.selectedPlant !== 'All Plants') q = q.where('plant','==',S.selectedPlant);
   const snap = await q.get().catch(()=>null);
   if (!snap) { document.getElementById('ncTbl').innerHTML = loadingRow(9); return; }
   document.getElementById('ncTbl').innerHTML = snap.empty
     ? '<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text-muted)">No non-conformities found</td></tr>'
     : snap.docs.map(d => { const f={id:d.id,...d.data()};
-        return `<tr><td><strong>${f.findingNo||f.id}</strong></td><td>${f.description||''}</td><td>${f.clause||'-'}</td>
-          <td>${f.plant}</td><td><span class="badge badge-amber">${f.type}</span></td>
-          <td>${formatDate(f.createdAt)}</td><td>${f.assigneeName||'-'}</td>
-          <td><span class="badge ${f.status==='Open'?'badge-amber':'badge-blue'}">${f.status}</span></td>
-          <td><button class="btn btn-sm btn-secondary">View</button></td></tr>`;
+        const stage = f.workflowStage||'Open';
+        const stageColor = NC_STAGE_COLOR[stage]||'badge-grey';
+        const typeBadge = f.type==='Major NC'?'badge-red':'badge-amber';
+        return `<tr>
+          <td><strong>${f.findingNo||f.id.slice(-6).toUpperCase()}</strong></td>
+          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.description||''}">${f.description||''}</td>
+          <td>${f.clause||f.clauseNo||'-'}</td>
+          <td>${f.plant||'-'}</td>
+          <td><span class="badge ${typeBadge}">${f.type}</span></td>
+          <td>${formatDate(f.createdAt)}</td>
+          <td>${f.auditeeName||f.assigneeName||'-'}</td>
+          <td><span class="badge ${stageColor}">${stage}</span></td>
+          <td><button class="btn btn-sm btn-primary" onclick="openNCDetail('${d.id}')">
+            <span class="material-icons" style="font-size:14px;vertical-align:middle">open_in_new</span> Open</button></td></tr>`;
       }).join('');
+}
+
+function closeNCDetail(){ renderNC(); }
+
+async function openNCDetail(ncId) {
+  document.getElementById('ncListView').style.display='none';
+  document.getElementById('ncDetailView').style.display='';
+  document.getElementById('ncInfoCard').innerHTML='<div class="spinner" style="margin:24px auto"></div>';
+  document.getElementById('ncTimelineCard').innerHTML='<div class="spinner" style="margin:24px auto"></div>';
+  document.getElementById('ncActionCard').style.display='none';
+  document.getElementById('ncApprovalCard').style.display='none';
+
+  const snap = await db.collection('findings').doc(ncId).get().catch(()=>null);
+  if (!snap||!snap.exists) { showToast('NC not found','error'); closeNCDetail(); return; }
+  const nc = { id:ncId, ...snap.data() };
+  const stage = nc.workflowStage||'Open';
+
+  // Title & stage badge
+  document.getElementById('ncDetailTitle').textContent = (nc.findingNo||ncId.slice(-6).toUpperCase())+' – '+(nc.description||'').slice(0,60);
+  const sb = document.getElementById('ncDetailStage');
+  sb.textContent = stage; sb.className = 'badge '+(NC_STAGE_COLOR[stage]||'badge-grey');
+
+  // ── Info card
+  document.getElementById('ncInfoCard').innerHTML = `
+    <div class="card-title">NC Details</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 20px;font-size:13px">
+      ${[['Plant',nc.plant],['Department',nc.department||nc.dept],['Type',nc.type],['Clause',nc.clause||nc.clauseNo||'—'],
+         ['Auditor',nc.auditorName||nc.raisedByName],['Auditee',nc.auditeeName||nc.assigneeName],
+         ['Raised On',formatDate(nc.createdAt)],['Severity',nc.severity||nc.type]
+        ].map(([l,v])=>`<div><span style="color:var(--text-muted);font-size:11px;text-transform:uppercase">${l}</span><div style="font-weight:600;margin-top:2px">${v||'—'}</div></div>`).join('')}
+    </div>
+    <div style="margin-top:12px;padding:10px 12px;background:#FEF9C3;border-radius:6px;font-size:13px;color:#78350F">
+      <strong>Observation:</strong> ${nc.description||'—'}
+    </div>
+    ${nc.evidence?`<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Evidence: ${nc.evidence}</div>`:''}`;
+
+  // ── Timeline card
+  _renderNCTimeline(nc);
+
+  // ── Role-based action cards
+  const uid = S.user?.uid;
+  const role = S.userDoc?.role||'';
+  const userDept = S.userDoc?.department||'';
+  const userPlant = S.userDoc?.plant||'All Plants';
+  const isAuditor = nc.raisedBy===uid || nc.auditorId===uid || role==='Auditor'||role==='superadmin'||role==='Super Admin';
+  const isAuditee = nc.auditeeId===uid || nc.assigneeId===uid;
+  const isDeptHead = (role==='Dept Head') && (nc.department===userDept||nc.plant===userPlant||userPlant==='All Plants');
+  const isMR      = role==='Plant Admin'||role==='superadmin'||role==='Super Admin';
+
+  const ap = document.getElementById('ncActionCard');
+  const appCard = document.getElementById('ncApprovalCard');
+
+  if(stage==='Open'||stage==='Auditee Action'){
+    ap.style.display=''; ap.innerHTML=`
+      <div class="card-title">Action Plan <span style="font-size:11px;font-weight:400;color:var(--text-muted)">(Auditee to fill)</span></div>
+      <div class="form-group"><label class="form-label">Root Cause *</label>
+        <textarea class="form-input" id="nc_rootCause" rows="2" placeholder="Why did this NC occur?">${nc.actionPlan?.rootCause||''}</textarea></div>
+      <div class="form-group"><label class="form-label">Immediate Correction *</label>
+        <textarea class="form-input" id="nc_correction" rows="2" placeholder="What was done immediately to fix the problem?">${nc.actionPlan?.correction||''}</textarea></div>
+      <div class="form-group"><label class="form-label">Corrective Action *</label>
+        <textarea class="form-input" id="nc_correctiveAction" rows="2" placeholder="What will be done to prevent recurrence?">${nc.actionPlan?.correctiveAction||''}</textarea></div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Target Date *</label>
+          <input class="form-input" type="date" id="nc_targetDate" value="${nc.actionPlan?.targetDate||''}"></div>
+        <div class="form-group"><label class="form-label">Responsible Person</label>
+          <input class="form-input" id="nc_responsible" value="${nc.actionPlan?.responsible||S.userDoc?.name||''}"></div>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:8px">
+        <button class="btn btn-primary" onclick="ncSubmitActionPlan('${ncId}')">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">send</span> Submit to Dept Head</button>
+        <button class="btn btn-secondary" onclick="ncSaveDraft('${ncId}')">Save Draft</button>
+      </div>`;
+  } else if(nc.actionPlan){
+    ap.style.display=''; ap.innerHTML=`
+      <div class="card-title">Action Plan</div>
+      <div style="display:grid;gap:10px;font-size:13px">
+        ${[['Root Cause',nc.actionPlan.rootCause],['Immediate Correction',nc.actionPlan.correction],
+           ['Corrective Action',nc.actionPlan.correctiveAction],['Target Date',nc.actionPlan.targetDate],
+           ['Responsible',nc.actionPlan.responsible]
+          ].map(([l,v])=>`<div><span style="color:var(--text-muted);font-size:11px;text-transform:uppercase">${l}</span>
+          <div style="margin-top:2px;padding:6px 10px;background:#F8FAFC;border-radius:4px;border:1px solid var(--border)">${v||'—'}</div></div>`).join('')}
+      </div>`;
+  }
+
+  // Approval / Return card
+  let approvalHtml='';
+  if(stage==='Dept Head Review' && isDeptHead){
+    approvalHtml=`<div class="card-title">Dept Head Review</div>
+      <div class="form-group"><label class="form-label">Comments</label>
+        <textarea class="form-input" id="nc_reviewComment" rows="2" placeholder="Add comments..."></textarea></div>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-primary" style="background:#16a34a;border-color:#16a34a" onclick="ncApprove('${ncId}','Auditor Review','Dept Head approved')">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">check_circle</span> Approve → Send to Auditor</button>
+        <button class="btn btn-secondary" style="border-color:#dc2626;color:#dc2626" onclick="ncReturn('${ncId}','Auditee Action')">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">undo</span> Return to Auditee</button>
+      </div>`;
+  } else if(stage==='Auditor Review' && isAuditor){
+    approvalHtml=`<div class="card-title">Auditor Review</div>
+      <div class="form-group"><label class="form-label">Comments</label>
+        <textarea class="form-input" id="nc_reviewComment" rows="2" placeholder="Add comments..."></textarea></div>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-primary" style="background:#16a34a;border-color:#16a34a" onclick="ncApprove('${ncId}','MR Review','Auditor approved')">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">check_circle</span> Approve → Send to MR</button>
+        <button class="btn btn-secondary" style="border-color:#dc2626;color:#dc2626" onclick="ncReturn('${ncId}','Auditee Action')">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">undo</span> Return to Auditee</button>
+      </div>`;
+  } else if(stage==='MR Review' && isMR){
+    approvalHtml=`<div class="card-title">MR Final Approval</div>
+      <div class="form-group"><label class="form-label">Comments</label>
+        <textarea class="form-input" id="nc_reviewComment" rows="2" placeholder="Add comments..."></textarea></div>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-primary" style="background:#16a34a;border-color:#16a34a" onclick="ncApprove('${ncId}','Closed','MR approved — NC Closed')">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">verified</span> Close NC</button>
+        <button class="btn btn-secondary" style="border-color:#dc2626;color:#dc2626" onclick="ncReturn('${ncId}','Auditee Action')">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">undo</span> Return to Auditee</button>
+      </div>`;
+  }
+  if(approvalHtml){ appCard.style.display=''; appCard.innerHTML=approvalHtml; }
+}
+
+function _renderNCTimeline(nc){
+  const timeline = Array.isArray(nc.timeline) ? nc.timeline : [];
+  const stageIcons = { 'Open':'flag','Auditee Action':'edit','Dept Head Review':'supervisor_account','Auditor Review':'manage_accounts','MR Review':'verified_user','Closed':'check_circle' };
+  const stageColors = { 'Open':'#F59E0B','Auditee Action':'#3B82F6','Dept Head Review':'#8B5CF6','Auditor Review':'#0EA5E9','MR Review':'#10B981','Closed':'#16A34A' };
+  const currentStage = nc.workflowStage||'Open';
+  const currentIdx = NC_STAGES.indexOf(currentStage);
+
+  let html = '<div class="card-title">Workflow Timeline</div><div style="position:relative;padding-left:28px">';
+  NC_STAGES.forEach((stage,i)=>{
+    const entry = timeline.find(t=>t.stage===stage);
+    const isActive = i===currentIdx;
+    const isDone = i<currentIdx || currentStage==='Closed';
+    const isFuture = i>currentIdx && currentStage!=='Closed';
+    const color = isDone||isActive ? (stageColors[stage]||'#64748B') : '#CBD5E1';
+    const dot = isDone ? '✓' : (isActive ? '●' : '○');
+    html += `<div style="position:relative;margin-bottom:20px">
+      <div style="position:absolute;left:-28px;top:0;width:20px;height:20px;border-radius:50%;background:${isDone?color:'#fff'};border:2px solid ${color};display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:${isDone?'#fff':color}">${isDone?'✓':''}</div>
+      ${i<NC_STAGES.length-1?`<div style="position:absolute;left:-19px;top:20px;width:2px;height:calc(100% + 10px);background:${isDone&&i<currentIdx-1?color:'#E2E8F0'}"></div>`:''}
+      <div style="font-size:12px;font-weight:${isActive?'700':'500'};color:${isFuture?'#94A3B8':'var(--text-primary)'}">
+        ${stage}${isActive?' <span style="font-size:10px;padding:1px 6px;background:#EFF6FF;color:#3B82F6;border-radius:10px;font-weight:600">Current</span>':''}
+      </div>
+      ${entry?`<div style="font-size:11px;color:var(--text-muted);margin-top:2px">${entry.byName||''} · ${entry.ts?new Date(entry.ts.seconds*1000).toLocaleDateString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}):''}</div>`:''}
+      ${entry&&entry.comment?`<div style="font-size:11px;color:#1E40AF;margin-top:3px;padding:4px 8px;background:#EFF6FF;border-radius:4px">"${entry.comment}"</div>`:''}
+      ${entry&&entry.action==='returned'?`<div style="font-size:11px;color:#DC2626;margin-top:2px">↩ Returned</div>`:''}
+    </div>`;
+  });
+  html += '</div>';
+  document.getElementById('ncTimelineCard').innerHTML = html;
+}
+
+async function ncSubmitActionPlan(ncId){
+  const rootCause = document.getElementById('nc_rootCause')?.value?.trim();
+  const correction = document.getElementById('nc_correction')?.value?.trim();
+  const correctiveAction = document.getElementById('nc_correctiveAction')?.value?.trim();
+  const targetDate = document.getElementById('nc_targetDate')?.value;
+  const responsible = document.getElementById('nc_responsible')?.value?.trim();
+  if(!rootCause||!correction||!correctiveAction||!targetDate){ showToast('Please fill all required fields','error'); return; }
+  const entry = { stage:'Auditee Action', action:'submitted', by:S.user.uid, byName:S.userDoc?.name||S.user.email,
+    comment:'Action plan submitted', ts:firebase.firestore.Timestamp.now() };
+  await db.collection('findings').doc(ncId).update({
+    workflowStage:'Dept Head Review',
+    actionPlan:{ rootCause, correction, correctiveAction, targetDate, responsible, submittedAt:firebase.firestore.FieldValue.serverTimestamp(), submittedBy:S.user.uid, submittedByName:S.userDoc?.name||S.user.email },
+    timeline: firebase.firestore.FieldValue.arrayUnion(entry),
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  });
+  logActivity('NC Action Plan Submitted', 'nc', ncId);
+  showToast('Action plan submitted to Dept Head ✓','success');
+  openNCDetail(ncId);
+}
+
+async function ncSaveDraft(ncId){
+  const rootCause = document.getElementById('nc_rootCause')?.value?.trim();
+  const correction = document.getElementById('nc_correction')?.value?.trim();
+  const correctiveAction = document.getElementById('nc_correctiveAction')?.value?.trim();
+  const targetDate = document.getElementById('nc_targetDate')?.value;
+  const responsible = document.getElementById('nc_responsible')?.value?.trim();
+  await db.collection('findings').doc(ncId).update({
+    actionPlan:{ rootCause, correction, correctiveAction, targetDate, responsible },
+    workflowStage:'Auditee Action',
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  });
+  showToast('Draft saved','success');
+}
+
+async function ncApprove(ncId, nextStage, comment){
+  const extraComment = document.getElementById('nc_reviewComment')?.value?.trim()||'';
+  const entry = { stage: nextStage==='Closed'?(document.getElementById('ncDetailStage')?.textContent||'MR Review'):document.getElementById('ncDetailStage')?.textContent,
+    action:'approved', by:S.user.uid, byName:S.userDoc?.name||S.user.email,
+    comment: extraComment||(comment||'Approved'), ts:firebase.firestore.Timestamp.now() };
+  const updateData = { workflowStage:nextStage, timeline:firebase.firestore.FieldValue.arrayUnion(entry), updatedAt:firebase.firestore.FieldValue.serverTimestamp() };
+  if(nextStage==='Closed') updateData.status='Closed';
+  await db.collection('findings').doc(ncId).update(updateData);
+  logActivity('NC '+comment, 'nc', ncId);
+  showToast(nextStage==='Closed'?'NC Closed ✓':'Approved & forwarded ✓','success');
+  openNCDetail(ncId);
+}
+
+async function ncReturn(ncId, returnToStage){
+  const comment = document.getElementById('nc_reviewComment')?.value?.trim();
+  if(!comment){ showToast('Please add a comment explaining why it is being returned','error'); return; }
+  const currentStage = document.getElementById('ncDetailStage')?.textContent||'';
+  const entry = { stage:currentStage, action:'returned', by:S.user.uid, byName:S.userDoc?.name||S.user.email,
+    comment, ts:firebase.firestore.Timestamp.now() };
+  await db.collection('findings').doc(ncId).update({
+    workflowStage: returnToStage,
+    timeline: firebase.firestore.FieldValue.arrayUnion(entry),
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  });
+  logActivity('NC Returned with comment', 'nc', ncId);
+  showToast('Returned to '+returnToStage+' ✓','info');
+  openNCDetail(ncId);
 }
 
 // ─── RCA ──────────────────────────────────────────────────────────────────────
