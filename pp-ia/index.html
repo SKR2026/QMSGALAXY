@@ -1342,7 +1342,8 @@ function applyRoleVisibility() {
   const role = S.userDoc?.role;
   const isAdmin = role === 'superadmin' || role === 'Super Admin' || role === 'Plant Admin' || role === 'plantadmin';
   const isSuperAdmin = role === 'superadmin' || role === 'Super Admin';
-  document.getElementById('navUsers').style.display    = isSuperAdmin ? 'flex' : 'none';
+  const isPlantAdminRole = role === 'Plant Admin' || role === 'plantadmin';
+  document.getElementById('navUsers').style.display    = (isSuperAdmin || isPlantAdminRole) ? 'flex' : 'none';
   document.getElementById('navSettings').style.display = isAdmin ? 'flex' : 'none';
 }
 
@@ -4584,13 +4585,36 @@ function markNotifRead(id) { db.collection('notifications').doc(id).update({read
 // ─── USERS ────────────────────────────────────────────────────────────────────
 async function renderUsers() {
   document.getElementById('usersTbl').innerHTML = loadingRow(7);
-  const snap = await db.collection('users').orderBy('name').get().catch(()=>null);
+  const myRole = S.userDoc?.role || '';
+  const isSA = myRole === 'superadmin' || myRole === 'Super Admin';
+  const isPA = myRole === 'Plant Admin' || myRole === 'plantadmin';
+  const myPlant = S.userDoc?.plant || '';
+
+  // Plant Admin only sees users from their plant
+  let query = db.collection('users').orderBy('name');
+  if (isPA && !isSA) {
+    query = db.collection('users').where('plant', '==', myPlant).orderBy('name');
+  }
+
+  const snap = await query.get().catch(async () => {
+    // orderBy may fail without index — fallback to unordered
+    const q2 = isSA
+      ? db.collection('users')
+      : db.collection('users').where('plant', '==', myPlant);
+    return q2.get().catch(() => null);
+  });
   if (!snap) return;
-  const rmap={superadmin:'badge-purple','Super Admin':'badge-purple','Plant Admin':'badge-blue','Auditor':'badge-green','Dept Head':'badge-amber','Viewer':'badge-grey',plantadmin:'badge-blue'};
+
+  const rmap={superadmin:'badge-purple','Super Admin':'badge-purple','Plant Admin':'badge-blue','Auditor':'badge-green','Dept Head':'badge-amber','Auditee':'badge-teal','Viewer':'badge-grey',plantadmin:'badge-blue'};
   const rlabel={superadmin:'Super Admin'};
+  // Plant Admin cannot edit/delete SuperAdmin or Plant Admin accounts
+  const paRestrictedRoles = ['superadmin','Super Admin','Plant Admin','plantadmin'];
+
   document.getElementById('usersTbl').innerHTML = snap.empty ? '<tr><td colspan="7" style="text-align:center;padding:40px">No users</td></tr>'
     : snap.docs.map(d=>{ const u={id:d.id,...d.data()};
         const statusBadge = u.status==='Active'?'badge-green':u.status==='Pending'?'badge-amber':'badge-red';
+        // Plant Admin cannot edit SuperAdmin or other Plant Admins
+        const canEditThis = isSA || (isPA && !paRestrictedRoles.includes(u.role));
         return `<tr>
           <td><strong>${u.name||'-'}</strong></td>
           <td style="font-size:12px">${u.email||'-'}</td>
@@ -4599,8 +4623,8 @@ async function renderUsers() {
           <td><span class="badge ${statusBadge}">${u.status||'Active'}</span></td>
           <td style="font-size:12px;color:var(--text-muted)">${u.uid?'✓ Auth linked':'⚠ Pending login'}</td>
           <td style="white-space:nowrap">
-            <button class="btn btn-sm btn-secondary" onclick="editUser('${d.id}')"><span class="material-icons" style="font-size:13px">edit</span></button>
-            <button class="btn btn-sm btn-danger" style="margin-left:4px" onclick="deleteUser('${d.id}','${(u.name||'').replace(/'/g,'')}')"><span class="material-icons" style="font-size:13px">delete</span></button>
+            ${canEditThis ? `<button class="btn btn-sm btn-secondary" onclick="editUser('${d.id}')"><span class="material-icons" style="font-size:13px">edit</span></button>
+            <button class="btn btn-sm btn-danger" style="margin-left:4px" onclick="deleteUser('${d.id}','${(u.name||'').replace(/'/g,'')}')"><span class="material-icons" style="font-size:13px">delete</span></button>` : '<span style="color:var(--text-muted);font-size:11px">View only</span>'}
           </td></tr>`;
       }).join('');
 }
@@ -4609,8 +4633,21 @@ function editUser(id) {
   db.collection('users').doc(id).get().then(doc => {
     if (!doc.exists) return;
     const u = doc.data();
-    const rmap={superadmin:'superadmin','Super Admin':'Super Admin','Plant Admin':'Plant Admin','Auditor':'Auditor','Dept Head':'Dept Head','Viewer':'Viewer',plantadmin:'Plant Admin'};
-    const opts=['superadmin','Plant Admin','Auditor','Dept Head','Viewer'];
+    const myRole = S.userDoc?.role || '';
+    const isSA = myRole === 'superadmin' || myRole === 'Super Admin';
+    const isPA = myRole === 'Plant Admin' || myRole === 'plantadmin';
+    const myPlant = S.userDoc?.plant || '';
+
+    // Role options depend on who is editing
+    const saOpts = ['superadmin','Plant Admin','Auditor','Auditee','Dept Head','Viewer'];
+    const paOpts = ['Auditor','Auditee','Dept Head','Viewer'];
+    const opts = isSA ? saOpts : paOpts;
+
+    // Plant Admin cannot change plant (locked to their plant)
+    const plantField = isSA
+      ? `<select class="form-input" id="euPlant"><option>All Plants</option>${S.plants.slice(1).map(p=>`<option ${u.plant===p?'selected':''}>${p}</option>`).join('')}</select>`
+      : `<input class="form-input" id="euPlant" value="${myPlant}" readonly style="opacity:.7;background:#f5f5f5">`;
+
     openModal(`<div class="modal-title">Edit User <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;font-size:20px;color:#999">×</button></div>
       <div class="form-row">
         <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="euName" value="${u.name||''}"></div>
@@ -4620,9 +4657,7 @@ function editUser(id) {
         <div class="form-group"><label class="form-label">Role</label>
           <select class="form-input" id="euRole">${opts.map(r=>`<option value="${r}" ${u.role===r?'selected':''}>${r==='superadmin'?'Super Admin':r}</option>`).join('')}</select>
         </div>
-        <div class="form-group"><label class="form-label">Plant</label>
-          <select class="form-input" id="euPlant"><option>All Plants</option>${S.plants.slice(1).map(p=>`<option ${u.plant===p?'selected':''}>${p}</option>`).join('')}</select>
-        </div>
+        <div class="form-group"><label class="form-label">Plant</label>${plantField}</div>
       </div>
       <div class="form-row">
         <div class="form-group"><label class="form-label">Status</label>
@@ -4645,17 +4680,57 @@ async function saveUserEdit(id) {
   const plant  = document.getElementById('euPlant').value;
   const status = document.getElementById('euStatus').value;
   if (!name) return showToast('Name required','error');
-  await db.collection('users').doc(id).update({ name, role, plant, status, updatedAt:firebase.firestore.FieldValue.serverTimestamp() });
+
+  // Client-side guard: Plant Admin cannot assign privileged roles
+  const myRole = S.userDoc?.role || '';
+  const isPA = myRole === 'Plant Admin' || myRole === 'plantadmin';
+  const isSA = myRole === 'superadmin' || myRole === 'Super Admin';
+  const paAllowedRoles = ['Auditor','Auditee','Dept Head','Viewer'];
+  if (isPA && !isSA && !paAllowedRoles.includes(role)) {
+    return showToast('You can only assign: Auditor, Auditee, Dept Head, Viewer', 'error');
+  }
+
+  await db.collection('users').doc(id).update({
+    name, role, plant, status,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  }).catch(e => { showToast('Save failed: ' + e.message, 'error'); return null; });
   closeModal(); showToast('User updated!','success'); renderUsers();
 }
 
 async function deleteUser(id, label) {
   if (!confirm(`Delete user "${label}"? This removes their profile but not their Firebase Auth account.`)) return;
-  await db.collection('users').doc(id).delete();
+  await db.collection('users').doc(id).delete()
+    .catch(e => { showToast('Delete failed: ' + e.message, 'error'); return null; });
   showToast('User deleted','success'); renderUsers();
 }
 
 function showAddUserModal() {
+  const myRole = S.userDoc?.role || '';
+  const isSA = myRole === 'superadmin' || myRole === 'Super Admin';
+  const isPA = myRole === 'Plant Admin' || myRole === 'plantadmin';
+  const myPlant = S.userDoc?.plant || '';
+
+  // Role options
+  const roleOpts = isSA
+    ? `<option value="superadmin">Super Admin</option>
+       <option value="Plant Admin">Plant Admin</option>
+       <option value="Auditor" selected>Auditor</option>
+       <option value="Auditee">Auditee</option>
+       <option value="Dept Head">Dept Head</option>
+       <option value="Viewer">Viewer</option>`
+    : `<option value="Auditor" selected>Auditor</option>
+       <option value="Auditee">Auditee</option>
+       <option value="Dept Head">Dept Head</option>
+       <option value="Viewer">Viewer</option>`;
+
+  // Plant field — Plant Admin has it locked to their plant
+  const plantField = isSA
+    ? `<select class="form-input" id="newUserPlant">
+        <option>All Plants</option>${S.plants.slice(1).map(p=>`<option>${p}</option>`).join('')}
+       </select>`
+    : `<input class="form-input" id="newUserPlant" value="${myPlant}" readonly style="opacity:.7;background:#f5f5f5">
+       <div style="font-size:11px;color:var(--text-muted);margin-top:2px">Users will be assigned to your plant: <strong>${myPlant}</strong></div>`;
+
   showModal(`<div class="modal-title">Add New User <button onclick="closeModal()" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="newUserName" placeholder="e.g. Ramesh Kumar"></div>
@@ -4663,19 +4738,9 @@ function showAddUserModal() {
     </div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Role</label>
-        <select class="form-input" id="newUserRole">
-          <option value="superadmin">Super Admin</option>
-          <option value="Plant Admin">Plant Admin</option>
-          <option value="Auditor" selected>Auditor</option>
-          <option value="Dept Head">Dept Head</option>
-          <option value="Viewer">Viewer</option>
-        </select>
+        <select class="form-input" id="newUserRole">${roleOpts}</select>
       </div>
-      <div class="form-group"><label class="form-label">Plant</label>
-        <select class="form-input" id="newUserPlant">
-          <option>All Plants</option>${S.plants.slice(1).map(p=>`<option>${p}</option>`).join('')}
-        </select>
-      </div>
+      <div class="form-group"><label class="form-label">Plant</label>${plantField}</div>
     </div>
     <div class="form-group">
       <label class="form-label">Temporary Password (optional but recommended)</label>
@@ -4695,6 +4760,18 @@ async function createUser() {
   const plant = document.getElementById('newUserPlant').value;
   const tempPwd = document.getElementById('newUserTempPwd')?.value.trim();
   if (!name || !email) { showToast('Name and email required','error'); return; }
+
+  // Client-side guard: Plant Admin cannot create SuperAdmin or Plant Admin
+  const myRole = S.userDoc?.role || '';
+  const isPA = myRole === 'Plant Admin' || myRole === 'plantadmin';
+  const isSA = myRole === 'superadmin' || myRole === 'Super Admin';
+  const paAllowedRoles = ['Auditor','Auditee','Dept Head','Viewer'];
+  if (isPA && !isSA && !paAllowedRoles.includes(role)) {
+    return showToast('You can only create: Auditor, Auditee, Dept Head, Viewer', 'error');
+  }
+  if (isPA && !isSA && plant !== (S.userDoc?.plant || '')) {
+    return showToast('You can only create users for your plant', 'error');
+  }
 
   const btn = document.querySelector('#modalBody .btn-primary');
   if (btn) { btn.disabled=true; btn.textContent='Creating…'; }
