@@ -376,6 +376,22 @@ select.form-input{cursor:pointer}
   </div>
 </div>
 
+<!-- ─── Supplier Magic Link Overlay ─────────────────────────────────────── -->
+<div id="supplierMagicOverlay" style="display:none;position:fixed;inset:0;z-index:9500;background:#f0f4f8;overflow:auto">
+  <div style="background:#0C1A2E;padding:12px 24px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:10">
+    <span style="color:#fff;font-weight:700;font-size:16px">🏭 Supplier Audit — Action Plan Portal</span>
+    <div style="margin-left:auto">
+      <span id="supplierMagicSupName" style="color:#94a3b8;font-size:12px;margin-right:12px"></span>
+      <span id="supplierMagicAuditNo" style="background:rgba(255,255,255,.12);color:#fff;padding:4px 10px;border-radius:12px;font-size:11px;font-weight:600"></span>
+    </div>
+  </div>
+  <div style="max-width:900px;margin:28px auto;padding:0 16px 60px">
+    <div id="supplierMagicCard" style="background:#fff;border-radius:12px;padding:28px;box-shadow:0 2px 12px rgba(0,0,0,.1)">
+      <div style="text-align:center;padding:40px;color:#9ca3af">Loading audit details…</div>
+    </div>
+  </div>
+</div>
+
 <!-- ─── Main App ──────────────────────────────────────────────────────────── -->
 <div id="app">
 <div id="sidebar">
@@ -3608,20 +3624,66 @@ function initLpaCharts() {
 // ─── SUPPLIER AUDITS ──────────────────────────────────────────────────────────
 async function renderSupplier() {
   document.getElementById('supplierTbl').innerHTML = loadingRow(9);
-  const snap = await db.collection('suppliers').orderBy('name').get().catch(()=>null);
-  if (!snap) return;
+  // Load from both collections: legacy 'suppliers' + 'supplierAudits'
+  const [snap1, snap2] = await Promise.all([
+    db.collection('suppliers').orderBy('name').get().catch(()=>null),
+    db.collection('supplierAudits').orderBy('name').get().catch(()=>null)
+  ]);
+  const allDocs = [];
+  if (snap1) snap1.docs.forEach(d => allDocs.push({ id:d.id, ...d.data(), _col:'suppliers' }));
+  if (snap2) snap2.docs.forEach(d => allDocs.push({ id:d.id, ...d.data(), _col:'supplierAudits' }));
+  if (!allDocs.length) {
+    document.getElementById('supplierTbl').innerHTML = '<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text-muted)">No suppliers found</td></tr>';
+    return;
+  }
   const rmap={'A+':'badge-green','A':'badge-green','B':'badge-blue','C':'badge-amber','D':'badge-red'};
-  document.getElementById('supplierTbl').innerHTML = snap.empty
-    ? '<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text-muted)">No suppliers found</td></tr>'
-    : snap.docs.map(d=>{ const s={id:d.id,...d.data()};
-        return `<tr><td><strong>${s.name}</strong></td><td>${s.category||'-'}</td><td>${s.location||'-'}</td>
-          <td>${formatDate(s.lastAuditDate)}</td>
-          <td><span style="font-weight:700;color:${(s.lastScore||0)>=85?'var(--green)':(s.lastScore||0)>=70?'var(--amber)':'var(--red)'}">${s.lastScore||'-'}</span></td>
-          <td><span class="badge ${rmap[s.rating]||'badge-grey'}">${s.rating||'-'}</span></td>
-          <td>${formatDate(s.nextAuditDate)}</td>
-          <td><span class="badge ${s.status==='Active'?'badge-green':s.status==='Due Soon'?'badge-amber':'badge-red'}">${s.status||'Active'}</span></td>
-          <td><button class="btn btn-sm btn-secondary" onclick="showToast('Opening...','info')">View</button></td></tr>`;
-      }).join('');
+  const statusBadge = s => {
+    if (s.status === 'Action Submitted') return 'badge-blue';
+    if (s.status === 'Action Pending')   return 'badge-amber';
+    if (s.status === 'Closed')           return 'badge-green';
+    if (s.status === 'Due Soon')         return 'badge-amber';
+    return 'badge-grey';
+  };
+  document.getElementById('supplierTbl').innerHTML = allDocs.map(s => `
+    <tr>
+      <td><strong>${s.name||'-'}</strong></td>
+      <td>${s.category||'-'}</td>
+      <td>${s.location||'-'}</td>
+      <td>${formatDate(s.lastAuditDate)}</td>
+      <td><span style="font-weight:700;color:${(s.lastScore||0)>=85?'var(--green)':(s.lastScore||0)>=70?'var(--amber)':'var(--red)'}">${s.lastScore||'-'}</span></td>
+      <td><span class="badge ${rmap[s.rating]||'badge-grey'}">${s.rating||'-'}</span></td>
+      <td>${formatDate(s.nextAuditDate)}</td>
+      <td><span class="badge ${statusBadge(s)}">${s.status||'Active'}</span></td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-sm btn-secondary" onclick="viewSupplierAudit('${s.id}','${s._col}')"><span class="material-icons" style="font-size:13px">visibility</span></button>
+        <button class="btn btn-sm btn-primary" style="margin-left:4px" onclick="sendSupplierMagicLink('${s.id}')" title="Send action plan link to supplier">
+          <span class="material-icons" style="font-size:13px">link</span> Send Link
+        </button>
+      </td>
+    </tr>`).join('');
+}
+
+function viewSupplierAudit(id, col) {
+  const colName = col || 'supplierAudits';
+  db.collection(colName).doc(id).get().then(snap => {
+    if (!snap.exists) return showToast('Not found','error');
+    const s = { id, ...snap.data() };
+    const fd = n => n ? (n.toDate ? n.toDate() : new Date(n)).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) : '—';
+    const hasAP = s.actionPlan?.correctiveAction;
+    openModal(`<div class="modal-title">${s.name||'Supplier Audit'} <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;font-size:20px;color:#999">×</button></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:13px;margin-bottom:16px">
+        ${[['Category',s.category],['Location',s.location],['Plant',s.plant],['Audit Date',fd(s.lastAuditDate)],['Lead Auditor',s.leadAuditor],['Score',s.lastScore],['Rating',s.rating],['Status',s.status]].map(([l,v])=>`<div><div style="font-size:10px;color:#9ca3af;text-transform:uppercase;font-weight:700;margin-bottom:2px">${l}</div><div style="font-weight:600">${v||'—'}</div></div>`).join('')}
+      </div>
+      ${hasAP ? `<div style="border-top:1px solid #e5e7eb;padding-top:14px;margin-top:4px">
+        <div style="font-weight:700;margin-bottom:10px;color:#0C1A2E">Action Plan</div>
+        ${[['Root Cause',s.actionPlan.rootCause],['Interim Correction',s.actionPlan.correction],['Corrective Action',s.actionPlan.correctiveAction],['Responsible',s.actionPlan.responsible],['Target Date',s.actionPlan.targetDate],['Evidence',s.actionPlan.evidence]].filter(([,v])=>v).map(([l,v])=>`<div style="margin-bottom:8px"><div style="font-size:11px;color:#9ca3af;text-transform:uppercase;font-weight:700;margin-bottom:3px">${l}</div><div style="background:#f8fafc;padding:8px 10px;border-radius:6px;font-size:13px">${v}</div></div>`).join('')}
+        ${s.actionPlan.submittedAt ? `<div style="font-size:11px;color:#9ca3af;text-align:right">Submitted via ${s.actionPlan.submittedVia==='magic_link'?'supplier portal':'app'} · ${fd(s.actionPlan.submittedAt)}</div>` : ''}
+      </div>` : `<div style="background:#FEF9C3;border-radius:8px;padding:12px;font-size:13px;text-align:center;color:#78350F">No action plan submitted yet. Use <strong>Send Link</strong> to request one from the supplier.</div>`}
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+        <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+        <button class="btn btn-primary" onclick="closeModal();sendSupplierMagicLink('${id}')"><span class="material-icons" style="font-size:14px;vertical-align:middle">link</span> Send Link to Supplier</button>
+      </div>`);
+  });
 }
 // ─── CHECKLIST MASTER ─────────────────────────────────────────────────────────
 async function renderChecklist() {
@@ -4485,16 +4547,20 @@ function showScheduleSupplierModal() {
       <div class="form-group"><label class="form-label">Category</label><select class="form-input" id="supCategory"><option>Raw Material</option><option>Sub-assembly</option><option>Service</option><option>Logistics</option><option>Tooling</option><option>Other</option></select></div>
     </div>
     <div class="form-row">
+      <div class="form-group"><label class="form-label">Supplier Email</label><input class="form-input" type="email" id="supEmail" placeholder="supplier@company.com (for sending action plan link)"></div>
       <div class="form-group"><label class="form-label">Location</label><input class="form-input" id="supLocation" placeholder="City, Country"></div>
+    </div>
+    <div class="form-row">
       <div class="form-group"><label class="form-label">Plant (Buyer)</label><select class="form-input" id="supPlant">${S.plants.slice(1).map(p=>`<option>${p}</option>`).join('')}</select></div>
-    </div>
-    <div class="form-row">
       <div class="form-group"><label class="form-label">Audit Date *</label><input class="form-input" type="date" id="supAuditDate"></div>
-      <div class="form-group"><label class="form-label">Lead Auditor</label><input class="form-input" id="supAuditor" placeholder="Name"></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label class="form-label">Audit Scope</label><input class="form-input" id="supScope" placeholder="e.g. Quality System, Process Audit"></div>
+      <div class="form-group"><label class="form-label">Lead Auditor</label><input class="form-input" id="supAuditor" placeholder="Name"></div>
       <div class="form-group"><label class="form-label">Rating</label><select class="form-input" id="supRating"><option value="">—</option><option>A+</option><option>A</option><option>B</option><option>C</option><option>D</option></select></div>
+    </div>
+    <div class="form-group"><label class="form-label">Audit Scope</label><input class="form-input" id="supScope" placeholder="e.g. Quality System, Process Audit, Product Inspection"></div>
+    <div style="background:#EFF6FF;border-radius:8px;padding:10px 14px;font-size:12px;color:#1e40af;margin-bottom:8px">
+      💡 After scheduling, use the <strong>Send Link</strong> button to share a secure action plan form with the supplier — no login required.
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -4503,25 +4569,29 @@ function showScheduleSupplierModal() {
 }
 async function saveSupplierAudit() {
   const name = document.getElementById('supName')?.value?.trim();
+  const email = document.getElementById('supEmail')?.value?.trim();
   const date = document.getElementById('supAuditDate')?.value;
   if (!name) { showToast('Supplier name is required','error'); return; }
   if (!date)  { showToast('Audit date is required','error'); return; }
   const btn = document.querySelector('#modalBody .btn-primary');
   if (btn) { btn.disabled=true; btn.textContent='Saving...'; }
   const data = {
-    name, category: document.getElementById('supCategory')?.value||'',
+    name, email: email||'',
+    category: document.getElementById('supCategory')?.value||'',
     location: document.getElementById('supLocation')?.value||'',
     plant: document.getElementById('supPlant')?.value||'',
     lastAuditDate: firebase.firestore.Timestamp.fromDate(new Date(date)),
     leadAuditor: document.getElementById('supAuditor')?.value||'',
     scope: document.getElementById('supScope')?.value||'',
     rating: document.getElementById('supRating')?.value||'',
-    status: 'Active', lastScore: null,
+    status: 'Action Pending', lastScore: null,
+    createdBy: S.user?.uid,
     createdAt: firebase.firestore.FieldValue.serverTimestamp(),
     nextAuditDate: firebase.firestore.Timestamp.fromDate(new Date(new Date(date).setFullYear(new Date(date).getFullYear()+1))),
   };
-  await db.collection('suppliers').add(data).catch(e=>{ showToast('Error: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent='Schedule Audit';} return; });
-  closeModal(); showToast('Supplier audit scheduled!','success'); renderSupplier();
+  // Save to 'supplierAudits' (magic-link compatible) + legacy 'suppliers'
+  await db.collection('supplierAudits').add(data).catch(e=>{ showToast('Error: '+e.message,'error'); if(btn){btn.disabled=false;btn.textContent='Schedule Audit';} return; });
+  closeModal(); showToast('Supplier audit scheduled! Use "Send Link" to share action plan form with supplier.','success'); renderSupplier();
 }
 
 // ─── ADD STANDARD MODAL ───────────────────────────────────────────────────────
@@ -4591,13 +4661,13 @@ async function renderUsers() {
   const myPlant = S.userDoc?.plant || '';
 
   // Plant Admin only sees users from their plant
-  let query = db.collection('users').orderBy('name');
-  if (isPA && !isSA) {
-    query = db.collection('users').where('plant', '==', myPlant).orderBy('name');
-  }
+  // NOTE: avoid compound query (where + orderBy) — requires composite index; sort client-side instead
+  let query = isSA
+    ? db.collection('users').orderBy('name')
+    : db.collection('users').where('plant', '==', myPlant);
 
   const snap = await query.get().catch(async () => {
-    // orderBy may fail without index — fallback to unordered
+    // orderBy on 'name' may fail if index missing — fallback unordered
     const q2 = isSA
       ? db.collection('users')
       : db.collection('users').where('plant', '==', myPlant);
@@ -4610,8 +4680,11 @@ async function renderUsers() {
   // Plant Admin cannot edit/delete SuperAdmin or Plant Admin accounts
   const paRestrictedRoles = ['superadmin','Super Admin','Plant Admin','plantadmin'];
 
+  // Sort client-side by name (needed when orderBy not used)
+  const sortedDocs = [...snap.docs].sort((a,b) => (a.data().name||'').localeCompare(b.data().name||''));
+
   document.getElementById('usersTbl').innerHTML = snap.empty ? '<tr><td colspan="7" style="text-align:center;padding:40px">No users</td></tr>'
-    : snap.docs.map(d=>{ const u={id:d.id,...d.data()};
+    : sortedDocs.map(d=>{ const u={id:d.id,...d.data()};
         const statusBadge = u.status==='Active'?'badge-green':u.status==='Pending'?'badge-amber':'badge-red';
         // Plant Admin cannot edit SuperAdmin or other Plant Admins
         const canEditThis = isSA || (isPA && !paRestrictedRoles.includes(u.role));
@@ -5857,10 +5930,17 @@ document.getElementById('loginEmail').addEventListener('keydown',    e => { if(e
 // ─── Magic Link: check URL params on page load ────────────────────────────────
 (function checkMagicLink() {
   const params = new URLSearchParams(window.location.search);
-  const ncId   = params.get('nc');
-  const token  = params.get('token');
-  if (ncId && token) {
-    // Hide login, show magic NC viewer
+  const ncId         = params.get('nc');
+  const supplierAuditId = params.get('supplierAudit');
+  const token        = params.get('token');
+
+  if (supplierAuditId && token) {
+    // Supplier audit magic link
+    document.getElementById('loginScreen').classList.add('hidden');
+    document.getElementById('supplierMagicOverlay').style.display = '';
+    _loadSupplierMagicAudit(supplierAuditId, token);
+  } else if (ncId && token) {
+    // NC magic link
     document.getElementById('loginScreen').classList.add('hidden');
     document.getElementById('magicNcOverlay').style.display = '';
     _loadMagicNC(ncId, token);
@@ -6043,6 +6123,252 @@ async function _ensureMagicToken(ncId) {
 function _buildMagicLink(ncId, token) {
   const base = window.location.origin + window.location.pathname;
   return `${base}?nc=${encodeURIComponent(ncId)}&token=${encodeURIComponent(token)}`;
+}
+
+// ─── Supplier Magic Link ──────────────────────────────────────────────────────
+function _buildSupplierMagicLink(auditId, token) {
+  const base = window.location.origin + window.location.pathname;
+  return `${base}?supplierAudit=${encodeURIComponent(auditId)}&token=${encodeURIComponent(token)}`;
+}
+
+function _generateSupplierToken() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+// Generate/refresh supplier magic token and return the link
+async function getOrCreateSupplierToken(auditId) {
+  const snap = await db.collection('supplierAudits').doc(auditId).get().catch(() => null);
+  if (!snap || !snap.exists) return null;
+  let token = snap.data().magicToken;
+  if (!token) {
+    token = _generateSupplierToken();
+    await db.collection('supplierAudits').doc(auditId).update({ magicToken: token }).catch(() => {});
+  }
+  return { token, link: _buildSupplierMagicLink(auditId, token) };
+}
+
+// Called from supplier audit row "Send Link" button
+async function sendSupplierMagicLink(auditId) {
+  const snap = await db.collection('supplierAudits').doc(auditId).get().catch(() => null);
+  if (!snap || !snap.exists) return showToast('Audit not found', 'error');
+  const audit = { id: auditId, ...snap.data() };
+
+  let token = audit.magicToken;
+  if (!token) {
+    token = _generateSupplierToken();
+    await db.collection('supplierAudits').doc(auditId).update({ magicToken: token }).catch(() => {});
+  }
+  const link = _buildSupplierMagicLink(auditId, token);
+
+  // Show copy-link modal (email sending if emailjs configured)
+  openModal(`<div class="modal-title">Send Supplier Link <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;font-size:20px;color:#999">×</button></div>
+    <div style="margin-bottom:14px;font-size:14px;color:var(--text-muted)">
+      Share this link with <strong>${audit.name||'Supplier'}</strong>. They can open it without logging in and fill in action plans and evidences.
+    </div>
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px 14px;font-size:12px;word-break:break-all;color:#1a76c2;margin-bottom:12px">${link}</div>
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <button class="btn btn-primary" style="flex:1" onclick="navigator.clipboard.writeText('${link}').then(()=>showToast('Link copied!','success'))">
+        <span class="material-icons" style="font-size:14px;vertical-align:middle">content_copy</span> Copy Link
+      </button>
+      <button class="btn btn-secondary" style="flex:1" onclick="window.open('mailto:?subject=Supplier Audit Action Plan - ${encodeURIComponent(audit.name||'')}&body='+encodeURIComponent('Dear Team,\\n\\nPlease find your supplier audit action plan link below:\\n\\n${link}\\n\\nPlease fill in the root cause, corrective actions, and upload evidence.\\n\\nThank you.'),'_blank')">
+        <span class="material-icons" style="font-size:14px;vertical-align:middle">email</span> Email
+      </button>
+    </div>
+    <div style="font-size:11px;color:var(--text-muted);text-align:center">Link is unique to this audit. Regenerate if compromised.</div>
+    <div style="display:flex;justify-content:flex-end;margin-top:8px">
+      <button class="btn btn-secondary btn-sm" onclick="regenerateSupplierToken('${auditId}')">🔄 Regenerate Link</button>
+    </div>`);
+}
+
+async function regenerateSupplierToken(auditId) {
+  const token = _generateSupplierToken();
+  await db.collection('supplierAudits').doc(auditId).update({ magicToken: token }).catch(e => showToast('Error: '+e.message,'error'));
+  showToast('New link generated!', 'success');
+  closeModal();
+  sendSupplierMagicLink(auditId);
+}
+
+// Load supplier audit by magic link (unauthenticated)
+async function _loadSupplierMagicAudit(auditId, token) {
+  const card = document.getElementById('supplierMagicCard');
+  const snap = await db.collection('supplierAudits').doc(auditId).get().catch(() => null);
+  if (!snap || !snap.exists) {
+    card.innerHTML = '<div style="text-align:center;padding:40px;color:#DC2626"><strong>Audit not found or link expired.</strong><br><br>Please contact your audit team.</div>';
+    return;
+  }
+  const audit = { id: auditId, ...snap.data() };
+  if (audit.magicToken !== token) {
+    card.innerHTML = '<div style="text-align:center;padding:40px;color:#DC2626"><strong>Invalid or expired link.</strong><br><br>Please request a new link from your audit team.</div>';
+    return;
+  }
+
+  // Update header
+  document.getElementById('supplierMagicSupName').textContent = audit.name || '';
+  document.getElementById('supplierMagicAuditNo').textContent = audit.auditNo || formatDate(audit.lastAuditDate);
+
+  const fd = n => n ? (n.toDate ? n.toDate() : new Date(n)).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }) : '—';
+  const hasActionPlan = audit.actionPlan?.rootCause || audit.actionPlan?.correctiveAction;
+  const statusColor = audit.status === 'Closed' ? '#16a34a' : audit.status === 'Action Pending' ? '#d97706' : '#2563eb';
+
+  card.innerHTML = `
+    <!-- Audit Summary -->
+    <div style="border-bottom:2px solid #e5e7eb;padding-bottom:20px;margin-bottom:24px">
+      <div style="display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:11px;color:#9ca3af;text-transform:uppercase;font-weight:700;margin-bottom:4px">Supplier</div>
+          <div style="font-size:22px;font-weight:800;color:#0C1A2E">${audit.name||'—'}</div>
+          <div style="font-size:13px;color:#6b7280;margin-top:3px">${audit.location||''} ${audit.category?'· '+audit.category:''}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+          <span style="background:${statusColor}18;color:${statusColor};border:1px solid ${statusColor}44;padding:5px 14px;border-radius:20px;font-size:12px;font-weight:700">${audit.status||'Open'}</span>
+          <span style="font-size:11px;color:#9ca3af">${audit.rating ? 'Rating: '+audit.rating : ''}</span>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-top:16px">
+        ${[['Audit Date', fd(audit.lastAuditDate)], ['Plant (Buyer)', audit.plant||'—'], ['Lead Auditor', audit.leadAuditor||'—'], ['Scope', audit.scope||'—'], ['Score', audit.lastScore ? audit.lastScore+'%' : '—']].map(([l,v])=>`
+          <div style="background:#f8fafc;border-radius:8px;padding:10px 12px">
+            <div style="font-size:10px;color:#9ca3af;text-transform:uppercase;font-weight:700;margin-bottom:3px">${l}</div>
+            <div style="font-size:13px;font-weight:600;color:#111827">${v}</div>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <!-- Findings list -->
+    <div id="supplierMagicFindings" style="margin-bottom:28px">
+      <div style="font-weight:700;font-size:15px;color:#0C1A2E;margin-bottom:14px">📋 Audit Findings / Non-Conformances</div>
+      <div style="text-align:center;color:#9ca3af;font-size:13px;padding:20px">Loading findings…</div>
+    </div>
+
+    <!-- Action Plan Form -->
+    <div id="supplierActionPlanSection" style="border-top:2px solid #e5e7eb;padding-top:24px">
+      <div style="font-weight:700;font-size:15px;color:#0C1A2E;margin-bottom:6px">✏️ Submit Action Plan</div>
+      <div style="font-size:12px;color:#6b7280;margin-bottom:16px">Fill in the corrective actions for all findings. Your response will be saved directly to the audit record.</div>
+
+      ${hasActionPlan ? `<div style="background:#DCFCE7;border:1px solid #86EFAC;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;color:#166534">
+        ✅ <strong>Action plan already submitted.</strong> You may update and resubmit below.
+      </div>` : ''}
+
+      <div style="display:grid;gap:14px">
+        <div class="form-group">
+          <label class="form-label" style="font-weight:700">Root Cause Analysis *</label>
+          <textarea class="form-input" id="supMagicRCA" rows="4" placeholder="Describe the root cause of the non-conformance(s)…" style="width:100%;resize:vertical">${audit.actionPlan?.rootCause||''}</textarea>
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="font-weight:700">Interim / Immediate Correction</label>
+          <textarea class="form-input" id="supMagicCorrection" rows="3" placeholder="What immediate action was taken?" style="width:100%;resize:vertical">${audit.actionPlan?.correction||''}</textarea>
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="font-weight:700">Corrective Action Plan *</label>
+          <textarea class="form-input" id="supMagicCA" rows="4" placeholder="Describe the long-term corrective action to prevent recurrence…" style="width:100%;resize:vertical">${audit.actionPlan?.correctiveAction||''}</textarea>
+        </div>
+        <div class="form-row" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="form-group">
+            <label class="form-label" style="font-weight:700">Responsible Person</label>
+            <input class="form-input" id="supMagicResponsible" placeholder="Name & designation" value="${audit.actionPlan?.responsible||''}">
+          </div>
+          <div class="form-group">
+            <label class="form-label" style="font-weight:700">Target Completion Date *</label>
+            <input class="form-input" type="date" id="supMagicTargetDate" value="${audit.actionPlan?.targetDate||''}">
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="font-weight:700">Evidence / Attachments</label>
+          <textarea class="form-input" id="supMagicEvidence" rows="3" placeholder="Describe evidence provided (photos, documents, test reports…). Attach files using the button below or paste links." style="width:100%;resize:vertical">${audit.actionPlan?.evidence||''}</textarea>
+          <div style="margin-top:6px;font-size:11px;color:#9ca3af">📎 To attach files: upload them to any cloud storage (Google Drive, OneDrive, etc.) and paste the shareable link in the evidence field above.</div>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:20px">
+        <button class="btn btn-primary" style="padding:10px 28px;font-size:14px" onclick="submitSupplierActionPlan('${auditId}','${token}')">
+          <span class="material-icons" style="font-size:16px;vertical-align:middle">send</span> Submit Action Plan
+        </button>
+      </div>
+      <div id="supMagicSubmitMsg" style="margin-top:12px"></div>
+    </div>`;
+
+  // Load findings for this supplier audit
+  _loadSupplierAuditFindings(auditId);
+}
+
+async function _loadSupplierAuditFindings(auditId) {
+  const el = document.getElementById('supplierMagicFindings');
+  if (!el) return;
+  const snap = await db.collection('supplierAudits').doc(auditId).collection('findings').get()
+    .catch(() => db.collection('findings').where('supplierAuditId','==',auditId).get().catch(() => null));
+  if (!snap || snap.empty) {
+    el.innerHTML = `<div style="font-weight:700;font-size:15px;color:#0C1A2E;margin-bottom:14px">📋 Audit Findings / Non-Conformances</div>
+      <div style="background:#f8fafc;border-radius:8px;padding:16px;font-size:13px;color:#9ca3af;text-align:center">No individual findings recorded — please address the overall audit observations in the action plan below.</div>`;
+    return;
+  }
+  const rows = snap.docs.map(d => {
+    const f = { id: d.id, ...d.data() };
+    const sev = f.type || f.severity || f.criticality || 'NC';
+    const sevColor = sev.includes('Major') || sev.includes('Critical') ? '#DC2626' : sev.includes('Minor') ? '#D97706' : '#2563EB';
+    return `<div style="border:1px solid #e5e7eb;border-radius:8px;padding:14px 16px;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <span style="font-weight:700;font-size:13px;color:#0C1A2E">${f.findingNo || f.clause || d.id}</span>
+        <span style="background:${sevColor}18;color:${sevColor};border:1px solid ${sevColor}44;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:700">${sev}</span>
+        ${f.department ? `<span style="font-size:11px;color:#6b7280">${f.department}</span>` : ''}
+      </div>
+      <div style="font-size:13px;color:#374151;line-height:1.5">${f.description || f.observation || '—'}</div>
+      ${f.clause ? `<div style="font-size:11px;color:#9ca3af;margin-top:6px">Clause: ${f.clause}</div>` : ''}
+    </div>`;
+  }).join('');
+  el.innerHTML = `<div style="font-weight:700;font-size:15px;color:#0C1A2E;margin-bottom:14px">📋 Audit Findings / Non-Conformances (${snap.size})</div>${rows}`;
+}
+
+async function submitSupplierActionPlan(auditId, token) {
+  const rca        = document.getElementById('supMagicRCA')?.value.trim();
+  const correction = document.getElementById('supMagicCorrection')?.value.trim();
+  const ca         = document.getElementById('supMagicCA')?.value.trim();
+  const responsible= document.getElementById('supMagicResponsible')?.value.trim();
+  const targetDate = document.getElementById('supMagicTargetDate')?.value;
+  const evidence   = document.getElementById('supMagicEvidence')?.value.trim();
+  const msgEl      = document.getElementById('supMagicSubmitMsg');
+
+  if (!rca || !ca) {
+    msgEl.innerHTML = '<div style="color:#DC2626;font-size:13px">⚠️ Root Cause and Corrective Action are required.</div>';
+    return;
+  }
+  if (!targetDate) {
+    msgEl.innerHTML = '<div style="color:#DC2626;font-size:13px">⚠️ Target completion date is required.</div>';
+    return;
+  }
+
+  const btn = document.querySelector('#supplierMagicCard .btn-primary');
+  if (btn) { btn.disabled = true; btn.textContent = 'Submitting…'; }
+  msgEl.innerHTML = '';
+
+  // Re-verify token before writing
+  const snap = await db.collection('supplierAudits').doc(auditId).get().catch(() => null);
+  if (!snap || snap.data()?.magicToken !== token) {
+    msgEl.innerHTML = '<div style="color:#DC2626;font-size:13px">⚠️ Link is no longer valid. Please request a new link.</div>';
+    if (btn) { btn.disabled = false; btn.textContent = 'Submit Action Plan'; }
+    return;
+  }
+
+  await db.collection('supplierAudits').doc(auditId).update({
+    'actionPlan.rootCause':        rca,
+    'actionPlan.correction':       correction,
+    'actionPlan.correctiveAction': ca,
+    'actionPlan.responsible':      responsible,
+    'actionPlan.targetDate':       targetDate,
+    'actionPlan.evidence':         evidence,
+    'actionPlan.submittedAt':      firebase.firestore.FieldValue.serverTimestamp(),
+    'actionPlan.submittedVia':     'magic_link',
+    status: 'Action Submitted',
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+  }).catch(e => {
+    msgEl.innerHTML = `<div style="color:#DC2626;font-size:13px">Save failed: ${e.message}</div>`;
+    if (btn) { btn.disabled = false; btn.textContent = 'Submit Action Plan'; }
+    return null;
+  });
+
+  if (btn) btn.textContent = '✓ Submitted';
+  msgEl.innerHTML = `<div style="background:#DCFCE7;border:1px solid #86EFAC;border-radius:8px;padding:14px 16px;font-size:14px;color:#166534;text-align:center">
+    <strong>✅ Action plan submitted successfully!</strong><br>
+    <span style="font-size:12px;color:#4b7a5a">Your response has been recorded. The audit team will review and get back to you.</span>
+  </div>`;
 }
 
 // ─── Enter key login ──────────────────────────────────────────────────────────
