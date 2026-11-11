@@ -1187,24 +1187,18 @@ firebase functions:secrets:set APP_URL</code>
     <span style="background:#eff6ff;color:#2563eb;font-size:10px;padding:2px 8px;border-radius:10px;font-weight:700;border:1px solid #bfdbfe;margin-left:auto">SUPER ADMIN ONLY</span>
   </div>
   <div style="font-size:12px;color:#1e40af;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:10px 14px;margin-bottom:16px;line-height:1.7">
-    Audit numbers are assigned automatically in continuity per plant per month.<br>
-    Format: <strong>PREFIX-PLANTCODE-NNN</strong> &nbsp;·&nbsp; e.g. <code style="background:#dbeafe;padding:1px 6px;border-radius:3px">QMS-YNR-001</code> &nbsp; <code style="background:#dbeafe;padding:1px 6px;border-radius:3px">QMS-BWL-001</code> &nbsp; <code style="background:#dbeafe;padding:1px 6px;border-radius:3px">QMS-BWL-002</code><br>
-    <span style="color:#64748b">Customer &amp; Supplier audits are excluded from auto-numbering.</span>
+    Set a unique prefix for <strong>each audit type</strong>. Numbers are assigned automatically in continuity per plant per month.<br>
+    Format: <strong>PREFIX-PLANTCODE-NNN</strong> &nbsp;·&nbsp; e.g. <code style="background:#dbeafe;padding:1px 6px;border-radius:3px">QMS-YNR-001</code> &nbsp; <code style="background:#dbeafe;padding:1px 6px;border-radius:3px">LPA-BWL-003</code> &nbsp; <code style="background:#dbeafe;padding:1px 6px;border-radius:3px">EMS-YNR-002</code><br>
+    <span style="color:#64748b">Customer &amp; Supplier audits are excluded from auto-numbering. Plant code is taken from Plant Management → Code field.</span>
   </div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px">
-    <div class="form-group" style="margin:0">
-      <label class="form-label">Audit No. Prefix *</label>
-      <input class="form-input" id="auditNoPrefix" placeholder="e.g. QMS" maxlength="10" style="font-weight:700;letter-spacing:.05em;text-transform:uppercase">
-      <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Short identifier for your QMS system (max 10 chars)</div>
-    </div>
-    <div class="form-group" style="margin:0">
-      <label class="form-label">Preview</label>
-      <div id="auditNoPrefixPreview" style="font-size:14px;font-weight:700;color:#2563eb;padding:9px 12px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;letter-spacing:.05em">QMS-YNR-001</div>
-      <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Plant code is taken from Plant Management → Code field</div>
-    </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px;align-items:center">
+    <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em">Audit Type</div>
+    <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em">Prefix <span style="font-weight:400;text-transform:none">(max 10 chars)</span></div>
+    <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em">Preview</div>
+    <div id="auditNoPrefixRows" style="display:contents"></div>
   </div>
   <div style="display:flex;align-items:center;gap:10px">
-    <button class="btn btn-primary btn-sm" onclick="saveAuditNoConfig()"><span class="material-icons" style="font-size:13px;vertical-align:middle">save</span> Save Prefix</button>
+    <button class="btn btn-primary btn-sm" onclick="saveAuditNoConfig()"><span class="material-icons" style="font-size:13px;vertical-align:middle">save</span> Save All Prefixes</button>
     <span id="auditNoPrefixStatus" style="font-size:12px;color:var(--text-muted)"></span>
   </div>
 </div>
@@ -2591,9 +2585,13 @@ async function saveAllAuditPlans(panelId, collection, isLPA) {
       data.area=tr.querySelector('.pr-area')?.value||'';
       data.auditNo='LPA-'+Date.now().toString(36).toUpperCase();
       data.auditType='LPA';
+      // Auto-assign sequential audit number for LPA too
+      const lpaAutoNo = await generateAuditNo(pCode, 'LPA');
+      if (lpaAutoNo) data.auditNo = lpaAutoNo;
     } else {
-      data.auditType='Internal';
-      // Auto-assign sequential audit number (skipped for Customer/Supplier types)
+      // Keep the user-selected audit type (from dropdown); fallback to 'Internal'
+      if (!data.auditType) data.auditType = 'Internal';
+      // Auto-assign sequential audit number (skipped for Customer Audit & Supplier Audit)
       const autoNo = await generateAuditNo(pCode, data.auditType);
       if (autoNo) data.auditNo = autoNo;
     }
@@ -4978,6 +4976,9 @@ async function saveNewAuditType() {
   closeModal(); showToast(`"${name}" added!`,'success');
   renderAuditTypesMgmt();
   buildPills('typePills', S.auditTypes, S.selectedType, v=>{ S.selectedType=v; renderModule(S.currentModule); });
+  // Refresh prefix config table to include the new type
+  const cfgSnap = await db.collection('appSettings').doc('auditConfig').get().catch(()=>null);
+  _renderAuditNoPrefixRows(cfgSnap?.data()?.prefixes || {});
 }
 
 function editAuditType(idx, oldName) {
@@ -5059,69 +5060,93 @@ async function renderSettings() {
   if (_dCard) _dCard.style.display = _isSA ? '' : 'none';
   const _anCard = document.getElementById('auditNoConfigCard');
   if (_anCard) _anCard.style.display = _isSA ? '' : 'none';
-  // Load audit number prefix
+  // Load audit number prefixes per audit type
   if (_isSA) {
     const cfgSnap = await db.collection('appSettings').doc('auditConfig').get().catch(()=>null);
-    const prefix = cfgSnap?.data()?.auditNoPrefix || 'QMS';
-    const inp = document.getElementById('auditNoPrefix');
-    if (inp) {
-      inp.value = prefix;
-      inp.addEventListener('input', () => {
-        const p = (inp.value.trim().toUpperCase() || 'QMS');
-        const prev = document.getElementById('auditNoPrefixPreview');
-        if (prev) prev.textContent = `${p}-YNR-001`;
-      });
-    }
-    const prev = document.getElementById('auditNoPrefixPreview');
-    if (prev) prev.textContent = `${prefix}-YNR-001`;
+    const savedPrefixes = cfgSnap?.data()?.prefixes || {};
+    _renderAuditNoPrefixRows(savedPrefixes);
   }
   // Update system info counts
   db.collection('plants').get().then(s=>{ const el=document.getElementById('sysPlantCount'); if(el) el.textContent=s.size; });
   db.collection('users').get().then(s=>{ const el=document.getElementById('sysUserCount'); if(el) el.textContent=s.size; });
 }
 
+// Render one row per audit type in the prefix config table
+function _renderAuditNoPrefixRows(savedPrefixes) {
+  const container = document.getElementById('auditNoPrefixRows');
+  if (!container) return;
+  // Excluded audit types (no auto-number)
+  const excluded = ['Supplier Audit','Customer Audit'];
+  const types = S.auditTypes.slice(1).filter(t => !excluded.includes(t));
+  container.innerHTML = types.map(t => {
+    const val = savedPrefixes[t] || '';
+    const preview = val ? `${val}-YNR-001` : '—';
+    return `
+      <div style="font-size:13px;font-weight:500;color:var(--text-primary);padding:6px 0;border-top:1px solid var(--border)">${t}</div>
+      <input class="form-input" data-audit-type="${t.replace(/"/g,'&quot;')}"
+        id="anp_${t.replace(/[^a-z0-9]/gi,'_')}"
+        value="${val}" maxlength="10" placeholder="e.g. QMS"
+        style="font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:6px 10px;font-size:12px"
+        oninput="this.value=this.value.toUpperCase();
+          const prev=document.getElementById('anprev_${t.replace(/[^a-z0-9]/gi,'_')}');
+          if(prev) prev.textContent=this.value?this.value+'-YNR-001':'—';">
+      <div id="anprev_${t.replace(/[^a-z0-9]/gi,'_')}"
+        style="font-size:12px;font-weight:700;color:#2563eb;padding:6px 10px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;letter-spacing:.04em;border-top:1px solid var(--border)">
+        ${preview}
+      </div>`;
+  }).join('');
+}
+
 async function saveAuditNoConfig() {
   const isSA = S.userDoc?.role==='superadmin' || S.userDoc?.role==='Super Admin';
   if (!isSA) { showToast('Super Admin only','error'); return; }
-  const inp = document.getElementById('auditNoPrefix');
-  const prefix = (inp?.value||'').trim().toUpperCase();
-  if (!prefix) { showToast('Prefix cannot be empty','error'); return; }
   const status = document.getElementById('auditNoPrefixStatus');
-  if (status) status.textContent = 'Saving…';
-  await db.collection('appSettings').doc('auditConfig').set({ auditNoPrefix: prefix }, { merge: true })
-    .catch(e => { showToast('Error: '+e.message,'error'); if(status) status.textContent=''; return; });
-  showToast(`Audit prefix saved as "${prefix}"`, 'success');
-  if (status) { status.textContent = `✓ Saved — format: ${prefix}-PLANTCODE-001`; status.style.color='#16a34a'; }
-  logActivity('Updated audit no. prefix to '+prefix, 'Settings', '');
+  if (status) { status.textContent = 'Saving…'; status.style.color='var(--text-muted)'; }
+
+  // Collect all prefix inputs
+  const inputs = document.querySelectorAll('#auditNoPrefixRows input[data-audit-type]');
+  const prefixes = {};
+  inputs.forEach(inp => {
+    const t = inp.getAttribute('data-audit-type');
+    const v = inp.value.trim().toUpperCase();
+    if (t && v) prefixes[t] = v;
+  });
+
+  await db.collection('appSettings').doc('auditConfig').set(
+    { prefixes, updatedAt: firebase.firestore.FieldValue.serverTimestamp(), updatedBy: S.user?.uid },
+    { merge: true }
+  ).catch(e => { showToast('Error: '+e.message,'error'); if(status) status.textContent=''; return; });
+
+  showToast('Audit number prefixes saved!', 'success');
+  if (status) { status.textContent = '✓ All prefixes saved'; status.style.color='#16a34a'; }
+  logActivity('Updated audit no. prefixes', 'Settings', JSON.stringify(prefixes));
 }
 
-// Generate sequential audit number: PREFIX-PLANTCODE-NNN (per plant per month)
-// Excludes Customer & Supplier audit types
+// Generate sequential audit number: PREFIX-PLANTCODE-NNN (per audit type per plant per month)
+// Excludes Customer Audit & Supplier Audit types
 async function generateAuditNo(plantCode, auditType) {
   // Customer & Supplier audits are excluded
-  const excluded = ['Customer Audit','Supplier Audit','supplier','customer'];
-  if (excluded.some(t => (auditType||'').toLowerCase().includes(t.toLowerCase()))) return null;
+  const excluded = ['Customer Audit','Supplier Audit'];
+  if (excluded.some(t => (auditType||'').toLowerCase() === t.toLowerCase())) return null;
+  if ((auditType||'').toLowerCase().includes('supplier') || (auditType||'').toLowerCase().includes('customer')) return null;
 
-  // 1. Get prefix from Firestore settings
+  // 1. Get prefix for this specific audit type from Firestore settings
   const cfgSnap = await db.collection('appSettings').doc('auditConfig').get().catch(()=>null);
-  const prefix = cfgSnap?.data()?.auditNoPrefix || 'QMS';
+  const prefixes = cfgSnap?.data()?.prefixes || {};
+  const prefix = prefixes[auditType] || prefixes['Internal'] || 'QMS';
 
   // 2. Build month key YYYY-MM
   const now = new Date();
   const monthKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
 
-  // 3. Count existing internal audit plans for this plant this month
+  // 3. Count existing audit plans for this audit type + plant + month
   const snap = await db.collection('auditPlans')
     .where('plantCode', '==', plantCode)
     .where('monthKey', '==', monthKey)
+    .where('auditType', '==', auditType)
     .get().catch(()=>null);
 
-  // Filter out Customer/Supplier in the count
-  const count = snap ? snap.docs.filter(d => {
-    const t = (d.data().auditType||'').toLowerCase();
-    return !t.includes('supplier') && !t.includes('customer');
-  }).length : 0;
-
+  const count = snap ? snap.docs.length : 0;
   const seq = String(count + 1).padStart(3, '0');
   return `${prefix}-${plantCode}-${seq}`;
 }
