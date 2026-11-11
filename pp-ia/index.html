@@ -2242,21 +2242,45 @@ async function renderMyActions() {
     </div>`).join('');
   const pmap={Critical:'badge-red',High:'badge-amber',Medium:'badge-blue',Low:'badge-grey'};
   const smap={Overdue:'badge-red',Pending:'badge-amber','In Progress':'badge-blue',Completed:'badge-green'};
+  // Infer display module from title when module field is missing
+  const inferModule = a => {
+    if (a.module && a.module !== 'undefined') return a.module;
+    const t = (a.title||'').toLowerCase();
+    if (t.includes('conduct audit')) return 'Conduct Audit';
+    if (t.includes('finding')) return 'Findings';
+    if (t.includes('capa') || t.includes('corrective')) return 'CAPA';
+    if (t.includes('lpa')) return 'LPA';
+    if (t.includes('supplier')) return 'Supplier';
+    if (t.includes('nc') || t.includes('non-conform')) return 'NC';
+    if (t.includes('rca') || t.includes('root cause')) return 'RCA';
+    return 'Action';
+  };
   document.getElementById('actionsTbl').innerHTML = actions.length ? actions.map(a=>`
-    <tr><td><strong>${a.title}</strong><br><small style="color:var(--text-muted)">${a.id}</small></td>
-    <td><span class="badge badge-grey">${a.module}</span></td><td>${a.plant||'-'}</td>
-    <td><span class="badge ${pmap[a.priority]||'badge-grey'}">${a.priority}</span></td>
+    <tr><td><strong>${a.title||'—'}</strong><br><small style="color:var(--text-muted)">${a.id}</small></td>
+    <td><span class="badge badge-grey">${inferModule(a)}</span></td><td>${a.plant||'-'}</td>
+    <td><span class="badge ${pmap[a.priority]||'badge-grey'}">${a.priority||'Medium'}</span></td>
     <td style="color:${a.status==='Overdue'?'var(--red)':'inherit'}">${formatDate(a.dueDate)}</td>
-    <td><span class="badge ${smap[a.status]||'badge-grey'}">${a.status}</span></td>
-    <td><button class="btn btn-sm btn-primary" onclick="openAction('${a.id}','${a.sourceRef||''}')">Open</button></td></tr>`).join('')
+    <td><span class="badge ${smap[a.status]||'badge-grey'}">${a.status||'Pending'}</span></td>
+    <td><button class="btn btn-sm btn-primary" onclick="openAction('${a.id}','${(a.sourceRef||'').replace(/'/g,"\\'")}','${(a.title||'').replace(/'/g,"\\'")}')">Open</button></td></tr>`).join('')
     : '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-muted)">All caught up — no open actions!</td></tr>';
 }
 
-function openAction(id, sourceRef) {
-  if (!sourceRef) return showToast('No linked record', 'info');
-  const module = sourceRef.split('/')[0];
-  const moduleMap = { correctiveActions:'capa', findings:'findings', auditPlans:'planning', rootCauseAnalyses:'rca', lpaAudits:'lpa', supplierAudits:'supplier' };
-  if (moduleMap[module]) navigate(moduleMap[module]);
+function openAction(id, sourceRef, title) {
+  // Infer target module from title first (most reliable)
+  const t = (title||'').toLowerCase();
+  if (t.startsWith('conduct audit') || t.includes('conduct audit')) { navigate('conduct'); return; }
+  if (t.startsWith('finding') || t.includes('finding')) { navigate('findings'); return; }
+  if (t.includes('capa') || t.includes('corrective')) { navigate('capa'); return; }
+  if (t.includes('lpa')) { navigate('lpa'); return; }
+  if (t.includes('supplier')) { navigate('supplier'); return; }
+  if (t.includes('nc') || t.includes('non-conform')) { navigate('nc'); return; }
+  // Fall back to sourceRef collection mapping
+  if (sourceRef) {
+    const col = sourceRef.split('/')[0];
+    const moduleMap = { correctiveActions:'capa', findings:'findings', auditPlans:'conduct', rootCauseAnalyses:'rca', lpaAudits:'lpa', supplierAudits:'supplier' };
+    if (moduleMap[col]) { navigate(moduleMap[col]); return; }
+  }
+  showToast('No linked module found', 'info');
 }
 
 // ─── AUDIT PLANNING ───────────────────────────────────────────────────────────
@@ -3075,16 +3099,65 @@ function cancelPlanAudits(panelId) {
 async function renderConduct() {
   const wrap = document.getElementById('conductList');
   wrap.innerHTML = `<div class="loading-row"><div class="spinner"></div></div>`;
-  let q = db.collection('auditPlans').where('status','in',['Planned','In Progress']).orderBy('plannedDate').limit(20);
-  if (S.userDoc?.plant && S.userDoc.plant !== 'All Plants') q = q.where('plant','==',S.userDoc.plant);
-  const snap = await q.get().catch(()=>null);
-  if (!snap || snap.empty) { wrap.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No audits to conduct</div>'; return; }
-  wrap.innerHTML = snap.docs.map(d => { const a={id:d.id,...d.data()};
+
+  const role = (S.userDoc?.role||'').toLowerCase().trim();
+  const isSA = role==='superadmin'||role==='super admin'||role==='superadmin';
+  const isAdmin = isSA||role==='admin'||role==='plant admin'||role==='plantadmin'||role==='plant_admin';
+  const isAuditor = role==='auditor';
+
+  // Admin/SA: see all audits in their plant; Auditor & others: only their own assigned audits
+  let allAudits = [];
+
+  if (isAdmin) {
+    // Admin sees all planned/in-progress for their plant
+    let q = db.collection('auditPlans').where('status','in',['Planned','In Progress']).orderBy('plannedDate').limit(100);
+    if (S.userDoc?.plant && S.userDoc.plant !== 'All Plants') q = q.where('plant','==',S.userDoc.plant);
+    const snap = await q.get().catch(()=>null);
+    allAudits = snap ? snap.docs.map(d=>({id:d.id,...d.data()})) : [];
+  } else {
+    // Auditors/others: fetch by leadAuditorId OR leadAuditorName OR leadAuditorEmail
+    const uid = S.user?.uid||'';
+    const name = S.userDoc?.name||'';
+    const email = S.user?.email||S.userDoc?.email||'';
+
+    // Run up to 3 parallel queries and deduplicate
+    const queries = [];
+    if (uid) queries.push(
+      db.collection('auditPlans').where('leadAuditorId','==',uid).where('status','in',['Planned','In Progress']).get().catch(()=>null)
+    );
+    if (name) queries.push(
+      db.collection('auditPlans').where('leadAuditorName','==',name).where('status','in',['Planned','In Progress']).get().catch(()=>null)
+    );
+    if (email) queries.push(
+      db.collection('auditPlans').where('leadAuditorEmail','==',email).where('status','in',['Planned','In Progress']).get().catch(()=>null)
+    );
+    const results = await Promise.all(queries);
+    const seen = new Set();
+    for (const snap of results) {
+      if (!snap) continue;
+      snap.docs.forEach(d=>{ if (!seen.has(d.id)) { seen.add(d.id); allAudits.push({id:d.id,...d.data()}); } });
+    }
+    // Sort by planned date
+    allAudits.sort((a,b)=>{ const da=a.plannedDate?.seconds||0; const db2=b.plannedDate?.seconds||0; return da-db2; });
+  }
+
+  if (!allAudits.length) {
+    wrap.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)"><span class="material-icons" style="font-size:40px;display:block;margin-bottom:12px;color:#cbd5e1">assignment_turned_in</span>No audits assigned to you</div>';
+    return;
+  }
+  wrap.innerHTML = allAudits.map(a => {
     return `<div class="card" style="margin-bottom:12px"><div style="display:flex;align-items:center;justify-content:space-between">
-      <div><strong style="font-size:14px">${a.name}</strong><br><span style="font-size:12px;color:var(--text-secondary)">${a.auditType||''} · ${a.plant} · ${formatDate(a.plannedDate)}</span></div>
+      <div>
+        <strong style="font-size:14px">${a.name}</strong>
+        ${a.auditNo?`<span style="font-size:10px;font-weight:700;color:#2563eb;background:#eff6ff;padding:1px 7px;border-radius:4px;margin-left:6px">${a.auditNo}</span>`:''}
+        <br><span style="font-size:12px;color:var(--text-secondary)">${a.auditType||''} · ${a.plant} · ${a.department||''} · ${formatDate(a.plannedDate)}</span>
+        ${a.leadAuditorName?`<br><span style="font-size:11px;color:var(--text-muted)">Auditor: ${a.leadAuditorName}${a.auditeeName?' · Auditee: '+a.auditeeName:''}</span>`:''}
+      </div>
       <div style="display:flex;gap:8px;align-items:center">
         <span class="badge ${a.status==='In Progress'?'badge-blue':'badge-grey'}">${a.status}</span>
-        <button class="btn btn-sm btn-primary" onclick="openAuditChecklist('${a.id}','${a.name}','${a.auditType||''}')"><span class="material-icons" style="font-size:14px">play_arrow</span>Start Audit</button>
+        <button class="btn btn-sm btn-primary" onclick="openAuditChecklist('${a.id}','${a.name.replace(/'/g,"\\'")}','${(a.auditType||'').replace(/'/g,"\\'")}')">
+          <span class="material-icons" style="font-size:14px">play_arrow</span>${a.status==='In Progress'?'Resume':'Start'} Audit
+        </button>
       </div></div></div>`;
   }).join('');
 }
