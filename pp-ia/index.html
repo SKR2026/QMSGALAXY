@@ -1279,23 +1279,34 @@ const S = {
 auth.onAuthStateChanged(async (user) => {
   if (user) {
     S.user = user;
-    // Load user doc from Firestore — first try by UID, then by email (for Pending users)
+    // Load user doc from Firestore — 3-stage lookup
     let snap = await db.collection('users').doc(user.uid).get();
     if (!snap.exists) {
-      // Try to find by email (created by admin before first login)
+      // Stage 2: exact email match
       const byEmail = await db.collection('users').where('email','==',user.email).limit(1).get().catch(()=>null);
       if (byEmail && !byEmail.empty) {
         const docRef = byEmail.docs[0].ref;
-        // Link the UID and activate
-        await docRef.update({ uid: user.uid, status: 'Active', lastLogin: firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{});
-        // Re-read with UID as doc ID (move document)
         const data = byEmail.docs[0].data();
+        await docRef.update({ uid: user.uid, status: 'Active', lastLogin: firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{});
         await db.collection('users').doc(user.uid).set({ ...data, uid: user.uid, status: 'Active' }).catch(()=>{});
         await docRef.delete().catch(()=>{});
         snap = await db.collection('users').doc(user.uid).get();
+      } else {
+        // Stage 3: case-insensitive email scan (catches typos like underscore vs dot)
+        const allUsers = await db.collection('users').get().catch(()=>null);
+        if (allUsers && !allUsers.empty) {
+          const loginEmail = (user.email || '').toLowerCase();
+          const matched = allUsers.docs.find(d => (d.data().email||'').toLowerCase() === loginEmail);
+          if (matched) {
+            const data = matched.data();
+            await matched.ref.update({ uid: user.uid, status: 'Active', lastLogin: firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{});
+            await db.collection('users').doc(user.uid).set({ ...data, uid: user.uid, status: 'Active' }).catch(()=>{});
+            await matched.ref.delete().catch(()=>{});
+            snap = await db.collection('users').doc(user.uid).get();
+          }
+        }
       }
     } else {
-      // Update last login timestamp
       db.collection('users').doc(user.uid).update({ lastLogin: firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{});
     }
     S.userDoc = snap.exists ? snap.data() : { role: 'Viewer', plant: 'All Plants', name: user.displayName || user.email };
