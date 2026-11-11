@@ -573,7 +573,7 @@ select.form-input{cursor:pointer}
     <select class="filter-select" id="actionStatusFilter" onchange="filterActions()"><option value="">All Status</option><option>Pending</option><option>Overdue</option><option>In Progress</option><option>Completed</option></select>
     <select class="filter-select" id="actionPriorityFilter" onchange="filterActions()"><option value="">All Priority</option><option>Critical</option><option>High</option><option>Medium</option><option>Low</option></select>
   </div>
-  <table><thead><tr><th>Task</th><th>Module</th><th>Plant</th><th>Priority</th><th>Due Date</th><th>Status</th><th>Action</th></tr></thead><tbody id="actionsTbl"></tbody></table>
+  <table><thead><tr><th>Task</th><th>Module</th><th>Audit Type</th><th>Plant</th><th>Priority</th><th>Due Date</th><th>Status</th><th>Action</th></tr></thead><tbody id="actionsTbl"></tbody></table>
 </div>
 </div>
 
@@ -2202,7 +2202,7 @@ async function renderMyActions() {
   if (!S.user) return;
   const statsEl = document.getElementById('myActionStats');
   statsEl.innerHTML = `<div class="kpi-card" style="grid-column:span 1"><div class="spinner"></div></div>`.repeat(4);
-  document.getElementById('actionsTbl').innerHTML = loadingRow(7);
+  document.getElementById('actionsTbl').innerHTML = loadingRow(8);
 
   // Try myActions first, fall back to correctiveActions assigned to this user
   let actions = [];
@@ -2257,15 +2257,17 @@ async function renderMyActions() {
   };
   document.getElementById('actionsTbl').innerHTML = actions.length ? actions.map(a=>`
     <tr><td><strong>${a.title||'—'}</strong><br><small style="color:var(--text-muted)">${a.id}</small></td>
-    <td><span class="badge badge-grey">${inferModule(a)}</span></td><td>${a.plant||'-'}</td>
+    <td><span class="badge badge-grey">${inferModule(a)}</span></td>
+    <td>${a.auditType ? `<span class="badge badge-blue" style="font-size:11px">${a.auditType}</span>` : '<span style="color:var(--text-muted)">—</span>'}</td>
+    <td>${a.plant||'-'}</td>
     <td><span class="badge ${pmap[a.priority]||'badge-grey'}">${a.priority||'Medium'}</span></td>
     <td style="color:${a.status==='Overdue'?'var(--red)':'inherit'}">${formatDate(a.dueDate)}</td>
     <td><span class="badge ${smap[a.status]||'badge-grey'}">${a.status||'Pending'}</span></td>
-    <td><button class="btn btn-sm btn-primary" onclick="openAction('${a.id}','${(a.sourceRef||'').replace(/'/g,"\\'")}','${(a.title||'').replace(/'/g,"\\'")}')">Open</button></td></tr>`).join('')
-    : '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-muted)">All caught up — no open actions!</td></tr>';
+    <td><button class="btn btn-sm btn-primary" onclick="openAction('${a.id}','${(a.sourceRef||'').replace(/'/g,"\\'")}','${(a.title||'').replace(/'/g,"\\'")}','${(a.auditType||'').replace(/'/g,"\\'")}')">Open</button></td></tr>`).join('')
+    : '<tr><td colspan="8" style="text-align:center;padding:40px;color:var(--text-muted)">All caught up — no open actions!</td></tr>';
 }
 
-function openAction(id, sourceRef, title) {
+function openAction(id, sourceRef, title, auditType) {
   const t = (title||'').toLowerCase();
   // Extract the referenced doc ID from sourceRef (e.g. "auditPlans/abc123" → "abc123")
   const refParts = (sourceRef||'').split('/');
@@ -2273,9 +2275,11 @@ function openAction(id, sourceRef, title) {
   const refId  = refParts[1]||'';
 
   if (t.includes('conduct audit') || refCol === 'auditPlans') {
-    navigate('conduct');
-    // After navigation, highlight the specific audit if we have its ID
-    if (refId) setTimeout(()=>_highlightConductAudit(refId), 600);
+    // Directly open the audit checklist modal using the plan ID and auditType
+    const planId = refId || id;
+    const auditName = title || 'Conduct Audit';
+    const type = auditType || '';
+    openAuditChecklistFromAction(planId, auditName, type);
     return;
   }
   if (t.includes('finding') || refCol === 'findings') { navigate('findings'); return; }
@@ -2299,6 +2303,22 @@ function _highlightConductAudit(planId) {
       return;
     }
   }
+}
+
+async function openAuditChecklistFromAction(planId, auditName, auditType) {
+  // Fetch the audit plan to get full details
+  let resolvedName = auditName;
+  let resolvedType = auditType;
+  if (planId) {
+    const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+    if (planDoc && planDoc.exists) {
+      const pd = planDoc.data();
+      resolvedName = pd.name || auditName;
+      resolvedType = pd.auditType || auditType;
+    }
+  }
+  // Open the checklist modal directly
+  openAuditChecklist(planId, resolvedName, resolvedType);
 }
 
 // ─── AUDIT PLANNING ───────────────────────────────────────────────────────────
@@ -3184,16 +3204,80 @@ async function renderConduct() {
 }
 
 async function openAuditChecklist(planId, name, auditType) {
-  // Load checklist from Firestore
+  // Show loading modal first
+  showModal(`<div class="modal-title"><span>${name}</span><button onclick="closeModal()" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>
+    <div style="text-align:center;padding:30px"><div class="spinner" style="width:28px;height:28px;margin:0 auto 10px"></div><div style="font-size:13px;color:var(--text-muted)">Loading checklist…</div></div>`);
+
+  // Fetch audit plan details if planId given
+  let planData = null;
+  if (planId) {
+    const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+    if (planDoc && planDoc.exists) planData = planDoc.data();
+  }
+  const resolvedType = auditType || planData?.auditType || '';
+  const displayType  = resolvedType || 'General';
+
+  // Load checklist from Firestore (up to 100 items)
   let q = db.collection('auditChecklists').where('active','==',true);
-  if (auditType) q = q.where('auditType','==',auditType);
-  const snap = await q.limit(10).get().catch(()=>null);
+  if (resolvedType) q = q.where('auditType','==',resolvedType);
+  const snap = await q.limit(100).get().catch(()=>null);
   const cls = snap ? snap.docs.map(d=>({id:d.id,...d.data()})) : [];
-  showModal(`<div class="modal-title">${name}<button onclick="closeModal()" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>
-    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">${cls.length} checklist items loaded for ${auditType}</p>
-    ${cls.length ? cls.map((c,i)=>`<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:8px"><strong style="font-size:13px">${i+1}. ${c.question}</strong><div style="font-size:11px;color:var(--text-muted);margin:4px 0">${c.clause}${c.subClause?'.'+c.subClause:''} · ${c.department} · <span class="badge ${c.criticality==='Critical'?'badge-red':c.criticality==='Major'?'badge-amber':'badge-grey'}" style="font-size:10px">${c.criticality}</span></div><div style="display:flex;gap:12px;margin-top:8px">${['Conforming','Non-Conforming','Observation','N/A'].map(v=>`<label style="display:flex;align-items:center;gap:4px;font-size:12px"><input type="radio" name="q${i}" value="${v}"> ${v}</label>`).join('')}</div><textarea class="form-input" style="margin-top:8px" rows="1" placeholder="Evidence / Comments..."></textarea></div>`).join('')
-    : '<div style="text-align:center;padding:20px;color:var(--text-muted)">No checklist items found for this audit type. Upload via Checklist Master.</div>'}
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px"><button class="btn btn-secondary" onclick="closeModal()">Save Draft</button><button class="btn btn-primary" onclick="submitAuditResponses('${planId}')">Submit Responses</button></div>`);
+
+  // Audit info banner
+  const infoBanner = planData ? `
+    <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:10px 14px;margin-bottom:14px;display:grid;grid-template-columns:repeat(3,1fr);gap:8px;font-size:12px">
+      <div><div style="color:#94A3B8;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em">Audit Type</div><div style="font-weight:600;color:#1D4ED8">${resolvedType||'—'}</div></div>
+      <div><div style="color:#94A3B8;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em">Plant</div><div style="font-weight:600">${planData.plant||'—'}</div></div>
+      <div><div style="color:#94A3B8;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em">Planned Date</div><div style="font-weight:600">${formatDate(planData.plannedDate)}</div></div>
+      ${planData.leadAuditorName?`<div><div style="color:#94A3B8;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em">Lead Auditor</div><div style="font-weight:600">${planData.leadAuditorName}</div></div>`:''}
+      ${planData.department?`<div><div style="color:#94A3B8;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em">Department</div><div style="font-weight:600">${planData.department}</div></div>`:''}
+      ${planData.scope?`<div style="grid-column:span 2"><div style="color:#94A3B8;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em">Scope</div><div style="font-weight:600">${planData.scope}</div></div>`:''}
+    </div>` : '';
+
+  const checklistHtml = cls.length
+    ? cls.map((c,i)=>`
+      <div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:8px">
+        <div style="display:flex;align-items:flex-start;gap:8px">
+          <span style="background:#EFF6FF;color:#1D4ED8;font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;flex-shrink:0;margin-top:1px">${i+1}</span>
+          <div style="flex:1">
+            <strong style="font-size:13px">${c.question}</strong>
+            <div style="font-size:11px;color:var(--text-muted);margin:4px 0 8px">
+              ${c.clause?`<span style="margin-right:8px">§ ${c.clause}${c.subClause?'.'+c.subClause:''}</span>`:''}
+              ${c.department?`<span style="margin-right:8px">📁 ${c.department}</span>`:''}
+              <span class="badge ${c.criticality==='Critical'?'badge-red':c.criticality==='Major'?'badge-amber':'badge-grey'}" style="font-size:10px">${c.criticality||'Minor'}</span>
+            </div>
+            ${c.requirement?`<div style="font-size:11px;color:#475569;background:#F8FAFC;border-radius:6px;padding:6px 8px;margin-bottom:8px"><strong>Requirement:</strong> ${c.requirement}</div>`:''}
+            <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:8px">
+              ${['Conforming','Non-Conforming','Observation','N/A'].map(v=>`<label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer"><input type="radio" name="q${i}" value="${v}"> ${v}</label>`).join('')}
+            </div>
+            <textarea class="form-input" id="ev${i}" style="margin-top:4px;font-size:12px" rows="2" placeholder="Evidence / Comments…"></textarea>
+          </div>
+        </div>
+      </div>`)
+    .join('')
+    : `<div style="text-align:center;padding:32px;color:var(--text-muted)">
+        <span class="material-icons" style="font-size:40px;display:block;margin-bottom:10px;color:#cbd5e1">checklist</span>
+        <div style="font-size:14px;font-weight:600;margin-bottom:6px">No checklist items found for <em>${displayType}</em></div>
+        <div style="font-size:12px">Add checklist questions in <strong>Checklist Master</strong> under the <strong>${displayType}</strong> audit type to get started.</div>
+       </div>`;
+
+  showModal(`<div class="modal-title">
+      <div style="display:flex;align-items:center;gap:8px;min-width:0">
+        <span class="material-icons" style="color:#059669">fact_check</span>
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${name}</span>
+        <span style="background:#DCFCE7;color:#15803D;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;flex-shrink:0">${displayType}</span>
+      </div>
+      <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;flex-shrink:0"><span class="material-icons">close</span></button>
+    </div>
+    ${infoBanner}
+    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">${cls.length} checklist item${cls.length!==1?'s':''} loaded for <strong>${displayType}</strong></p>
+    ${checklistHtml}
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-secondary" onclick="closeModal()">Save Draft</button>
+      <button class="btn btn-primary" onclick="submitAuditResponses('${planId}')">
+        <span class="material-icons" style="font-size:15px">send</span> Submit Responses
+      </button>
+    </div>`);
 }
 
 async function submitAuditResponses(planId) {
