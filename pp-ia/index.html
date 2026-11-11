@@ -1502,7 +1502,11 @@ function navigate(module) {
   });
   document.querySelectorAll('.module-panel').forEach(p => p.classList.remove('active'));
   const panel = document.getElementById(`panel-${module}`);
-  if (panel) panel.classList.add('active');
+  if (panel) {
+    // Restore original HTML if it was replaced by a temporary banner/form
+    if (panel._origHTML) { panel.innerHTML = panel._origHTML; delete panel._origHTML; }
+    panel.classList.add('active');
+  }
   const titles = {dashboard:'Dashboard',myactions:'My Actions',planning:'Audit Planning',conduct:'Conduct Audit',findings:'Findings',nc:'Non-Conformities',rca:'Root Cause Analysis',capa:'CAPA',effectiveness:'Effectiveness Verification',lpa:'Layered Process Audits',supplier:'Supplier Audits',checklist:'Checklist Master',analytics:'Analytics & Reports',deptperf:'Department Performance',plantperf:'Plant Performance',standards:'Standards Master',notifications:'Notifications',users:'User Management',logs:'Activity Logs',settings:'Settings'};
   document.getElementById('headerTitle').textContent = titles[module] || module;
   S.currentModule = module;
@@ -2349,9 +2353,40 @@ async function bulkDeleteAuditPlans() {
   } catch(e) { showToast('Delete failed: ' + e.message, 'error'); }
 }
 
-function viewAuditPlan(id) {
-  showToast('Opening audit…', 'info');
-  // Navigate to conduct panel with this audit pre-selected if available
+async function viewAuditPlan(id) {
+  const snap = await db.collection('auditPlans').doc(id).get().catch(()=>null);
+  if (!snap || !snap.exists) return showToast('Audit not found','error');
+  const a = { id, ...snap.data() };
+  const fd = n => { if(!n) return '—'; try { const d = n.toDate ? n.toDate() : new Date(n.seconds*1000||n); return d.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}); } catch(e){ return '—'; } };
+  const statusColor = {Planned:'#6b7280',  'In Progress':'#2563eb', Completed:'#16a34a', Cancelled:'#dc2626'}[a.status] || '#6b7280';
+  openModal(`<div class="modal-title" style="display:flex;align-items:center;gap:10px">
+    <span class="material-icons" style="color:#2563eb">assignment</span>
+    <span style="flex:1">Audit Details</span>
+    <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;font-size:20px;color:#999">×</button>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:13px;margin-top:4px">
+    ${[
+      ['Audit Name', a.name||'—'],
+      ['Audit No', a.auditNo||'—'],
+      ['Audit Type', a.auditType||'—'],
+      ['Plant', a.plant||'—'],
+      ['Department', a.department||'—'],
+      ['Process', a.process||'—'],
+      ['Lead Auditor', a.leadAuditorName||'—'],
+      ['Auditee', a.auditeeName||'—'],
+      ['Planned Date', fd(a.plannedDate)],
+      ['Shift', a.shift||'—'],
+      ['Status', `<span style="color:${statusColor};font-weight:700">${a.status||'—'}</span>`],
+      ['Created By', a.createdByName||'—'],
+    ].map(([l,v])=>`<div style="background:#f8fafc;border-radius:8px;padding:10px 12px">
+      <div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">${l}</div>
+      <div style="font-weight:600;color:#0f172a">${v}</div>
+    </div>`).join('')}
+  </div>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+    <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+    <button class="btn btn-primary" onclick="closeModal();editAuditPlan('${id}')"><span class="material-icons" style="font-size:14px;vertical-align:middle">edit</span> Edit</button>
+  </div>`);
 }
 
 async function editAuditPlan(id) {
@@ -2710,7 +2745,11 @@ async function saveAllAuditPlans(panelId, collection, isLPA) {
   const rows=[...document.querySelectorAll('#'+(window._planTbodyId||'planRowsTbody')+' tr')];
   let saved=0, errors=0;
   const savedDocs=[]; // track for Publish
+  const now = new Date();
+  const monthKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
 
+  // ── Step 1: Collect all row data first ──────────────────────────────────
+  const rowDataList = [];
   for(const tr of rows){
     const plant=tr.querySelector('.pr-plant')?.value;
     const dateV=tr.querySelector('.pr-date')?.value;
@@ -2718,6 +2757,7 @@ async function saveAllAuditPlans(panelId, collection, isLPA) {
     if(!plant||!dateV){errors++;continue;}
     const level=tr.querySelector('.pr-level')?.value||'';
     const auditorEmail = auditorSel?.options[auditorSel?.selectedIndex]?.dataset?.email||'';
+    const auditType = isLPA ? 'LPA' : (tr.querySelector('.pr-type')?.value || 'Internal');
     const data={
       name:(tr.querySelector('.pr-process')?.value||tr.querySelector('.pr-dept')?.value||'Audit')+(level?' – '+level:''),
       plant, department:tr.querySelector('.pr-dept')?.value||'',
@@ -2729,34 +2769,36 @@ async function saveAllAuditPlans(panelId, collection, isLPA) {
       auditeeEmail:(()=>{const s=tr.querySelector('.pr-auditee');return s?.options[s?.selectedIndex]?.dataset?.email||'';})(),
       plannedDate:firebase.firestore.Timestamp.fromDate(new Date(dateV)),
       shift:tr.querySelector('.pr-shift')?.value||'',
-      auditType:tr.querySelector('.pr-type')?.value||'',
+      auditType,
       status:'Planned', published:false,
       createdBy:S.user?.uid||'',
       createdByName:S.userDoc?.name||S.user?.email||'',
       createdAt:firebase.firestore.FieldValue.serverTimestamp(),
+      monthKey,
     };
-    // Resolve plant code from Firestore plants collection
-    const pSnap = await db.collection('plants').where('name','==',data.plant).limit(1).get().catch(()=>null);
-    const pCode = pSnap?.docs[0]?.data()?.code || data.plant.replace(/[^A-Z0-9]/gi,'').substring(0,4).toUpperCase();
-    const now = new Date();
-    data.plantCode = pCode;
-    data.monthKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-
     if(isLPA){
       data.layer=level;
       data.area=tr.querySelector('.pr-area')?.value||'';
-      data.auditNo='LPA-'+Date.now().toString(36).toUpperCase();
-      data.auditType='LPA';
-      // Auto-assign sequential audit number for LPA too
-      const lpaAutoNo = await generateAuditNo(pCode, 'LPA');
-      if (lpaAutoNo) data.auditNo = lpaAutoNo;
-    } else {
-      // Keep the user-selected audit type (from dropdown); fallback to 'Internal'
-      if (!data.auditType) data.auditType = 'Internal';
-      // Auto-assign sequential audit number (skipped for Customer Audit & Supplier Audit)
-      const autoNo = await generateAuditNo(pCode, data.auditType);
-      if (autoNo) data.auditNo = autoNo;
     }
+    // Resolve plant code
+    const pSnap = await db.collection('plants').where('name','==',data.plant).limit(1).get().catch(()=>null);
+    data.plantCode = pSnap?.docs[0]?.data()?.code || data.plant.replace(/[^A-Z0-9]/gi,'').substring(0,4).toUpperCase();
+    rowDataList.push(data);
+  }
+
+  // ── Step 2: Generate ONE audit number per unique plant+type combo ────────
+  // Key = "PLANTCODE|auditType"
+  const auditNoMap = {}; // key → auditNo
+  for(const data of rowDataList){
+    const key = `${data.plantCode}|${data.auditType}`;
+    if(!auditNoMap[key]){
+      auditNoMap[key] = await generateAuditNo(data.plantCode, data.auditType) || `AUD-${data.plantCode}-${Date.now().toString(36).toUpperCase()}`;
+    }
+    data.auditNo = auditNoMap[key];
+  }
+
+  // ── Step 3: Save all rows ────────────────────────────────────────────────
+  for(const data of rowDataList){
     const ref=await db.collection(collection).add(data).catch(()=>null);
     if(ref){saved++;savedDocs.push({id:ref.id,...data});}else errors++;
   }
@@ -2776,6 +2818,8 @@ async function saveAllAuditPlans(panelId, collection, isLPA) {
 
 function _showPlanSavedBanner(docs, collection) {
   const panel=document.getElementById('panel-planning');
+  // Save original panel HTML so navigate('planning') can restore it
+  if (!panel._origHTML) panel._origHTML = panel.innerHTML;
   panel.innerHTML=`
     <div style="max-width:680px;margin:40px auto;text-align:center">
       <div style="width:64px;height:64px;background:#ecfdf5;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 16px">
@@ -2802,7 +2846,7 @@ function _showPlanSavedBanner(docs, collection) {
       </div>
 
       <div style="display:flex;gap:12px;justify-content:center">
-        <button class="btn btn-secondary" onclick="cancelPlanAudits('panel-planning');renderPlanning()">Back to Planning</button>
+        <button class="btn btn-secondary" onclick="navigate('planning')">Back to Planning</button>
         <button class="btn btn-primary" id="publishScheduleBtn" onclick="publishAuditSchedule(${JSON.stringify(docs.map(d=>d.id)).replace(/"/g,"'")}, '${collection}')"
           style="background:#7c3aed;border-color:#7c3aed;gap:6px">
           <span class="material-icons" style="font-size:16px;vertical-align:middle">send</span>
@@ -2858,8 +2902,8 @@ async function publishAuditSchedule(docIds, collection) {
       if(msg) msg.innerHTML='<span style="color:var(--amber)">⚠ No email addresses found. Ensure Auditor/Auditee users have emails saved in User Management.</span>';
       if(btn){btn.disabled=false;btn.innerHTML='<span class="material-icons" style="font-size:15px;vertical-align:middle">send</span> Publish &amp; Notify All';}
       // Still mark as published even if no emails
-      for(const d of docs){
-        await db.collection(collection).doc(d.id).update({ published:true, publishedAt:firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{});
+      for(const id of docIds){
+        await db.collection(collection).doc(id).update({ published:true, publishedAt:firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{});
       }
       return;
     }
@@ -2918,15 +2962,22 @@ function _showPublishPreviewModal(recipients, plans, docIds, collection) {
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="confirmPublishBtn"
-        onclick="_confirmPublishSend(${JSON.stringify(recipients).replace(/"/g,"'")}, ${JSON.stringify(docIds).replace(/"/g,"'")}, '${collection}')"
+        onclick="_confirmPublishSend()"
         style="background:#7c3aed;border-color:#7c3aed">
         <span class="material-icons" style="font-size:15px;vertical-align:middle">email</span>
         Confirm &amp; Send Notifications
       </button>
     </div>`);
+  // Store data in globals to avoid serialization issues via onclick attributes
+  window._publishRecipients = recipients;
+  window._publishDocIds = docIds;
+  window._publishCollection = collection;
 }
 
-async function _confirmPublishSend(recipients, docIds, collection) {
+async function _confirmPublishSend() {
+  const recipients = window._publishRecipients || [];
+  const docIds = window._publishDocIds || [];
+  const collection = window._publishCollection || 'auditPlans';
   const btn=document.getElementById('confirmPublishBtn');
   if(btn){btn.disabled=true;btn.innerHTML='<span class="material-icons" style="font-size:14px;vertical-align:middle">hourglass_top</span> Sending…';}
 
@@ -3009,7 +3060,7 @@ async function _confirmPublishSend(recipients, docIds, collection) {
     showToast(`Schedule published & ${sent} email${sent!==1?'s':''} sent! 🎉`,'success');
   }
   logActivity('Published audit schedule — '+docIds.length+' plans, '+sent+' notified','Planning','');
-  renderPlanning();
+  navigate('planning');
 }
 
 function cancelPlanAudits(panelId) {
@@ -5339,32 +5390,38 @@ async function saveAuditNoConfig() {
   logActivity('Updated audit no. prefixes', 'Settings', JSON.stringify(prefixes));
 }
 
-// Generate sequential audit number: PREFIX-PLANTCODE-NNN (per audit type per plant per month)
-// Excludes Customer Audit & Supplier Audit types
+// Generate sequential audit number: PREFIX-PLANTCODE-NNN
+// Number is cumulative (never resets) — each month gets the next number in sequence.
+// One number per plant+type per month batch; shared across all rows in the same batch.
+// Excludes Customer Audit & Supplier Audit types.
 async function generateAuditNo(plantCode, auditType) {
-  // Customer & Supplier audits are excluded
   const excluded = ['Customer Audit','Supplier Audit'];
   if (excluded.some(t => (auditType||'').toLowerCase() === t.toLowerCase())) return null;
   if ((auditType||'').toLowerCase().includes('supplier') || (auditType||'').toLowerCase().includes('customer')) return null;
 
-  // 1. Get prefix for this specific audit type from Firestore settings
+  // 1. Get prefix for this audit type from Firestore settings
   const cfgSnap = await db.collection('appSettings').doc('auditConfig').get().catch(()=>null);
   const prefixes = cfgSnap?.data()?.prefixes || {};
   const prefix = prefixes[auditType] || prefixes['Internal'] || 'QMS';
 
-  // 2. Build month key YYYY-MM
-  const now = new Date();
-  const monthKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-
-  // 3. Count existing audit plans for this audit type + plant + month
+  // 2. Count ALL existing audit plans ever for this plant + audit type (cumulative, no month filter)
   const snap = await db.collection('auditPlans')
     .where('plantCode', '==', plantCode)
-    .where('monthKey', '==', monthKey)
     .where('auditType', '==', auditType)
     .get().catch(()=>null);
 
-  const count = snap ? snap.docs.length : 0;
-  const seq = String(count + 1).padStart(3, '0');
+  // Count distinct monthKeys already used — each month's batch = 1 number
+  const usedMonthKeys = new Set();
+  if (snap) snap.docs.forEach(d => { const mk = d.data().monthKey; if(mk) usedMonthKeys.add(mk); });
+  const now = new Date();
+  const thisMonth = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+  // If this month already has a number, reuse it; otherwise next in sequence
+  if (usedMonthKeys.has(thisMonth)) {
+    // Find the existing auditNo for this month
+    const existing = snap?.docs.find(d => d.data().monthKey === thisMonth && d.data().auditNo);
+    if (existing?.data()?.auditNo) return existing.data().auditNo;
+  }
+  const seq = String(usedMonthKeys.size + 1).padStart(3, '0');
   return `${prefix}-${plantCode}-${seq}`;
 }
 
