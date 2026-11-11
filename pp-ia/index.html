@@ -1745,23 +1745,32 @@ async function renderDashboard() {
 
   renderKpiCards(kpiData);
 
-  // Upcoming audits — filtered by plant + type
+  // Upcoming audits — filtered by plant + type (client-side sort to avoid composite index)
   document.getElementById('upcomingTbl').innerHTML = loadingRow(4);
-  let q = db.collection('auditPlans').where('status','in',['Planned','In Progress']).orderBy('plannedDate').limit(5);
-  if (plant) q = q.where('plant','==',plant);
-  if (type)  q = q.where('auditType','==',type);
+  let q = plant ? db.collection('auditPlans').where('plant','==',plant).limit(100)
+                : db.collection('auditPlans').limit(100);
   q.get().then(snap => {
-    document.getElementById('upcomingTbl').innerHTML = snap.empty
+    let rows = snap.docs.map(d=>({id:d.id,...d.data()}))
+      .filter(a=>['Planned','In Progress'].includes(a.status))
+      .filter(a=>!type || a.auditType===type)
+      .sort((a,b)=>{ const ta=a.plannedDate?.toMillis?.()??0; const tb=b.plannedDate?.toMillis?.()??0; return ta-tb; })
+      .slice(0,5);
+    document.getElementById('upcomingTbl').innerHTML = rows.length===0
       ? '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:20px">No upcoming audits</td></tr>'
-      : snap.docs.map(d => { const a=d.data(); return `<tr><td>${a.auditNo?`<span style="font-size:10px;font-weight:700;color:#2563eb;background:#eff6ff;padding:1px 6px;border-radius:4px;margin-right:4px">${a.auditNo}</span>`:''}${a.name}</td><td>${a.plant}</td><td>${formatDate(a.plannedDate)}</td><td><span class="badge ${a.status==='In Progress'?'badge-blue':'badge-grey'}">${a.status}</span></td></tr>`; }).join('');
-  }).catch(()=>{});
+      : rows.map(a=>`<tr><td>${a.auditNo?`<span style="font-size:10px;font-weight:700;color:#2563eb;background:#eff6ff;padding:1px 6px;border-radius:4px;margin-right:4px">${a.auditNo}</span>`:''}${a.name}</td><td>${a.plant}</td><td>${formatDate(a.plannedDate)}</td><td><span class="badge ${a.status==='In Progress'?'badge-blue':'badge-grey'}">${a.status}</span></td></tr>`).join('');
+  }).catch(()=>{ document.getElementById('upcomingTbl').innerHTML='<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:20px">No upcoming audits</td></tr>'; });
 
-  // Pending CAPA — filtered by plant
+  // Pending CAPA — filtered by plant (client-side sort)
   document.getElementById('capaTbl').innerHTML = loadingRow(4);
-  let cq = db.collection('correctiveActions').where('status','in',['Open','In Progress','Overdue']).orderBy('dueDate').limit(5);
-  if (plant) cq = cq.where('plant','==',plant);
+  let cq = plant ? db.collection('correctiveActions').where('plant','==',plant).limit(100)
+                 : db.collection('correctiveActions').limit(100);
   cq.get().then(snap => {
-    document.getElementById('capaTbl').innerHTML = snap.empty
+    let capaRows = snap.docs.map(d=>({id:d.id,...d.data()}))
+      .filter(a=>['Open','In Progress','Overdue'].includes(a.status))
+      .sort((a,b)=>{ const ta=a.dueDate?.toMillis?.()??0; const tb=b.dueDate?.toMillis?.()??0; return ta-tb; })
+      .slice(0,5);
+    const snap2 = { empty: capaRows.length===0, docs: capaRows.map(a=>({data:()=>a})) };
+    document.getElementById('capaTbl').innerHTML = snap2.empty
       ? '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:20px">No pending CAPAs</td></tr>'
       : snap.docs.map(d => { const c=d.data(); return `<tr><td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${c.title}</td><td>${c.assigneeName||'-'}</td><td>${formatDate(c.dueDate)}</td><td><span class="badge ${c.status==='Overdue'?'badge-red':c.status==='In Progress'?'badge-blue':'badge-amber'}">${c.status}</span></td></tr>`; }).join('');
   }).catch(()=>{});
@@ -3230,11 +3239,16 @@ async function renderConduct() {
   let allAudits = [];
 
   if (isAdmin) {
-    // Admin sees all planned/in-progress for their plant
-    let q = db.collection('auditPlans').where('status','in',['Planned','In Progress']).orderBy('plannedDate').limit(100);
-    if (S.userDoc?.plant && S.userDoc.plant !== 'All Plants') q = q.where('plant','==',S.userDoc.plant);
+    // Admin sees all planned/in-progress for their plant (client-side filter to avoid composite index)
+    const userPlant = S.userDoc?.plant;
+    let q = (userPlant && userPlant !== 'All Plants')
+      ? db.collection('auditPlans').where('plant','==',userPlant).limit(300)
+      : db.collection('auditPlans').limit(300);
     const snap = await q.get().catch(()=>null);
-    allAudits = snap ? snap.docs.map(d=>({id:d.id,...d.data()})) : [];
+    allAudits = snap ? snap.docs.map(d=>({id:d.id,...d.data()}))
+      .filter(a=>['Planned','In Progress'].includes(a.status))
+      .sort((a,b)=>{ const ta=a.plannedDate?.toMillis?.()??0; const tb=b.plannedDate?.toMillis?.()??0; return ta-tb; })
+      : [];
   } else {
     // Auditors/others: fetch by leadAuditorId OR leadAuditorName OR leadAuditorEmail
     // NOTE: No compound index needed — query by single field only, filter status client-side
@@ -3496,13 +3510,37 @@ async function renderNC() {
   document.getElementById('ncDetailView').style.display='none';
   document.getElementById('ncTbl').innerHTML = loadingRow(9);
   _refreshPublishNcBtn();
-  let q = db.collection('findings').where('type','in',['Major NC','Minor NC','OI']).orderBy('createdAt','desc').limit(100);
-  if (S.selectedPlant !== 'All Plants') q = q.where('plant','==',S.selectedPlant);
-  const snap = await q.get().catch(()=>null);
-  if (!snap) { document.getElementById('ncTbl').innerHTML = loadingRow(9); return; }
-  document.getElementById('ncTbl').innerHTML = snap.empty
+
+  // Single where clause only — no compound orderBy (avoids composite index requirement)
+  // Filter and sort client-side
+  let q = S.selectedPlant !== 'All Plants'
+    ? db.collection('findings').where('plant','==',S.selectedPlant).limit(300)
+    : db.collection('findings').limit(300);
+
+  const snap = await q.get().catch(async () => {
+    return db.collection('findings').limit(300).get().catch(()=>null);
+  });
+  if (!snap) {
+    document.getElementById('ncTbl').innerHTML = '<tr><td colspan="9" style="text-align:center;padding:40px;color:#DC2626">Failed to load — please refresh</td></tr>';
+    return;
+  }
+
+  // Filter to NC types only, sort newest first
+  const ncDocs = snap.docs
+    .filter(d => ['Major NC','Minor NC','OI'].includes(d.data().type))
+    .sort((a,b)=>{
+      const ta = a.data().createdAt?.toMillis?.() || 0;
+      const tb = b.data().createdAt?.toMillis?.() || 0;
+      return tb - ta;
+    });
+
+  // Apply type filter from dropdown if set
+  const typeFilter = document.getElementById('ncTypeFilter')?.value || '';
+  const filtered = typeFilter ? ncDocs.filter(d => d.data().type === typeFilter) : ncDocs;
+
+  document.getElementById('ncTbl').innerHTML = filtered.length === 0
     ? '<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text-muted)">No non-conformities found</td></tr>'
-    : snap.docs.map(d => { const f={id:d.id,...d.data()};
+    : filtered.map(d => { const f={id:d.id,...d.data()};
         const stage = f.workflowStage||'Open';
         const stageColor = NC_STAGE_COLOR[stage]||'badge-grey';
         const typeBadge = f.type==='Major NC'?'badge-red':'badge-amber';
@@ -3822,7 +3860,7 @@ async function saveCAPAUpdate(id) {
 // ─── EFFECTIVENESS ────────────────────────────────────────────────────────────
 async function renderEffectiveness() {
   document.getElementById('effectTbl').innerHTML = loadingRow(8);
-  const snap = await db.collection('correctiveActions').where('status','==','Pending Verification').orderBy('updatedAt','desc').limit(20).get().catch(()=>null);
+  const snap = await db.collection('correctiveActions').where('status','==','Pending Verification').limit(50).get().catch(()=>null);
   if (!snap) return;
   document.getElementById('effectTbl').innerHTML = snap.empty
     ? '<tr><td colspan="8" style="text-align:center;padding:40px;color:var(--text-muted)">No CAPAs pending verification</td></tr>'
@@ -5355,7 +5393,12 @@ async function saveStandard() {
 // ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
 async function renderNotifications() {
   if (!S.user) return;
-  const snap = await db.collection('notifications').where('userId','==',S.user.uid).orderBy('createdAt','desc').limit(50).get().catch(()=>null);
+  const rawSnap = await db.collection('notifications').where('userId','==',S.user.uid).limit(50).get().catch(()=>null);
+  // Sort newest first client-side (removed orderBy to avoid composite index requirement)
+  const snap = rawSnap ? {
+    empty: rawSnap.empty,
+    docs: [...rawSnap.docs].sort((a,b)=>(b.data().createdAt?.toMillis?.()??0)-(a.data().createdAt?.toMillis?.()??0))
+  } : null;
 
   const cfg = {
     error:   { icon:'warning',       bg:'#FEF2F2', border:'#FECACA', iconBg:'#FEE2E2', iconColor:'#DC2626', label:'Alert',   labelBg:'#FEE2E2', labelColor:'#991B1B' },
