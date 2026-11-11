@@ -3300,11 +3300,17 @@ async function openAuditChecklist(planId, name, auditType) {
   const resolvedType = auditType || planData?.auditType || '';
   const displayType  = resolvedType || 'General';
 
-  // Load checklist from Firestore (up to 100 items)
-  let q = db.collection('auditChecklists').where('active','==',true);
-  if (resolvedType) q = q.where('auditType','==',resolvedType);
-  const snap = await q.limit(100).get().catch(()=>null);
-  const cls = snap ? snap.docs.map(d=>({id:d.id,...d.data()})) : [];
+  // Load checklist from Firestore — single where clause to avoid composite index
+  // Filter active + sort client-side
+  let q = resolvedType
+    ? db.collection('auditChecklists').where('auditType','==',resolvedType).limit(200)
+    : db.collection('auditChecklists').limit(200);
+  const snap = await q.get().catch(()=>null);
+  const cls = snap
+    ? snap.docs.map(d=>({id:d.id,...d.data()}))
+        .filter(c => c.active !== false)
+        .sort((a,b)=>(a.clause||'').localeCompare(b.clause||''))
+    : [];
 
   // Audit info banner
   const infoBanner = planData ? `
@@ -4258,20 +4264,43 @@ async function filterChecklists() {
 
 async function renderChecklistTable() {
   document.getElementById('checklistTbl').innerHTML = loadingRow(11);
-  let q = db.collection('auditChecklists');
   const type   = document.getElementById('clTypeFilter')?.value;
   const status = document.getElementById('clStatusFilter')?.value;
-  if (type)   q = q.where('auditType','==',type);
-  if (status !== '') q = q.where('active','==', status === 'true');
-  q = q.orderBy('auditType').orderBy('clause').limit(100);
-  const snap = await q.get().catch(()=>null);
-  if (!snap) return;
-  const qText = document.getElementById('clSearch')?.value?.toLowerCase() || '';
-  const docs = snap.docs.filter(d => {
-    if (!qText) return true;
-    const r=d.data();
-    return r.question?.toLowerCase().includes(qText) || r.clause?.includes(qText) || r.department?.toLowerCase().includes(qText);
+
+  // Use simple queries only (no compound orderBy — avoids composite index requirement)
+  // Apply filters one at a time; sort client-side
+  let q = db.collection('auditChecklists');
+  if (type)              q = q.where('auditType','==', type);
+  else if (status !== '') q = q.where('active','==', status === 'true');
+
+  let snap = await q.limit(500).get().catch(async () => {
+    // Fallback: fetch all without filter
+    return db.collection('auditChecklists').limit(500).get().catch(()=>null);
   });
+  if (!snap) { document.getElementById('checklistTbl').innerHTML = '<tr><td colspan="11" style="text-align:center;padding:40px;color:#DC2626">Failed to load — check Firestore indexes</td></tr>'; return; }
+
+  // Apply remaining filter client-side
+  let allDocs = snap.docs;
+  if (type && status !== '')   allDocs = allDocs.filter(d => d.data().active === (status === 'true'));
+  else if (!type && status !== '') allDocs = allDocs.filter(d => d.data().active === (status === 'true'));
+
+  // Client-side sort: auditType → clause
+  allDocs.sort((a,b)=>{
+    const at = (a.data().auditType||'').localeCompare(b.data().auditType||'');
+    if (at !== 0) return at;
+    return (a.data().clause||'').localeCompare(b.data().clause||'');
+  });
+
+  const qText = document.getElementById('clSearch')?.value?.toLowerCase() || '';
+  const docs = allDocs.filter(d => {
+    if (!qText) return true;
+    const r = d.data();
+    return (r.question||'').toLowerCase().includes(qText)
+        || (r.clause||'').includes(qText)
+        || (r.department||'').toLowerCase().includes(qText)
+        || (r.auditType||'').toLowerCase().includes(qText);
+  });
+
   document.getElementById('checklistTbl').innerHTML = docs.length ? docs.map(d=>{ const c={id:d.id,...d.data()};
     return `<tr><td><span class="badge badge-blue" style="font-size:10px">${c.auditType}</span></td>
       <td style="font-size:11px">${c.standard}</td>
