@@ -1233,6 +1233,32 @@ firebase functions:secrets:set APP_URL</code>
   </div>
 </div>
 
+<!-- ── RESET APP (superadmin only) ──────────────────────────────────────── -->
+<div class="card" id="resetAppCard" style="margin-top:16px;display:none;border:1.5px solid #DC262622;background:linear-gradient(135deg,#FEF2F2 0%,#fff 100%)">
+  <div style="display:flex;align-items:flex-start;gap:14px">
+    <span class="material-icons" style="color:#DC2626;font-size:28px;margin-top:2px">restart_alt</span>
+    <div style="flex:1">
+      <div class="card-title" style="margin-bottom:4px;color:#DC2626">Reset App to Fresh State</div>
+      <div style="font-size:12px;color:#6B7280;margin-bottom:16px;line-height:1.7">
+        Permanently deletes <strong>all data</strong> across every collection —
+        audit plans, findings, NCs, CAPA, RCA, effectiveness, LPA, supplier audits,
+        checklists, standards, myActions, notifications, activity logs, and all settings.<br>
+        <strong style="color:#DC2626">⚠ User accounts are preserved. This cannot be undone.</strong>
+      </div>
+      <div id="resetAppStatus" style="display:none;padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;margin-bottom:14px"></div>
+      <div id="resetProgressWrap" style="display:none;margin-bottom:14px">
+        <div style="font-size:12px;color:#6B7280;margin-bottom:6px" id="resetProgressLabel">Deleting…</div>
+        <div class="progress-bar"><div class="progress-fill" id="resetProgressBar" style="width:0%;background:#DC2626"></div></div>
+      </div>
+      <button class="btn" id="resetAppBtn" onclick="confirmResetApp()"
+        style="background:#DC2626;color:#fff;border:none;font-weight:700">
+        <span class="material-icons" style="font-size:15px;vertical-align:middle">delete_forever</span>
+        Reset Entire App
+      </button>
+    </div>
+  </div>
+</div>
+
 </div>
 
   </div><!-- end #content -->
@@ -2218,6 +2244,11 @@ async function renderMyActions() {
     actions = [...a2, ...a3];
   }
 
+  // Filter out completed/closed/cancelled actions
+  actions = actions.filter(a => {
+    const st = (a.status||'').toLowerCase();
+    return st !== 'completed' && st !== 'closed' && st !== 'cancelled';
+  });
   const now = new Date();
   const overdue  = actions.filter(a=>{ const dd=a.dueDate?.toDate?a.dueDate.toDate():new Date(a.dueDate||0); return dd<now&&a.status!=='Completed'&&a.status!=='Closed'; }).length;
   const pending  = actions.filter(a=>a.status==='Pending'||a.status==='Open'||!a.status).length;
@@ -2256,7 +2287,9 @@ async function renderMyActions() {
     return 'Action';
   };
   document.getElementById('actionsTbl').innerHTML = actions.length ? actions.map(a=>`
-    <tr><td><strong>${a.title||'—'}</strong><br><small style="color:var(--text-muted)">${a.id}</small></td>
+    <tr><td><strong>${a.title||'—'}</strong>
+    ${a.auditNo?`<span style="font-size:10px;font-weight:700;color:#2563eb;background:#eff6ff;padding:1px 7px;border-radius:4px;margin-left:5px">${a.auditNo}</span>`:''}
+    <br><small style="color:var(--text-muted)">${a.id}</small></td>
     <td><span class="badge badge-grey">${inferModule(a)}</span></td>
     <td>${a.auditType ? `<span class="badge badge-blue" style="font-size:11px">${a.auditType}</span>` : '<span style="color:var(--text-muted)">—</span>'}</td>
     <td>${a.plant||'-'}</td>
@@ -2515,10 +2548,26 @@ async function _saveAuditPlanEdit(id) {
 }
 
 async function deleteAuditPlan(id, name) {
-  if (!confirm('Delete audit "' + name + '"? This cannot be undone.')) return;
+  if (!confirm('Delete audit "' + name + '"?\n\nThis will also remove it from My Actions for all Auditor & Auditee accounts. This cannot be undone.')) return;
   try {
+    // ── Cascade: delete myActions referencing this audit ─────────────────────
+    const sourceRef = `auditPlans/${id}`;
+    const maSnap = await db.collection('myActions').where('sourceRef','==',sourceRef).get().catch(()=>null);
+    if(maSnap && !maSnap.empty){
+      const batch = db.batch();
+      maSnap.docs.forEach(d => batch.delete(d.ref));
+      await batch.commit().catch(()=>{});
+    }
+    // ── Cascade: cancel any open NC / findings linked to this audit ──────────
+    const ncSnap = await db.collection('nonConformities').where('auditPlanId','==',id).get().catch(()=>null);
+    if(ncSnap && !ncSnap.empty){
+      const b2 = db.batch();
+      ncSnap.docs.forEach(d => b2.update(d.ref,{ _auditDeleted:true }));
+      await b2.commit().catch(()=>{});
+    }
+    // ── Finally delete the plan ───────────────────────────────────────────────
     await db.collection('auditPlans').doc(id).delete();
-    showToast('Audit deleted', 'success');
+    showToast('Audit deleted & removed from all accounts ✓', 'success');
     logActivity('Deleted audit plan: ' + name, 'Planning', id);
     renderPlanning();
   } catch(e) {
@@ -3034,94 +3083,111 @@ function _showPublishPreviewModal(recipients, plans, docIds, collection) {
   window._publishRecipients = recipients;
   window._publishDocIds = docIds;
   window._publishCollection = collection;
+  window._publishPlans = plans;
 }
 
 async function _confirmPublishSend() {
   const recipients = window._publishRecipients || [];
-  const docIds = window._publishDocIds || [];
+  const docIds     = window._publishDocIds     || [];
   const collection = window._publishCollection || 'auditPlans';
-  const btn=document.getElementById('confirmPublishBtn');
-  if(btn){btn.disabled=true;btn.innerHTML='<span class="material-icons" style="font-size:14px;vertical-align:middle">hourglass_top</span> Sending…';}
+  const plans      = window._publishPlans      || [];
+  const btn = document.getElementById('confirmPublishBtn');
+  if(btn){btn.disabled=true;btn.innerHTML='<span class="material-icons" style="font-size:14px;vertical-align:middle">hourglass_top</span> Publishing…';}
 
-  let sent=0, failed=0;
+  let emailSent=0, emailFailed=0;
 
-  // Fetch Gmail config
-  const cfgSnap=await db.collection('appSettings').doc('emailConfig').get().catch(()=>null);
-  const cfg=cfgSnap?.data()||{};
-  const hasGmail=!!(cfg.gmailAddress&&cfg.gmailAppPwd);
-
-  for(const r of recipients){
-    const auditRows=r.audits.map(a=>{
-      const dt=a.plannedDate?.toDate?a.plannedDate.toDate():new Date(a.plannedDate?.seconds*1000||Date.now());
-      return `<tr>
-        <td style="padding:6px 10px;border-bottom:1px solid #eee;font-weight:600">${a.name}</td>
-        <td style="padding:6px 10px;border-bottom:1px solid #eee">${a.plant}</td>
-        <td style="padding:6px 10px;border-bottom:1px solid #eee">${a.department||'—'}</td>
-        <td style="padding:6px 10px;border-bottom:1px solid #eee">${dt.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})}</td>
-        <td style="padding:6px 10px;border-bottom:1px solid #eee">${a.shift||'—'}</td>
-        <td style="padding:6px 10px;border-bottom:1px solid #eee">${r.role==='Auditor'?a.auditeeName||'—':a.leadAuditorName||'—'}</td>
-      </tr>`;
-    }).join('');
-
-    const html=`<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#f4f4f4;margin:0;padding:20px">
-<div style="max-width:620px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08)">
-  <div style="background:#1e3a8a;padding:20px 24px;color:#fff">
-    <div style="font-size:18px;font-weight:700">Audit Schedule Notification</div>
-    <div style="font-size:12px;opacity:.8;margin-top:4px">Group Audit Management System</div>
-  </div>
-  <div style="padding:24px">
-    <p style="margin:0 0 8px;color:#374151">Dear <strong>${r.name}</strong>,</p>
-    <p style="margin:0 0 20px;color:#6b7280;font-size:13px">
-      You have been assigned as <strong>${r.role}</strong> for the following audit${r.audits.length!==1?'s':''}. Please review and prepare accordingly.
-    </p>
-    <table style="width:100%;border-collapse:collapse;font-size:13px;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden">
-      <thead><tr style="background:#f9fafb;font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase">
-        <th style="padding:8px 10px;text-align:left">Audit</th>
-        <th style="padding:8px 10px;text-align:left">Plant</th>
-        <th style="padding:8px 10px;text-align:left">Department</th>
-        <th style="padding:8px 10px;text-align:left">Date</th>
-        <th style="padding:8px 10px;text-align:left">Shift</th>
-        <th style="padding:8px 10px;text-align:left">${r.role==='Auditor'?'Auditee':'Auditor'}</th>
-      </tr></thead>
-      <tbody>${auditRows}</tbody>
-    </table>
-    <p style="margin:20px 0 0;font-size:12px;color:#9ca3af">This is an automated notification from the Group Audit Management System. Please do not reply to this email.</p>
-  </div>
-</div></body></html>`;
-
-    try {
-      if(hasGmail){
-        const fn=fnRegion.httpsCallable('sendAuditScheduleEmail');
-        await fn({to:r.email,name:r.name,subject:`Audit Schedule Notification — ${r.audits.length} Audit${r.audits.length!==1?'s':''} Assigned`,html,gmailAddress:cfg.gmailAddress,gmailAppPwd:cfg.gmailAppPwd,planIds:r.audits.map(a=>a.id||''),skipPlanLookup:true});
-      }
-      // Log notification in Firestore regardless
-      await db.collection('notifications').add({
-        type:'audit_schedule',recipientEmail:r.email,recipientName:r.name,role:r.role,
-        auditCount:r.audits.length,sentAt:firebase.firestore.FieldValue.serverTimestamp(),
-        sentBy:S.user?.email||'',emailSent:hasGmail,
-      });
-      sent++;
-    } catch(e){ console.error('Email to '+r.email+' failed:',e); failed++; }
+  // ── Step 1: Send emails via Cloud Function (correct params) ──────────────
+  try {
+    const allEmails = recipients.map(r=>r.email).filter(Boolean);
+    const fnRegion = firebase.app().functions('asia-south1');
+    const fn = fnRegion.httpsCallable('sendAuditScheduleEmail');
+    await fn({ docIds, collection, recipients: allEmails });
+    emailSent = allEmails.length;
+  } catch(e) {
+    console.warn('Cloud Function email failed:', e.message);
+    // Fallback: log per-recipient notification docs (in-app)
+    for(const r of recipients){
+      try {
+        await db.collection('notifications').add({
+          type:'audit_schedule', recipientEmail:r.email, recipientName:r.name, role:r.role,
+          auditCount:r.audits.length, sentAt:firebase.firestore.FieldValue.serverTimestamp(),
+          sentBy:S.user?.email||'', emailSent:false,
+          auditIds: r.audits.map(a=>a.id||''),
+          message:`You have been assigned as ${r.role} for ${r.audits.length} audit(s). Please log in to view your schedule.`,
+        });
+      } catch(_){}
+      emailFailed++;
+    }
   }
 
-  // Mark plans as published
+  // ── Step 2: Create / update myActions for each auditor & auditee ─────────
+  // Build email→userId lookup from users collection for all recipient emails
+  const allEmails = [...new Set(recipients.map(r=>r.email).filter(Boolean))];
+  const emailToUid = {};
+  for(const em of allEmails){
+    const us = await db.collection('users').where('email','==',em).limit(1).get().catch(()=>null);
+    if(us && !us.empty) emailToUid[em] = us.docs[0].id;
+  }
+
+  for(const p of plans){
+    // Helper: upsert a myAction for a user
+    const upsertAction = async (userId, userEmail, role) => {
+      if(!userId && !userEmail) return;
+      const uid = userId || emailToUid[userEmail] || null;
+      if(!uid) return;
+      const sourceRef = `${collection}/${p.id}`;
+      // Check if already exists
+      const ex = await db.collection('myActions')
+        .where('userId','==',uid).where('sourceRef','==',sourceRef)
+        .limit(1).get().catch(()=>null);
+      const data = {
+        userId:     uid,
+        userEmail:  userEmail||'',
+        title:      `Conduct Audit: ${p.name||p.id}`,
+        auditType:  p.auditType||'',
+        auditNo:    p.auditNo||'',
+        plant:      p.plant||'',
+        department: p.department||'',
+        dueDate:    p.plannedDate||null,
+        priority:   'Medium',
+        status:     'Pending',
+        module:     'Conduct Audit',
+        sourceRef,
+        role,
+        updatedAt:  firebase.firestore.FieldValue.serverTimestamp(),
+      };
+      if(ex && !ex.empty){
+        await ex.docs[0].ref.update(data).catch(()=>{});
+      } else {
+        await db.collection('myActions').add({...data, createdAt:firebase.firestore.FieldValue.serverTimestamp(), createdBy:S.user?.uid||''}).catch(()=>{});
+      }
+    };
+
+    // Auditor action
+    await upsertAction(p.leadAuditorId||'', p.leadAuditorEmail||'', 'Auditor');
+    // Auditee action
+    const auditeeUid = emailToUid[p.auditeeEmail||''] || '';
+    await upsertAction(auditeeUid, p.auditeeEmail||'', 'Auditee');
+  }
+
+  // ── Step 3: Mark plans as published ──────────────────────────────────────
   for(const id of docIds){
     await db.collection(collection).doc(id).update({
-      published:true,
-      publishedAt:firebase.firestore.FieldValue.serverTimestamp(),
-      publishedBy:S.user?.uid||'',
+      published: true,
+      publishedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      publishedBy: S.user?.uid||'',
     }).catch(()=>{});
   }
 
   closeModal();
-  if(!hasGmail){
-    showToast('Schedule published! (Email not sent — configure Gmail in Settings)','info');
-  } else if(failed){
-    showToast(`${sent} notified, ${failed} failed`,'error');
+  if(emailFailed && !emailSent){
+    showToast(`Schedule published & tasks created! (Email needs Cloud Functions deployment — in-app notifications sent)`, 'info');
+  } else if(emailFailed){
+    showToast(`Schedule published! ${emailSent} emailed, ${emailFailed} in-app notified`, 'info');
   } else {
-    showToast(`Schedule published & ${sent} email${sent!==1?'s':''} sent! 🎉`,'success');
+    showToast(`Schedule published & ${emailSent} email${emailSent!==1?'s':''} sent! 🎉`, 'success');
   }
-  logActivity('Published audit schedule — '+docIds.length+' plans, '+sent+' notified','Planning','');
+  logActivity('Published audit schedule — '+docIds.length+' plans, '+recipients.length+' notified','Planning','');
   navigate('planning');
 }
 
@@ -3281,9 +3347,28 @@ async function openAuditChecklist(planId, name, auditType) {
 }
 
 async function submitAuditResponses(planId) {
-  await db.collection('auditPlans').doc(planId).update({ status:'Pending Review', completedAt: firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{});
-  closeModal(); showToast('Audit responses submitted!','success');
+  await db.collection('auditPlans').doc(planId).update({
+    status:'Pending Review',
+    completedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    completedBy: S.user?.uid||'',
+  }).catch(()=>{});
+
+  // ── Remove this audit from myActions for all users ────────────────────────
+  if(planId){
+    const sourceRef = `auditPlans/${planId}`;
+    const snap = await db.collection('myActions').where('sourceRef','==',sourceRef).get().catch(()=>null);
+    if(snap && !snap.empty){
+      const batch = db.batch();
+      snap.docs.forEach(d => batch.update(d.ref,{ status:'Completed', completedAt:firebase.firestore.FieldValue.serverTimestamp() }));
+      await batch.commit().catch(()=>{});
+    }
+  }
+
+  closeModal();
+  showToast('Audit responses submitted! ✅','success');
   logActivity('Submitted audit responses','Conduct Audit',planId);
+  // Refresh My Actions badge if visible
+  if(S.currentModule === 'myactions') renderMyActions();
 }
 
 // ─── FINDINGS ─────────────────────────────────────────────────────────────────
@@ -5501,6 +5586,8 @@ async function renderSettings() {
   if (_dCard) _dCard.style.display = _isSA ? '' : 'none';
   const _anCard = document.getElementById('auditNoConfigCard');
   if (_anCard) _anCard.style.display = _isSA ? '' : 'none';
+  const _rCard = document.getElementById('resetAppCard');
+  if (_rCard) _rCard.style.display = _isSA ? '' : 'none';
   // Load audit number prefixes per audit type
   if (_isSA) {
     const cfgSnap = await db.collection('appSettings').doc('auditConfig').get().catch(()=>null);
@@ -6516,6 +6603,168 @@ function _showDummyStatus(filled) {
 async function _loadDummyStatus() {
   const snap=await db.collection('appSettings').doc('dummyMeta').get().catch(()=>null);
   _showDummyStatus(snap?.exists&&snap.data()?.filled===true);
+}
+
+// ─── RESET APP (superadmin) ───────────────────────────────────────────────────
+function confirmResetApp() {
+  const isSA = S.userDoc?.role==='superadmin'||S.userDoc?.role==='Super Admin'||S.userDoc?.role==='SuperAdmin';
+  if(!isSA){ showToast('Super Admin only','error'); return; }
+
+  showModal(`
+    <div class="modal-title" style="color:#DC2626">
+      <span class="material-icons" style="vertical-align:middle;margin-right:6px">warning</span>
+      Reset Entire App — Step 1 of 2
+      <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;float:right"><span class="material-icons">close</span></button>
+    </div>
+    <div style="background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:14px;margin-bottom:16px;font-size:13px;line-height:1.7">
+      <strong style="color:#DC2626">This will permanently delete ALL data in the app:</strong>
+      <ul style="margin:8px 0 0 16px;color:#7F1D1D;font-size:12px">
+        <li>All audit plans, findings, NCs, CAPA, RCA, effectiveness records</li>
+        <li>All LPA audits, supplier audits, checklists, standards</li>
+        <li>All My Actions, notifications, activity logs</li>
+        <li>All app settings (email config, audit numbers, plants, departments)</li>
+      </ul>
+      <div style="margin-top:10px;font-weight:700;color:#DC2626">⚠ User accounts will NOT be deleted. This cannot be undone.</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label" style="color:#DC2626">Type <strong>RESET</strong> to confirm</label>
+      <input class="form-input" id="resetConfirmInput" placeholder="Type RESET here" style="border-color:#FECACA;font-weight:700;letter-spacing:.1em;text-transform:uppercase">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn" id="resetStep2Btn" disabled onclick="_resetStep2()"
+        style="background:#DC2626;color:#fff;font-weight:700;opacity:.5;cursor:not-allowed">
+        <span class="material-icons" style="font-size:14px;vertical-align:middle">arrow_forward</span> Continue →
+      </button>
+    </div>`);
+
+  setTimeout(()=>{
+    const inp=document.getElementById('resetConfirmInput');
+    const btn=document.getElementById('resetStep2Btn');
+    if(inp&&btn){
+      inp.addEventListener('input',()=>{
+        const ok=inp.value.trim()==='RESET';
+        btn.disabled=!ok;
+        btn.style.opacity=ok?'1':'0.5';
+        btn.style.cursor=ok?'pointer':'not-allowed';
+      });
+    }
+  },100);
+}
+
+function _resetStep2() {
+  closeModal();
+  setTimeout(()=>{
+    showModal(`
+      <div class="modal-title" style="color:#DC2626">
+        <span class="material-icons" style="vertical-align:middle;margin-right:6px">delete_forever</span>
+        Final Confirmation — Step 2 of 2
+        <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;float:right"><span class="material-icons">close</span></button>
+      </div>
+      <div style="text-align:center;padding:20px 0">
+        <span class="material-icons" style="font-size:56px;color:#DC2626;display:block;margin-bottom:12px">warning_amber</span>
+        <div style="font-size:16px;font-weight:700;color:#0F172A;margin-bottom:8px">Are you absolutely sure?</div>
+        <div style="font-size:13px;color:#6B7280">This action is <strong>permanent and irreversible</strong>.<br>All operational data will be wiped from the database.</div>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:8px">
+        <button class="btn btn-secondary" onclick="closeModal()">No, Cancel</button>
+        <button class="btn" onclick="closeModal();setTimeout(resetEntireApp,200)"
+          style="background:#DC2626;color:#fff;font-weight:700">
+          <span class="material-icons" style="font-size:14px;vertical-align:middle">delete_forever</span>
+          Yes, Wipe All Data
+        </button>
+      </div>`);
+  },200);
+}
+
+async function resetEntireApp() {
+  const isSA = S.userDoc?.role==='superadmin'||S.userDoc?.role==='Super Admin'||S.userDoc?.role==='SuperAdmin';
+  if(!isSA){ showToast('Super Admin only','error'); return; }
+
+  const btn = document.getElementById('resetAppBtn');
+  const statusEl = document.getElementById('resetAppStatus');
+  const progressWrap = document.getElementById('resetProgressWrap');
+  const progressBar  = document.getElementById('resetProgressBar');
+  const progressLbl  = document.getElementById('resetProgressLabel');
+
+  if(btn){ btn.disabled=true; btn.innerHTML='<div class="spinner" style="width:14px;height:14px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:6px"></div> Resetting…'; }
+  if(progressWrap) progressWrap.style.display='block';
+  if(statusEl) statusEl.style.display='none';
+
+  const COLLECTIONS = [
+    'auditPlans','auditReports','findings','nonConformities',
+    'correctiveActions','rootCauseAnalyses','effectivenessRecords',
+    'lpaAudits','lpaFindings','lpaActions',
+    'supplierAudits','supplierFindings',
+    'auditChecklists','standards',
+    'myActions','notifications','activityLogs','auditNumbers',
+  ];
+  const SETTINGS_DOCS = ['emailConfig','auditConfig','dummyMeta','escalationPolicy','auditTypes'];
+
+  const total = COLLECTIONS.length + 1;
+  let done = 0;
+
+  const setProgress = (pct, label) => {
+    if(progressBar) progressBar.style.width = pct+'%';
+    if(progressLbl) progressLbl.textContent = label;
+  };
+
+  const wipeCollection = async (colName) => {
+    setProgress(Math.round((done/total)*100), `Deleting ${colName}…`);
+    while(true){
+      const snap = await db.collection(colName).limit(400).get().catch(()=>null);
+      if(!snap || snap.empty) break;
+      const batch = db.batch();
+      snap.docs.forEach(d => batch.delete(d.ref));
+      await batch.commit().catch(()=>{});
+      if(snap.docs.length < 400) break;
+    }
+    done++;
+    setProgress(Math.round((done/total)*100), `Cleared: ${colName}`);
+  };
+
+  try {
+    for(const col of COLLECTIONS) await wipeCollection(col);
+
+    setProgress(Math.round((done/total)*100), 'Resetting app settings…');
+    const sBatch = db.batch();
+    for(const docId of SETTINGS_DOCS) sBatch.delete(db.collection('appSettings').doc(docId));
+    await sBatch.commit().catch(()=>{});
+    done++;
+    setProgress(100,'Reset complete!');
+
+    if(statusEl){
+      statusEl.style.display='block';
+      statusEl.style.background='#DCFCE7';
+      statusEl.style.border='1px solid #86EFAC';
+      statusEl.style.color='#15803D';
+      statusEl.style.padding='10px 14px';
+      statusEl.style.borderRadius='8px';
+      statusEl.style.fontSize='13px';
+      statusEl.style.marginBottom='12px';
+      statusEl.innerHTML='<span class="material-icons" style="font-size:14px;vertical-align:middle;margin-right:4px">check_circle</span>App reset successfully! All data has been wiped.';
+    }
+    if(btn){ btn.disabled=false; btn.innerHTML='<span class="material-icons" style="font-size:15px;vertical-align:middle">delete_forever</span> Reset Entire App'; }
+    showToast('App reset complete! 🧹 All data wiped.','success');
+
+    setTimeout(()=>{ navigate('dashboard'); },2000);
+
+  } catch(e){
+    if(statusEl){
+      statusEl.style.display='block';
+      statusEl.style.background='#FEF2F2';
+      statusEl.style.border='1px solid #FECACA';
+      statusEl.style.color='#B91C1C';
+      statusEl.style.padding='10px 14px';
+      statusEl.style.borderRadius='8px';
+      statusEl.style.fontSize='13px';
+      statusEl.style.marginBottom='12px';
+      statusEl.innerHTML='<span class="material-icons" style="font-size:14px;vertical-align:middle;margin-right:4px">error</span>Reset failed: '+e.message;
+    }
+    if(progressWrap) progressWrap.style.display='none';
+    if(btn){ btn.disabled=false; btn.innerHTML='<span class="material-icons" style="font-size:15px;vertical-align:middle">delete_forever</span> Reset Entire App'; }
+    showToast('Reset failed: '+e.message,'error');
+  }
 }
 
 // ─── Enter key login ──────────────────────────────────────────────────────────
