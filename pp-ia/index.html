@@ -2249,6 +2249,37 @@ async function renderMyActions() {
     const st = (a.status||'').toLowerCase();
     return st !== 'completed' && st !== 'closed' && st !== 'cancelled';
   });
+
+  // Backfill missing auditType / auditNo from linked auditPlans (for older records)
+  const missingType = actions.filter(a => !a.auditType && (a.sourceRef||'').startsWith('auditPlans/'));
+  if (missingType.length) {
+    const planIds = [...new Set(missingType.map(a => a.sourceRef.split('/')[1]).filter(Boolean))];
+    const planFetches = await Promise.all(planIds.map(pid => db.collection('auditPlans').doc(pid).get().catch(()=>null)));
+    const planMap = {};
+    planFetches.forEach(d => { if(d && d.exists) planMap[d.id] = d.data(); });
+    // Patch actions in memory and update Firestore in background
+    const batch = db.batch();
+    let batchCount = 0;
+    actions = actions.map(a => {
+      if (!a.auditType && (a.sourceRef||'').startsWith('auditPlans/')) {
+        const pid = a.sourceRef.split('/')[1];
+        const pd = planMap[pid];
+        if (pd) {
+          const patch = {};
+          if (pd.auditType && !a.auditType) { a.auditType = pd.auditType; patch.auditType = pd.auditType; }
+          if (pd.auditNo  && !a.auditNo)  { a.auditNo  = pd.auditNo;  patch.auditNo  = pd.auditNo;  }
+          if (pd.name     && !a.auditName){ a.auditName = pd.name; }
+          if (Object.keys(patch).length && batchCount < 490) {
+            batch.update(db.collection('myActions').doc(a.id), patch);
+            batchCount++;
+          }
+        }
+      }
+      return a;
+    });
+    if (batchCount > 0) batch.commit().catch(()=>{});
+  }
+
   const now = new Date();
   const overdue  = actions.filter(a=>{ const dd=a.dueDate?.toDate?a.dueDate.toDate():new Date(a.dueDate||0); return dd<now&&a.status!=='Completed'&&a.status!=='Closed'; }).length;
   const pending  = actions.filter(a=>a.status==='Pending'||a.status==='Open'||!a.status).length;
