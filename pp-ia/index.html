@@ -2266,21 +2266,39 @@ async function renderMyActions() {
 }
 
 function openAction(id, sourceRef, title) {
-  // Infer target module from title first (most reliable)
   const t = (title||'').toLowerCase();
-  if (t.startsWith('conduct audit') || t.includes('conduct audit')) { navigate('conduct'); return; }
-  if (t.startsWith('finding') || t.includes('finding')) { navigate('findings'); return; }
-  if (t.includes('capa') || t.includes('corrective')) { navigate('capa'); return; }
-  if (t.includes('lpa')) { navigate('lpa'); return; }
-  if (t.includes('supplier')) { navigate('supplier'); return; }
-  if (t.includes('nc') || t.includes('non-conform')) { navigate('nc'); return; }
-  // Fall back to sourceRef collection mapping
-  if (sourceRef) {
-    const col = sourceRef.split('/')[0];
-    const moduleMap = { correctiveActions:'capa', findings:'findings', auditPlans:'conduct', rootCauseAnalyses:'rca', lpaAudits:'lpa', supplierAudits:'supplier' };
-    if (moduleMap[col]) { navigate(moduleMap[col]); return; }
+  // Extract the referenced doc ID from sourceRef (e.g. "auditPlans/abc123" → "abc123")
+  const refParts = (sourceRef||'').split('/');
+  const refCol = refParts[0]||'';
+  const refId  = refParts[1]||'';
+
+  if (t.includes('conduct audit') || refCol === 'auditPlans') {
+    navigate('conduct');
+    // After navigation, highlight the specific audit if we have its ID
+    if (refId) setTimeout(()=>_highlightConductAudit(refId), 600);
+    return;
   }
+  if (t.includes('finding') || refCol === 'findings') { navigate('findings'); return; }
+  if (t.includes('capa') || t.includes('corrective') || refCol === 'correctiveActions') { navigate('capa'); return; }
+  if (t.includes('lpa') || refCol === 'lpaAudits') { navigate('lpa'); return; }
+  if (t.includes('supplier') || refCol === 'supplierAudits') { navigate('supplier'); return; }
+  if (t.includes('nc') || t.includes('non-conform')) { navigate('nc'); return; }
+  if (t.includes('rca') || t.includes('root cause') || refCol === 'rootCauseAnalyses') { navigate('rca'); return; }
   showToast('No linked module found', 'info');
+}
+
+function _highlightConductAudit(planId) {
+  // Find the card for this audit and scroll + highlight it
+  const cards = document.querySelectorAll('#conductList .card');
+  for (const card of cards) {
+    if (card.innerHTML.includes(planId)) {
+      card.scrollIntoView({behavior:'smooth', block:'center'});
+      card.style.transition='box-shadow .3s';
+      card.style.boxShadow='0 0 0 3px #2563eb88';
+      setTimeout(()=>card.style.boxShadow='', 2000);
+      return;
+    }
+  }
 }
 
 // ─── AUDIT PLANNING ───────────────────────────────────────────────────────────
@@ -3116,29 +3134,32 @@ async function renderConduct() {
     allAudits = snap ? snap.docs.map(d=>({id:d.id,...d.data()})) : [];
   } else {
     // Auditors/others: fetch by leadAuditorId OR leadAuditorName OR leadAuditorEmail
+    // NOTE: No compound index needed — query by single field only, filter status client-side
     const uid = S.user?.uid||'';
     const name = S.userDoc?.name||'';
     const email = S.user?.email||S.userDoc?.email||'';
 
-    // Run up to 3 parallel queries and deduplicate
     const queries = [];
-    if (uid) queries.push(
-      db.collection('auditPlans').where('leadAuditorId','==',uid).where('status','in',['Planned','In Progress']).get().catch(()=>null)
-    );
-    if (name) queries.push(
-      db.collection('auditPlans').where('leadAuditorName','==',name).where('status','in',['Planned','In Progress']).get().catch(()=>null)
-    );
-    if (email) queries.push(
-      db.collection('auditPlans').where('leadAuditorEmail','==',email).where('status','in',['Planned','In Progress']).get().catch(()=>null)
-    );
+    if (uid)   queries.push(db.collection('auditPlans').where('leadAuditorId','==',uid).get().catch(()=>null));
+    if (name)  queries.push(db.collection('auditPlans').where('leadAuditorName','==',name).get().catch(()=>null));
+    if (email) queries.push(db.collection('auditPlans').where('leadAuditorEmail','==',email).get().catch(()=>null));
+
     const results = await Promise.all(queries);
     const seen = new Set();
     for (const snap of results) {
       if (!snap) continue;
-      snap.docs.forEach(d=>{ if (!seen.has(d.id)) { seen.add(d.id); allAudits.push({id:d.id,...d.data()}); } });
+      snap.docs.forEach(d=>{
+        if (!seen.has(d.id)) {
+          seen.add(d.id);
+          const data = {id:d.id,...d.data()};
+          // Filter: only active statuses (not Completed/Cancelled)
+          const st = data.status||'Planned';
+          if (st !== 'Completed' && st !== 'Cancelled') allAudits.push(data);
+        }
+      });
     }
-    // Sort by planned date
-    allAudits.sort((a,b)=>{ const da=a.plannedDate?.seconds||0; const db2=b.plannedDate?.seconds||0; return da-db2; });
+    // Sort by planned date ascending
+    allAudits.sort((a,b)=>(a.plannedDate?.seconds||0)-(b.plannedDate?.seconds||0));
   }
 
   if (!allAudits.length) {
