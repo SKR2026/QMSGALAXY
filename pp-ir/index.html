@@ -5607,33 +5607,49 @@ async function runAutoEngine() {
   i ? (DB.settings._lastAutoRun = (new Date).toISOString(), saveDB(), buildNav(), updateBellCount()) : DB.settings._lastAutoRun = (new Date).toISOString(), _updateAutoEngineStatus()
 }
 
-function getEscRecipients(e) {
+function getEscRecipients(e, rule) {
   const {
     superAdmins: t,
     admins: n,
     safetyOfficers: i,
     plantHeads: a
   } = getPlantRoleUsers(e.plantId), o = [];
-  return a.forEach(t => {
-    const n = generateToken(e.id, t.id, t.name, t.email, "plant-head-view");
+  // If the escalation rule has specific notifyEmails configured, send ONLY to those.
+  // This prevents role-based recipients (e.g. Safety Officer) from receiving
+  // escalation emails that are meant for a different audience (e.g. Senior Management).
+  if (rule && rule.notifyEmails && rule.notifyEmails.trim()) {
+    rule.notifyEmails.split(",").map(x => x.trim()).filter(Boolean).forEach(email => {
+      const user = DB.users.find(u => u.email && u.email.toLowerCase() === email.toLowerCase());
+      const tok = generateToken(e.id, user ? user.id : ("ext_" + email), user ? user.name : email, email, "plant-head-view");
+      o.push({
+        name: user ? user.name : email,
+        email: email,
+        action: "escalation-alert",
+        tokenUrl: getTokenURL(tok)
+      });
+    });
+    return o;
+  }
+  // Default fallback: notify plant head + safety officer + admin for the incident's plant ONLY.
+  // Super-admins are intentionally excluded here — they receive via the global escalationEmail
+  // setting and should not get per-plant role-based copies for every plant.
+  // Deduplication by email ensures no one gets two copies.
+  const seen = new Set();
+  [...a, ...i, ...n].forEach(t => {
+    if (!t.email || seen.has(t.email.toLowerCase())) return;
+    seen.add(t.email.toLowerCase());
+    const tok = generateToken(e.id, t.id, t.name, t.email, "plant-head-view");
     o.push({
       name: t.name,
       email: t.email,
       action: "escalation-alert",
-      tokenUrl: getTokenURL(n)
-    })
-  }), [...i, ...n, ...t].forEach(t => {
-    const n = generateToken(e.id, t.id, t.name, t.email, "plant-head-view");
-    o.push({
-      name: t.name,
-      email: t.email,
-      action: "escalation-alert",
-      tokenUrl: getTokenURL(n)
-    })
-  }), o
+      tokenUrl: getTokenURL(tok)
+    });
+  });
+  return o;
 }
 async function sendEscalationEmail(e, t, n) {
-  const i = getEscRecipients(e);
+  const i = getEscRecipients(e, t);  // pass rule so notifyEmails is respected
   if (!i.length) return;
   const a = DB.plants.find(t => t.id === e.plantId),
     o = DB.settings.companyName || "Your Company",
@@ -5645,7 +5661,7 @@ async function sendEscalationEmail(e, t, n) {
   }))
 }
 async function sendReminderEmail(e, t, n) {
-  const i = getEscRecipients(e);
+  const i = getEscRecipients(e, t);  // pass rule so notifyEmails is respected
   if (!i.length) return;
   const a = DB.plants.find(x => x.id === e.plantId),
     o = DB.settings.companyName || "Your Company",
