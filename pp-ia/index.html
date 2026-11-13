@@ -991,7 +991,7 @@ select.form-input{cursor:pointer}
 <div class="page-title">User Management</div>
 <div class="page-sub">Manage system users and role-based access</div>
 <div class="toolbar"><div class="search-bar"><span class="material-icons">search</span><input type="text" placeholder="Search users..."></div><button class="btn btn-primary" onclick="showAddUserModal()"><span class="material-icons">add</span>Add User</button></div>
-<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Plant</th><th>Status</th><th>Last Login</th><th>Actions</th></tr></thead><tbody id="usersTbl"></tbody></table>
+<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Plant</th><th>Dept</th><th>Status</th><th>Last Login</th><th>Actions</th></tr></thead><tbody id="usersTbl"></tbody></table>
 </div>
 
 <!-- LOGS -->
@@ -2909,6 +2909,35 @@ async function onPlanDeptChange(deptSel) {
   const procs=[...pSet].sort();
   procSel.innerHTML='<option value="">— Process (optional)</option>'+procs.map(p=>`<option>${p}</option>`).join('');
   procSel.disabled=false;
+
+  // ── Auto-select Auditee based on plant + dept match ───────────────
+  const auditeeSel = row.querySelector('.pr-auditee');
+  if (!auditeeSel || !dept) return;
+  const plantSel = row.querySelector('.pr-plant');
+  const plant = plantSel ? plantSel.value : '';
+  // Find users whose department matches selected dept (and optionally plant)
+  const uSnap = await db.collection('users')
+    .where('department','==',dept).get().catch(()=>null);
+  if (!uSnap || uSnap.empty) return;
+  // Filter by plant if applicable
+  const matches = uSnap.docs.map(d=>({id:d.id,...d.data()}))
+    .filter(u => u.status !== 'Inactive' &&
+      (!plant || !u.plant || u.plant === 'All Plants' || u.plant === plant));
+  // Auto-select only if exactly one match (or best match = Auditee role)
+  const auditeeMatch = matches.find(u => (u.role||'').toLowerCase().includes('auditee')) || matches[0];
+  if (auditeeMatch) {
+    // Find the matching option and select it
+    const opts = [...auditeeSel.options];
+    const opt = opts.find(o => o.value === auditeeMatch.id);
+    if (opt) {
+      auditeeSel.value = auditeeMatch.id;
+      // Trigger visual highlight so user knows it was auto-filled
+      auditeeSel.style.borderColor = '#16a34a';
+      auditeeSel.style.background  = '#f0fdf4';
+      auditeeSel.title = `Auto-filled: ${auditeeMatch.name} (${auditeeMatch.department||dept})`;
+      setTimeout(()=>{ auditeeSel.style.borderColor=''; auditeeSel.style.background=''; }, 2500);
+    }
+  }
 }
 
 async function saveAllAuditPlans(panelId, collection, isLPA) {
@@ -5654,7 +5683,7 @@ async function renderUsers() {
   // Sort client-side by name (needed when orderBy not used)
   const sortedDocs = [...snap.docs].sort((a,b) => (a.data().name||'').localeCompare(b.data().name||''));
 
-  document.getElementById('usersTbl').innerHTML = snap.empty ? '<tr><td colspan="7" style="text-align:center;padding:40px">No users</td></tr>'
+  document.getElementById('usersTbl').innerHTML = snap.empty ? '<tr><td colspan="8" style="text-align:center;padding:40px">No users</td></tr>'
     : sortedDocs.map(d=>{ const u={id:d.id,...d.data()};
         const statusBadge = u.status==='Active'?'badge-green':u.status==='Pending'?'badge-amber':'badge-red';
         // Admin cannot edit SuperAdmin or other Admins
@@ -5664,6 +5693,7 @@ async function renderUsers() {
           <td style="font-size:12px">${u.email||'-'}</td>
           <td><span class="badge ${rmap[u.role]||'badge-grey'}">${rlabel[u.role]||u.role||'-'}</span></td>
           <td>${u.plant||'-'}</td>
+          <td style="font-size:12px">${u.department||'—'}</td>
           <td><span class="badge ${statusBadge}">${u.status||'Active'}</span></td>
           <td style="font-size:12px;color:var(--text-muted)">${u.uid?'✓ Auth linked':'⚠ Pending login'}</td>
           <td style="white-space:nowrap">
@@ -5692,6 +5722,8 @@ function editUser(id) {
       ? `<select class="form-input" id="euPlant"><option value="All Plants">All Plants</option>${S.plants.slice(1).map(p=>`<option ${u.plant===p?'selected':''}>${p}</option>`).join('')}</select>`
       : `<input class="form-input" id="euPlant" value="${myPlant}" readonly style="opacity:.7;background:#f5f5f5">`;
 
+    // Load depts for selected plant
+    _getUserDeptOpts(u.plant||'').then(deptOptsHtml => {
     openModal(`<div class="modal-title">Edit User <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;font-size:20px;color:#999">×</button></div>
       <div class="form-row">
         <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="euName" value="${u.name||''}"></div>
@@ -5704,17 +5736,24 @@ function editUser(id) {
         <div class="form-group"><label class="form-label">Plant</label>${plantField}</div>
       </div>
       <div class="form-row">
+        <div class="form-group"><label class="form-label">Department</label>
+          <select class="form-input" id="euDept"><option value="">— Select Dept</option>${deptOptsHtml.replace(new RegExp(`value="${u.department||'__none__'}"`),'value="'+(u.department||'')+'" selected')}</select>
+        </div>
         <div class="form-group"><label class="form-label">Status</label>
           <select class="form-input" id="euStatus"><option ${u.status==='Active'?'selected':''}>Active</option><option ${u.status==='Inactive'?'selected':''}>Inactive</option><option ${u.status==='Pending'?'selected':''}>Pending</option></select>
         </div>
+      </div>
+      <div class="form-row">
         <div class="form-group"><label class="form-label">Reset Password (optional)</label>
           <input class="form-input" type="text" id="euNewPwd" placeholder="Leave blank to keep current">
         </div>
+        <div class="form-group"></div>
       </div>
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
         <button class="btn btn-primary" onclick="saveUserEdit('${id}')">Save</button>
       </div>`);
+    });
   });
 }
 
@@ -5722,6 +5761,7 @@ async function saveUserEdit(id) {
   const name   = document.getElementById('euName').value.trim();
   const role   = document.getElementById('euRole').value;
   const plant  = document.getElementById('euPlant').value;
+  const dept   = document.getElementById('euDept')?.value || '';
   const status = document.getElementById('euStatus').value;
   if (!name) return showToast('Name required','error');
 
@@ -5735,7 +5775,7 @@ async function saveUserEdit(id) {
   }
 
   await db.collection('users').doc(id).update({
-    name, role, plant, status,
+    name, role, plant, department: dept, status,
     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
   }).catch(e => { showToast('Save failed: ' + e.message, 'error'); return null; });
   closeModal(); showToast('User updated!','success'); renderUsers();
@@ -5748,7 +5788,28 @@ async function deleteUser(id, label) {
   showToast('User deleted','success'); renderUsers();
 }
 
-function showAddUserModal() {
+// ── User dept helper: fetch department options for a given plant ──────────────
+async function _getUserDeptOpts(plant) {
+  const queries = plant && plant !== 'All Plants'
+    ? [db.collection('departments').where('plant','==',plant).get().catch(()=>null),
+       db.collection('departments').where('plant','==','All Plants').get().catch(()=>null)]
+    : [db.collection('departments').get().catch(()=>null)];
+  const snaps = await Promise.all(queries);
+  const deptSet = new Set();
+  snaps.forEach(s => { if(s) s.docs.forEach(d=>{ if(d.data().active!==false) deptSet.add(d.data().name||d.id); }); });
+  return [...deptSet].sort().map(d=>`<option value="${d}">${d}</option>`).join('');
+}
+
+async function _refreshUserDeptOpts(plantSel) {
+  const plant = plantSel.value;
+  const deptSel = document.getElementById('newUserDept');
+  if (!deptSel) return;
+  deptSel.innerHTML = '<option value="">Loading…</option>';
+  const opts = await _getUserDeptOpts(plant);
+  deptSel.innerHTML = '<option value="">— Select Dept</option>' + opts;
+}
+
+async function showAddUserModal() {
   const myRole = S.userDoc?.role || '';
   const isSA = myRole === 'superadmin' || myRole === 'Super Admin' || myRole === 'SuperAdmin';
   const isPA = myRole === 'Admin' || myRole === 'plantadmin';
@@ -5775,6 +5836,9 @@ function showAddUserModal() {
     : `<input class="form-input" id="newUserPlant" value="${myPlant}" readonly style="opacity:.7;background:#f5f5f5">
        <div style="font-size:11px;color:var(--text-muted);margin-top:2px">Users will be assigned to your plant: <strong>${myPlant}</strong></div>`;
 
+  // Build dept options for the selected plant (or all if SA)
+  const deptOptsHtml = await _getUserDeptOpts(isSA ? '' : myPlant);
+
   showModal(`<div class="modal-title">Add New User <button onclick="closeModal()" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Full Name *</label><input class="form-input" id="newUserName" placeholder="e.g. Ramesh Kumar"></div>
@@ -5784,7 +5848,21 @@ function showAddUserModal() {
       <div class="form-group"><label class="form-label">Role</label>
         <select class="form-input" id="newUserRole">${roleOpts}</select>
       </div>
-      <div class="form-group"><label class="form-label">Plant</label>${plantField}</div>
+      <div class="form-group"><label class="form-label">Plant</label>
+        ${isSA
+          ? `<select class="form-input" id="newUserPlant" onchange="_refreshUserDeptOpts(this)">
+              <option value="All Plants">All Plants</option>${S.plants.slice(1).map(p=>`<option>${p}</option>`).join('')}
+             </select>`
+          : `<input class="form-input" id="newUserPlant" value="${myPlant}" readonly style="opacity:.7;background:#f5f5f5">
+             <div style="font-size:11px;color:var(--text-muted);margin-top:2px">Users will be assigned to your plant: <strong>${myPlant}</strong></div>`
+        }
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Department</label>
+        <select class="form-input" id="newUserDept"><option value="">— Select Dept</option>${deptOptsHtml}</select>
+      </div>
+      <div class="form-group"></div>
     </div>
     <div class="form-group">
       <label class="form-label">Temporary Password (optional but recommended)</label>
@@ -5802,6 +5880,7 @@ async function createUser() {
   const email = document.getElementById('newUserEmail').value.trim();
   const role  = document.getElementById('newUserRole').value;
   const plant = document.getElementById('newUserPlant').value;
+  const dept  = document.getElementById('newUserDept')?.value || '';
   const tempPwd = document.getElementById('newUserTempPwd')?.value.trim();
   if (!name || !email) { showToast('Name and email required','error'); return; }
 
@@ -5825,7 +5904,7 @@ async function createUser() {
     //    When the user signs in for the first time, their UID is linked via onAuthStateChanged
     const userRef = db.collection('users').doc();
     await userRef.set({
-      name, email, role, plant,
+      name, email, role, plant, department: dept,
       status: 'Pending',
       uid: null,         // will be set on first login
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
