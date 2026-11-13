@@ -854,8 +854,14 @@ select.form-input{cursor:pointer}
     <select class="filter-select" id="clStatusFilter" onchange="filterChecklists()"><option value="">All Status</option><option value="true">Active</option><option value="false">Inactive</option></select>
     <button class="btn btn-primary" onclick="showAddChecklistModal()"><span class="material-icons">add</span>Add Question</button>
     <button class="btn btn-secondary" onclick="exportChecklistToExcel()"><span class="material-icons">file_download</span>Export</button>
+    <button id="clBulkDeleteBtn" class="btn btn-sm" style="display:none;background:#FEF2F2;color:#DC2626;border:1px solid #FECACA" onclick="bulkDeleteChecklists()">
+      <span class="material-icons" style="font-size:14px;vertical-align:middle">delete_sweep</span> Delete Selected (<span id="clBulkCount">0</span>)
+    </button>
   </div>
-  <table><thead><tr><th>Audit Type</th><th>Standard</th><th>Clause</th><th>Department</th><th>Question</th><th>Criticality</th><th>Wt</th><th>Plant</th><th>Status</th><th>Ver</th><th>Actions</th></tr></thead><tbody id="checklistTbl"></tbody></table>
+  <table><thead><tr>
+    <th style="width:36px;text-align:center"><input type="checkbox" id="clSelectAll" title="Select all" onchange="toggleAllChecklists(this)"></th>
+    <th>Audit Type</th><th>Standard</th><th>Clause</th><th>Department</th><th>Question</th><th>Criticality</th><th>Wt</th><th>Plant</th><th>Status</th><th>Ver</th><th>Actions</th>
+  </tr></thead><tbody id="checklistTbl"></tbody></table>
 </div>
 <div id="cl-upload" class="tab-content">
   <div class="step-indicator" id="uploadSteps">
@@ -4729,8 +4735,15 @@ async function renderChecklistTable() {
         || (r.auditType||'').toLowerCase().includes(qText);
   });
 
+  // Reset select-all checkbox
+  const selAll = document.getElementById('clSelectAll');
+  if (selAll) selAll.checked = false;
+  _updateClBulkBtn();
+
   document.getElementById('checklistTbl').innerHTML = docs.length ? docs.map(d=>{ const c={id:d.id,...d.data()};
-    return `<tr><td><span class="badge badge-blue" style="font-size:10px">${c.auditType}</span></td>
+    return `<tr>
+      <td style="text-align:center"><input type="checkbox" class="cl-row-chk" data-id="${d.id}" onchange="_updateClBulkBtn()"></td>
+      <td><span class="badge badge-blue" style="font-size:10px">${c.auditType}</span></td>
       <td style="font-size:11px">${c.standard}</td>
       <td style="font-size:12px;font-weight:600">${c.clause}${c.subClause?'.'+c.subClause:''}</td>
       <td>${c.department}</td>
@@ -4743,7 +4756,70 @@ async function renderChecklistTable() {
         <button class="btn btn-sm btn-secondary" onclick="editChecklistQuestion('${d.id}')" style="margin-right:4px">Edit</button>
         <button class="btn btn-sm ${c.active?'btn-danger':'btn-primary'}" onclick="toggleChecklistStatus('${d.id}',${c.active})">${c.active?'Deactivate':'Activate'}</button>
       </td></tr>`;
-  }).join('') : '<tr><td colspan="11" style="text-align:center;padding:40px;color:var(--text-muted)">No checklist items found</td></tr>';
+  }).join('') : '<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--text-muted)">No checklist items found</td></tr>';
+}
+
+function _updateClBulkBtn() {
+  const checked = [...document.querySelectorAll('.cl-row-chk:checked')];
+  const btn = document.getElementById('clBulkDeleteBtn');
+  const countEl = document.getElementById('clBulkCount');
+  if (btn) btn.style.display = checked.length > 0 ? '' : 'none';
+  if (countEl) countEl.textContent = checked.length;
+  // Keep select-all in sync
+  const all = document.querySelectorAll('.cl-row-chk');
+  const selAll = document.getElementById('clSelectAll');
+  if (selAll && all.length > 0) selAll.indeterminate = checked.length > 0 && checked.length < all.length;
+  if (selAll && all.length > 0) selAll.checked = checked.length === all.length;
+}
+
+function toggleAllChecklists(masterCb) {
+  document.querySelectorAll('.cl-row-chk').forEach(cb => cb.checked = masterCb.checked);
+  _updateClBulkBtn();
+}
+
+async function bulkDeleteChecklists() {
+  const checked = [...document.querySelectorAll('.cl-row-chk:checked')];
+  if (!checked.length) return;
+  const ids = checked.map(cb => cb.dataset.id);
+  const n = ids.length;
+  showModal(`<div class="modal-title"><span class="material-icons" style="color:var(--red)">delete_sweep</span> <span>Bulk Delete Checklists</span>
+    <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button></div>
+    <div style="padding:24px">
+      <div style="background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:16px;margin-bottom:20px;font-size:14px;color:#991B1B">
+        <span class="material-icons" style="vertical-align:middle;margin-right:6px;font-size:18px">warning</span>
+        <strong>You are about to permanently delete ${n} checklist item${n!==1?'s':''}.</strong><br>
+        <span style="font-size:12px;color:#B91C1C">This cannot be undone. Active checklist items used in audits will be removed.</span>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-danger" id="confirmBulkDelBtn" onclick="confirmBulkDeleteChecklists(${JSON.stringify(ids).replace(/"/g,'&quot;')})">
+          <span class="material-icons" style="font-size:14px;vertical-align:middle">delete_forever</span> Delete ${n} Item${n!==1?'s':''}
+        </button>
+      </div>
+    </div>`);
+}
+
+async function confirmBulkDeleteChecklists(ids) {
+  const btn = document.getElementById('confirmBulkDelBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Deleting…'; }
+  let deleted = 0, failed = 0;
+  // Firestore batch allows max 500 ops; chunk into batches of 400
+  const CHUNK = 400;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    const batch = db.batch();
+    chunk.forEach(id => batch.delete(db.collection('auditChecklists').doc(id)));
+    const ok = await batch.commit().then(()=>true).catch(()=>false);
+    if (ok) deleted += chunk.length; else failed += chunk.length;
+  }
+  closeModal();
+  if (failed === 0) {
+    showToast(`${deleted} checklist item${deleted!==1?'s':''} deleted successfully.`, 'success');
+    logActivity(`Bulk deleted ${deleted} checklist items`, 'Checklist Master', '');
+  } else {
+    showToast(`${deleted} deleted, ${failed} failed — check permissions.`, 'error');
+  }
+  renderChecklistTable();
 }
 
 async function toggleChecklistStatus(id, currentActive) {
