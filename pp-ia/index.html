@@ -1571,15 +1571,26 @@ function buildPills(containerId, items, activeVal, onChange) {
 // ─── Notifications subscription ───────────────────────────────────────────────
 function subscribeNotifications() {
   if (!S.user) return;
-  const unsub = db.collection('notifications')
+  // Listen to unread notifications (drives the bell dot)
+  const unsubNotif = db.collection('notifications')
     .where('userId', '==', S.user.uid)
     .where('read', '==', false)
     .onSnapshot(snap => {
-      const count = snap.size;
-      document.getElementById('actionsBadge').textContent = count;
-      document.getElementById('notifDot').style.display = count ? 'block' : 'none';
+      document.getElementById('notifDot').style.display = snap.size ? 'block' : 'none';
     });
-  S.listeners.push(unsub);
+  S.listeners.push(unsubNotif);
+
+  // Listen to open myActions (drives the sidebar badge count)
+  const unsubActions = db.collection('myActions')
+    .where('userId', '==', S.user.uid)
+    .onSnapshot(snap => {
+      const openCount = snap.docs.filter(d => {
+        const st = (d.data().status||'').toLowerCase();
+        return st !== 'completed' && st !== 'closed' && st !== 'cancelled';
+      }).length;
+      document.getElementById('actionsBadge').textContent = openCount || 0;
+    });
+  S.listeners.push(unsubActions);
 }
 
 // ─── Org settings (logo) ──────────────────────────────────────────────────────
@@ -2342,6 +2353,14 @@ function openAction(id, sourceRef, title, auditType) {
   const refParts = (sourceRef||'').split('/');
   const refCol = refParts[0]||'';
   const refId  = refParts[1]||'';
+
+  // ── Auditee: "Fill Action Plan" action — open the action plan form, NOT the auditor checklist ──
+  if (t.includes('fill action plan') || t.includes('action plan')) {
+    const planId = refId || id;
+    const auditName = title.replace(/^fill action plan\s*[—\-–]\s*/i, '') || 'Audit';
+    openAuditeeActionPlan(planId, auditName);
+    return;
+  }
 
   if (t.includes('conduct audit') || refCol === 'auditPlans') {
     // Directly open the audit checklist modal using the plan ID and auditType
@@ -3608,6 +3627,14 @@ async function openAuditeeActionPlan(planId, auditName) {
     </div>
     <div style="text-align:center;padding:24px"><div class="spinner" style="width:24px;height:24px;margin:0 auto 8px"></div><div style="font-size:13px;color:var(--text-muted)">Loading findings…</div></div>`);
 
+  // Resolve the actual audit name from Firestore if it looks like a raw title
+  if (planId) {
+    const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+    if (planDoc && planDoc.exists) {
+      auditName = planDoc.data().name || auditName;
+    }
+  }
+
   // Fetch findings raised against this audit plan
   const snap = await db.collection('findings').where('auditId','==',planId).get().catch(()=>null);
   const findings = snap ? snap.docs.map(d=>({id:d.id,...d.data()}))
@@ -3623,7 +3650,7 @@ async function openAuditeeActionPlan(planId, auditName) {
       <div style="padding:28px;text-align:center">
         <span class="material-icons" style="font-size:40px;color:#cbd5e1;display:block;margin-bottom:10px">task_alt</span>
         <div style="font-size:14px;font-weight:600;margin-bottom:6px">No open findings for this audit</div>
-        <div style="font-size:12px;color:var(--text-secondary)">The auditor may not have recorded any findings yet, or all findings are already closed.</div>
+        <div style="font-size:12px;color:var(--text-secondary)">The auditor has not recorded any findings yet, or all findings are already addressed.<br>If you believe this is incorrect, please contact your auditor.</div>
         <button class="btn btn-secondary" onclick="closeModal()" style="margin-top:16px">Close</button>
       </div>`);
     return;
@@ -3734,6 +3761,35 @@ async function submitAuditeeActionPlans(planId, auditName, findingIds) {
   } else {
     showToast(`Action plan${saved!==1?'s':''} submitted for ${saved} finding${saved!==1?'s':''}! ✅`, 'success');
     logActivity('Auditee submitted action plans','Conduct Audit', planId);
+
+    // ── Mark auditee's myActions for this plan as Completed ──────────────────
+    const sourceRef = `auditPlans/${planId}`;
+    const myActSnap = await db.collection('myActions')
+      .where('sourceRef','==',sourceRef)
+      .where('userId','==',S.user?.uid||'')
+      .get().catch(()=>null);
+    if (myActSnap && !myActSnap.empty) {
+      const batch2 = db.batch();
+      myActSnap.docs.forEach(d => batch2.update(d.ref,{
+        status:'Completed',
+        completedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      }));
+      await batch2.commit().catch(()=>{});
+    }
+
+    // ── Mark related notifications as read ───────────────────────────────────
+    const notifSnap = await db.collection('notifications')
+      .where('userId','==',S.user?.uid||'')
+      .where('sourceRef','==',sourceRef)
+      .where('read','==',false)
+      .get().catch(()=>null);
+    if (notifSnap && !notifSnap.empty) {
+      const batch3 = db.batch();
+      notifSnap.docs.forEach(d => batch3.update(d.ref,{ read:true }));
+      await batch3.commit().catch(()=>{});
+    }
+
+    if(S.currentModule === 'myactions') renderMyActions();
     renderConduct();
   }
 }
