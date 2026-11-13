@@ -3525,28 +3525,77 @@ async function openAuditChecklist(planId, name, auditType) {
 }
 
 async function submitAuditResponses(planId) {
+  // Fetch the plan so we can notify the auditee
+  const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+  const plan = planDoc?.exists ? planDoc.data() : {};
+
   await db.collection('auditPlans').doc(planId).update({
     status:'Pending Review',
     completedAt: firebase.firestore.FieldValue.serverTimestamp(),
     completedBy: S.user?.uid||'',
   }).catch(()=>{});
 
-  // ── Remove this audit from myActions for all users ────────────────────────
-  if(planId){
-    const sourceRef = `auditPlans/${planId}`;
-    const snap = await db.collection('myActions').where('sourceRef','==',sourceRef).get().catch(()=>null);
-    if(snap && !snap.empty){
-      const batch = db.batch();
-      snap.docs.forEach(d => batch.update(d.ref,{ status:'Completed', completedAt:firebase.firestore.FieldValue.serverTimestamp() }));
-      await batch.commit().catch(()=>{});
+  // ── Mark auditor's myActions as Completed ────────────────────────────────
+  const sourceRef = `auditPlans/${planId}`;
+  const auditorSnap = await db.collection('myActions').where('sourceRef','==',sourceRef).get().catch(()=>null);
+  if(auditorSnap && !auditorSnap.empty){
+    const batch = db.batch();
+    auditorSnap.docs.forEach(d => batch.update(d.ref,{ status:'Completed', completedAt:firebase.firestore.FieldValue.serverTimestamp() }));
+    await batch.commit().catch(()=>{});
+  }
+
+  // ── Create myActions record for the Auditee ───────────────────────────────
+  const auditeeId    = plan.auditeeId    || '';
+  const auditeeName  = plan.auditeeName  || '';
+  const auditeeEmail = plan.auditeeEmail || '';
+  if (auditeeId || auditeeEmail) {
+    // Check if one already exists for auditee for this plan
+    const existQ = auditeeId
+      ? db.collection('myActions').where('sourceRef','==',sourceRef).where('userId','==',auditeeId).get().catch(()=>null)
+      : null;
+    const existSnap = existQ ? await existQ : null;
+    if (!existSnap || existSnap.empty) {
+      await db.collection('myActions').add({
+        userId:     auditeeId,
+        userEmail:  auditeeEmail,
+        userName:   auditeeName,
+        role:       'Auditee',
+        type:       'Action Plan Required',
+        title:      `Fill Action Plan — ${plan.name||'Audit'}`,
+        description:`Audit conducted by ${S.userDoc?.name||'Auditor'}. Please fill in your corrective action plan.`,
+        sourceRef,
+        module:     'Conduct Audit',
+        status:     'Open',
+        priority:   'High',
+        plant:      plan.plant||'',
+        department: plan.department||'',
+        dueDate:    null,
+        createdAt:  firebase.firestore.FieldValue.serverTimestamp(),
+        updatedAt:  firebase.firestore.FieldValue.serverTimestamp(),
+      }).catch(()=>{});
     }
   }
 
+  // ── Create in-app notification for the Auditee ───────────────────────────
+  if (auditeeId || auditeeEmail) {
+    await db.collection('notifications').add({
+      userId:    auditeeId,
+      userEmail: auditeeEmail,
+      type:      'action_plan_required',
+      title:     'Action Plan Required',
+      message:   `Audit "${plan.name||''}" has been conducted. Please fill in your corrective action plan.`,
+      sourceRef,
+      module:    'Conduct Audit',
+      read:      false,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    }).catch(()=>{});
+  }
+
   closeModal();
-  showToast('Audit responses submitted! ✅','success');
+  showToast('Audit submitted! Auditee notified to fill action plan. ✅','success');
   logActivity('Submitted audit responses','Conduct Audit',planId);
-  // Refresh My Actions badge if visible
   if(S.currentModule === 'myactions') renderMyActions();
+  renderConduct();
 }
 
 
@@ -5007,22 +5056,65 @@ async function importChecklist() {
   btn.disabled = true; btn.innerHTML = '<span class="material-icons" style="font-size:14px">hourglass_empty</span> Importing...';
   try {
     const version = `v${Date.now()}`;
-    // Write upload log to Firestore — Cloud Function will process rows
+    const uploadedBy     = S.user?.uid || '';
+    const uploadedByName = S.userDoc?.name || S.user?.email || 'Unknown';
+    const now = firebase.firestore.FieldValue.serverTimestamp();
+
+    // Write directly to auditChecklists in batches of 400
+    const CHUNK = 400;
+    let imported = 0;
+    for (let i = 0; i < valid.length; i += CHUNK) {
+      const chunk = valid.slice(i, i + CHUNK);
+      const batch = db.batch();
+      chunk.forEach(row => {
+        const ref = db.collection('auditChecklists').doc();
+        batch.set(ref, {
+          auditType:   row.auditType   || '',
+          standard:    row.standard    || '',
+          clause:      row.clause      || '',
+          subClause:   row.subClause   || '',
+          department:  row.department  || '',
+          processArea: row.processArea || '',
+          question:    row.question    || '',
+          requirement: row.requirement || '',
+          criticality: row.criticality || 'Minor',
+          weightage:   parseInt(row.weightage) || 3,
+          plant:       row.plant       || 'All Plants',
+          frequency:   row.frequency   || 'Annual',
+          active:      row.active !== false && row.active !== 'No',
+          version,
+          uploadedBy,
+          uploadedByName,
+          createdAt: now,
+          updatedAt: now,
+        });
+      });
+      await batch.commit();
+      imported += chunk.length;
+    }
+
+    // Also log to checklistUploadLogs for Version History tab
     await db.collection('checklistUploadLogs').add({
-      version, rows: valid, totalRows: rows.length,
-      uploadedBy: S.user?.uid, uploadedByName: S.userDoc?.name || S.user?.email || 'Unknown',
+      version, totalRows: valid.length, importedRows: imported,
+      uploadedBy, uploadedByName,
       auditType: valid[0]?.auditType || 'Mixed',
-      status: 'pending',
-      createdAt: firebase.firestore.FieldValue.serverTimestamp()
-    });
+      status: 'completed',
+      createdAt: now,
+    }).catch(()=>{});
+
     document.getElementById('uploadPreview').style.display='none';
     document.getElementById('uploadProgress').style.display='none';
     document.getElementById('clFileInput').value='';
     window._uploadRows = null;
-    showToast(`${valid.length} rows submitted for import!`,'success');
-    logActivity('Bulk upload checklist','Checklist Master',valid.length+' rows');
-    setTimeout(renderVersionTable, 3000);
-  } catch(e) { showToast('Import failed: '+e.message,'error'); }
+    showToast(`${imported} checklist items imported successfully! ✅`,'success');
+    logActivity('Bulk upload checklist','Checklist Master', imported+' rows');
+
+    // Switch to Manage tab and refresh table immediately
+    const manageTab = document.querySelector('#clTabs .tab');
+    if (manageTab) switchTab(manageTab, 'cl-manage');
+    await renderChecklistTable();
+    setTimeout(renderVersionTable, 500);
+  } catch(e) { showToast('Import failed: '+e.message,'error'); console.error(e); }
   btn.disabled=false; btn.innerHTML='<span class="material-icons">publish</span>Import Valid Rows';
 }
 
