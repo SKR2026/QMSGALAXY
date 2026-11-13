@@ -3298,36 +3298,33 @@ async function renderConduct() {
   wrap.innerHTML = `<div class="loading-row"><div class="spinner"></div></div>`;
 
   const role = (S.userDoc?.role||'').toLowerCase().trim();
-  const isSA = role==='superadmin'||role==='super admin'||role==='superadmin';
-  const isAdmin = isSA||role==='admin'||role==='plant admin'||role==='plantadmin'||role==='plant_admin';
-  const isAuditor = role==='auditor';
+  const isSA      = role==='superadmin'||role==='super admin';
+  const isAdmin   = isSA||role==='admin'||role==='plant admin'||role==='plantadmin'||role==='plant_admin';
+  const isAuditee = role==='auditee';   // ← key flag
 
-  // Admin/SA: see all audits in their plant; Auditor & others: only their own assigned audits
+  const uid   = S.user?.uid||'';
+  const name  = S.userDoc?.name||'';
+  const email = S.user?.email||S.userDoc?.email||'';
+
   let allAudits = [];
 
   if (isAdmin) {
-    // Admin sees all planned/in-progress for their plant (client-side filter to avoid composite index)
+    // Admin sees all planned/in-progress for their plant
     const userPlant = S.userDoc?.plant;
     let q = (userPlant && userPlant !== 'All Plants')
       ? db.collection('auditPlans').where('plant','==',userPlant).limit(300)
       : db.collection('auditPlans').limit(300);
     const snap = await q.get().catch(()=>null);
     allAudits = snap ? snap.docs.map(d=>({id:d.id,...d.data()}))
-      .filter(a=>['Planned','In Progress'].includes(a.status))
+      .filter(a=>['Planned','In Progress','Pending Review'].includes(a.status))
       .sort((a,b)=>{ const ta=a.plannedDate?.toMillis?.()??0; const tb=b.plannedDate?.toMillis?.()??0; return ta-tb; })
       : [];
-  } else {
-    // Auditors/others: fetch by leadAuditorId OR leadAuditorName OR leadAuditorEmail
-    // NOTE: No compound index needed — query by single field only, filter status client-side
-    const uid = S.user?.uid||'';
-    const name = S.userDoc?.name||'';
-    const email = S.user?.email||S.userDoc?.email||'';
-
+  } else if (isAuditee) {
+    // Auditee: only audits where they are the assigned auditee
     const queries = [];
-    if (uid)   queries.push(db.collection('auditPlans').where('leadAuditorId','==',uid).get().catch(()=>null));
-    if (name)  queries.push(db.collection('auditPlans').where('leadAuditorName','==',name).get().catch(()=>null));
-    if (email) queries.push(db.collection('auditPlans').where('leadAuditorEmail','==',email).get().catch(()=>null));
-
+    if (uid)   queries.push(db.collection('auditPlans').where('auditeeId','==',uid).get().catch(()=>null));
+    if (email) queries.push(db.collection('auditPlans').where('auditeeEmail','==',email).get().catch(()=>null));
+    if (name)  queries.push(db.collection('auditPlans').where('auditeeName','==',name).get().catch(()=>null));
     const results = await Promise.all(queries);
     const seen = new Set();
     for (const snap of results) {
@@ -3336,13 +3333,30 @@ async function renderConduct() {
         if (!seen.has(d.id)) {
           seen.add(d.id);
           const data = {id:d.id,...d.data()};
-          // Filter: only active statuses (not Completed/Cancelled)
+          if ((data.status||'') !== 'Cancelled') allAudits.push(data);
+        }
+      });
+    }
+    allAudits.sort((a,b)=>(a.plannedDate?.seconds||0)-(b.plannedDate?.seconds||0));
+  } else {
+    // Auditor: fetch by leadAuditorId / leadAuditorName / leadAuditorEmail
+    const queries = [];
+    if (uid)   queries.push(db.collection('auditPlans').where('leadAuditorId','==',uid).get().catch(()=>null));
+    if (name)  queries.push(db.collection('auditPlans').where('leadAuditorName','==',name).get().catch(()=>null));
+    if (email) queries.push(db.collection('auditPlans').where('leadAuditorEmail','==',email).get().catch(()=>null));
+    const results = await Promise.all(queries);
+    const seen = new Set();
+    for (const snap of results) {
+      if (!snap) continue;
+      snap.docs.forEach(d=>{
+        if (!seen.has(d.id)) {
+          seen.add(d.id);
+          const data = {id:d.id,...d.data()};
           const st = data.status||'Planned';
           if (st !== 'Completed' && st !== 'Cancelled') allAudits.push(data);
         }
       });
     }
-    // Sort by planned date ascending
     allAudits.sort((a,b)=>(a.plannedDate?.seconds||0)-(b.plannedDate?.seconds||0));
   }
 
@@ -3350,7 +3364,39 @@ async function renderConduct() {
     wrap.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)"><span class="material-icons" style="font-size:40px;display:block;margin-bottom:12px;color:#cbd5e1">assignment_turned_in</span>No audits assigned to you</div>';
     return;
   }
+
   wrap.innerHTML = allAudits.map(a => {
+    const auditDone = ['Pending Review','Completed'].includes(a.status);
+
+    if (isAuditee) {
+      // ── Auditee card ──────────────────────────────────────────────────────
+      const statusBadge = a.status==='In Progress'?'badge-blue':a.status==='Pending Review'?'badge-amber':a.status==='Completed'?'badge-green':'badge-grey';
+      return `<div class="card" style="margin-bottom:12px;border-left:4px solid ${auditDone?'var(--green)':'var(--amber)'}">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+          <div>
+            <strong style="font-size:14px">${a.name}</strong>
+            ${a.auditNo?`<span style="font-size:10px;font-weight:700;color:#2563eb;background:#eff6ff;padding:1px 7px;border-radius:4px;margin-left:6px">${a.auditNo}</span>`:''}
+            <br><span style="font-size:12px;color:var(--text-secondary)">${a.auditType||''} · ${a.plant} · ${a.department||''} · ${formatDate(a.plannedDate)}</span>
+            <br><span style="font-size:11px;color:var(--text-muted)">Auditor: ${a.leadAuditorName||'—'}</span>
+            ${auditDone
+              ? `<span style="display:inline-block;margin-left:10px;font-size:11px;font-weight:600;color:#15803d;background:#dcfce7;padding:1px 8px;border-radius:10px">✓ Audit completed — your action plan is due</span>`
+              : `<span style="display:inline-block;margin-left:10px;font-size:11px;color:#92400e;background:#fef3c7;padding:1px 8px;border-radius:10px">⏳ Waiting for auditor to conduct &amp; submit the audit</span>`}
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+            <span class="badge ${statusBadge}">${a.status}</span>
+            ${auditDone
+              ? `<button class="btn btn-sm btn-primary" onclick="openAuditeeActionPlan('${a.id}','${a.name.replace(/'/g,"\\'")}')">
+                   <span class="material-icons" style="font-size:14px">edit_note</span> Fill Action Plan
+                 </button>`
+              : `<button class="btn btn-sm btn-secondary" disabled style="cursor:not-allowed;opacity:.5" title="Available after auditor submits the audit">
+                   <span class="material-icons" style="font-size:14px">lock</span> Awaiting Audit
+                 </button>`}
+          </div>
+        </div>
+      </div>`;
+    }
+
+    // ── Auditor / Admin card ───────────────────────────────────────────────
     return `<div class="card" style="margin-bottom:12px"><div style="display:flex;align-items:center;justify-content:space-between">
       <div>
         <strong style="font-size:14px">${a.name}</strong>
@@ -3359,7 +3405,7 @@ async function renderConduct() {
         ${a.leadAuditorName?`<br><span style="font-size:11px;color:var(--text-muted)">Auditor: ${a.leadAuditorName}${a.auditeeName?' · Auditee: '+a.auditeeName:''}</span>`:''}
       </div>
       <div style="display:flex;gap:8px;align-items:center">
-        <span class="badge ${a.status==='In Progress'?'badge-blue':'badge-grey'}">${a.status}</span>
+        <span class="badge ${a.status==='In Progress'?'badge-blue':a.status==='Pending Review'?'badge-amber':'badge-grey'}">${a.status}</span>
         <button class="btn btn-sm btn-primary" onclick="openAuditChecklist('${a.id}','${a.name.replace(/'/g,"\\'")}','${(a.auditType||'').replace(/'/g,"\\'")}')">
           <span class="material-icons" style="font-size:14px">play_arrow</span>${a.status==='In Progress'?'Resume':'Start'} Audit
         </button>
@@ -3368,6 +3414,23 @@ async function renderConduct() {
 }
 
 async function openAuditChecklist(planId, name, auditType) {
+  // Guard: Auditee must NOT access the checksheet — redirect to action plan flow
+  const _role = (S.userDoc?.role||'').toLowerCase().trim();
+  if (_role === 'auditee') {
+    showModal(`<div class="modal-title"><span class="material-icons" style="color:var(--amber)">lock</span> <span>Access Restricted</span>
+      <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button></div>
+      <div style="padding:28px;text-align:center">
+        <span class="material-icons" style="font-size:48px;color:var(--amber);display:block;margin-bottom:12px">assignment_late</span>
+        <div style="font-size:15px;font-weight:700;margin-bottom:8px">Checklist is for Auditors only</div>
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:20px;max-width:380px;margin-left:auto;margin-right:auto">
+          As an Auditee, you can fill your <strong>Action Plan</strong> only after the auditor has conducted and submitted the audit.
+          Please wait for the audit status to change to <strong>Pending Review</strong>.
+        </div>
+        <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+      </div>`);
+    return;
+  }
+
   // Show loading modal first
   showModal(`<div class="modal-title"><span>${name}</span><button onclick="closeModal()" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>
     <div style="text-align:center;padding:30px"><div class="spinner" style="width:28px;height:28px;margin:0 auto 10px"></div><div style="font-size:13px;color:var(--text-muted)">Loading checklist…</div></div>`);
@@ -3473,6 +3536,146 @@ async function submitAuditResponses(planId) {
   logActivity('Submitted audit responses','Conduct Audit',planId);
   // Refresh My Actions badge if visible
   if(S.currentModule === 'myactions') renderMyActions();
+}
+
+
+// ─── AUDITEE ACTION PLAN ──────────────────────────────────────────────────────
+async function openAuditeeActionPlan(planId, auditName) {
+  showModal(`<div class="modal-title">
+      <span class="material-icons" style="color:#059669">edit_note</span>
+      <span style="margin-left:6px">Action Plan — ${auditName}</span>
+      <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
+    </div>
+    <div style="text-align:center;padding:24px"><div class="spinner" style="width:24px;height:24px;margin:0 auto 8px"></div><div style="font-size:13px;color:var(--text-muted)">Loading findings…</div></div>`);
+
+  // Fetch findings raised against this audit plan
+  const snap = await db.collection('findings').where('auditId','==',planId).get().catch(()=>null);
+  const findings = snap ? snap.docs.map(d=>({id:d.id,...d.data()}))
+    .filter(f=>['Open','In Progress'].includes(f.status||'Open'))
+    : [];
+
+  if (!findings.length) {
+    showModal(`<div class="modal-title">
+        <span class="material-icons" style="color:#059669">edit_note</span>
+        <span style="margin-left:6px">Action Plan — ${auditName}</span>
+        <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
+      </div>
+      <div style="padding:28px;text-align:center">
+        <span class="material-icons" style="font-size:40px;color:#cbd5e1;display:block;margin-bottom:10px">task_alt</span>
+        <div style="font-size:14px;font-weight:600;margin-bottom:6px">No open findings for this audit</div>
+        <div style="font-size:12px;color:var(--text-secondary)">The auditor may not have recorded any findings yet, or all findings are already closed.</div>
+        <button class="btn btn-secondary" onclick="closeModal()" style="margin-top:16px">Close</button>
+      </div>`);
+    return;
+  }
+
+  const smap = {Major:'badge-red',Minor:'badge-amber',OI:'badge-blue'};
+  const rows = findings.map((f,i) => `
+    <div style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:10px">
+      <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:10px">
+        <span style="background:#EFF6FF;color:#1D4ED8;font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;flex-shrink:0">${i+1}</span>
+        <div style="flex:1">
+          <div style="font-size:13px;font-weight:600;margin-bottom:4px">${f.description||'—'}</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <span class="badge ${smap[f.severity]||'badge-grey'}">${f.severity||'—'}</span>
+            ${f.clause?`<span style="font-size:11px;color:#475569;background:#f1f5f9;padding:1px 6px;border-radius:4px">§ ${f.clause}</span>`:''}
+            ${f.standard?`<span style="font-size:11px;color:#475569;background:#f1f5f9;padding:1px 6px;border-radius:4px">${f.standard}</span>`:''}
+          </div>
+        </div>
+      </div>
+      <div class="form-row" style="margin-bottom:0">
+        <div class="form-group" style="margin-bottom:8px">
+          <label class="form-label">Immediate Correction *</label>
+          <textarea class="form-input" id="ap_imm_${f.id}" rows="2" placeholder="What was done immediately to correct the issue?"></textarea>
+        </div>
+        <div class="form-group" style="margin-bottom:8px">
+          <label class="form-label">Root Cause</label>
+          <textarea class="form-input" id="ap_rc_${f.id}" rows="2" placeholder="Why did this occur?"></textarea>
+        </div>
+      </div>
+      <div class="form-row" style="margin-bottom:0">
+        <div class="form-group" style="margin-bottom:0">
+          <label class="form-label">Corrective Action *</label>
+          <textarea class="form-input" id="ap_ca_${f.id}" rows="2" placeholder="Long-term action to prevent recurrence…"></textarea>
+        </div>
+        <div class="form-group" style="margin-bottom:0">
+          <label class="form-label">Target Date *</label>
+          <input class="form-input" type="date" id="ap_dt_${f.id}" min="${new Date().toISOString().split('T')[0]}">
+        </div>
+      </div>
+    </div>`).join('');
+
+  showModal(`<div class="modal-title">
+      <span class="material-icons" style="color:#059669">edit_note</span>
+      <span style="margin-left:6px">Action Plan — ${auditName}</span>
+      <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
+    </div>
+    <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#1e40af">
+      <strong>${findings.length} open finding${findings.length!==1?'s':''}</strong> require your action plan.
+      Fill the correction, root cause and corrective action for each finding below.
+    </div>
+    ${rows}
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitAuditeeActionPlans('${planId}','${auditName.replace(/'/g,"\'")}',${JSON.stringify(findings.map(f=>f.id))})">
+        <span class="material-icons" style="font-size:15px">send</span> Submit Action Plans
+      </button>
+    </div>`);
+}
+
+async function submitAuditeeActionPlans(planId, auditName, findingIds) {
+  const btn = document.querySelector('#modalBody .btn-primary');
+  if (btn) { btn.disabled=true; btn.textContent='Saving…'; }
+
+  let saved=0, errors=0;
+  for (const fid of findingIds) {
+    const imm = document.getElementById('ap_imm_'+fid)?.value.trim();
+    const rc  = document.getElementById('ap_rc_'+fid)?.value.trim();
+    const ca  = document.getElementById('ap_ca_'+fid)?.value.trim();
+    const dt  = document.getElementById('ap_dt_'+fid)?.value;
+    if (!imm || !ca || !dt) { errors++; continue; }
+
+    // Update the finding with auditee's action plan
+    await db.collection('findings').doc(fid).update({
+      immediateCorrection : imm,
+      rootCause           : rc,
+      correctiveAction    : ca,
+      targetDate          : dt,
+      status              : 'In Progress',
+      workflowStage       : 'Auditor Review',
+      auditeeSubmittedAt  : firebase.firestore.FieldValue.serverTimestamp(),
+      auditeeId           : S.user?.uid||'',
+      auditeeName         : S.userDoc?.name||'',
+    }).catch(()=>{ errors++; });
+
+    // Create / update CAPA record
+    await db.collection('correctiveActions').add({
+      findingId     : fid,
+      auditId       : planId,
+      title         : `Action plan for finding in ${auditName}`,
+      correctiveAction: ca,
+      rootCause     : rc,
+      plant         : S.userDoc?.plant||'',
+      department    : S.userDoc?.department||'',
+      assigneeId    : S.user?.uid||'',
+      assigneeName  : S.userDoc?.name||'',
+      dueDate       : dt,
+      status        : 'Open',
+      progress      : 0,
+      createdAt     : firebase.firestore.FieldValue.serverTimestamp(),
+    }).catch(()=>{});
+
+    saved++;
+  }
+
+  closeModal();
+  if (errors > 0 && saved === 0) {
+    showToast(`Please fill all required fields (Correction, Corrective Action, Date) for each finding.`, 'error');
+  } else {
+    showToast(`Action plan${saved!==1?'s':''} submitted for ${saved} finding${saved!==1?'s':''}! ✅`, 'success');
+    logActivity('Auditee submitted action plans','Conduct Audit', planId);
+    renderConduct();
+  }
 }
 
 // ─── FINDINGS ─────────────────────────────────────────────────────────────────
