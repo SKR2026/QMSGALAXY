@@ -911,6 +911,7 @@ select.form-input{cursor:pointer}
         <div style="padding:10px 16px;background:#FEF3C7;border-radius:8px;font-size:13px"><strong style="color:#92400E" id="dupCount">0</strong> <span style="color:#78350F">Duplicates</span></div>
       </div>
       <div id="previewRows" style="max-height:300px;overflow-y:auto;font-size:12px"></div>
+      <div id="dupInfoBanner" style="display:none;margin-top:12px;padding:10px 14px;background:#FFFBEB;border:1px solid #FCD34D;border-radius:8px;font-size:12px;color:#92400E;line-height:1.5">⚠ Duplicates found — these will be skipped automatically on import.</div>
       <div style="margin-top:16px;display:flex;gap:10px"><button class="btn btn-primary" id="importBtn" onclick="importChecklist()"><span class="material-icons">publish</span>Import Valid Rows</button><button class="btn btn-secondary" onclick="document.getElementById('uploadPreview').style.display='none'">Cancel</button></div>
     </div>
   </div>
@@ -3300,13 +3301,17 @@ async function renderConduct() {
   const role = (S.userDoc?.role||'').toLowerCase().trim();
   const isSA      = role==='superadmin'||role==='super admin';
   const isAdmin   = isSA||role==='admin'||role==='plant admin'||role==='plantadmin'||role==='plant_admin';
-  const isAuditee = role==='auditee';   // ← key flag
+  const isAuditor = role==='auditor'||role==='lead auditor';
+  // isAuditeeRole: user's role is Auditee (may also be assigned as auditee in plans)
+  const isAuditeeRole = role==='auditee';
 
   const uid   = S.user?.uid||'';
   const name  = S.userDoc?.name||'';
   const email = S.user?.email||S.userDoc?.email||'';
 
   let allAudits = [];
+  // Track which audit IDs this user is assigned as auditee (for per-audit card logic)
+  const auditeeAuditIds = new Set();
 
   if (isAdmin) {
     // Admin sees all planned/in-progress for their plant
@@ -3316,47 +3321,45 @@ async function renderConduct() {
       : db.collection('auditPlans').limit(300);
     const snap = await q.get().catch(()=>null);
     allAudits = snap ? snap.docs.map(d=>({id:d.id,...d.data()}))
-      .filter(a=>['Planned','In Progress','Pending Review'].includes(a.status))
+      .filter(a=>['Planned','In Progress','Pending Review','Completed'].includes(a.status))
       .sort((a,b)=>{ const ta=a.plannedDate?.toMillis?.()??0; const tb=b.plannedDate?.toMillis?.()??0; return ta-tb; })
       : [];
-  } else if (isAuditee) {
-    // Auditee: only audits where they are the assigned auditee
-    const queries = [];
-    if (uid)   queries.push(db.collection('auditPlans').where('auditeeId','==',uid).get().catch(()=>null));
-    if (email) queries.push(db.collection('auditPlans').where('auditeeEmail','==',email).get().catch(()=>null));
-    if (name)  queries.push(db.collection('auditPlans').where('auditeeName','==',name).get().catch(()=>null));
-    const results = await Promise.all(queries);
-    const seen = new Set();
-    for (const snap of results) {
-      if (!snap) continue;
-      snap.docs.forEach(d=>{
-        if (!seen.has(d.id)) {
-          seen.add(d.id);
-          const data = {id:d.id,...d.data()};
-          if ((data.status||'') !== 'Cancelled') allAudits.push(data);
-        }
-      });
-    }
-    allAudits.sort((a,b)=>(a.plannedDate?.seconds||0)-(b.plannedDate?.seconds||0));
   } else {
-    // Auditor: fetch by leadAuditorId / leadAuditorName / leadAuditorEmail
-    const queries = [];
-    if (uid)   queries.push(db.collection('auditPlans').where('leadAuditorId','==',uid).get().catch(()=>null));
-    if (name)  queries.push(db.collection('auditPlans').where('leadAuditorName','==',name).get().catch(()=>null));
-    if (email) queries.push(db.collection('auditPlans').where('leadAuditorEmail','==',email).get().catch(()=>null));
-    const results = await Promise.all(queries);
+    // Fetch audits where user is assigned as auditee (by uid / email / name)
+    const auditeeQueries = [];
+    if (uid)   auditeeQueries.push(db.collection('auditPlans').where('auditeeId','==',uid).get().catch(()=>null));
+    if (email) auditeeQueries.push(db.collection('auditPlans').where('auditeeEmail','==',email).get().catch(()=>null));
+    if (name)  auditeeQueries.push(db.collection('auditPlans').where('auditeeName','==',name).get().catch(()=>null));
+
+    // Fetch audits where user is assigned as auditor (by uid / name / email)
+    const auditorQueries = [];
+    if (!isAuditeeRole) {
+      if (uid)   auditorQueries.push(db.collection('auditPlans').where('leadAuditorId','==',uid).get().catch(()=>null));
+      if (name)  auditorQueries.push(db.collection('auditPlans').where('leadAuditorName','==',name).get().catch(()=>null));
+      if (email) auditorQueries.push(db.collection('auditPlans').where('leadAuditorEmail','==',email).get().catch(()=>null));
+    }
+
+    const allResults = await Promise.all([...auditeeQueries, ...auditorQueries]);
+    const auditeeResultCount = auditeeQueries.length;
     const seen = new Set();
-    for (const snap of results) {
-      if (!snap) continue;
-      snap.docs.forEach(d=>{
+
+    allResults.forEach((snap, idx) => {
+      if (!snap) return;
+      const isAuditeeResult = idx < auditeeResultCount;
+      snap.docs.forEach(d => {
+        const data = {id:d.id,...d.data()};
+        const st = data.status||'Planned';
+        if (st === 'Cancelled') return;
+        if (isAuditeeResult) auditeeAuditIds.add(d.id);
+        // Auditee-assigned audits: show regardless of status (including Completed)
+        // Auditor-assigned audits: skip Completed/Cancelled
+        if (!isAuditeeResult && (st === 'Completed' || st === 'Cancelled')) return;
         if (!seen.has(d.id)) {
           seen.add(d.id);
-          const data = {id:d.id,...d.data()};
-          const st = data.status||'Planned';
-          if (st !== 'Completed' && st !== 'Cancelled') allAudits.push(data);
+          allAudits.push(data);
         }
       });
-    }
+    });
     allAudits.sort((a,b)=>(a.plannedDate?.seconds||0)-(b.plannedDate?.seconds||0));
   }
 
@@ -3367,6 +3370,8 @@ async function renderConduct() {
 
   wrap.innerHTML = allAudits.map(a => {
     const auditDone = ['Pending Review','Completed'].includes(a.status);
+    // Show auditee card if: role is Auditee, OR this specific audit has user as assigned auditee
+    const isAuditee = isAuditeeRole || auditeeAuditIds.has(a.id);
 
     if (isAuditee) {
       // ── Auditee card ──────────────────────────────────────────────────────
@@ -4826,12 +4831,12 @@ function processChecklistFile(file) {
   const pct=document.getElementById('uploadPct');
   prog.style.display='block';
   const reader = new FileReader();
-  reader.onload = e => {
+  reader.onload = async e => {
     try {
       const wb = XLSX.read(e.target.result, {type:'array'});
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(ws, {defval:''});
-      fill.style.width='60%'; pct.textContent='60%'; status.textContent='Validating rows...';
+      fill.style.width='40%'; pct.textContent='40%'; status.textContent='Validating rows...';
       const colMap = { 'Audit Type':'auditType','Standard':'standard','Clause Number':'clause','Sub-Clause':'subClause','Department':'department','Process/Area':'processArea','Audit Question':'question','Expected Requirement':'requirement','Criticality':'criticality','Weightage':'weightage','Applicable Plant':'plant','Audit Frequency':'frequency','Active Status':'active' };
       const validCrit = new Set(['Critical','Major','Minor']);
       const validFreq = new Set(['Daily','Weekly','Monthly','Quarterly','Semi-Annual','Annual']);
@@ -4845,6 +4850,36 @@ function processChecklistFile(file) {
         else row._status='valid';
         return row;
       });
+
+      // ── Duplicate check against existing Firestore records ──────────────────
+      fill.style.width='70%'; pct.textContent='70%'; status.textContent='Checking for duplicates in database...';
+      // Build a fingerprint key: auditType|clause|subClause|question (lowercased)
+      const makeKey = r => `${(r.auditType||'').toLowerCase()}|${(r.clause||'').toLowerCase()}|${(r.subClause||'').toLowerCase()}|${(r.question||'').trim().toLowerCase()}`;
+      // Fetch existing checklists — we only need the fingerprint fields
+      const existingSnap = await db.collection('auditChecklists').get().catch(()=>null);
+      const existingKeys = new Set();
+      if (existingSnap) {
+        existingSnap.docs.forEach(d => {
+          const c = d.data();
+          existingKeys.add(makeKey(c));
+        });
+      }
+      // Also check for duplicates within the uploaded file itself
+      const fileKeys = new Set();
+      processed.forEach(row => {
+        if (row._status !== 'valid') return;
+        const k = makeKey(row);
+        if (existingKeys.has(k)) {
+          row._status = 'duplicate';
+          row._error  = 'Already exists in database';
+        } else if (fileKeys.has(k)) {
+          row._status = 'duplicate';
+          row._error  = 'Duplicate within this file';
+        } else {
+          fileKeys.add(k);
+        }
+      });
+
       fill.style.width='100%'; pct.textContent='100%'; status.textContent='Done';
       showUploadPreview(file.name, processed);
     } catch(err) { status.textContent='Parse error: '+err.message; fill.style.background='var(--red)'; }
@@ -4855,14 +4890,34 @@ function processChecklistFile(file) {
 function showUploadPreview(fileName, rows) {
   const valid   = rows.filter(r=>r._status==='valid').length;
   const invalid = rows.filter(r=>r._status==='invalid').length;
+  const dups    = rows.filter(r=>r._status==='duplicate').length;
   document.getElementById('validCount').textContent = valid;
   document.getElementById('invalidCount').textContent = invalid;
-  document.getElementById('dupCount').textContent = 0;
+  document.getElementById('dupCount').textContent = dups;
+  // Colour the dup count badge amber if there are duplicates
+  const dupEl = document.getElementById('dupCount');
+  if (dupEl) {
+    dupEl.parentElement.style.background = dups > 0 ? '#FEF3C7' : '';
+    dupEl.parentElement.style.borderColor = dups > 0 ? '#FCD34D' : '';
+    dupEl.style.color = dups > 0 ? '#92400E' : '';
+  }
   document.getElementById('previewTitle').textContent = `Validation — ${fileName}`;
   document.getElementById('previewRows').innerHTML = `
     <table style="width:100%;font-size:11px"><thead><tr><th>#</th><th>Type</th><th>Clause</th><th>Dept</th><th>Question (preview)</th><th>Crit</th><th>Status</th><th>Issue</th></tr></thead><tbody>
-    ${rows.map(r=>`<tr style="background:${r._status==='valid'?'#F0FDF4':r._status==='invalid'?'#FEF2F2':'#FFFBEB'}"><td>${r._row}</td><td>${r.auditType}</td><td>${r.clause}</td><td>${r.department}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.question?.slice(0,50)||''}</td><td>${r.criticality}</td><td style="font-weight:600;color:${r._status==='valid'?'var(--green)':r._status==='invalid'?'var(--red)':'var(--amber)'}">${r._status}</td><td style="color:var(--red)">${r._error||''}</td></tr>`).join('')}
+    ${rows.map(r=>`<tr style="background:${r._status==='valid'?'#F0FDF4':r._status==='invalid'?'#FEF2F2':'#FFFBEB'}">
+      <td>${r._row}</td><td>${r.auditType}</td><td>${r.clause}</td><td>${r.department}</td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.question?.slice(0,50)||''}</td>
+      <td>${r.criticality}</td>
+      <td style="font-weight:600;color:${r._status==='valid'?'var(--green)':r._status==='duplicate'?'var(--amber)':'var(--red)'}">${r._status==='duplicate'?'⚠ duplicate':r._status}</td>
+      <td style="color:${r._status==='duplicate'?'var(--amber)':'var(--red)'}">${r._error||''}</td>
+    </tr>`).join('')}
     </tbody></table>`;
+  // Show info banner if duplicates exist
+  const infoBanner = document.getElementById('dupInfoBanner');
+  if (infoBanner) {
+    infoBanner.style.display = dups > 0 ? 'block' : 'none';
+    infoBanner.textContent = `${dups} duplicate row${dups!==1?'s':''} found — these already exist in the database and will be skipped automatically on import.`;
+  }
   document.getElementById('uploadPreview').style.display = 'block';
   // Store rows for import
   window._uploadRows = rows;
