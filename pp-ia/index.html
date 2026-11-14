@@ -4046,16 +4046,48 @@ async function openAuditeeActionPlan(planId, auditName) {
       <span style="font-size:13px;color:var(--primary,#1e40af)"><strong>${findings.length} open finding${findings.length!==1?'s':''}</strong> require your action plan. Fill all required fields (*) for each finding.</span>
     </div>
     ${rows}
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
-      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" id="submitActionPlanBtn" onclick="submitAuditeeActionPlans()">
-        <span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">send</span> Submit Action Plans
-      </button>
+    <div style="display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+      <span id="modalDraftStatus" style="font-size:12px;color:var(--text-muted)"></span>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-secondary" id="saveDraftAllBtn" onclick="saveAllDrafts()">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">save</span> Save Draft
+        </button>
+        <button class="btn btn-primary" id="submitActionPlanBtn" onclick="submitAuditeeActionPlans()">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">send</span> Submit Action Plans
+        </button>
+      </div>
     </div>`);
 
   // Widen the modal after inserting content
   const mb = document.getElementById('modalBody');
   if (mb) { mb.style.maxWidth = '860px'; mb.style.width = '95vw'; }
+}
+
+async function saveAllDrafts() {
+  const findingIds = window._actionPlanFindingIds || [];
+  if (!findingIds.length) return;
+  const btn = document.getElementById('saveDraftAllBtn');
+  if (btn) { btn.disabled=true; btn.innerHTML='<span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">hourglass_top</span> Saving…'; }
+  const st = document.getElementById('modalDraftStatus');
+  let saved = 0;
+  for (const fid of findingIds) {
+    const imm = document.getElementById('ap_imm_'+fid)?.value?.trim()||'';
+    const rc  = document.getElementById('ap_rc_'+fid)?.value?.trim()||'';
+    const ca  = document.getElementById('ap_ca_'+fid)?.value?.trim()||'';
+    const dt  = document.getElementById('ap_dt_'+fid)?.value||'';
+    if (!imm && !rc && !ca && !dt) continue;
+    await db.collection('findings').doc(fid).update({
+      actionPlan: { rootCause: rc, correction: imm, correctiveAction: ca, targetDate: dt,
+        responsible: S.userDoc?.name||'' },
+      workflowStage: 'Auditee Action',
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    }).catch(()=>{});
+    saved++;
+  }
+  if (btn) { btn.disabled=false; btn.innerHTML='<span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">save</span> Save Draft'; }
+  if (st) st.innerHTML = `<span style="color:#16a34a">● ${saved} draft${saved!==1?'s':''} saved · ${new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})}</span>`;
+  if (saved) showToast('Drafts saved ✓','success');
 }
 
 async function submitAuditeeActionPlans() {
@@ -4469,22 +4501,26 @@ async function openNCDetail(ncId) {
   const userDept = S.userDoc?.department||'';
   const userPlant = S.userDoc?.plant||'All Plants';
   const isAuditor = nc.raisedBy===uid || nc.auditorId===uid || role==='Auditor'||role==='superadmin'||role==='Super Admin';
-  const isAuditee = nc.auditeeId===uid || nc.assigneeId===uid;
+  const isAuditee = nc.auditeeId===uid || nc.assigneeId===uid || (S.role||'').toLowerCase()==='auditee';
   const isDeptHead = (role==='Dept Head') && (nc.department===userDept||nc.plant===userPlant||userPlant==='All Plants');
   const isMR      = role==='Admin'||role==='superadmin'||role==='Super Admin';
+  // Auditors are LOCKED from editing after they submit the audit (stage no longer 'Open')
+  const auditorCanEdit = isAuditor && stage === 'Open';
 
   const ap = document.getElementById('ncActionCard');
   const appCard = document.getElementById('ncApprovalCard');
 
   if(stage==='Open'||stage==='Auditee Action'){
+    // Only the auditee (or admin) can fill the action plan — auditor sees read-only info
+    if (isAuditee || isMR) {
     ap.style.display=''; ap.innerHTML=`
       <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
         <span>Action Plan <span style="font-size:11px;font-weight:400;color:var(--text-muted)">(Auditee to fill)</span></span>
-        <span id="ncDraftStatus" style="font-size:11px;color:var(--text-muted);font-weight:400"></span>
+        <span id="ncDraftStatus" style="font-size:11px;color:var(--text-muted);font-weight:400">${nc.actionPlan?.rootCause||nc.actionPlan?.correction?'<span style="color:#16a34a">● Draft saved</span>':''}</span>
       </div>
       <div style="background:#FEF9C3;border:1px solid #FDE68A;border-radius:7px;padding:9px 12px;margin-bottom:12px;font-size:12px;color:#78350F;display:flex;align-items:center;gap:7px">
         <span class="material-icons" style="font-size:15px">info</span>
-        Fill in your action plan below. Changes auto-save as draft. Use <strong>Submit Action Plans</strong> from the My Actions panel to submit all findings at once.
+        Changes auto-save as draft. Use <strong>Submit Action Plans</strong> from My Actions panel to submit all findings at once to Dept Head → Auditor → MR.
       </div>
       <div class="form-group"><label class="form-label">Root Cause <span style="color:var(--red)">*</span></label>
         <textarea class="form-input" id="nc_rootCause" rows="2" placeholder="Why did this NC occur?" onblur="ncAutoSave('${ncId}')">${nc.actionPlan?.rootCause||''}</textarea></div>
@@ -4502,6 +4538,21 @@ async function openNCDetail(ncId) {
         <button class="btn btn-secondary" onclick="ncSaveDraft('${ncId}')">
           <span class="material-icons" style="font-size:15px;vertical-align:middle">save</span> Save Draft</button>
       </div>`;
+    } else if (isAuditor) {
+      // Auditor sees the finding — read-only after submission, locked from editing
+      ap.style.display=''; ap.innerHTML=`
+        <div class="card-title">Finding Status</div>
+        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:7px;padding:12px 14px;font-size:13px;color:#166534;display:flex;align-items:center;gap:8px">
+          <span class="material-icons" style="font-size:18px">lock</span>
+          <span>Audit submitted. This finding is now with the Auditee for action plan. Auditors cannot edit findings after audit submission.</span>
+        </div>
+        ${nc.actionPlan?.rootCause||nc.actionPlan?.correction ? `
+        <div style="margin-top:12px;font-size:13px">
+          <div style="font-weight:600;margin-bottom:8px;color:var(--text-muted)">Draft action plan (auditee is working on this):</div>
+          ${[['Root Cause',nc.actionPlan.rootCause],['Immediate Correction',nc.actionPlan.correction],['Corrective Action',nc.actionPlan.correctiveAction]]
+            .filter(([,v])=>v).map(([l,v])=>`<div style="margin-bottom:6px"><span style="font-size:11px;color:var(--text-muted);text-transform:uppercase">${l}</span><div style="background:#f8fafc;padding:6px 10px;border-radius:4px;border:1px solid var(--border);margin-top:2px">${v}</div></div>`).join('')}
+        </div>` : ''}`;
+    }
   } else if(nc.actionPlan){
     ap.style.display=''; ap.innerHTML=`
       <div class="card-title">Action Plan</div>
