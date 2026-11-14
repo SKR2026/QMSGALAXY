@@ -2291,15 +2291,83 @@ async function renderMyActions() {
     allActions = [...a2, ...a3];
   }
 
+  const isAuditeeUser = (S.role||'').toLowerCase() === 'auditee';
+
   // Count completed before filtering (for the stat card)
+  // For Auditee: exclude "Conduct Audit" planning entries that were wrongly auto-completed
   const completedCount = allActions.filter(a => {
     const st = (a.status||'').toLowerCase();
-    return st === 'completed' || st === 'closed';
+    if (st !== 'completed' && st !== 'closed') return false;
+    if (isAuditeeUser && (a.role||'').toLowerCase() === 'auditee' &&
+        (a.title||'').toLowerCase().startsWith('conduct audit')) return false;
+    return true;
   }).length;
+
+  // ── Auditee backfill: for every "Conduct Audit" action that was wrongly ─────
+  // marked Completed, check if the audit is Pending Review (auditor submitted
+  // but no "Fill Action Plan" action exists yet) and create one on the fly.
+  if (isAuditeeUser) {
+    const orphaned = allActions.filter(a => {
+      const st = (a.status||'').toLowerCase();
+      const title = (a.title||'').toLowerCase();
+      const role  = (a.role||'').toLowerCase();
+      // Completed "Conduct Audit" actions belonging to this auditee (not action plan tasks)
+      return (st === 'completed' || st === 'closed') && role === 'auditee' && title.startsWith('conduct audit');
+    });
+    if (orphaned.length) {
+      const planIds = [...new Set(orphaned.map(a => (a.sourceRef||'').split('/')[1]).filter(Boolean))];
+      await Promise.all(planIds.map(async pid => {
+        const sourceRef = `auditPlans/${pid}`;
+        // Check if a "Fill Action Plan" action already exists for this plan
+        const existSnap = await db.collection('myActions')
+          .where('sourceRef','==',sourceRef)
+          .where('type','==','Action Plan Required')
+          .get().catch(()=>null);
+        if (existSnap && !existSnap.empty) return; // already has one
+        // Check audit plan status
+        const planDoc = await db.collection('auditPlans').doc(pid).get().catch(()=>null);
+        if (!planDoc || !planDoc.exists) return;
+        const plan = planDoc.data();
+        if (!['Pending Review','Completed'].includes(plan.status)) return;
+        // Create the missing "Fill Action Plan" action
+        const newAction = {
+          userId:      S.user.uid,
+          userEmail:   S.user.email||'',
+          userName:    S.userDoc?.name||'',
+          role:        'Auditee',
+          type:        'Action Plan Required',
+          title:       `Fill Action Plan — ${plan.name||'Audit'}`,
+          description: `Audit conducted. Please fill in your corrective action plan.`,
+          sourceRef,
+          module:      'Conduct Audit',
+          auditNo:     plan.auditNo   || '',
+          auditType:   plan.auditType || '',
+          auditName:   plan.name      || '',
+          status:      'Open',
+          priority:    'High',
+          plant:       plan.plant      || '',
+          department:  plan.department || '',
+          dueDate:     null,
+          createdAt:   firebase.firestore.FieldValue.serverTimestamp(),
+          updatedAt:   firebase.firestore.FieldValue.serverTimestamp(),
+        };
+        const ref = await db.collection('myActions').add(newAction).catch(()=>null);
+        if (ref) {
+          // Add to allActions so it shows immediately without a re-render
+          allActions.push({ id: ref.id, ...newAction, dueDate: null });
+          seen.add(ref.id);
+        }
+      }));
+    }
+  }
 
   // Filter out completed/closed/cancelled actions for the table
   let actions = allActions.filter(a => {
     const st = (a.status||'').toLowerCase();
+    // For Auditee: also hide "Conduct Audit" completed planning entries — they are noise
+    if (isAuditeeUser && (st === 'completed' || st === 'closed') &&
+        (a.role||'').toLowerCase() === 'auditee' &&
+        (a.title||'').toLowerCase().startsWith('conduct audit')) return false;
     return st !== 'completed' && st !== 'closed' && st !== 'cancelled';
   });
 
@@ -2427,7 +2495,14 @@ function filterActionsByStat(filter, cardEl) {
     filtered = open.filter(a => a.priority==='Critical'||a.priority==='High');
     if (sf) sf.value = '';
   } else if (filter === 'Completed') {
-    filtered = all.filter(a => { const st=(a.status||'').toLowerCase(); return st==='completed'||st==='closed'; });
+    const isAuditee = (S.role||'').toLowerCase() === 'auditee';
+    filtered = all.filter(a => {
+      const st=(a.status||'').toLowerCase();
+      if (st!=='completed' && st!=='closed') return false;
+      // Auditee: hide "Conduct Audit" planning actions — only show "Action Plan Required" completions
+      if (isAuditee && (a.role||'').toLowerCase()==='auditee' && a.type!=='Action Plan Required') return false;
+      return true;
+    });
     if (sf) sf.value = 'Completed';
   }
 
@@ -2450,6 +2525,7 @@ function filterActions() {
   document.querySelectorAll('#myActionStats .kpi-card').forEach(c => c.style.outline = '');
 
   // Decide base pool: completed filter needs allActions
+  const isAuditee = (S.role||'').toLowerCase() === 'auditee';
   const pool = (sf === 'completed') ? all : open;
   const now  = new Date();
 
@@ -2462,6 +2538,10 @@ function filterActions() {
     if (sf === 'overdue') {
       const dd = a.dueDate?.toDate ? a.dueDate.toDate() : new Date(a.dueDate||0);
       if (!(dd < now && st !== 'completed' && st !== 'closed')) return false;
+    } else if (sf === 'completed') {
+      if (st !== 'completed' && st !== 'closed') return false;
+      // Auditee: hide "Conduct Audit" planning completions — not meaningful for auditee
+      if (isAuditee && (a.role||'').toLowerCase()==='auditee' && a.type!=='Action Plan Required') return false;
     } else if (sf && st !== sf) return false;
 
     if (tf && !mod.includes(tf)) return false;
@@ -2480,7 +2560,9 @@ function openAction(id, sourceRef, title, auditType) {
   const refCol = refParts[0]||'';
   const refId  = refParts[1]||'';
 
-  // ── Auditee: "Fill Action Plan" action — open the action plan form, NOT the auditor checklist ──
+  const isAuditee = (S.role||'').toLowerCase() === 'auditee';
+
+  // ── Auditee: "Fill Action Plan" action — open the action plan form ────────
   if (t.includes('fill action plan') || t.includes('action plan')) {
     const planId = refId || id;
     const auditName = title.replace(/^fill action plan\s*[—\-–]\s*/i, '') || 'Audit';
@@ -2488,8 +2570,16 @@ function openAction(id, sourceRef, title, auditType) {
     return;
   }
 
+  // ── Auditee clicking a "Conduct Audit" planning action → open action plan ─
+  if (isAuditee && (t.includes('conduct audit') || refCol === 'auditPlans')) {
+    const planId = refId || id;
+    const auditName = title.replace(/^conduct audit\s*[:\-–]\s*/i, '') || 'Audit';
+    openAuditeeActionPlan(planId, auditName);
+    return;
+  }
+
   if (t.includes('conduct audit') || refCol === 'auditPlans') {
-    // Directly open the audit checklist modal using the plan ID and auditType
+    // Auditor: open the audit checklist modal
     const planId = refId || id;
     const auditName = title || 'Conduct Audit';
     const type = auditType || '';
