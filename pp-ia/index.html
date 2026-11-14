@@ -753,6 +753,11 @@ select.form-input{cursor:pointer}
       <option>Planned</option>
     </select>
     <button class="btn btn-secondary" onclick="showPlanLPAModal()"><span class="material-icons" style="font-size:14px">calendar_month</span>Plan LPA</button>
+    <button class="btn btn-secondary" onclick="downloadLPATemplate()"><span class="material-icons" style="font-size:14px">download</span>Template</button>
+    <label class="btn btn-secondary" style="cursor:pointer;margin:0" title="Bulk upload LPA audits from Excel">
+      <span class="material-icons" style="font-size:14px;vertical-align:middle">upload_file</span> Bulk Upload
+      <input type="file" accept=".xlsx,.xls,.csv" style="display:none" onchange="bulkUploadLPA(this)">
+    </label>
     <button class="btn btn-primary" onclick="showNewLPAModal()"><span class="material-icons">add</span>New LPA</button>
     <button class="btn btn-secondary" onclick="exportLPAExcel()"><span class="material-icons" style="font-size:14px">table_chart</span>Export</button>
   </div>
@@ -848,7 +853,14 @@ select.form-input{cursor:pointer}
 <div id="panel-supplier" class="module-panel">
 <div class="page-title">Supplier Audits</div>
 <div class="page-sub">Manage and track supplier quality audits</div>
-<div class="toolbar"><div class="search-bar"><span class="material-icons">search</span><input type="text" placeholder="Search suppliers..."></div><button class="btn btn-primary" onclick="showScheduleSupplierModal()"><span class="material-icons">add</span>Schedule Supplier Audit</button></div>
+<div class="toolbar"><div class="search-bar"><span class="material-icons">search</span><input type="text" placeholder="Search suppliers..."></div>
+  <button class="btn btn-secondary" onclick="downloadSupplierTemplate()"><span class="material-icons" style="font-size:14px">download</span>Template</button>
+  <label class="btn btn-secondary" style="cursor:pointer;margin:0" title="Bulk upload supplier audits from Excel">
+    <span class="material-icons" style="font-size:14px;vertical-align:middle">upload_file</span> Bulk Upload
+    <input type="file" accept=".xlsx,.xls,.csv" style="display:none" onchange="bulkUploadSupplier(this)">
+  </label>
+  <button class="btn btn-primary" onclick="showScheduleSupplierModal()"><span class="material-icons">add</span>Schedule Supplier Audit</button>
+</div>
 <table><thead><tr><th>Supplier</th><th>Plant ID</th><th>Category</th><th>Location</th><th>Last Audit</th><th>Score</th><th>Rating</th><th>Next Due</th><th>Status</th><th>Actions</th></tr></thead><tbody id="supplierTbl"></tbody></table>
 </div>
 
@@ -9971,6 +9983,316 @@ async function submitSupplierActionPlan(auditId, token) {
 // ─── Enter key login ──────────────────────────────────────────────────────────
 document.getElementById('loginPassword').addEventListener('keydown', e => { if(e.key==='Enter') signIn(); });
 document.getElementById('loginEmail').addEventListener('keydown',    e => { if(e.key==='Enter') document.getElementById('loginPassword').focus(); });
+
+// ════════════════════════════════════════════════════════════════════════════
+// BULK UPLOAD — LPA Audits
+// ════════════════════════════════════════════════════════════════════════════
+const LPA_TEMPLATE_COLS = [
+  'Plant*','Department*','Process*','LPA Layer*',
+  'Area / Sub-process','Audit Type*','Auditor*','Auditee',
+  'Planned Date* (YYYY-MM-DD)','Shift','Frequency'
+];
+
+function downloadLPATemplate() {
+  const wb = XLSX.utils.book_new();
+  const header = [LPA_TEMPLATE_COLS];
+  const samples = [
+    ['Plant A','Quality','Assembly Line 1','Layer 1 - Operator','Station 3','IATF','John Smith','Ravi Kumar','2026-11-20','Morning','Daily'],
+    ['Plant B','Production','Welding','Layer 2 - Supervisor','Bay 2','EHS','Priya Nair','','2026-11-21','Afternoon','Weekly'],
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([...header, ...samples]);
+  ws['!cols'] = LPA_TEMPLATE_COLS.map(c => ({ wch: Math.max(c.length+2, 16) }));
+  XLSX.utils.book_append_sheet(wb, ws, 'LPA Audits');
+  const instr = XLSX.utils.aoa_to_sheet([
+    ['LPA Bulk Upload — Instructions'],[''],
+    ['1. Fill in the "LPA Audits" sheet. Do NOT rename columns.'],
+    ['2. Columns marked * are required.'],
+    ['3. LPA Layer: Layer 1 - Operator / Layer 2 - Supervisor / Layer 3 - Manager'],
+    ['4. Planned Date format: YYYY-MM-DD (e.g. 2026-11-20)'],
+    ['5. Frequency: Daily / Weekly / Monthly'],
+    ['6. Shift: Morning / Afternoon / Night (optional)'],
+    ['7. Delete the sample rows before uploading.'],
+  ]);
+  instr['!cols'] = [{wch:40},{wch:60}];
+  XLSX.utils.book_append_sheet(wb, instr, 'Instructions');
+  XLSX.writeFile(wb, 'LPA_Bulk_Upload_Template.xlsx');
+  showToast('LPA template downloaded — fill and upload','success');
+}
+
+async function bulkUploadLPA(input) {
+  const file = input.files[0]; if (!file) return;
+  input.value = '';
+  showToast('Reading file…','info');
+  let rows = [];
+  try {
+    const ab = await file.arrayBuffer();
+    const wb = XLSX.read(ab, { type:'array', cellDates:true });
+    rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval:'' });
+  } catch(e) { showToast('Could not read file: '+e.message,'error'); return; }
+  if (!rows.length) { showToast('File is empty or has no data rows','warning'); return; }
+
+  const col = (row, ...keys) => {
+    for (const k of keys) {
+      const found = Object.keys(row).find(r => r.replace(/\*/g,'').trim().toLowerCase() === k.toLowerCase());
+      if (found !== undefined && row[found] !== '') return String(row[found]).trim();
+    }
+    return '';
+  };
+
+  const preview = rows.slice(0,5).map((r,i) => {
+    const plant=col(r,'Plant'), proc=col(r,'Process'), layer=col(r,'LPA Layer');
+    const date=col(r,'Planned Date* (YYYY-MM-DD)','Planned Date');
+    const ok = plant && proc && layer && date;
+    return `<tr style="background:${ok?'':'#fef2f2'}">
+      <td style="padding:4px 8px;font-size:12px">${i+1}</td>
+      <td style="padding:4px 8px;font-size:12px">${plant||'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px">${col(r,'Department')||'—'}</td>
+      <td style="padding:4px 8px;font-size:12px">${proc||'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px">${layer||'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px">${date||'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px;color:${ok?'#16a34a':'#ef4444'}">${ok?'✓ OK':'✗ Skip'}</td>
+    </tr>`;
+  }).join('');
+
+  window._lpaBulkRows = rows;
+  showModal(`<div class="modal-title">
+    <span class="material-icons" style="color:#2563eb">upload_file</span>
+    <span style="margin-left:6px">Bulk Upload LPA — Preview</span>
+    <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
+  </div>
+  <div style="padding:4px 0 12px">
+    <div style="font-size:13px;font-weight:600;margin-bottom:10px">${rows.length} row${rows.length!==1?'s':''} found — preview of first ${Math.min(5,rows.length)}:</div>
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">
+      <thead><tr style="background:#f1f5f9">
+        <th style="padding:5px 8px;font-size:12px;text-align:left">#</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Plant</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Dept</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Process</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Layer</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Planned Date</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Status</th>
+      </tr></thead>
+      <tbody>${preview}</tbody>
+    </table></div>
+    ${rows.length>5?`<div style="font-size:11px;color:#94a3b8;margin-top:6px">…and ${rows.length-5} more row${rows.length-5!==1?'s':''}</div>`:''}
+  </div>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
+    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+    <button class="btn btn-primary" id="confirmLPAUploadBtn" onclick="_doLPAUpload()">
+      <span class="material-icons" style="font-size:14px;vertical-align:middle">cloud_upload</span>
+      Upload All ${rows.length} Rows
+    </button>
+  </div>`);
+}
+
+async function _doLPAUpload() {
+  const rows = window._lpaBulkRows || [];
+  if (!rows.length) return;
+  const btn = document.getElementById('confirmLPAUploadBtn');
+  if (btn) { btn.disabled=true; btn.innerHTML='<span class="material-icons" style="font-size:14px;vertical-align:middle">hourglass_top</span> Uploading…'; }
+
+  const col = (row, ...keys) => {
+    for (const k of keys) {
+      const found = Object.keys(row).find(r => r.replace(/\*/g,'').trim().toLowerCase() === k.toLowerCase());
+      if (found !== undefined && row[found] !== '') return String(row[found]).trim();
+    }
+    return '';
+  };
+
+  let saved = 0, skipped = 0;
+  const batch = db.batch(); let bCount = 0;
+
+  for (const row of rows) {
+    const plant   = col(row,'Plant');
+    const process = col(row,'Process');
+    const layer   = col(row,'LPA Layer');
+    const rawDate = col(row,'Planned Date* (YYYY-MM-DD)','Planned Date');
+    if (!plant || !process || !layer || !rawDate) { skipped++; continue; }
+
+    let dateObj;
+    try {
+      dateObj = rawDate instanceof Date ? rawDate : new Date(rawDate);
+      if (isNaN(dateObj.getTime())) { skipped++; continue; }
+    } catch(e) { skipped++; continue; }
+
+    const data = {
+      plant, department: col(row,'Department'), process, layer,
+      area: col(row,'Area / Sub-process','Area','Sub-process'),
+      auditType: col(row,'Audit Type')||'LPA',
+      auditor: col(row,'Auditor'), auditee: col(row,'Auditee'),
+      shift: col(row,'Shift'), frequency: col(row,'Frequency')||'',
+      plannedDate: firebase.firestore.Timestamp.fromDate(dateObj),
+      status: 'Planned', score: null, deviations: 0,
+      createdBy: S.user?.uid||'', createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    };
+    batch.set(db.collection('lpaAudits').doc(), data);
+    saved++; bCount++;
+    if (bCount >= 490) break;
+  }
+
+  try {
+    await batch.commit();
+    closeModal();
+    showToast(`✅ ${saved} LPA audit${saved!==1?'s':''} uploaded${skipped?` · ${skipped} skipped (missing required fields)`:''}`, 'success');
+    if (typeof renderLPA === 'function') renderLPA();
+  } catch(e) {
+    showToast('Upload failed: '+e.message,'error');
+    if (btn) { btn.disabled=false; btn.innerHTML='Upload'; }
+  }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// BULK UPLOAD — Supplier Audits
+// ════════════════════════════════════════════════════════════════════════════
+const SUPPLIER_TEMPLATE_COLS = [
+  'Supplier Name*','Category','Supplier Email','Location',
+  'Plant (Buyer)*','Audit Date* (YYYY-MM-DD)','Lead Auditor',
+  'Vendor Code','GST / Tax ID','Audit Scope','Rating'
+];
+
+function downloadSupplierTemplate() {
+  const wb = XLSX.utils.book_new();
+  const header = [SUPPLIER_TEMPLATE_COLS];
+  const samples = [
+    ['ABC Components Ltd.','Raw Material','abc@supplier.com','Pune','Plant A','2026-11-25','John Smith','VND-0042','27AABCX1234Z1Z5','Quality System Audit','A'],
+    ['XYZ Logistics','Logistics','','Mumbai','Plant B','2026-12-01','Priya Nair','VND-0088','','Process Audit','B'],
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([...header, ...samples]);
+  ws['!cols'] = SUPPLIER_TEMPLATE_COLS.map(c => ({ wch: Math.max(c.length+2, 18) }));
+  XLSX.utils.book_append_sheet(wb, ws, 'Supplier Audits');
+  const instr = XLSX.utils.aoa_to_sheet([
+    ['Supplier Audit Bulk Upload — Instructions'],[''],
+    ['1. Fill in the "Supplier Audits" sheet. Do NOT rename columns.'],
+    ['2. Columns marked * are required.'],
+    ['3. Audit Date format: YYYY-MM-DD (e.g. 2026-11-25)'],
+    ['4. Category: Raw Material / Sub-assembly / Service / Logistics / Tooling / Other'],
+    ['5. Rating: A+ / A / B / C / D (optional)'],
+    ['7. Delete the sample rows before uploading.'],
+  ]);
+  instr['!cols'] = [{wch:40},{wch:60}];
+  XLSX.utils.book_append_sheet(wb, instr, 'Instructions');
+  XLSX.writeFile(wb, 'Supplier_Audit_Bulk_Upload_Template.xlsx');
+  showToast('Supplier template downloaded — fill and upload','success');
+}
+
+async function bulkUploadSupplier(input) {
+  const file = input.files[0]; if (!file) return;
+  input.value = '';
+  showToast('Reading file…','info');
+  let rows = [];
+  try {
+    const ab = await file.arrayBuffer();
+    const wb = XLSX.read(ab, { type:'array', cellDates:true });
+    rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval:'' });
+  } catch(e) { showToast('Could not read file: '+e.message,'error'); return; }
+  if (!rows.length) { showToast('File is empty or has no data rows','warning'); return; }
+
+  const col = (row, ...keys) => {
+    for (const k of keys) {
+      const found = Object.keys(row).find(r => r.replace(/\*/g,'').trim().toLowerCase() === k.toLowerCase());
+      if (found !== undefined && row[found] !== '') return String(row[found]).trim();
+    }
+    return '';
+  };
+
+  const preview = rows.slice(0,5).map((r,i) => {
+    const name=col(r,'Supplier Name'), plant=col(r,'Plant (Buyer)','Plant');
+    const date=col(r,'Audit Date* (YYYY-MM-DD)','Audit Date');
+    const ok = name && plant && date;
+    return `<tr style="background:${ok?'':'#fef2f2'}">
+      <td style="padding:4px 8px;font-size:12px">${i+1}</td>
+      <td style="padding:4px 8px;font-size:12px">${name||'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px">${col(r,'Category')||'—'}</td>
+      <td style="padding:4px 8px;font-size:12px">${plant||'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px">${date||'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px;color:${ok?'#16a34a':'#ef4444'}">${ok?'✓ OK':'✗ Skip'}</td>
+    </tr>`;
+  }).join('');
+
+  window._supplierBulkRows = rows;
+  showModal(`<div class="modal-title">
+    <span class="material-icons" style="color:#6366f1">upload_file</span>
+    <span style="margin-left:6px">Bulk Upload Suppliers — Preview</span>
+    <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
+  </div>
+  <div style="padding:4px 0 12px">
+    <div style="font-size:13px;font-weight:600;margin-bottom:10px">${rows.length} row${rows.length!==1?'s':''} found — preview of first ${Math.min(5,rows.length)}:</div>
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">
+      <thead><tr style="background:#f1f5f9">
+        <th style="padding:5px 8px;font-size:12px;text-align:left">#</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Supplier Name</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Category</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Plant</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Audit Date</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Status</th>
+      </tr></thead>
+      <tbody>${preview}</tbody>
+    </table></div>
+    ${rows.length>5?`<div style="font-size:11px;color:#94a3b8;margin-top:6px">…and ${rows.length-5} more row${rows.length-5!==1?'s':''}</div>`:''}
+  </div>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
+    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+    <button class="btn btn-primary" id="confirmSupUploadBtn" onclick="_doSupplierUpload()">
+      <span class="material-icons" style="font-size:14px;vertical-align:middle">cloud_upload</span>
+      Upload All ${rows.length} Rows
+    </button>
+  </div>`);
+}
+
+async function _doSupplierUpload() {
+  const rows = window._supplierBulkRows || [];
+  if (!rows.length) return;
+  const btn = document.getElementById('confirmSupUploadBtn');
+  if (btn) { btn.disabled=true; btn.innerHTML='<span class="material-icons" style="font-size:14px;vertical-align:middle">hourglass_top</span> Uploading…'; }
+
+  const col = (row, ...keys) => {
+    for (const k of keys) {
+      const found = Object.keys(row).find(r => r.replace(/\*/g,'').trim().toLowerCase() === k.toLowerCase());
+      if (found !== undefined && row[found] !== '') return String(row[found]).trim();
+    }
+    return '';
+  };
+
+  let saved = 0, skipped = 0;
+  for (const row of rows) {
+    const name    = col(row,'Supplier Name');
+    const plant   = col(row,'Plant (Buyer)','Plant');
+    const rawDate = col(row,'Audit Date* (YYYY-MM-DD)','Audit Date');
+    if (!name || !plant || !rawDate) { skipped++; continue; }
+
+    let dateObj;
+    try {
+      dateObj = rawDate instanceof Date ? rawDate : new Date(rawDate);
+      if (isNaN(dateObj.getTime())) { skipped++; continue; }
+    } catch(e) { skipped++; continue; }
+
+    const data = {
+      name, plant,
+      email:       col(row,'Supplier Email','Email')||'',
+      category:    col(row,'Category')||'Other',
+      location:    col(row,'Location')||'',
+      leadAuditor: col(row,'Lead Auditor','Auditor')||'',
+      plantId:     col(row,'Vendor Code','Plant ID')||'',
+      gstId:       col(row,'GST / Tax ID','GST')||'',
+      scope:       col(row,'Audit Scope','Scope')||'',
+      rating:      col(row,'Rating')||'',
+      lastAuditDate: firebase.firestore.Timestamp.fromDate(dateObj),
+      nextAuditDate: firebase.firestore.Timestamp.fromDate(
+        new Date(new Date(dateObj).setFullYear(dateObj.getFullYear()+1))
+      ),
+      status: 'Action Pending', lastScore: null,
+      createdBy: S.user?.uid||'', createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    };
+    await db.collection('supplierAudits').add(data).catch(()=>{ skipped++; return; });
+    saved++;
+  }
+
+  closeModal();
+  showToast(`✅ ${saved} supplier audit${saved!==1?'s':''} uploaded${skipped?` · ${skipped} skipped`:''}`, 'success');
+  if (typeof renderSupplier === 'function') renderSupplier();
+}
+
 </script>
 </body>
 </html>
