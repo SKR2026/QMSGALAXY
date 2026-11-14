@@ -3674,8 +3674,11 @@ async function openAuditChecklist(planId, name, auditType) {
     return;
   }
 
+  // Track which audit plan is currently open so NC raises get linked automatically
+  S._activeAuditPlanId = planId;
+
   // Show loading modal first
-  showModal(`<div class="modal-title"><span>${name}</span><button onclick="closeModal()" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>
+  showModal(`<div class="modal-title"><span>${name}</span><button onclick="closeModal();S._activeAuditPlanId='';" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>
     <div style="text-align:center;padding:30px"><div class="spinner" style="width:28px;height:28px;margin:0 auto 10px"></div><div style="font-size:13px;color:var(--text-muted)">Loading checklist…</div></div>`);
 
   // Fetch audit plan details if planId given
@@ -3762,41 +3765,44 @@ async function submitAuditResponses(planId) {
   const plan = planDoc?.exists ? planDoc.data() : {};
 
   // ── Collect checklist responses & create findings for NC / Observation items ─
-  // Read all checklist items from the modal DOM (still open at submit time)
-  const checklistItems = document.querySelectorAll('[name^="q"]');
+  // Iterate by question index (each question group name="q0", "q1", ...)
   const findingsBatch = [];
-  checklistItems.forEach((radio, idx) => {
-    // Each group of radios shares name="q{idx}" — find the checked one
-    if (!radio.checked) return;
-    const val = radio.value; // Conforming / Non-Conforming / Observation / N/A
-    if (val !== 'Non-Conforming' && val !== 'Observation') return;
-    const evidence = document.getElementById(`ev${idx}`)?.value?.trim() || '';
-    const questionEl = radio.closest('[style*="border"]');
-    const questionText = questionEl?.querySelector('strong')?.textContent?.trim() || `Checklist item ${idx+1}`;
-    const clauseMatch = questionEl?.querySelector('[style*="text-muted"]')?.textContent?.match(/§\s*([\d.]+)/);
-    const clause = clauseMatch ? clauseMatch[1] : '';
-    findingsBatch.push({
-      type:          val === 'Non-Conforming' ? 'Major NC' : 'OI',
-      severity:      val === 'Non-Conforming' ? 'Major' : 'OI',
-      description:   questionText,
-      evidence:      evidence,
-      clause:        clause,
-      auditId:       planId,
-      auditPlanId:   planId,
-      auditNo:       plan.auditNo    || '',
-      auditType:     plan.auditType  || '',
-      plant:         plan.plant      || '',
-      department:    plan.department || '',
-      status:        'Open',
-      published:     true,
-      findingNo:     'NC-' + Date.now().toString(36).toUpperCase() + '-' + idx,
-      raisedBy:      S.user?.uid     || '',
-      raisedByName:  S.userDoc?.name || S.user?.email || '',
-      createdAt:     firebase.firestore.FieldValue.serverTimestamp(),
-      updatedAt:     firebase.firestore.FieldValue.serverTimestamp(),
-    });
-  });
-  // Also collect any "Observation" radio items (name="q{n}" value="Observation")
+  let qIdx = 0;
+  while (true) {
+    const radios = document.querySelectorAll(`[name="q${qIdx}"]`);
+    if (!radios.length) break; // no more questions
+    const checked = [...radios].find(r => r.checked);
+    const val = checked ? checked.value : '';
+    if (val === 'Non-Conforming' || val === 'Observation') {
+      const evidence    = document.getElementById(`ev${qIdx}`)?.value?.trim() || '';
+      const questionEl  = radios[0].closest('div[style*="border"]');
+      const questionText = questionEl?.querySelector('strong')?.textContent?.trim() || `Checklist item ${qIdx+1}`;
+      const clauseText  = questionEl?.querySelector('div[style*="text-muted"]')?.textContent || '';
+      const clauseMatch = clauseText.match(/§\s*([\d.]+)/);
+      const clause      = clauseMatch ? clauseMatch[1] : '';
+      findingsBatch.push({
+        type:         val === 'Non-Conforming' ? 'Major NC' : 'OI',
+        severity:     val === 'Non-Conforming' ? 'Major'    : 'OI',
+        description:  questionText,
+        evidence,
+        clause,
+        auditId:      planId,
+        auditPlanId:  planId,
+        auditNo:      plan.auditNo    || '',
+        auditType:    plan.auditType  || '',
+        plant:        plan.plant      || '',
+        department:   plan.department || '',
+        status:       'Open',
+        published:    true,
+        findingNo:    'NC-' + Date.now().toString(36).toUpperCase() + String(qIdx).padStart(2,'0'),
+        raisedBy:     S.user?.uid     || '',
+        raisedByName: S.userDoc?.name || S.user?.email || '',
+        createdAt:    firebase.firestore.FieldValue.serverTimestamp(),
+        updatedAt:    firebase.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+    qIdx++;
+  }
   if (findingsBatch.length) {
     await Promise.all(findingsBatch.map(f => db.collection('findings').add(f).catch(()=>{})));
   }
@@ -3884,8 +3890,9 @@ async function submitAuditResponses(planId) {
     }).catch(()=>{});
   }
 
+  S._activeAuditPlanId = '';
   closeModal();
-  showToast('Audit submitted! Auditee notified to fill action plan. ✅','success');
+  showToast(`Audit submitted${findingsBatch.length ? ` with ${findingsBatch.length} finding(s)` : ''}! Auditee notified to fill action plan. ✅`,'success');
   logActivity('Submitted audit responses','Conduct Audit',planId);
   if(S.currentModule === 'myactions') renderMyActions();
   renderConduct();
@@ -3901,24 +3908,64 @@ async function openAuditeeActionPlan(planId, auditName) {
     </div>
     <div style="text-align:center;padding:24px"><div class="spinner" style="width:24px;height:24px;margin:0 auto 8px"></div><div style="font-size:13px;color:var(--text-muted)">Loading findings…</div></div>`);
 
-  // Resolve the actual audit name from Firestore if it looks like a raw title
+  // Fetch the audit plan to get plant, auditType, department, and audit date range
+  let plan = {};
   if (planId) {
     const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
     if (planDoc && planDoc.exists) {
-      auditName = planDoc.data().name || auditName;
+      plan = planDoc.data();
+      auditName = plan.name || auditName;
     }
   }
 
-  // Fetch findings raised against this audit plan — try both field names used across the app
-  const [snap1, snap2] = await Promise.all([
+  // Fetch findings — try multiple strategies to handle findings saved with different field names
+  const queries = [
     db.collection('findings').where('auditId','==',planId).get().catch(()=>null),
     db.collection('findings').where('auditPlanId','==',planId).get().catch(()=>null),
-  ]);
+    db.collection('findings').where('auditNo','==', plan.auditNo||'__none__').get().catch(()=>null),
+  ];
+  // Also search by plant + auditType (catches NCs raised from NC panel without an auditId)
+  if (plan.plant && plan.auditType) {
+    queries.push(
+      db.collection('findings').where('plant','==',plan.plant).where('auditType','==',plan.auditType).get().catch(()=>null)
+    );
+  }
+  const snaps = await Promise.all(queries);
   const seenFIds = new Set();
   const allFindings = [];
-  [snap1, snap2].forEach(snap => {
-    if (snap && !snap.empty) snap.docs.forEach(d => { if (!seenFIds.has(d.id)) { seenFIds.add(d.id); allFindings.push({id:d.id,...d.data()}); } });
+
+  // For the plant+auditType fallback, only include findings created around the audit date
+  const auditDate = plan.plannedDate?.toDate ? plan.plannedDate.toDate() :
+                    plan.plannedDate ? new Date(plan.plannedDate) : null;
+  const windowMs = 7 * 24 * 60 * 60 * 1000; // ±7 days
+
+  snaps.forEach((snap, idx) => {
+    if (!snap || snap.empty) return;
+    snap.docs.forEach(d => {
+      if (seenFIds.has(d.id)) return;
+      const f = {id:d.id,...d.data()};
+      // For the fallback plant+auditType query (idx 3), validate date proximity
+      if (idx === 3 && auditDate) {
+        const fDate = f.createdAt?.toDate ? f.createdAt.toDate() : new Date(f.createdAt||0);
+        if (Math.abs(fDate - auditDate) > windowMs) return;
+      }
+      seenFIds.add(d.id);
+      allFindings.push(f);
+    });
   });
+
+  // Backfill: tag found findings with this auditId so future queries find them directly
+  if (allFindings.length) {
+    const bf = db.batch();
+    let n = 0;
+    allFindings.forEach(f => {
+      if (!f.auditId && !f.auditPlanId && n < 490) {
+        bf.update(db.collection('findings').doc(f.id), { auditId: planId, auditPlanId: planId });
+        n++;
+      }
+    });
+    if (n) bf.commit().catch(()=>{});
+  }
   // Show findings that still need action plan (open/in-progress/pending/no-status)
   const findings = allFindings.filter(f => {
     const st = (f.status||'Open');
@@ -6091,6 +6138,8 @@ async function saveNC() {
     if (statusEl) statusEl.style.display = 'none';
   }
 
+  // Link to current open audit plan if the auditor is in the middle of an audit
+  const activePlanId = S._activeAuditPlanId || '';
   const data = {
     type, description:desc,
     plant:      document.getElementById('ncPlant')?.value||'',
@@ -6106,6 +6155,8 @@ async function saveNC() {
     published: false,
     evidenceUrls: evidenceUrls,
     evidenceCount: evidenceUrls.length,
+    // Always link to the active audit plan so Auditee's Action Plan can find this finding
+    ...(activePlanId ? { auditId: activePlanId, auditPlanId: activePlanId } : {}),
   };
   const err = await db.collection('findings').add(data).then(()=>null).catch(e=>e);
   if (err) { showToast('Error: '+err.message,'error'); if(btn){btn.disabled=false;btn.innerHTML='<span class="material-icons" style="font-size:14px;vertical-align:middle">flag</span> Raise NC';} return; }
