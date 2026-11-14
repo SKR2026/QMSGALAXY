@@ -565,7 +565,7 @@ select.form-input{cursor:pointer}
 <div id="panel-myactions" class="module-panel">
 <div class="page-title">My Actions</div>
 <div class="page-sub">Your consolidated task inbox across all modules</div>
-<div class="kpi-grid" style="grid-template-columns:repeat(4,1fr)" id="myActionStats"></div>
+<div class="kpi-grid" style="grid-template-columns:repeat(5,1fr)" id="myActionStats"></div>
 <div class="card">
   <div class="toolbar">
     <div class="search-bar"><span class="material-icons">search</span><input type="text" placeholder="Search tasks..."></div>
@@ -2263,25 +2263,42 @@ function exportAuditReport() {
 async function renderMyActions() {
   if (!S.user) return;
   const statsEl = document.getElementById('myActionStats');
-  statsEl.innerHTML = `<div class="kpi-card" style="grid-column:span 1"><div class="spinner"></div></div>`.repeat(4);
+  statsEl.innerHTML = `<div class="kpi-card" style="grid-column:span 1"><div class="spinner"></div></div>`.repeat(5);
   document.getElementById('actionsTbl').innerHTML = loadingRow(8);
 
-  // Try myActions first, fall back to correctiveActions assigned to this user
-  let actions = [];
-  const snap1 = await db.collection('myActions').where('userId','==',S.user.uid).get().catch(()=>null);
+  // Try myActions first (by userId), also try by userEmail to catch Auditee records where userId may be empty
+  let allActions = [];
+  const [snap1, snapEmail] = await Promise.all([
+    db.collection('myActions').where('userId','==',S.user.uid).get().catch(()=>null),
+    S.user.email
+      ? db.collection('myActions').where('userEmail','==',S.user.email).get().catch(()=>null)
+      : Promise.resolve(null),
+  ]);
+  const seen = new Set();
   if (snap1 && !snap1.empty) {
-    actions = snap1.docs.map(d=>({id:d.id,...d.data()}));
-  } else {
+    snap1.docs.forEach(d => { seen.add(d.id); allActions.push({id:d.id,...d.data()}); });
+  }
+  // Merge email-matched records (Auditee actions where userId wasn't set at creation time)
+  if (snapEmail && !snapEmail.empty) {
+    snapEmail.docs.forEach(d => { if(!seen.has(d.id)){ seen.add(d.id); allActions.push({id:d.id,...d.data()}); } });
+  }
+  if (allActions.length === 0) {
     // Fallback: correctiveActions where assigneeId == user uid OR assigneeEmail == user email
     const snap2 = await db.collection('correctiveActions').where('assigneeId','==',S.user.uid).get().catch(()=>null);
     const snap3 = await db.collection('lpaActions').where('assigneeId','==',S.user.uid).get().catch(()=>null);
     const a2 = snap2 ? snap2.docs.map(d=>({id:d.id,...d.data(), module:'capa'})) : [];
     const a3 = snap3 ? snap3.docs.map(d=>({id:d.id,...d.data(), module:'lpa'})) : [];
-    actions = [...a2, ...a3];
+    allActions = [...a2, ...a3];
   }
 
-  // Filter out completed/closed/cancelled actions
-  actions = actions.filter(a => {
+  // Count completed before filtering (for the stat card)
+  const completedCount = allActions.filter(a => {
+    const st = (a.status||'').toLowerCase();
+    return st === 'completed' || st === 'closed';
+  }).length;
+
+  // Filter out completed/closed/cancelled actions for the table
+  let actions = allActions.filter(a => {
     const st = (a.status||'').toLowerCase();
     return st !== 'completed' && st !== 'closed' && st !== 'cancelled';
   });
@@ -2323,10 +2340,11 @@ async function renderMyActions() {
   const critical = actions.filter(a=>a.priority==='Critical'||a.priority==='High').length;
 
   const kpiCards = [
-    {label:'Overdue',      value:overdue,  icon:'schedule',      iconBg:'#FEF2F2', iconColor:'#DC2626', alert:'#DC2626'},
-    {label:'Pending',      value:pending,  icon:'pending',       iconBg:'#FFFBEB', iconColor:'#D97706', alert:'#D97706'},
-    {label:'In Progress',  value:inprog,   icon:'autorenew',     iconBg:'#EFF6FF', iconColor:'#2563EB'},
-    {label:'High/Critical',value:critical, icon:'priority_high', iconBg:'#FEF2F2', iconColor:'#DC2626', alert:'#DC2626'},
+    {label:'Overdue',      value:overdue,         icon:'schedule',      iconBg:'#FEF2F2', iconColor:'#DC2626', alert:'#DC2626'},
+    {label:'Pending',      value:pending,         icon:'pending',       iconBg:'#FFFBEB', iconColor:'#D97706', alert:'#D97706'},
+    {label:'In Progress',  value:inprog,          icon:'autorenew',     iconBg:'#EFF6FF', iconColor:'#2563EB'},
+    {label:'High/Critical',value:critical,        icon:'priority_high', iconBg:'#FEF2F2', iconColor:'#DC2626', alert:'#DC2626'},
+    {label:'Completed',    value:completedCount,  icon:'check_circle',  iconBg:'#F0FDF4', iconColor:'#16A34A'},
   ];
   statsEl.innerHTML = kpiCards.map(c=>`
     <div class="kpi-card${c.alert?' kpi-alert':''}" style="${c.alert?`--kpi-alert-color:${c.alert};`:''}">
@@ -3588,12 +3606,23 @@ async function submitAuditResponses(planId) {
   const auditeeName  = plan.auditeeName  || '';
   const auditeeEmail = plan.auditeeEmail || '';
   if (auditeeId || auditeeEmail) {
-    // Check if one already exists for auditee for this plan
-    const existQ = auditeeId
-      ? db.collection('myActions').where('sourceRef','==',sourceRef).where('userId','==',auditeeId).get().catch(()=>null)
-      : null;
-    const existSnap = existQ ? await existQ : null;
-    if (!existSnap || existSnap.empty) {
+    // Check if one already exists for auditee for this plan (search by both userId and userEmail)
+    const [existByUid, existByEmail] = await Promise.all([
+      auditeeId
+        ? db.collection('myActions').where('sourceRef','==',sourceRef).where('userId','==',auditeeId).get().catch(()=>null)
+        : Promise.resolve(null),
+      auditeeEmail
+        ? db.collection('myActions').where('sourceRef','==',sourceRef).where('userEmail','==',auditeeEmail).get().catch(()=>null)
+        : Promise.resolve(null),
+    ]);
+    const alreadyExists = (existByUid && !existByUid.empty) || (existByEmail && !existByEmail.empty);
+    // If found by email but userId is missing, backfill the userId so future queries by uid work
+    if (auditeeId && existByEmail && !existByEmail.empty) {
+      const bfBatch = db.batch();
+      existByEmail.docs.forEach(d => { if (!d.data().userId) bfBatch.update(d.ref, { userId: auditeeId }); });
+      bfBatch.commit().catch(()=>{});
+    }
+    if (!alreadyExists) {
       await db.collection('myActions').add({
         userId:     auditeeId,
         userEmail:  auditeeEmail,
@@ -3604,6 +3633,9 @@ async function submitAuditResponses(planId) {
         description:`Audit conducted by ${S.userDoc?.name||'Auditor'}. Please fill in your corrective action plan.`,
         sourceRef,
         module:     'Conduct Audit',
+        auditNo:    plan.auditNo    || '',
+        auditType:  plan.auditType  || '',
+        auditName:  plan.name       || '',
         status:     'Open',
         priority:   'High',
         plant:      plan.plant||'',
