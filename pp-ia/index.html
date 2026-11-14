@@ -209,8 +209,6 @@ tr:hover td{background:#FAFBFC}
 .stat-lbl{font-size:12px;color:var(--text-secondary);margin-top:4px}
 .spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-@keyframes timeline-pulse{0%,100%{box-shadow:0 0 0 0 rgba(217,119,6,.7);transform:scale(1)}50%{box-shadow:0 0 0 6px rgba(217,119,6,0);transform:scale(1.18)}}
-@keyframes label-blink{0%,100%{opacity:1}50%{opacity:.4}}
 .loading-row{text-align:center;padding:40px;color:var(--text-muted)}
 .capa-flow{display:flex;align-items:center;gap:4px;margin-bottom:20px;flex-wrap:wrap}
 .capa-step{display:flex;align-items:center;gap:6px;padding:8px 14px;border-radius:6px;font-size:12px;font-weight:600;background:var(--bg);border:1px solid var(--border);color:var(--text-secondary)}
@@ -4026,16 +4024,21 @@ async function openAuditeeActionPlan(planId, auditName) {
     }
   }
 
-  // Fetch findings — try multiple strategies to handle findings saved with different field names
+  // Fetch findings — force server to bypass stale cache (critical for workflowStage lock check)
+  const _sv = { source: 'server' };
   const queries = [
-    db.collection('findings').where('auditId','==',planId).get().catch(()=>null),
-    db.collection('findings').where('auditPlanId','==',planId).get().catch(()=>null),
-    db.collection('findings').where('auditNo','==', plan.auditNo||'__none__').get().catch(()=>null),
+    db.collection('findings').where('auditId','==',planId).get(_sv).catch(()=>
+      db.collection('findings').where('auditId','==',planId).get().catch(()=>null)),
+    db.collection('findings').where('auditPlanId','==',planId).get(_sv).catch(()=>
+      db.collection('findings').where('auditPlanId','==',planId).get().catch(()=>null)),
+    db.collection('findings').where('auditNo','==', plan.auditNo||'__none__').get(_sv).catch(()=>
+      db.collection('findings').where('auditNo','==', plan.auditNo||'__none__').get().catch(()=>null)),
   ];
   // Also search by plant + auditType (catches NCs raised from NC panel without an auditId)
   if (plan.plant && plan.auditType) {
     queries.push(
-      db.collection('findings').where('plant','==',plan.plant).where('auditType','==',plan.auditType).get().catch(()=>null)
+      db.collection('findings').where('plant','==',plan.plant).where('auditType','==',plan.auditType).get(_sv).catch(()=>
+        db.collection('findings').where('plant','==',plan.plant).where('auditType','==',plan.auditType).get().catch(()=>null))
     );
   }
   const snaps = await Promise.all(queries);
@@ -4361,7 +4364,7 @@ async function saveAllDrafts() {
       rca4M_man: m4man, rca4M_machine: m4machine, rca4M_method: m4method, rca4M_material: m4material,
       rcaWhy1: why1, rcaWhy2: why2, rcaWhy3: why3, rcaWhy4: why4, rcaWhy5: why5,
       rcaRootCause: whyRc||rc,
-      workflowStage: 'Auditee Action',
+      // NOTE: do NOT set workflowStage here — draft save must never downgrade a submitted stage
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
     }).catch(()=>{});
     saved++;
@@ -4402,7 +4405,15 @@ async function submitAuditeeActionPlans() {
       if (rcEl) { rcEl.style.borderColor='#ef4444'; rcEl.focus(); rcEl.scrollIntoView({behavior:'smooth',block:'center'}); }
       return;
     }
-    if (!imm || !ca || !dt) { errors++; continue; }
+    if (!imm || !ca || !dt) {
+      showToast('Please fill Immediate Correction, Corrective Action and Target Date for all findings','warning');
+      if (btn) { btn.disabled=false; btn.innerHTML='<span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">send</span> Submit Action Plans'; }
+      // Highlight the first empty required field
+      const immEl=document.getElementById('ap_imm_'+fid), caEl=document.getElementById('ap_ca_'+fid), dtEl=document.getElementById('ap_dt_'+fid);
+      const focusEl = (!imm&&immEl)||(!ca&&caEl)||(!dt&&dtEl);
+      if (focusEl) { focusEl.style.borderColor='#ef4444'; focusEl.focus(); focusEl.scrollIntoView({behavior:'smooth',block:'center'}); }
+      return;
+    }
 
     // Upload evidence for this finding
     const apFiles = (window._apEvidenceFiles?.[fid]||[]).filter(Boolean);
@@ -4725,14 +4736,16 @@ function miniTimeline(stages, current) {
     const lineColor = i < curIdx ? '#16A34A' : '#E2E8F0';
 
     // dot (fixed 22px) + connecting line (flex:1) — both on same align:center row
-    const pulseStyle = isActive ? 'animation:timeline-pulse 1.4s ease-in-out infinite;' : '';
     const title = isActive ? `title="⏳ Waiting with: ${MINI_LABELS[s]||s}"` : '';
-    dotRow += `<div ${title} style="width:22px;height:22px;border-radius:50%;background:${bgColor};border:2px solid ${border};display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:${txtColor};flex-shrink:0;cursor:${isActive?'help':'default'};${pulseStyle}">${isDone?'✓':(isActive?'●':i+1)}</div>`;
+    // Active stage shows a clock icon instead of pulsing dot
+    const dotInner = isDone ? '✓' : isActive
+      ? `<span class="material-icons" style="font-size:13px;line-height:1;color:#fff">hourglass_empty</span>`
+      : `<span style="font-size:9px;font-weight:700;color:#94A3B8">${i+1}</span>`;
+    dotRow += `<div ${title} style="width:22px;height:22px;border-radius:50%;background:${bgColor};border:2px solid ${border};display:flex;align-items:center;justify-content:center;flex-shrink:0;cursor:${isActive?'help':'default'}">${dotInner}</div>`;
     if (i < stages.length-1) dotRow += `<div style="flex:1;height:2px;background:${lineColor};min-width:6px"></div>`;
 
     // label below the dot (same 22px width + spacer to match line)
-    const labelAnim = isActive ? 'animation:label-blink 1.4s ease-in-out infinite;' : '';
-    labelRow += `<div style="width:22px;text-align:center;flex-shrink:0"><span style="font-size:8px;color:${labelCol};font-weight:${labelWt};line-height:1.2;display:block;white-space:normal;word-break:break-word;${labelAnim}" title="${s}">${MINI_LABELS[s]||s}</span></div>`;
+    labelRow += `<div style="width:22px;text-align:center;flex-shrink:0"><span style="font-size:8px;color:${labelCol};font-weight:${labelWt};line-height:1.2;display:block;white-space:normal;word-break:break-word" title="${s}">${MINI_LABELS[s]||s}</span></div>`;
     if (i < stages.length-1) labelRow += `<div style="flex:1"></div>`;
   });
 
