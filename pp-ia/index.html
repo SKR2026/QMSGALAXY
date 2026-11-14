@@ -2569,32 +2569,71 @@ function filterActions() {
 }
 
 async function _openActionPlanWithLockCheck(planId, auditName) {
-  // Check server for latest actionPlanStatus — prevents re-opening after submission
-  const planDoc = await db.collection('auditPlans').doc(planId).get({ source:'server' }).catch(()=>
-    db.collection('auditPlans').doc(planId).get().catch(()=>null));
-  if (planDoc && planDoc.exists) {
-    const pd = planDoc.data();
-    if (pd.actionPlanStatus === 'Submitted') {
+  // Show spinner while checking
+  showModal(`<div class="modal-title">
+      <span class="material-icons" style="color:#059669">edit_note</span>
+      <span style="margin-left:6px">Action Plan — ${auditName}</span>
+      <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
+    </div>
+    <div style="text-align:center;padding:28px">
+      <div class="spinner" style="width:24px;height:24px;margin:0 auto 10px"></div>
+      <div style="font-size:13px;color:var(--text-muted)">Checking status…</div>
+    </div>`);
+
+  // Query findings from SERVER (bypass cache) — auditee can read/write findings
+  const lockedStages = ['Dept Head Review','Auditor Review','MR Review','Closed'];
+  const sv = { source: 'server' };
+  let allFindings = [];
+  try {
+    const snaps = await Promise.all([
+      db.collection('findings').where('auditId','==',planId).get(sv).catch(()=>
+        db.collection('findings').where('auditId','==',planId).get().catch(()=>null)),
+      db.collection('findings').where('auditPlanId','==',planId).get(sv).catch(()=>
+        db.collection('findings').where('auditPlanId','==',planId).get().catch(()=>null)),
+    ]);
+    const seen = new Set();
+    snaps.forEach(snap => {
+      if (!snap || snap.empty) return;
+      snap.docs.forEach(d => { if (!seen.has(d.id)) { seen.add(d.id); allFindings.push({id:d.id,...d.data()}); } });
+    });
+  } catch(e) {}
+
+  // If there are findings and ALL are beyond Auditee Action → fully locked
+  if (allFindings.length > 0) {
+    const pending  = allFindings.filter(f => !lockedStages.includes(f.workflowStage));
+    const locked   = allFindings.filter(f =>  lockedStages.includes(f.workflowStage));
+    if (pending.length === 0 && locked.length > 0) {
+      // All submitted — show locked modal
       showModal(`<div class="modal-title">
           <span class="material-icons" style="color:#16a34a">task_alt</span>
-          <span style="margin-left:6px">Action Plan — ${pd.name||auditName}</span>
+          <span style="margin-left:6px">Action Plan — ${auditName}</span>
           <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
         </div>
         <div style="padding:28px;text-align:center">
           <span class="material-icons" style="font-size:48px;color:#16a34a;display:block;margin-bottom:12px">verified</span>
-          <div style="font-size:15px;font-weight:700;color:#15803d;margin-bottom:8px">Action Plan Already Submitted ✅</div>
-          <div style="font-size:13px;color:#166534;max-width:340px;margin:0 auto 16px;line-height:1.6">
-            Your action plan has been submitted to the <strong>HOD</strong> for review.<br>
-            You cannot edit or resubmit at this stage.
+          <div style="font-size:15px;font-weight:700;color:#15803d;margin-bottom:8px">Action Plan Submitted ✅</div>
+          <div style="font-size:13px;color:#166534;max-width:340px;margin:0 auto 20px;line-height:1.6">
+            Your action plan has been submitted to the <strong>HOD (Section Head)</strong> for review.<br><br>
+            You cannot edit or resubmit. If changes are needed, your HOD will return it to you.
           </div>
-          <div style="font-size:11px;color:#94a3b8;margin-bottom:20px">
-            ${pd.actionPlanSubmittedName ? `Submitted by: ${pd.actionPlanSubmittedName}` : ''}
+          <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:20px">
+            ${locked.map((f,i)=>`
+            <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:7px;padding:9px 12px;text-align:left;display:flex;align-items:center;gap:8px">
+              <span class="material-icons" style="color:#16a34a;font-size:16px">check_circle</span>
+              <div>
+                <div style="font-size:11px;font-weight:600;color:#14532d">${f.description||'Finding '+(i+1)}</div>
+                <div style="font-size:10px;color:#16a34a">Currently with: <strong>${f.workflowStage}</strong></div>
+              </div>
+            </div>`).join('')}
           </div>
           <button class="btn btn-secondary" onclick="closeModal()">Close</button>
         </div>`);
       return;
     }
   }
+
+  // Not fully locked — open the editable form normally
+  closeModal();
   openAuditeeActionPlan(planId, auditName);
 }
 
@@ -3681,33 +3720,26 @@ async function renderConduct() {
     if (isAuditee) {
       // ── Auditee card ──────────────────────────────────────────────────────
       const statusBadge = a.status==='In Progress'?'badge-blue':a.status==='Pending Review'?'badge-amber':a.status==='Completed'?'badge-green':'badge-grey';
-      const apSubmitted = a.actionPlanStatus === 'Submitted';
-      return `<div class="card" style="margin-bottom:12px;border-left:4px solid ${apSubmitted?'#16a34a':auditDone?'var(--green)':'var(--amber)'}">
+      return `<div class="card" style="margin-bottom:12px;border-left:4px solid ${auditDone?'var(--green)':'var(--amber)'}">
         <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
           <div>
             <strong style="font-size:14px">${a.name}</strong>
             ${a.auditNo?`<span style="font-size:10px;font-weight:700;color:#2563eb;background:#eff6ff;padding:1px 7px;border-radius:4px;margin-left:6px">${a.auditNo}</span>`:''}
             <br><span style="font-size:12px;color:var(--text-secondary)">${a.auditType||''} · ${a.plant} · ${a.department||''} · ${formatDate(a.plannedDate)}</span>
             <br><span style="font-size:11px;color:var(--text-muted)">Auditor: ${a.leadAuditorName||'—'}</span>
-            ${apSubmitted
-              ? `<span style="display:inline-block;margin-left:10px;font-size:11px;font-weight:600;color:#15803d;background:#dcfce7;padding:1px 8px;border-radius:10px">✅ Action plan submitted — awaiting HOD review</span>`
-              : auditDone
-                ? `<span style="display:inline-block;margin-left:10px;font-size:11px;font-weight:600;color:#15803d;background:#dcfce7;padding:1px 8px;border-radius:10px">✓ Audit completed — your action plan is due</span>`
-                : `<span style="display:inline-block;margin-left:10px;font-size:11px;color:#92400e;background:#fef3c7;padding:1px 8px;border-radius:10px">⏳ Waiting for auditor to conduct &amp; submit the audit</span>`}
+            ${auditDone
+              ? `<span style="display:inline-block;margin-left:10px;font-size:11px;font-weight:600;color:#15803d;background:#dcfce7;padding:1px 8px;border-radius:10px">✓ Audit completed — your action plan is due</span>`
+              : `<span style="display:inline-block;margin-left:10px;font-size:11px;color:#92400e;background:#fef3c7;padding:1px 8px;border-radius:10px">⏳ Waiting for auditor to conduct &amp; submit the audit</span>`}
           </div>
           <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
             <span class="badge ${statusBadge}">${a.status}</span>
-            ${apSubmitted
-              ? `<button class="btn btn-sm btn-secondary" disabled style="cursor:not-allowed;opacity:.7;background:#dcfce7;border-color:#86efac;color:#15803d" title="Action plan submitted — awaiting HOD review">
-                   <span class="material-icons" style="font-size:14px">lock</span> Submitted to HOD
+            ${auditDone
+              ? `<button class="btn btn-sm btn-primary" onclick="_openActionPlanWithLockCheck('${a.id}','${a.name.replace(/'/g,"\\'")}')">
+                   <span class="material-icons" style="font-size:14px">edit_note</span> Fill Action Plan
                  </button>`
-              : auditDone
-                ? `<button class="btn btn-sm btn-primary" onclick="openAuditeeActionPlan('${a.id}','${a.name.replace(/'/g,"\\'")}')">
-                     <span class="material-icons" style="font-size:14px">edit_note</span> Fill Action Plan
-                   </button>`
-                : `<button class="btn btn-sm btn-secondary" disabled style="cursor:not-allowed;opacity:.5" title="Available after auditor submits the audit">
-                     <span class="material-icons" style="font-size:14px">lock</span> Awaiting Audit
-                   </button>`}
+              : `<button class="btn btn-sm btn-secondary" disabled style="cursor:not-allowed;opacity:.5" title="Available after auditor submits the audit">
+                   <span class="material-icons" style="font-size:14px">lock</span> Awaiting Audit
+                 </button>`}
           </div>
         </div>
       </div>`;
@@ -4521,15 +4553,8 @@ async function submitAuditeeActionPlans() {
     showToast(`${saved} action plan${saved!==1?'s':''} submitted → Dept Head → Auditor → MR ✅`, 'success');
     logActivity('Auditee submitted action plans','Conduct Audit', planId);
 
-    // ── Stamp the auditPlan so the card shows locked immediately ─────────────
-    if (planId) {
-      await db.collection('auditPlans').doc(planId).update({
-        actionPlanStatus       : 'Submitted',
-        actionPlanSubmittedAt  : firebase.firestore.FieldValue.serverTimestamp(),
-        actionPlanSubmittedBy  : S.user?.uid||'',
-        actionPlanSubmittedName: S.userDoc?.name||'',
-      }).catch(()=>{});
-    }
+    // ── Stamp findings collection (auditee has write access here) ───────────
+    // We do NOT write to auditPlans — auditee Firestore rules may block that.
 
     // ── Mark auditee's myActions for this plan as Completed ──────────────────
     const sourceRef = `auditPlans/${planId}`;
