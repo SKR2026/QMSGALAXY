@@ -3761,10 +3761,51 @@ async function submitAuditResponses(planId) {
   const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
   const plan = planDoc?.exists ? planDoc.data() : {};
 
+  // ── Collect checklist responses & create findings for NC / Observation items ─
+  // Read all checklist items from the modal DOM (still open at submit time)
+  const checklistItems = document.querySelectorAll('[name^="q"]');
+  const findingsBatch = [];
+  checklistItems.forEach((radio, idx) => {
+    // Each group of radios shares name="q{idx}" — find the checked one
+    if (!radio.checked) return;
+    const val = radio.value; // Conforming / Non-Conforming / Observation / N/A
+    if (val !== 'Non-Conforming' && val !== 'Observation') return;
+    const evidence = document.getElementById(`ev${idx}`)?.value?.trim() || '';
+    const questionEl = radio.closest('[style*="border"]');
+    const questionText = questionEl?.querySelector('strong')?.textContent?.trim() || `Checklist item ${idx+1}`;
+    const clauseMatch = questionEl?.querySelector('[style*="text-muted"]')?.textContent?.match(/§\s*([\d.]+)/);
+    const clause = clauseMatch ? clauseMatch[1] : '';
+    findingsBatch.push({
+      type:          val === 'Non-Conforming' ? 'Major NC' : 'OI',
+      severity:      val === 'Non-Conforming' ? 'Major' : 'OI',
+      description:   questionText,
+      evidence:      evidence,
+      clause:        clause,
+      auditId:       planId,
+      auditPlanId:   planId,
+      auditNo:       plan.auditNo    || '',
+      auditType:     plan.auditType  || '',
+      plant:         plan.plant      || '',
+      department:    plan.department || '',
+      status:        'Open',
+      published:     true,
+      findingNo:     'NC-' + Date.now().toString(36).toUpperCase() + '-' + idx,
+      raisedBy:      S.user?.uid     || '',
+      raisedByName:  S.userDoc?.name || S.user?.email || '',
+      createdAt:     firebase.firestore.FieldValue.serverTimestamp(),
+      updatedAt:     firebase.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+  // Also collect any "Observation" radio items (name="q{n}" value="Observation")
+  if (findingsBatch.length) {
+    await Promise.all(findingsBatch.map(f => db.collection('findings').add(f).catch(()=>{})));
+  }
+
   await db.collection('auditPlans').doc(planId).update({
     status:'Pending Review',
     completedAt: firebase.firestore.FieldValue.serverTimestamp(),
     completedBy: S.user?.uid||'',
+    findingsCount: findingsBatch.length,
   }).catch(()=>{});
 
   // ── Mark ONLY the Auditor's myActions as Completed (not the Auditee's) ─────
@@ -3878,8 +3919,11 @@ async function openAuditeeActionPlan(planId, auditName) {
   [snap1, snap2].forEach(snap => {
     if (snap && !snap.empty) snap.docs.forEach(d => { if (!seenFIds.has(d.id)) { seenFIds.add(d.id); allFindings.push({id:d.id,...d.data()}); } });
   });
-  // Show all findings (open + already responded) so auditee can fill/update each one
-  const findings = allFindings.filter(f => ['Open','In Progress','Pending',''].includes(f.status||'Open'));
+  // Show findings that still need action plan (open/in-progress/pending/no-status)
+  const findings = allFindings.filter(f => {
+    const st = (f.status||'Open');
+    return ['Open','In Progress','Pending'].includes(st) || !f.status;
+  });
 
   if (!findings.length) {
     // Fall back: show ALL findings for this plan regardless of status (closed/resolved ones too)
