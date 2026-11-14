@@ -708,6 +708,7 @@ select.form-input{cursor:pointer}
   <button class="lpa-tab" onclick="switchLpaTab('lpa-audits',this)">📋 Audits</button>
   <button class="lpa-tab" onclick="switchLpaTab('lpa-findings',this)">⚠️ Findings</button>
   <button class="lpa-tab" onclick="switchLpaTab('lpa-actions',this)">🔧 Actions</button>
+  <button class="lpa-tab" onclick="switchLpaTab('lpa-questions',this)">❓ Checklist Questions</button>
   <button class="lpa-tab" onclick="switchLpaTab('lpa-reports',this)">📄 Reports</button>
 </div>
 
@@ -790,6 +791,56 @@ select.form-input{cursor:pointer}
     </select>
   </div>
   <table><thead><tr><th style="width:40px;text-align:center">S.No</th><th>Finding</th><th>Process/Station</th><th>Plant</th><th>Corrective Action</th><th>Owner</th><th>Due Date</th><th>Priority</th><th>Status</th><th>Actions</th></tr></thead><tbody id="lpaActionsTbl"><tr><td colspan="10" class="loading-row"><div class="spinner"></div></td></tr></tbody></table>
+</div>
+
+<!-- LPA Checklist Questions Tab -->
+<div id="lpa-questions" class="lpa-sub-panel">
+  <div class="toolbar">
+    <div class="search-bar"><span class="material-icons">search</span>
+      <input type="text" id="lpaQSearch" placeholder="Search questions..." oninput="renderLPAQuestionsTable()">
+    </div>
+    <select class="filter-select" id="lpaQLayerFilter" onchange="renderLPAQuestionsTable()">
+      <option value="">All Layers</option>
+      <option>Layer 1 - Operator</option>
+      <option>Layer 2 - Supervisor</option>
+      <option>Layer 3 - Manager</option>
+      <option>Layer 4 - Plant Head</option>
+    </select>
+    <select class="filter-select" id="lpaQDeptFilter" onchange="renderLPAQuestionsTable()">
+      <option value="">All Departments</option>
+    </select>
+    <button class="btn btn-secondary" onclick="downloadLPAQuestionTemplate()">
+      <span class="material-icons" style="font-size:14px">download</span> Template
+    </button>
+    <label class="btn btn-secondary" style="cursor:pointer;margin:0" title="Bulk upload LPA checklist questions">
+      <span class="material-icons" style="font-size:14px;vertical-align:middle">upload_file</span> Bulk Upload
+      <input type="file" accept=".xlsx,.xls,.csv" style="display:none" onchange="bulkUploadLPAQuestions(this)">
+    </label>
+    <button class="btn btn-primary" onclick="showAddLPAQuestionModal()">
+      <span class="material-icons">add</span> Add Question
+    </button>
+  </div>
+  <div style="font-size:12px;color:var(--text-muted);padding:4px 0 8px">
+    These questions appear in the LPA checklist during audit conduct. Use <strong>Template → Bulk Upload</strong> to add many questions at once.
+  </div>
+  <table>
+    <thead><tr>
+      <th style="width:40px;text-align:center">S.No</th>
+      <th>LPA Layer</th>
+      <th>Department</th>
+      <th>Process / Area</th>
+      <th style="min-width:280px">Question</th>
+      <th>Expected Answer</th>
+      <th>Criticality</th>
+      <th style="width:40px;text-align:center">Wt</th>
+      <th>Status</th>
+      <th style="width:70px">Actions</th>
+    </tr></thead>
+    <tbody id="lpaQuestionsTbl">
+      <tr><td colspan="10" class="loading-row"><div class="spinner"></div></td></tr>
+    </tbody>
+  </table>
+  <div class="table-footer"><span id="lpaQCount" style="font-size:12px;color:var(--text-muted)"></span></div>
 </div>
 
 <!-- LPA Reports Tab -->
@@ -5991,6 +6042,7 @@ function switchLpaTab(id, btn) {
   if (id === 'lpa-audits') renderLPAAuditsTable();
   if (id === 'lpa-findings') renderLPAFindingsTable();
   if (id === 'lpa-actions') renderLPAActionsTable();
+  if (id === 'lpa-questions') { _lpaQCache = []; renderLPAQuestionsTable(); }
 }
 
 // Cache for LPA data
@@ -9996,27 +10048,101 @@ const LPA_TEMPLATE_COLS = [
 function downloadLPATemplate() {
   const wb = XLSX.utils.book_new();
   const header = [LPA_TEMPLATE_COLS];
-  const samples = [
-    ['Plant A','Quality','Assembly Line 1','Layer 1 - Operator','Station 3','IATF','John Smith','Ravi Kumar','2026-11-20','Morning','Daily'],
-    ['Plant B','Production','Welding','Layer 2 - Supervisor','Bay 2','EHS','Priya Nair','','2026-11-21','Afternoon','Weekly'],
+  // 20 empty data rows so user can type directly
+  const emptyRows = Array.from({length:20}, () => Array(LPA_TEMPLATE_COLS.length).fill(''));
+  const ws = XLSX.utils.aoa_to_sheet([...header, ...emptyRows]);
+
+  // Column widths — wider for LPA Layer and Planned Date
+  ws['!cols'] = [
+    {wch:14}, // Plant
+    {wch:16}, // Department
+    {wch:18}, // Process
+    {wch:26}, // LPA Layer  ← wider so full text shows
+    {wch:20}, // Area/Sub-process
+    {wch:14}, // Audit Type
+    {wch:16}, // Auditor
+    {wch:16}, // Auditee
+    {wch:26}, // Planned Date
+    {wch:12}, // Shift
+    {wch:12}, // Frequency
   ];
-  const ws = XLSX.utils.aoa_to_sheet([...header, ...samples]);
-  ws['!cols'] = LPA_TEMPLATE_COLS.map(c => ({ wch: Math.max(c.length+2, 16) }));
+
+  // Data validation dropdowns (rows 2–21, i.e. index 1–20)
+  ws['!dataValidation'] = ws['!dataValidation'] || [];
+
+  // LPA Layer dropdown — column D (index 3)
+  for (let r = 1; r <= 20; r++) {
+    ws['!dataValidation'].push({
+      sqref: XLSX.utils.encode_cell({r, c:3}),
+      type: 'list',
+      formula1: '"Layer 1 - Operator,Layer 2 - Supervisor,Layer 3 - Manager,Layer 4 - Plant Head"',
+      showDropDown: false,
+      showErrorMessage: true,
+      error: 'Please select a valid LPA Layer from the dropdown.',
+      errorTitle: 'Invalid LPA Layer',
+    });
+  }
+  // Audit Type dropdown — column F (index 5)
+  for (let r = 1; r <= 20; r++) {
+    ws['!dataValidation'].push({
+      sqref: XLSX.utils.encode_cell({r, c:5}),
+      type: 'list',
+      formula1: '"LPA,IATF,EHS,5S,Process,Product"',
+      showDropDown: false,
+    });
+  }
+  // Shift dropdown — column J (index 9)
+  for (let r = 1; r <= 20; r++) {
+    ws['!dataValidation'].push({
+      sqref: XLSX.utils.encode_cell({r, c:9}),
+      type: 'list',
+      formula1: '"Morning,Afternoon,Night,General"',
+      showDropDown: false,
+    });
+  }
+  // Frequency dropdown — column K (index 10)
+  for (let r = 1; r <= 20; r++) {
+    ws['!dataValidation'].push({
+      sqref: XLSX.utils.encode_cell({r, c:10}),
+      type: 'list',
+      formula1: '"Daily,Weekly,Monthly,Quarterly"',
+      showDropDown: false,
+    });
+  }
+
   XLSX.utils.book_append_sheet(wb, ws, 'LPA Audits');
+
+  // Instructions sheet
   const instr = XLSX.utils.aoa_to_sheet([
-    ['LPA Bulk Upload — Instructions'],[''],
-    ['1. Fill in the "LPA Audits" sheet. Do NOT rename columns.'],
-    ['2. Columns marked * are required.'],
-    ['3. LPA Layer: Layer 1 - Operator / Layer 2 - Supervisor / Layer 3 - Manager'],
-    ['4. Planned Date format: YYYY-MM-DD (e.g. 2026-11-20)'],
-    ['5. Frequency: Daily / Weekly / Monthly'],
-    ['6. Shift: Morning / Afternoon / Night (optional)'],
-    ['7. Delete the sample rows before uploading.'],
+    ['LPA Bulk Upload — Instructions'],
+    [''],
+    ['Column','Allowed Values / Format','Required?'],
+    ['Plant*','Your plant name (e.g. YNR, Plant A)','Yes'],
+    ['Department*','Department name (e.g. MLD, Quality, Production)','Yes'],
+    ['Process*','Process name (e.g. Moulding, Assembly)','Yes'],
+    ['LPA Layer*','Layer 1 - Operator  |  Layer 2 - Supervisor  |  Layer 3 - Manager  |  Layer 4 - Plant Head','Yes'],
+    ['Area / Sub-process','Specific area or sub-process (optional)','No'],
+    ['Audit Type*','LPA | IATF | EHS | 5S | Process | Product','Yes'],
+    ['Auditor*','Name of the auditor','Yes'],
+    ['Auditee','Name of the auditee (optional)','No'],
+    ['Planned Date*','YYYY-MM-DD format, e.g. 2026-11-20','Yes'],
+    ['Shift','Morning | Afternoon | Night | General','No'],
+    ['Frequency','Daily | Weekly | Monthly | Quarterly','No'],
+    [''],
+    ['Tips:'],
+    ['• The LPA Layer column has a dropdown — click the cell to see choices.'],
+    ['• Delete rows you do not need before uploading.'],
+    ['• Do NOT rename or delete any column headers.'],
   ]);
-  instr['!cols'] = [{wch:40},{wch:60}];
+  instr['!cols'] = [{wch:24},{wch:62},{wch:10}];
+  // Bold the header rows
+  ['A1','A3','B3','C3'].forEach(ref => {
+    if (instr[ref]) instr[ref].s = { font:{ bold:true } };
+  });
   XLSX.utils.book_append_sheet(wb, instr, 'Instructions');
+
   XLSX.writeFile(wb, 'LPA_Bulk_Upload_Template.xlsx');
-  showToast('LPA template downloaded — fill and upload','success');
+  showToast('LPA template downloaded — select LPA Layer from dropdown in column D','success');
 }
 
 async function bulkUploadLPA(input) {
@@ -10238,6 +10364,348 @@ async function bulkUploadSupplier(input) {
       Upload All ${rows.length} Rows
     </button>
   </div>`);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// LPA CHECKLIST QUESTIONS
+// ════════════════════════════════════════════════════════════════════════════
+let _lpaQCache = [];
+
+async function renderLPAQuestionsTable() {
+  const el = document.getElementById('lpaQuestionsTbl');
+  const countEl = document.getElementById('lpaQCount');
+  if (!el) return;
+
+  // Load from Firestore if cache empty
+  if (!_lpaQCache.length) {
+    el.innerHTML = `<tr><td colspan="10" class="loading-row"><div class="spinner"></div></td></tr>`;
+    const snap = await db.collection('auditChecklists')
+      .where('auditType','==','LPA').limit(500).get().catch(async () =>
+        db.collection('auditChecklists').limit(500).get().catch(()=>null)
+      );
+    if (!snap) { el.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:20px;color:var(--text-muted)">Could not load questions</td></tr>`; return; }
+    _lpaQCache = snap.docs
+      .map(d=>({id:d.id,...d.data()}))
+      .filter(d => !d.auditType || d.auditType === 'LPA');
+
+    // Populate dept filter
+    const depts = [...new Set(_lpaQCache.map(q=>q.department||'').filter(Boolean))].sort();
+    const deptSel = document.getElementById('lpaQDeptFilter');
+    if (deptSel) {
+      const cur = deptSel.value;
+      deptSel.innerHTML = `<option value="">All Departments</option>` + depts.map(d=>`<option${cur===d?' selected':''}>${d}</option>`).join('');
+    }
+  }
+
+  const search = (document.getElementById('lpaQSearch')?.value||'').toLowerCase();
+  const layer  = document.getElementById('lpaQLayerFilter')?.value||'';
+  const dept   = document.getElementById('lpaQDeptFilter')?.value||'';
+
+  let rows = _lpaQCache.filter(q => {
+    if (layer && q.clause !== layer && q.department !== layer && q.layer !== layer && q.subClause !== layer) {
+      // layer stored differently — match via clause (re-used for layer) or a dedicated field
+      const qLayer = q.layer || q.clause || '';
+      if (layer && !qLayer.includes(layer.split(' - ')[1]||layer)) return false;
+    }
+    if (dept && q.department !== dept) return false;
+    if (search && !(
+      (q.question||'').toLowerCase().includes(search) ||
+      (q.processArea||'').toLowerCase().includes(search) ||
+      (q.department||'').toLowerCase().includes(search)
+    )) return false;
+    return true;
+  });
+
+  if (countEl) countEl.textContent = `${rows.length} question${rows.length!==1?'s':''}`;
+  const critColor = {Critical:'#ef4444', Major:'#f59e0b', Minor:'#3b82f6'};
+  el.innerHTML = rows.length === 0
+    ? `<tr><td colspan="10" style="text-align:center;padding:30px;color:var(--text-muted)">
+        No LPA questions found.<br>
+        <span style="font-size:12px">Use <strong>Template → Bulk Upload</strong> or <strong>Add Question</strong> to get started.</span>
+       </td></tr>`
+    : rows.map((q,i) => `<tr>
+        <td style="text-align:center;color:#475569;font-weight:700">${i+1}</td>
+        <td><span class="badge badge-blue" style="font-size:11px">${q.layer||q.clause||'—'}</span></td>
+        <td>${q.department||'—'}</td>
+        <td style="font-size:12px">${q.processArea||'—'}</td>
+        <td style="font-size:13px;line-height:1.4">${q.question||'—'}</td>
+        <td style="font-size:12px;color:var(--text-muted)">${q.requirement||'—'}</td>
+        <td><span style="font-size:11px;font-weight:600;color:${critColor[q.criticality]||'#64748b'}">${q.criticality||'—'}</span></td>
+        <td style="text-align:center">${q.weightage||'—'}</td>
+        <td><span class="badge ${q.active===false?'badge-grey':'badge-green'}">${q.active===false?'Inactive':'Active'}</span></td>
+        <td>
+          <button class="btn btn-sm btn-secondary" onclick="toggleLPAQuestion('${q.id}',${q.active===false})" title="${q.active===false?'Activate':'Deactivate'}">
+            <span class="material-icons" style="font-size:13px">${q.active===false?'toggle_off':'toggle_on'}</span>
+          </button>
+          <button class="btn btn-sm" style="background:#fef2f2;color:#ef4444;border:1px solid #fecaca" onclick="deleteLPAQuestion('${q.id}')" title="Delete">
+            <span class="material-icons" style="font-size:13px">delete</span>
+          </button>
+        </td>
+      </tr>`).join('');
+}
+
+async function toggleLPAQuestion(id, currentlyInactive) {
+  await db.collection('auditChecklists').doc(id).update({ active: currentlyInactive, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{});
+  _lpaQCache = [];
+  renderLPAQuestionsTable();
+}
+
+async function deleteLPAQuestion(id) {
+  if (!confirm('Delete this LPA checklist question? This cannot be undone.')) return;
+  await db.collection('auditChecklists').doc(id).delete().catch(e => showToast('Delete failed: '+e.message,'error'));
+  _lpaQCache = [];
+  renderLPAQuestionsTable();
+  showToast('Question deleted','success');
+}
+
+function showAddLPAQuestionModal() {
+  showModal(`<div class="modal-title">
+    <span class="material-icons" style="color:#0d9488">playlist_add</span>
+    <span style="margin-left:6px">Add LPA Checklist Question</span>
+    <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
+  </div>
+  <div class="form-row">
+    <div class="form-group"><label class="form-label">LPA Layer *</label>
+      <select class="form-input" id="lpaQLayer">
+        <option>Layer 1 - Operator</option>
+        <option>Layer 2 - Supervisor</option>
+        <option>Layer 3 - Manager</option>
+        <option>Layer 4 - Plant Head</option>
+      </select>
+    </div>
+    <div class="form-group"><label class="form-label">Department *</label>
+      <input class="form-input" id="lpaQDept" placeholder="e.g. Production, Quality">
+    </div>
+  </div>
+  <div class="form-row">
+    <div class="form-group"><label class="form-label">Process / Area</label>
+      <input class="form-input" id="lpaQProc" placeholder="e.g. Moulding, Final Assembly">
+    </div>
+    <div class="form-group"><label class="form-label">Criticality *</label>
+      <select class="form-input" id="lpaQCrit">
+        <option>Critical</option><option>Major</option><option selected>Minor</option>
+      </select>
+    </div>
+  </div>
+  <div class="form-group"><label class="form-label">Audit Question *</label>
+    <textarea class="form-input" id="lpaQQuestion" rows="3" placeholder="e.g. Is the operator following the standard work procedure?"></textarea>
+  </div>
+  <div class="form-group"><label class="form-label">Expected Answer / Requirement</label>
+    <input class="form-input" id="lpaQReq" placeholder="e.g. Operator should follow SOP-MLD-01 at all times">
+  </div>
+  <div class="form-row">
+    <div class="form-group"><label class="form-label">Weightage (1–5)</label>
+      <select class="form-input" id="lpaQWt">
+        <option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option>
+      </select>
+    </div>
+    <div class="form-group"><label class="form-label">Plant</label>
+      <select class="form-input" id="lpaQPlant">
+        <option value="All Plants">All Plants</option>
+        ${(S.plants||[]).filter(p=>p!=='All Plants').map(p=>`<option>${p}</option>`).join('')}
+      </select>
+    </div>
+  </div>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+    <button class="btn btn-primary" onclick="_saveLPAQuestion()">
+      <span class="material-icons" style="font-size:14px;vertical-align:middle">save</span> Save Question
+    </button>
+  </div>`);
+}
+
+async function _saveLPAQuestion() {
+  const layer = document.getElementById('lpaQLayer')?.value?.trim();
+  const dept  = document.getElementById('lpaQDept')?.value?.trim();
+  const q     = document.getElementById('lpaQQuestion')?.value?.trim();
+  if (!layer || !dept || !q) { showToast('Layer, Department and Question are required','warning'); return; }
+  await db.collection('auditChecklists').add({
+    auditType: 'LPA',
+    layer,
+    clause: layer,                  // also stored in clause for compatibility
+    department: dept,
+    processArea: document.getElementById('lpaQProc')?.value?.trim()||'',
+    question: q,
+    requirement: document.getElementById('lpaQReq')?.value?.trim()||'',
+    criticality: document.getElementById('lpaQCrit')?.value||'Minor',
+    weightage: parseInt(document.getElementById('lpaQWt')?.value)||3,
+    plant: document.getElementById('lpaQPlant')?.value||'All Plants',
+    frequency: 'Daily',
+    active: true,
+    version: 'v1',
+    createdBy: S.user?.uid||'',
+    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+  }).catch(e => { showToast('Save failed: '+e.message,'error'); return null; });
+  closeModal();
+  _lpaQCache = [];
+  renderLPAQuestionsTable();
+  showToast('LPA checklist question saved','success');
+}
+
+// LPA Questions — template download
+function downloadLPAQuestionTemplate() {
+  const wb = XLSX.utils.book_new();
+  const cols = ['LPA Layer*','Department*','Process / Area','Question*','Expected Answer / Requirement','Criticality*','Weightage (1-5)','Plant','Active (Yes/No)'];
+  const header = [cols];
+  const emptyRows = Array.from({length:30}, () => Array(cols.length).fill(''));
+  const ws = XLSX.utils.aoa_to_sheet([...header, ...emptyRows]);
+  ws['!cols'] = [
+    {wch:26},{wch:18},{wch:20},{wch:60},{wch:50},{wch:12},{wch:16},{wch:16},{wch:14}
+  ];
+  // Dropdowns
+  ws['!dataValidation'] = [];
+  for (let r = 1; r <= 30; r++) {
+    ws['!dataValidation'].push({ sqref: XLSX.utils.encode_cell({r,c:0}), type:'list',
+      formula1:'"Layer 1 - Operator,Layer 2 - Supervisor,Layer 3 - Manager,Layer 4 - Plant Head"', showDropDown:false });
+    ws['!dataValidation'].push({ sqref: XLSX.utils.encode_cell({r,c:5}), type:'list',
+      formula1:'"Critical,Major,Minor"', showDropDown:false });
+    ws['!dataValidation'].push({ sqref: XLSX.utils.encode_cell({r,c:6}), type:'list',
+      formula1:'"1,2,3,4,5"', showDropDown:false });
+    ws['!dataValidation'].push({ sqref: XLSX.utils.encode_cell({r,c:8}), type:'list',
+      formula1:'"Yes,No"', showDropDown:false });
+  }
+  XLSX.utils.book_append_sheet(wb, ws, 'LPA Questions');
+  const instr = XLSX.utils.aoa_to_sheet([
+    ['LPA Checklist Questions — Bulk Upload Instructions'],[''],
+    ['Column','Allowed Values / Notes','Required?'],
+    ['LPA Layer*','Layer 1 - Operator | Layer 2 - Supervisor | Layer 3 - Manager | Layer 4 - Plant Head','Yes'],
+    ['Department*','e.g. Production, Quality, Maintenance, EHS','Yes'],
+    ['Process / Area','Specific process or area (e.g. Moulding, Final Inspection)','No'],
+    ['Question*','The audit question text — be specific and actionable','Yes'],
+    ['Expected Answer / Requirement','What correct conformance looks like','No'],
+    ['Criticality*','Critical | Major | Minor','Yes'],
+    ['Weightage (1-5)','1 = Low, 5 = High. Used for scoring.','Yes (default 3)'],
+    ['Plant','Specific plant name or "All Plants"','No (default All Plants)'],
+    ['Active (Yes/No)','Yes = question is active during audits','No (default Yes)'],
+    [''],
+    ['Tip: These questions will appear in the LPA checklist when auditors conduct the audit.'],
+    ['     Layer 1 questions are shown to Operators, Layer 2 to Supervisors, etc.'],
+  ]);
+  instr['!cols'] = [{wch:24},{wch:62},{wch:12}];
+  XLSX.utils.book_append_sheet(wb, instr, 'Instructions');
+  XLSX.writeFile(wb, 'LPA_Checklist_Questions_Template.xlsx');
+  showToast('LPA Questions template downloaded','success');
+}
+
+// LPA Questions — bulk upload
+async function bulkUploadLPAQuestions(input) {
+  const file = input.files[0]; if (!file) return;
+  input.value = '';
+  showToast('Reading file…','info');
+  let rows = [];
+  try {
+    const ab = await file.arrayBuffer();
+    const wb = XLSX.read(ab, { type:'array' });
+    rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval:'' });
+  } catch(e) { showToast('Could not read file: '+e.message,'error'); return; }
+  if (!rows.length) { showToast('File is empty or has no data rows','warning'); return; }
+
+  const col = (row, ...keys) => {
+    for (const k of keys) {
+      const found = Object.keys(row).find(r => r.replace(/\*/g,'').trim().toLowerCase() === k.toLowerCase());
+      if (found !== undefined && row[found] !== '') return String(row[found]).trim();
+    }
+    return '';
+  };
+
+  const preview = rows.slice(0,5).map((r,i) => {
+    const layer = col(r,'LPA Layer'), dept=col(r,'Department'), q=col(r,'Question');
+    const ok = layer && dept && q;
+    return `<tr style="background:${ok?'':'#fef2f2'}">
+      <td style="padding:4px 8px;font-size:12px">${i+1}</td>
+      <td style="padding:4px 8px;font-size:12px">${layer||'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px">${dept||'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px">${q?q.substring(0,60)+(q.length>60?'…':''):'<span style="color:#ef4444">missing</span>'}</td>
+      <td style="padding:4px 8px;font-size:12px">${col(r,'Criticality')||'—'}</td>
+      <td style="padding:4px 8px;font-size:12px;color:${ok?'#16a34a':'#ef4444'}">${ok?'✓ OK':'✗ Skip'}</td>
+    </tr>`;
+  }).join('');
+
+  window._lpaQBulkRows = rows;
+  showModal(`<div class="modal-title">
+    <span class="material-icons" style="color:#0d9488">upload_file</span>
+    <span style="margin-left:6px">Bulk Upload LPA Questions — Preview</span>
+    <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
+  </div>
+  <div style="padding:4px 0 12px">
+    <div style="font-size:13px;font-weight:600;margin-bottom:10px">${rows.length} question${rows.length!==1?'s':''} found — preview of first ${Math.min(5,rows.length)}:</div>
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">
+      <thead><tr style="background:#f1f5f9">
+        <th style="padding:5px 8px;font-size:12px;text-align:left">#</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Layer</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Dept</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Question</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Criticality</th>
+        <th style="padding:5px 8px;font-size:12px;text-align:left">Status</th>
+      </tr></thead>
+      <tbody>${preview}</tbody>
+    </table></div>
+    ${rows.length>5?`<div style="font-size:11px;color:#94a3b8;margin-top:6px">…and ${rows.length-5} more</div>`:''}
+  </div>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
+    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+    <button class="btn btn-primary" id="confirmLPAQBtn" onclick="_doLPAQUpload()">
+      <span class="material-icons" style="font-size:14px;vertical-align:middle">cloud_upload</span>
+      Upload All ${rows.length} Questions
+    </button>
+  </div>`);
+}
+
+async function _doLPAQUpload() {
+  const rows = window._lpaQBulkRows || [];
+  if (!rows.length) return;
+  const btn = document.getElementById('confirmLPAQBtn');
+  if (btn) { btn.disabled=true; btn.innerHTML='<span class="material-icons" style="font-size:14px;vertical-align:middle">hourglass_top</span> Uploading…'; }
+
+  const col = (row, ...keys) => {
+    for (const k of keys) {
+      const found = Object.keys(row).find(r => r.replace(/\*/g,'').trim().toLowerCase() === k.toLowerCase());
+      if (found !== undefined && row[found] !== '') return String(row[found]).trim();
+    }
+    return '';
+  };
+
+  let saved = 0, skipped = 0;
+  const batch = db.batch(); let bCount = 0;
+
+  for (const row of rows) {
+    const layer = col(row,'LPA Layer');
+    const dept  = col(row,'Department');
+    const q     = col(row,'Question');
+    if (!layer || !dept || !q) { skipped++; continue; }
+
+    const activeVal = col(row,'Active (Yes/No)','Active');
+    const data = {
+      auditType: 'LPA',
+      layer, clause: layer,
+      department: dept,
+      processArea: col(row,'Process / Area','Process','Area')||'',
+      question: q,
+      requirement: col(row,'Expected Answer / Requirement','Expected Answer','Requirement')||'',
+      criticality: col(row,'Criticality')||'Minor',
+      weightage: parseInt(col(row,'Weightage (1-5)','Weightage'))||3,
+      plant: col(row,'Plant')||'All Plants',
+      frequency: 'Daily',
+      active: activeVal.toLowerCase() !== 'no',
+      version: 'v1',
+      createdBy: S.user?.uid||'',
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    };
+    batch.set(db.collection('auditChecklists').doc(), data);
+    saved++; bCount++;
+    if (bCount >= 490) break;
+  }
+
+  try {
+    await batch.commit();
+    closeModal();
+    _lpaQCache = [];
+    renderLPAQuestionsTable();
+    showToast(`✅ ${saved} LPA question${saved!==1?'s':''} uploaded${skipped?` · ${skipped} skipped`:''}`, 'success');
+  } catch(e) {
+    showToast('Upload failed: '+e.message,'error');
+    if (btn) { btn.disabled=false; btn.innerHTML='Upload'; }
+  }
 }
 
 async function _doSupplierUpload() {
