@@ -2633,6 +2633,28 @@ async function openAuditChecklistFromAction(planId, auditName, auditType) {
       const pd = planDoc.data();
       resolvedName = pd.name || auditName;
       resolvedType = pd.auditType || auditType;
+      // Guard: if audit already submitted, show info instead of reopening checklist
+      if (['Pending Review','Completed'].includes(pd.status)) {
+        showModal(`
+          <div class="modal-title" style="font-family:'Inter',sans-serif">
+            <span class="material-icons" style="color:#16a34a">lock</span>
+            <span>Audit Already Submitted</span>
+            <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
+          </div>
+          <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:18px;margin-bottom:16px;font-family:'Inter',sans-serif">
+            <div style="font-size:14px;font-weight:700;color:#166534;margin-bottom:6px">✅ ${resolvedName}</div>
+            <div style="font-size:13px;color:#15803d;margin-bottom:4px">Status: <strong>${pd.status}</strong></div>
+            <div style="font-size:12px;color:#166534">The audit checklist has already been submitted. No further changes can be made.</div>
+          </div>
+          <div style="font-size:13px;color:var(--text-secondary);font-family:'Inter',sans-serif;margin-bottom:16px">
+            To review findings and non-conformities raised during this audit, navigate to the <strong>Non-Conformities</strong> or <strong>Findings</strong> module.
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+            <button class="btn btn-primary" onclick="closeModal();navigate('nc')">View NCs</button>
+          </div>`);
+        return;
+      }
     }
   }
   // Open the checklist modal directly
@@ -4934,23 +4956,104 @@ async function ncReturn(ncId, returnToStage){
 
 // ─── RCA ──────────────────────────────────────────────────────────────────────
 async function renderRCA() {
-  document.getElementById('rcaList').innerHTML = `<div class="loading-row"><div class="spinner"></div></div>`;
-  const snap = await db.collection('rootCauseAnalyses').limit(50).get().catch(()=>null);
-  if (snap) snap.docs.sort((a,b)=>(b.data().createdAt?.toMillis?.()??0)-(a.data().createdAt?.toMillis?.()??0));
-  if (!snap || snap.empty) { document.getElementById('rcaList').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No RCA records found. RCAs are created automatically when findings are raised.</div>'; return; }
-  document.getElementById('rcaList').innerHTML = snap.docs.map((d,i) => { const r={id:d.id,...d.data()};
+  const el = document.getElementById('rcaList');
+  el.innerHTML = `<div class="loading-row"><div class="spinner"></div></div>`;
+
+  // Load findings that have rootCause filled (submitted action plans) OR are beyond Open stage
+  const snap = await db.collection('findings').limit(100).get().catch(()=>null);
+  if (!snap || snap.empty) {
+    el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No RCA records found. RCAs appear here after auditees submit action plans.</div>';
+    return;
+  }
+
+  // Filter: only NCs/OI that have actionPlan with rootCause OR workflowStage beyond Open
+  const docs = snap.docs
+    .map(d=>({id:d.id,...d.data()}))
+    .filter(r => {
+      const hasRootCause = r.actionPlan?.rootCause || r.rootCause;
+      const isNC = ['Major NC','Minor NC','OI'].includes(r.type) || ['Major','Minor','OI'].includes(r.severity);
+      const submitted = r.workflowStage && r.workflowStage !== 'Open';
+      return isNC && (hasRootCause || submitted);
+    })
+    .sort((a,b)=>(b.createdAt?.toMillis?.()??0)-(a.createdAt?.toMillis?.()??0));
+
+  if (!docs.length) {
+    el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No RCA records found. RCAs appear here after auditees submit action plans.</div>';
+    return;
+  }
+
+  const wsColor = {'Open':'#94a3b8','Auditee Action':'#3b82f6','Dept Head Review':'#f59e0b','Auditor Review':'#8b5cf6','MR Review':'#ec4899','Closed':'#22c55e'};
+
+  el.innerHTML = docs.map((r,i) => {
+    const ap = r.actionPlan || {};
+    const rootCause = ap.rootCause || r.rootCause || '';
+    const correction = ap.correction || r.correction || '';
+    const correctiveAction = ap.correctiveAction || r.correctiveAction || '';
+    const targetDate = ap.targetDate || r.targetDate || '';
+    const responsible = ap.responsible || r.responsible || '';
+    const wsCol = wsColor[r.workflowStage] || '#94a3b8';
+
     return `<div class="card" style="margin-bottom:16px">
-      <div class="card-title">${r.findingNo||r.id}: ${r.description||''}</div>
-      <div style="display:flex;gap:8px;margin-bottom:12px">
-        <div class="rca-tab active" onclick="switchRcaTab(this,'why${i}')">5-Why</div>
-        <div class="rca-tab" onclick="switchRcaTab(this,'fm${i}')">4M Analysis</div>
+      <!-- Header -->
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:12px;gap:12px">
+        <div>
+          <div class="card-title" style="margin-bottom:4px">${r.findingNo||r.id}: ${r.description||'(No description)'}</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            ${ncTypeBadge(r.type||r.severity)}
+            <span class="badge" style="background:${wsCol}20;color:${wsCol};border:1px solid ${wsCol}40;font-size:11px">${r.workflowStage||'Open'}</span>
+            ${r.auditeeName?`<span style="font-size:11px;color:var(--text-muted)">Auditee: <b>${r.auditeeName}</b></span>`:''}
+            ${r.plant?`<span style="font-size:11px;color:var(--text-muted)">Plant: <b>${r.plant}</b></span>`:''}
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);white-space:nowrap">${formatDate(r.createdAt)}</div>
       </div>
-      <div id="why${i}">
-        ${[1,2,3,4,5].map(n=>`<div class="form-group"><label class="form-label">Why ${n}</label><input class="form-input" value="${r['why'+n]||''}"></div>`).join('')}
-        <div class="form-group"><label class="form-label">Root Cause</label><input class="form-input" value="${r.rootCause||''}"></div>
+
+      <!-- RCA Tabs -->
+      <div style="display:flex;gap:8px;margin-bottom:14px">
+        <div class="rca-tab active" onclick="switchRcaTab(this,'rca_why_${i}')">5-Why Analysis</div>
+        <div class="rca-tab" onclick="switchRcaTab(this,'rca_fm_${i}')">4M Analysis</div>
+        <div class="rca-tab" onclick="switchRcaTab(this,'rca_ap_${i}')">Action Plan</div>
       </div>
-      <div id="fm${i}" style="display:none"><div class="form-row"><div class="form-group"><label class="form-label">Man</label><textarea class="form-input" rows="2">${r.man||''}</textarea></div><div class="form-group"><label class="form-label">Machine</label><textarea class="form-input" rows="2">${r.machine||''}</textarea></div></div><div class="form-row"><div class="form-group"><label class="form-label">Method</label><textarea class="form-input" rows="2">${r.method||''}</textarea></div><div class="form-group"><label class="form-label">Material</label><textarea class="form-input" rows="2">${r.material||''}</textarea></div></div></div>
-      <button class="btn btn-primary btn-sm" onclick="saveRCA('${d.id}',${i})">Save RCA</button>
+
+      <!-- 5-Why Tab -->
+      <div id="rca_why_${i}">
+        <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Root Cause — 5-Why Investigation</div>
+        <div style="background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:12px">
+          <div class="form-group"><label class="form-label" style="font-family:'Inter',sans-serif">Problem Statement</label>
+            <textarea class="form-input" id="rca_prob_${i}" rows="2" style="font-family:'Inter',sans-serif;font-size:13px" placeholder="Describe the problem...">${r.description||''}</textarea></div>
+          ${[1,2,3,4,5].map(n=>`
+          <div class="form-group"><label class="form-label" style="font-family:'Inter',sans-serif">Why ${n}</label>
+            <input class="form-input" id="rca_w${n}_${i}" style="font-family:'Inter',sans-serif;font-size:13px" placeholder="Why did this happen?" value="${r['rcaWhy'+n]||''}"></div>`).join('')}
+          <div class="form-group"><label class="form-label" style="color:#dc2626;font-family:'Inter',sans-serif">Root Cause (from 5-Why)</label>
+            <textarea class="form-input" id="rca_rc_${i}" rows="2" style="font-family:'Inter',sans-serif;font-size:13px;border-color:#fca5a5" placeholder="Identified root cause...">${r.rcaRootCause || rootCause}</textarea></div>
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="saveRCAData('${r.id}',${i})" style="font-family:'Inter',sans-serif">Save 5-Why</button>
+      </div>
+
+      <!-- 4M Tab -->
+      <div id="rca_fm_${i}" style="display:none">
+        <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">4M Cause Analysis</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+          ${[['Man','rca_man','👤 People / Human factors'],['Machine','rca_mch','⚙️ Equipment / Tools'],['Method','rca_mth','📋 Process / Procedure'],['Material','rca_mat','📦 Raw Material / Inputs']].map(([lbl,id,ph])=>`
+          <div style="background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:12px">
+            <label class="form-label" style="font-family:'Inter',sans-serif">${lbl}</label>
+            <textarea class="form-input" id="${id}_${i}" rows="3" style="font-family:'Inter',sans-serif;font-size:13px" placeholder="${ph}">${r['rca4M_'+lbl.toLowerCase()]||''}</textarea>
+          </div>`).join('')}
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="saveRCA4M('${r.id}',${i})" style="font-family:'Inter',sans-serif">Save 4M</button>
+      </div>
+
+      <!-- Action Plan Tab -->
+      <div id="rca_ap_${i}" style="display:none">
+        <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Action Plan Summary</div>
+        ${rootCause||correction||correctiveAction ? `
+        <div style="display:grid;gap:10px">
+          ${rootCause?`<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:12px"><div style="font-size:11px;font-weight:700;color:#dc2626;text-transform:uppercase;margin-bottom:4px">Root Cause</div><div style="font-size:13px;color:#1e293b;font-family:'Inter',sans-serif">${rootCause}</div></div>`:''}
+          ${correction?`<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px"><div style="font-size:11px;font-weight:700;color:#92400e;text-transform:uppercase;margin-bottom:4px">Immediate Correction</div><div style="font-size:13px;color:#1e293b;font-family:'Inter',sans-serif">${correction}</div></div>`:''}
+          ${correctiveAction?`<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px"><div style="font-size:11px;font-weight:700;color:#166534;text-transform:uppercase;margin-bottom:4px">Corrective Action</div><div style="font-size:13px;color:#1e293b;font-family:'Inter',sans-serif">${correctiveAction}</div></div>`:''}
+          ${(targetDate||responsible)?`<div style="display:flex;gap:16px;font-size:12px;color:var(--text-muted);padding-top:4px">${targetDate?`<span>📅 Target: <b>${targetDate}</b></span>`:''}${responsible?`<span>👤 Responsible: <b>${responsible}</b></span>`:''}</div>`:''}
+        </div>` : `<div style="text-align:center;padding:24px;color:var(--text-muted);font-family:'Inter',sans-serif;font-size:13px">Action plan not yet submitted by auditee.</div>`}
+      </div>
     </div>`;
   }).join('');
 }
@@ -4958,16 +5061,30 @@ async function renderRCA() {
 function switchRcaTab(el,tabId){
   const container=el.closest('.card');
   container.querySelectorAll('.rca-tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');
-  container.querySelectorAll('[id^="why"],[id^="fm"]').forEach(x=>x.style.display='none');
+  container.querySelectorAll('[id^="rca_why_"],[id^="rca_fm_"],[id^="rca_ap_"],[id^="why"],[id^="fm"]').forEach(x=>x.style.display='none');
   const t=document.getElementById(tabId);if(t)t.style.display='block';
 }
 
+async function saveRCAData(id, i) {
+  const data = { rcaUpdatedAt: firebase.firestore.FieldValue.serverTimestamp() };
+  for(let n=1;n<=5;n++){const el=document.getElementById(`rca_w${n}_${i}`);if(el)data[`rcaWhy${n}`]=el.value;}
+  const rcEl=document.getElementById(`rca_rc_${i}`);if(rcEl)data.rcaRootCause=rcEl.value;
+  await db.collection('findings').doc(id).update(data).catch(()=>{});
+  showToast('5-Why RCA saved ✓','success');
+}
+
+async function saveRCA4M(id, i) {
+  const data = { rcaUpdatedAt: firebase.firestore.FieldValue.serverTimestamp() };
+  ['Man','Machine','Method','Material'].forEach(lbl=>{
+    const el=document.getElementById(`rca_${lbl.substring(0,3).toLowerCase()}_${i}`);
+    if(el) data[`rca4M_${lbl.toLowerCase()}`]=el.value;
+  });
+  await db.collection('findings').doc(id).update(data).catch(()=>{});
+  showToast('4M Analysis saved ✓','success');
+}
+
 async function saveRCA(id, i) {
-  const data={};
-  for(let n=1;n<=5;n++){const el=document.querySelector(`#why${i} .form-group:nth-child(${n}) input`);if(el)data['why'+n]=el.value;}
-  const rcEl=document.querySelector(`#why${i} .form-group:last-child input`);if(rcEl)data.rootCause=rcEl.value;
-  await db.collection('rootCauseAnalyses').doc(id).update({...data,updatedAt:firebase.firestore.FieldValue.serverTimestamp()}).catch(()=>{});
-  showToast('RCA saved!','success');
+  // legacy — no-op
 }
 
 // ─── CAPA ─────────────────────────────────────────────────────────────────────
@@ -5097,7 +5214,26 @@ function updateCAPAFinding(ncId) {
       <span>Update CAPA</span>
       <button onclick="closeModal()" style="background:none;border:none;cursor:pointer;margin-left:auto"><span class="material-icons">close</span></button>
     </div>
-    <div style="font-size:13px;font-weight:600;color:var(--text-secondary);margin-bottom:14px;font-family:'Inter',sans-serif">${nc.findingNo||ncId.slice(-6).toUpperCase()} — ${(nc.description||'').slice(0,60)}</div>
+    <!-- NC Detail Summary -->
+    <div style="background:#f8fafc;border:1px solid var(--border);border-radius:9px;padding:13px 15px;margin-bottom:16px;font-family:'Inter',sans-serif">
+      <div style="font-size:13px;font-weight:700;color:#1e293b;margin-bottom:8px">${nc.findingNo||ncId.slice(-6).toUpperCase()} — ${nc.description||'(No description)'}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:${(nc.actionPlan?.rootCause||nc.rootCause)?'10px':'0'}">
+        ${ncTypeBadge(nc.type||nc.severity)}
+        <span style="font-size:11px;color:var(--text-muted)">📍 ${nc.plant||'—'}</span>
+        ${nc.auditeeName?`<span style="font-size:11px;color:var(--text-muted)">👤 ${nc.auditeeName}</span>`:''}
+        ${nc.clause?`<span style="font-size:11px;color:var(--text-muted)">Clause: ${nc.clause}</span>`:''}
+      </div>
+      ${(nc.actionPlan?.rootCause||nc.rootCause) ? `
+      <div style="border-top:1px solid var(--border);padding-top:8px;margin-top:4px">
+        <div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Root Cause (Auditee Submitted)</div>
+        <div style="font-size:12px;color:#374151">${nc.actionPlan?.rootCause||nc.rootCause}</div>
+      </div>` : ''}
+      ${(nc.actionPlan?.correctiveAction||nc.correctiveAction) ? `
+      <div style="border-top:1px solid var(--border);padding-top:8px;margin-top:6px">
+        <div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Corrective Action</div>
+        <div style="font-size:12px;color:#374151">${nc.actionPlan?.correctiveAction||nc.correctiveAction}</div>
+      </div>` : ''}
+    </div>
     <div class="form-group">
       <label class="form-label" style="font-family:'Inter',sans-serif">NC Type / Severity</label>
       <select class="form-input" id="capaNCType" style="font-family:'Inter',sans-serif;font-size:13px">
