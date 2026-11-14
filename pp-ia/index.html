@@ -3640,18 +3640,25 @@ async function renderConduct() {
     }
 
     // ── Auditor / Admin card ───────────────────────────────────────────────
-    return `<div class="card" style="margin-bottom:12px"><div style="display:flex;align-items:center;justify-content:space-between">
+    const auditSubmittedDone = ['Pending Review','Completed'].includes(a.status);
+    const auditBadgeCls = a.status==='In Progress'?'badge-blue':a.status==='Pending Review'?'badge-amber':a.status==='Completed'?'badge-green':'badge-grey';
+    return `<div class="card" style="margin-bottom:12px"><div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
       <div>
         <strong style="font-size:14px">${a.name}</strong>
         ${a.auditNo?`<span style="font-size:10px;font-weight:700;color:#2563eb;background:#eff6ff;padding:1px 7px;border-radius:4px;margin-left:6px">${a.auditNo}</span>`:''}
         <br><span style="font-size:12px;color:var(--text-secondary)">${a.auditType||''} · ${a.plant} · ${a.department||''} · ${formatDate(a.plannedDate)}</span>
         ${a.leadAuditorName?`<br><span style="font-size:11px;color:var(--text-muted)">Auditor: ${a.leadAuditorName}${a.auditeeName?' · Auditee: '+a.auditeeName:''}</span>`:''}
+        ${auditSubmittedDone?`<span style="display:inline-block;margin-left:10px;font-size:11px;font-weight:600;color:#166534;background:#dcfce7;padding:1px 8px;border-radius:10px">✓ Audit submitted — awaiting Dept Head & MR review</span>`:''}
       </div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <span class="badge ${a.status==='In Progress'?'badge-blue':a.status==='Pending Review'?'badge-amber':'badge-grey'}">${a.status}</span>
-        <button class="btn btn-sm btn-primary" onclick="openAuditChecklist('${a.id}','${a.name.replace(/'/g,"\\'")}','${(a.auditType||'').replace(/'/g,"\\'")}')">
-          <span class="material-icons" style="font-size:14px">play_arrow</span>${a.status==='In Progress'?'Resume':'Start'} Audit
-        </button>
+      <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+        <span class="badge ${auditBadgeCls}">${a.status}</span>
+        ${auditSubmittedDone
+          ? `<button class="btn btn-sm btn-secondary" disabled style="cursor:not-allowed;opacity:.55" title="Audit already submitted — awaiting review">
+               <span class="material-icons" style="font-size:14px">lock</span> Submitted
+             </button>`
+          : `<button class="btn btn-sm btn-primary" onclick="openAuditChecklist('${a.id}','${a.name.replace(/'/g,"\\'")}','${(a.auditType||'').replace(/'/g,"\\'")}')">
+               <span class="material-icons" style="font-size:14px">play_arrow</span>${a.status==='In Progress'?'Resume':'Start'} Audit
+             </button>`}
       </div></div></div>`;
   }).join('');
 }
@@ -4182,6 +4189,51 @@ async function submitAuditeeActionPlans() {
       await batch3.commit().catch(()=>{});
     }
 
+    // ── Create myActions entries for Dept Heads to review ────────────────────
+    if (saved > 0) {
+      // Fetch plan to get dept info
+      const planSnap2 = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+      const planData2 = planSnap2?.exists ? planSnap2.data() : {};
+      const dept2 = planData2.department || S.userDoc?.department || '';
+      const plant2 = planData2.plant || S.userDoc?.plant || '';
+      const auditNo2 = planData2.auditNo || '';
+
+      // Find all Dept Head users for this department/plant
+      let deptHeadQuery = db.collection('users').where('role','==','Dept Head');
+      const deptHeadSnap = await deptHeadQuery.get().catch(()=>null);
+      if (deptHeadSnap && !deptHeadSnap.empty) {
+        const dhBatch = db.batch();
+        deptHeadSnap.docs.forEach(dhu => {
+          const dhuData = dhu.data();
+          // Match by dept or plant (or if Dept Head has 'All Plants')
+          const dhuDept = dhuData.department || '';
+          const dhuPlant = dhuData.plant || 'All Plants';
+          if (dhuDept === dept2 || dhuPlant === plant2 || dhuPlant === 'All Plants' || dept2 === '') {
+            const dhRef = db.collection('myActions').doc();
+            dhBatch.set(dhRef, {
+              userId      : dhu.id,
+              userEmail   : dhuData.email || '',
+              userName    : dhuData.name || '',
+              role        : 'Dept Head',
+              type        : 'Review Action Plan',
+              title       : `Review Action Plan — ${auditName}`,
+              description : `${saved} action plan${saved!==1?'s':''} submitted by auditee. Please review and approve.`,
+              status      : 'Pending',
+              sourceRef   : `auditPlans/${planId}`,
+              auditId     : planId,
+              auditPlanId : planId,
+              auditNo     : auditNo2,
+              department  : dept2,
+              plant       : plant2,
+              dueDate     : null,
+              createdAt   : firebase.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+        });
+        await dhBatch.commit().catch(()=>{});
+      }
+    }
+
     if(S.currentModule === 'myactions') renderMyActions();
     renderConduct();
   }
@@ -4456,6 +4508,20 @@ async function openNCDetail(ncId) {
   const nc = { id:ncId, ...snap.data() };
   const stage = nc.workflowStage||'Open';
 
+  // Fill in missing auditee/auditor info from the linked auditPlan if needed
+  if ((!nc.auditeeName || !nc.auditorName) && (nc.auditId || nc.auditPlanId)) {
+    const planRef = nc.auditId || nc.auditPlanId;
+    const planSnap = await db.collection('auditPlans').doc(planRef).get().catch(()=>null);
+    if (planSnap?.exists) {
+      const pd = planSnap.data();
+      if (!nc.auditeeName) nc.auditeeName = pd.auditeeName || pd.auditeeEmail || '';
+      if (!nc.auditorName) nc.auditorName = pd.leadAuditorName || '';
+      if (!nc.auditeeId)   nc.auditeeId   = pd.auditeeId || '';
+      if (!nc.department)  nc.department  = pd.department || '';
+      if (!nc.plant)       nc.plant       = pd.plant || '';
+    }
+  }
+
   // Title & stage badge
   document.getElementById('ncDetailTitle').textContent = (nc.findingNo||ncId.slice(-6).toUpperCase())+' – '+(nc.description||'').slice(0,60);
   const sb = document.getElementById('ncDetailStage');
@@ -4501,7 +4567,9 @@ async function openNCDetail(ncId) {
   const userPlant = S.userDoc?.plant||'All Plants';
   const isAuditor = nc.raisedBy===uid || nc.auditorId===uid || role==='Auditor'||role==='superadmin'||role==='Super Admin';
   const isAuditee = nc.auditeeId===uid || nc.assigneeId===uid || (S.role||'').toLowerCase()==='auditee';
-  const isDeptHead = (role==='Dept Head') && (nc.department===userDept||nc.plant===userPlant||userPlant==='All Plants');
+  const isDeptHead = (role==='Dept Head') && (
+    !nc.department || nc.department===userDept || nc.plant===userPlant || userPlant==='All Plants' || userDept===''
+  );
   const isMR      = role==='Admin'||role==='superadmin'||role==='Super Admin';
   // Auditors are LOCKED from editing after they submit the audit (stage no longer 'Open')
   const auditorCanEdit = isAuditor && stage === 'Open';
