@@ -2817,11 +2817,11 @@ function _highlightConductAudit(planId) {
 }
 
 async function openAuditChecklistFromAction(planId, auditName, auditType) {
-  // Fetch the audit plan to get full details
+  // Fetch the audit plan to get full details (tries lpaAudits first, then auditPlans)
   let resolvedName = auditName;
   let resolvedType = auditType;
   if (planId) {
-    const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+    const {doc: planDoc} = await _fetchPlanDoc(planId);
     if (planDoc && planDoc.exists) {
       const pd = planDoc.data();
       resolvedName = pd.name || auditName;
@@ -3952,6 +3952,16 @@ async function renderConduct() {
   }).join('');
 }
 
+// Helper: fetch a plan from lpaAudits first, then auditPlans — returns {doc, collection}
+async function _fetchPlanDoc(planId) {
+  if (!planId) return {doc:null, col:''};
+  const lpaDoc = await db.collection('lpaAudits').doc(planId).get().catch(()=>null);
+  if (lpaDoc && lpaDoc.exists) return {doc:lpaDoc, col:'lpaAudits'};
+  const apDoc  = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+  if (apDoc  && apDoc.exists)  return {doc:apDoc,  col:'auditPlans'};
+  return {doc:null, col:''};
+}
+
 async function openAuditChecklist(planId, name, auditType) {
   // Guard: Auditee must NOT access the checksheet — redirect to action plan flow
   const _role = (S.userDoc?.role||'').toLowerCase().trim();
@@ -3977,10 +3987,10 @@ async function openAuditChecklist(planId, name, auditType) {
   showModal(`<div class="modal-title"><span>${name}</span><button onclick="closeModal();S._activeAuditPlanId='';" style="background:none;border:none;cursor:pointer"><span class="material-icons">close</span></button></div>
     <div style="text-align:center;padding:30px"><div class="spinner" style="width:28px;height:28px;margin:0 auto 10px"></div><div style="font-size:13px;color:var(--text-muted)">Loading checklist…</div></div>`, true);
 
-  // Fetch audit plan details if planId given
+  // Fetch audit plan details if planId given (tries lpaAudits first, then auditPlans)
   let planData = null;
   if (planId) {
-    const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+    const {doc: planDoc} = await _fetchPlanDoc(planId);
     if (planDoc && planDoc.exists) planData = planDoc.data();
   }
   const resolvedType = auditType || planData?.auditType || '';
@@ -4123,8 +4133,8 @@ function onChecklistRadio(idx, val) {
 }
 
 async function submitAuditResponses(planId) {
-  // Fetch the plan so we can notify the auditee
-  const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+  // Fetch the plan — tries lpaAudits first, then auditPlans
+  const {doc: planDoc, col: planCol} = await _fetchPlanDoc(planId);
   const plan = planDoc?.exists ? planDoc.data() : {};
 
   // ── Collect checklist responses & create findings for NC / Observation items ─
@@ -4186,7 +4196,9 @@ async function submitAuditResponses(planId) {
     await Promise.all(findingsBatch.map(f => db.collection('findings').add(f).catch(()=>{})));
   }
 
-  await db.collection('auditPlans').doc(planId).update({
+  // Update plan status — use the actual collection where the plan lives
+  const planColResolved = planCol || 'auditPlans';
+  await db.collection(planColResolved).doc(planId).update({
     status:'Pending Review',
     completedAt: firebase.firestore.FieldValue.serverTimestamp(),
     completedBy: S.user?.uid||'',
@@ -4194,7 +4206,8 @@ async function submitAuditResponses(planId) {
   }).catch(()=>{});
 
   // ── Mark ONLY the Auditor's myActions as Completed (not the Auditee's) ─────
-  const sourceRef = `auditPlans/${planId}`;
+  // sourceRef must match what was stored when the myAction was created
+  const sourceRef = `${planColResolved}/${planId}`;
   const allActionsSnap = await db.collection('myActions').where('sourceRef','==',sourceRef).get().catch(()=>null);
   if(allActionsSnap && !allActionsSnap.empty){
     const batch = db.batch();
