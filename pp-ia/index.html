@@ -679,7 +679,7 @@ select.form-input{cursor:pointer}
     <span id="ncDetailStage" class="badge" style="margin-left:auto"></span>
     <button class="btn btn-secondary btn-sm" id="exportNCRBtn" onclick="exportNCRPDF()" title="Export NCR as PDF" style="margin-left:8px"><span class="material-icons" style="font-size:15px;vertical-align:middle">picture_as_pdf</span> Export NCR</button>
   </div>
-  <div style="display:grid;grid-template-columns:1fr 340px;gap:20px;align-items:start">
+  <div style="display:grid;grid-template-columns:1fr 380px;gap:24px;align-items:start">
     <!-- Left: NC info + action form -->
     <div>
       <div class="card" id="ncInfoCard" style="margin-bottom:16px"></div>
@@ -2512,6 +2512,43 @@ async function renderMyActions() {
       }
     });
     if (anyAutoComplete) autoCompleteBatch.commit().catch(()=>{});
+  }
+
+  // ── Auto-create missing myActions for NCs at current user's review stage ──
+  // Handles cases where DH approved but Auditor/MR task was never created
+  const _myUid   = S.uid||S.user?.uid||'';
+  const _myEmail = S.email||S.user?.email||'';
+  const _stageForRole = _isAuditorRole ? 'Auditor Review' : (_isMRRole ? 'MR Review' : null);
+  if (_stageForRole) {
+    // Find NCs waiting at this reviewer's stage that have no myAction yet
+    const ncSnap = await db.collection('findings').where('workflowStage','==',_stageForRole).get().catch(()=>null);
+    if (ncSnap && !ncSnap.empty) {
+      const existingRefs = new Set(allActions.map(a=>a.sourceRef||''));
+      const createBatch = db.batch();
+      let anyCreate = false;
+      ncSnap.forEach(ndoc => {
+        const sRef = `findings/${ndoc.id}`;
+        if (existingRefs.has(sRef)) return; // already have a task for this NC
+        const nd = ndoc.data();
+        const ncLabel = nd.findingNo||ndoc.id.slice(-6).toUpperCase();
+        const newTask = {
+          userId: _myUid, userEmail: _myEmail, userName: S.userDoc?.name||'',
+          role: _isAuditorRole ? 'Auditor' : 'MR',
+          type: 'Review NC Action Plan',
+          title: `Review NC Action Plan — ${ncLabel}`,
+          description: `Action plan is awaiting your review.`,
+          status: 'Pending', sourceRef: sRef,
+          ncStage: _stageForRole,
+          auditId: nd.auditId||nd.auditNo||'', department: nd.department||'', plant: nd.plant||'',
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        };
+        createBatch.set(db.collection('myActions').doc(), newTask);
+        // Add to local list immediately so it shows without reload
+        allActions.push({ ...newTask, id: 'tmp_'+ndoc.id, status:'Pending', ncStage:_stageForRole });
+        anyCreate = true;
+      });
+      if (anyCreate) createBatch.commit().catch(()=>{});
+    }
   }
 
   const isAuditeeUser = (S.role||'').toLowerCase() === 'auditee';
@@ -6452,10 +6489,12 @@ async function _updateNcMyAction(ncId, reviewerStatus, nextStage, returnComment)
     [s1,s2].forEach(snap=>{ if(snap) snap.forEach(d=>{ if(!seen.has(d.id)){ seen.add(d.id);
       mb.update(d.ref,{ status:reviewerStatus, ncStage:nextStage, completedAt:firebase.firestore.FieldValue.serverTimestamp() }); }}); });
 
+    // Fetch finding doc for auditee info + NC metadata
+    const fDoc = await db.collection('findings').doc(ncId).get().catch(()=>null);
+    const fd = fDoc?.data()||{};
+
     // On return: re-open auditee's Action Plan task for this NC
     if (returnComment) {
-      const fDoc = await db.collection('findings').doc(ncId).get().catch(()=>null);
-      const fd = fDoc?.data()||{};
       const aeId = fd.auditeeId||fd.assigneeId||'';
       const aeEmail = fd.auditeeEmail||'';
       if (aeId||aeEmail) {
@@ -6468,6 +6507,54 @@ async function _updateNcMyAction(ncId, reviewerStatus, nextStage, returnComment)
           mb.update(d.ref,{ status:'Pending', returnComment, updatedAt:firebase.firestore.FieldValue.serverTimestamp() }); }}); });
       }
     }
+
+    // On forward approval: create myAction for next stage's reviewer
+    if (!returnComment && nextStage !== 'Closed') {
+      const ncLabel = fd.findingNo||ncId.slice(-6).toUpperCase();
+      const dept = fd.department||'';
+      const plant = fd.plant||'';
+
+      // Determine which role to notify
+      const nextRoleMap = { 'Auditor Review':'Auditor', 'MR Review':'MR', 'Closed':null };
+      const nextRole = nextRoleMap[nextStage];
+
+      if (nextRole) {
+        // Find users with that role (and matching plant/dept where possible)
+        let roleQuery = db.collection('users').where('role','==',nextRole);
+        // Also handle "Lead Auditor" role for Auditor Review
+        const altRoles = nextRole==='Auditor' ? ['Auditor','Lead Auditor'] : [nextRole];
+        const roleSnaps = await Promise.all(
+          altRoles.map(r => db.collection('users').where('role','==',r).get().catch(()=>null))
+        );
+        const nextReviewers = [];
+        const seenU = new Set();
+        roleSnaps.forEach(snap => { if(snap) snap.forEach(d => { if(!seenU.has(d.id)){ seenU.add(d.id); nextReviewers.push({id:d.id,...d.data()}); }}); });
+
+        // Check for existing myAction for each reviewer to avoid duplicates
+        for (const ru of nextReviewers) {
+          const ruEmail = ru.email||'';
+          const ruPlant = ru.plant||'All Plants';
+          // Plant-match filter
+          if (plant && ruPlant !== 'All Plants' && ruPlant !== plant) continue;
+
+          const exSnap = await db.collection('myActions')
+            .where('userId','==',ru.id).where('sourceRef','==',sourceRef).where('status','==','Pending').get().catch(()=>null);
+          if (exSnap && !exSnap.empty) continue; // already has a pending task
+
+          mb.set(db.collection('myActions').doc(), {
+            userId: ru.id, userEmail: ruEmail, userName: ru.name||'',
+            role: nextRole, type: 'Review NC Action Plan',
+            title: `Review NC Action Plan — ${ncLabel}`,
+            description: `Action plan approved by ${S.userDoc?.name||'previous reviewer'}. Please review and approve or return.`,
+            status: 'Pending', sourceRef,
+            ncStage: nextStage,
+            auditId: fd.auditId||fd.auditNo||'', department: dept, plant,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+      }
+    }
+
     await mb.commit().catch(()=>{});
   } catch(e){ console.warn('_updateNcMyAction:',e); }
 }
@@ -6825,6 +6912,9 @@ function updateCAPAFinding(ncId) {
         </div>`:''}
       </div>
     </div>
+    <!-- 2-column layout for the edit fields -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start">
+    <div>
     <div class="form-group">
       <label class="form-label" style="font-family:'Inter',sans-serif">NC Type / Severity</label>
       <select class="form-input" id="capaNCType" style="font-family:'Inter',sans-serif;font-size:13px">
@@ -6863,9 +6953,11 @@ function updateCAPAFinding(ncId) {
         }
       })()}
     </div>
+    </div><!-- end left col -->
+    <div>
     <div class="form-group">
       <label class="form-label" style="font-family:'Inter',sans-serif">Update Note / Evidence</label>
-      <textarea class="form-input" id="capaNote" rows="3" style="font-family:'Inter',sans-serif;font-size:13px" placeholder="Describe what was implemented, evidence of action taken…"></textarea>
+      <textarea class="form-input" id="capaNote" rows="4" style="font-family:'Inter',sans-serif;font-size:13px" placeholder="Describe what was implemented, evidence of action taken…"></textarea>
     </div>
     <!-- Evidence Upload -->
     <div class="form-group">
@@ -6897,12 +6989,14 @@ function updateCAPAFinding(ncId) {
         </div>
       </div>`:''}
     </div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
+    </div><!-- end right col -->
+    </div><!-- end 2-col grid -->
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" onclick="saveCAPAFindingUpdate('${ncId}')">
         <span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">save</span>Save Update
       </button>
-    </div>`);
+    </div>`, true);
   window._capaEvidenceFiles = [];
 }
 
