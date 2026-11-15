@@ -7,21 +7,66 @@ service cloud.firestore {
     function userDoc()    { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
     function role()       { return userDoc().role; }
     function plant()      { return userDoc().plant; }
-    function isSuperAdmin()  { return role() == 'Super Admin'; }
-    function isPlantAdmin()  { return role() == 'Plant Admin'; }
-    function isAuditor()     { return role() == 'Auditor'; }
-    function isDeptHead()    { return role() == 'Dept Head'; }
-    function isViewer()      { return role() == 'Viewer'; }
-    function canWrite()      { return isSuperAdmin() || isPlantAdmin() || isAuditor(); }
+
+    // Accept all variants — 'superadmin', 'Super Admin'
+    function isSuperAdmin() { return role() == 'superadmin' || role() == 'Super Admin'; }
+    // Accept renamed role 'Admin' / 'admin' as well as legacy 'Plant Admin' / 'plantadmin'
+    function isPlantAdmin() {
+      return role() == 'Admin' || role() == 'admin' ||
+             role() == 'Plant Admin' || role() == 'plantadmin';
+    }
+    function isAuditor()  { return role() == 'Auditor'; }
+    function isAuditee()  { return role() == 'Auditee'; }   // ← NEW
+    function isDeptHead() { return role() == 'Dept Head'; }
+    function isViewer()   { return role() == 'Viewer'; }
+    function isAdmin()    { return isSuperAdmin() || isPlantAdmin(); }
+    function canWrite()   { return isSuperAdmin() || isPlantAdmin() || isAuditor() || isDeptHead(); }
+
     // Plant-scoped check: Super Admin sees all; others see only their plant
-    function myPlant(res)    { return isSuperAdmin() || plant() == 'All Plants' || res.data.plant == plant(); }
+    function myPlant(res) {
+      return isSuperAdmin() || plant() == 'All Plants' || res.data.plant == plant();
+    }
+
+    // Fields an Auditee is allowed to write on a finding (action plan submission)
+    function auditeeActionPlanFields() {
+      return [
+        'actionPlan', 'immediateCorrection', 'rootCause', 'correctiveAction',
+        'targetDate', 'status', 'workflowStage',
+        'auditeeObservation', 'auditeeSubmittedAt', 'auditeeId', 'auditeeName',
+        'rca4M_man', 'rca4M_machine', 'rca4M_method', 'rca4M_material',
+        'rcaWhy1', 'rcaWhy2', 'rcaWhy3', 'rcaWhy4', 'rcaWhy5', 'rcaRootCause',
+        'evidenceUrls', 'timeline', 'updatedAt'
+      ];
+    }
 
     // ── Users ─────────────────────────────────────────────────────────────
+    // Roles that Admin can assign to other users (cannot escalate to Admin/SuperAdmin)
+    function adminAllowedRoles() {
+      return ['Auditor', 'Auditee', 'Viewer', 'Dept Head'];
+    }
+
     match /users/{uid} {
-      allow read:  if isSignedIn() && (request.auth.uid == uid || isSuperAdmin());
-      allow create: if isSuperAdmin();
-      allow update: if isSuperAdmin() || request.auth.uid == uid;
-      allow delete: if isSuperAdmin();
+      allow read: if isSignedIn();
+
+      allow create: if isSuperAdmin() ||
+        (isPlantAdmin() &&
+         request.resource.data.plant == plant() &&
+         request.resource.data.role in adminAllowedRoles()) ||
+        (isSignedIn() && request.auth.uid == uid);
+
+      allow update: if isSuperAdmin() ||
+        request.auth.uid == uid ||
+        (isPlantAdmin() &&
+         resource.data.plant == plant() &&
+         request.resource.data.plant == plant() &&
+         request.resource.data.role in adminAllowedRoles()) ||
+        (isSignedIn() && resource.data.email == request.auth.token.email);
+
+      allow delete: if isSuperAdmin() ||
+        (isPlantAdmin() &&
+         resource.data.plant == plant() &&
+         resource.data.role in adminAllowedRoles()) ||
+        (isSignedIn() && resource.data.email == request.auth.token.email);
     }
 
     // ── App Settings ──────────────────────────────────────────────────────
@@ -33,13 +78,25 @@ service cloud.firestore {
     // ── Plants ────────────────────────────────────────────────────────────
     match /plants/{id} {
       allow read:  if isSignedIn();
-      allow write: if isSuperAdmin();
+      allow write: if isAdmin();
     }
 
     // ── Departments ───────────────────────────────────────────────────────
     match /departments/{id} {
       allow read:  if isSignedIn();
-      allow write: if isSuperAdmin() || isPlantAdmin();
+      allow write: if isAdmin();
+    }
+
+    // ── Processes ─────────────────────────────────────────────────────────
+    match /processes/{id} {
+      allow read:  if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── Shifts ────────────────────────────────────────────────────────────
+    match /shifts/{id} {
+      allow read:  if isSignedIn();
+      allow write: if isAdmin();
     }
 
     // ── Audit Types / Standards ───────────────────────────────────────────
@@ -49,7 +106,7 @@ service cloud.firestore {
 
     // ── Audit Checklists ──────────────────────────────────────────────────
     match /auditChecklists/{id} {
-      allow read:  if isSignedIn();
+      allow read:   if isSignedIn();
       allow create: if canWrite();
       allow update: if canWrite() && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['version','uploadedBy','uploadedAt']);
       allow delete: if isSuperAdmin();
@@ -57,38 +114,64 @@ service cloud.firestore {
 
     // ── Checklist Upload Logs ─────────────────────────────────────────────
     match /checklistUploadLogs/{id} {
-      allow read:  if isSignedIn();
-      allow create: if canWrite();
+      allow read:          if isSignedIn();
+      allow create:        if canWrite();
       allow update, delete: if isSuperAdmin();
     }
 
     // ── Audit Plans ───────────────────────────────────────────────────────
     match /auditPlans/{id} {
-      allow read:  if isSignedIn() && myPlant(resource);
+      allow read:   if isSignedIn() && myPlant(resource);
       allow create: if canWrite();
       allow update: if canWrite() && myPlant(resource);
       allow delete: if isSuperAdmin() || (isPlantAdmin() && myPlant(resource));
     }
 
+    // ── Audit Reports ─────────────────────────────────────────────────────
+    match /auditReports/{id} {
+      allow read:   if isSignedIn();
+      allow create: if canWrite();
+      allow update: if canWrite();
+      allow delete: if isSuperAdmin();
+    }
+
     // ── Audits ────────────────────────────────────────────────────────────
     match /audits/{id} {
-      allow read:  if isSignedIn() && myPlant(resource);
+      allow read:   if isSignedIn() && myPlant(resource);
       allow create: if canWrite();
       allow update: if canWrite() && myPlant(resource);
       allow delete: if isSuperAdmin();
     }
 
-    // ── Audit Responses (checklist answers) ───────────────────────────────
+    // ── Audit Responses ───────────────────────────────────────────────────
     match /auditResponses/{id} {
       allow read:  if isSignedIn();
-      allow write: if isAuditor() || isPlantAdmin() || isSuperAdmin();
+      allow write: if canWrite();
     }
 
     // ── Findings ──────────────────────────────────────────────────────────
     match /findings/{id} {
-      allow read:  if isSignedIn() && myPlant(resource);
+      allow read:   if isSignedIn() && myPlant(resource);
       allow create: if canWrite();
-      allow update: if canWrite() && myPlant(resource);
+
+      // canWrite() roles have full update access.
+      // Auditee can update ONLY their action-plan fields (workflowStage, rootCause, etc.)
+      // This is what actually saves the action plan and advances the NC to Dept Head Review.
+      allow update: if myPlant(resource) && (
+        canWrite() ||
+        (isSignedIn() && isAuditee() &&
+         request.resource.data.diff(resource.data).affectedKeys()
+           .hasOnly(auditeeActionPlanFields()))
+      );
+
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Non-Conformities ──────────────────────────────────────────────────
+    match /nonConformities/{id} {
+      allow read:   if isSignedIn();
+      allow create: if canWrite();
+      allow update: if isSignedIn() && canWrite();
       allow delete: if isSuperAdmin();
     }
 
@@ -100,17 +183,23 @@ service cloud.firestore {
 
     // ── Corrective Actions (CAPA) ─────────────────────────────────────────
     match /correctiveActions/{id} {
-      allow read:  if isSignedIn() && myPlant(resource);
-      allow create: if canWrite();
+      allow read:   if isSignedIn() && myPlant(resource);
+
+      // Auditee creates a CAPA record when submitting their action plan
+      allow create: if isSignedIn() && (canWrite() || isAuditee());
+
       allow update: if isSignedIn() && (
         canWrite() ||
-        // Dept head can update status of their own CAPAs
         (isDeptHead() && resource.data.assignedTo == request.auth.uid)
       );
       allow delete: if isSuperAdmin();
     }
 
-    // ── Verification Records ──────────────────────────────────────────────
+    // ── Effectiveness / Verification Records ──────────────────────────────
+    match /effectivenessRecords/{id} {
+      allow read:  if isSignedIn();
+      allow write: if canWrite();
+    }
     match /verificationRecords/{id} {
       allow read:  if isSignedIn();
       allow write: if canWrite();
@@ -122,33 +211,94 @@ service cloud.firestore {
       allow write: if canWrite();
     }
 
+    // ── LPA Findings ──────────────────────────────────────────────────────
+    match /lpaFindings/{id} {
+      allow read:  if isSignedIn();
+      allow write: if canWrite();
+    }
+
+    // ── LPA Actions ───────────────────────────────────────────────────────
+    match /lpaActions/{id} {
+      allow read:  if isSignedIn();
+      allow write: if canWrite();
+    }
+
+    // ── KPI Snapshots ─────────────────────────────────────────────────────
+    match /kpiSnapshots/{id} {
+      allow read:  if isSignedIn();
+      allow write: if isAdmin();
+    }
+
     // ── Supplier Audits ───────────────────────────────────────────────────
     match /suppliers/{id}      { allow read: if isSignedIn(); allow write: if canWrite(); }
-    match /supplierAudits/{id} { allow read: if isSignedIn(); allow write: if canWrite(); }
+    match /supplierAudits/{id} {
+      allow read:   if true; // public read for magic-link token verification
+      allow create: if canWrite();
+      allow delete: if isSuperAdmin();
+      allow update: if isSignedIn() ||
+        (request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['actionPlan', 'status', 'updatedAt']));
+    }
+    match /supplierFindings/{id} {
+      allow read:  if isSignedIn();
+      allow write: if canWrite();
+    }
 
     // ── Notifications ─────────────────────────────────────────────────────
     match /notifications/{id} {
-      allow read:  if isSignedIn() && (resource.data.userId == request.auth.uid || isSuperAdmin());
+      allow read:   if isSignedIn() && (resource.data.userId == request.auth.uid || isSuperAdmin());
       allow create: if isSignedIn();
       allow update: if isSignedIn() && resource.data.userId == request.auth.uid;
-      allow delete: if isSuperAdmin();
+      allow delete: if isSuperAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
     }
 
     // ── Email Queue / Logs ────────────────────────────────────────────────
-    match /emailQueue/{id} { allow read, write: if false; } // Cloud Functions only
+    match /emailQueue/{id} { allow read, write: if false; }
     match /emailLogs/{id}  { allow read: if isSuperAdmin(); allow write: if false; }
 
     // ── My Actions ────────────────────────────────────────────────────────
     match /myActions/{id} {
-      allow read:  if isSignedIn() && resource.data.userId == request.auth.uid;
-      allow write: if false; // Cloud Functions only — generated automatically
+      // Users read only their own; SuperAdmin/Admin/canWrite() roles read all
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin() || canWrite() || isAuditee());
+
+      // canWrite() roles + Auditee can create myActions
+      // (Auditee creates myAction for Dept Head when submitting action plan)
+      allow create: if isSignedIn() && (canWrite() || isAuditee());
+
+      // Owner can update (mark complete); canWrite() roles can update (admin, auditor);
+      // Auditee can update their own action
+      allow update: if isSignedIn() && (
+        canWrite() ||
+        resource.data.userId == request.auth.uid
+      );
+
+      // SuperAdmin can delete (cascade from deleteAuditPlan & reset); owner can delete their own
+      allow delete: if isSuperAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+    }
+
+    // ── Dept Head Magic Review Tokens (passwordless approve/return) ──────────
+    // Public read so unauthenticated users can open the review link from email.
+    // Create only by authenticated users (auditee on submit); update only via Cloud Function
+    // (which uses Admin SDK and bypasses rules), so update is blocked here.
+    match /deptHeadReviewLinks/{token} {
+      allow read:   if true;                              // public — link holder can read
+      allow create: if isSignedIn();                      // auditee creates token on submit
+      allow update: if false;                             // only Admin SDK (Cloud Function) updates
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Audit Numbers ─────────────────────────────────────────────────────
+    match /auditNumbers/{id} {
+      allow read:  if isSignedIn();
+      allow write: if isSuperAdmin() || isPlantAdmin();
     }
 
     // ── Activity Logs ─────────────────────────────────────────────────────
     match /activityLogs/{id} {
-      allow read:  if isSuperAdmin() || isPlantAdmin();
+      allow read:   if isAdmin();
       allow create: if isSignedIn();
-      allow update, delete: if false;
+      allow update: if false;
+      allow delete: if isSuperAdmin();
     }
   }
 }
