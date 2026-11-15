@@ -2477,7 +2477,7 @@ async function renderMyActions() {
   const _roleLC2 = (S.role||S.userDoc?.role||'').toLowerCase().replace(/[\s_-]/g,'');
   const _isDHRole = _roleLC2==='depthead'||_roleLC2==='departmenthead';
   const _isAuditorRole = _roleLC2==='auditor'||_roleLC2==='leadauditor';
-  const _isMRRole = _roleLC2==='mr'||_roleLC2==='admin'||_roleLC2==='superadmin';
+  const _isMRRole = _roleLC2==='mr'||_roleLC2==='managementrepresentative'||_roleLC2==='plantmr'||_roleLC2==='admin'||_roleLC2==='superadmin';
   const ncTasks = allActions.filter(a => (a.sourceRef||'').startsWith('findings/') && a.status!=='Completed');
   if (ncTasks.length) {
     const fIds = [...new Set(ncTasks.map(a => a.sourceRef.split('/')[1]).filter(Boolean))];
@@ -2520,14 +2520,23 @@ async function renderMyActions() {
   const _myEmail = S.email||S.user?.email||'';
   const _stageForRole = _isAuditorRole ? 'Auditor Review' : (_isMRRole ? 'MR Review' : null);
   if (_stageForRole) {
-    // Find NCs waiting at this reviewer's stage that have no myAction yet
-    const ncSnap = await db.collection('findings').where('workflowStage','==',_stageForRole).get().catch(()=>null);
-    if (ncSnap && !ncSnap.empty) {
+    // Force server fetch (bypass cache) so fresh workflowStage values are used.
+    // Also query by `status` field as fallback (older findings may use status instead of workflowStage).
+    const [ncSnap, ncSnapStatus] = await Promise.all([
+      db.collection('findings').where('workflowStage','==',_stageForRole).get({ source:'server' }).catch(()=>null),
+      db.collection('findings').where('status','==',_stageForRole).get({ source:'server' }).catch(()=>null),
+    ]);
+    // Merge results deduplicated by doc ID
+    const ncDocMap = new Map();
+    [ncSnap, ncSnapStatus].forEach(snap => {
+      if (snap && !snap.empty) snap.forEach(d => { if (!ncDocMap.has(d.id)) ncDocMap.set(d.id, d); });
+    });
+    if (ncDocMap.size > 0) {
       // Only skip if there's already a PENDING task for this NC (allow re-create if only completed tasks exist)
       const existingPendingRefs = new Set(allActions.filter(a=>a.status!=='Completed').map(a=>a.sourceRef||''));
       const createBatch = db.batch();
       let anyCreate = false;
-      ncSnap.forEach(ndoc => {
+      ncDocMap.forEach(ndoc => {
         const sRef = `findings/${ndoc.id}`;
         if (existingPendingRefs.has(sRef)) return; // already have a pending task for this NC
         const nd = ndoc.data();
@@ -3908,25 +3917,25 @@ async function publishAuditSchedule(docIds, collection) {
   if(btn){btn.disabled=true;btn.innerHTML='<span class="material-icons" style="font-size:15px;vertical-align:middle">hourglass_top</span> Publishing…';}
 
   try {
-    // Fetch saved plans
-    const plans=[];
-    for(const id of docIds){
-      const snap=await db.collection(collection).doc(id).get().catch(()=>null);
-      if(snap?.exists) plans.push({id:snap.id,...snap.data()});
-    }
+    // Fetch saved plans in parallel
+    const planSnaps = await Promise.all(docIds.map(id => db.collection(collection).doc(id).get().catch(()=>null)));
+    const plans = planSnaps.filter(s=>s?.exists).map(s=>({id:s.id,...s.data()}));
 
     // Collect unique recipient emails
     const emailSet=new Set();
     const recipients=[]; // {email, name, role, audits[]}
     const emailMap={};
 
+    // Pre-fetch auditor emails for plans missing them — in parallel
+    const auditorEmailMap = {};
+    await Promise.all(plans.filter(p=>!p.leadAuditorEmail && p.leadAuditorId).map(async p=>{
+      const uSnap=await db.collection('users').doc(p.leadAuditorId).get().catch(()=>null);
+      if(uSnap?.exists) auditorEmailMap[p.leadAuditorId]=uSnap.data()?.email||'';
+    }));
+
     for(const p of plans){
-      // Auditor email — look up from users collection if not stored
-      let auditorEmail=p.leadAuditorEmail||'';
-      if(!auditorEmail && p.leadAuditorId){
-        const uSnap=await db.collection('users').doc(p.leadAuditorId).get().catch(()=>null);
-        auditorEmail=uSnap?.data()?.email||'';
-      }
+      // Auditor email — use prefetched lookup
+      let auditorEmail=p.leadAuditorEmail||auditorEmailMap[p.leadAuditorId]||'';
       if(auditorEmail && !emailSet.has(auditorEmail)){
         emailSet.add(auditorEmail);
         emailMap[auditorEmail]={email:auditorEmail,name:p.leadAuditorName||auditorEmail,role:'Auditor',audits:[]};
@@ -3947,9 +3956,7 @@ async function publishAuditSchedule(docIds, collection) {
       if(msg) msg.innerHTML='<span style="color:var(--amber)">⚠ No email addresses found. Ensure Auditor/Auditee users have emails saved in User Management.</span>';
       if(btn){btn.disabled=false;btn.innerHTML='<span class="material-icons" style="font-size:15px;vertical-align:middle">send</span> Publish &amp; Notify All';}
       // Still mark as published even if no emails
-      for(const id of docIds){
-        await db.collection(collection).doc(id).update({ published:true, publishedAt:firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{});
-      }
+      await Promise.all(docIds.map(id => db.collection(collection).doc(id).update({ published:true, publishedAt:firebase.firestore.FieldValue.serverTimestamp() }).catch(()=>{})));
       return;
     }
 
@@ -4054,61 +4061,54 @@ async function _confirmPublishSend() {
     }
   }
 
-  // ── Step 2: Create / update myActions for each auditor & auditee ─────────
-  // Build email→userId lookup from users collection for all recipient emails
-  const allEmails = [...new Set(recipients.map(r=>r.email).filter(Boolean))];
+  // ── Step 2: Create / update myActions — all in parallel ──────────────────
+  // Build email→userId lookup in parallel
+  const allEmails2 = [...new Set(recipients.map(r=>r.email).filter(Boolean))];
+  const uidLookups = await Promise.all(
+    allEmails2.map(em => db.collection('users').where('email','==',em).limit(1).get().catch(()=>null))
+  );
   const emailToUid = {};
-  for(const em of allEmails){
-    const us = await db.collection('users').where('email','==',em).limit(1).get().catch(()=>null);
-    if(us && !us.empty) emailToUid[em] = us.docs[0].id;
-  }
+  uidLookups.forEach((us,i) => { if(us && !us.empty) emailToUid[allEmails2[i]] = us.docs[0].id; });
 
-  for(const p of plans){
-    // Helper: upsert a myAction for a user
-    const upsertAction = async (userId, userEmail, role) => {
-      if(!userId && !userEmail) return;
-      const uid = userId || emailToUid[userEmail] || null;
-      if(!uid) return;
-      const sourceRef = `${collection}/${p.id}`;
-      // Check if already exists
-      const ex = await db.collection('myActions')
-        .where('userId','==',uid).where('sourceRef','==',sourceRef)
-        .limit(1).get().catch(()=>null);
-      const data = {
-        userId:     uid,
-        userEmail:  userEmail||'',
-        title:      `Conduct Audit: ${p.name||p.id}`,
-        auditType:  p.auditType||'',
-        auditNo:    p.auditNo||'',
-        plant:      p.plant||'',
-        department: p.department||'',
-        dueDate:    p.plannedDate||null,
-        priority:   'Medium',
-        status:     'Pending',
-        module:     'Conduct Audit',
-        sourceRef,
-        role,
-        updatedAt:  firebase.firestore.FieldValue.serverTimestamp(),
-      };
-      if(ex && !ex.empty){
-        await ex.docs[0].ref.update(data).catch(()=>{});
-      } else {
-        await db.collection('myActions').add({...data, createdAt:firebase.firestore.FieldValue.serverTimestamp(), createdBy:S.user?.uid||''}).catch(()=>{});
-      }
+  // Check existing myActions for all plans in parallel
+  const myActionChecks = await Promise.all(plans.map(p => {
+    const uid = p.leadAuditorId || emailToUid[p.leadAuditorEmail||''] || null;
+    if (!uid) return Promise.resolve(null);
+    return db.collection('myActions')
+      .where('userId','==',uid).where('sourceRef','==',`${collection}/${p.id}`)
+      .limit(1).get().catch(()=>null);
+  }));
+
+  // Batch-write all myActions at once
+  const maBatch = db.batch();
+  plans.forEach((p, i) => {
+    const uid = p.leadAuditorId || emailToUid[p.leadAuditorEmail||''] || null;
+    if (!uid) return;
+    const sourceRef = `${collection}/${p.id}`;
+    const data = {
+      userId: uid, userEmail: p.leadAuditorEmail||'',
+      title: `Conduct Audit: ${p.name||p.id}`,
+      auditType: p.auditType||'', auditNo: p.auditNo||'',
+      plant: p.plant||'', department: p.department||'',
+      dueDate: p.plannedDate||null, priority: 'Medium',
+      status: 'Pending', module: 'Conduct Audit', sourceRef,
+      role: 'Auditor', updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
     };
+    const ex = myActionChecks[i];
+    if (ex && !ex.empty) {
+      maBatch.update(ex.docs[0].ref, data);
+    } else {
+      maBatch.set(db.collection('myActions').doc(), { ...data, createdAt: firebase.firestore.FieldValue.serverTimestamp(), createdBy: S.user?.uid||'' });
+    }
+  });
+  await maBatch.commit().catch(()=>{});
 
-    // Auditor action only — Auditee gets "Fill Action Plan" after audit is submitted, not at planning time
-    await upsertAction(p.leadAuditorId||'', p.leadAuditorEmail||'', 'Auditor');
-  }
-
-  // ── Step 3: Mark plans as published ──────────────────────────────────────
-  for(const id of docIds){
-    await db.collection(collection).doc(id).update({
-      published: true,
-      publishedAt: firebase.firestore.FieldValue.serverTimestamp(),
-      publishedBy: S.user?.uid||'',
-    }).catch(()=>{});
-  }
+  // ── Step 3: Mark plans as published — all in parallel ────────────────────
+  await Promise.all(docIds.map(id => db.collection(collection).doc(id).update({
+    published: true,
+    publishedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    publishedBy: S.user?.uid||'',
+  }).catch(()=>{})));
 
   closeModal();
   if(emailFailed && !emailSent){
@@ -4907,86 +4907,101 @@ async function openAuditeeActionPlan(planId, auditName) {
         <div style="font-size:10px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">🔍 Auditor Evidence Photos</div>
         <div style="display:flex;flex-wrap:wrap;gap:6px">${(f.evidenceUrls||[]).map((u,ei)=>`<a href="${u}" target="_blank" style="display:inline-flex;align-items:center;gap:3px;font-size:11px;color:#2563eb;background:#eff6ff;padding:3px 8px;border-radius:5px;text-decoration:none;border:1px solid #bfdbfe"><span class="material-icons" style="font-size:12px">photo_camera</span>Photo ${ei+1}</a>`).join('')}</div>
       </div>`:''}
-      <div class="form-row" style="margin-bottom:12px">
-        <div class="form-group" style="margin-bottom:0">
-          <label class="form-label">Immediate Correction <span style="color:var(--red)">*</span></label>
-          <textarea class="form-input" id="ap_imm_${f.id}" rows="3" style="font-family:'Inter',sans-serif;resize:vertical" placeholder="Describe the immediate action taken…">${f.actionPlan?.correction||''}</textarea>
+      <!-- TAB BAR -->
+      <div style="display:flex;border-bottom:2px solid #e2e8f0;margin-bottom:14px;gap:0">
+        <button type="button" id="tab_ap_${f.id}"
+          onclick="document.getElementById('tab_ap_${f.id}').style.cssText='font-family:Inter,sans-serif;font-size:12px;font-weight:700;padding:7px 16px;border:none;border-bottom:2.5px solid #2563eb;background:none;cursor:pointer;color:#2563eb;margin-bottom:-2px';document.getElementById('tab_rca_${f.id}').style.cssText='font-family:Inter,sans-serif;font-size:12px;font-weight:600;padding:7px 16px;border:none;border-bottom:2.5px solid transparent;background:none;cursor:pointer;color:#64748b;margin-bottom:-2px';document.getElementById('pane_ap_${f.id}').style.display='block';document.getElementById('pane_rca_${f.id}').style.display='none'"
+          style="font-family:'Inter',sans-serif;font-size:12px;font-weight:700;padding:7px 16px;border:none;border-bottom:2.5px solid #2563eb;background:none;cursor:pointer;color:#2563eb;margin-bottom:-2px">
+          📋 Action Plan
+        </button>
+        <button type="button" id="tab_rca_${f.id}"
+          onclick="document.getElementById('tab_rca_${f.id}').style.cssText='font-family:Inter,sans-serif;font-size:12px;font-weight:700;padding:7px 16px;border:none;border-bottom:2.5px solid #7c3aed;background:none;cursor:pointer;color:#7c3aed;margin-bottom:-2px';document.getElementById('tab_ap_${f.id}').style.cssText='font-family:Inter,sans-serif;font-size:12px;font-weight:600;padding:7px 16px;border:none;border-bottom:2.5px solid transparent;background:none;cursor:pointer;color:#64748b;margin-bottom:-2px';document.getElementById('pane_rca_${f.id}').style.display='block';document.getElementById('pane_ap_${f.id}').style.display='none'"
+          style="font-family:'Inter',sans-serif;font-size:12px;font-weight:600;padding:7px 16px;border:none;border-bottom:2.5px solid transparent;background:none;cursor:pointer;color:#64748b;margin-bottom:-2px">
+          🔍 Root Cause &amp; 4M Analysis
+        </button>
+      </div>
+
+      <!-- TAB 1: ACTION PLAN -->
+      <div id="pane_ap_${f.id}">
+        <div class="form-row" style="margin-bottom:12px">
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">Immediate Correction <span style="color:var(--red)">*</span></label>
+            <textarea class="form-input" id="ap_imm_${f.id}" rows="3" style="font-family:'Inter',sans-serif;resize:vertical" placeholder="Describe the immediate action taken…">${f.actionPlan?.correction||''}</textarea>
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">Root Cause <span style="color:var(--red)">*</span></label>
+            <textarea class="form-input" id="ap_rc_${f.id}" rows="3" style="font-family:'Inter',sans-serif;resize:vertical;border-color:#fca5a5" placeholder="Why did this NC occur? Use 5-Why: Why → Why → Why…">${f.actionPlan?.rootCause||''}</textarea>
+            <div style="font-size:11px;color:#94a3b8;margin-top:3px;font-family:'Inter',sans-serif">Tip: Use the Root Cause &amp; 4M tab for deeper analysis</div>
+          </div>
         </div>
-        <div class="form-group" style="margin-bottom:0">
-          <label class="form-label">Root Cause <span style="color:var(--red)">*</span></label>
-          <textarea class="form-input" id="ap_rc_${f.id}" rows="3" style="font-family:'Inter',sans-serif;resize:vertical;border-color:#fca5a5" placeholder="Why did this NC occur? Use 5-Why: Why → Why → Why…">${f.actionPlan?.rootCause||''}</textarea>
-          <div style="font-size:11px;color:#94a3b8;margin-top:3px;font-family:'Inter',sans-serif">Tip: Ask "Why?" at least 3 times to find the root cause</div>
+        <div class="form-row" style="margin-bottom:12px">
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">Corrective Action <span style="color:var(--red)">*</span></label>
+            <textarea class="form-input" id="ap_ca_${f.id}" rows="3" style="font-family:'Inter',sans-serif;resize:vertical" placeholder="Systemic action to prevent recurrence…">${f.actionPlan?.correctiveAction||''}</textarea>
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">Target Date <span style="color:var(--red)">*</span></label>
+            <input class="form-input" type="date" id="ap_dt_${f.id}" min="${today}" value="${f.actionPlan?.targetDate||''}" style="font-family:'Inter',sans-serif">
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom:12px">
+          <label class="form-label" style="font-family:'Inter',sans-serif">Auditee's Observation / Comments <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
+          <textarea class="form-input" id="ap_obs_${f.id}" rows="2" style="font-family:'Inter',sans-serif;resize:vertical" placeholder="Add any observations, context or comments from auditee side…">${f.actionPlan?.auditeeObservation||f.auditeeObservation||''}</textarea>
         </div>
       </div>
-      <div class="form-row" style="margin-bottom:12px">
-        <div class="form-group" style="margin-bottom:0">
-          <label class="form-label">Corrective Action <span style="color:var(--red)">*</span></label>
-          <textarea class="form-input" id="ap_ca_${f.id}" rows="3" style="font-family:'Inter',sans-serif;resize:vertical" placeholder="Systemic action to prevent recurrence…">${f.actionPlan?.correctiveAction||''}</textarea>
-        </div>
-        <div class="form-group" style="margin-bottom:0">
-          <label class="form-label">Target Date <span style="color:var(--red)">*</span></label>
-          <input class="form-input" type="date" id="ap_dt_${f.id}" min="${today}" value="${f.actionPlan?.targetDate||''}" style="font-family:'Inter',sans-serif">
-        </div>
-      </div>
-      <!-- Auditee Observation -->
-      <div class="form-group" style="margin-bottom:12px">
-        <label class="form-label" style="font-family:'Inter',sans-serif">Auditee's Observation / Comments <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
-        <textarea class="form-input" id="ap_obs_${f.id}" rows="2" style="font-family:'Inter',sans-serif;resize:vertical" placeholder="Add any observations, context or comments from auditee side…">${f.actionPlan?.auditeeObservation||f.auditeeObservation||''}</textarea>
-      </div>
-      <!-- 5-Why Analysis (collapsible) -->
-      <div style="margin-bottom:12px;border:1px solid #fce7f3;border-radius:10px;overflow:hidden">
-        <div onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none';this.querySelector('.exp-icon').textContent=this.nextElementSibling.style.display==='none'?'expand_more':'expand_less'"
-          style="background:#fdf2f8;padding:10px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;user-select:none">
-          <span class="material-icons" style="font-size:16px;color:#be185d">psychology</span>
-          <span style="font-size:12px;font-weight:700;color:#9d174d;font-family:'Inter',sans-serif;flex:1">5-Why Root Cause Analysis — Ask "Why?" 5 times</span>
-          <span class="material-icons exp-icon" style="font-size:18px;color:#db2777">expand_more</span>
-        </div>
-        <div style="display:none;padding:12px;background:#fafafa">
-          <div style="font-size:11px;color:#be185d;margin-bottom:10px;font-family:'Inter',sans-serif">Start from the problem and keep asking "Why?" until you reach the root cause</div>
-          <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px">
-            <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#374151">Problem Statement</label>
+
+      <!-- TAB 2: ROOT CAUSE & 4M ANALYSIS -->
+      <div id="pane_rca_${f.id}" style="display:none">
+        <!-- 5-Why -->
+        <div style="margin-bottom:14px">
+          <div style="display:flex;align-items:center;gap:7px;margin-bottom:10px">
+            <span class="material-icons" style="font-size:16px;color:#be185d">psychology</span>
+            <span style="font-size:12px;font-weight:700;color:#9d174d;font-family:'Inter',sans-serif">5-Why Root Cause Analysis</span>
+            <span style="font-size:11px;color:#94a3b8;font-family:'Inter',sans-serif">— Ask "Why?" 5 times to find the true cause</span>
+          </div>
+          <div style="background:#fdf2f8;border:1px solid #fbcfe8;border-radius:8px;padding:10px;margin-bottom:8px">
+            <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#9d174d">Problem Statement</label>
             <textarea class="form-input" id="ap_why_prob_${f.id}" rows="2" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical" placeholder="Describe the nonconformity…">${f.description||f.observation||''}</textarea>
           </div>
-          ${[1,2,3,4,5].map(n=>`
-          <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;display:flex;gap:10px;align-items:flex-start">
-            <div style="background:#fdf2f8;border:1px solid #fbcfe8;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:12px;font-weight:700;color:#be185d;margin-top:2px">${n}</div>
-            <div style="flex:1">
-              <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#374151">Why ${n}?</label>
-              <input class="form-input" id="ap_why${n}_${f.id}" style="font-family:'Inter',sans-serif;font-size:12px" placeholder="Why did this happen?" value="${f['rcaWhy'+n]||''}">
-            </div>
-          </div>`).join('')}
-          <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px">
-            <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#dc2626">🎯 Root Cause (from 5-Why)</label>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            ${[1,2,3,4,5].map(n=>`
+            <div style="display:flex;gap:10px;align-items:flex-start;background:#fff;border:1px solid #fce7f3;border-radius:8px;padding:9px 10px">
+              <div style="background:#fdf2f8;border:1px solid #fbcfe8;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:11px;font-weight:700;color:#be185d;margin-top:3px">${n}</div>
+              <div style="flex:1">
+                <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#9d174d;margin-bottom:3px">Why ${n}?</label>
+                <input class="form-input" id="ap_why${n}_${f.id}" style="font-family:'Inter',sans-serif;font-size:12px" placeholder="Why did this happen?" value="${f['rcaWhy'+n]||''}">
+              </div>
+            </div>`).join('')}
+          </div>
+          <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px;margin-top:8px">
+            <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#dc2626">🎯 Final Root Cause (from 5-Why)</label>
             <textarea class="form-input" id="ap_why_rc_${f.id}" rows="2" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical;border-color:#fca5a5" placeholder="Final identified root cause after 5-Why…">${f.rcaRootCause||f.actionPlan?.rootCause||''}</textarea>
           </div>
         </div>
-      </div>
-      <!-- 4M Analysis (collapsible) -->
-      <div style="margin-bottom:12px;border:1px solid #e0e7ff;border-radius:10px;overflow:hidden">
-        <div onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none';this.querySelector('.exp-icon').textContent=this.nextElementSibling.style.display==='none'?'expand_more':'expand_less'"
-          style="background:#eef2ff;padding:10px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;user-select:none">
-          <span class="material-icons" style="font-size:16px;color:#4f46e5">account_tree</span>
-          <span style="font-size:12px;font-weight:700;color:#3730a3;font-family:'Inter',sans-serif;flex:1">4M Root Cause Analysis (Man / Machine / Method / Material)</span>
-          <span class="material-icons exp-icon" style="font-size:18px;color:#6366f1">expand_more</span>
-        </div>
-        <div style="display:none;padding:12px;background:#fafafa">
-          <div style="font-size:11px;color:#6366f1;margin-bottom:10px;font-family:'Inter',sans-serif">Identify which category caused the NC — fill one or more</div>
+
+        <!-- 4M Analysis -->
+        <div>
+          <div style="display:flex;align-items:center;gap:7px;margin-bottom:10px">
+            <span class="material-icons" style="font-size:16px;color:#4f46e5">account_tree</span>
+            <span style="font-size:12px;font-weight:700;color:#3730a3;font-family:'Inter',sans-serif">4M Analysis — Man / Machine / Method / Material</span>
+          </div>
+          <div style="font-size:11px;color:#6366f1;margin-bottom:10px;font-family:'Inter',sans-serif">Identify which M-category caused the NC — fill one or more</div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-            <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px">
-              <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#374151">👤 Man (People / Human)</label>
-              <textarea class="form-input" id="ap_4m_man_${f.id}" rows="2" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical" placeholder="Skill gap, error, fatigue…">${f.rca4M_man||f.actionPlan?.rca4M_man||''}</textarea>
+            <div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;padding:10px">
+              <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#3730a3">👤 Man (People / Human)</label>
+              <textarea class="form-input" id="ap_4m_man_${f.id}" rows="3" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical" placeholder="Skill gap, training, fatigue, error…">${f.rca4M_man||f.actionPlan?.rca4M_man||''}</textarea>
             </div>
-            <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px">
-              <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#374151">⚙️ Machine (Equipment / Tools)</label>
-              <textarea class="form-input" id="ap_4m_machine_${f.id}" rows="2" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical" placeholder="Breakdown, wear, calibration…">${f.rca4M_machine||f.actionPlan?.rca4M_machine||''}</textarea>
+            <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:10px">
+              <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#92400e">⚙️ Machine (Equipment / Tools)</label>
+              <textarea class="form-input" id="ap_4m_machine_${f.id}" rows="3" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical" placeholder="Breakdown, wear, calibration…">${f.rca4M_machine||f.actionPlan?.rca4M_machine||''}</textarea>
             </div>
-            <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px">
-              <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#374151">📋 Method (Process / Procedure)</label>
-              <textarea class="form-input" id="ap_4m_method_${f.id}" rows="2" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical" placeholder="Wrong SOP, missing step, sequence…">${f.rca4M_method||f.actionPlan?.rca4M_method||''}</textarea>
+            <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px">
+              <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#166534">📋 Method (Process / Procedure)</label>
+              <textarea class="form-input" id="ap_4m_method_${f.id}" rows="3" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical" placeholder="Wrong SOP, missing step, sequence…">${f.rca4M_method||f.actionPlan?.rca4M_method||''}</textarea>
             </div>
-            <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px">
-              <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#374151">📦 Material (Inputs / Components)</label>
-              <textarea class="form-input" id="ap_4m_material_${f.id}" rows="2" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical" placeholder="Defective input, wrong spec…">${f.rca4M_material||f.actionPlan?.rca4M_material||''}</textarea>
+            <div style="background:#fdf4ff;border:1px solid #e9d5ff;border-radius:8px;padding:10px">
+              <label class="form-label" style="font-family:'Inter',sans-serif;font-size:11px;color:#6b21a8">📦 Material (Inputs / Components)</label>
+              <textarea class="form-input" id="ap_4m_material_${f.id}" rows="3" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical" placeholder="Defective input, wrong spec…">${f.rca4M_material||f.actionPlan?.rca4M_material||''}</textarea>
             </div>
           </div>
         </div>
@@ -5292,7 +5307,9 @@ async function submitAuditeeActionPlans() {
           const dhuData = dhu.data();
           const dhuDept  = dhuData.department || '';
           const dhuPlant = dhuData.plant || 'All Plants';
-          if (dhuDept === dept2 || dhuPlant === plant2 || dhuPlant === 'All Plants' || dept2 === '') {
+          // Match only the DH for this exact department (and optionally same plant or 'All Plants')
+          const _dhMatch = dhuDept === dept2 && (dhuPlant === plant2 || dhuPlant === 'All Plants' || plant2 === '');
+          if (_dhMatch || dept2 === '') {
             dhBatch.set(db.collection('myActions').doc(), {
               userId      : dhu.id,
               userEmail   : dhuData.email || '',
@@ -5323,7 +5340,8 @@ async function submitAuditeeActionPlans() {
           const dhuData = dhu.data();
           const dhuDept  = dhuData.department || '';
           const dhuPlant = dhuData.plant || 'All Plants';
-          if (dhuDept === dept2 || dhuPlant === plant2 || dhuPlant === 'All Plants' || dept2 === '') {
+          const _dhNotifMatch = dhuDept === dept2 && (dhuPlant === plant2 || dhuPlant === 'All Plants' || plant2 === '');
+          if (_dhNotifMatch || dept2 === '') {
             notifBatch.set(db.collection('notifications').doc(), {
               userId    : dhu.id,
               userEmail : dhuData.email || '',
@@ -5337,6 +5355,26 @@ async function submitAuditeeActionPlans() {
           }
         });
         await notifBatch.commit().catch(()=>{});
+
+        // ── Email each matched Dept Head about the new action plan ───────────
+        const dhEmails = [];
+        deptHeadSnap.docs.forEach(dhu => {
+          const dhuData = dhu.data();
+          const dhuDept  = dhuData.department || '';
+          const dhuPlant = dhuData.plant || 'All Plants';
+          const _dhEmailMatch = dhuDept === dept2 && (dhuPlant === plant2 || dhuPlant === 'All Plants' || plant2 === '');
+          if ((_dhEmailMatch || dept2 === '') && dhuData.email) {
+            dhEmails.push(dhuData.email);
+          }
+        });
+        if (dhEmails.length) {
+          _sendNcEmail(dhEmails,
+            `Action Plan Submitted — Awaiting Your Review (${auditName})`,
+            `<p>Dear Dept Head,</p>
+             <p><strong>${S.userDoc?.name||'Auditee'}</strong> has submitted ${saved} action plan${saved!==1?'s':''} for <strong>${auditName}</strong>. Please review and approve.</p>
+             <p><strong>Department:</strong> ${dept2||'—'} | <strong>Plant:</strong> ${plant2||'—'} | <strong>Audit No:</strong> ${auditNo2||'—'}</p>
+             <p>Log in to QMS Galaxy → My Actions to review the submission.</p>`);
+        }
       }
     }
 
@@ -5835,7 +5873,8 @@ async function openNCDetail(ncId) {
     !nc.department || nc.department===userDept || nc.plant===userPlant ||
     userPlant==='All Plants' || userDept==='' || userDept===nc.department
   );
-  const isMR      = role==='Admin'||role==='superadmin'||role==='Super Admin';
+  const _roleForMR = (role||'').toLowerCase().replace(/[\s_-]/g,'');
+  const isMR      = _roleForMR==='mr'||_roleForMR==='managementrepresentative'||_roleForMR==='plantmr'||role==='Admin'||role==='superadmin'||role==='Super Admin';
   // Auditors are LOCKED from editing after they submit the audit (stage no longer 'Open')
   const auditorCanEdit = isAuditor && stage === 'Open';
 
@@ -6449,6 +6488,34 @@ async function dhInlineApprove(findingIdsCsv, action) {
   if(S.currentModule==='myactions') renderMyActions();
 }
 
+// ── NC email notification helper ─────────────────────────────────────────────
+// Sends an email to one or more recipients about an NC workflow event.
+// Falls back silently if Cloud Functions are not configured.
+async function _sendNcEmail(toEmails, subject, bodyHtml) {
+  if (!toEmails || toEmails.length === 0) return;
+  try {
+    const cfgSnap = await db.collection('appSettings').doc('emailConfig').get().catch(()=>null);
+    const cfg = cfgSnap?.exists ? cfgSnap.data() : {};
+    if (!cfg.gmailAddress || !cfg.gmailAppPwd) return; // email not configured — skip silently
+    const to = [...new Set(toEmails.filter(Boolean))].join(',');
+    const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+      <div style="background:#1e3a5f;padding:16px 24px;border-radius:8px 8px 0 0">
+        <h2 style="color:#fff;margin:0;font-size:18px">QMS Galaxy — NC Update</h2>
+      </div>
+      <div style="background:#f8fafc;padding:20px 24px;border-radius:0 0 8px 8px;border:1px solid #e2e8f0">
+        ${bodyHtml}
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:16px 0">
+        <p style="font-size:11px;color:#94a3b8;margin:0">This is an automated notification from QMS Galaxy. Please log in to take action.</p>
+      </div>
+    </div>`;
+    try {
+      await fnRegion.httpsCallable('sendAuditScheduleEmail')({ to, subject, html, gmailAddress: cfg.gmailAddress, gmailAppPwd: cfg.gmailAppPwd, planIds:[], skipPlanLookup:true });
+    } catch(_) {
+      try { await fnRegion.httpsCallable('sendGenericEmail')({ to, subject, html, gmailAddress: cfg.gmailAddress, gmailAppPwd: cfg.gmailAppPwd }); } catch(_2) {}
+    }
+  } catch(e) { console.warn('_sendNcEmail:', e); }
+}
+
 async function ncApprove(ncId, nextStage, comment){
   const extraComment = document.getElementById('nc_reviewComment')?.value?.trim()||'';
   const currentStage = document.getElementById('ncDetailStage')?.textContent || 'Dept Head Review';
@@ -6462,6 +6529,93 @@ async function ncApprove(ncId, nextStage, comment){
   // Mark the reviewer's myAction for this NC as Completed
   _updateNcMyAction(ncId, 'Completed', nextStage, '');
   showToast(nextStage==='Closed'?'NC Closed ✓':'Approved & forwarded ✓','success');
+
+  // ── Send email notifications ─────────────────────────────────────────────
+  // Fetch the finding to get recipient details
+  const _ncDoc = await db.collection('findings').doc(ncId).get().catch(()=>null);
+  const _nc = _ncDoc?.data()||{};
+  const _approverName = S.userDoc?.name||S.user?.email||'Reviewer';
+  if (nextStage === 'Closed') {
+    // Notify auditee that NC is closed
+    const _toEmails = [_nc.auditeeEmail||_nc.assigneeEmail||''].filter(Boolean);
+    _sendNcEmail(_toEmails,
+      `NC Closed — ${_nc.findingNo||ncId}`,
+      `<p>Dear ${_nc.auditeeName||'Auditee'},</p>
+       <p>Your Non-Conformity <strong>${_nc.findingNo||ncId}</strong> has been <strong style="color:#16a34a">closed</strong> by the MR (${_approverName}).</p>
+       <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`);
+  } else {
+    const _ncPlant = _nc.plant||'';
+    const _ncDept  = _nc.department||'';
+    const _auditeeEmail = _nc.auditeeEmail||_nc.assigneeEmail||'';
+
+    // Fetch the linked audit plan to get the specific auditor email
+    const _planId = _nc.auditId||_nc.auditPlanId||'';
+    let _auditorEmail = '';
+    if (_planId) {
+      const _planDoc = await db.collection('auditPlans').doc(_planId).get().catch(()=>null);
+      if (_planDoc?.exists) {
+        const _pd = _planDoc.data();
+        _auditorEmail = _pd.leadAuditorEmail||_pd.auditorEmail||'';
+      }
+    }
+    // Fallback: if audit plan has no email, try to get from raisedBy uid
+    if (!_auditorEmail && (_nc.raisedBy||_nc.auditorId)) {
+      const _audUid = _nc.raisedBy||_nc.auditorId;
+      const _audDoc = await db.collection('users').doc(_audUid).get().catch(()=>null);
+      if (_audDoc?.exists) _auditorEmail = _audDoc.data().email||'';
+    }
+    // Last resort: use stored auditorEmail field on finding itself
+    if (!_auditorEmail) _auditorEmail = _nc.auditorEmail||'';
+
+    if (nextStage === 'Auditor Review') {
+      // Notify the specific lead auditor of this audit only
+      const _toAuditor = [_auditorEmail].filter(Boolean);
+      _sendNcEmail(_toAuditor,
+        `NC Action Plan Awaiting Your Review — ${_nc.findingNo||ncId}`,
+        `<p>Dear Auditor,</p>
+         <p>The action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been approved by the Dept Head (<strong>${_approverName}</strong>) and is now awaiting your review.</p>
+         <p><strong>Description:</strong> ${_nc.description||''}<br>
+         <strong>Plant:</strong> ${_ncPlant||'—'} | <strong>Dept:</strong> ${_ncDept||'—'} | <strong>Audit:</strong> ${_nc.auditNo||''}</p>
+         <p>Please log in to QMS Galaxy → NC module to review.</p>`);
+      // Notify auditee of progress
+      if (_auditeeEmail) _sendNcEmail([_auditeeEmail],
+        `Your NC Action Plan is Under Auditor Review — ${_nc.findingNo||ncId}`,
+        `<p>Dear ${_nc.auditeeName||'Auditee'},</p>
+         <p>Your action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been approved by the Dept Head and forwarded to the <strong>Auditor</strong> for review.</p>
+         <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`);
+
+    } else if (nextStage === 'MR Review') {
+      // Notify only the MR users whose plant matches this NC's plant
+      const _mrRoles = ['MR','Management Representative','Plant MR','Admin','Super Admin'];
+      Promise.all(_mrRoles.map(r=>db.collection('users').where('role','==',r).get().catch(()=>null))).then(snaps=>{
+        const mrEmails=[];
+        snaps.forEach(s=>{ if(s) s.forEach(d=>{
+          const u=d.data();
+          const uPlant=u.plant||'All Plants';
+          if ((!_ncPlant || uPlant==='All Plants' || uPlant===_ncPlant) && u.email) mrEmails.push(u.email);
+        }); });
+        _sendNcEmail(mrEmails,
+          `NC Action Plan Awaiting MR Approval — ${_nc.findingNo||ncId}`,
+          `<p>Dear MR,</p>
+           <p>The action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been approved by the Auditor (<strong>${_approverName}</strong>) and is now awaiting your final approval.</p>
+           <p><strong>Description:</strong> ${_nc.description||''}<br>
+           <strong>Plant:</strong> ${_ncPlant||'—'} | <strong>Dept:</strong> ${_ncDept||'—'} | <strong>Audit:</strong> ${_nc.auditNo||''}</p>
+           <p>Please log in to QMS Galaxy → NC module to review and close.</p>`);
+      });
+      // Notify auditor & auditee of progress
+      if (_auditorEmail) _sendNcEmail([_auditorEmail],
+        `NC Forwarded to MR — ${_nc.findingNo||ncId}`,
+        `<p>Dear Auditor,</p>
+         <p>NC <strong>${_nc.findingNo||ncId}</strong> has been forwarded to the MR for final approval after your review.</p>
+         <p style="color:#64748b">Audit: ${_nc.auditNo||''}</p>`);
+      if (_auditeeEmail) _sendNcEmail([_auditeeEmail],
+        `Your NC Action Plan is Under MR Review — ${_nc.findingNo||ncId}`,
+        `<p>Dear ${_nc.auditeeName||'Auditee'},</p>
+         <p>Your action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been forwarded to the <strong>MR</strong> for final review and closure.</p>
+         <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`);
+    }
+  }
+
   openNCDetail(ncId);
 }
 
@@ -6480,6 +6634,23 @@ async function ncReturn(ncId, returnToStage){
   // Mark reviewer's myAction Completed; re-open auditee's
   _updateNcMyAction(ncId, 'Completed', returnToStage, comment);
   showToast('Returned to '+returnToStage+' ✓','info');
+
+  // ── Notify auditee by email that their action plan was returned ──────────
+  db.collection('findings').doc(ncId).get().catch(()=>null).then(_rDoc => {
+    const _rNc = _rDoc?.data()||{};
+    const _retEmail = _rNc.auditeeEmail||_rNc.assigneeEmail||'';
+    const _retBy = S.userDoc?.name||S.user?.email||'Reviewer';
+    if (_retEmail) {
+      _sendNcEmail([_retEmail],
+        `NC Action Plan Returned for Revision — ${_rNc.findingNo||ncId}`,
+        `<p>Dear ${_rNc.auditeeName||'Auditee'},</p>
+         <p>Your action plan for NC <strong>${_rNc.findingNo||ncId}</strong> has been <strong style="color:#dc2626">returned</strong> for revision by <strong>${_retBy}</strong>.</p>
+         <p><strong>Reviewer Comment:</strong> ${comment}</p>
+         <p>Please log in to QMS Galaxy, update your action plan, and re-submit.</p>
+         <p style="color:#64748b">Audit: ${_rNc.auditNo||''} | Stage: ${currentStage}</p>`);
+    }
+  });
+
   openNCDetail(ncId);
 }
 
@@ -6532,8 +6703,12 @@ async function _updateNcMyAction(ncId, reviewerStatus, nextStage, returnComment)
       if (nextRole) {
         // Find users with that role (and matching plant/dept where possible)
         let roleQuery = db.collection('users').where('role','==',nextRole);
-        // Also handle "Lead Auditor" role for Auditor Review
-        const altRoles = nextRole==='Auditor' ? ['Auditor','Lead Auditor'] : [nextRole];
+        // Also handle role variants: "Lead Auditor" for Auditor Review, "Management Representative"/"Plant MR" for MR Review
+        const altRoles = nextRole==='Auditor'
+          ? ['Auditor','Lead Auditor']
+          : nextRole==='MR'
+            ? ['MR','Management Representative','Plant MR','Admin','Super Admin']
+            : [nextRole];
         const roleSnaps = await Promise.all(
           altRoles.map(r => db.collection('users').where('role','==',r).get().catch(()=>null))
         );
