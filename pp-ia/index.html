@@ -4635,6 +4635,33 @@ async function openAuditeeActionPlan(planId, auditName) {
         ${f.actionPlan?.rootCause?`<div style="margin-top:6px"><div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em">Root Cause</div><div style="font-size:12px;color:#374151;margin-top:2px">${f.actionPlan.rootCause}</div></div>`:''}
         ${f.actionPlan?.correctiveAction?`<div style="margin-top:6px"><div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em">Corrective Action</div><div style="font-size:12px;color:#374151;margin-top:2px">${f.actionPlan.correctiveAction}</div></div>`:''}
       </div>`).join('');
+    // Check if current user is Dept Head and any findings need their review
+    const _roleNow = (S.role||S.userDoc?.role||'').toLowerCase().replace(/[\s_-]/g,'');
+    const _isDH = _roleNow==='depthead' || _roleNow==='departmenthead' || _roleNow==='superadmin' || _roleNow==='admin' || S.role==='Super Admin' || S.role==='Admin';
+    const dhPendingFindings = submittedFindings.filter(f => f.workflowStage === 'Dept Head Review');
+
+    const dhReviewPanel = (_isDH && dhPendingFindings.length) ? `
+      <div style="background:#ede9fe;border:1.5px solid #a78bfa;border-radius:10px;padding:16px 18px;margin-bottom:16px">
+        <div style="font-size:13px;font-weight:700;color:#4c1d95;margin-bottom:10px">
+          <span class="material-icons" style="font-size:16px;vertical-align:middle;margin-right:4px">supervisor_account</span>
+          Dept Head Review — ${dhPendingFindings.length} finding${dhPendingFindings.length!==1?'s':''} awaiting your decision
+        </div>
+        <div style="margin-bottom:10px">
+          <label style="font-size:12px;font-weight:600;color:#5b21b6;display:block;margin-bottom:4px">Comments (required for Return)</label>
+          <textarea id="dh_inline_comment" rows="2" class="form-input" style="font-size:13px;resize:vertical" placeholder="Add your review comments…"></textarea>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn btn-primary" style="background:#16a34a;border-color:#16a34a;flex:1;min-width:140px"
+            onclick="dhInlineApprove('${planId}','approve')">
+            <span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">check_circle</span>Approve All → Auditor
+          </button>
+          <button class="btn btn-secondary" style="border-color:#dc2626;color:#dc2626;flex:1;min-width:140px"
+            onclick="dhInlineApprove('${planId}','return')">
+            <span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">undo</span>Return to Auditee
+          </button>
+        </div>
+      </div>` : '';
+
     showModal(`<div class="modal-title">
         <span class="material-icons" style="color:#059669">task_alt</span>
         <span style="margin-left:6px">Action Plan — ${auditName}</span>
@@ -4648,6 +4675,7 @@ async function openAuditeeActionPlan(planId, auditName) {
             <div style="font-size:12px;color:#166534;margin-top:2px">Your action plans have been submitted to your HOD for review. You cannot edit them at this stage.</div>
           </div>
         </div>
+        ${dhReviewPanel}
         ${lockedRows}
         <button class="btn btn-secondary" onclick="closeModal()" style="width:100%;margin-top:8px">Close</button>
       </div>`);
@@ -6068,6 +6096,52 @@ function ncAutoSave(ncId){
     }).catch(()=>{});
     if (st) st.textContent = 'Draft saved · ' + new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
   }, 800);
+}
+
+// ─── Dept Head inline approve/return from Action Plan modal ─────────────────
+async function dhInlineApprove(planId, action) {
+  const comment = (document.getElementById('dh_inline_comment')?.value||'').trim();
+  if (action === 'return' && !comment) {
+    showToast('Please enter a comment before returning to Auditee.','error'); return;
+  }
+  const approveBtns = document.querySelectorAll('#dh_inline_comment, #dh_inline_comment ~ div button');
+  approveBtns.forEach(b => { if(b.tagName==='BUTTON') b.disabled=true; });
+
+  // Get findings for this plan at Dept Head Review stage
+  const snap = await db.collection('findings').where('auditId','==',planId).get({ source:'server' }).catch(()=>null)
+    || await db.collection('findings').where('auditPlanId','==',planId).get({ source:'server' }).catch(()=>null);
+  const findingIds = [];
+  if (snap) snap.forEach(d => { if(d.data().workflowStage==='Dept Head Review') findingIds.push(d.id); });
+
+  if (!findingIds.length) { showToast('No findings found at Dept Head Review stage.','error'); return; }
+
+  const nextStage = action === 'approve' ? 'Auditor Review' : 'Auditee Action';
+  const batch = db.batch();
+  findingIds.forEach(fid => {
+    const entry = {
+      stage: 'Dept Head Review',
+      action: action === 'approve' ? 'approved' : 'returned',
+      by: S.uid||'dept-head',
+      byName: S.userDoc?.name || S.email || 'Dept Head',
+      comment: comment || (action==='approve' ? 'Approved by Dept Head' : 'Returned by Dept Head'),
+      ts: firebase.firestore.Timestamp.now(),
+    };
+    batch.update(db.collection('findings').doc(fid), {
+      workflowStage: nextStage,
+      timeline: firebase.firestore.FieldValue.arrayUnion(entry),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      ...(action==='approve'
+        ? { deptHeadApprovedAt: firebase.firestore.FieldValue.serverTimestamp() }
+        : { returnedToDeptAt: firebase.firestore.FieldValue.serverTimestamp(), returnComment: comment }),
+    });
+  });
+  await batch.commit().catch(e=>{ showToast('Error: '+e.message,'error'); return; });
+  const msg = action==='approve'
+    ? `✅ ${findingIds.length} finding${findingIds.length!==1?'s':''} approved → Auditor Review`
+    : `↩ ${findingIds.length} finding${findingIds.length!==1?'s':''} returned to Auditee`;
+  showToast(msg,'success');
+  closeModal();
+  if(S.currentModule==='myactions') renderMyActions();
 }
 
 async function ncApprove(ncId, nextStage, comment){
