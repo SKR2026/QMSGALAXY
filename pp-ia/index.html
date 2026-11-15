@@ -2471,6 +2471,49 @@ async function renderMyActions() {
     allActions = Array.from(dedupMap.values());
   }
 
+  // ── Enrich NC/Finding tasks: live-check workflowStage and auto-complete ────
+  // For DH: if the finding has moved past "Dept Head Review", mark action Completed
+  // For Auditor: if past "Auditor Review", mark Completed. For MR: if Closed, mark Completed.
+  const _roleLC2 = (S.role||'').toLowerCase().replace(/[\s_-]/g,'');
+  const _isDHRole = _roleLC2==='depthead'||_roleLC2==='departmenthead';
+  const _isAuditorRole = _roleLC2==='auditor';
+  const _isMRRole = _roleLC2==='admin'||_roleLC2==='superadmin';
+  const ncTasks = allActions.filter(a => (a.sourceRef||'').startsWith('findings/') && a.status!=='Completed');
+  if (ncTasks.length) {
+    const fIds = [...new Set(ncTasks.map(a => a.sourceRef.split('/')[1]).filter(Boolean))];
+    const fDocs = await Promise.all(fIds.map(fid => db.collection('findings').doc(fid).get().catch(()=>null)));
+    const fMap = {};
+    fDocs.forEach((d,i) => { if(d&&d.exists) fMap[fIds[i]] = d.data(); });
+    const autoCompleteBatch = db.batch();
+    let anyAutoComplete = false;
+    ncTasks.forEach(a => {
+      const fid = (a.sourceRef||'').split('/')[1];
+      const fd = fMap[fid];
+      if (!fd) return;
+      const ws = fd.workflowStage||'Open';
+      const dhStages = ['Auditor Review','MR Review','Closed'];
+      const auditorStages = ['MR Review','Closed'];
+      const shouldComplete =
+        (_isDHRole && dhStages.includes(ws)) ||
+        (_isAuditorRole && auditorStages.includes(ws)) ||
+        (_isMRRole && ws==='Closed');
+      if (shouldComplete) {
+        a.status = 'Completed';
+        a.ncStage = ws;
+        anyAutoComplete = true;
+        // Persist to Firestore so it stays Completed next load
+        autoCompleteBatch.update(db.collection('myActions').doc(a.id), {
+          status: 'Completed', ncStage: ws,
+          completedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      } else {
+        // Update displayed stage pill even if not completing
+        a.ncStage = ws;
+      }
+    });
+    if (anyAutoComplete) autoCompleteBatch.commit().catch(()=>{});
+  }
+
   const isAuditeeUser = (S.role||'').toLowerCase() === 'auditee';
 
   // Count completed before filtering (for the stat card)
