@@ -4207,12 +4207,11 @@ async function submitAuditResponses(planId) {
   }
   // Reset checklist evidence store
   window._clEvidenceFiles = {};
+  // Update plan status — use the actual collection where the plan lives
+  const planColResolved = planCol || 'auditPlans';
   if (findingsBatch.length) {
     await Promise.all(findingsBatch.map(f => db.collection('findings').add(f).catch(()=>{})));
   }
-
-  // Update plan status — use the actual collection where the plan lives
-  const planColResolved = planCol || 'auditPlans';
   await db.collection(planColResolved).doc(planId).update({
     status:'Pending Review',
     completedAt: firebase.firestore.FieldValue.serverTimestamp(),
@@ -4303,10 +4302,10 @@ async function openAuditeeActionPlan(planId, auditName) {
     </div>
     <div style="text-align:center;padding:24px"><div class="spinner" style="width:24px;height:24px;margin:0 auto 8px"></div><div style="font-size:13px;color:var(--text-muted)">Loading findings…</div></div>`);
 
-  // Fetch the audit plan to get plant, auditType, department, and audit date range
+  // Fetch the audit plan — tries lpaAudits first, then auditPlans
   let plan = {};
   if (planId) {
-    const planDoc = await db.collection('auditPlans').doc(planId).get().catch(()=>null);
+    const {doc: planDoc} = await _fetchPlanDoc(planId);
     if (planDoc && planDoc.exists) {
       plan = planDoc.data();
       auditName = plan.name || auditName;
@@ -4314,12 +4313,15 @@ async function openAuditeeActionPlan(planId, auditName) {
   }
 
   // Fetch findings — force server to bypass stale cache (critical for workflowStage lock check)
+  // LPA submits findings to 'findings' collection AND lpaFindings — search both
   const _sv = { source: 'server' };
   const queries = [
     db.collection('findings').where('auditId','==',planId).get(_sv).catch(()=>
       db.collection('findings').where('auditId','==',planId).get().catch(()=>null)),
     db.collection('findings').where('auditPlanId','==',planId).get(_sv).catch(()=>
       db.collection('findings').where('auditPlanId','==',planId).get().catch(()=>null)),
+    db.collection('lpaFindings').where('auditId','==',planId).get(_sv).catch(()=>
+      db.collection('lpaFindings').where('auditId','==',planId).get().catch(()=>null)),
     db.collection('findings').where('auditNo','==', plan.auditNo||'__none__').get(_sv).catch(()=>
       db.collection('findings').where('auditNo','==', plan.auditNo||'__none__').get().catch(()=>null)),
   ];
@@ -4344,8 +4346,8 @@ async function openAuditeeActionPlan(planId, auditName) {
     snap.docs.forEach(d => {
       if (seenFIds.has(d.id)) return;
       const f = {id:d.id,...d.data()};
-      // For the fallback plant+auditType query (idx 3), validate date proximity
-      if (idx === 3 && auditDate) {
+      // For the fallback plant+auditType query (last idx), validate date proximity
+      if (idx >= 4 && auditDate) {
         const fDate = f.createdAt?.toDate ? f.createdAt.toDate() : new Date(f.createdAt||0);
         if (Math.abs(fDate - auditDate) > windowMs) return;
       }
