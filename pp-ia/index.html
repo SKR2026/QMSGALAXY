@@ -6239,21 +6239,106 @@ async function dhInlineApprove(findingIdsCsv, action) {
         : { returnedToDeptAt: firebase.firestore.FieldValue.serverTimestamp(), returnComment: comment }),
     });
   });
-  await batch.commit().catch(e=>{ showToast('Error: '+e.message,'error'); approveBtns.forEach(b=>{if(b.tagName==='BUTTON')b.disabled=false;}); return; });
+  const commitErr = await batch.commit().catch(e=>e);
+  if (commitErr instanceof Error) {
+    showToast('Error: '+commitErr.message,'error');
+    approveBtns.forEach(b=>{ if(b.tagName==='BUTTON') b.disabled=false; });
+    return;
+  }
 
-  // Mark the Dept Head's myAction task as Completed
+  // ── Update myAction statuses ────────────────────────────────────────────────
   try {
-    const maSnap = await db.collection('myActions')
-      .where('userId','==', S.uid||'')
-      .where('type','==','Review Action Plan')
-      .where('status','!=','Completed')
-      .get().catch(()=>null);
-    if (maSnap && !maSnap.empty) {
-      const maBatch = db.batch();
-      maSnap.forEach(d => maBatch.update(d.ref, { status:'Completed', completedAt: firebase.firestore.FieldValue.serverTimestamp() }));
-      await maBatch.commit().catch(()=>{});
+    const maBatch2 = db.batch();
+
+    // 1) Mark DH's own "Review Action Plan" tasks → Completed
+    //    Query by both userId and userEmail to catch all variants
+    const uid = S.uid || S.user?.uid || '';
+    const email = S.email || S.user?.email || '';
+    const [dhSnap1, dhSnap2] = await Promise.all([
+      uid   ? db.collection('myActions').where('userId','==',uid).where('type','==','Review Action Plan').get().catch(()=>null) : Promise.resolve(null),
+      email ? db.collection('myActions').where('userEmail','==',email).where('type','==','Review Action Plan').get().catch(()=>null) : Promise.resolve(null),
+    ]);
+    const dhSeen = new Set();
+    [dhSnap1, dhSnap2].forEach(snap => {
+      if (!snap) return;
+      snap.forEach(d => {
+        if (!dhSeen.has(d.id)) {
+          dhSeen.add(d.id);
+          maBatch2.update(d.ref, {
+            status: 'Completed',
+            completedAt: firebase.firestore.FieldValue.serverTimestamp(),
+            dhAction: action,
+            dhComment: comment||'',
+          });
+        }
+      });
+    });
+
+    if (action === 'return') {
+      // 2) On return: re-open auditee's Action Plan task OR create a new one
+      // Find the auditee for these findings (from the first finding doc)
+      const firstFDoc = await db.collection('findings').doc(findingIds[0]).get().catch(()=>null);
+      const fdata = firstFDoc?.data()||{};
+      const auditeeId    = fdata.auditeeId || fdata.assigneeId || '';
+      const auditeeEmail = fdata.auditeeEmail || '';
+      const auditeeName  = fdata.auditeeName  || fdata.assigneeName || '';
+      const auditName2   = fdata.auditName    || fdata.plant || '';
+      const planId2      = fdata.auditId      || fdata.auditPlanId || '';
+
+      if (auditeeId || auditeeEmail) {
+        // Try to re-open an existing Auditee Action Plan task for this plan
+        // Query by both userId and userEmail (Auditee records may use either)
+        const [aeSnap1, aeSnap2] = await Promise.all([
+          auditeeId    ? db.collection('myActions').where('userId','==',auditeeId).where('type','==','Action Plan Required').get().catch(()=>null) : Promise.resolve(null),
+          auditeeEmail ? db.collection('myActions').where('userEmail','==',auditeeEmail).where('type','==','Action Plan Required').get().catch(()=>null) : Promise.resolve(null),
+        ]);
+        const aeMerged = new Map();
+        [aeSnap1, aeSnap2].forEach(snap => { if(snap) snap.forEach(d => { if(!aeMerged.has(d.id)) aeMerged.set(d.id, d); }); });
+        const aeSnap = { empty: aeMerged.size===0, forEach: cb => aeMerged.forEach(d=>cb(d)) };
+        let reopened = false;
+        if (aeSnap) {
+          aeSnap.forEach(d => {
+            const dd = d.data();
+            if (dd.auditId===planId2 || dd.auditPlanId===planId2 || dd.sourceRef?.includes(planId2)) {
+              maBatch2.update(d.ref, {
+                status: 'Pending',
+                returnComment: comment,
+                returnedAt: firebase.firestore.FieldValue.serverTimestamp(),
+                updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+              });
+              reopened = true;
+            }
+          });
+        }
+        if (!reopened && auditeeId) {
+          // Create a fresh myAction for the auditee
+          maBatch2.set(db.collection('myActions').doc(), {
+            userId: auditeeId, userEmail: auditeeEmail, userName: auditeeName,
+            role: 'Auditee', type: 'Action Plan Required',
+            title: `Action Plan Returned — ${auditName2}`,
+            description: `Your action plan was returned by Dept Head. Please revise and resubmit.${comment ? ' Comment: '+comment : ''}`,
+            status: 'Pending', priority: 'High',
+            auditId: planId2, auditPlanId: planId2,
+            plant: fdata.plant||'', department: fdata.department||'',
+            returnComment: comment,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+            updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+        // In-app notification for auditee
+        db.collection('notifications').add({
+          userId: auditeeId, userEmail: auditeeEmail,
+          type: 'action_plan_returned',
+          title: 'Action Plan Returned by HOD',
+          message: `Your action plan for "${auditName2}" was returned by the Dept Head. ${comment ? 'Comment: '+comment : 'Please revise and resubmit.'}`,
+          read: false,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        }).catch(()=>{});
+      }
     }
-  } catch(e) { /* non-critical */ }
+
+    await maBatch2.commit().catch(()=>{});
+  } catch(e) { console.warn('myAction update error:', e); }
 
   const msg = action==='approve'
     ? `✅ ${findingIds.length} finding${findingIds.length!==1?'s':''} approved → Auditor Review`
