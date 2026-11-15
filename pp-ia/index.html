@@ -2429,6 +2429,21 @@ async function renderMyActions() {
     allActions = [...a2, ...a3];
   }
 
+  // Deduplicate: keep only the latest myAction per (sourceRef + role) combination
+  // This prevents duplicate entries when submitAuditResponses creates a new one on re-submit
+  {
+    const dedupMap = new Map();
+    allActions.forEach(a => {
+      const key = `${a.sourceRef||a.id}|${a.role||a.type||''}`;
+      const existing = dedupMap.get(key);
+      // Keep the one with the most recent createdAt
+      if (!existing || (a.createdAt?.seconds||0) > (existing.createdAt?.seconds||0)) {
+        dedupMap.set(key, a);
+      }
+    });
+    allActions = Array.from(dedupMap.values());
+  }
+
   const isAuditeeUser = (S.role||'').toLowerCase() === 'auditee';
 
   // Count completed before filtering (for the stat card)
@@ -4205,18 +4220,18 @@ async function submitAuditResponses(planId) {
     findingsCount: findingsBatch.length,
   }).catch(()=>{});
 
-  // ── Mark ONLY the Auditor's myActions as Completed (not the Auditee's) ─────
+  // ── Mark the Auditor's own myActions as Completed ────────────────────────
   // sourceRef must match what was stored when the myAction was created
   const sourceRef = `${planColResolved}/${planId}`;
-  const allActionsSnap = await db.collection('myActions').where('sourceRef','==',sourceRef).get().catch(()=>null);
-  if(allActionsSnap && !allActionsSnap.empty){
+  // Query ONLY current user's own records — querying other users' docs violates Firestore rules
+  const myActionsSnap = await db.collection('myActions')
+    .where('userId','==',S.user.uid)
+    .where('sourceRef','==',sourceRef)
+    .get().catch(()=>null);
+  if(myActionsSnap && !myActionsSnap.empty){
     const batch = db.batch();
-    allActionsSnap.docs.forEach(d => {
-      const role = (d.data().role||'').toLowerCase();
-      // Only complete actions belonging to the Auditor role (not Auditee's)
-      if (role !== 'auditee') {
-        batch.update(d.ref,{ status:'Completed', completedAt:firebase.firestore.FieldValue.serverTimestamp() });
-      }
+    myActionsSnap.docs.forEach(d => {
+      batch.update(d.ref,{ status:'Completed', completedAt:firebase.firestore.FieldValue.serverTimestamp() });
     });
     await batch.commit().catch(()=>{});
   }
@@ -4226,19 +4241,10 @@ async function submitAuditResponses(planId) {
   const auditeeName  = plan.auditeeName  || '';
   const auditeeEmail = plan.auditeeEmail || '';
   if (auditeeId || auditeeEmail) {
-    // Check for existing "Action Plan Required" action — use single-field query to avoid composite index
-    const existSnap = auditeeId
-      ? await db.collection('myActions').where('userId','==',auditeeId).where('sourceRef','==',sourceRef).get().catch(()=>null)
-      : await db.collection('myActions').where('userEmail','==',auditeeEmail).where('sourceRef','==',sourceRef).get().catch(()=>null);
-    const alreadyExists = existSnap && !existSnap.empty &&
-      existSnap.docs.some(d => d.data().type === 'Action Plan Required' || d.data().role === 'Auditee');
-    // If found by email but userId is missing, backfill the userId so future queries by uid work
-    if (auditeeId && existSnap && !existSnap.empty) {
-      const bfBatch = db.batch();
-      existSnap.docs.forEach(d => { if (!d.data().userId) bfBatch.update(d.ref, { userId: auditeeId }); });
-      bfBatch.commit().catch(()=>{});
-    }
-    if (!alreadyExists) {
+    // Skip existence check — auditor cannot read auditee's myActions docs (Firestore rules).
+    // Instead use a unique sourceRef+role combination; Firestore 'add' is idempotent via app logic.
+    // We rely on dedup in renderMyActions (same sourceRef + role='Auditee' shown once).
+    {
       await db.collection('myActions').add({
         userId:     auditeeId,
         userEmail:  auditeeEmail,
