@@ -3974,9 +3974,24 @@ async function openAuditChecklist(planId, name, auditType) {
     ? db.collection('auditChecklists').where('auditType','==',resolvedType).limit(200)
     : db.collection('auditChecklists').limit(200);
   const snap = await q.get().catch(()=>null);
+  // For LPA audits: filter by the layer assigned in the plan (planData.layer)
+  const planLayer = resolvedType === 'LPA' ? (planData?.layer || planData?.level || '') : '';
   const cls = snap
     ? snap.docs.map(d=>({id:d.id,...d.data()}))
-        .filter(c => c.active !== false)
+        .filter(c => {
+          if (c.active === false) return false;
+          if (planLayer) {
+            // Match by layer field, or clause field (used as layer in older records)
+            const qLayer = c.layer || c.clause || '';
+            if (!qLayer) return true; // include questions with no layer set
+            // "Layer 1 - Operator" matches if planLayer contains "1" or the word "Operator"
+            const shortNum = planLayer.match(/Layer\s*(\d)/i)?.[1];
+            if (shortNum && qLayer.match(new RegExp('Layer\\s*'+shortNum,'i'))) return true;
+            return qLayer.toLowerCase().includes(planLayer.toLowerCase()) ||
+                   planLayer.toLowerCase().includes(qLayer.toLowerCase());
+          }
+          return true;
+        })
         .sort((a,b)=>(a.clause||'').localeCompare(b.clause||''))
     : [];
 
@@ -4068,7 +4083,7 @@ async function openAuditChecklist(planId, name, auditType) {
       <button onclick="closeModal();S._activeAuditPlanId='';" style="background:none;border:none;cursor:pointer;flex-shrink:0"><span class="material-icons">close</span></button>
     </div>
     ${infoBanner}
-    <p style="font-size:13px;font-weight:500;color:var(--text-secondary);margin-bottom:14px;font-family:'Inter',sans-serif">${cls.length} checklist item${cls.length!==1?'s':''} loaded for <strong style="color:var(--text-primary)">${displayType}</strong></p>
+    <p style="font-size:13px;font-weight:500;color:var(--text-secondary);margin-bottom:14px;font-family:'Inter',sans-serif">${cls.length} checklist item${cls.length!==1?'s':''} loaded for <strong style="color:var(--text-primary)">${displayType}</strong>${planLayer?` · <span style="color:#7c3aed;font-weight:600">${planLayer}</span>`:''}</p>
     ${checklistHtml}
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
       <button class="btn btn-secondary" onclick="closeModal();S._activeAuditPlanId='';">Save Draft</button>
@@ -4174,20 +4189,16 @@ async function submitAuditResponses(planId) {
   const auditeeName  = plan.auditeeName  || '';
   const auditeeEmail = plan.auditeeEmail || '';
   if (auditeeId || auditeeEmail) {
-    // Only skip creation if a "Fill Action Plan" / "Action Plan Required" action already exists for auditee
-    const [existByUid, existByEmail] = await Promise.all([
-      auditeeId
-        ? db.collection('myActions').where('sourceRef','==',sourceRef).where('userId','==',auditeeId).where('type','==','Action Plan Required').get().catch(()=>null)
-        : Promise.resolve(null),
-      auditeeEmail
-        ? db.collection('myActions').where('sourceRef','==',sourceRef).where('userEmail','==',auditeeEmail).where('type','==','Action Plan Required').get().catch(()=>null)
-        : Promise.resolve(null),
-    ]);
-    const alreadyExists = (existByUid && !existByUid.empty) || (existByEmail && !existByEmail.empty);
+    // Check for existing "Action Plan Required" action — use single-field query to avoid composite index
+    const existSnap = auditeeId
+      ? await db.collection('myActions').where('userId','==',auditeeId).where('sourceRef','==',sourceRef).get().catch(()=>null)
+      : await db.collection('myActions').where('userEmail','==',auditeeEmail).where('sourceRef','==',sourceRef).get().catch(()=>null);
+    const alreadyExists = existSnap && !existSnap.empty &&
+      existSnap.docs.some(d => d.data().type === 'Action Plan Required' || d.data().role === 'Auditee');
     // If found by email but userId is missing, backfill the userId so future queries by uid work
-    if (auditeeId && existByEmail && !existByEmail.empty) {
+    if (auditeeId && existSnap && !existSnap.empty) {
       const bfBatch = db.batch();
-      existByEmail.docs.forEach(d => { if (!d.data().userId) bfBatch.update(d.ref, { userId: auditeeId }); });
+      existSnap.docs.forEach(d => { if (!d.data().userId) bfBatch.update(d.ref, { userId: auditeeId }); });
       bfBatch.commit().catch(()=>{});
     }
     if (!alreadyExists) {
@@ -4209,9 +4220,10 @@ async function submitAuditResponses(planId) {
         plant:      plan.plant||'',
         department: plan.department||'',
         dueDate:    null,
+        findingsCount: findingsBatch.length,
         createdAt:  firebase.firestore.FieldValue.serverTimestamp(),
         updatedAt:  firebase.firestore.FieldValue.serverTimestamp(),
-      }).catch(()=>{});
+      }).catch(e=>{ console.error('Auditee myAction create failed:',e); });
     }
   }
 
