@@ -40,11 +40,17 @@ const { onDocumentCreated, onDocumentUpdated } = require('firebase-functions/v2/
 const { onSchedule }      = require('firebase-functions/v2/scheduler');
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
 const { setGlobalOptions } = require('firebase-functions/v2');
-const admin  = require('firebase-admin');
+const { defineSecret }     = require('firebase-functions/params');
+const admin    = require('firebase-admin');
 const { google } = require('googleapis');
+const nodemailer = require('nodemailer');
 
 admin.initializeApp();
 const db = admin.firestore();
+
+// App-Password secrets (used by sendCustomEmail callable + sendEmail fallback)
+const GMAIL_USER     = defineSecret('GMAIL_USER');
+const GMAIL_APP_PASS = defineSecret('GMAIL_APP_PASS');
 
 setGlobalOptions({ region: 'asia-south1', memory: '256MiB', timeoutSeconds: 120 });
 
@@ -82,14 +88,21 @@ async function getGmailClient() {
 }
 
 /**
- * Send an email via Gmail API.
+ * Send an email — tries Gmail OAuth2 first, falls back to App Password via nodemailer.
+ * The App-Password secrets are injected only inside sendCustomEmail (which declares them).
+ * For trigger functions, we try OAuth2; if it fails we log the error (triggers don't have
+ * the secrets in scope, so nodemailer fallback inside triggers is not used).
  * @param {string|string[]} to   recipient(s)
  * @param {string}          subject
  * @param {string}          html  full HTML body
+ * @param {object}          [opts]  { gmailUser, gmailPass } for nodemailer fallback
  */
-async function sendEmail(to, subject, html) {
+async function sendEmail(to, subject, html, opts = {}) {
   const recipients = Array.isArray(to) ? to.join(',') : to;
   if (!recipients) return;
+
+  // ── Method A: Gmail OAuth2 (existing) ──────────────────────────────────────
+  let sent = false;
   try {
     const { gmail, from, fromName } = await getGmailClient();
     const message = [
@@ -103,20 +116,33 @@ async function sendEmail(to, subject, html) {
     ].join('\r\n');
     const raw = Buffer.from(message).toString('base64url');
     await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
-    // Log success
-    await db.collection('emailLogs').add({
-      to: recipients, subject,
-      status: 'sent',
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  } catch (err) {
-    console.error('sendEmail failed:', err.message);
-    await db.collection('emailLogs').add({
-      to: recipients, subject,
-      status: 'failed', error: err.message,
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    sent = true;
+  } catch (oauthErr) {
+    console.warn('sendEmail OAuth2 failed:', oauthErr.message);
   }
+
+  // ── Method B: nodemailer + App Password fallback ────────────────────────────
+  if (!sent && opts.gmailUser && opts.gmailPass) {
+    try {
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: opts.gmailUser, pass: opts.gmailPass },
+      });
+      await transporter.sendMail({
+        from: `"Group Audit System" <${opts.gmailUser}>`,
+        to: recipients, subject, html,
+      });
+      sent = true;
+    } catch (appPassErr) {
+      console.error('sendEmail App-Password fallback failed:', appPassErr.message);
+    }
+  }
+
+  await db.collection('emailLogs').add({
+    to: recipients, subject,
+    status: sent ? 'sent' : 'failed',
+    sentAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -900,3 +926,280 @@ exports.rollbackChecklistVersion = onCall(async (request) => {
   await db.collection('checklistUploadLogs').doc(logId).update({ status: 'rolled_back', rolledBackAt: admin.firestore.FieldValue.serverTimestamp() });
   return { deleted };
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TRIGGER 5 — Finding workflowStage → Dept Head Review → email Dept Head
+// ═══════════════════════════════════════════════════════════════════════════
+exports.onFindingWorkflowUpdated = onDocumentUpdated('findings/{findingId}', async (event) => {
+  const before = event.data.before.data();
+  const after  = event.data.after.data();
+  if (!before || !after) return;
+
+  const movedToDeptHead = before.workflowStage !== 'Dept Head Review' && after.workflowStage === 'Dept Head Review';
+  const movedToAuditor  = before.workflowStage !== 'Auditor Review'   && after.workflowStage === 'Auditor Review';
+  const movedToMR       = before.workflowStage !== 'MR Review'        && after.workflowStage === 'MR Review';
+  const movedToClosed   = before.workflowStage !== 'Closed'           && after.workflowStage === 'Closed';
+
+  const dept  = after.department || '';
+  const plant = after.plant      || '';
+  const findingNo = after.findingNo || event.params.findingId.slice(-6).toUpperCase();
+  const auditName = after.auditName || after.auditId || '—';
+
+  // ── A. Auditee submitted → Dept Head needs to review ─────────────────────
+  if (movedToDeptHead) {
+    const deptHeadSnap = await db.collection('users').where('role', '==', 'Dept Head').get().catch(() => null);
+    if (deptHeadSnap && !deptHeadSnap.empty) {
+      const promises = [];
+      for (const dhu of deptHeadSnap.docs) {
+        const dhuData  = dhu.data();
+        const dhuDept  = dhuData.department || '';
+        const dhuPlant = dhuData.plant || 'All Plants';
+        const matches  = !dept || dhuDept === dept || dhuPlant === plant || dhuPlant === 'All Plants';
+        if (!matches || !dhuData.email) continue;
+
+        const ap = after.actionPlan || {};
+        const html = emailWrapper(
+          `Action Plan Ready for Review — ${findingNo}`,
+          `Auditee has submitted action plan for finding ${findingNo}. Your review is required.`,
+          `<p class="para">Dear ${dhuData.name || 'Dept Head'},</p>
+           <p class="para">An auditee has submitted their <strong>Action Plan</strong> for the following finding. Please review and approve or return it.</p>
+           <div class="kv">
+             <div class="kv-row"><span class="kv-label">Finding No.</span><span class="kv-val">${findingNo}</span></div>
+             <div class="kv-row"><span class="kv-label">Audit</span><span class="kv-val">${auditName}</span></div>
+             <div class="kv-row"><span class="kv-label">Plant</span><span class="kv-val">${plant || '—'}</span></div>
+             <div class="kv-row"><span class="kv-label">Department</span><span class="kv-val">${dept || '—'}</span></div>
+             <div class="kv-row"><span class="kv-label">Auditee</span><span class="kv-val">${after.auditeeName || '—'}</span></div>
+           </div>
+           ${ap.rootCause ? `<div class="alert-box alert-blue">📋 <strong>Root Cause:</strong> ${ap.rootCause}</div>` : ''}
+           ${ap.correctiveAction ? `<div class="alert-box alert-blue">🔧 <strong>Corrective Action:</strong> ${ap.correctiveAction}</div>` : ''}
+           <p class="para">You can review and approve directly from the button below — <strong>no login required</strong>. The link is valid for 30 days.</p>
+           <div class="btn-wrap">
+             ${after.deptHeadReviewUrl
+               ? `<a class="btn" href="${after.deptHeadReviewUrl}">Review Action Plan (No Login) →</a>`
+               : `<a class="btn" href="${BRAND.appUrl}">Review Action Plan →</a>`}
+           </div>
+           ${after.deptHeadReviewUrl ? `<p style="font-size:11px;color:#94a3b8;text-align:center;margin-top:6px">Or <a href="${BRAND.appUrl}" style="color:#94a3b8">log in to the portal</a> to review</p>` : ''}`
+        );
+        promises.push(sendEmail(dhuData.email, `[Action Required] Review Action Plan — ${findingNo}`, html));
+        promises.push(notify(dhu.id, `Action plan submitted by auditee for finding ${findingNo}. Please review.`, 'info', BRAND.appUrl));
+      }
+      await Promise.allSettled(promises);
+    }
+  }
+
+  // ── B. Dept Head approved → Auditor needs to review ──────────────────────
+  if (movedToAuditor) {
+    const auditorId = after.raisedBy || after.auditorId || '';
+    if (auditorId) {
+      const userSnap = await db.collection('users').doc(auditorId).get().catch(() => null);
+      const email    = userSnap?.data()?.email;
+      const name     = userSnap?.data()?.name || 'Auditor';
+      if (email) {
+        const html = emailWrapper(
+          `Dept Head Approved — Your Review Required: ${findingNo}`,
+          `Dept Head has approved the action plan for ${findingNo}. Please review.`,
+          `<p class="para">Dear ${name},</p>
+           <p class="para">The Dept Head has <strong>approved</strong> the action plan for the following finding. It is now pending your review.</p>
+           <div class="kv">
+             <div class="kv-row"><span class="kv-label">Finding No.</span><span class="kv-val">${findingNo}</span></div>
+             <div class="kv-row"><span class="kv-label">Audit</span><span class="kv-val">${auditName}</span></div>
+             <div class="kv-row"><span class="kv-label">Plant / Dept</span><span class="kv-val">${plant} / ${dept || '—'}</span></div>
+             <div class="kv-row"><span class="kv-label">Auditee</span><span class="kv-val">${after.auditeeName || '—'}</span></div>
+           </div>
+           <div class="btn-wrap"><a class="btn" href="${BRAND.appUrl}">Review & Approve →</a></div>`
+        );
+        await sendEmail(email, `[Action Required] Auditor Review — ${findingNo}`, html);
+        await notify(auditorId, `Dept Head approved action plan for ${findingNo}. Your review required.`, 'info', BRAND.appUrl);
+      }
+    }
+  }
+
+  // ── C. Auditor approved → MR needs to review ─────────────────────────────
+  if (movedToMR) {
+    const adminEmails = await getAdminEmails(plant);
+    const html = emailWrapper(
+      `Auditor Approved — MR Review Required: ${findingNo}`,
+      `Action plan for finding ${findingNo} needs MR final approval.`,
+      `<p class="para">Dear Management Representative,</p>
+       <p class="para">The Auditor has <strong>approved</strong> the action plan for finding <strong>${findingNo}</strong>. It is now pending your final review and closure.</p>
+       <div class="kv">
+         <div class="kv-row"><span class="kv-label">Finding No.</span><span class="kv-val">${findingNo}</span></div>
+         <div class="kv-row"><span class="kv-label">Audit</span><span class="kv-val">${auditName}</span></div>
+         <div class="kv-row"><span class="kv-label">Plant / Dept</span><span class="kv-val">${plant} / ${dept || '—'}</span></div>
+       </div>
+       <div class="btn-wrap"><a class="btn" href="${BRAND.appUrl}">Final Approval →</a></div>`
+    );
+    await Promise.allSettled(adminEmails.map(e => sendEmail(e, `[Action Required] MR Final Approval — ${findingNo}`, html)));
+  }
+
+  // ── D. NC Closed → notify auditee ────────────────────────────────────────
+  if (movedToClosed) {
+    const auditeeId = after.auditeeId || '';
+    if (auditeeId) {
+      const userSnap = await db.collection('users').doc(auditeeId).get().catch(() => null);
+      const email    = userSnap?.data()?.email;
+      const name     = userSnap?.data()?.name || 'Auditee';
+      if (email) {
+        const html = emailWrapper(
+          `NC Closed: ${findingNo}`,
+          `Finding ${findingNo} has been closed. No further action required.`,
+          `<p class="para">Dear ${name},</p>
+           <p class="para">🎉 The following finding has been <strong>reviewed, approved, and officially closed</strong>. No further action is required from you.</p>
+           <div class="kv">
+             <div class="kv-row"><span class="kv-label">Finding No.</span><span class="kv-val">${findingNo}</span></div>
+             <div class="kv-row"><span class="kv-label">Audit</span><span class="kv-val">${auditName}</span></div>
+             <div class="kv-row"><span class="kv-label">Plant / Dept</span><span class="kv-val">${plant} / ${dept || '—'}</span></div>
+           </div>
+           <div class="alert-box alert-green">✅ <strong>Status: Closed</strong> — Your corrective action has been accepted.</div>
+           <div class="btn-wrap"><a class="btn" href="${BRAND.appUrl}">View Record →</a></div>`
+        );
+        await sendEmail(email, `✅ NC Closed — ${findingNo}`, html);
+        await notify(auditeeId, `Finding ${findingNo} has been closed. Well done!`, 'success', BRAND.appUrl);
+      }
+    }
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TRIGGER 6 — LPA Audit Plan Created → notify lead auditor
+//  (mirrors onAuditPlanCreated but for the lpaAudits collection)
+// ═══════════════════════════════════════════════════════════════════════════
+exports.onLPAAuditPlanCreated = onDocumentCreated('lpaAudits/{planId}', async (event) => {
+  const plan   = event.data.data();
+  const planId = event.params.planId;
+  if (!plan || !plan.leadAuditorId) return;
+
+  // myAction for lead auditor
+  await db.collection('myActions').add({
+    userId:    plan.leadAuditorId,
+    userName:  plan.leadAuditorName || '',
+    type:      'audit',
+    title:     `Conduct Audit: ${plan.name}`,
+    sourceId:  planId,
+    sourceRef: `lpaAudits/${planId}`,
+    auditType: plan.auditType || 'LPA',
+    auditNo:   plan.auditNo || '',
+    plant:     plan.plant,
+    department: plan.department || '',
+    dueDate:   plan.plannedDate,
+    priority:  'Medium',
+    status:    'Pending',
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // Email lead auditor
+  const userSnap = await db.collection('users').doc(plan.leadAuditorId).get().catch(() => null);
+  const email    = userSnap?.data()?.email;
+  if (email) {
+    await sendEmail(email,
+      `Audit Scheduled: ${plan.name}`,
+      tplAuditScheduled({
+        auditName:   plan.name,
+        auditType:   plan.auditType || 'LPA',
+        plant:       plan.plant,
+        dept:        plan.department,
+        auditorName: plan.leadAuditorName || 'Auditor',
+        plannedDate: fmtDate(plan.plannedDate),
+        scope:       plan.scope,
+      })
+    );
+    await notify(plan.leadAuditorId, `You are assigned as Lead Auditor for "${plan.name}"`, 'info');
+  }
+});
+
+
+
+// ─── Dept Head Magic Link Approve / Return (passwordless) ─────────────────────
+exports.deptHeadMagicApprove = onCall(async (request) => {
+  const { token, action, comment } = request.data || {};
+  if (!token)  throw new HttpsError('invalid-argument', 'token is required');
+  if (!action) throw new HttpsError('invalid-argument', 'action is required (approve | return)');
+
+  const tokenRef = db.collection('deptHeadReviewLinks').doc(token);
+  const tokenDoc = await tokenRef.get().catch(() => null);
+  if (!tokenDoc || !tokenDoc.exists) throw new HttpsError('not-found', 'Invalid review link.');
+
+  const tdata   = tokenDoc.data();
+  const expiry  = tdata.expiresAt?.toDate?.() || new Date(0);
+  if (expiry < new Date())  throw new HttpsError('deadline-exceeded', 'Review link has expired.');
+  if (tdata.used)           throw new HttpsError('already-exists',    'This link has already been used.');
+
+  const nextStage   = action === 'approve' ? 'Auditor Review' : 'Auditee Action';
+  const findingIds  = tdata.findingIds || [];
+
+  const batch = db.batch();
+  for (const fid of findingIds) {
+    const timelineEntry = {
+      stage  : 'Dept Head Review',
+      action : action === 'approve' ? 'approved' : 'returned',
+      by     : 'dept-head-magic-link',
+      byName : 'Dept Head (via email link)',
+      comment: comment || (action === 'approve' ? 'Approved via email link' : 'Returned via email link'),
+      ts     : admin.firestore.Timestamp.now(),
+    };
+    batch.update(db.collection('findings').doc(fid), {
+      workflowStage: nextStage,
+      timeline     : admin.firestore.FieldValue.arrayUnion(timelineEntry),
+      updatedAt    : admin.firestore.FieldValue.serverTimestamp(),
+      ...(action === 'approve'
+        ? { deptHeadApprovedAt: admin.firestore.FieldValue.serverTimestamp() }
+        : { returnedToDeptAt:   admin.firestore.FieldValue.serverTimestamp(), returnComment: comment }),
+    });
+  }
+  // Mark token as used
+  batch.update(tokenRef, {
+    used    : true,
+    usedAt  : admin.firestore.FieldValue.serverTimestamp(),
+    action,
+  });
+  await batch.commit();
+  return { success: true, nextStage, findingCount: findingIds.length };
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CALLABLE — sendCustomEmail
+//  Accepts { to, subject, html } and sends via Gmail App Password.
+//  Called by the client for NC workflow emails (branded HTML templates).
+//  Uses GMAIL_USER + GMAIL_APP_PASS secrets (already in Secret Manager).
+// ═══════════════════════════════════════════════════════════════════════════
+exports.sendCustomEmail = onCall(
+  { secrets: [GMAIL_USER, GMAIL_APP_PASS] },
+  async (request) => {
+    if (!request.auth) throw new HttpsError('unauthenticated', 'Authentication required.');
+
+    const { to, subject, html } = request.data || {};
+    if (!to)      throw new HttpsError('invalid-argument', 'Missing "to".');
+    if (!subject) throw new HttpsError('invalid-argument', 'Missing "subject".');
+    if (!html)    throw new HttpsError('invalid-argument', 'Missing "html".');
+
+    const toList = Array.isArray(to) ? to.filter(Boolean) : [to];
+    if (!toList.length) throw new HttpsError('invalid-argument', '"to" has no valid addresses.');
+
+    const gmailUser = GMAIL_USER.value();
+    const gmailPass = GMAIL_APP_PASS.value();
+
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: gmailUser, pass: gmailPass },
+    });
+
+    await transporter.sendMail({
+      from   : `"Group Audit System" <${gmailUser}>`,
+      to     : toList.join(', '),
+      subject,
+      html,
+    });
+
+    // Log
+    await db.collection('emailLogs').add({
+      to     : toList.join(', '),
+      subject,
+      status : 'sent',
+      method : 'sendCustomEmail',
+      sentBy : request.auth.uid || '',
+      sentAt : admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return { success: true, recipients: toList.length };
+  }
+);
