@@ -3366,9 +3366,84 @@ async function _saveAuditPlanEdit(id) {
     updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
   };
   if (dateVal) updates.plannedDate = firebase.firestore.Timestamp.fromDate(new Date(dateVal));
+  // Fetch old status before update (to detect change)
+  const _oldSnap = await db.collection('auditPlans').doc(id).get().catch(()=>null);
+  const _oldStatus = _oldSnap?.exists ? (_oldSnap.data().status||'') : '';
+  const _oldAuditData = _oldSnap?.exists ? _oldSnap.data() : {};
+
   await db.collection('auditPlans').doc(id).update(updates).catch(e=>{ showToast('Error: '+e.message,'error'); return; });
   showToast('Audit plan updated','success');
   logActivity('Updated audit plan: '+name,'Planning',id);
+
+  // ── Notify concerned members when audit status changes ───────────────────
+  if (status && status !== _oldStatus) {
+    const _auditName  = name || _oldAuditData.name || '';
+    const _plant      = updates.plant || _oldAuditData.plant || '';
+    const _dept       = updates.department || _oldAuditData.department || '';
+    const _auditorEmail = _oldAuditData.leadAuditorEmail || '';
+    const _auditorId    = _oldAuditData.leadAuditorId    || '';
+    const _auditeeEmail = _oldAuditData.auditeeEmail     || '';
+    const _auditeeId    = _oldAuditData.auditeeId        || '';
+    const _byName       = S.userDoc?.name || S.user?.email || 'Admin';
+
+    const _statusMsg = `Audit <strong>${_auditName}</strong> status changed from <strong>${_oldStatus||'—'}</strong> to <strong>${status}</strong> by ${_byName}.`;
+    const _notifBase = { type: 'audit_status_change', sourceRef: `auditPlans/${id}`, read: false, createdAt: firebase.firestore.FieldValue.serverTimestamp() };
+
+    // Collect all recipients: auditor + auditee + MR/Plant Admin
+    const _statusRecipients = [];
+    if (_auditorEmail) _statusRecipients.push({ id: _auditorId, email: _auditorEmail, name: _oldAuditData.leadAuditorName||_auditorEmail, role: 'Auditor' });
+    if (_auditeeEmail) _statusRecipients.push({ id: _auditeeId, email: _auditeeEmail, name: _oldAuditData.auditeeName||_auditeeEmail, role: 'Auditee' });
+
+    // Add MR / Plant Admin
+    try {
+      const _mrRoles3 = ['MR','Plant Admin','Management Representative','Quality Manager'];
+      const _mrSnaps3 = await Promise.all(_mrRoles3.map(r => db.collection('users').where('role','==',r).get().catch(()=>null)));
+      _mrSnaps3.forEach(s => {
+        if (!s) return;
+        s.forEach(d => {
+          const dd = d.data();
+          const dp = dd.plant || 'All Plants';
+          if (!_plant || dp === _plant || dp === 'All Plants') {
+            if (dd.email && !_statusRecipients.find(r => r.email === dd.email)) {
+              _statusRecipients.push({ id: d.id, email: dd.email, name: dd.name||dd.email, role: dd.role||'MR' });
+            }
+          }
+        });
+      });
+    } catch(_e3) { console.warn('MR lookup failed:', _e3?.message||_e3); }
+
+    // Write in-app notifications
+    if (_statusRecipients.length) {
+      const _snb = db.batch();
+      _statusRecipients.forEach(u => {
+        _snb.set(db.collection('notifications').doc(), {
+          ..._notifBase,
+          userId   : u.id,
+          userEmail: u.email,
+          title    : `Audit Status Updated — ${_auditName}`,
+          message  : `Audit "${_auditName}" status changed to "${status}" by ${_byName}.`,
+        });
+      });
+      _snb.commit().catch(()=>{});
+
+      // Send email to all recipients
+      const _allEmails3 = _statusRecipients.map(u => u.email).filter(Boolean);
+      if (_allEmails3.length) {
+        _sendNcEmail(
+          _allEmails3,
+          `[Audit Status Update] ${_auditName} — ${status}`,
+          _ncEmailHtml('mr',
+            `Audit Status Changed to "${status}"`,
+            _statusMsg,
+            { audit: _auditName, plant: _plant, dept: _dept, byName: _byName }
+          ),
+          null, id,
+          { title: `Audit Status Updated — ${_auditName}`, message: `Status changed to "${status}" by ${_byName}.`, type: 'audit_status_change', sourceRef: `auditPlans/${id}` }
+        ).catch(()=>{});
+      }
+    }
+  }
+
   closeModal();
   renderPlanning();
 }
@@ -4631,7 +4706,75 @@ async function submitAuditResponses(planId) {
       read:      false,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
     }).catch(()=>{});
+
+    // ── Email the Auditee ─────────────────────────────────────────────────
+    if (auditeeEmail) {
+      _sendNcEmail(
+        [auditeeEmail],
+        `[Action Required] Fill Action Plan — ${plan.name||'Audit'}`,
+        _ncEmailHtml('auditee',
+          'Action Plan Required',
+          `The audit <strong>${plan.name||''}</strong> has been conducted by ${S.userDoc?.name||'Auditor'}. Please log in to fill your corrective action plan.`,
+          { audit: plan.name||'', plant: plan.plant||'', dept: plan.department||'', byName: S.userDoc?.name||S.user?.email||'' }
+        ),
+        null, planId,
+        { title: 'Action Plan Required', message: `Audit "${plan.name||''}" conducted. Please fill your corrective action plan.`, type: 'action_plan_required', sourceRef }
+      ).catch(()=>{});
+    }
   }
+
+  // ── Notify MR / Plant Admin that audit is Pending Review ─────────────────
+  try {
+    const _mrRoles2 = ['MR','Plant Admin','Management Representative','Quality Manager'];
+    const _mrSnaps2 = await Promise.all(
+      _mrRoles2.map(r => db.collection('users').where('role','==',r).get().catch(()=>null))
+    );
+    const _mrEmails2 = [];
+    const _mrUserIds2 = [];
+    _mrSnaps2.forEach(s => {
+      if (!s) return;
+      s.forEach(d => {
+        const dd = d.data();
+        const dp = dd.plant || 'All Plants';
+        if (!plan.plant || dp === plan.plant || dp === 'All Plants') {
+          if (dd.email && !_mrEmails2.includes(dd.email)) {
+            _mrEmails2.push(dd.email);
+            _mrUserIds2.push({ id: d.id, email: dd.email, name: dd.name||dd.email });
+          }
+        }
+      });
+    });
+    if (_mrEmails2.length) {
+      // In-app notifications for MR/Plant Admin
+      const _mrNotifBatch = db.batch();
+      _mrUserIds2.forEach(u => {
+        _mrNotifBatch.set(db.collection('notifications').doc(), {
+          userId    : u.id,
+          userEmail : u.email,
+          title     : `Audit Pending Review — ${plan.name||''}`,
+          message   : `Audit "${plan.name||''}" has been submitted by ${S.userDoc?.name||'Auditor'} and is pending review.`,
+          type      : 'audit_pending_review',
+          sourceRef,
+          read      : false,
+          createdAt : firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+      await _mrNotifBatch.commit().catch(()=>{});
+
+      // Email MR/Plant Admin
+      _sendNcEmail(
+        _mrEmails2,
+        `[Audit Pending Review] ${plan.name||'Audit'} — ${plan.plant||''}`,
+        _ncEmailHtml('mr',
+          'Audit Submitted — Pending Review',
+          `Audit <strong>${plan.name||''}</strong> has been conducted by ${S.userDoc?.name||'Auditor'} and is now <strong>Pending Review</strong>. ${findingsBatch.length} finding(s) were raised.`,
+          { audit: plan.name||'', plant: plan.plant||'', dept: plan.department||'', byName: S.userDoc?.name||S.user?.email||'' }
+        ),
+        null, planId,
+        { title: `Audit Pending Review — ${plan.name||''}`, message: `Audit "${plan.name||''}" submitted by ${S.userDoc?.name||'Auditor'}. ${findingsBatch.length} finding(s).`, type: 'audit_pending_review', sourceRef }
+      ).catch(()=>{});
+    }
+  } catch(_mrErr2) { console.warn('MR/Admin progress notification failed:', _mrErr2?.message||_mrErr2); }
 
   S._activeAuditPlanId = '';
   closeModal();
