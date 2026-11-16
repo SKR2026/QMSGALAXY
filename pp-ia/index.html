@@ -6983,15 +6983,48 @@ async function _sendNcEmail(toEmails, subject, bodyHtml, ncId, auditPlanId, noti
   }).catch(()=>{});
 
   // ── Strategy 1: sendCustomEmail CF (primary — Gmail App Password) ────────
+  // Fetch Gmail credentials from appSettings — required by the CF to authenticate
   let emailSent = false;
   try {
-    const _fn = fnRegion.httpsCallable('sendCustomEmail');
-    await _fn({ to: uniqueEmails, subject: subject || 'Audit NC Notification', html: bodyHtml || `<p>${subject}</p>` });
-    _logRef.update({ status:'sent', method:'sendCustomEmail' }).catch(()=>{});
-    emailSent = true;
+    const _cfgSnap = await db.collection('appSettings').doc('emailConfig').get().catch(()=>null);
+    const _cfg = _cfgSnap?.data() || {};
+    const _gmailAddr = _cfg.gmailAddress || '';
+    const _gmailPwd  = _cfg.gmailAppPwd  || '';
+    if (!_gmailAddr || !_gmailPwd) {
+      console.warn('_sendNcEmail: Gmail credentials not configured in appSettings/emailConfig — skipping CF call');
+      _logRef.update({ status:'skipped', error:'Gmail credentials not configured' }).catch(()=>{});
+    } else {
+      const _fn = fnRegion.httpsCallable('sendCustomEmail');
+      await _fn({
+        to: uniqueEmails,
+        subject: subject || 'Audit NC Notification',
+        html: bodyHtml || `<p>${subject}</p>`,
+        gmailAddress: _gmailAddr,
+        gmailAppPwd:  _gmailPwd,
+      });
+      _logRef.update({ status:'sent', method:'sendCustomEmail' }).catch(()=>{});
+      emailSent = true;
+    }
   } catch(e) {
     console.warn('sendCustomEmail CF failed:', e?.message||e);
-    _logRef.update({ status:'failed', error: e?.message||String(e) }).catch(()=>{});
+    // ── Fallback: try sendGenericEmail ──────────────────────────────────────
+    try {
+      const _cfgSnap2 = await db.collection('appSettings').doc('emailConfig').get().catch(()=>null);
+      const _cfg2 = _cfgSnap2?.data() || {};
+      const _fn2 = fnRegion.httpsCallable('sendGenericEmail');
+      await _fn2({
+        to: uniqueEmails,
+        subject: subject || 'Audit NC Notification',
+        html: bodyHtml || `<p>${subject}</p>`,
+        gmailAddress: _cfg2.gmailAddress || '',
+        gmailAppPwd:  _cfg2.gmailAppPwd  || '',
+      });
+      _logRef.update({ status:'sent', method:'sendGenericEmail' }).catch(()=>{});
+      emailSent = true;
+    } catch(e2) {
+      console.warn('sendGenericEmail CF also failed:', e2?.message||e2);
+      _logRef.update({ status:'failed', error: e?.message||String(e) }).catch(()=>{});
+    }
   }
 
   // ── Strategy 2: In-app notifications (ALWAYS — mirrors price-approval pattern) ─
