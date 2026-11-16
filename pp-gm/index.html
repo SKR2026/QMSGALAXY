@@ -5,6 +5,8 @@
 <title>Gift Management System</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 .hidden{display:none!important}
@@ -85,6 +87,13 @@ tr:hover td{background:#fafbfc}
 /* Masters */
 .masters-tabs{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:12px}
 .masters-tabs button{padding:7px 14px;font-size:12px}
+/* Toggle switch */
+.toggle-switch{position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0}
+.toggle-switch input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#cbd5e1;border-radius:24px;transition:.3s}
+.toggle-slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
+.toggle-switch input:checked+.toggle-slider{background:var(--primary)}
+.toggle-switch input:checked+.toggle-slider:before{transform:translateX(20px)}
 .master-section{display:none}.master-section.active{display:block}
 .master-add-form{background:var(--bg);border-radius:8px;padding:12px 14px;margin-bottom:12px;border:1px solid var(--border)}
 .master-add-form h4{font-size:13px;margin-bottom:10px;color:var(--text)}
@@ -446,7 +455,7 @@ tr:hover td{background:#fafbfc}
             <div class="kpi-reg-field"></div>
             <div class="kpi-reg-field" id="regDeptWrap"><label id="regDeptLabel">Department *</label><select class="bio-input-sm" id="regDepartment" required><option value="">Select dept</option></select></div>
             <div class="kpi-reg-field" id="regPlantWrap"><label id="regPlantLabel">Plant *</label><select class="bio-input-sm" id="regPlant" required><option value="">Select plant</option></select></div>
-            <div class="kpi-reg-field" style="grid-column:1/-1"><label>Email *</label><input class="bio-input-sm" id="regEmail" type="email" required placeholder="you@company.com" autocomplete="email"></div>
+            <div class="kpi-reg-field" style="grid-column:1/-1"><label>Email *</label><input class="bio-input-sm" id="regEmail" type="email" required placeholder="you@company.com" autocomplete="email"><small id="regEmailHint" style="color:var(--muted);font-size:11px;margin-top:3px;display:block"></small></div>
             <div class="kpi-reg-field" style="grid-column:1/-1"><label>Password * (min 6 chars)</label><input class="bio-input-sm" id="regPassword" type="password" minlength="6" required placeholder="Choose a strong password" autocomplete="new-password"></div>
           </div>
           <button class="bio-signin-btn" type="submit" id="regSubmitBtn">
@@ -511,6 +520,7 @@ firebase.initializeApp({
 const auth=firebase.auth(), db=firebase.firestore(), storage=firebase.storage();
 let currentUser=null, profile=null;
 let BRANDING={logoBase64:null};
+let SETTINGS={allowDummyRequests:false};
 // In-memory master caches (refreshed on login & after mutations)
 let PLANTS={}, DEPTS={}, ORGS={}, GCATS=[];
 const charts={};
@@ -614,6 +624,10 @@ async function handleRegister(e){
   const btn=$("regSubmitBtn");btn.disabled=true;btn.textContent="Creating account…";
   try{
     const code=$("regCode").value.trim(), email=$("regEmail").value.trim();
+    // Email domain restriction
+    const allowedDomain=BRANDING.allowedEmailDomain||"";
+    if(allowedDomain&&!email.toLowerCase().endsWith("@"+allowedDomain))
+      throw new Error(`Only @${allowedDomain} email addresses are allowed to register.`);
     // Create Firebase Auth user first (Firebase itself blocks duplicate emails)
     const cred=await auth.createUserWithEmailAndPassword(email,$("regPassword").value);
     // Check duplicate employee code after auth (now signed in, so read is allowed)
@@ -661,6 +675,14 @@ async function loadMasters(){
   }
   // Apply role-based plant/dept rules after dropdowns are populated
   onRegRoleChange();
+  // Show email domain hint if restriction is set
+  const hint=$("regEmailHint");
+  if(hint){
+    const d=BRANDING.allowedEmailDomain||"";
+    hint.textContent=d?`Only @${d} addresses allowed`:"";
+    const emailInput=$("regEmail");
+    if(d)emailInput.placeholder=`you@${d}`;
+  }
 }
 
 /* ═══ Auth state ═══ */
@@ -685,7 +707,7 @@ auth.onAuthStateChanged(async user=>{
       loginMsg("Your account is pending activation. Please contact your Plant Admin.","error");
       return;
     }
-    await loadAllMasters();
+    await Promise.all([loadAllMasters(), loadAppSettings()]);
     $("loginOverlay").classList.add("hidden");
     $("mainHeader").style.display="flex";
     $("appPanel").classList.remove("hidden");
@@ -758,7 +780,16 @@ async function renderDashboard(){
     const pending=all.filter(r=>["pending_plant_review","pending_top_management","returned"].includes(r.status)).length;
     const approved=all.filter(r=>["approved","partially_approved"].includes(r.status)).length;
     const distributed=all.filter(r=>r.status==="distributed").length;
+    // Store for export
+    dv._exportAll=all;
     dv.innerHTML=`
+      <div class="view-header" style="margin-bottom:10px">
+        <h2 style="font-size:16px;font-weight:700;margin:0">📊 Dashboard</h2>
+        <div style="display:flex;gap:6px">
+          <button class="secondary" onclick="exportDashboardExcel()" style="font-size:12px;padding:5px 10px">📊 Excel</button>
+          <button class="secondary" onclick="exportDashboardPDF()" style="font-size:12px;padding:5px 10px">📄 PDF</button>
+        </div>
+      </div>
       <div class="kpi-grid">
         <div class="kpi-tile blue"><div class="kpi-icon">📦</div><div class="kpi-label">Total Requests</div><div class="kpi-value">${all.length}</div><div class="kpi-sub">All gift requests</div></div>
         <div class="kpi-tile amber"><div class="kpi-icon">⏳</div><div class="kpi-label">Pending / Returned</div><div class="kpi-value">${pending}</div><div class="kpi-sub">Awaiting action</div></div>
@@ -847,6 +878,14 @@ function renderNewRequestForm(){
         </div>
       </div>
 
+      ${SETTINGS.allowDummyRequests?`
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:#fef9c3;border:1px solid #fde047;border-radius:8px;margin-bottom:10px">
+        <label class="toggle-switch"><input type="checkbox" id="isDummyRequest"><span class="toggle-slider"></span></label>
+        <div>
+          <div style="font-size:13px;font-weight:600;color:#854d0e">🧪 Mark as Dummy / Test Request</div>
+          <div style="font-size:11px;color:#a16207">This request will be tagged as a test record and can be identified separately.</div>
+        </div>
+      </div>`:""}
       <div class="actions"><button type="submit">Submit for Plant Admin review</button></div>
     </form>`;
 
@@ -869,21 +908,52 @@ function renderNewRequestForm(){
       if(giftCat==="__other__")giftCat=$("giftCategoryOther").value.trim();
       let guestOrg=$("guestOrg").value;
       if(guestOrg==="__other__")guestOrg=$("guestOrgOther").value.trim();
+      const guestEmail=$("guestEmail").value.trim();
+      const guestName=$("guestName").value.trim();
+      const distDate=$("distributionDate").value; // "YYYY-MM-DD"
+      const distYear=distDate?distDate.slice(0,4):"";
+
+      // ── One gift per guest per calendar year ──────────────────────────
+      if((guestEmail||guestName)&&distYear){
+        // Build year range strings for comparison against distributionDate
+        const yearStart=`${distYear}-01-01`, yearEnd=`${distYear}-12-31`;
+        // Query by date range only (no extra where to avoid composite index)
+        let dupQuery=db.collection("giftRequests")
+          .where("distributionDate",">=",yearStart)
+          .where("distributionDate","<=",yearEnd);
+        const dupSnap=await dupQuery.get();
+        const activeStatuses=new Set(["approved","partially_approved","distributed","pending_plant_review","pending_top_management"]);
+        const dup=dupSnap.docs.find(d=>{
+          const x=d.data();
+          if(!activeStatuses.has(x.status))return false; // skip rejected/returned
+          if(guestEmail&&x.guestEmail&&x.guestEmail.toLowerCase()===guestEmail.toLowerCase())return true;
+          if(!guestEmail&&guestName&&x.guestName&&x.guestName.toLowerCase()===guestName.toLowerCase()
+            &&(guestOrg?x.guestOrganisation===guestOrg:true))return true;
+          return false;
+        });
+        if(dup){
+          const dx=dup.data();
+          throw new Error(`${dx.guestName||guestEmail} already has a gift request in ${distYear} (${dx.giftName} — ${(dx.status||"").replace(/_/g," ")}). Only one gift per recipient per year is allowed.`);
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────
+
       const payload={
-        occasion:$("occasion").value.trim(),distributionDate:$("distributionDate").value,
+        occasion:$("occasion").value.trim(),distributionDate:distDate,
         giftName:$("giftName").value.trim(),giftCategory:giftCat,
         requestedQuantity:qty,estimatedUnitCost:cost,estimatedTotal:qty*cost,
         remarks:$("remarks").value.trim(),
         plantId:profile.plantId||null,departmentId:profile.departmentId||null,
         requestedBy:currentUser.uid,requesterName:profile.name||"",employeeCode:profile.employeeCode||"",
         // Guest info
-        guestName:$("guestName").value.trim(),
-        guestEmail:$("guestEmail").value.trim(),
+        guestName:guestName,
+        guestEmail:guestEmail,
         guestContact:$("guestContact").value.trim(),
         guestDesignation:$("guestDesignation").value.trim(),
         guestDept:$("guestDept").value.trim(),
         guestOrganisation:guestOrg,
-        status:"pending_plant_review",createdAt:ts()
+        status:"pending_plant_review",createdAt:ts(),
+        _isDummy:SETTINGS.allowDummyRequests&&!!($("isDummyRequest")?.checked)
       };
       await db.collection("giftRequests").add(payload);
       e.target.reset();
@@ -900,12 +970,12 @@ function renderNewRequestForm(){
 ═══════════════════════════════════════════════ */
 async function loadRequests(){
   try{
-    const snap=await visibleRequests();let rows=[];
+    const snap=await visibleRequests();_lastReqSnap=snap;let rows=[];
     snap.forEach(d=>{
       const x=d.data();
       const hasGuest=x.guestName||x.guestEmail;
-      rows.push(`<tr>
-        <td><strong>${esc(x.giftName)}</strong><br><small style="color:var(--muted)">${esc(x.occasion)}</small></td>
+      rows.push(`<tr${x._isDummy?' style="opacity:0.75;background:repeating-linear-gradient(45deg,#fef9c3,#fef9c3 4px,transparent 4px,transparent 12px)"':''}>
+        <td><strong>${esc(x.giftName)}</strong>${x._isDummy?' <span title="Test/Dummy request" style="font-size:10px;padding:1px 5px;background:#fde047;color:#854d0e;border-radius:4px;font-weight:600">🧪 TEST</span>':''}<br><small style="color:var(--muted)">${esc(x.occasion)}</small></td>
         <td>${esc(x.giftCategory||"—")}</td>
         <td style="text-align:right">${esc(x.requestedQuantity)}</td>
         <td style="text-align:right">₹${Number(x.estimatedTotal||0).toLocaleString("en-IN")}</td>
@@ -917,7 +987,11 @@ async function loadRequests(){
     });
     $("requestsView").innerHTML=`
       <div class="view-header">
-        <h2>Gift Requests</h2><span style="font-size:12px;color:var(--muted)">${snap.size} records</span>
+        <div><h2>Gift Requests</h2><span style="font-size:12px;color:var(--muted)">${snap.size} records</span></div>
+        <div style="display:flex;gap:6px">
+          <button class="secondary" onclick="exportRequestsExcel()" style="font-size:12px;padding:5px 10px">📊 Excel</button>
+          <button class="secondary" onclick="exportRequestsPDF()" style="font-size:12px;padding:5px 10px">📄 PDF</button>
+        </div>
       </div>
       <div style="overflow:auto">
         <table>
@@ -987,7 +1061,11 @@ function renderGuestShell(){
         <h2 style="font-size:16px;font-weight:700;margin:0">\U0001f465 Guest / Recipient List</h2>
         <p class="view-sub">All recipients with gift history — <strong id="guestCount">…</strong> records</p>
       </div>
-      <button class="secondary" id="guestExportBtn" style="font-size:12px;padding:5px 10px">⬇ Export CSV</button>
+      <div style="display:flex;gap:6px">
+        <button class="secondary" id="guestExportExcel" style="font-size:12px;padding:5px 10px">📊 Excel</button>
+        <button class="secondary" id="guestExportPDF" style="font-size:12px;padding:5px 10px">📄 PDF</button>
+        <button class="secondary" id="guestExportBtn" style="font-size:12px;padding:5px 10px">⬇ CSV</button>
+      </div>
     </div>
     <div class="filter-bar">
       <div><label>Search</label><input id="gf_search" placeholder="Name / email / gift…" style="min-width:160px"></div>
@@ -1013,6 +1091,8 @@ function wireGuestFilters(){
       renderGuestTable(_guestAllRows);const b=$("guestCount");if(b)b.textContent=_guestAllRows.length;
     };
     $("guestExportBtn").onclick=()=>exportGuestCSV(_guestAllRows);
+    $("guestExportExcel").onclick=()=>exportGuestExcel();
+    $("guestExportPDF").onclick=()=>exportGuestPDF();
   },50);
 }
 
@@ -1048,7 +1128,7 @@ function renderGuestTable(rows){
     const cost=x.approvedBudget||(x.requestedQuantity*(x.estimatedUnitCost||0))||0;
     const distDate=x.distributionDate||"—";
     const reqDate=x.createdAt?.toDate?.()?x.createdAt.toDate().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"}):"—";
-    return `<tr>
+    return `<tr${x._isDummy?' style="opacity:0.75;background:repeating-linear-gradient(45deg,#fef9c3,#fef9c3 4px,transparent 4px,transparent 12px)"':''}>
       <td>
         <div style="font-weight:600;color:var(--text)">${esc(x.guestName||"—")}</div>
         ${x.guestDesignation?`<div style="font-size:11px;color:var(--muted)">${esc(x.guestDesignation)}</div>`:""}
@@ -1062,7 +1142,7 @@ function renderGuestTable(rows){
         ${x.guestContact?`<div style="font-size:12px;color:var(--muted)">${esc(x.guestContact)}</div>`:""}
       </td>
       <td>
-        <div style="font-weight:600">${esc(x.giftName||"—")}</div>
+        <div style="font-weight:600">${esc(x.giftName||"—")}${x._isDummy?' <span title="Test/Dummy request" style="font-size:10px;padding:1px 5px;background:#fde047;color:#854d0e;border-radius:4px;font-weight:600">🧪 TEST</span>':''}</div>
         <div style="font-size:11px;color:var(--muted)">${esc(x.giftCategory||"")}${x.giftCategory&&x.occasion?" · ":""}${esc(x.occasion||"")}</div>
       </td>
       <td style="text-align:right">
@@ -1436,6 +1516,7 @@ async function renderAdmin(){
       ${isSA?'<button data-sub="giftCategories">🏷 Gift Categories</button>':''}
       ${isSA?'<button data-sub="branding">🎨 Branding</button>':''}
       ${isSA?'<button data-sub="seeder">🌱 Seeder</button>':''}
+      ${isSA?'<button data-sub="settings">⚙ Settings</button>':''}
     </div>
     <div id="adminUsers" class="master-section active"></div>
     <div id="adminPlants" class="master-section"></div>
@@ -1443,7 +1524,8 @@ async function renderAdmin(){
     ${isSA?'<div id="adminOrganisations" class="master-section"></div>':''}
     ${isSA?'<div id="adminGiftCategories" class="master-section"></div>':''}
     ${isSA?'<div id="adminBranding" class="master-section"></div>':''}
-    ${isSA?'<div id="adminSeeder" class="master-section"></div>':''}`;
+    ${isSA?'<div id="adminSeeder" class="master-section"></div>':''}
+    ${isSA?'<div id="adminSettings" class="master-section"></div>':''}`;
 
   document.querySelectorAll("#adminSubTabs button").forEach(b=>{
     b.onclick=()=>{
@@ -1466,6 +1548,7 @@ async function loadAdminSection(sub){
   else if(sub==="giftCategories")await loadMasterSection("giftCategories","adminGiftCategories",["name","description"],["Category Name","Description"],true);
   else if(sub==="branding")renderBrandingSection();
   else if(sub==="seeder")renderSeederSection();
+  else if(sub==="settings")renderSettingsSection();
 }
 
 async function loadPendingUsers(){
@@ -1775,6 +1858,19 @@ function renderBrandingSection(){
         <div style="flex:1;min-width:200px"><input id="brandCompanyName" class="bio-input-sm" style="width:100%" value="${esc(BRANDING.companyName||'')}" placeholder="e.g. Polyplastics India"></div>
         <button id="saveCompanyName" style="height:38px">Save Name</button>
       </div>
+    </div>
+    <div class="panel" style="margin-top:10px">
+      <h4 style="font-size:13px;margin-bottom:6px">🔒 Allowed Email Domain for Registration</h4>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:10px">Only emails from this domain can self-register. Leave blank to allow any domain.</p>
+      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:200px">
+          <span style="font-size:14px;color:var(--muted)">@</span>
+          <input id="brandEmailDomain" class="bio-input-sm" style="width:100%" value="${esc(BRANDING.allowedEmailDomain||'')}" placeholder="e.g. polyplasticsindia.com">
+        </div>
+        <button id="saveEmailDomain" style="height:38px">Save Domain</button>
+        ${BRANDING.allowedEmailDomain?`<button class="secondary" id="clearEmailDomain" style="height:38px">Clear (allow any)</button>`:""}
+      </div>
+      ${BRANDING.allowedEmailDomain?`<p style="font-size:12px;color:#16a34a;margin-top:8px">✅ Currently restricted to <strong>@${esc(BRANDING.allowedEmailDomain)}</strong></p>`:`<p style="font-size:12px;color:var(--muted);margin-top:8px">⚠ No restriction — any email can register.</p>`}
     </div>`;
 
   // File chooser
@@ -1814,6 +1910,68 @@ function renderBrandingSection(){
     BRANDING.companyName=nm;applyBranding(BRANDING);
     message("Company name saved.","success");
   };
+  $("saveEmailDomain").onclick=async()=>{
+    let domain=$("brandEmailDomain").value.trim().toLowerCase().replace(/^@/,"");
+    if(domain&&!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(domain)){message("Invalid domain format. Example: polyplasticsindia.com","error");return;}
+    await db.collection("settings").doc("branding").set({...BRANDING,allowedEmailDomain:domain,updatedAt:ts()},{merge:true});
+    BRANDING.allowedEmailDomain=domain;
+    message(domain?`Registration restricted to @${domain}.`:"Domain restriction cleared.","success");
+    renderBrandingSection();
+  };
+  if($("clearEmailDomain"))$("clearEmailDomain").onclick=async()=>{
+    await db.collection("settings").doc("branding").set({...BRANDING,allowedEmailDomain:"",updatedAt:ts()},{merge:true});
+    BRANDING.allowedEmailDomain="";
+    message("Domain restriction removed — any email can now register.","success");
+    renderBrandingSection();
+  };
+}
+
+/* ═══ App Settings ═══ */
+async function renderSettingsSection(){
+  const el=$("adminSettings");
+  if(!el)return;
+  // Re-read latest settings
+  try{const doc=await db.collection("settings").doc("appSettings").get();if(doc.exists)SETTINGS={...SETTINGS,...doc.data()};}catch(e){}
+
+  const tog=(key,label,desc)=>`
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)">
+      <div>
+        <div style="font-weight:600;font-size:14px">${label}</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">${desc}</div>
+      </div>
+      <label class="toggle-switch">
+        <input type="checkbox" id="tog_${key}" ${SETTINGS[key]?"checked":""} onchange="saveSetting('${key}',this.checked)">
+        <span class="toggle-slider"></span>
+      </label>
+    </div>`;
+
+  el.innerHTML=`
+    <div class="panel" style="margin-top:0">
+      <h3 style="font-size:14px;font-weight:700;margin-bottom:4px">⚙ Application Settings</h3>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Control system-wide behaviour. Changes take effect immediately.</p>
+      ${tog("allowDummyRequests","🧪 Allow Dummy / Test Gift Requests",
+            "When ON, any logged-in user can mark a gift request as a test/dummy. Dummy requests are tagged and can be identified separately.")}
+      ${tog("allowSelfRegistration","📝 Allow Employee Self-Registration",
+            "When OFF, only Super Admin can create user accounts. The Register tab is hidden on the login screen.")}
+      ${tog("requireGuestForRequest","👤 Require Guest Info on Gift Requests",
+            "When ON, Guest Name and Organisation become mandatory fields on the New Request form.")}
+    </div>`;
+}
+
+async function saveSetting(key, value){
+  try{
+    SETTINGS[key]=value;
+    await db.collection("settings").doc("appSettings").set({[key]:value,updatedAt:ts(),updatedBy:currentUser.uid},{merge:true});
+    message(`Setting updated: ${key} = ${value}.`,"success");
+    // Apply side-effects immediately
+    if(key==="allowSelfRegistration") applyRegistrationToggle();
+    if(key==="allowDummyRequests") renderNewRequestForm();
+  }catch(e){message("Failed to save setting: "+e.message,"error");}
+}
+
+function applyRegistrationToggle(){
+  const regTab=$("registerTab");
+  if(regTab) regTab.style.display=SETTINGS.allowSelfRegistration===false?"none":"";
 }
 
 /* ═══ Seeder ═══ */
@@ -1941,7 +2099,145 @@ async function wipeSeededData(){
 }
 
 /* Boot */
+/* ═══════════════════════════════════════════════════════════════════════
+   EXPORT UTILITIES  (Excel via SheetJS, PDF via jsPDF + AutoTable)
+═══════════════════════════════════════════════════════════════════════ */
+function exportToExcel(headers, rows, filename, sheetName="Data"){
+  const ws=XLSX.utils.aoa_to_sheet([headers,...rows]);
+  // Auto column widths
+  ws["!cols"]=headers.map((_,i)=>{
+    const max=Math.max(String(headers[i]).length,...rows.map(r=>String(r[i]??'').length));
+    return {wch:Math.min(max+2,40)};
+  });
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,sheetName);
+  XLSX.writeFile(wb,filename);
+}
+
+function exportToPDF(title, headers, rows, filename, orientation="landscape"){
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF({orientation,unit:"mm",format:"a4"});
+  const co=BRANDING.companyName||"Gift Management System";
+  // Header
+  doc.setFontSize(14);doc.setFont(undefined,"bold");
+  doc.text(co,14,14);
+  doc.setFontSize(10);doc.setFont(undefined,"normal");
+  doc.text(title,14,21);
+  doc.text(`Generated: ${new Date().toLocaleString("en-IN")}`,14,27);
+  // Table
+  doc.autoTable({
+    head:[headers],
+    body:rows,
+    startY:32,
+    styles:{fontSize:8,cellPadding:2},
+    headStyles:{fillColor:[37,99,235],textColor:255,fontStyle:"bold"},
+    alternateRowStyles:{fillColor:[239,246,255]},
+    margin:{left:14,right:14}
+  });
+  doc.save(filename);
+}
+
+/* ── Dashboard export ───────────────────────────────────────────────── */
+function exportDashboardExcel(){
+  const all=$("dashboardView")._exportAll;
+  if(!all?.length){message("No dashboard data to export.","warn");return;}
+  // Sheet 1: KPI summary
+  const tiles=[...document.querySelectorAll(".kpi-tile")].map(t=>[
+    t.querySelector(".kpi-label")?.textContent||"",
+    t.querySelector(".kpi-value")?.textContent||""
+  ]);
+  // Sheet 2: Full data
+  const hdrs=["Gift Name","Category","Occasion","Qty","Unit Cost","Total (₹)","Status","Requested By","Plant","Guest","Dist. Date"];
+  const rows=all.map(x=>{const qty=Number(x.requestedQuantity||0),cost=Number(x.estimatedUnitCost||0);
+    return[x.giftName||"",x.giftCategory||"",x.occasion||"",qty,cost,qty*cost,
+      (x.status||"").replace(/_/g," "),x.requesterName||"",PLANTS[x.plantId]||x.plantId||"",x.guestName||"",x.distributionDate||""];});
+  const wb=XLSX.utils.book_new();
+  const ws1=XLSX.utils.aoa_to_sheet([["Metric","Value"],...tiles]);ws1["!cols"]=[{wch:28},{wch:14}];
+  XLSX.utils.book_append_sheet(wb,ws1,"Summary");
+  const ws2=XLSX.utils.aoa_to_sheet([hdrs,...rows]);ws2["!cols"]=hdrs.map((_,i)=>({wch:Math.max(hdrs[i].length,...rows.map(r=>String(r[i]??'').length))+2}));
+  XLSX.utils.book_append_sheet(wb,ws2,"All Requests");
+  XLSX.writeFile(wb,`Dashboard_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+function exportDashboardPDF(){
+  const all=$("dashboardView")._exportAll;
+  if(!all?.length){message("No dashboard data to export.","warn");return;}
+  const tiles=[...document.querySelectorAll(".kpi-tile")].map(t=>[
+    t.querySelector(".kpi-label")?.textContent||"",
+    t.querySelector(".kpi-value")?.textContent||""
+  ]);
+  exportToPDF("Dashboard Summary",["Metric","Value"],tiles,`Dashboard_${new Date().toISOString().slice(0,10)}.pdf`,"portrait");
+}
+
+/* ── Guest List export ──────────────────────────────────────────────── */
+const GUEST_HEADERS=["Guest Name","Designation","Organisation","Dept","Email","Contact","Gift","Category","Occasion","Qty","Unit Cost","Total (₹)","Status","Plant","Dist. Date","Req. Date","Remarks"];
+function guestListRows(rows){
+  return rows.map(x=>{
+    const qty=Number(x.requestedQuantity||0);
+    const cost=Number(x.estimatedUnitCost||0);
+    const reqDate=x.createdAt?.toDate?x.createdAt.toDate().toLocaleDateString("en-IN"):x.createdAt||"";
+    return[x.guestName||"",x.guestDesignation||"",x.guestOrganisation||"",x.guestDept||"",
+      x.guestEmail||"",x.guestContact||"",x.giftName||"",x.giftCategory||"",x.occasion||"",
+      qty,cost,qty*cost,(x.status||"").replace(/_/g," "),
+      PLANTS[x.plantId]||x.plantId||"",x.distributionDate||"",reqDate,x.remarks||""];
+  });
+}
+function exportGuestExcel(){
+  if(!_guestAllRows?.length){message("No guest records to export.","warn");return;}
+  exportToExcel(GUEST_HEADERS,guestListRows(_guestAllRows),`GuestList_${new Date().toISOString().slice(0,10)}.xlsx`,"Guest List");
+}
+function exportGuestPDF(){
+  if(!_guestAllRows?.length){message("No guest records to export.","warn");return;}
+  // Shorter headers for PDF
+  const ph=["Name","Designation","Organisation","Email","Gift","Qty","Total","Status","Plant","Dist. Date"];
+  const pr=_guestAllRows.map(x=>{
+    const qty=Number(x.requestedQuantity||0),cost=Number(x.estimatedUnitCost||0);
+    return[x.guestName||"",x.guestDesignation||"",x.guestOrganisation||"",
+      x.guestEmail||"",x.giftName||"",qty,`₹${(qty*cost).toLocaleString("en-IN")}`,
+      (x.status||"").replace(/_/g," "),PLANTS[x.plantId]||x.plantId||"",x.distributionDate||""];
+  });
+  exportToPDF("Guest / Recipient List",ph,pr,`GuestList_${new Date().toISOString().slice(0,10)}.pdf`);
+}
+
+/* ── Gift Requests export ───────────────────────────────────────────── */
+const REQ_HEADERS=["Gift Name","Category","Occasion","Qty","Unit Cost","Total (₹)","Status","Requested By","Plant","Guest","Dist. Date","Req. Date","Remarks"];
+function reqRows(snap){
+  const out=[];
+  snap.forEach(d=>{
+    const x=d.data();
+    const qty=Number(x.requestedQuantity||0),cost=Number(x.estimatedUnitCost||0);
+    const reqDate=x.createdAt?.toDate?x.createdAt.toDate().toLocaleDateString("en-IN"):x.createdAt||"";
+    out.push([x.giftName||"",x.giftCategory||"",x.occasion||"",qty,cost,qty*cost,
+      (x.status||"").replace(/_/g," "),x.requesterName||"",
+      PLANTS[x.plantId]||x.plantId||"",x.guestName||"",x.distributionDate||"",reqDate,x.remarks||""]);
+  });
+  return out;
+}
+let _lastReqSnap=null; // set after each loadRequests
+function exportRequestsExcel(){
+  if(!_lastReqSnap){message("Load Gift Requests first.","warn");return;}
+  exportToExcel(REQ_HEADERS,reqRows(_lastReqSnap),`GiftRequests_${new Date().toISOString().slice(0,10)}.xlsx`,"Gift Requests");
+}
+function exportRequestsPDF(){
+  if(!_lastReqSnap){message("Load Gift Requests first.","warn");return;}
+  const ph=["Gift","Category","Qty","Total","Status","Requested By","Plant","Guest","Dist. Date"];
+  const pr=[];
+  _lastReqSnap.forEach(d=>{
+    const x=d.data();const qty=Number(x.requestedQuantity||0),cost=Number(x.estimatedUnitCost||0);
+    pr.push([x.giftName||"",x.giftCategory||"",qty,`₹${(qty*cost).toLocaleString("en-IN")}`,
+      (x.status||"").replace(/_/g," "),x.requesterName||"",
+      PLANTS[x.plantId]||x.plantId||"",x.guestName||"",x.distributionDate||""]);
+  });
+  exportToPDF("Gift Requests",ph,pr,`GiftRequests_${new Date().toISOString().slice(0,10)}.pdf`);
+}
+
 loadBranding(); // Public read — loads logo before auth, fails silently if no branding set
+// Load app settings (requires auth — called after login in onAuthStateChanged)
+async function loadAppSettings(){
+  try{
+    const doc=await db.collection("settings").doc("appSettings").get();
+    if(doc.exists)SETTINGS={...SETTINGS,...doc.data()};
+  }catch(e){/* silent */}
+}
 </script>
 </body>
 </html>
