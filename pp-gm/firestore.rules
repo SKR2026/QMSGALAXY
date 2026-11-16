@@ -1,0 +1,87 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function activeUser() {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && userDoc().status == 'active';
+    }
+    function roleIs(role) { return activeUser() && userDoc().role == role; }
+    function isSuperAdmin() { return roleIs('superadmin'); }
+    function isTopManagement() { return roleIs('top_management') || isSuperAdmin(); }
+    function isPlantAdmin() { return roleIs('plant_admin') || isSuperAdmin(); }
+    function samePlant(plantId) { return activeUser() && userDoc().plantId == plantId; }
+
+    match /users/{uid} {
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'employee'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasOnly([
+          'employeeCode','name','designation','department','plantId',
+          'email','mobile','role','status','createdAt'
+        ]);
+      allow read: if signedIn() && (
+        request.auth.uid == uid || isTopManagement() ||
+        (isPlantAdmin() && resource.data.plantId == userDoc().plantId)
+      );
+      allow update: if isSuperAdmin() ||
+        (isPlantAdmin() && resource.data.plantId == userDoc().plantId
+          && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status','role','updatedAt']));
+      allow delete: if isSuperAdmin();
+    }
+
+    match /plants/{plantId} {
+      allow read: if signedIn();
+      allow write: if isSuperAdmin();
+    }
+    match /departments/{departmentId} {
+      allow read: if signedIn();
+      allow write: if isSuperAdmin();
+    }
+    match /giftCatalog/{giftId} {
+      allow read: if activeUser();
+      allow write: if isSuperAdmin();
+    }
+    match /giftRequests/{requestId} {
+      allow create: if activeUser()
+        && request.resource.data.requestedBy == request.auth.uid
+        && request.resource.data.status == 'pending_plant_review'
+        && request.resource.data.plantId == userDoc().plantId;
+      allow read: if activeUser() && (
+        isTopManagement() ||
+        (isPlantAdmin() && resource.data.plantId == userDoc().plantId) ||
+        resource.data.requestedBy == request.auth.uid
+      );
+      allow update: if isSuperAdmin() ||
+        (isPlantAdmin() && resource.data.plantId == userDoc().plantId
+          && resource.data.status == 'pending_plant_review'
+          && request.resource.data.status in ['pending_top_management','returned','rejected']) ||
+        (isTopManagement() && resource.data.status in ['pending_top_management','returned']
+          && request.resource.data.status in ['approved','partially_approved','rejected','returned']);
+      allow delete: if isSuperAdmin();
+    }
+    match /distributions/{distributionId} {
+      allow create: if isPlantAdmin()
+        && request.resource.data.plantId == userDoc().plantId
+        && request.resource.data.approvedRequestId is string;
+      allow read: if activeUser() && (
+        isTopManagement() || (isPlantAdmin() && resource.data.plantId == userDoc().plantId)
+        || resource.data.employeeUid == request.auth.uid
+      );
+      allow update, delete: if isSuperAdmin();
+    }
+    match /inventoryTransactions/{transactionId} {
+      allow read: if isSuperAdmin() || isTopManagement();
+      allow create, update, delete: if isSuperAdmin();
+    }
+    match /auditLogs/{logId} {
+      allow read: if isSuperAdmin() || isTopManagement();
+      allow create: if activeUser();
+      allow update, delete: if false;
+    }
+  }
+}
