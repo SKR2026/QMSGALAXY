@@ -3952,6 +3952,36 @@ async function publishAuditSchedule(docIds, collection) {
       if(p.auditeeEmail) emailMap[p.auditeeEmail].audits.push(p);
     }
 
+    // ── Also add MR / Admin users (they need the audit schedule too) ───────
+    // Collect distinct plants from plans so we can filter by plant if needed
+    const _planPlants = [...new Set(plans.map(p=>p.plant||p.plantId||'All Plants').filter(Boolean))];
+    try {
+      // Query users with MR-type roles in one or two Firestore calls
+      const _mrRoleVariants = ['MR','Management Representative','Plant MR'];
+      const _adminVariants  = ['Admin','Super Admin'];
+      const [_mrSnap, _adminSnap] = await Promise.all([
+        db.collection('users').where('role','in',_mrRoleVariants).get().catch(()=>null),
+        db.collection('users').where('role','in',_adminVariants).get().catch(()=>null),
+      ]);
+      const _mrDocs = [...(_mrSnap?.docs||[]), ...(_adminSnap?.docs||[])];
+      for (const _mrDoc of _mrDocs) {
+        const _mrd = _mrDoc.data();
+        if (!_mrd.email) continue;
+        // Filter by plant: include if user's plant matches any plan plant, or if 'All Plants' / no plant set
+        const _mrdPlant = _mrd.plant||_mrd.plantId||'All Plants';
+        const _plantMatch = _mrdPlant==='All Plants' || _planPlants.includes('All Plants') || _planPlants.includes(_mrdPlant);
+        if (!_plantMatch) continue;
+        if (!emailSet.has(_mrd.email)) {
+          emailSet.add(_mrd.email);
+          const _mrEntry = { email:_mrd.email, name:_mrd.name||_mrd.email, role:_mrd.role||'MR', audits:[] };
+          emailMap[_mrd.email] = _mrEntry;
+          recipients.push(_mrEntry);
+        }
+        // Associate all plans with MR (they need visibility of whole schedule)
+        plans.forEach(p => { if(!emailMap[_mrd.email].audits.find(a=>a.id===p.id)) emailMap[_mrd.email].audits.push(p); });
+      }
+    } catch(_mrErr){ console.warn('MR email fetch failed:', _mrErr?.message||_mrErr); }
+
     if(recipients.length===0){
       if(msg) msg.innerHTML='<span style="color:var(--amber)">⚠ No email addresses found. Ensure Auditor/Auditee users have emails saved in User Management.</span>';
       if(btn){btn.disabled=false;btn.innerHTML='<span class="material-icons" style="font-size:15px;vertical-align:middle">send</span> Publish &amp; Notify All';}
@@ -5373,8 +5403,11 @@ async function submitAuditeeActionPlans() {
         if (_dhEmails.length) {
           _sendNcEmail(_dhEmails,
             `[Action Required] Review Action Plan — ${auditName}`,
-            `Auditee submitted ${saved} action plan${saved!==1?'s':''} for "${auditName}". Please review and approve.`,
-            null, planId
+            _ncEmailHtml('depthead',
+              'Action Plan Submitted for Review',
+              `The auditee has submitted ${saved} action plan${saved!==1?'s':''} for <strong>${auditName}</strong>. Please log in to review and approve.`,
+              { audit: auditName, plant: S.userDoc?.plant||'', dept: S.userDoc?.department||'', byName: S.userDoc?.name||S.user?.email||'' }
+            ), null, planId
           ).catch(()=>{});
         }
       }
@@ -6455,8 +6488,11 @@ async function ncSubmitToHOD(ncId){
     });
     if (_dhEmails2.length) _sendNcEmail(_dhEmails2,
       `[Action Required] Review NC Action Plan — ${_ncNo2}`,
-      `Auditee submitted action plan for NC ${_ncNo2}. Please review.`,
-      ncId, _ncPlanId).catch(()=>{});
+      _ncEmailHtml('depthead',
+        `NC Action Plan Submitted — ${_ncNo2}`,
+        `The auditee has submitted their action plan for NC <strong>${_ncNo2}</strong>. Please log in to review and approve or return with comments.`,
+        { ncNo: _ncNo2, audit: ncData.auditName||'', plant: ncData.plant||'', dept: ncData.department||'', byName: S.userDoc?.name||S.user?.email||'' }
+      ), ncId, _ncPlanId).catch(()=>{});
   }
 
   showToast('Submitted to Dept Head ✅','success');
@@ -6677,8 +6713,11 @@ async function dhInlineApprove(findingIdsCsv, action) {
         }
         if (_audEmail3) await _sendNcEmail([_audEmail3],
           `[Action Required] Auditor Review — NC ${_ncNo3}`,
-          `Dept Head approved action plan for NC ${_ncNo3}. Please review.`,
-          fid, _planId3).catch(()=>{});
+          _ncEmailHtml('auditor',
+            `Dept Head Approved — Auditor Review Required`,
+            `The Dept Head has approved the action plan for NC <strong>${_ncNo3}</strong>. Please log in to review and forward to MR or return with comments.`,
+            { ncNo: _ncNo3, audit: _fds3?.data()?.auditName||'', plant: _fds3?.data()?.plant||'', dept: _fds3?.data()?.department||'', byName: S.userDoc?.name||S.user?.email||'' }
+          ), fid, _planId3).catch(()=>{});
       }
     } else {
       // Return — email auditee for each finding
@@ -6695,8 +6734,11 @@ async function dhInlineApprove(findingIdsCsv, action) {
         }
         if (_aeEmail4) await _sendNcEmail([_aeEmail4],
           `Action Required: NC ${_ncNo4} Returned for Revision`,
-          `NC ${_ncNo4} was returned by Dept Head. Comment: ${comment}. Please revise and resubmit.`,
-          fid, _planId4).catch(()=>{});
+          _ncEmailHtml('auditee',
+            `NC Returned for Revision — ${_ncNo4}`,
+            `Your action plan for NC <strong>${_ncNo4}</strong> has been returned by the Dept Head. Please log in, review the comment below, revise your action plan, and resubmit.`,
+            { ncNo: _ncNo4, audit: _fdd2.auditName||'', plant: _fdd2.plant||'', dept: _fdd2.department||'', comment, byName: S.userDoc?.name||S.user?.email||'' }
+          ), fid, _planId4).catch(()=>{});
       }
     }
   } catch(_dhe){ console.warn('dhInlineApprove email error:', _dhe?.message||_dhe); }
@@ -6709,34 +6751,116 @@ async function dhInlineApprove(findingIdsCsv, action) {
   if(S.currentModule==='myactions') renderMyActions();
 }
 
+// ── NC email HTML template builder ───────────────────────────────────────────
+// Generates a branded, role-specific HTML email body.
+// role: 'auditee' | 'auditor' | 'depthead' | 'mr'
+// data: { ncNo, auditName, plant, department, comment, deadline, byName, appUrl }
+function _ncEmailHtml(role, headline, action, data={}) {
+  const appUrl  = data.appUrl  || 'https://your-app.web.app';
+  const ncNo    = data.ncNo    || '';
+  const audit   = data.audit   || '';
+  const plant   = data.plant   || '';
+  const dept    = data.dept    || '';
+  const comment = data.comment || '';
+  const byName  = data.byName  || '';
+  const deadline= data.deadline|| '';
+
+  // Role palette
+  const palettes = {
+    auditee:  { accent:'#2563eb', icon:'📋', badge:'Auditee Action',   badgeBg:'#dbeafe', badgeColor:'#1e40af' },
+    auditor:  { accent:'#7c3aed', icon:'🔍', badge:'Auditor Review',   badgeBg:'#ede9fe', badgeColor:'#5b21b6' },
+    depthead: { accent:'#b45309', icon:'🏢', badge:'Dept Head Review', badgeBg:'#fef3c7', badgeColor:'#92400e' },
+    mr:       { accent:'#059669', icon:'✅', badge:'MR Final Approval', badgeBg:'#d1fae5', badgeColor:'#065f46' },
+    closed:   { accent:'#16a34a', icon:'🎉', badge:'NC Closed',        badgeBg:'#dcfce7', badgeColor:'#166534' },
+  };
+  const p = palettes[role] || palettes.auditee;
+
+  const metaRows = [
+    ncNo    && `<tr><td style="padding:4px 0;color:#64748b;font-size:13px;width:130px">NC Number</td><td style="padding:4px 0;font-size:13px;font-weight:600;color:#1e293b">${ncNo}</td></tr>`,
+    audit   && `<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Audit</td><td style="padding:4px 0;font-size:13px;color:#1e293b">${audit}</td></tr>`,
+    plant   && `<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Plant</td><td style="padding:4px 0;font-size:13px;color:#1e293b">${plant}</td></tr>`,
+    dept    && `<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Department</td><td style="padding:4px 0;font-size:13px;color:#1e293b">${dept}</td></tr>`,
+    byName  && `<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Actioned By</td><td style="padding:4px 0;font-size:13px;color:#1e293b">${byName}</td></tr>`,
+    deadline&& `<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Target Date</td><td style="padding:4px 0;font-size:13px;font-weight:600;color:#dc2626">${deadline}</td></tr>`,
+  ].filter(Boolean).join('');
+
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head><body style="margin:0;padding:0;background:#f1f5f9;font-family:Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 0">
+  <tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08)">
+      <!-- Header -->
+      <tr><td style="background:${p.accent};padding:28px 32px">
+        <div style="font-size:22px;color:#fff;font-weight:700">${p.icon} ${headline}</div>
+        <div style="margin-top:8px">
+          <span style="display:inline-block;background:rgba(255,255,255,.2);color:#fff;padding:3px 12px;border-radius:20px;font-size:12px;font-weight:600">${p.badge}</span>
+        </div>
+      </td></tr>
+      <!-- Body -->
+      <tr><td style="padding:28px 32px">
+        <p style="margin:0 0 20px;font-size:15px;color:#334155;line-height:1.6">${action}</p>
+        ${metaRows ? `<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;width:100%;margin-bottom:20px"><tbody style="display:table;width:100%">${metaRows}</tbody></table>` : ''}
+        ${comment ? `<div style="background:#fef9ec;border-left:4px solid #f59e0b;padding:12px 16px;border-radius:0 8px 8px 0;margin-bottom:20px"><strong style="font-size:12px;text-transform:uppercase;color:#92400e;letter-spacing:.5px">Reviewer Comment</strong><p style="margin:6px 0 0;font-size:14px;color:#1e293b">${comment}</p></div>` : ''}
+        <div style="text-align:center;margin:24px 0">
+          <a href="${appUrl}" style="display:inline-block;background:${p.accent};color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:15px">Open Audit App →</a>
+        </div>
+      </td></tr>
+      <!-- Footer -->
+      <tr><td style="background:#f8fafc;padding:16px 32px;border-top:1px solid #e2e8f0;text-align:center">
+        <p style="margin:0;font-size:12px;color:#94a3b8">This is an automated notification from your Audit Management System.<br>Please do not reply to this email.</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table></body></html>`;
+}
+
 // ── NC email notification helper ─────────────────────────────────────────────
-// CRITICAL: sendAuditScheduleEmail CF only processes 'auditPlans' collection.
-// Calling it with collection:'findings' is ignored by the CF → no email sent.
-// Fix: always call with collection:'auditPlans' + the finding's auditPlanId.
-// Recipients are resolved client-side and passed explicitly.
+// NC Email helper — tries Firebase trigger-email extension ('mail' collection) first
+// for custom subject/body, then falls back to sendAuditScheduleEmail CF.
 async function _sendNcEmail(toEmails, subject, bodyHtml, ncId, auditPlanId) {
   if (!toEmails || toEmails.length === 0) return;
   const uniqueEmails = [...new Set(toEmails.filter(Boolean))];
   if (!uniqueEmails.length) return;
-  try {
-    db.collection('ncEmailLog').add({
-      to: uniqueEmails, subject, ncId: ncId||'', auditPlanId: auditPlanId||'',
-      sentBy: S.user?.uid||'',
-      sentAt: firebase.firestore.FieldValue.serverTimestamp(),
-      status: 'pending',
-    }).catch(()=>{});
 
-    const fn = fnRegion.httpsCallable('sendAuditScheduleEmail');
-    // Use auditPlans collection + planId — matches exactly how working schedule email is called
-    // If no planId available, still try with findings as fallback
-    const _useCol = auditPlanId ? 'auditPlans' : 'findings';
-    const _useIds = auditPlanId ? [auditPlanId] : (ncId ? [ncId] : []);
-    await fn({ docIds: _useIds, collection: _useCol, recipients: uniqueEmails });
-  } catch(e) {
-    console.warn('_sendNcEmail CF failed:', e?.message||e);
-    db.collection('ncEmailLog').where('ncId','==',ncId||'').orderBy('sentAt','desc').limit(1).get()
-      .then(s=>{ if(s&&!s.empty) s.docs[0].ref.update({ status:'failed', error: e?.message||String(e) }); })
-      .catch(()=>{});
+  // Log attempt
+  const _logRef = db.collection('ncEmailLog').doc();
+  _logRef.set({
+    to: uniqueEmails, subject, ncId: ncId||'', auditPlanId: auditPlanId||'',
+    sentBy: S.user?.uid||'',
+    sentAt: firebase.firestore.FieldValue.serverTimestamp(),
+    status: 'pending',
+  }).catch(()=>{});
+
+  // ── Strategy 1: Firebase trigger-email extension ('mail' collection) ──────
+  // This extension watches 'mail' collection and sends emails with custom body.
+  // Format: { to:[emails], message:{ subject, html } }
+  let _mailSent = false;
+  try {
+    const _mailBody = bodyHtml || `<p>${subject}</p>`;
+    const _mailPayload = {
+      to: uniqueEmails,
+      message: { subject: subject || 'Audit NC Notification', html: _mailBody },
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    };
+    await db.collection('mail').add(_mailPayload);
+    _mailSent = true;
+    _logRef.update({ status:'sent', method:'mail-collection' }).catch(()=>{});
+  } catch(_mailErr) {
+    // 'mail' collection not available (extension not installed or permission denied) — fall through
+    console.info('mail collection unavailable, falling back to CF:', _mailErr?.message||_mailErr);
+  }
+
+  // ── Strategy 2: sendAuditScheduleEmail CF (fallback, sends schedule-style body) ─
+  if (!_mailSent) {
+    try {
+      const fn = fnRegion.httpsCallable('sendAuditScheduleEmail');
+      const _useCol = auditPlanId ? 'auditPlans' : 'findings';
+      const _useIds = auditPlanId ? [auditPlanId] : (ncId ? [ncId] : []);
+      await fn({ docIds: _useIds, collection: _useCol, recipients: uniqueEmails });
+      _logRef.update({ status:'sent', method:'sendAuditScheduleEmail' }).catch(()=>{});
+    } catch(e) {
+      console.warn('_sendNcEmail CF fallback failed:', e?.message||e);
+      _logRef.update({ status:'failed', error: e?.message||String(e) }).catch(()=>{});
+    }
   }
 }
 
@@ -6780,8 +6904,11 @@ async function ncApprove(ncId, nextStage, comment){
       }
       if (_audEmail) await _sendNcEmail([_audEmail],
         `[Action Required] Auditor Review — NC ${_ncNo}`,
-        `Dept Head approved action plan for NC ${_ncNo} (${_auditName}). Please review.`,
-        ncId, _planId);
+        _ncEmailHtml('auditor',
+          `Dept Head Approved — Auditor Review Required`,
+          `The Dept Head has approved the action plan for NC <strong>${_ncNo}</strong> (<em>${_auditName}</em>). Please log in to review and forward to MR or return with comments.`,
+          { ncNo: _ncNo, audit: _auditName, plant: _plant, dept: _dept, byName: _byName }
+        ), ncId, _planId);
 
     } else if (nextStage === 'MR Review') {
       // Email MR / Plant Admin users for this plant
@@ -6792,8 +6919,11 @@ async function ncApprove(ncId, nextStage, comment){
         if (!_plant||dp===_plant||dp==='All Plants') { if(dd.email&&!_mrEmails.includes(dd.email)) _mrEmails.push(dd.email); } }); });
       if (_mrEmails.length) await _sendNcEmail(_mrEmails,
         `[Action Required] MR Final Approval — NC ${_ncNo}`,
-        `Auditor approved action plan for NC ${_ncNo} (${_auditName}). MR final approval required.`,
-        ncId, _planId);
+        _ncEmailHtml('mr',
+          `MR Final Approval Required — NC ${_ncNo}`,
+          `The Auditor has reviewed and approved the action plan for NC <strong>${_ncNo}</strong> (<em>${_auditName}</em>). Your final approval is required to close this NC.`,
+          { ncNo: _ncNo, audit: _auditName, plant: _plant, dept: _dept, byName: _byName }
+        ), ncId, _planId);
 
     } else if (nextStage === 'Closed') {
       // Email auditee
@@ -6805,8 +6935,11 @@ async function ncApprove(ncId, nextStage, comment){
       }
       if (_aeEmail) await _sendNcEmail([_aeEmail],
         `✅ NC Closed — ${_ncNo}`,
-        `NC ${_ncNo} (${_auditName}) has been reviewed and officially closed. No further action required.`,
-        ncId, _planId);
+        _ncEmailHtml('closed',
+          `NC Officially Closed — ${_ncNo}`,
+          `Your action plan for NC <strong>${_ncNo}</strong> (<em>${_auditName}</em>) has been reviewed and approved by all reviewers. This NC is now officially <strong>closed</strong>. No further action is required from you.`,
+          { ncNo: _ncNo, audit: _auditName, plant: _plant, dept: _dept, byName: _byName }
+        ), ncId, _planId);
     }
   } catch(_ee){ console.warn('ncApprove email error:', _ee?.message||_ee); }
 
@@ -6842,19 +6975,17 @@ async function ncReturn(ncId, returnToStage){
       if (_aeDoc?.exists) _finalAeEmail = _aeDoc.data().email||'';
     }
     if (_finalAeEmail) {
-      const _ncNo     = _fd.findingNo||ncId.slice(-6).toUpperCase();
-      const _ncDesc   = _fd.description||_fd.finding||'';
-      const _retBy    = S.userDoc?.name||S.user?.email||'Reviewer';
-      const _subject  = `Action Required: NC ${_ncNo} Returned for Revision`;
-      const _bodyHtml = `
-        <p>Dear Auditee,</p>
-        <p>Non-Conformance <strong>${_ncNo}</strong> has been returned to <strong>Auditee Action</strong> by <strong>${_retBy}</strong>.</p>
-        ${_ncDesc ? `<p><strong>NC Description:</strong> ${_ncDesc}</p>` : ''}
-        <p><strong>Reviewer Comment:</strong><br/>${comment}</p>
-        <p>Please log in to the Audit Management System, review the comment, update your action plan, and re-submit.</p>
-      `;
+      const _ncNo      = _fd.findingNo||ncId.slice(-6).toUpperCase();
+      const _retBy     = S.userDoc?.name||S.user?.email||'Reviewer';
+      const _retRole   = currentStage==='MR Review' ? 'MR' : currentStage==='Auditor Review' ? 'Auditor' : 'Dept Head';
       const _retPlanId = _fd.auditId||_fd.auditPlanId||'';
-      await _sendNcEmail([_finalAeEmail], _subject, _bodyHtml, ncId, _retPlanId);
+      await _sendNcEmail([_finalAeEmail],
+        `Action Required: NC ${_ncNo} Returned for Revision`,
+        _ncEmailHtml('auditee',
+          `NC Returned for Revision — ${_ncNo}`,
+          `Your action plan for NC <strong>${_ncNo}</strong> has been returned by the <strong>${_retRole}</strong>. Please log in, review the comment below, revise your action plan, and resubmit.`,
+          { ncNo: _ncNo, audit: _fd.auditName||'', plant: _fd.plant||'', dept: _fd.department||'', comment, byName: _retBy }
+        ), ncId, _retPlanId);
     }
   } catch(_re){ console.warn('Return email error:', _re?.message||_re); }
 
