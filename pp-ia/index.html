@@ -4511,7 +4511,12 @@ async function submitAuditResponses(planId) {
         findingNo:    'NC-' + Date.now().toString(36).toUpperCase() + String(qIdx).padStart(2,'0'),
         raisedBy:     S.user?.uid     || '',
         raisedByName: S.userDoc?.name || S.user?.email || '',
+        auditorId:    S.user?.uid     || '',
         auditorName:  S.userDoc?.name || S.user?.email || '',
+        auditName:    plan.name       || '',
+        auditeeId:    plan.auditeeId  || '',
+        auditeeName:  plan.auditeeName|| '',
+        auditeeEmail: plan.auditeeEmail||'',
         ...(qEvidenceUrls.length ? {evidenceUrls: qEvidenceUrls} : {}),
         createdAt:    firebase.firestore.FieldValue.serverTimestamp(),
         updatedAt:    firebase.firestore.FieldValue.serverTimestamp(),
@@ -5356,26 +5361,8 @@ async function submitAuditeeActionPlans() {
         });
         await notifBatch.commit().catch(()=>{});
 
-        // ── Email each matched Dept Head about the new action plan ───────────
-        const dhEmails = [];
-        deptHeadSnap.docs.forEach(dhu => {
-          const dhuData = dhu.data();
-          const dhuDept  = dhuData.department || '';
-          const dhuPlant = dhuData.plant || 'All Plants';
-          const _dhEmailMatch = dhuDept === dept2 && (dhuPlant === plant2 || dhuPlant === 'All Plants' || plant2 === '');
-          if ((_dhEmailMatch || dept2 === '') && dhuData.email) {
-            dhEmails.push(dhuData.email);
-          }
-        });
-        if (dhEmails.length) {
-          _sendNcEmail(dhEmails,
-            `Action Plan Submitted — Awaiting Your Review (${auditName})`,
-            `<p>Dear Dept Head,</p>
-             <p><strong>${S.userDoc?.name||'Auditee'}</strong> has submitted ${saved} action plan${saved!==1?'s':''} for <strong>${auditName}</strong>. Please review and approve.</p>
-             <p><strong>Department:</strong> ${dept2||'—'} | <strong>Plant:</strong> ${plant2||'—'} | <strong>Audit No:</strong> ${auditNo2||'—'}</p>
-             <p>Log in to QMS Galaxy → My Actions to review the submission.</p>`,
-            findingIds[0]||'');
-        }
+        // Email to Dept Head is handled automatically by Cloud Function trigger
+        // onFindingWorkflowUpdated when workflowStage changes to 'Dept Head Review'.
       }
     }
 
@@ -6597,98 +6584,8 @@ async function ncApprove(ncId, nextStage, comment){
   _updateNcMyAction(ncId, 'Completed', nextStage, '');
   showToast(nextStage==='Closed'?'NC Closed ✓':'Approved & forwarded ✓','success');
 
-  // ── Send email notifications ─────────────────────────────────────────────
-  // Fetch the finding to get recipient details
-  const _ncDoc = await db.collection('findings').doc(ncId).get().catch(()=>null);
-  const _nc = _ncDoc?.data()||{};
-  const _approverName = S.userDoc?.name||S.user?.email||'Reviewer';
-  if (nextStage === 'Closed') {
-    // Notify auditee that NC is closed
-    const _toEmails = [_nc.auditeeEmail||_nc.assigneeEmail||''].filter(Boolean);
-    _sendNcEmail(_toEmails,
-      `NC Closed — ${_nc.findingNo||ncId}`,
-      `<p>Dear ${_nc.auditeeName||'Auditee'},</p>
-       <p>Your Non-Conformity <strong>${_nc.findingNo||ncId}</strong> has been <strong style="color:#16a34a">closed</strong> by the MR (${_approverName}).</p>
-       <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`,
-      ncId);
-  } else {
-    const _ncPlant = _nc.plant||'';
-    const _ncDept  = _nc.department||'';
-    const _auditeeEmail = _nc.auditeeEmail||_nc.assigneeEmail||'';
-
-    // Fetch the linked audit plan to get the specific auditor email
-    const _planId = _nc.auditId||_nc.auditPlanId||'';
-    let _auditorEmail = '';
-    if (_planId) {
-      const _planDoc = await db.collection('auditPlans').doc(_planId).get().catch(()=>null);
-      if (_planDoc?.exists) {
-        const _pd = _planDoc.data();
-        _auditorEmail = _pd.leadAuditorEmail||_pd.auditorEmail||'';
-      }
-    }
-    // Fallback: if audit plan has no email, try to get from raisedBy uid
-    if (!_auditorEmail && (_nc.raisedBy||_nc.auditorId)) {
-      const _audUid = _nc.raisedBy||_nc.auditorId;
-      const _audDoc = await db.collection('users').doc(_audUid).get().catch(()=>null);
-      if (_audDoc?.exists) _auditorEmail = _audDoc.data().email||'';
-    }
-    // Last resort: use stored auditorEmail field on finding itself
-    if (!_auditorEmail) _auditorEmail = _nc.auditorEmail||'';
-
-    if (nextStage === 'Auditor Review') {
-      // Notify the specific lead auditor of this audit only
-      const _toAuditor = [_auditorEmail].filter(Boolean);
-      _sendNcEmail(_toAuditor,
-        `NC Action Plan Awaiting Your Review — ${_nc.findingNo||ncId}`,
-        `<p>Dear Auditor,</p>
-         <p>The action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been approved by the Dept Head (<strong>${_approverName}</strong>) and is now awaiting your review.</p>
-         <p><strong>Description:</strong> ${_nc.description||''}<br>
-         <strong>Plant:</strong> ${_ncPlant||'—'} | <strong>Dept:</strong> ${_ncDept||'—'} | <strong>Audit:</strong> ${_nc.auditNo||''}</p>
-         <p>Please log in to QMS Galaxy → NC module to review.</p>`,
-        ncId);
-      // Notify auditee of progress
-      if (_auditeeEmail) _sendNcEmail([_auditeeEmail],
-        `Your NC Action Plan is Under Auditor Review — ${_nc.findingNo||ncId}`,
-        `<p>Dear ${_nc.auditeeName||'Auditee'},</p>
-         <p>Your action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been approved by the Dept Head and forwarded to the <strong>Auditor</strong> for review.</p>
-         <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`,
-        ncId);
-
-    } else if (nextStage === 'MR Review') {
-      // Notify only the MR users whose plant matches this NC's plant
-      const _mrRoles = ['MR','Management Representative','Plant MR','Admin','Super Admin'];
-      Promise.all(_mrRoles.map(r=>db.collection('users').where('role','==',r).get().catch(()=>null))).then(snaps=>{
-        const mrEmails=[];
-        snaps.forEach(s=>{ if(s) s.forEach(d=>{
-          const u=d.data();
-          const uPlant=u.plant||'All Plants';
-          if ((!_ncPlant || uPlant==='All Plants' || uPlant===_ncPlant) && u.email) mrEmails.push(u.email);
-        }); });
-        _sendNcEmail(mrEmails,
-          `NC Action Plan Awaiting MR Approval — ${_nc.findingNo||ncId}`,
-          `<p>Dear MR,</p>
-           <p>The action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been approved by the Auditor (<strong>${_approverName}</strong>) and is now awaiting your final approval.</p>
-           <p><strong>Description:</strong> ${_nc.description||''}<br>
-           <strong>Plant:</strong> ${_ncPlant||'—'} | <strong>Dept:</strong> ${_ncDept||'—'} | <strong>Audit:</strong> ${_nc.auditNo||''}</p>
-           <p>Please log in to QMS Galaxy → NC module to review and close.</p>`,
-          ncId);
-      });
-      // Notify auditor & auditee of progress
-      if (_auditorEmail) _sendNcEmail([_auditorEmail],
-        `NC Forwarded to MR — ${_nc.findingNo||ncId}`,
-        `<p>Dear Auditor,</p>
-         <p>NC <strong>${_nc.findingNo||ncId}</strong> has been forwarded to the MR for final approval after your review.</p>
-         <p style="color:#64748b">Audit: ${_nc.auditNo||''}</p>`,
-        ncId);
-      if (_auditeeEmail) _sendNcEmail([_auditeeEmail],
-        `Your NC Action Plan is Under MR Review — ${_nc.findingNo||ncId}`,
-        `<p>Dear ${_nc.auditeeName||'Auditee'},</p>
-         <p>Your action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been forwarded to the <strong>MR</strong> for final review and closure.</p>
-         <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`,
-        ncId);
-    }
-  }
-
+  // Email notifications are handled automatically by the Cloud Function trigger
+  // onFindingWorkflowUpdated — it fires when workflowStage changes on the finding doc.
   openNCDetail(ncId);
 }
 
@@ -6708,22 +6605,7 @@ async function ncReturn(ncId, returnToStage){
   _updateNcMyAction(ncId, 'Completed', returnToStage, comment);
   showToast('Returned to '+returnToStage+' ✓','info');
 
-  // ── Notify auditee by email that their action plan was returned ──────────
-  db.collection('findings').doc(ncId).get().catch(()=>null).then(_rDoc => {
-    const _rNc = _rDoc?.data()||{};
-    const _retEmail = _rNc.auditeeEmail||_rNc.assigneeEmail||'';
-    const _retBy = S.userDoc?.name||S.user?.email||'Reviewer';
-    if (_retEmail) {
-      _sendNcEmail([_retEmail],
-        `NC Action Plan Returned for Revision — ${_rNc.findingNo||ncId}`,
-        `<p>Dear ${_rNc.auditeeName||'Auditee'},</p>
-         <p>Your action plan for NC <strong>${_rNc.findingNo||ncId}</strong> has been <strong style="color:#dc2626">returned</strong> for revision by <strong>${_retBy}</strong>.</p>
-         <p><strong>Reviewer Comment:</strong> ${comment}</p>
-         <p>Please log in to QMS Galaxy, update your action plan, and re-submit.</p>
-         <p style="color:#64748b">Audit: ${_rNc.auditNo||''} | Stage: ${currentStage}</p>`,
-        ncId);
-    }
-  });
+  // Email notifications handled by Cloud Function trigger onFindingWorkflowUpdated.
 
   openNCDetail(ncId);
 }
