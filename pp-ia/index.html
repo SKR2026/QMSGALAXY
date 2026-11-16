@@ -6982,38 +6982,49 @@ async function _sendNcEmail(toEmails, subject, bodyHtml, ncId, auditPlanId, noti
     status: 'pending',
   }).catch(()=>{});
 
-  // ── Strategy 1: sendAuditScheduleEmail CF (same CF that schedule emails use — reads
-  //    Gmail credentials from Firebase Secrets server-side, nothing to pass from client)
+  // ── Fetch Gmail credentials (required by both CFs — same as supplier/schedule email flows)
+  const _emailCfgSnap = await db.collection('appSettings').doc('emailConfig').get().catch(()=>null);
+  const _emailCfg     = _emailCfgSnap?.data() || {};
+  const _gmailAddr    = _emailCfg.gmailAddress || '';
+  const _gmailPwd     = _emailCfg.gmailAppPwd  || '';
+
   let emailSent = false;
-  try {
-    const _fn1 = fnRegion.httpsCallable('sendAuditScheduleEmail');
-    await _fn1({
-      // Pass recipients directly so the CF sends to these addresses
-      recipients: uniqueEmails,
-      // Override subject & html so the CF uses our custom content
-      subject: subject || 'Audit Notification',
-      html: bodyHtml || `<p>${subject}</p>`,
-      // Flags that tell the CF to skip plan-lookup and use the provided content as-is
-      skipPlanLookup: true,
-      planIds: (auditPlanId ? [auditPlanId] : (ncId ? [ncId] : ['nc'])),
-    });
-    _logRef.update({ status:'sent', method:'sendAuditScheduleEmail' }).catch(()=>{});
-    emailSent = true;
-  } catch(e) {
-    console.warn('sendAuditScheduleEmail CF failed:', e?.message||e);
-    // ── Fallback: sendGenericEmail (also reads creds from Secrets) ───────────
+  if (!_gmailAddr || !_gmailPwd) {
+    console.warn('_sendNcEmail: Gmail credentials not set in Settings → Email Configuration. Skipping email.');
+    _logRef.update({ status:'skipped', error:'Gmail credentials not configured' }).catch(()=>{});
+  } else {
+    // ── Strategy 1: sendAuditScheduleEmail (same CF as schedule emails) ──────
     try {
-      const _fn2 = fnRegion.httpsCallable('sendGenericEmail');
-      await _fn2({
-        to: uniqueEmails,
-        subject: subject || 'Audit Notification',
-        html: bodyHtml || `<p>${subject}</p>`,
+      const _fn1 = fnRegion.httpsCallable('sendAuditScheduleEmail');
+      await _fn1({
+        to          : uniqueEmails,
+        subject     : subject || 'Audit Notification',
+        html        : bodyHtml || `<p>${subject}</p>`,
+        gmailAddress: _gmailAddr,
+        gmailAppPwd : _gmailPwd,
+        planIds     : (auditPlanId ? [auditPlanId] : (ncId ? [ncId] : ['nc'])),
+        skipPlanLookup: true,
       });
-      _logRef.update({ status:'sent', method:'sendGenericEmail' }).catch(()=>{});
+      _logRef.update({ status:'sent', method:'sendAuditScheduleEmail' }).catch(()=>{});
       emailSent = true;
-    } catch(e2) {
-      console.warn('sendGenericEmail CF also failed:', e2?.message||e2);
-      _logRef.update({ status:'failed', error: e2?.message||e?.message||String(e2) }).catch(()=>{});
+    } catch(e) {
+      console.warn('sendAuditScheduleEmail CF failed:', e?.message||e);
+      // ── Fallback: sendGenericEmail ──────────────────────────────────────────
+      try {
+        const _fn2 = fnRegion.httpsCallable('sendGenericEmail');
+        await _fn2({
+          to          : uniqueEmails,
+          subject     : subject || 'Audit Notification',
+          html        : bodyHtml || `<p>${subject}</p>`,
+          gmailAddress: _gmailAddr,
+          gmailAppPwd : _gmailPwd,
+        });
+        _logRef.update({ status:'sent', method:'sendGenericEmail' }).catch(()=>{});
+        emailSent = true;
+      } catch(e2) {
+        console.warn('sendGenericEmail CF also failed:', e2?.message||e2);
+        _logRef.update({ status:'failed', error: e2?.message||e?.message||String(e2) }).catch(()=>{});
+      }
     }
   }
 
