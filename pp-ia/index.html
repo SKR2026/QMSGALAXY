@@ -6830,37 +6830,32 @@ async function _sendNcEmail(toEmails, subject, bodyHtml, ncId, auditPlanId) {
     status: 'pending',
   }).catch(()=>{});
 
-  // ── Strategy 1: Firebase trigger-email extension ('mail' collection) ──────
-  // This extension watches 'mail' collection and sends emails with custom body.
-  // Format: { to:[emails], message:{ subject, html } }
-  let _mailSent = false;
+  // ── Strategy 1: sendAuditScheduleEmail CF (primary — known to work) ────────
   try {
-    const _mailBody = bodyHtml || `<p>${subject}</p>`;
-    const _mailPayload = {
-      to: uniqueEmails,
-      message: { subject: subject || 'Audit NC Notification', html: _mailBody },
-      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-    };
-    await db.collection('mail').add(_mailPayload);
-    _mailSent = true;
-    _logRef.update({ status:'sent', method:'mail-collection' }).catch(()=>{});
-  } catch(_mailErr) {
-    // 'mail' collection not available (extension not installed or permission denied) — fall through
-    console.info('mail collection unavailable, falling back to CF:', _mailErr?.message||_mailErr);
+    const fn = fnRegion.httpsCallable('sendAuditScheduleEmail');
+    const _useCol = auditPlanId ? 'auditPlans' : 'findings';
+    const _useIds = auditPlanId ? [auditPlanId] : (ncId ? [ncId] : []);
+    await fn({ docIds: _useIds, collection: _useCol, recipients: uniqueEmails });
+    _logRef.update({ status:'sent', method:'sendAuditScheduleEmail' }).catch(()=>{});
+  } catch(e) {
+    console.warn('_sendNcEmail CF failed:', e?.message||e);
+    _logRef.update({ status:'failed', error: e?.message||String(e) }).catch(()=>{});
   }
 
-  // ── Strategy 2: sendAuditScheduleEmail CF (fallback, sends schedule-style body) ─
-  if (!_mailSent) {
-    try {
-      const fn = fnRegion.httpsCallable('sendAuditScheduleEmail');
-      const _useCol = auditPlanId ? 'auditPlans' : 'findings';
-      const _useIds = auditPlanId ? [auditPlanId] : (ncId ? [ncId] : []);
-      await fn({ docIds: _useIds, collection: _useCol, recipients: uniqueEmails });
-      _logRef.update({ status:'sent', method:'sendAuditScheduleEmail' }).catch(()=>{});
-    } catch(e) {
-      console.warn('_sendNcEmail CF fallback failed:', e?.message||e);
-      _logRef.update({ status:'failed', error: e?.message||String(e) }).catch(()=>{});
-    }
+  // ── Strategy 2: Firebase trigger-email extension ('mail' collection) ─────
+  // Writes a nicely-formatted email doc. If the trigger-email extension is
+  // installed in Firebase Console, recipients get the branded HTML template.
+  // If the extension is NOT installed the doc just sits in Firestore unused —
+  // the CF above already delivered the email, so this is purely additive.
+  try {
+    await db.collection('mail').add({
+      to: uniqueEmails,
+      message: { subject: subject || 'Audit NC Notification', html: bodyHtml || `<p>${subject}</p>` },
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch(_mailErr) {
+    // Silently ignore — CF above is the reliable path
+    console.info('mail collection write skipped:', _mailErr?.message||_mailErr);
   }
 }
 
