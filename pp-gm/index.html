@@ -2186,22 +2186,44 @@ function exportToExcel(headers, rows, filename, sheetName="Data"){
 function exportToPDF(title, headers, rows, filename, orientation="landscape"){
   const {jsPDF}=window.jspdf;
   const doc=new jsPDF({orientation,unit:"mm",format:"a4"});
+  const pageW=doc.internal.pageSize.getWidth();
   const co=BRANDING.companyName||"Gift Management System";
-  // Header
+
+  // ── Logo (if set) ──────────────────────────────────────────────────
+  const logoH=14, logoW=14, logoX=pageW-14-logoW;
+  if(BRANDING.logoBase64){
+    try{
+      const fmt=BRANDING.logoBase64.includes("image/png")?"PNG":"JPEG";
+      doc.addImage(BRANDING.logoBase64,fmt,logoX,6,logoW,logoH);
+    }catch(e){/* skip if image fails */}
+  }
+
+  // ── Header text ───────────────────────────────────────────────────
   doc.setFontSize(14);doc.setFont(undefined,"bold");
   doc.text(co,14,14);
   doc.setFontSize(10);doc.setFont(undefined,"normal");
   doc.text(title,14,21);
   doc.text(`Generated: ${new Date().toLocaleString("en-IN")}`,14,27);
-  // Table
+
+  // ── Divider ───────────────────────────────────────────────────────
+  doc.setDrawColor(200,200,200);doc.line(14,30,pageW-14,30);
+
+  // ── Table ─────────────────────────────────────────────────────────
   doc.autoTable({
     head:[headers],
     body:rows,
-    startY:32,
+    startY:34,
     styles:{fontSize:8,cellPadding:2},
     headStyles:{fillColor:[37,99,235],textColor:255,fontStyle:"bold"},
     alternateRowStyles:{fillColor:[239,246,255]},
-    margin:{left:14,right:14}
+    margin:{left:14,right:14},
+    didDrawPage:(data)=>{
+      // Footer on every page
+      const pg=doc.internal.getNumberOfPages();
+      doc.setFontSize(7);doc.setFont(undefined,"normal");doc.setTextColor(150);
+      doc.text(`${co} · ${title} · Page ${data.pageNumber} of ${pg}`,14,doc.internal.pageSize.getHeight()-6);
+      doc.setTextColor(0);
+    }
   });
   doc.save(filename);
 }
@@ -2227,14 +2249,93 @@ function exportDashboardExcel(){
   XLSX.utils.book_append_sheet(wb,ws2,"All Requests");
   XLSX.writeFile(wb,`Dashboard_${new Date().toISOString().slice(0,10)}.xlsx`);
 }
-function exportDashboardPDF(){
+async function exportDashboardPDF(){
   const all=$("dashboardView")._exportAll;
   if(!all?.length){message("No dashboard data to export.","warn");return;}
+  message("Generating PDF with charts…","info");
+
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+  const pageW=doc.internal.pageSize.getWidth(); // 297
+  const pageH=doc.internal.pageSize.getHeight(); // 210
+  const co=BRANDING.companyName||"Gift Management System";
+
+  // ── Helper: draw page header ──────────────────────────────────────
+  function drawHeader(pageTitle){
+    if(BRANDING.logoBase64){
+      try{const fmt=BRANDING.logoBase64.includes("image/png")?"PNG":"JPEG";
+        doc.addImage(BRANDING.logoBase64,fmt,pageW-28,4,20,14);}catch(e){}
+    }
+    doc.setFontSize(14);doc.setFont(undefined,"bold");doc.setTextColor(0);
+    doc.text(co,14,13);
+    doc.setFontSize(10);doc.setFont(undefined,"normal");
+    doc.text(pageTitle,14,20);
+    doc.text(`Generated: ${new Date().toLocaleString("en-IN")}`,14,26);
+    doc.setDrawColor(200,200,200);doc.line(14,29,pageW-14,29);
+  }
+
+  // ── Page 1: KPI summary table ─────────────────────────────────────
+  drawHeader("Dashboard Summary");
   const tiles=[...document.querySelectorAll(".kpi-tile")].map(t=>[
     t.querySelector(".kpi-label")?.textContent||"",
     t.querySelector(".kpi-value")?.textContent||""
   ]);
-  exportToPDF("Dashboard Summary",["Metric","Value"],tiles,`Dashboard_${new Date().toISOString().slice(0,10)}.pdf`,"portrait");
+  doc.autoTable({
+    head:[["Metric","Value"]],body:tiles,startY:33,
+    styles:{fontSize:9,cellPadding:3},
+    headStyles:{fillColor:[37,99,235],textColor:255,fontStyle:"bold"},
+    alternateRowStyles:{fillColor:[239,246,255]},
+    columnStyles:{0:{cellWidth:120},1:{cellWidth:60}},
+    margin:{left:14,right:14}
+  });
+
+  // ── Pages 2+: Charts ──────────────────────────────────────────────
+  const chartDefs=[
+    {id:"chartPlantCat",label:"Plant-wise Gifts by Category"},
+    {id:"chartStatus",label:"Status Distribution"},
+    {id:"chartDeptCat",label:"Dept-wise Gift Categories"},
+    {id:"chartMonthly",label:"Monthly Request Trend"},
+    {id:"chartTopGifts",label:"Top Gift Items by Quantity"},
+  ];
+
+  // Lay 2 charts per page side by side
+  const pairW=(pageW-14-14-8)/2; // usable width per chart
+  const chartH=100;
+  let pairIdx=0;
+
+  for(const {id,label} of chartDefs){
+    const canvas=document.getElementById(id);
+    if(!canvas)continue;
+    let imgData;
+    try{imgData=canvas.toDataURL("image/png",1.0);}catch(e){continue;}
+    if(!imgData||imgData==="data:,")continue;
+
+    const col=pairIdx%2;
+    if(col===0){
+      doc.addPage();
+      drawHeader("Dashboard Charts");
+    }
+    const xOff=14+(col*(pairW+8));
+    const yOff=33;
+    // chart title
+    doc.setFontSize(8);doc.setFont(undefined,"bold");doc.setTextColor(80);
+    doc.text(label,xOff,yOff-2);
+    doc.setTextColor(0);
+    // chart image
+    doc.addImage(imgData,"PNG",xOff,yOff,pairW,chartH);
+    pairIdx++;
+  }
+
+  // ── Footer on every page ──────────────────────────────────────────
+  const totalPages=doc.internal.getNumberOfPages();
+  for(let p=1;p<=totalPages;p++){
+    doc.setPage(p);
+    doc.setFontSize(7);doc.setFont(undefined,"normal");doc.setTextColor(150);
+    doc.text(`${co} · Dashboard Report · Page ${p} of ${totalPages}`,14,pageH-4);
+    doc.setTextColor(0);
+  }
+
+  doc.save(`Dashboard_${new Date().toISOString().slice(0,10)}.pdf`);
 }
 
 /* ── Guest List export ──────────────────────────────────────────────── */
