@@ -1187,6 +1187,18 @@ select.form-input{cursor:pointer}
   </div>
 </div>
 
+<!-- LPA Frequency Management (Super Admin only) -->
+<div class="card" id="lpaFreqMgmtCard" style="margin-top:16px;display:none">
+  <div class="card-title">LPA Audit Frequency Options</div>
+  <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Manage the frequency options available when planning LPA audits. These are shown in the Plan LPA Audits modal.</p>
+  <div id="lpaFreqList" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px"></div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <input class="form-input" id="lpaFreqNewInput" placeholder="New frequency (e.g. Bi-Weekly)" style="max-width:220px">
+    <button class="btn btn-secondary btn-sm" onclick="addLpaFreqOption()"><span class="material-icons" style="font-size:14px;vertical-align:middle">add</span> Add</button>
+    <button class="btn btn-primary btn-sm" onclick="saveLpaFreqOptions()" style="margin-left:auto">Save Frequencies</button>
+  </div>
+</div>
+
 <!-- Login Screen Customisation — full width card -->
 <div class="card" style="margin-top:16px">
   <div class="card-title">Login Screen Customisation</div>
@@ -3573,7 +3585,7 @@ async function _loadShiftOpts() {
 }
 
 // ── Shared table builder ───────────────────────────────────────────────────────
-function _openPlanTable(panelId, title, collection, plantOpts, shiftOpts, today, isLPA) {
+async function _openPlanTable(panelId, title, collection, plantOpts, shiftOpts, today, isLPA) {
   const panel = document.getElementById(panelId);
   panel._prevHTML = panel.innerHTML;
   panel._isLPA = isLPA;
@@ -3581,9 +3593,20 @@ function _openPlanTable(panelId, title, collection, plantOpts, shiftOpts, today,
 
   const lpaLevelOpts = ['Layer 1 - Operator','Layer 2 - Supervisor','Layer 3 - Management'].map(l=>`<option value="${l}">${l}</option>`).join('');
 
+  // Load LPA frequency options from Firestore (Super Admin managed)
+  let lpaFreqOpts = 'Daily,Weekly,Monthly,Quarterly'; // default fallback
+  if (isLPA) {
+    const freqSnap = await db.collection('appSettings').doc('lpaFrequencies').get().catch(()=>null);
+    if (freqSnap?.exists && freqSnap.data()?.options?.length) {
+      lpaFreqOpts = freqSnap.data().options.join(',');
+    }
+  }
+  window._planLpaFreqOpts = lpaFreqOpts;
+
   const lpaExtraHead = isLPA
     ? `<th style="padding:8px 6px;text-align:left;font-weight:600;color:var(--text-secondary);white-space:nowrap">LPA LAYER <span style="color:var(--red)">*</span></th>`
       +`<th style="padding:8px 6px;text-align:left;font-weight:600;color:var(--text-secondary)">AREA / SUB-PROCESS</th>`
+      +`<th style="padding:8px 6px;text-align:left;font-weight:600;color:var(--text-secondary);white-space:nowrap">FREQUENCY <span style="color:var(--red)">*</span></th>`
     : '';
 
   panel.innerHTML = `
@@ -3651,9 +3674,11 @@ function addPlanRow() {
   const inp = `border:1px solid var(--border);border-radius:6px;padding:5px 7px;font-size:12px;width:100%;background:#fff;color:var(--text-primary)`;
   const sel = `border:1px solid var(--border);border-radius:6px;padding:5px 4px;font-size:12px;width:100%;background:#fff;color:var(--text-primary)`;
 
+  const lpaFreqOpts = (window._planLpaFreqOpts||'Daily,Weekly,Monthly,Quarterly').split(',').map(f=>`<option value="${f}">${f}</option>`).join('');
   const lpaExtraCells = isLPA
     ? `<td style="padding:6px 4px;min-width:140px;vertical-align:top"><select style="${sel}" class="pr-level"><option value="">— Layer</option>${lpaLevelOpts}</select></td>`
       +`<td style="padding:6px 4px;min-width:150px;vertical-align:top"><input style="${inp}" class="pr-area" placeholder="Area / sub-process"></td>`
+      +`<td style="padding:6px 4px;min-width:120px;vertical-align:top"><select style="${sel}" class="pr-freq"><option value="">— Freq</option>${lpaFreqOpts}</select></td>`
     : '';
 
   const auditTypeOpts = ['Product','Process','5S','System','Internal','LPA','Supplier Audit','EHS','IATF 16949','ISO 9001','ISO 14001','ISO 45001','Fire Safety','Energy Management','TPM','Legal Compliance']
@@ -3867,6 +3892,7 @@ async function saveAllAuditPlans(panelId, collection, isLPA) {
     if(isLPA){
       data.layer=level;
       data.area=tr.querySelector('.pr-area')?.value||'';
+      data.frequency=tr.querySelector('.pr-freq')?.value||'Monthly';
     }
     // Resolve plant code
     const pSnap = await db.collection('plants').where('name','==',data.plant).limit(1).get().catch(()=>null);
@@ -3940,6 +3966,45 @@ async function saveAllAuditPlans(panelId, collection, isLPA) {
         }
       } catch(e){ console.warn('LPA myActions create error:', e); }
       showToast(saved+' LPA plan'+(saved!==1?'s':'')+' scheduled!','success');
+
+      // ── Send email notification to each assigned auditor ──────────────────
+      try {
+        for(const p of savedDocs){
+          const auditorEmail = p.leadAuditorEmail||'';
+          if(!auditorEmail) continue;
+          const auditDateStr = p.plannedDate?.toDate ? p.plannedDate.toDate().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) : (p.plannedDate||'');
+          const freq = p.frequency||'';
+          const bodyHtml = _ncEmailHtml('auditor',
+            'LPA Audit Assigned to You',
+            'Please complete the audit on the planned date.',
+            {
+              id: p.id,
+              plant: p.plant||'',
+              department: p.department||'',
+              process: p.process||'',
+              layer: p.layer||'',
+              area: p.area||'',
+              frequency: freq,
+              plannedDate: auditDateStr,
+              auditorName: p.leadAuditorName||auditorEmail,
+              auditNo: p.auditNo||'',
+              auditType: p.auditType||'LPA',
+              shift: p.shift||'',
+              workflowStage: 'Planned',
+              status: 'Planned',
+              raisedByName: p.createdByName||'',
+            }
+          );
+          await _sendNcEmail(
+            [auditorEmail],
+            `LPA Audit Assigned – ${p.plant||''} | ${p.process||p.department||''} | ${auditDateStr}`,
+            bodyHtml,
+            null, p.id,
+            { type:'lpa_assigned', title:`LPA Audit: ${p.name||p.id}`, body:`You have a ${freq} LPA audit on ${auditDateStr}` }
+          );
+        }
+      } catch(eEmail){ console.warn('LPA plan email error:', eEmail); }
+
       renderLPA();
     }
   }
@@ -10421,6 +10486,57 @@ async function renderSettings() {
   // Update system info counts
   db.collection('plants').get().then(s=>{ const el=document.getElementById('sysPlantCount'); if(el) el.textContent=s.size; });
   db.collection('users').get().then(s=>{ const el=document.getElementById('sysUserCount'); if(el) el.textContent=s.size; });
+
+  // LPA Frequency Management (Super Admin only)
+  const _lpaFreqCard = document.getElementById('lpaFreqMgmtCard');
+  if (_lpaFreqCard) {
+    _lpaFreqCard.style.display = _isSA ? '' : 'none';
+    if (_isSA) renderLpaFreqOptions();
+  }
+}
+
+// ── LPA Frequency Management ─────────────────────────────────────────────────
+let _lpaFreqCurrent = ['Daily','Weekly','Monthly','Quarterly'];
+
+async function renderLpaFreqOptions() {
+  const snap = await db.collection('appSettings').doc('lpaFrequencies').get().catch(()=>null);
+  if (snap?.exists && snap.data()?.options?.length) {
+    _lpaFreqCurrent = [...snap.data().options];
+  }
+  _renderLpaFreqChips();
+}
+
+function _renderLpaFreqChips() {
+  const container = document.getElementById('lpaFreqList');
+  if (!container) return;
+  container.innerHTML = _lpaFreqCurrent.map((f,i) => `
+    <span style="display:inline-flex;align-items:center;gap:4px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:20px;padding:4px 12px;font-size:12px;font-weight:600;color:#1d4ed8">
+      ${f}
+      <span onclick="_removeLpaFreq(${i})" style="cursor:pointer;color:#94a3b8;font-size:16px;line-height:1;margin-left:2px">&times;</span>
+    </span>`).join('');
+}
+
+function _removeLpaFreq(idx) {
+  _lpaFreqCurrent.splice(idx, 1);
+  _renderLpaFreqChips();
+}
+
+function addLpaFreqOption() {
+  const inp = document.getElementById('lpaFreqNewInput');
+  const val = (inp?.value||'').trim();
+  if (!val) { showToast('Enter a frequency name','info'); return; }
+  if (_lpaFreqCurrent.includes(val)) { showToast('Already exists','info'); return; }
+  _lpaFreqCurrent.push(val);
+  _renderLpaFreqChips();
+  if (inp) inp.value = '';
+}
+
+async function saveLpaFreqOptions() {
+  const isSA = (S.userDoc?.role||'').toLowerCase().replace(/[\s_-]/g,'') === 'superadmin';
+  if (!isSA) { showToast('Super Admin only','error'); return; }
+  if (!_lpaFreqCurrent.length) { showToast('Add at least one frequency option','info'); return; }
+  await db.collection('appSettings').doc('lpaFrequencies').set({ options: _lpaFreqCurrent, updatedAt: firebase.firestore.FieldValue.serverTimestamp(), updatedBy: S.user?.uid||'' }).catch(e=>{ showToast('Save failed: '+e.message,'error'); return; });
+  showToast('Frequency options saved ✓','success');
 }
 
 // Render one row per audit type in the prefix config table
