@@ -5407,7 +5407,8 @@ async function submitAuditeeActionPlans() {
               'Action Plan Submitted for Review',
               `The auditee has submitted ${saved} action plan${saved!==1?'s':''} for <strong>${auditName}</strong>. Please log in to review and approve.`,
               { audit: auditName, plant: S.userDoc?.plant||'', dept: S.userDoc?.department||'', byName: S.userDoc?.name||S.user?.email||'' }
-            ), null, planId
+            ), null, planId,
+            { title: `Action Plan Ready for Review — ${auditName}`, message: `${S.userDoc?.name||'Auditee'} submitted action plan(s) for "${auditName}". Please review.`, type: 'action_plan_review', sourceRef: `auditPlans/${planId}` }
           ).catch(()=>{});
         }
       }
@@ -6492,7 +6493,9 @@ async function ncSubmitToHOD(ncId){
         `NC Action Plan Submitted — ${_ncNo2}`,
         `The auditee has submitted their action plan for NC <strong>${_ncNo2}</strong>. Please log in to review and approve or return with comments.`,
         { ncNo: _ncNo2, audit: ncData.auditName||'', plant: ncData.plant||'', dept: ncData.department||'', byName: S.userDoc?.name||S.user?.email||'' }
-      ), ncId, _ncPlanId).catch(()=>{});
+      ), ncId, _ncPlanId,
+      { title: `NC Action Plan Submitted — ${_ncNo2}`, message: `Auditee submitted action plan for NC ${_ncNo2}. Please review and approve.`, type: 'nc_action_plan_review', sourceRef: `findings/${ncId}` }
+    ).catch(()=>{});
   }
 
   showToast('Submitted to Dept Head ✅','success');
@@ -6717,7 +6720,9 @@ async function dhInlineApprove(findingIdsCsv, action) {
             `Dept Head Approved — Auditor Review Required`,
             `The Dept Head has approved the action plan for NC <strong>${_ncNo3}</strong>. Please log in to review and forward to MR or return with comments.`,
             { ncNo: _ncNo3, audit: _fds3?.data()?.auditName||'', plant: _fds3?.data()?.plant||'', dept: _fds3?.data()?.department||'', byName: S.userDoc?.name||S.user?.email||'' }
-          ), fid, _planId3).catch(()=>{});
+          ), fid, _planId3,
+          { title: `Auditor Review Required — NC ${_ncNo3}`, message: `Dept Head approved the action plan for NC ${_ncNo3}. Your review is needed.`, type: 'nc_auditor_review', sourceRef: `findings/${fid}` }
+        ).catch(()=>{});
       }
     } else {
       // Return — email auditee for each finding
@@ -6738,7 +6743,9 @@ async function dhInlineApprove(findingIdsCsv, action) {
             `NC Returned for Revision — ${_ncNo4}`,
             `Your action plan for NC <strong>${_ncNo4}</strong> has been returned by the Dept Head. Please log in, review the comment below, revise your action plan, and resubmit.`,
             { ncNo: _ncNo4, audit: _fdd2.auditName||'', plant: _fdd2.plant||'', dept: _fdd2.department||'', comment, byName: S.userDoc?.name||S.user?.email||'' }
-          ), fid, _planId4).catch(()=>{});
+          ), fid, _planId4,
+          { title: `NC ${_ncNo4} Returned for Revision`, message: `Your action plan for NC ${_ncNo4} was returned by Dept Head. Please revise and resubmit.`, type: 'nc_returned', sourceRef: `findings/${fid}` }
+        ).catch(()=>{});
       }
     }
   } catch(_dhe){ console.warn('dhInlineApprove email error:', _dhe?.message||_dhe); }
@@ -6816,12 +6823,14 @@ function _ncEmailHtml(role, headline, action, data={}) {
 // ── NC email notification helper ─────────────────────────────────────────────
 // NC Email helper — tries Firebase trigger-email extension ('mail' collection) first
 // for custom subject/body, then falls back to sendAuditScheduleEmail CF.
-async function _sendNcEmail(toEmails, subject, bodyHtml, ncId, auditPlanId) {
+// _sendNcEmail — dual delivery: email via CF + in-app notification (always)
+// notifInfo: { title, message, type, sourceRef } — drives the bell icon for each recipient
+async function _sendNcEmail(toEmails, subject, bodyHtml, ncId, auditPlanId, notifInfo={}) {
   if (!toEmails || toEmails.length === 0) return;
   const uniqueEmails = [...new Set(toEmails.filter(Boolean))];
   if (!uniqueEmails.length) return;
 
-  // Log attempt
+  // ── Log attempt ──────────────────────────────────────────────────────────
   const _logRef = db.collection('ncEmailLog').doc();
   _logRef.set({
     to: uniqueEmails, subject, ncId: ncId||'', auditPlanId: auditPlanId||'',
@@ -6830,14 +6839,57 @@ async function _sendNcEmail(toEmails, subject, bodyHtml, ncId, auditPlanId) {
     status: 'pending',
   }).catch(()=>{});
 
-  // ── sendCustomEmail CF — custom subject + branded HTML body via Gmail ───
+  // ── Strategy 1: sendCustomEmail CF (primary — Gmail App Password) ────────
+  let emailSent = false;
   try {
     const _fn = fnRegion.httpsCallable('sendCustomEmail');
     await _fn({ to: uniqueEmails, subject: subject || 'Audit NC Notification', html: bodyHtml || `<p>${subject}</p>` });
     _logRef.update({ status:'sent', method:'sendCustomEmail' }).catch(()=>{});
+    emailSent = true;
   } catch(e) {
     console.warn('sendCustomEmail CF failed:', e?.message||e);
     _logRef.update({ status:'failed', error: e?.message||String(e) }).catch(()=>{});
+  }
+
+  // ── Strategy 2: In-app notifications (ALWAYS — mirrors price-approval pattern) ─
+  // Write a notifications doc for each recipient so the bell icon lights up,
+  // regardless of whether the email CF succeeded.
+  try {
+    const _notifTitle   = notifInfo.title   || subject || 'Audit Notification';
+    const _notifMessage = notifInfo.message || subject || 'You have a new audit action item.';
+    const _notifType    = notifInfo.type    || 'nc_workflow';
+    const _notifSrcRef  = notifInfo.sourceRef || (ncId ? `findings/${ncId}` : auditPlanId ? `auditPlans/${auditPlanId}` : '');
+    const _ts = firebase.firestore.FieldValue.serverTimestamp();
+
+    // Look up userId for each email (batch parallel reads) — same approach as price-approval app
+    const _userLookups = await Promise.all(
+      uniqueEmails.map(em =>
+        db.collection('users').where('email','==',em).limit(1).get().catch(()=>null)
+      )
+    );
+
+    const _nb = db.batch();
+    uniqueEmails.forEach((em, i) => {
+      const _snap = _userLookups[i];
+      const _userId = (_snap && !_snap.empty) ? _snap.docs[0].id : `email_${em}`;
+      _nb.set(db.collection('notifications').doc(), {
+        userId     : _userId,
+        userEmail  : em,
+        title      : _notifTitle,
+        message    : _notifMessage,
+        type       : _notifType,
+        sourceRef  : _notifSrcRef,
+        ncId       : ncId||'',
+        auditPlanId: auditPlanId||'',
+        emailSent  : emailSent,
+        read       : false,
+        createdAt  : _ts,
+        createdBy  : S.user?.uid||'',
+      });
+    });
+    await _nb.commit();
+  } catch(_ne) {
+    console.warn('In-app notification write failed:', _ne?.message||_ne);
   }
 }
 
@@ -6885,7 +6937,9 @@ async function ncApprove(ncId, nextStage, comment){
           `Dept Head Approved — Auditor Review Required`,
           `The Dept Head has approved the action plan for NC <strong>${_ncNo}</strong> (<em>${_auditName}</em>). Please log in to review and forward to MR or return with comments.`,
           { ncNo: _ncNo, audit: _auditName, plant: _plant, dept: _dept, byName: _byName }
-        ), ncId, _planId);
+        ), ncId, _planId,
+        { title: `Auditor Review Required — NC ${_ncNo}`, message: `Dept Head approved action plan for NC ${_ncNo} (${_auditName}). Your review is needed.`, type: 'nc_auditor_review', sourceRef: `findings/${ncId}` }
+      );
 
     } else if (nextStage === 'MR Review') {
       // Email MR / Plant Admin users for this plant
@@ -6900,7 +6954,9 @@ async function ncApprove(ncId, nextStage, comment){
           `MR Final Approval Required — NC ${_ncNo}`,
           `The Auditor has reviewed and approved the action plan for NC <strong>${_ncNo}</strong> (<em>${_auditName}</em>). Your final approval is required to close this NC.`,
           { ncNo: _ncNo, audit: _auditName, plant: _plant, dept: _dept, byName: _byName }
-        ), ncId, _planId);
+        ), ncId, _planId,
+        { title: `MR Final Approval Required — NC ${_ncNo}`, message: `Auditor approved action plan for NC ${_ncNo}. Your final approval is required to close this NC.`, type: 'nc_mr_review', sourceRef: `findings/${ncId}` }
+      );
 
     } else if (nextStage === 'Closed') {
       // Email auditee
@@ -6916,7 +6972,9 @@ async function ncApprove(ncId, nextStage, comment){
           `NC Officially Closed — ${_ncNo}`,
           `Your action plan for NC <strong>${_ncNo}</strong> (<em>${_auditName}</em>) has been reviewed and approved by all reviewers. This NC is now officially <strong>closed</strong>. No further action is required from you.`,
           { ncNo: _ncNo, audit: _auditName, plant: _plant, dept: _dept, byName: _byName }
-        ), ncId, _planId);
+        ), ncId, _planId,
+        { title: `✅ NC Closed — ${_ncNo}`, message: `NC ${_ncNo} (${_auditName}) has been approved by all reviewers and is now officially closed.`, type: 'nc_closed', sourceRef: `findings/${ncId}` }
+      );
     }
   } catch(_ee){ console.warn('ncApprove email error:', _ee?.message||_ee); }
 
@@ -6962,7 +7020,9 @@ async function ncReturn(ncId, returnToStage){
           `NC Returned for Revision — ${_ncNo}`,
           `Your action plan for NC <strong>${_ncNo}</strong> has been returned by the <strong>${_retRole}</strong>. Please log in, review the comment below, revise your action plan, and resubmit.`,
           { ncNo: _ncNo, audit: _fd.auditName||'', plant: _fd.plant||'', dept: _fd.department||'', comment, byName: _retBy }
-        ), ncId, _retPlanId);
+        ), ncId, _retPlanId,
+        { title: `NC ${_ncNo} Returned for Revision`, message: `Your action plan for NC ${_ncNo} was returned by ${_retRole}. Please revise and resubmit.`, type: 'nc_returned', sourceRef: `findings/${ncId}` }
+      );
     }
   } catch(_re){ console.warn('Return email error:', _re?.message||_re); }
 
