@@ -5373,7 +5373,8 @@ async function submitAuditeeActionPlans() {
             `<p>Dear Dept Head,</p>
              <p><strong>${S.userDoc?.name||'Auditee'}</strong> has submitted ${saved} action plan${saved!==1?'s':''} for <strong>${auditName}</strong>. Please review and approve.</p>
              <p><strong>Department:</strong> ${dept2||'—'} | <strong>Plant:</strong> ${plant2||'—'} | <strong>Audit No:</strong> ${auditNo2||'—'}</p>
-             <p>Log in to QMS Galaxy → My Actions to review the submission.</p>`);
+             <p>Log in to QMS Galaxy → My Actions to review the submission.</p>`,
+            findingIds[0]||'');
         }
       }
     }
@@ -6546,65 +6547,40 @@ async function dhInlineApprove(findingIdsCsv, action) {
 // ── NC email notification helper ─────────────────────────────────────────────
 // Sends an email to one or more recipients about an NC workflow event.
 // Uses the same Cloud Function + payload pattern as the working schedule email.
-async function _sendNcEmail(toEmails, subject, bodyHtml) {
+// _sendNcEmail — calls sendAuditScheduleEmail exactly like the working schedule publish email does:
+//   { docIds, collection, recipients }  — no gmail creds in payload; CF reads those from its own config.
+// ncId is passed so the CF can fetch the finding doc for context if needed.
+async function _sendNcEmail(toEmails, subject, bodyHtml, ncId) {
   if (!toEmails || toEmails.length === 0) return;
+  const uniqueEmails = [...new Set(toEmails.filter(Boolean))];
+  if (!uniqueEmails.length) return;
   try {
-    const cfgSnap = await db.collection('appSettings').doc('emailConfig').get().catch(()=>null);
-    const cfg = cfgSnap?.exists ? cfgSnap.data() : {};
-    if (!cfg.gmailAddress || !cfg.gmailAppPwd) return; // email not configured — skip silently
-
-    const uniqueEmails = [...new Set(toEmails.filter(Boolean))];
-    const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
-      <div style="background:#1e3a5f;padding:16px 24px;border-radius:8px 8px 0 0">
-        <h2 style="color:#fff;margin:0;font-size:18px">QMS Galaxy — NC Update</h2>
-      </div>
-      <div style="background:#f8fafc;padding:20px 24px;border-radius:0 0 8px 8px;border:1px solid #e2e8f0">
-        ${bodyHtml}
-        <hr style="border:none;border-top:1px solid #e2e8f0;margin:16px 0">
-        <p style="font-size:11px;color:#94a3b8;margin:0">This is an automated notification from QMS Galaxy. Please log in to take action.</p>
-      </div>
-    </div>`;
-
-    // Write an email_queue doc — Cloud Function picks it up and sends via Gmail
-    // This matches how audit schedule emails are handled server-side
-    const queueRef = db.collection('email_queue').doc();
-    await queueRef.set({
+    // Store a notification doc so it's visible in-app even if email fails
+    db.collection('ncEmailLog').add({
       to: uniqueEmails,
       subject,
-      html,
-      gmailAddress: cfg.gmailAddress,
-      gmailAppPwd:  cfg.gmailAppPwd,
-      type: 'nc_notification',
+      ncId: ncId||'',
+      sentBy: S.user?.uid||'',
+      sentAt: firebase.firestore.FieldValue.serverTimestamp(),
       status: 'pending',
-      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-      createdBy: S.user?.uid||'',
     }).catch(()=>{});
 
-    // Also try Cloud Function directly (sendGenericEmail if available)
-    try {
-      await fnRegion.httpsCallable('sendGenericEmail')({
-        to: uniqueEmails.join(','),
-        subject,
-        html,
-        gmailAddress: cfg.gmailAddress,
-        gmailAppPwd:  cfg.gmailAppPwd,
-      });
-    } catch(_) {
-      // Fallback: try sendAuditScheduleEmail with a plain payload
-      try {
-        await fnRegion.httpsCallable('sendAuditScheduleEmail')({
-          to: uniqueEmails.join(','),
-          subject,
-          html,
-          gmailAddress: cfg.gmailAddress,
-          gmailAppPwd:  cfg.gmailAppPwd,
-          docIds: [],
-          collection: 'findings',
-          recipients: uniqueEmails,
-        });
-      } catch(_2) { /* silent — queue doc already written */ }
-    }
-  } catch(e) { console.warn('_sendNcEmail:', e); }
+    // Call the Cloud Function the same way the working schedule email does
+    const fn = fnRegion.httpsCallable('sendAuditScheduleEmail');
+    await fn({
+      docIds    : ncId ? [ncId] : [],
+      collection: 'findings',
+      recipients: uniqueEmails,
+      subject,                    // extra params the CF may or may not use
+      bodyHtml,
+    });
+  } catch(e) {
+    console.warn('_sendNcEmail CF failed:', e?.message||e);
+    // Update log doc to reflect failure
+    db.collection('ncEmailLog').where('ncId','==',ncId||'').orderBy('sentAt','desc').limit(1).get()
+      .then(s=>{ if(s&&!s.empty) s.docs[0].ref.update({ status:'failed', error: e?.message||String(e) }); })
+      .catch(()=>{});
+  }
 }
 
 async function ncApprove(ncId, nextStage, comment){
@@ -6633,7 +6609,8 @@ async function ncApprove(ncId, nextStage, comment){
       `NC Closed — ${_nc.findingNo||ncId}`,
       `<p>Dear ${_nc.auditeeName||'Auditee'},</p>
        <p>Your Non-Conformity <strong>${_nc.findingNo||ncId}</strong> has been <strong style="color:#16a34a">closed</strong> by the MR (${_approverName}).</p>
-       <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`);
+       <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`,
+      ncId);
   } else {
     const _ncPlant = _nc.plant||'';
     const _ncDept  = _nc.department||'';
@@ -6667,13 +6644,15 @@ async function ncApprove(ncId, nextStage, comment){
          <p>The action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been approved by the Dept Head (<strong>${_approverName}</strong>) and is now awaiting your review.</p>
          <p><strong>Description:</strong> ${_nc.description||''}<br>
          <strong>Plant:</strong> ${_ncPlant||'—'} | <strong>Dept:</strong> ${_ncDept||'—'} | <strong>Audit:</strong> ${_nc.auditNo||''}</p>
-         <p>Please log in to QMS Galaxy → NC module to review.</p>`);
+         <p>Please log in to QMS Galaxy → NC module to review.</p>`,
+        ncId);
       // Notify auditee of progress
       if (_auditeeEmail) _sendNcEmail([_auditeeEmail],
         `Your NC Action Plan is Under Auditor Review — ${_nc.findingNo||ncId}`,
         `<p>Dear ${_nc.auditeeName||'Auditee'},</p>
          <p>Your action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been approved by the Dept Head and forwarded to the <strong>Auditor</strong> for review.</p>
-         <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`);
+         <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`,
+        ncId);
 
     } else if (nextStage === 'MR Review') {
       // Notify only the MR users whose plant matches this NC's plant
@@ -6691,19 +6670,22 @@ async function ncApprove(ncId, nextStage, comment){
            <p>The action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been approved by the Auditor (<strong>${_approverName}</strong>) and is now awaiting your final approval.</p>
            <p><strong>Description:</strong> ${_nc.description||''}<br>
            <strong>Plant:</strong> ${_ncPlant||'—'} | <strong>Dept:</strong> ${_ncDept||'—'} | <strong>Audit:</strong> ${_nc.auditNo||''}</p>
-           <p>Please log in to QMS Galaxy → NC module to review and close.</p>`);
+           <p>Please log in to QMS Galaxy → NC module to review and close.</p>`,
+          ncId);
       });
       // Notify auditor & auditee of progress
       if (_auditorEmail) _sendNcEmail([_auditorEmail],
         `NC Forwarded to MR — ${_nc.findingNo||ncId}`,
         `<p>Dear Auditor,</p>
          <p>NC <strong>${_nc.findingNo||ncId}</strong> has been forwarded to the MR for final approval after your review.</p>
-         <p style="color:#64748b">Audit: ${_nc.auditNo||''}</p>`);
+         <p style="color:#64748b">Audit: ${_nc.auditNo||''}</p>`,
+        ncId);
       if (_auditeeEmail) _sendNcEmail([_auditeeEmail],
         `Your NC Action Plan is Under MR Review — ${_nc.findingNo||ncId}`,
         `<p>Dear ${_nc.auditeeName||'Auditee'},</p>
          <p>Your action plan for NC <strong>${_nc.findingNo||ncId}</strong> has been forwarded to the <strong>MR</strong> for final review and closure.</p>
-         <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`);
+         <p style="color:#64748b">Audit: ${_nc.auditNo||''} | Type: ${_nc.type||''}</p>`,
+        ncId);
     }
   }
 
@@ -6738,7 +6720,8 @@ async function ncReturn(ncId, returnToStage){
          <p>Your action plan for NC <strong>${_rNc.findingNo||ncId}</strong> has been <strong style="color:#dc2626">returned</strong> for revision by <strong>${_retBy}</strong>.</p>
          <p><strong>Reviewer Comment:</strong> ${comment}</p>
          <p>Please log in to QMS Galaxy, update your action plan, and re-submit.</p>
-         <p style="color:#64748b">Audit: ${_rNc.auditNo||''} | Stage: ${currentStage}</p>`);
+         <p style="color:#64748b">Audit: ${_rNc.auditNo||''} | Stage: ${currentStage}</p>`,
+        ncId);
     }
   });
 
