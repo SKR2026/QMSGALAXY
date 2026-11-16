@@ -6862,7 +6862,7 @@ async function dhInlineApprove(findingIdsCsv, action) {
           _ncEmailHtml('auditor',
             `Dept Head Approved — Auditor Review Required`,
             `The Dept Head has approved the action plan for NC <strong>${_ncNo3}</strong>. Please log in to review and forward to MR or return with comments.`,
-            { ncNo: _ncNo3, audit: _fdd.auditName||'', plant: _fdd.plant||'', dept: _fdd.department||'', byName: S.userDoc?.name||S.user?.email||'' }
+            { ncNo: _ncNo3, audit: _fds3?.data()?.auditName||'', plant: _fds3?.data()?.plant||'', dept: _fds3?.data()?.department||'', byName: S.userDoc?.name||S.user?.email||'' }
           ), fid, _planId3,
           { title: `Auditor Review Required — NC ${_ncNo3}`, message: `Dept Head approved the action plan for NC ${_ncNo3}. Your review is needed.`, type: 'nc_auditor_review', sourceRef: `findings/${fid}` }
         ).catch(()=>{});
@@ -6982,35 +6982,31 @@ async function _sendNcEmail(toEmails, subject, bodyHtml, ncId, auditPlanId, noti
     status: 'pending',
   }).catch(()=>{});
 
-  // ── Fetch Gmail credentials (required by both CFs — same as supplier/schedule email flows)
-  const _emailCfgSnap = await db.collection('appSettings').doc('emailConfig').get().catch(()=>null);
-  const _emailCfg     = _emailCfgSnap?.data() || {};
-  const _gmailAddr    = _emailCfg.gmailAddress || '';
-  const _gmailPwd     = _emailCfg.gmailAppPwd  || '';
-
+  // ── Use sendAuditScheduleEmail exactly like the working schedule email:
+  //    { docIds, collection: 'auditPlans', recipients } — CF was designed for auditPlans.
+  //    Always resolve to an auditPlanId; if only ncId available, look it up from findings.
   let emailSent = false;
-  if (!_gmailAddr || !_gmailPwd) {
-    console.warn('_sendNcEmail: Gmail credentials not set in Settings → Email Configuration. Skipping email.');
-    _logRef.update({ status:'skipped', error:'Gmail credentials not configured' }).catch(()=>{});
-  } else {
-    // Use sendGenericEmail for NC workflow messages because it accepts a
-    // custom recipient list, subject and HTML body. sendAuditScheduleEmail is
-    // reserved for schedule publishing (docIds/collection/recipients payload).
+  let _resolvedPlanId = auditPlanId || '';
+  if (!_resolvedPlanId && ncId) {
+    // Look up the finding to get its linked audit plan ID
     try {
-      const _sendFn = fnRegion.httpsCallable('sendGenericEmail');
-      await _sendFn({
-        to          : uniqueEmails,
-        subject     : subject || 'Audit Notification',
-        html        : bodyHtml || `<p>${subject||'Audit Notification'}</p>`,
-        gmailAddress: _gmailAddr,
-        gmailAppPwd : _gmailPwd,
-      });
-      _logRef.update({ status:'sent', method:'sendGenericEmail' }).catch(()=>{});
+      const _fSnap = await db.collection('findings').doc(ncId).get().catch(()=>null);
+      _resolvedPlanId = _fSnap?.data()?.auditId || _fSnap?.data()?.auditPlanId || '';
+    } catch(_) {}
+  }
+  if (_resolvedPlanId) {
+    try {
+      const _fn1 = fnRegion.httpsCallable('sendAuditScheduleEmail');
+      await _fn1({ docIds: [_resolvedPlanId], collection: 'auditPlans', recipients: uniqueEmails });
+      _logRef.update({ status:'sent', method:'sendAuditScheduleEmail', planId: _resolvedPlanId }).catch(()=>{});
       emailSent = true;
     } catch(e) {
-      console.warn('_sendNcEmail: sendGenericEmail failed:', e?.message||e);
+      console.warn('sendAuditScheduleEmail CF failed:', e?.message||e);
       _logRef.update({ status:'failed', error: e?.message||String(e) }).catch(()=>{});
     }
+  } else {
+    console.warn('_sendNcEmail: could not resolve auditPlanId — skipping CF call. ncId:', ncId, 'auditPlanId:', auditPlanId);
+    _logRef.update({ status:'skipped', error:'no auditPlanId resolved' }).catch(()=>{});
   }
 
   // ── Strategy 2: In-app notifications (ALWAYS — mirrors price-approval pattern) ─
@@ -7736,28 +7732,14 @@ async function saveCAPAFindingUpdate(ncId) {
     showToast('⛔ Only Plant MR or Super Admin can advance the workflow stage.','error');
     return;
   }
-
-  // Read the finding before updating it so the notification is addressed to
-  // the correct person for the stage being worked on.
-  const _beforeSnap = await db.collection('findings').doc(ncId).get();
-  if (!_beforeSnap.exists) { showToast('NC record not found.','error'); return; }
-  const _fdBefore = _beforeSnap.data()||{};
-  const _oldStage = _fdBefore.workflowStage||'Open';
-
   // Upload CAPA evidence
   const capaFiles = (window._capaEvidenceFiles||[]).filter(Boolean);
   let capaEvidenceUrls = [];
   if (capaFiles.length) {
     showToast('Uploading evidence…','info');
-    try {
-      capaEvidenceUrls = await uploadEvidenceFiles(capaFiles, `capa-evidence/${S.user?.uid||'anon'}/${ncId}`);
-      window._capaEvidenceFiles = [];
-    } catch(_uploadErr) {
-      showToast('Evidence upload failed: '+(_uploadErr?.message||_uploadErr),'error');
-      return;
-    }
+    capaEvidenceUrls = await uploadEvidenceFiles(capaFiles, `capa-evidence/${S.user?.uid||'anon'}/${ncId}`);
+    window._capaEvidenceFiles = [];
   }
-
   const updateObj = {
     capaProgress: progress,
     capaNote: note,
@@ -7779,77 +7761,13 @@ async function saveCAPAFindingUpdate(ncId) {
     updateObj.timeline = firebase.firestore.FieldValue.arrayUnion(timelineEntry);
     if (newStage==='Closed') updateObj.status='Closed';
   }
-
-  try {
-    await db.collection('findings').doc(ncId).update(updateObj);
-  } catch(_saveErr) {
-    console.error('CAPA update failed:',_saveErr);
-    showToast('CAPA update failed: '+(_saveErr?.message||_saveErr),'error');
-    return;
-  }
-
-  // Notify the person responsible for the current/next workflow stage.
-  // A progress-only update notifies the current stage owner; a stage change
-  // notifies the owner of the destination stage.
-  try {
-    const _targetStage = newStage||_oldStage;
-    const _plant = _fdBefore.plant||'';
-    const _dept = _fdBefore.department||'';
-    const _ncNo = _fdBefore.findingNo||ncId.slice(-6).toUpperCase();
-    const _auditName = _fdBefore.auditName||_fdBefore.auditId||_fdBefore.auditPlanId||'';
-    const _planId = _fdBefore.auditId||_fdBefore.auditPlanId||'';
-    const _actor = S.userDoc?.name||S.user?.email||'Audit team';
-    const _emails = new Set();
-    const _add = v => { if (typeof v==='string' && v.trim() && v.includes('@')) _emails.add(v.trim()); };
-    const _getUserEmail = async id => {
-      if (!id) return '';
-      const u = await db.collection('users').doc(id).get().catch(()=>null);
-      return u?.exists ? (u.data()?.email||'') : '';
-    };
-
-    if (_targetStage==='Auditee Action' || _targetStage==='Open' || _targetStage==='Closed') {
-      _add(_fdBefore.auditeeEmail);
-      _add(_fdBefore.assigneeEmail);
-      if (!_fdBefore.auditeeEmail && !_fdBefore.assigneeEmail) _add(await _getUserEmail(_fdBefore.auditeeId||_fdBefore.assigneeId));
-    } else if (_targetStage==='Dept Head Review') {
-      const dh = await db.collection('users').where('role','==','Dept Head').get().catch(()=>null);
-      if (dh) dh.forEach(d=>{ const u=d.data()||{}; if ((!_plant||u.plant===_plant||u.plant==='All Plants') && (!_dept||!u.department||u.department===_dept)) _add(u.email); });
-    } else if (_targetStage==='Auditor Review') {
-      _add(_fdBefore.auditorEmail);
-      if (!_fdBefore.auditorEmail) _add(await _getUserEmail(_fdBefore.raisedBy||_fdBefore.auditorId));
-      if (!_emails.size && _planId) {
-        const ap=await db.collection('auditPlans').doc(_planId).get().catch(()=>null);
-        if(ap?.exists) { _add(ap.data()?.leadAuditorEmail); _add(ap.data()?.auditorEmail); }
-      }
-    } else if (_targetStage==='MR Review') {
-      const roles=['MR','Management Representative','Plant MR','Plant Admin','Admin','Super Admin'];
-      const snaps=await Promise.all(roles.map(r=>db.collection('users').where('role','==',r).get().catch(()=>null)));
-      snaps.forEach(sn=>{ if(sn) sn.forEach(d=>{ const u=d.data()||{}; if(!_plant||u.plant===_plant||u.plant==='All Plants') _add(u.email); }); });
-    }
-
-    if (_emails.size) {
-      const _stageLabel = newStage ? `Workflow moved to ${newStage}` : `CAPA progress updated (${progress}%)`;
-      const _body = _ncEmailHtml(
-        _targetStage==='MR Review'?'mr':_targetStage==='Auditor Review'?'auditor':_targetStage==='Closed'?'closed':_targetStage==='Dept Head Review'?'depthead':'auditee',
-        `${_stageLabel} — NC ${_ncNo}`,
-        `The CAPA for NC <strong>${_ncNo}</strong> (${_auditName}) has been updated by <strong>${_actor}</strong>. Current progress: <strong>${progress}%</strong>.${note?`<br><br><strong>Update:</strong> ${note}`:''}${capaEvidenceUrls.length?`<br><br>${capaEvidenceUrls.length} new evidence file(s) uploaded.`:''}`,
-        {ncNo:_ncNo,audit:_auditName,plant:_plant,dept:_dept,byName:_actor}
-      );
-      await _sendNcEmail([..._emails], `${newStage?'[Workflow Update]':'[CAPA Progress Update]'} NC ${_ncNo} — ${_stageLabel}`, _body, ncId, _planId,
-        {title:`${_stageLabel} — NC ${_ncNo}`,message:`${_stageLabel}. Progress: ${progress}%. ${note}`,type:'nc_capa_progress',sourceRef:`findings/${ncId}`});
-    } else {
-      console.warn('CAPA update saved, but no email recipient could be resolved for stage:',_targetStage,ncId);
-    }
-  } catch(_mailErr) {
-    console.error('CAPA progress email notification failed:',_mailErr);
-    showToast('CAPA saved, but email notification failed. Check ncEmailLog.','warning');
-  }
-
+  await db.collection('findings').doc(ncId).update(updateObj).catch(()=>{});
   closeModal();
   showToast('CAPA updated ✓','success');
   logActivity('Updated CAPA for NC '+ncId,'CAPA', newStage||'progress update');
   renderCAPA();
 }
+
 async function saveCAPAUpdate(id) { await saveCAPAFindingUpdate(id); }
 
 // ─── EFFECTIVENESS ────────────────────────────────────────────────────────────
