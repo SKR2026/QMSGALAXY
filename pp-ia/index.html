@@ -5361,8 +5361,22 @@ async function submitAuditeeActionPlans() {
         });
         await notifBatch.commit().catch(()=>{});
 
-        // Email to Dept Head is handled automatically by Cloud Function trigger
-        // onFindingWorkflowUpdated when workflowStage changes to 'Dept Head Review'.
+        // Email matched Dept Heads — using sendAuditScheduleEmail with auditPlans collection
+        const _dhEmails = [];
+        deptHeadSnap.docs.forEach(dhu => {
+          const dhuData = dhu.data();
+          const dhuDept  = dhuData.department||'';
+          const dhuPlant = dhuData.plant||'All Plants';
+          const _dhMatch2 = dhuDept === dept2 && (dhuPlant === plant2 || dhuPlant === 'All Plants' || plant2 === '');
+          if ((_dhMatch2 || dept2 === '') && dhuData.email) _dhEmails.push(dhuData.email);
+        });
+        if (_dhEmails.length) {
+          _sendNcEmail(_dhEmails,
+            `[Action Required] Review Action Plan — ${auditName}`,
+            `Auditee submitted ${saved} action plan${saved!==1?'s':''} for "${auditName}". Please review and approve.`,
+            null, planId
+          ).catch(()=>{});
+        }
       }
     }
 
@@ -5877,70 +5891,117 @@ async function openNCDetail(ncId) {
   if (auditeeStages.includes(stage)) {
     // Auditee (or MR/admin): show editable action plan form
     if (isAuditee || isMR) {
+      // Pre-fill values from both top-level fields and actionPlan sub-object
+      const _apE = nc.actionPlan||{};
+      const _vWhy1=nc.rcaWhy1||_apE.rcaWhy1||'',_vWhy2=nc.rcaWhy2||_apE.rcaWhy2||'',_vWhy3=nc.rcaWhy3||_apE.rcaWhy3||'',_vWhy4=nc.rcaWhy4||_apE.rcaWhy4||'',_vWhy5=nc.rcaWhy5||_apE.rcaWhy5||'';
+      const _vWhyRc=nc.rcaRootCause||_apE.rcaRootCause||'';
+      const _v4mMan=nc.rca4M_man||_apE.rca4M_man||'',_v4mMach=nc.rca4M_machine||_apE.rca4M_machine||'',_v4mMeth=nc.rca4M_method||_apE.rca4M_method||'',_v4mMat=nc.rca4M_material||_apE.rca4M_material||'';
       ap.style.display=''; ap.innerHTML=`
         <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;font-family:'Inter',sans-serif">
           <span>Action Plan <span style="font-size:11px;font-weight:400;color:var(--text-muted)">(Auditee to fill)</span></span>
-          <span id="ncDraftStatus" style="font-size:11px;font-weight:500;color:#16a34a;font-family:'Inter',sans-serif">${nc.actionPlan?.rootCause||nc.actionPlan?.correction?'● Draft saved':''}</span>
+          <span id="ncDraftStatus" style="font-size:11px;font-weight:500;color:#16a34a;font-family:'Inter',sans-serif">${_apE.rootCause||_apE.correction?'● Draft saved':''}</span>
         </div>
-        <div class="form-group">
-          <label class="form-label" style="font-family:'Inter',sans-serif">Root Cause <span style="color:var(--red)">*</span></label>
-          <textarea class="form-input" id="nc_rootCause" rows="3" style="font-family:'Inter',sans-serif;font-size:13px;resize:vertical" placeholder="Why did this NC occur?" onblur="ncAutoSave('${ncId}')">${nc.actionPlan?.rootCause||''}</textarea>
+        <!-- Tab switcher -->
+        <div style="display:flex;gap:0;border-bottom:2px solid var(--border);margin-bottom:14px">
+          <button id="ncTab_basic" onclick="ncSwitchTab('basic')" style="padding:7px 14px;font-size:12px;font-weight:600;font-family:'Inter',sans-serif;border:none;background:none;cursor:pointer;border-bottom:2px solid #2563eb;margin-bottom:-2px;color:#2563eb">📋 Action Plan</button>
+          <button id="ncTab_why" onclick="ncSwitchTab('why')" style="padding:7px 14px;font-size:12px;font-weight:600;font-family:'Inter',sans-serif;border:none;background:none;cursor:pointer;color:var(--text-muted)">🔍 5-Why${_vWhy1?` ✓`:''}</button>
+          <button id="ncTab_4m" onclick="ncSwitchTab('4m')" style="padding:7px 14px;font-size:12px;font-weight:600;font-family:'Inter',sans-serif;border:none;background:none;cursor:pointer;color:var(--text-muted)">📊 4M${_v4mMan||_v4mMach||_v4mMeth||_v4mMat?` ✓`:''}</button>
         </div>
-        <div class="form-group">
-          <label class="form-label" style="font-family:'Inter',sans-serif">Immediate Correction <span style="color:var(--red)">*</span></label>
-          <textarea class="form-input" id="nc_correction" rows="3" style="font-family:'Inter',sans-serif;font-size:13px;resize:vertical" placeholder="What was done immediately to fix the problem?" onblur="ncAutoSave('${ncId}')">${nc.actionPlan?.correction||''}</textarea>
-        </div>
-        <div class="form-group">
-          <label class="form-label" style="font-family:'Inter',sans-serif">Corrective Action <span style="color:var(--red)">*</span></label>
-          <textarea class="form-input" id="nc_correctiveAction" rows="3" style="font-family:'Inter',sans-serif;font-size:13px;resize:vertical" placeholder="What will be done to prevent recurrence?" onblur="ncAutoSave('${ncId}')">${nc.actionPlan?.correctiveAction||''}</textarea>
-        </div>
-        <div class="form-row">
+        <!-- TAB: Basic Action Plan -->
+        <div id="ncTabPane_basic">
           <div class="form-group">
-            <label class="form-label" style="font-family:'Inter',sans-serif">Target Date <span style="color:var(--red)">*</span></label>
-            <input class="form-input" type="date" id="nc_targetDate" value="${nc.actionPlan?.targetDate||''}" style="font-family:'Inter',sans-serif;font-size:13px" onchange="ncAutoSave('${ncId}')">
+            <label class="form-label" style="font-family:'Inter',sans-serif">Root Cause <span style="color:var(--red)">*</span></label>
+            <textarea class="form-input" id="nc_rootCause" rows="3" style="font-family:'Inter',sans-serif;font-size:13px;resize:vertical" placeholder="Why did this NC occur?" onblur="ncAutoSave('${ncId}')">${_apE.rootCause||''}</textarea>
           </div>
           <div class="form-group">
-            <label class="form-label" style="font-family:'Inter',sans-serif">Responsible Person</label>
-            <input class="form-input" id="nc_responsible" value="${nc.actionPlan?.responsible||S.userDoc?.name||''}" style="font-family:'Inter',sans-serif;font-size:13px" onblur="ncAutoSave('${ncId}')">
+            <label class="form-label" style="font-family:'Inter',sans-serif">Immediate Correction <span style="color:var(--red)">*</span></label>
+            <textarea class="form-input" id="nc_correction" rows="3" style="font-family:'Inter',sans-serif;font-size:13px;resize:vertical" placeholder="What was done immediately to fix the problem?" onblur="ncAutoSave('${ncId}')">${_apE.correction||''}</textarea>
           </div>
-        </div>
-        <!-- Evidence Upload -->
-        <div class="form-group" style="margin-top:4px">
-          <label class="form-label" style="font-family:'Inter',sans-serif">Evidence Photos / Documents</label>
-          <div style="border:2px dashed #cbd5e1;border-radius:9px;padding:14px;background:#f8fafc;cursor:pointer" onclick="document.getElementById('nc_evidenceInput_${ncId}').click()">
-            <input type="file" id="nc_evidenceInput_${ncId}" multiple accept="image/*,video/*,.pdf,.doc,.docx"
-              capture style="display:none" onchange="ncHandleEvidenceFiles('${ncId}',this)">
-            <div style="text-align:center;pointer-events:none">
-              <span class="material-icons" style="font-size:28px;color:#94a3b8;display:block">add_photo_alternate</span>
-              <div style="font-size:12px;font-weight:600;color:#64748b;margin-top:4px;font-family:'Inter',sans-serif">Tap to upload from Gallery or Camera</div>
-              <div style="font-size:11px;color:#94a3b8;margin-top:2px">Photos, videos, PDF, Word — multiple files allowed</div>
+          <div class="form-group">
+            <label class="form-label" style="font-family:'Inter',sans-serif">Corrective Action <span style="color:var(--red)">*</span></label>
+            <textarea class="form-input" id="nc_correctiveAction" rows="3" style="font-family:'Inter',sans-serif;font-size:13px;resize:vertical" placeholder="What will be done to prevent recurrence?" onblur="ncAutoSave('${ncId}')">${_apE.correctiveAction||''}</textarea>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" style="font-family:'Inter',sans-serif">Target Date <span style="color:var(--red)">*</span></label>
+              <input class="form-input" type="date" id="nc_targetDate" value="${_apE.targetDate||''}" style="font-family:'Inter',sans-serif;font-size:13px" onchange="ncAutoSave('${ncId}')">
+            </div>
+            <div class="form-group">
+              <label class="form-label" style="font-family:'Inter',sans-serif">Responsible Person</label>
+              <input class="form-input" id="nc_responsible" value="${_apE.responsible||S.userDoc?.name||''}" style="font-family:'Inter',sans-serif;font-size:13px" onblur="ncAutoSave('${ncId}')">
             </div>
           </div>
-          <!-- Camera option -->
-          <div style="display:flex;gap:8px;margin-top:8px">
-            <button type="button" class="btn btn-secondary btn-sm" style="flex:1;font-family:'Inter',sans-serif;font-size:12px"
-              onclick="document.getElementById('nc_evidenceInput_${ncId}').removeAttribute('capture');document.getElementById('nc_evidenceInput_${ncId}').click()">
-              <span class="material-icons" style="font-size:14px;vertical-align:middle">photo_library</span> Gallery
-            </button>
-            <button type="button" class="btn btn-secondary btn-sm" style="flex:1;font-family:'Inter',sans-serif;font-size:12px"
-              onclick="document.getElementById('nc_evidenceInput_${ncId}').setAttribute('capture','environment');document.getElementById('nc_evidenceInput_${ncId}').click()">
-              <span class="material-icons" style="font-size:14px;vertical-align:middle">camera_alt</span> Camera
-            </button>
-          </div>
-          <div id="nc_evidencePreviews_${ncId}" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px"></div>
-          <!-- Existing uploaded evidence -->
-          ${(nc.evidenceUrls||nc.actionPlan?.evidenceUrls||[]).length?`
-          <div style="margin-top:8px">
-            <div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Previously Uploaded</div>
-            <div style="display:flex;flex-wrap:wrap;gap:6px">
-              ${(nc.evidenceUrls||nc.actionPlan?.evidenceUrls||[]).map((u,ei)=>`
-                <a href="${u}" target="_blank" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:#2563eb;background:#eff6ff;padding:3px 8px;border-radius:5px;text-decoration:none;border:1px solid #bfdbfe">
-                  <span class="material-icons" style="font-size:13px">attachment</span>Evidence ${ei+1}
-                </a>`).join('')}
+          <!-- Evidence Upload -->
+          <div class="form-group" style="margin-top:4px">
+            <label class="form-label" style="font-family:'Inter',sans-serif">Evidence Photos / Documents</label>
+            <div style="border:2px dashed #cbd5e1;border-radius:9px;padding:14px;background:#f8fafc;cursor:pointer" onclick="document.getElementById('nc_evidenceInput_${ncId}').click()">
+              <input type="file" id="nc_evidenceInput_${ncId}" multiple accept="image/*,video/*,.pdf,.doc,.docx"
+                capture style="display:none" onchange="ncHandleEvidenceFiles('${ncId}',this)">
+              <div style="text-align:center;pointer-events:none">
+                <span class="material-icons" style="font-size:28px;color:#94a3b8;display:block">add_photo_alternate</span>
+                <div style="font-size:12px;font-weight:600;color:#64748b;margin-top:4px;font-family:'Inter',sans-serif">Tap to upload from Gallery or Camera</div>
+                <div style="font-size:11px;color:#94a3b8;margin-top:2px">Photos, videos, PDF, Word — multiple files allowed</div>
+              </div>
             </div>
-          </div>`:''}
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <button type="button" class="btn btn-secondary btn-sm" style="flex:1;font-family:'Inter',sans-serif;font-size:12px"
+                onclick="document.getElementById('nc_evidenceInput_${ncId}').removeAttribute('capture');document.getElementById('nc_evidenceInput_${ncId}').click()">
+                <span class="material-icons" style="font-size:14px;vertical-align:middle">photo_library</span> Gallery
+              </button>
+              <button type="button" class="btn btn-secondary btn-sm" style="flex:1;font-family:'Inter',sans-serif;font-size:12px"
+                onclick="document.getElementById('nc_evidenceInput_${ncId}').setAttribute('capture','environment');document.getElementById('nc_evidenceInput_${ncId}').click()">
+                <span class="material-icons" style="font-size:14px;vertical-align:middle">camera_alt</span> Camera
+              </button>
+            </div>
+            <div id="nc_evidencePreviews_${ncId}" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px"></div>
+            ${(nc.evidenceUrls||_apE.evidenceUrls||[]).length?`
+            <div style="margin-top:8px">
+              <div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Previously Uploaded</div>
+              <div style="display:flex;flex-wrap:wrap;gap:6px">
+                ${(nc.evidenceUrls||_apE.evidenceUrls||[]).map((u,ei)=>`
+                  <a href="${u}" target="_blank" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:#2563eb;background:#eff6ff;padding:3px 8px;border-radius:5px;text-decoration:none;border:1px solid #bfdbfe">
+                    <span class="material-icons" style="font-size:13px">attachment</span>Evidence ${ei+1}
+                  </a>`).join('')}
+              </div>
+            </div>`:''}
+          </div>
         </div>
-        <div style="display:flex;gap:10px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+        <!-- TAB: 5-Why -->
+        <div id="ncTabPane_why" style="display:none">
+          <div style="font-size:11px;color:#9d174d;font-weight:600;margin-bottom:12px;font-family:'Inter',sans-serif">🔍 5-Why Root Cause Analysis — drill down to the real root cause</div>
+          ${[1,2,3,4,5].map(n=>`
+          <div class="form-group">
+            <label class="form-label" style="font-family:'Inter',sans-serif;color:#9d174d">Why ${n}${n===1?' (Problem statement)':n===5?' (Root cause)':''}</label>
+            <input class="form-input" id="nc_why${n}" value="${[_vWhy1,_vWhy2,_vWhy3,_vWhy4,_vWhy5][n-1]}" style="font-family:'Inter',sans-serif;font-size:13px" placeholder="Why did this happen?" onblur="ncAutoSave('${ncId}')">
+          </div>`).join('')}
+          <div class="form-group">
+            <label class="form-label" style="font-family:'Inter',sans-serif;color:#dc2626">🎯 Final Root Cause (from 5-Why)</label>
+            <textarea class="form-input" id="nc_whyRc" rows="2" style="font-family:'Inter',sans-serif;font-size:13px;resize:vertical;border-color:#fca5a5" placeholder="Summarise the identified root cause after drilling down…" onblur="ncAutoSave('${ncId}')">${_vWhyRc}</textarea>
+          </div>
+        </div>
+        <!-- TAB: 4M -->
+        <div id="ncTabPane_4m" style="display:none">
+          <div style="font-size:11px;color:#3730a3;font-weight:600;margin-bottom:12px;font-family:'Inter',sans-serif">📊 4M Analysis — Man / Machine / Method / Material</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+            <div class="form-group">
+              <label class="form-label" style="font-family:'Inter',sans-serif;color:#1e40af">👤 Man</label>
+              <textarea class="form-input" id="nc_4m_man" rows="3" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical;background:#eff6ff" placeholder="Skill gap, training, error…" onblur="ncAutoSave('${ncId}')">${_v4mMan}</textarea>
+            </div>
+            <div class="form-group">
+              <label class="form-label" style="font-family:'Inter',sans-serif;color:#92400e">⚙️ Machine</label>
+              <textarea class="form-input" id="nc_4m_machine" rows="3" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical;background:#fefce8" placeholder="Breakdown, wear, calibration…" onblur="ncAutoSave('${ncId}')">${_v4mMach}</textarea>
+            </div>
+            <div class="form-group">
+              <label class="form-label" style="font-family:'Inter',sans-serif;color:#166534">📋 Method</label>
+              <textarea class="form-input" id="nc_4m_method" rows="3" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical;background:#f0fdf4" placeholder="Wrong SOP, missing step…" onblur="ncAutoSave('${ncId}')">${_v4mMeth}</textarea>
+            </div>
+            <div class="form-group">
+              <label class="form-label" style="font-family:'Inter',sans-serif;color:#6b21a8">📦 Material</label>
+              <textarea class="form-input" id="nc_4m_material" rows="3" style="font-family:'Inter',sans-serif;font-size:12px;resize:vertical;background:#faf5ff" placeholder="Defective input, wrong spec…" onblur="ncAutoSave('${ncId}')">${_v4mMat}</textarea>
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
           <button class="btn btn-secondary" onclick="ncSaveDraft('${ncId}')">
             <span class="material-icons" style="font-size:15px;vertical-align:middle;margin-right:4px">save</span>Save Draft
           </button>
@@ -6262,6 +6323,16 @@ async function ncSaveDraft(ncId){
   const correctiveAction = document.getElementById('nc_correctiveAction')?.value?.trim();
   const targetDate = document.getElementById('nc_targetDate')?.value;
   const responsible = document.getElementById('nc_responsible')?.value?.trim();
+  const why1=document.getElementById('nc_why1')?.value?.trim()||'';
+  const why2=document.getElementById('nc_why2')?.value?.trim()||'';
+  const why3=document.getElementById('nc_why3')?.value?.trim()||'';
+  const why4=document.getElementById('nc_why4')?.value?.trim()||'';
+  const why5=document.getElementById('nc_why5')?.value?.trim()||'';
+  const whyRc=document.getElementById('nc_whyRc')?.value?.trim()||'';
+  const m4man=document.getElementById('nc_4m_man')?.value?.trim()||'';
+  const m4machine=document.getElementById('nc_4m_machine')?.value?.trim()||'';
+  const m4method=document.getElementById('nc_4m_method')?.value?.trim()||'';
+  const m4material=document.getElementById('nc_4m_material')?.value?.trim()||'';
   // Upload any pending evidence files
   const pendingFiles = (window._ncEvidenceFilesByNC[ncId]||[]).filter(Boolean);
   let evidenceUrls = [];
@@ -6271,7 +6342,11 @@ async function ncSaveDraft(ncId){
     window._ncEvidenceFilesByNC[ncId] = [];
   }
   const updateObj = {
-    actionPlan:{ rootCause, correction, correctiveAction, targetDate, responsible },
+    actionPlan:{ rootCause, correction, correctiveAction, targetDate, responsible,
+      rcaWhy1:why1,rcaWhy2:why2,rcaWhy3:why3,rcaWhy4:why4,rcaWhy5:why5,rcaRootCause:whyRc||rootCause,
+      rca4M_man:m4man,rca4M_machine:m4machine,rca4M_method:m4method,rca4M_material:m4material },
+    rcaWhy1:why1,rcaWhy2:why2,rcaWhy3:why3,rcaWhy4:why4,rcaWhy5:why5,rcaRootCause:whyRc||rootCause,
+    rca4M_man:m4man,rca4M_machine:m4machine,rca4M_method:m4method,rca4M_material:m4material,
     workflowStage:'Auditee Action',
     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
   };
@@ -6287,6 +6362,16 @@ async function ncSubmitToHOD(ncId){
   const correctiveAction = document.getElementById('nc_correctiveAction')?.value?.trim();
   const targetDate = document.getElementById('nc_targetDate')?.value;
   const responsible = document.getElementById('nc_responsible')?.value?.trim();
+  const why1=document.getElementById('nc_why1')?.value?.trim()||'';
+  const why2=document.getElementById('nc_why2')?.value?.trim()||'';
+  const why3=document.getElementById('nc_why3')?.value?.trim()||'';
+  const why4=document.getElementById('nc_why4')?.value?.trim()||'';
+  const why5=document.getElementById('nc_why5')?.value?.trim()||'';
+  const whyRc=document.getElementById('nc_whyRc')?.value?.trim()||'';
+  const m4man=document.getElementById('nc_4m_man')?.value?.trim()||'';
+  const m4machine=document.getElementById('nc_4m_machine')?.value?.trim()||'';
+  const m4method=document.getElementById('nc_4m_method')?.value?.trim()||'';
+  const m4material=document.getElementById('nc_4m_material')?.value?.trim()||'';
 
   if (!correction || !correctiveAction || !targetDate) {
     showToast('Please fill Immediate Correction, Corrective Action and Target Date.','error');
@@ -6313,9 +6398,13 @@ async function ncSubmitToHOD(ncId){
 
   await db.collection('findings').doc(ncId).update({
     actionPlan:{ rootCause, correction, correctiveAction, targetDate, responsible,
+      rcaWhy1:why1,rcaWhy2:why2,rcaWhy3:why3,rcaWhy4:why4,rcaWhy5:why5,rcaRootCause:whyRc||rootCause,
+      rca4M_man:m4man,rca4M_machine:m4machine,rca4M_method:m4method,rca4M_material:m4material,
       submittedAt: firebase.firestore.FieldValue.serverTimestamp(),
       submittedBy: S.user?.uid||'', submittedByName: S.userDoc?.name||S.user?.email||'',
       ...(submittedEvidenceUrls.length?{evidenceUrls: submittedEvidenceUrls}:{}) },
+    rcaWhy1:why1,rcaWhy2:why2,rcaWhy3:why3,rcaWhy4:why4,rcaWhy5:why5,rcaRootCause:whyRc||rootCause,
+    rca4M_man:m4man,rca4M_machine:m4machine,rca4M_method:m4method,rca4M_material:m4material,
     immediateCorrection: correction,
     rootCause, correctiveAction, targetDate,
     ...(submittedEvidenceUrls.length?{evidenceUrls: firebase.firestore.FieldValue.arrayUnion(...submittedEvidenceUrls)}:{}),
@@ -6355,8 +6444,37 @@ async function ncSubmitToHOD(ncId){
     await dhBatch.commit().catch(()=>{});
   }
 
+  // Email Dept Head
+  if (deptHeadSnap && !deptHeadSnap.empty) {
+    const _ncPlanId = ncData.auditId||ncData.auditPlanId||'';
+    const _ncNo2 = ncData.findingNo||ncId.slice(-6).toUpperCase();
+    const _dhEmails2 = [];
+    deptHeadSnap.docs.forEach(dhu=>{
+      const dd=dhu.data(); const dp=dd.plant||'All Plants';
+      if (!dept||dd.department===dept||dp===plant||dp==='All Plants') if(dd.email) _dhEmails2.push(dd.email);
+    });
+    if (_dhEmails2.length) _sendNcEmail(_dhEmails2,
+      `[Action Required] Review NC Action Plan — ${_ncNo2}`,
+      `Auditee submitted action plan for NC ${_ncNo2}. Please review.`,
+      ncId, _ncPlanId).catch(()=>{});
+  }
+
   showToast('Submitted to Dept Head ✅','success');
   setTimeout(()=>{ closeNCDetail(); if(S.currentModule==='myactions') renderMyActions(); }, 700);
+}
+
+// Tab switcher for NC detail action form
+function ncSwitchTab(tab) {
+  ['basic','why','4m'].forEach(t => {
+    const pane = document.getElementById('ncTabPane_'+t);
+    const btn  = document.getElementById('ncTab_'+t);
+    if (!pane||!btn) return;
+    const active = t===tab;
+    pane.style.display = active ? '' : 'none';
+    btn.style.borderBottom = active ? '2px solid #2563eb' : 'none';
+    btn.style.marginBottom = active ? '-2px' : '0';
+    btn.style.color = active ? '#2563eb' : 'var(--text-muted)';
+  });
 }
 
 // Auto-save on blur — silent, no toast
@@ -6369,12 +6487,27 @@ function ncAutoSave(ncId){
     const correctiveAction = document.getElementById('nc_correctiveAction')?.value?.trim();
     const targetDate = document.getElementById('nc_targetDate')?.value;
     const responsible = document.getElementById('nc_responsible')?.value?.trim();
-    // Only save if at least one field has content
     if (!rootCause && !correction && !correctiveAction && !targetDate) return;
+    // 5-Why
+    const why1=document.getElementById('nc_why1')?.value?.trim()||'';
+    const why2=document.getElementById('nc_why2')?.value?.trim()||'';
+    const why3=document.getElementById('nc_why3')?.value?.trim()||'';
+    const why4=document.getElementById('nc_why4')?.value?.trim()||'';
+    const why5=document.getElementById('nc_why5')?.value?.trim()||'';
+    const whyRc=document.getElementById('nc_whyRc')?.value?.trim()||'';
+    // 4M
+    const m4man=document.getElementById('nc_4m_man')?.value?.trim()||'';
+    const m4machine=document.getElementById('nc_4m_machine')?.value?.trim()||'';
+    const m4method=document.getElementById('nc_4m_method')?.value?.trim()||'';
+    const m4material=document.getElementById('nc_4m_material')?.value?.trim()||'';
     const st = document.getElementById('ncDraftStatus');
     if (st) st.textContent = 'Saving…';
     await db.collection('findings').doc(ncId).update({
-      actionPlan:{ rootCause, correction, correctiveAction, targetDate, responsible },
+      actionPlan:{ rootCause, correction, correctiveAction, targetDate, responsible,
+        rcaWhy1:why1,rcaWhy2:why2,rcaWhy3:why3,rcaWhy4:why4,rcaWhy5:why5,rcaRootCause:whyRc||rootCause,
+        rca4M_man:m4man,rca4M_machine:m4machine,rca4M_method:m4method,rca4M_material:m4material },
+      rcaWhy1:why1,rcaWhy2:why2,rcaWhy3:why3,rcaWhy4:why4,rcaWhy5:why5,rcaRootCause:whyRc||rootCause,
+      rca4M_man:m4man,rca4M_machine:m4machine,rca4M_method:m4method,rca4M_material:m4material,
       workflowStage:'Auditee Action',
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     }).catch(()=>{});
@@ -6523,6 +6656,51 @@ async function dhInlineApprove(findingIdsCsv, action) {
     await maBatch2.commit().catch(()=>{});
   } catch(e) { console.warn('myAction update error:', e); }
 
+  // Send email notifications
+  try {
+    if (action === 'approve') {
+      // Email auditor for each finding
+      for (const fid of findingIds) {
+        const _fds = await db.collection('findings').doc(fid).get().catch(()=>null);
+        const _fdd = _fds?.data()||{};
+        const _planId3 = _fdd.auditId||_fdd.auditPlanId||'';
+        const _ncNo3 = _fdd.findingNo||fid.slice(-6).toUpperCase();
+        const _audId3 = _fdd.raisedBy||_fdd.auditorId||'';
+        let _audEmail3 = _fdd.auditorEmail||'';
+        if (!_audEmail3 && _audId3) {
+          const _au3 = await db.collection('users').doc(_audId3).get().catch(()=>null);
+          if (_au3?.exists) _audEmail3 = _au3.data().email||'';
+        }
+        if (!_audEmail3 && _planId3) {
+          const _pd3 = await db.collection('auditPlans').doc(_planId3).get().catch(()=>null);
+          if (_pd3?.exists) _audEmail3 = _pd3.data().leadAuditorEmail||_pd3.data().auditorEmail||'';
+        }
+        if (_audEmail3) await _sendNcEmail([_audEmail3],
+          `[Action Required] Auditor Review — NC ${_ncNo3}`,
+          `Dept Head approved action plan for NC ${_ncNo3}. Please review.`,
+          fid, _planId3).catch(()=>{});
+      }
+    } else {
+      // Return — email auditee for each finding
+      for (const fid of findingIds) {
+        const _fds2 = await db.collection('findings').doc(fid).get().catch(()=>null);
+        const _fdd2 = _fds2?.data()||{};
+        const _planId4 = _fdd2.auditId||_fdd2.auditPlanId||'';
+        const _ncNo4 = _fdd2.findingNo||fid.slice(-6).toUpperCase();
+        const _aeId4 = _fdd2.auditeeId||_fdd2.assigneeId||'';
+        let _aeEmail4 = _fdd2.auditeeEmail||'';
+        if (!_aeEmail4 && _aeId4) {
+          const _aeu4 = await db.collection('users').doc(_aeId4).get().catch(()=>null);
+          if (_aeu4?.exists) _aeEmail4 = _aeu4.data().email||'';
+        }
+        if (_aeEmail4) await _sendNcEmail([_aeEmail4],
+          `Action Required: NC ${_ncNo4} Returned for Revision`,
+          `NC ${_ncNo4} was returned by Dept Head. Comment: ${comment}. Please revise and resubmit.`,
+          fid, _planId4).catch(()=>{});
+      }
+    }
+  } catch(_dhe){ console.warn('dhInlineApprove email error:', _dhe?.message||_dhe); }
+
   const msg = action==='approve'
     ? `✅ ${findingIds.length} finding${findingIds.length!==1?'s':''} approved → Auditor Review`
     : `↩ ${findingIds.length} finding${findingIds.length!==1?'s':''} returned to Auditee`;
@@ -6532,38 +6710,30 @@ async function dhInlineApprove(findingIdsCsv, action) {
 }
 
 // ── NC email notification helper ─────────────────────────────────────────────
-// Sends an email to one or more recipients about an NC workflow event.
-// Uses the same Cloud Function + payload pattern as the working schedule email.
-// _sendNcEmail — calls sendAuditScheduleEmail exactly like the working schedule publish email does:
-//   { docIds, collection, recipients }  — no gmail creds in payload; CF reads those from its own config.
-// ncId is passed so the CF can fetch the finding doc for context if needed.
-async function _sendNcEmail(toEmails, subject, bodyHtml, ncId) {
+// CRITICAL: sendAuditScheduleEmail CF only processes 'auditPlans' collection.
+// Calling it with collection:'findings' is ignored by the CF → no email sent.
+// Fix: always call with collection:'auditPlans' + the finding's auditPlanId.
+// Recipients are resolved client-side and passed explicitly.
+async function _sendNcEmail(toEmails, subject, bodyHtml, ncId, auditPlanId) {
   if (!toEmails || toEmails.length === 0) return;
   const uniqueEmails = [...new Set(toEmails.filter(Boolean))];
   if (!uniqueEmails.length) return;
   try {
-    // Store a notification doc so it's visible in-app even if email fails
     db.collection('ncEmailLog').add({
-      to: uniqueEmails,
-      subject,
-      ncId: ncId||'',
+      to: uniqueEmails, subject, ncId: ncId||'', auditPlanId: auditPlanId||'',
       sentBy: S.user?.uid||'',
       sentAt: firebase.firestore.FieldValue.serverTimestamp(),
       status: 'pending',
     }).catch(()=>{});
 
-    // Call the Cloud Function the same way the working schedule email does
     const fn = fnRegion.httpsCallable('sendAuditScheduleEmail');
-    await fn({
-      docIds    : ncId ? [ncId] : [],
-      collection: 'findings',
-      recipients: uniqueEmails,
-      subject,                    // extra params the CF may or may not use
-      bodyHtml,
-    });
+    // Use auditPlans collection + planId — matches exactly how working schedule email is called
+    // If no planId available, still try with findings as fallback
+    const _useCol = auditPlanId ? 'auditPlans' : 'findings';
+    const _useIds = auditPlanId ? [auditPlanId] : (ncId ? [ncId] : []);
+    await fn({ docIds: _useIds, collection: _useCol, recipients: uniqueEmails });
   } catch(e) {
     console.warn('_sendNcEmail CF failed:', e?.message||e);
-    // Update log doc to reflect failure
     db.collection('ncEmailLog').where('ncId','==',ncId||'').orderBy('sentAt','desc').limit(1).get()
       .then(s=>{ if(s&&!s.empty) s.docs[0].ref.update({ status:'failed', error: e?.message||String(e) }); })
       .catch(()=>{});
@@ -6584,8 +6754,62 @@ async function ncApprove(ncId, nextStage, comment){
   _updateNcMyAction(ncId, 'Completed', nextStage, '');
   showToast(nextStage==='Closed'?'NC Closed ✓':'Approved & forwarded ✓','success');
 
-  // Email notifications are handled automatically by the Cloud Function trigger
-  // onFindingWorkflowUpdated — it fires when workflowStage changes on the finding doc.
+  // Send email to the next reviewer — CF trigger's sendEmail is unreliable (OAuth creds).
+  // We call sendAuditScheduleEmail directly with resolved recipients.
+  try {
+    const _snap = await db.collection('findings').doc(ncId).get();
+    const _fd   = _snap.data()||{};
+    const _ncNo   = _fd.findingNo||ncId.slice(-6).toUpperCase();
+    const _dept   = _fd.department||'';
+    const _plant  = _fd.plant||'';
+    const _planId = _fd.auditId||_fd.auditPlanId||'';
+    const _auditName = _fd.auditName||_planId||'';
+    const _byName = S.userDoc?.name||S.user?.email||'Reviewer';
+
+    if (nextStage === 'Auditor Review') {
+      // Email the auditor
+      const _audId = _fd.raisedBy||_fd.auditorId||'';
+      let _audEmail = _fd.auditorEmail||'';
+      if (!_audEmail && _audId) {
+        const _au = await db.collection('users').doc(_audId).get().catch(()=>null);
+        if (_au?.exists) _audEmail = _au.data().email||'';
+      }
+      if (!_audEmail && _planId) {
+        const _pd = await db.collection('auditPlans').doc(_planId).get().catch(()=>null);
+        if (_pd?.exists) _audEmail = _pd.data().leadAuditorEmail||_pd.data().auditorEmail||'';
+      }
+      if (_audEmail) await _sendNcEmail([_audEmail],
+        `[Action Required] Auditor Review — NC ${_ncNo}`,
+        `Dept Head approved action plan for NC ${_ncNo} (${_auditName}). Please review.`,
+        ncId, _planId);
+
+    } else if (nextStage === 'MR Review') {
+      // Email MR / Plant Admin users for this plant
+      const _mrRoles = ['MR','Management Representative','Plant MR','Plant Admin','Super Admin'];
+      const _mrSnaps = await Promise.all(_mrRoles.map(r=>db.collection('users').where('role','==',r).get().catch(()=>null)));
+      const _mrEmails = [];
+      _mrSnaps.forEach(s=>{ if(s) s.forEach(d=>{ const dd=d.data(); const dp=dd.plant||'All Plants';
+        if (!_plant||dp===_plant||dp==='All Plants') { if(dd.email&&!_mrEmails.includes(dd.email)) _mrEmails.push(dd.email); } }); });
+      if (_mrEmails.length) await _sendNcEmail(_mrEmails,
+        `[Action Required] MR Final Approval — NC ${_ncNo}`,
+        `Auditor approved action plan for NC ${_ncNo} (${_auditName}). MR final approval required.`,
+        ncId, _planId);
+
+    } else if (nextStage === 'Closed') {
+      // Email auditee
+      const _aeId = _fd.auditeeId||_fd.assigneeId||'';
+      let _aeEmail = _fd.auditeeEmail||'';
+      if (!_aeEmail && _aeId) {
+        const _aeu = await db.collection('users').doc(_aeId).get().catch(()=>null);
+        if (_aeu?.exists) _aeEmail = _aeu.data().email||'';
+      }
+      if (_aeEmail) await _sendNcEmail([_aeEmail],
+        `✅ NC Closed — ${_ncNo}`,
+        `NC ${_ncNo} (${_auditName}) has been reviewed and officially closed. No further action required.`,
+        ncId, _planId);
+    }
+  } catch(_ee){ console.warn('ncApprove email error:', _ee?.message||_ee); }
+
   openNCDetail(ncId);
 }
 
@@ -6629,7 +6853,8 @@ async function ncReturn(ncId, returnToStage){
         <p><strong>Reviewer Comment:</strong><br/>${comment}</p>
         <p>Please log in to the Audit Management System, review the comment, update your action plan, and re-submit.</p>
       `;
-      await _sendNcEmail([_finalAeEmail], _subject, _bodyHtml, ncId);
+      const _retPlanId = _fd.auditId||_fd.auditPlanId||'';
+      await _sendNcEmail([_finalAeEmail], _subject, _bodyHtml, ncId, _retPlanId);
     }
   } catch(_re){ console.warn('Return email error:', _re?.message||_re); }
 
