@@ -4,6 +4,7 @@
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Gift Management System</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 .hidden{display:none!important}
@@ -460,12 +461,16 @@ tr:hover td{background:#fafbfc}
         <button data-view="newRequest">➕ New Request</button>
         <button data-view="bulkUpload">📂 Bulk Upload</button>
         <button data-view="requests">📋 Gift Requests</button>
+        <button data-view="guestList">👥 Guest List</button>
+        <button data-view="yearWise">📅 Year-Wise</button>
         <button data-view="admin">⚙️ Administration</button>
       </div>
       <div id="dashboardView"></div>
       <div id="newRequestView" class="hidden"></div>
       <div id="bulkUploadView" class="hidden"></div>
       <div id="requestsView" class="hidden"></div>
+      <div id="guestListView" class="hidden"></div>
+      <div id="yearWiseView" class="hidden"></div>
       <div id="adminView" class="hidden"></div>
     </div>
   </section>
@@ -499,6 +504,10 @@ const ts=()=>firebase.firestore.FieldValue.serverTimestamp();
 function normaliseRole(r){
   const m={"super admin":"superadmin","superadmin":"superadmin","plant admin":"plant_admin","plant_admin":"plant_admin","top management":"top_management","top_management":"top_management","employee":"employee"};
   return m[(r||"").toLowerCase().trim()]||((r||"").toLowerCase().replace(/\s+/g,"_"));
+}
+function displayRole(r){
+  const m={superadmin:"Super Admin",plant_admin:"Plant Admin",top_management:"Top Management",employee:"Employee"};
+  return m[r]||r||"Unknown";
 }
 function message(msg,type="notice"){$("message").textContent=msg;$("message").className="notice "+type;window.scrollTo({top:0,behavior:"smooth"});}
 function clearMessage(){$("message").className="notice hidden";}
@@ -625,7 +634,7 @@ auth.onAuthStateChanged(async user=>{
     $("loginOverlay").classList.add("hidden");
     $("mainHeader").style.display="flex";
     $("appPanel").classList.remove("hidden");
-    $("accountArea").innerHTML=`<span class="user-pill">👤 ${esc(profile.name)}</span><span style="opacity:.7;font-size:12px">${esc(profile.role)}</span><button class="secondary" id="logoutBtn" style="padding:5px 12px;font-size:12px">Sign out</button>`;
+    $("accountArea").innerHTML=`<span class="user-pill">👤 ${esc(profile.name)}</span><span style="opacity:.7;font-size:12px">${esc(displayRole(profile.role))}</span><button class="secondary" id="logoutBtn" style="padding:5px 12px;font-size:12px">Sign out</button>`;
     $("logoutBtn").onclick=()=>auth.signOut();
     $("welcome").textContent=`Welcome, ${profile.name} 👋`;
     configureNavigation();
@@ -635,18 +644,24 @@ auth.onAuthStateChanged(async user=>{
   }catch(err){loginMsg(err.message,"error");}
 });
 function configureNavigation(){
+  const adminRoles=["superadmin","plant_admin"];
+  const mgmtRoles=["superadmin","plant_admin","top_management"];
   document.querySelectorAll("#navTabs button").forEach(b=>{
     const v=b.dataset.view;
-    b.classList.toggle("hidden",v==="admin"&&!["superadmin","plant_admin"].includes(profile.role));
+    if(v==="admin")b.classList.toggle("hidden",!adminRoles.includes(profile.role));
+    else if(v==="guestList"||v==="yearWise")b.classList.toggle("hidden",!mgmtRoles.includes(profile.role));
+    else b.classList.remove("hidden");
     b.onclick=()=>showView(v);
   });
 }
 function showView(view){
-  ["dashboard","newRequest","bulkUpload","requests","admin"].forEach(v=>$(v+"View").classList.toggle("hidden",v!==view));
+  ["dashboard","newRequest","bulkUpload","requests","guestList","yearWise","admin"].forEach(v=>$(v+"View").classList.toggle("hidden",v!==view));
   document.querySelectorAll("#navTabs button").forEach(b=>b.classList.toggle("active",b.dataset.view===view));
   if(view==="requests")loadRequests();
+  if(view==="guestList")loadGuestList();
   if(view==="admin")renderAdmin();
   if(view==="bulkUpload")renderBulkUpload();
+  if(view==="yearWise")loadYearWise();
   clearMessage();
 }
 
@@ -883,6 +898,349 @@ async function processRequest(id,action){
 }
 
 /* ═══════════════════════════════════════════════
+   GUEST LIST
+═══════════════════════════════════════════════ */
+let _guestAllRows=[];  // cached for client-side filter
+
+async function loadGuestList(){
+  const el=$("guestListView");
+  el.innerHTML=renderGuestShell();
+  wireGuestFilters();
+  try{
+    const snap=await visibleRequests();
+    _guestAllRows=[];
+    snap.forEach(d=>{
+      const x=d.data();
+      if(!x.guestName&&!x.guestEmail&&!x.guestOrganisation)return; // skip records without any guest info
+      _guestAllRows.push({id:d.id,...x});
+    });
+    renderGuestTable(_guestAllRows);
+    // Update count badge
+    const badge=$("guestCount");if(badge)badge.textContent=_guestAllRows.length;
+  }catch(err){
+    el.innerHTML=`<div class="notice error">${esc(err.message)}</div>`;
+  }
+}
+
+function renderGuestShell(){
+  // Build org filter options from cache
+  const orgOpts=Object.values(ORGS).sort().map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  const plantOpts=Object.entries(PLANTS).sort((a,b)=>a[1].localeCompare(b[1])).map(([id,name])=>`<option value="${esc(id)}">${esc(name)}</option>`).join("");
+  const statusOpts=Object.entries(STATUS_LABELS).map(([k,v])=>`<option value="${k}">${v}</option>`).join("");
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+      <div>
+        <h2 style="margin-bottom:2px">👥 Guest / Recipient List</h2>
+        <p style="font-size:12px;color:var(--muted)">All external recipients with gift history — <strong id="guestCount">…</strong> records</p>
+      </div>
+      <button class="secondary" id="guestExportBtn" style="font-size:12px;padding:6px 12px">⬇ Export CSV</button>
+    </div>
+
+    <!-- Filters -->
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:14px;margin-bottom:18px">
+      <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;align-items:end">
+        <div>
+          <label>Search</label>
+          <input id="gf_search" placeholder="Name / email / gift…" style="height:36px;font-size:13px">
+        </div>
+        <div>
+          <label>Organisation</label>
+          <select id="gf_org" style="height:36px;font-size:13px"><option value="">All organisations</option>${orgOpts}</select>
+        </div>
+        <div>
+          <label>Plant</label>
+          <select id="gf_plant" style="height:36px;font-size:13px"><option value="">All plants</option>${plantOpts}</select>
+        </div>
+        <div>
+          <label>Status</label>
+          <select id="gf_status" style="height:36px;font-size:13px"><option value="">All statuses</option>${statusOpts}</select>
+        </div>
+        <div>
+          <label>From date</label>
+          <input id="gf_from" type="date" style="height:36px;font-size:13px">
+        </div>
+        <div>
+          <label>To date</label>
+          <input id="gf_to" type="date" style="height:36px;font-size:13px">
+        </div>
+        <div style="display:flex;gap:8px;align-items:flex-end">
+          <button id="gf_apply" style="height:36px;padding:0 14px;font-size:13px">Filter</button>
+          <button class="secondary" id="gf_clear" style="height:36px;padding:0 12px;font-size:13px">Clear</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="guestTableWrap">
+      <div style="text-align:center;padding:40px;color:var(--muted)">Loading…</div>
+    </div>`;
+}
+
+function wireGuestFilters(){
+  setTimeout(()=>{
+    $("gf_apply").onclick=applyGuestFilter;
+    $("gf_search").onkeyup=e=>{if(e.key==="Enter")applyGuestFilter();};
+    $("gf_clear").onclick=()=>{
+      ["gf_search","gf_org","gf_plant","gf_status","gf_from","gf_to"].forEach(id=>{const el=$(id);if(el){if(el.tagName==="SELECT")el.value="";else el.value="";}});
+      renderGuestTable(_guestAllRows);const b=$("guestCount");if(b)b.textContent=_guestAllRows.length;
+    };
+    $("guestExportBtn").onclick=()=>exportGuestCSV(_guestAllRows);
+  },50);
+}
+
+function applyGuestFilter(){
+  const q=($("gf_search").value||"").toLowerCase();
+  const org=$("gf_org").value;
+  const plant=$("gf_plant").value;
+  const status=$("gf_status").value;
+  const from=$("gf_from").value;
+  const to=$("gf_to").value;
+  const filtered=_guestAllRows.filter(x=>{
+    if(q&&![x.guestName,x.guestEmail,x.guestOrganisation,x.giftName,x.guestContact,x.guestDesignation].some(v=>(v||"").toLowerCase().includes(q)))return false;
+    if(org&&x.guestOrganisation!==org)return false;
+    if(plant&&x.plantId!==plant)return false;
+    if(status&&x.status!==status)return false;
+    if(from&&x.distributionDate&&x.distributionDate<from)return false;
+    if(to&&x.distributionDate&&x.distributionDate>to)return false;
+    return true;
+  });
+  renderGuestTable(filtered);
+  const b=$("guestCount");if(b)b.textContent=filtered.length;
+}
+
+function renderGuestTable(rows){
+  const wrap=$("guestTableWrap");if(!wrap)return;
+  if(!rows.length){
+    wrap.innerHTML=`<div style="text-align:center;padding:40px;color:var(--muted)">No guest records match the current filter.</div>`;
+    return;
+  }
+  const trs=rows.map(x=>{
+    const plant=PLANTS[x.plantId]||x.plantId||"—";
+    const qty=x.approvedQuantity||x.requestedQuantity||"—";
+    const cost=x.approvedBudget||(x.requestedQuantity*(x.estimatedUnitCost||0))||0;
+    const distDate=x.distributionDate||"—";
+    const reqDate=x.createdAt?.toDate?.()?x.createdAt.toDate().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"}):"—";
+    return `<tr>
+      <td>
+        <div style="font-weight:600;color:var(--text)">${esc(x.guestName||"—")}</div>
+        ${x.guestDesignation?`<div style="font-size:11px;color:var(--muted)">${esc(x.guestDesignation)}</div>`:""}
+      </td>
+      <td>
+        <div>${esc(x.guestOrganisation||"—")}</div>
+        ${x.guestDept?`<div style="font-size:11px;color:var(--muted)">${esc(x.guestDept)}</div>`:""}
+      </td>
+      <td>
+        ${x.guestEmail?`<div style="font-size:12px">${esc(x.guestEmail)}</div>`:""}
+        ${x.guestContact?`<div style="font-size:12px;color:var(--muted)">${esc(x.guestContact)}</div>`:""}
+      </td>
+      <td>
+        <div style="font-weight:600">${esc(x.giftName||"—")}</div>
+        <div style="font-size:11px;color:var(--muted)">${esc(x.giftCategory||"")}${x.giftCategory&&x.occasion?" · ":""}${esc(x.occasion||"")}</div>
+      </td>
+      <td style="text-align:right">
+        <div>${qty}</div>
+        ${cost?`<div style="font-size:11px;color:var(--muted)">₹${Number(cost).toLocaleString("en-IN")}</div>`:""}
+      </td>
+      <td><span class="badge badge-${x.status||""}">${esc((x.status||"").replace(/_/g," "))}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(plant)}</td>
+      <td style="font-size:12px;color:var(--muted);white-space:nowrap">${esc(distDate)}</td>
+      <td style="font-size:12px;color:var(--muted);white-space:nowrap">${reqDate}</td>
+    </tr>`;
+  }).join("");
+  wrap.innerHTML=`<div style="overflow:auto">
+    <table>
+      <thead><tr>
+        <th>Guest / Recipient</th>
+        <th>Organisation</th>
+        <th>Contact</th>
+        <th>Gift</th>
+        <th style="text-align:right">Qty / Value</th>
+        <th>Status</th>
+        <th>Plant</th>
+        <th>Dist. Date</th>
+        <th>Req. Date</th>
+      </tr></thead>
+      <tbody>${trs}</tbody>
+    </table>
+  </div>
+  <p style="font-size:11px;color:var(--muted);text-align:right;margin-top:8px">${rows.length} record${rows.length===1?"":"s"}</p>`;
+}
+
+function exportGuestCSV(rows){
+  if(!rows.length){message("No records to export.","warn");return;}
+  const headers=["Guest Name","Designation","Organisation","Dept","Email","Contact","Gift Name","Category","Occasion","Qty","Unit Cost","Total Value","Status","Plant","Distribution Date","Requested Date","Remarks"];
+  const csvRows=[headers.join(",")];
+  rows.forEach(x=>{
+    const qty=x.approvedQuantity||x.requestedQuantity||"";
+    const cost=x.approvedBudget||(x.requestedQuantity*(x.estimatedUnitCost||0))||"";
+    const reqDate=x.createdAt?.toDate?.()?x.createdAt.toDate().toLocaleDateString("en-IN"):"";
+    const cols=[x.guestName,x.guestDesignation,x.guestOrganisation,x.guestDept,x.guestEmail,x.guestContact,x.giftName,x.giftCategory,x.occasion,qty,x.estimatedUnitCost||"",cost,(x.status||"").replace(/_/g," "),PLANTS[x.plantId]||x.plantId||"",x.distributionDate||"",reqDate,x.remarks||""];
+    csvRows.push(cols.map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(","));
+  });
+  const blob=new Blob([csvRows.join("\r\n")],{type:"text/csv"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+  a.download=`GuestList_${new Date().toISOString().slice(0,10)}.csv`;a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ═══════════════════════════════════════════════
+   YEAR-WISE GIFT CATEGORY ANALYSIS
+═══════════════════════════════════════════════ */
+async function loadYearWise(){
+  const dv=$("yearWiseView");
+  dv.innerHTML=`<h2 style="margin-bottom:6px">Year-Wise Gift Analysis</h2>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:18px">Gift distribution breakdown by year and category.</p>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:20px">
+      <div><label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px">Year</label>
+        <select id="yw_year" style="height:36px;font-size:13px;padding:0 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface)"><option value="">All Years</option></select>
+      </div>
+      <div><label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px">Category</label>
+        <select id="yw_cat" style="height:36px;font-size:13px;padding:0 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface)"><option value="">All Categories</option></select>
+      </div>
+      <button id="yw_export" class="secondary" style="margin-top:18px;font-size:13px">⬇ Export CSV</button>
+    </div>
+    <div id="yw_summary" style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px"></div>
+    <div id="yw_table"></div>`;
+
+  // Load data
+  const snap = await visibleRequests();
+  let allRows=[];
+  snap.forEach(d=>allRows.push({id:d.id,...d.data()}));
+  // Only approved/distributed
+  const data=allRows.filter(r=>["approved","partially_approved","distributed"].includes(r.status));
+
+  // Populate year filter
+  const years=[...new Set(data.map(r=>{
+    const d=r.distributionDate||r.createdAt?.toDate?.().toISOString().slice(0,10)||"";
+    return d.slice(0,4);
+  }).filter(y=>y&&y.length===4))].sort().reverse();
+  const yw_year=$("yw_year");
+  years.forEach(y=>{const o=document.createElement("option");o.value=y;o.textContent=y;yw_year.appendChild(o);});
+
+  // Populate category filter
+  const cats=[...new Set(data.map(r=>r.giftCategory||"Uncategorised").filter(Boolean))].sort();
+  const yw_cat=$("yw_cat");
+  cats.forEach(c=>{const o=document.createElement("option");o.value=c;o.textContent=c;yw_cat.appendChild(o);});
+
+  function renderYW(){
+    const selYear=yw_year.value;
+    const selCat=yw_cat.value;
+    let rows=data.filter(r=>{
+      const yr=(r.distributionDate||r.createdAt?.toDate?.().toISOString().slice(0,10)||"").slice(0,4);
+      if(selYear&&yr!==selYear)return false;
+      if(selCat&&(r.giftCategory||"Uncategorised")!==selCat)return false;
+      return true;
+    });
+
+    // Summary KPIs
+    const totalQty=rows.reduce((s,r)=>s+(r.approvedQuantity||r.requestedQuantity||0),0);
+    const totalVal=rows.reduce((s,r)=>s+(r.approvedBudget||((r.approvedQuantity||r.requestedQuantity||0)*(r.estimatedUnitCost||0))),0);
+    const catCount=[...new Set(rows.map(r=>r.giftCategory||"Uncategorised"))].length;
+    $("yw_summary").innerHTML=`
+      <div class="kpi-tile blue"><div class="kpi-label">Requests</div><div class="kpi-value">${rows.length}</div></div>
+      <div class="kpi-tile green"><div class="kpi-label">Total Qty Gifted</div><div class="kpi-value">${totalQty.toLocaleString("en-IN")}</div></div>
+      <div class="kpi-tile amber"><div class="kpi-label">Total Value</div><div class="kpi-value" style="font-size:22px">₹${totalVal.toLocaleString("en-IN",{maximumFractionDigits:0})}</div></div>
+      <div class="kpi-tile purple"><div class="kpi-label">Categories</div><div class="kpi-value">${catCount}</div></div>`;
+
+    // Build category×year pivot
+    const pivotYears=selYear?[selYear]:years;
+    const pivotCats=selCat?[selCat]:cats;
+    if(!pivotCats.length){$("yw_table").innerHTML=`<p style="color:var(--muted);padding:20px;text-align:center">No approved gifts found.</p>`;return;}
+
+    // Build pivot: cat → year → {qty, val, count}
+    const pivot={};
+    pivotCats.forEach(c=>{pivot[c]={};pivotYears.forEach(y=>{pivot[c][y]={qty:0,val:0,count:0};});});
+    rows.forEach(r=>{
+      const yr=(r.distributionDate||r.createdAt?.toDate?.().toISOString().slice(0,10)||"").slice(0,4);
+      const cat=r.giftCategory||"Uncategorised";
+      if(!pivot[cat])return;
+      if(!pivot[cat][yr])return;
+      const qty=r.approvedQuantity||r.requestedQuantity||0;
+      const val=r.approvedBudget||((r.approvedQuantity||r.requestedQuantity||0)*(r.estimatedUnitCost||0));
+      pivot[cat][yr].qty+=qty;pivot[cat][yr].val+=val;pivot[cat][yr].count++;
+    });
+
+    // Category totals
+    const catTotals={};
+    pivotCats.forEach(c=>{
+      catTotals[c]={qty:0,val:0,count:0};
+      pivotYears.forEach(y=>{catTotals[c].qty+=pivot[c][y].qty;catTotals[c].val+=pivot[c][y].val;catTotals[c].count+=pivot[c][y].count;});
+    });
+
+    const hdrYears=pivotYears.map(y=>`<th colspan="2" style="text-align:center;border-left:2px solid var(--border)">${y}</th>`).join("")+"<th colspan="2" style="text-align:center;border-left:2px solid var(--border);background:#f8fafc">Total</th>";
+    const subHdr=pivotYears.map(()=>'<th style="border-left:2px solid var(--border)">Qty</th><th>Value (₹)</th>').join("")+'<th style="border-left:2px solid var(--border);background:#f8fafc">Qty</th><th style="background:#f8fafc">Value (₹)</th>';
+
+    const bodyRows=pivotCats.map(cat=>{
+      const cells=pivotYears.map(y=>{
+        const p=pivot[cat][y];
+        return `<td style="border-left:2px solid var(--border);text-align:right">${p.qty||""}</td><td style="text-align:right">${p.val?("₹"+p.val.toLocaleString("en-IN",{maximumFractionDigits:0})):""}${p.count?` <span style="font-size:10px;color:var(--muted)">(${p.count})</span>`:""}`;
+      }).join("</td><td>");
+      const t=catTotals[cat];
+      return `<tr>
+        <td style="font-weight:500">${esc(cat)}</td>
+        <td style="border-left:2px solid var(--border);text-align:right">${cells}</td>
+        <td style="border-left:2px solid var(--border);font-weight:600;text-align:right;background:#f8fafc">${t.qty||""}</td>
+        <td style="font-weight:600;text-align:right;background:#f8fafc">${t.val?("₹"+t.val.toLocaleString("en-IN",{maximumFractionDigits:0})):""}</td>
+      </tr>`;
+    }).join("");
+
+    // Year totals row
+    const yearTotals=pivotYears.map(y=>{
+      let qty=0,val=0;
+      pivotCats.forEach(c=>{qty+=pivot[c][y].qty;val+=pivot[c][y].val;});
+      return `<td style="border-left:2px solid var(--border);font-weight:700;text-align:right">${qty||""}</td><td style="font-weight:700;text-align:right">${val?("₹"+val.toLocaleString("en-IN",{maximumFractionDigits:0})):""}`;
+    }).join("</td><td>");
+    const grandQty=rows.reduce((s,r)=>s+(r.approvedQuantity||r.requestedQuantity||0),0);
+    const grandVal=rows.reduce((s,r)=>s+(r.approvedBudget||((r.approvedQuantity||r.requestedQuantity||0)*(r.estimatedUnitCost||0))),0);
+
+    $("yw_table").innerHTML=`<div style="overflow:auto"><table style="border-collapse:collapse;width:100%;font-size:13px">
+      <thead>
+        <tr style="background:var(--primary);color:#fff">
+          <th style="padding:10px 12px;text-align:left;min-width:160px">Category</th>${hdrYears}
+        </tr>
+        <tr style="background:#e8f0fe;font-size:12px">
+          <th></th>${subHdr}
+        </tr>
+      </thead>
+      <tbody>${bodyRows}</tbody>
+      <tfoot>
+        <tr style="background:#f1f5f9;font-weight:700;border-top:2px solid var(--border)">
+          <td style="padding:8px 12px">Grand Total</td>
+          <td style="border-left:2px solid var(--border);text-align:right">${yearTotals}</td>
+          <td style="border-left:2px solid var(--border);font-weight:700;text-align:right;background:#e8f0fe">${grandQty||""}</td>
+          <td style="font-weight:700;text-align:right;background:#e8f0fe">${grandVal?("₹"+grandVal.toLocaleString("en-IN",{maximumFractionDigits:0})):""}</td>
+        </tr>
+      </tfoot>
+    </table></div>
+    <p style="font-size:11px;color:var(--muted);margin-top:8px">Shows approved / partially approved / distributed requests only. Values in INR.</p>`;
+
+    // Store filtered rows for export
+    $("yw_export")._rows=rows;
+  }
+
+  $("yw_year").onchange=renderYW;
+  $("yw_cat").onchange=renderYW;
+  $("yw_export").onclick=()=>{
+    const rows=$("yw_export")._rows||[];
+    if(!rows.length){message("No data to export.","warn");return;}
+    const headers=["Year","Category","Gift Name","Occasion","Guest Name","Guest Org","Plant","Qty","Unit Cost","Total Value","Status","Distribution Date"];
+    const csvRows=[headers.join(",")];
+    rows.forEach(r=>{
+      const yr=(r.distributionDate||r.createdAt?.toDate?.().toISOString().slice(0,10)||"").slice(0,4);
+      const qty=r.approvedQuantity||r.requestedQuantity||0;
+      const val=r.approvedBudget||(qty*(r.estimatedUnitCost||0));
+      const cols=[yr,r.giftCategory||"",r.giftName||"",r.occasion||"",r.guestName||"",r.guestOrganisation||"",PLANTS[r.plantId]||r.plantId||"",qty,r.estimatedUnitCost||"",val,(r.status||"").replace(/_/g," "),r.distributionDate||""];
+      csvRows.push(cols.map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(","));
+    });
+    const blob=new Blob([csvRows.join("\r\n")],{type:"text/csv"});
+    const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+    a.download=`YearWise_Gift_Analysis_${new Date().toISOString().slice(0,10)}.csv`;a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  renderYW();
+}
+
+/* ═══════════════════════════════════════════════
    BULK UPLOAD
 ═══════════════════════════════════════════════ */
 const BULK_COLS=["giftName","occasion","giftCategory","quantity","unitCost","distributionDate","guestName","guestEmail","guestContact","guestDesignation","guestDept","guestOrganisation","remarks"];
@@ -891,77 +1249,68 @@ let bulkParsed=[];
 function renderBulkUpload(){
   $("bulkUploadView").innerHTML=`
     <h2 style="margin-bottom:6px">Bulk Upload Gift Requests</h2>
-    <p style="color:var(--muted);font-size:13px;margin-bottom:18px">Upload a CSV file to submit multiple gift requests at once. Each row becomes one request assigned to your plant &amp; department.</p>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:18px">Download the Excel template, fill in gift request data, then upload to submit multiple requests at once.</p>
 
-    <div style="margin-bottom:16px">
-      <button id="downloadTemplate" class="secondary">⬇ Download CSV Template</button>
-      <span style="font-size:12px;color:var(--muted);margin-left:10px">Required columns: <code>giftName, occasion, giftCategory, quantity</code> · Optional: all others</span>
+    <div style="margin-bottom:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <button id="downloadTemplate" class="secondary">&#x2B07; Download Excel Template</button>
+      <span style="font-size:12px;color:var(--muted)">Required columns: <code>giftName, occasion, giftCategory, quantity</code></span>
     </div>
 
     <div class="upload-zone" id="uploadZone">
-      <input type="file" id="csvFile" accept=".csv,.txt">
-      <div class="upload-icon">📂</div>
-      <div style="font-weight:600;margin-bottom:4px">Click to choose a CSV file, or drag &amp; drop here</div>
-      <div style="font-size:12px;color:var(--muted)">Accepts .csv files · Max 500 rows</div>
+      <input type="file" id="xlsxFile" accept=".xlsx,.xls">
+      <div class="upload-icon">&#x1F4C2;</div>
+      <div style="font-weight:600;margin-bottom:4px">Click to choose an Excel file, or drag &amp; drop here</div>
+      <div style="font-size:12px;color:var(--muted)">Accepts .xlsx / .xls files &middot; Max 500 rows</div>
     </div>
 
     <div id="bulkPreview"></div>
     <div id="bulkActions" class="actions" style="display:none">
-      <button id="bulkSubmitBtn">📤 Submit All Valid Rows</button>
-      <button class="secondary" id="bulkClearBtn">✕ Clear</button>
+      <button id="bulkSubmitBtn">&#x1F4E4; Submit All Valid Rows</button>
+      <button class="secondary" id="bulkClearBtn">&#x2715; Clear</button>
       <span id="bulkStats" style="font-size:13px;color:var(--muted);margin-left:4px"></span>
     </div>
     <div id="bulkProgress" style="display:none;margin-top:12px"></div>`;
 
-  $("downloadTemplate").onclick=downloadCSVTemplate;
+  $("downloadTemplate").onclick=downloadExcelTemplate;
   const zone=$("uploadZone");
-  zone.onclick=()=>$("csvFile").click();
-  $("csvFile").onchange=e=>handleCSVFile(e.target.files[0]);
+  zone.onclick=()=>$("xlsxFile").click();
+  $("xlsxFile").onchange=e=>handleXlsxFile(e.target.files[0]);
   zone.ondragover=e=>{e.preventDefault();zone.classList.add("dragover");};
   zone.ondragleave=()=>zone.classList.remove("dragover");
-  zone.ondrop=e=>{e.preventDefault();zone.classList.remove("dragover");handleCSVFile(e.dataTransfer.files[0]);};
+  zone.ondrop=e=>{e.preventDefault();zone.classList.remove("dragover");handleXlsxFile(e.dataTransfer.files[0]);};
 }
 
-function downloadCSVTemplate(){
-  const header=BULK_COLS.join(",");
-  const example=["Diwali Gift Hamper","Diwali Festival","Festival","100","450","2026-11-01","Rajesh Sharma","rajesh@abc.com","9876543210","Director","Purchase","ABC Industries","Sample remark"].join(",");
-  const csv=header+"\n"+example;
-  const a=document.createElement("a");a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);a.download="gift_requests_template.csv";a.click();
+function downloadExcelTemplate(){
+  if(typeof XLSX==="undefined"){message("Excel library not loaded. Please refresh and try again.","error");return;}
+  const wb=XLSX.utils.book_new();
+  const headers=BULK_COLS;
+  const exampleRow=["Diwali Gift Hamper","Diwali Festival","Festival","100","450","2026-11-01","Rajesh Sharma","rajesh@abc.com","9876543210","Director","Purchase","ABC Industries","Sample remark"];
+  const ws=XLSX.utils.aoa_to_sheet([headers,exampleRow]);
+  // Column widths
+  ws["!cols"]=headers.map(h=>({wch:Math.max(h.length,15)}));
+  XLSX.utils.book_append_sheet(wb,ws,"Gift Requests");
+  XLSX.writeFile(wb,"gift_requests_template.xlsx");
 }
 
-function parseCSV(text){
-  const lines=text.trim().split(/\r?\n/).filter(l=>l.trim());
-  if(lines.length<2)return{headers:[],rows:[]};
-  const headers=splitCSVRow(lines[0]).map(h=>h.trim().toLowerCase().replace(/\s+/g,""));
-  const rows=lines.slice(1).map(l=>splitCSVRow(l));
-  return{headers,rows};
-}
-function splitCSVRow(row){
-  const result=[];let cur="",inQ=false;
-  for(let i=0;i<row.length;i++){
-    const c=row[i];
-    if(c==='"')inQ=!inQ;
-    else if(c===","&&!inQ){result.push(cur.trim());cur="";}
-    else cur+=c;
-  }
-  result.push(cur.trim());return result;
-}
-
-function handleCSVFile(file){
+function handleXlsxFile(file){
   if(!file){return;}
-  if(!file.name.match(/\.(csv|txt)$/i)){message("Please upload a .csv file.","error");return;}
+  if(!file.name.match(/\.(xlsx|xls)$/i)){message("Please upload an .xlsx or .xls file.","error");return;}
+  if(typeof XLSX==="undefined"){message("Excel library not loaded. Please refresh and try again.","error");return;}
   const reader=new FileReader();
   reader.onload=e=>{
     try{
-      const {headers,rows}=parseCSV(e.target.result);
-      if(!headers.length){message("Could not parse CSV. Check the file format.","error");return;}
-      bulkParsed=rows.slice(0,500).map((row,i)=>{
+      const wb=XLSX.read(e.target.result,{type:"array"});
+      const sheetName=wb.SheetNames[0];
+      const ws=wb.Sheets[sheetName];
+      const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+      if(rows.length<2){message("The file appears empty or has no data rows.","error");return;}
+      const rawHeaders=rows[0].map(h=>String(h).trim().toLowerCase().replace(/\s+/g,""));
+      bulkParsed=rows.slice(1,501).map((row,i)=>{
         const obj={_rowNum:i+2};
         BULK_COLS.forEach(col=>{
-          const idx=headers.indexOf(col.toLowerCase());
-          obj[col]=idx>=0?(row[idx]||"").trim():"";
+          const idx=rawHeaders.indexOf(col.toLowerCase());
+          obj[col]=idx>=0?String(row[idx]||"").trim():"";
         });
-        // Validate required
         const errors=[];
         if(!obj.giftName)errors.push("giftName required");
         if(!obj.occasion)errors.push("occasion required");
@@ -972,9 +1321,9 @@ function handleCSVFile(file){
         return obj;
       });
       renderBulkPreview();
-    }catch(err){message("Error parsing CSV: "+err.message,"error");}
+    }catch(err){message("Error reading Excel file: "+err.message,"error");}
   };
-  reader.readAsText(file);
+  reader.readAsArrayBuffer(file);
 }
 
 function renderBulkPreview(){
@@ -990,7 +1339,7 @@ function renderBulkPreview(){
   </tr>`).join("");
   $("bulkPreview").innerHTML=`
     <div style="margin-top:16px;padding:12px 16px;background:var(--bg);border-radius:8px;border:1px solid var(--border);font-size:13px;display:flex;gap:20px">
-      <span>📄 <strong>${bulkParsed.length}</strong> rows parsed</span>
+      <span>&#x1F4C4; <strong>${bulkParsed.length}</strong> rows parsed</span>
       <span style="color:var(--success)">✅ <strong>${valid}</strong> valid</span>
       ${invalid?`<span style="color:var(--danger)">⚠ <strong>${invalid}</strong> errors (will be skipped)</span>`:""}
     </div>
@@ -1000,7 +1349,7 @@ function renderBulkPreview(){
   $("bulkActions").style.display=valid>0?"flex":"none";
   $("bulkStats").textContent=`${valid} row${valid!==1?"s":""} will be submitted`;
   $("bulkSubmitBtn").onclick=submitBulk;
-  $("bulkClearBtn").onclick=()=>{bulkParsed=[];$("bulkPreview").innerHTML="";$("bulkActions").style.display="none";$("csvFile").value="";};
+  $("bulkClearBtn").onclick=()=>{bulkParsed=[];$("bulkPreview").innerHTML="";$("bulkActions").style.display="none";if($("xlsxFile"))$("xlsxFile").value="";};
 }
 
 async function submitBulk(){
@@ -1010,33 +1359,35 @@ async function submitBulk(){
   $("bulkProgress").style.display="block";
   $("bulkProgress").innerHTML=`<div class="notice">⏳ Submitting ${valid.length} requests…</div>`;
   let done=0,failed=0;
-  const batch=db.batch();
-  for(const r of valid){
-    const qty=Number(r.quantity)||1,cost=Number(r.unitCost)||0;
-    const ref=db.collection("giftRequests").doc();
-    batch.set(ref,{
-      giftName:r.giftName,occasion:r.occasion,giftCategory:r.giftCategory,
-      requestedQuantity:qty,estimatedUnitCost:cost,estimatedTotal:qty*cost,
-      distributionDate:r.distributionDate||"",remarks:r.remarks||"",
-      plantId:profile.plantId,departmentId:profile.departmentId,
-      requestedBy:currentUser.uid,requesterName:profile.name,employeeCode:profile.employeeCode,
-      guestName:r.guestName||"",guestEmail:r.guestEmail||"",guestContact:r.guestContact||"",
-      guestDesignation:r.guestDesignation||"",guestDept:r.guestDept||"",guestOrganisation:r.guestOrganisation||"",
-      status:"pending_plant_review",_bulkUpload:true,createdAt:ts()
-    });
-    done++;
-    // Firestore batch limit is 500; commit in chunks
-    if(done%499===0){try{await batch.commit();}catch(e){failed+=499;}}
+  // Process in chunks of 499 (Firestore batch limit)
+  for(let chunk=0;chunk<valid.length;chunk+=499){
+    const slice=valid.slice(chunk,chunk+499);
+    const batch=db.batch();
+    for(const r of slice){
+      const qty=Number(r.quantity)||1,cost=Number(r.unitCost)||0;
+      const ref=db.collection("giftRequests").doc();
+      batch.set(ref,{
+        giftName:r.giftName,occasion:r.occasion,giftCategory:r.giftCategory,
+        requestedQuantity:qty,estimatedUnitCost:cost,estimatedTotal:qty*cost,
+        distributionDate:r.distributionDate||"",remarks:r.remarks||"",
+        plantId:profile.plantId,departmentId:profile.departmentId,
+        requestedBy:currentUser.uid,requesterName:profile.name,employeeCode:profile.employeeCode,
+        guestName:r.guestName||"",guestEmail:r.guestEmail||"",guestContact:r.guestContact||"",
+        guestDesignation:r.guestDesignation||"",guestDept:r.guestDept||"",guestOrganisation:r.guestOrganisation||"",
+        status:"pending_plant_review",_bulkUpload:true,createdAt:ts()
+      });
+    }
+    try{await batch.commit();done+=slice.length;}
+    catch(e){failed+=slice.length;}
   }
-  try{
-    await batch.commit();
-    $("bulkProgress").innerHTML=`<div class="notice success">✅ ${done-failed} requests submitted successfully${failed?` (${failed} failed)`:""}.</div>`;
-    bulkParsed=[];$("bulkPreview").innerHTML="";$("bulkActions").style.display="none";$("csvFile").value="";
-    await renderDashboard();
-  }catch(err){
-    $("bulkProgress").innerHTML=`<div class="notice error">Error submitting: ${esc(err.message)}</div>`;
+  if(failed===0){
+    $("bulkProgress").innerHTML=`<div class="notice success">✅ ${done} requests submitted successfully.</div>`;
+  }else{
+    $("bulkProgress").innerHTML=`<div class="notice ${done>0?"":"error"}">${done>0?"✅ "+done+" submitted":""}${failed>0?" ⚠ "+failed+" failed":""}</div>`;
   }
+  bulkParsed=[];$("bulkPreview").innerHTML="";$("bulkActions").style.display="none";if($("xlsxFile"))$("xlsxFile").value="";
   $("bulkSubmitBtn").disabled=false;
+  await renderDashboard();
 }
 
 /* ═══════════════════════════════════════════════
@@ -1090,15 +1441,164 @@ async function loadAdminSection(sub){
 
 async function loadPendingUsers(){
   const el=$("adminUsers");
-  el.innerHTML=`<h3 style="margin-bottom:14px">Pending Employee Accounts</h3><div id="pendingUsers">Loading…</div>`;
+  const isSA=profile.role==="superadmin";
+  el.innerHTML=`
+    ${isSA?`<div class="master-add-form" style="margin-bottom:20px">
+      <h4>➕ Create New User</h4>
+      <div class="grid">
+        <div><label>Employee Code *</label><input id="cu_empCode"></div>
+        <div><label>Full Name *</label><input id="cu_name"></div>
+        <div><label>Designation</label><input id="cu_desig"></div>
+        <div><label>Email *</label><input id="cu_email" type="email"></div>
+        <div><label>Mobile</label><input id="cu_mobile" type="tel"></div>
+        <div><label>Password *</label><input id="cu_pass" type="password" placeholder="Min 6 chars"></div>
+        <div><label>Role *</label><select id="cu_role">
+          <option value="employee">Employee</option>
+          <option value="plant_admin">Plant Admin</option>
+          <option value="top_management">Top Management</option>
+          <option value="superadmin">Super Admin</option>
+        </select></div>
+        <div><label>Plant</label><select id="cu_plant"><option value="">-- Select Plant --</option>${Object.entries(PLANTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("")}</select></div>
+        <div><label>Department</label><select id="cu_dept"><option value="">-- Select Dept --</option>${Object.entries(DEPTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("")}</select></div>
+      </div>
+      <div class="actions"><button id="createUserBtn">👤 Create User</button></div>
+      <div id="createUserMsg" style="margin-top:8px"></div>
+    </div>`:""}
+    <h3 style="margin-bottom:14px">Pending Employee Accounts</h3><div id="pendingUsers">Loading…</div>`;
+  if(isSA){
+    document.getElementById("createUserBtn").onclick=async()=>{
+      const empCode=document.getElementById("cu_empCode").value.trim();
+      const name=document.getElementById("cu_name").value.trim();
+      const email=document.getElementById("cu_email").value.trim();
+      const pass=document.getElementById("cu_pass").value;
+      const role=document.getElementById("cu_role").value;
+      const plant=document.getElementById("cu_plant").value;
+      const dept=document.getElementById("cu_dept").value;
+      const desig=document.getElementById("cu_desig").value.trim();
+      const mobile=document.getElementById("cu_mobile").value.trim();
+      const msgEl=document.getElementById("createUserMsg");
+      if(!empCode||!name||!email||!pass){msgEl.innerHTML=`<span style="color:var(--danger)">Employee Code, Name, Email and Password are required.</span>`;return;}
+      if(pass.length<6){msgEl.innerHTML=`<span style="color:var(--danger)">Password must be at least 6 characters.</span>`;return;}
+      msgEl.innerHTML=`<span style="color:var(--muted)">⏳ Creating user…</span>`;
+      document.getElementById("createUserBtn").disabled=true;
+      try{
+        // Create Auth user via secondary app instance
+        const fbConfig={apiKey:firebase.app().options.apiKey,authDomain:firebase.app().options.authDomain,projectId:firebase.app().options.projectId};
+        let secApp;
+        try{secApp=firebase.app("secondary");}catch(e){secApp=firebase.initializeApp(fbConfig,"secondary");}
+        const secAuth=firebase.auth(secApp);
+        const cred=await secAuth.createUserWithEmailAndPassword(email,pass);
+        const uid=cred.user.uid;
+        await secAuth.signOut();
+        // Write Firestore doc with status:active
+        await db.collection("users").doc(uid).set({
+          employeeCode:empCode,name,email,designation:desig,mobile,
+          role,plantId:plant,departmentId:dept,
+          status:"active",createdAt:ts(),createdBy:currentUser.uid
+        });
+        msgEl.innerHTML=`<span style="color:var(--success)">✅ User "${name}" created successfully.</span>`;
+        ["cu_empCode","cu_name","cu_email","cu_pass","cu_desig","cu_mobile"].forEach(id=>{document.getElementById(id).value="";});
+        document.getElementById("cu_role").value="employee";
+        document.getElementById("cu_plant").value="";
+        document.getElementById("cu_dept").value="";
+        await refreshPendingList(isSA);
+      }catch(err){
+        msgEl.innerHTML=`<span style="color:var(--danger)">Error: ${esc(err.message)}</span>`;
+      }
+      document.getElementById("createUserBtn").disabled=false;
+    };
+  }
+  await refreshPendingList(isSA);
+}
+
+async function refreshPendingList(isSA){
+  const pendEl=document.getElementById("pendingUsers");
+  if(!pendEl)return;
+  // Load pending users
   let q=db.collection("users").where("status","==","pending");
   if(profile.role==="plant_admin")q=q.where("plantId","==",profile.plantId);
-  const snap=await q.limit(100).get();let rows=[];
-  snap.forEach(d=>{const u=d.data();rows.push(`<tr><td>${esc(u.employeeCode)}</td><td>${esc(u.name)}</td><td>${esc(u.designation)}</td><td>${esc(u.email)}</td><td>${esc(PLANTS[u.plantId]||u.plantId||"—")}</td><td><button data-uid="${d.id}" style="font-size:12px;padding:5px 10px">✅ Activate</button></td></tr>`);});
-  $("pendingUsers").innerHTML=`<div style="overflow:auto"><table><thead><tr><th>Code</th><th>Name</th><th>Designation</th><th>Email</th><th>Plant</th><th>Action</th></tr></thead><tbody>${rows.join("")||'<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px">No pending accounts.</td></tr>'}</tbody></table></div>`;
-  $("pendingUsers").querySelectorAll("button").forEach(b=>b.onclick=async()=>{
+  const snap=await q.limit(100).get();
+  let pRows=[];
+  snap.forEach(d=>{
+    const u=d.data();
+    pRows.push(`<tr><td>${esc(u.employeeCode)}</td><td>${esc(u.name)}</td><td>${esc(u.designation)}</td><td>${esc(u.email)}</td><td>${esc(PLANTS[u.plantId]||u.plantId||"—")}</td><td>${esc(displayRole(u.role))}</td><td><button data-uid="${d.id}" class="activate-btn" style="font-size:12px;padding:5px 10px">✅ Activate</button></td></tr>`);
+  });
+  // Load active users
+  let aq=db.collection("users").where("status","==","active");
+  if(profile.role==="plant_admin")aq=aq.where("plantId","==",profile.plantId);
+  const aSnap=await aq.orderBy("name").limit(200).get();
+  let aRows=[];
+  const plantOpts=Object.entries(PLANTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("");
+  const deptOpts=Object.entries(DEPTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("");
+  aSnap.forEach(d=>{
+    const u=d.data();
+    aRows.push(`<tr data-uid="${d.id}">
+      <td><span class="uv">${esc(u.employeeCode)}</span><input class="ue hidden" data-f="employeeCode" value="${esc(u.employeeCode||"")}" style="width:80px;font-size:12px;padding:2px 4px"></td>
+      <td><span class="uv">${esc(u.name)}</span><input class="ue hidden" data-f="name" value="${esc(u.name||"")}" style="width:110px;font-size:12px;padding:2px 4px"></td>
+      <td><span class="uv">${esc(u.designation)}</span><input class="ue hidden" data-f="designation" value="${esc(u.designation||"")}" style="width:100px;font-size:12px;padding:2px 4px"></td>
+      <td><span class="uv">${esc(u.email)}</span></td>
+      <td><span class="uv">${esc(PLANTS[u.plantId]||u.plantId||"—")}</span><select class="ue hidden" data-f="plantId" style="font-size:12px;padding:2px 4px"><option value="">--</option>${plantOpts.replace(`value="${u.plantId}"`,`value="${u.plantId}" selected`)}</select></td>
+      <td><span class="uv">${esc(displayRole(u.role))}</span><select class="ue hidden" data-f="role" style="font-size:12px;padding:2px 4px">
+        <option value="employee"${u.role==="employee"?" selected":""}>Employee</option>
+        <option value="plant_admin"${u.role==="plant_admin"?" selected":""}>Plant Admin</option>
+        <option value="top_management"${u.role==="top_management"?" selected":""}>Top Management</option>
+        ${isSA?`<option value="superadmin"${u.role==="superadmin"?" selected":""}>Super Admin</option>`:""}
+      </select></td>
+      <td class="row-actions">
+        <button class="icon-btn u-edit" title="Edit">✏️</button>
+        <button class="icon-btn u-save hidden" title="Save" style="color:var(--success)">✔</button>
+        <button class="icon-btn u-cancel hidden" title="Cancel">✕</button>
+        ${isSA?`<button class="icon-btn u-deact" title="Deactivate" style="color:var(--danger)">\U0001f6ab</button>`:""}
+      </td>
+    </tr>`);
+  });
+
+  pendEl.innerHTML=`
+    <h4 style="margin-bottom:10px">⏳ Pending Accounts (${pRows.length})</h4>
+    <div style="overflow:auto;margin-bottom:24px"><table><thead><tr><th>Code</th><th>Name</th><th>Designation</th><th>Email</th><th>Plant</th><th>Role</th><th>Action</th></tr></thead>
+    <tbody>${pRows.join("")||'<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:16px">No pending accounts.</td></tr>'}</tbody></table></div>
+    <h4 style="margin-bottom:10px">✅ Active Users (${aRows.length})</h4>
+    <div style="overflow:auto"><table><thead><tr><th>Code</th><th>Name</th><th>Designation</th><th>Email</th><th>Plant</th><th>Role</th><th style="width:110px"></th></tr></thead>
+    <tbody id="activeUsersTbody">${aRows.join("")}</tbody></table></div>`;
+
+  // Wire pending activate buttons
+  pendEl.querySelectorAll(".activate-btn").forEach(b=>b.onclick=async()=>{
     await db.collection("users").doc(b.dataset.uid).update({status:"active",updatedAt:ts()});
-    loadPendingUsers();message("Account activated.","success");
+    await refreshPendingList(isSA);message("Account activated.","success");
+  });
+
+  // Wire active user edit / save / cancel / deactivate
+  pendEl.querySelectorAll("tr[data-uid]").forEach(tr=>{
+    const uid=tr.dataset.uid;
+    tr.querySelector(".u-edit").onclick=()=>{
+      tr.querySelectorAll(".uv").forEach(s=>s.classList.add("hidden"));
+      tr.querySelectorAll(".ue").forEach(i=>i.classList.remove("hidden"));
+      tr.querySelector(".u-edit").classList.add("hidden");
+      tr.querySelector(".u-save").classList.remove("hidden");
+      tr.querySelector(".u-cancel").classList.remove("hidden");
+      const deact=tr.querySelector(".u-deact");if(deact)deact.classList.add("hidden");
+    };
+    tr.querySelector(".u-cancel").onclick=()=>{
+      tr.querySelectorAll(".uv").forEach(s=>s.classList.remove("hidden"));
+      tr.querySelectorAll(".ue").forEach(i=>i.classList.add("hidden"));
+      tr.querySelector(".u-edit").classList.remove("hidden");
+      tr.querySelector(".u-save").classList.add("hidden");
+      tr.querySelector(".u-cancel").classList.add("hidden");
+      const deact=tr.querySelector(".u-deact");if(deact)deact.classList.remove("hidden");
+    };
+    tr.querySelector(".u-save").onclick=async()=>{
+      const updates={updatedAt:ts(),updatedBy:currentUser.uid};
+      tr.querySelectorAll(".ue").forEach(el=>{updates[el.dataset.f]=el.value.trim();});
+      if(!updates.name){message("Name is required.","error");return;}
+      await db.collection("users").doc(uid).update(updates);
+      await refreshPendingList(isSA);message("User updated.","success");
+    };
+    const deact=tr.querySelector(".u-deact");
+    if(deact)deact.onclick=async()=>{
+      if(!confirm("Deactivate this user? They will not be able to log in."))return;
+      await db.collection("users").doc(uid).update({status:"inactive",updatedAt:ts()});
+      await refreshPendingList(isSA);message("User deactivated.","success");
+    };
   });
 }
 
@@ -1106,10 +1606,12 @@ async function loadMasterSection(collection,containerId,fields,labels,canAdd){
   const el=$(containerId);
   const addFormId=`addForm_${collection}`;
   const colTitle=labels[0].replace(" Name","");
+  // Use collection-prefixed IDs to avoid conflicts when multiple sections exist
+  const fid=f=>`mf_${collection}_${f}`;
 
   let addFormHtml="";
   if(canAdd){
-    const inputs=fields.map((f,i)=>`<div><label>${esc(labels[i])} ${i===0?"*":""}</label><input id="mf_${f}" ${i===0?"required":""}></div>`).join("");
+    const inputs=fields.map((f,i)=>`<div><label>${esc(labels[i])} ${i===0?"*":""}</label><input id="${fid(f)}" ${i===0?"required":""}></div>`).join("");
     addFormHtml=`
       <div class="master-add-form">
         <h4>➕ Add ${esc(colTitle)}</h4>
@@ -1125,16 +1627,15 @@ async function loadMasterSection(collection,containerId,fields,labels,canAdd){
 
   if(canAdd){
     document.getElementById(`${addFormId}Btn`).onclick=async()=>{
-      const name=document.getElementById(`mf_${fields[0]}`).value.trim();
+      const name=document.getElementById(fid(fields[0])).value.trim();
       if(!name){message(`${labels[0]} is required.`,"error");return;}
       const data={createdAt:ts(),createdBy:currentUser.uid};
-      fields.forEach(f=>{data[f]=(document.getElementById(`mf_${f}`).value||"").trim();});
+      fields.forEach(f=>{data[f]=(document.getElementById(fid(f)).value||"").trim();});
       await db.collection(collection).add(data);
-      fields.forEach(f=>{document.getElementById(`mf_${f}`).value="";});
+      fields.forEach(f=>{document.getElementById(fid(f)).value="";});
       await loadAllMasters();
       await refreshMasterList(collection,containerId,fields,labels,canAdd);
       message(`${colTitle} added.`,"success");
-      // Rebuild new request form dropdowns
       if(collection==="giftCategories"||collection==="organisations")renderNewRequestForm();
     };
   }
@@ -1149,24 +1650,67 @@ async function refreshMasterList(collection,containerId,fields,labels,canDelete)
   const rows=[];
   snap.forEach(d=>{
     const x=d.data();
-    const cells=fields.map(f=>`<td>${esc(x[f]||"")}</td>`).join("");
-    const del=canDelete?`<td><button class="icon-btn danger-icon" data-col="${collection}" data-id="${d.id}" title="Delete">🗑</button></td>`:"<td></td>";
-    rows.push(`<tr>${cells}${del}</tr>`);
+    const cells=fields.map(f=>`<td><span class="cell-view">${esc(x[f]||"")}</span><input class="cell-edit hidden" data-field="${f}" value="${esc(x[f]||"")}" style="width:100%;padding:3px 6px;font-size:13px"></td>`).join("");
+    const del=canDelete?`<td class="row-actions">
+      <button class="icon-btn edit-icon" data-col="${collection}" data-id="${d.id}" title="Edit">✏️</button>
+      <button class="icon-btn save-icon hidden" data-col="${collection}" data-id="${d.id}" title="Save" style="color:var(--success)">✔</button>
+      <button class="icon-btn cancel-icon hidden" data-col="${collection}" data-id="${d.id}" title="Cancel">✕</button>
+      <button class="icon-btn danger-icon" data-col="${collection}" data-id="${d.id}" title="Delete">\U0001f5d1</button>
+    </td>`:"<td></td>";
+    rows.push(`<tr data-row-id="${d.id}">${cells}${del}</tr>`);
   });
   listEl.innerHTML=`<div style="overflow:auto"><table>
-    <thead><tr>${labels.map(l=>`<th>${esc(l)}</th>`).join("")}<th></th></tr></thead>
+    <thead><tr>${labels.map(l=>`<th>${esc(l)}</th>`).join("")}<th style="width:100px"></th></tr></thead>
     <tbody>${rows.join("")}</tbody>
   </table></div>`;
-  listEl.querySelectorAll("[data-col]").forEach(b=>b.onclick=async()=>{
-    if(!confirm("Delete this record? This cannot be undone."))return;
-    await db.collection(b.dataset.col).doc(b.dataset.id).delete();
-    await loadAllMasters();
-    await refreshMasterList(collection,containerId,fields,labels,canDelete);
-    if(collection==="giftCategories"||collection==="organisations")renderNewRequestForm();
-    message("Record deleted.","success");
+
+  // Wire edit / save / cancel / delete buttons
+  listEl.querySelectorAll(".edit-icon").forEach(b=>{
+    b.onclick=()=>{
+      const tr=listEl.querySelector(`tr[data-row-id="${b.dataset.id}"]`);
+      tr.querySelectorAll(".cell-view").forEach(s=>s.classList.add("hidden"));
+      tr.querySelectorAll(".cell-edit").forEach(i=>i.classList.remove("hidden"));
+      tr.querySelector(".edit-icon").classList.add("hidden");
+      tr.querySelector(".save-icon").classList.remove("hidden");
+      tr.querySelector(".cancel-icon").classList.remove("hidden");
+      tr.querySelector(".danger-icon").classList.add("hidden");
+    };
+  });
+  listEl.querySelectorAll(".cancel-icon").forEach(b=>{
+    b.onclick=()=>{
+      const tr=listEl.querySelector(`tr[data-row-id="${b.dataset.id}"]`);
+      tr.querySelectorAll(".cell-view").forEach(s=>s.classList.remove("hidden"));
+      tr.querySelectorAll(".cell-edit").forEach(i=>i.classList.add("hidden"));
+      tr.querySelector(".edit-icon").classList.remove("hidden");
+      tr.querySelector(".save-icon").classList.add("hidden");
+      tr.querySelector(".cancel-icon").classList.add("hidden");
+      tr.querySelector(".danger-icon").classList.remove("hidden");
+    };
+  });
+  listEl.querySelectorAll(".save-icon").forEach(b=>{
+    b.onclick=async()=>{
+      const tr=listEl.querySelector(`tr[data-row-id="${b.dataset.id}"]`);
+      const updates={updatedAt:ts(),updatedBy:currentUser.uid};
+      tr.querySelectorAll(".cell-edit").forEach(inp=>{updates[inp.dataset.field]=inp.value.trim();});
+      if(!updates[fields[0]]){message(`${labels[0]} is required.`,"error");return;}
+      await db.collection(b.dataset.col).doc(b.dataset.id).update(updates);
+      await loadAllMasters();
+      await refreshMasterList(collection,containerId,fields,labels,canDelete);
+      if(collection==="giftCategories"||collection==="organisations")renderNewRequestForm();
+      message("Record updated.","success");
+    };
+  });
+  listEl.querySelectorAll(".danger-icon").forEach(b=>{
+    b.onclick=async()=>{
+      if(!confirm("Delete this record? This cannot be undone."))return;
+      await db.collection(b.dataset.col).doc(b.dataset.id).delete();
+      await loadAllMasters();
+      await refreshMasterList(collection,containerId,fields,labels,canDelete);
+      if(collection==="giftCategories"||collection==="organisations")renderNewRequestForm();
+      message("Record deleted.","success");
+    };
   });
 }
-
 /* ═══ Branding ═══ */
 function renderBrandingSection(){
   const el=$("adminBranding");if(!el)return;
