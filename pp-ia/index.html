@@ -13288,7 +13288,7 @@ async function _loadAuditorMagicChecksheet(auditId, token) {
         </div>
       </div>
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-top:16px">
-        ${[['Audit Date', fd(audit.lastAuditDate)], ['Plant (Buyer)', audit.plant || '—'], ['Lead Auditor', audit.leadAuditor || '—'], ['Scope', audit.scope || '—'], ['Standard', audit.standard || audit.category || '—']].map(([l, v]) => `
+        ${[['Audit Date', fd(audit.lastAuditDate)], ['Audit Type', audit.auditType || '—'], ['Plant (Buyer)', audit.plant || '—'], ['Lead Auditor', audit.leadAuditor || '—'], ['Scope', audit.scope || '—'], ['Vendor Code', audit.plantId || '—']].map(([l, v]) => `
           <div style="background:#f8fafc;border-radius:8px;padding:10px 12px">
             <div style="font-size:10px;color:#9ca3af;text-transform:uppercase;font-weight:700;margin-bottom:3px">${l}</div>
             <div style="font-size:13px;font-weight:600;color:#111827">${v}</div>
@@ -13296,26 +13296,26 @@ async function _loadAuditorMagicChecksheet(auditId, token) {
       </div>
     </div>
 
-    <!-- Checklist Section -->
-    <div style="margin-bottom:28px">
-      <div style="font-weight:700;font-size:15px;color:#0C1A2E;margin-bottom:4px">📋 Audit Checklist / Observations</div>
-      <div style="font-size:12px;color:#6b7280;margin-bottom:16px">Record your findings for each area. Mark conformance status and add observations.</div>
-
-      <div id="auditorChecklistItems">
-        ${['Quality Management System', 'Production Process & Controls', 'Inspection & Testing', 'Document Control', 'Corrective Actions & NCRs', 'Housekeeping & Safety'].map((area, i) => `
-        <div style="border:1px solid #e5e7eb;border-radius:10px;padding:16px;margin-bottom:12px">
-          <div style="font-weight:700;font-size:14px;color:#0C1A2E;margin-bottom:10px">${i + 1}. ${area}</div>
-          <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-            ${['Conforming', 'Minor NC', 'Major NC', 'Observation', 'N/A'].map(s => {
-              const col = s==='Conforming'?'#16a34a':s==='Minor NC'?'#d97706':s==='Major NC'?'#DC2626':s==='Observation'?'#2563eb':'#6b7280';
-              return `<label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:12px;color:${col};font-weight:600">
-                <input type="radio" name="cl_status_${i}" value="${s}" style="accent-color:${col}"> ${s}
-              </label>`;
-            }).join('')}
-          </div>
-          <textarea class="form-input" id="cl_obs_${i}" rows="2" placeholder="Observations / findings for this area…" style="width:100%;resize:vertical;font-size:13px"></textarea>
-        </div>`).join('')}
+    <!-- Checklist Section — dynamically filled after render -->
+    <div style="margin-bottom:28px" id="audChecklistSection">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;flex-wrap:wrap">
+        <div style="font-weight:700;font-size:15px;color:#0C1A2E">📋 Audit Checklist</div>
+        <span id="audChecklistTypeBadge" style="background:#ede9fe;color:#6d28d9;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:700"></span>
+        <span id="audChecklistSourceBadge" style="border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600"></span>
       </div>
+      <div style="font-size:12px;color:#6b7280;margin-bottom:12px">Score each clause/question. Score auto-calculates from your responses.</div>
+      <!-- Live score bar -->
+      <div id="audLiveScoreBar" style="display:none;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 16px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <div style="font-size:12px;font-weight:700;color:#374151">Live Score</div>
+          <div id="audLiveScoreText" style="font-size:20px;font-weight:800;color:#16a34a">—</div>
+        </div>
+        <div style="background:#e5e7eb;border-radius:4px;height:8px;overflow:hidden">
+          <div id="audLiveScoreFill" style="height:100%;border-radius:4px;background:#16a34a;width:0%;transition:width .4s"></div>
+        </div>
+        <div id="audLiveScoreBreakdown" style="font-size:11px;color:#6b7280;margin-top:6px"></div>
+      </div>
+      <div id="auditorChecklistItems"><div style="text-align:center;padding:30px;color:#9ca3af"><span class="spinner"></span> Loading questions…</div></div>
     </div>
 
     <!-- Summary Findings -->
@@ -13394,19 +13394,231 @@ async function _loadAuditorMagicChecksheet(auditId, token) {
   // Load any existing evidence
   _loadAuditorEvidenceList(auditId, token);
 
-  // Pre-fill checklist if data exists
-  if (audit.checksheetData?.checklist) {
-    audit.checksheetData.checklist.forEach((item, i) => {
-      if (item.status) {
-        const radio = document.querySelector(`input[name="cl_status_${i}"][value="${item.status}"]`);
-        if (radio) radio.checked = true;
-      }
-      if (item.observation) {
-        const obs = document.getElementById(`cl_obs_${i}`);
-        if (obs) obs.value = item.observation;
-      }
-    });
+  // Load audit-type-specific checklist questions (or fallback to generic)
+  _loadSupplierAuditQuestions(audit);
+}
+
+/* ─── Dynamic supplier audit checklist (fetches from auditChecklists by auditType) ─── */
+async function _loadSupplierAuditQuestions(audit) {
+  const container = document.getElementById('auditorChecklistItems');
+  const typeBadge = document.getElementById('audChecklistTypeBadge');
+  const srcBadge  = document.getElementById('audChecklistSourceBadge');
+  if (!container) return;
+
+  const auditType = audit.auditType || '';
+  if (typeBadge) typeBadge.textContent = auditType || 'General';
+
+  // Try to load questions from master auditChecklists filtered by auditType
+  let questions = [];
+  if (auditType) {
+    try {
+      const snap = await db.collection('auditChecklists')
+        .where('auditType', '==', auditType)
+        .where('active', '==', true)
+        .limit(300)
+        .get();
+      questions = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      // Sort by clause then subClause
+      questions.sort((a, b) => (a.clause||'').localeCompare(b.clause||'') || (a.subClause||'').localeCompare(b.subClause||''));
+    } catch(e) {
+      // Fallback: no compound index — fetch all and filter
+      try {
+        const snap2 = await db.collection('auditChecklists').where('auditType', '==', auditType).limit(300).get();
+        questions = snap2.docs.map(d => ({ id: d.id, ...d.data() })).filter(q => q.active !== false);
+        questions.sort((a, b) => (a.clause||'').localeCompare(b.clause||''));
+      } catch(_) {}
+    }
   }
+
+  // Decide source: master (type-specific) or generic fallback
+  const useMaster = questions.length > 0;
+  if (srcBadge) {
+    if (useMaster) {
+      srcBadge.textContent = `${questions.length} clauses from master checklist`;
+      srcBadge.style.cssText = 'background:#dcfce7;color:#15803d;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600';
+    } else {
+      srcBadge.textContent = 'Using generic checklist (no master questions found for this type)';
+      srcBadge.style.cssText = 'background:#fef3c7;color:#92400e;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600';
+    }
+  }
+  document.getElementById('audLiveScoreBar').style.display = '';
+
+  // Build saved state map from previous submission
+  const savedChecklist = audit.checksheetData?.checklist || [];
+  const savedById = {};
+  savedChecklist.forEach((item, i) => { savedById[item.questionId || String(i)] = item; });
+
+  if (useMaster) {
+    // Group by clause
+    const byClause = {};
+    questions.forEach(q => {
+      const cl = q.clause || q.subClause || 'General';
+      if (!byClause[cl]) byClause[cl] = [];
+      byClause[cl].push(q);
+    });
+
+    const clauses = Object.keys(byClause);
+    container.innerHTML = clauses.map((clause, ci) => {
+      const clauseQs = byClause[clause];
+      const qHtml = clauseQs.map((q, qi) => {
+        const idx = `${ci}_${qi}`;
+        const saved = savedById[q.id] || {};
+        const critColor = q.criticality==='Critical'?'#dc2626':q.criticality==='Major'?'#d97706':'#6b7280';
+        return `<div class="sup-cl-question" data-id="${q.id}" data-wt="${q.weightage||3}" data-crit="${q.criticality||'Minor'}"
+          style="border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px;margin-bottom:8px;background:#fff">
+          <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:600;color:#111827;line-height:1.4">${q.question||q.requirement||'—'}</div>
+              ${q.requirement && q.requirement !== q.question ? `<div style="font-size:11px;color:#6b7280;margin-top:3px">Expected: ${q.requirement}</div>` : ''}
+            </div>
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0">
+              <span style="font-size:10px;font-weight:700;color:${critColor};border:1px solid ${critColor}22;background:${critColor}11;border-radius:8px;padding:1px 7px">${q.criticality||'Minor'}</span>
+              <span style="font-size:10px;color:#9ca3af">Wt: ${q.weightage||3}</span>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+            ${[['C','Conforming','#16a34a'],['Mn','Minor NC','#d97706'],['Mj','Major NC','#dc2626'],['Ob','Observation','#2563eb'],['NA','N/A','#6b7280']].map(([abbr,val,col]) =>
+              `<label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;font-weight:600;color:${col};background:${col}11;border:1px solid ${col}33;border-radius:20px;padding:4px 10px;user-select:none">
+                <input type="radio" name="sq_${idx}" value="${val}" data-idx="${idx}" style="display:none" onchange="_supScoreUpdate()" ${saved.status===val?'checked':''}> ${abbr} <span style="font-size:10px;font-weight:400">${val}</span>
+              </label>`).join('')}
+          </div>
+          <textarea class="form-input sup-cl-obs" id="sq_obs_${idx}" rows="2"
+            placeholder="Observation / finding (required for NC)…"
+            style="width:100%;resize:vertical;font-size:12px">${saved.observation||''}</textarea>
+        </div>`;
+      }).join('');
+
+      return `<div style="margin-bottom:20px">
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:linear-gradient(90deg,#4c1d9511,transparent);border-left:3px solid #6d28d9;border-radius:0 8px 8px 0;margin-bottom:8px">
+          <span style="font-size:13px;font-weight:800;color:#4c1d95">${clause}</span>
+          <span style="font-size:11px;color:#9ca3af">${clauseQs.length} question${clauseQs.length!==1?'s':''}</span>
+          <span class="clause-score-badge" id="clause_badge_${ci}" style="margin-left:auto;font-size:11px;font-weight:700;color:#374151"></span>
+        </div>
+        ${qHtml}
+      </div>`;
+    }).join('');
+
+  } else {
+    // Generic fallback
+    const genericAreas = [
+      'Quality Management System','Production Process & Controls',
+      'Inspection & Testing','Document Control',
+      'Corrective Actions & NCRs','Housekeeping & Safety'
+    ];
+    container.innerHTML = genericAreas.map((area, i) => {
+      const saved = savedById[String(i)] || {};
+      return `<div class="sup-cl-question" data-id="${i}" data-wt="3" data-crit="Minor"
+        style="border:1px solid #e5e7eb;border-radius:10px;padding:14px;margin-bottom:10px;background:#fff">
+        <div style="font-weight:700;font-size:14px;color:#0C1A2E;margin-bottom:10px">${i+1}. ${area}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+          ${[['C','Conforming','#16a34a'],['Mn','Minor NC','#d97706'],['Mj','Major NC','#dc2626'],['Ob','Observation','#2563eb'],['NA','N/A','#6b7280']].map(([abbr,val,col]) =>
+            `<label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;font-weight:600;color:${col};background:${col}11;border:1px solid ${col}33;border-radius:20px;padding:4px 10px;user-select:none">
+              <input type="radio" name="sq_${i}" value="${val}" data-idx="${i}" style="display:none" onchange="_supScoreUpdate()" ${saved.status===val?'checked':''}> ${abbr} <span style="font-size:10px;font-weight:400">${val}</span>
+            </label>`).join('')}
+        </div>
+        <textarea class="form-input sup-cl-obs" id="sq_obs_${i}" rows="2"
+          placeholder="Observations / findings for this area…"
+          style="width:100%;resize:vertical;font-size:13px">${saved.observation||''}</textarea>
+      </div>`;
+    }).join('');
+  }
+
+  // Style radio labels on selection
+  container.addEventListener('change', e => {
+    if (e.target.type !== 'radio') return;
+    const name = e.target.name;
+    document.querySelectorAll(`input[name="${name}"]`).forEach(r => {
+      const lbl = r.closest('label');
+      if (!lbl) return;
+      const col = lbl.style.color;
+      lbl.style.background = r.checked ? col+'33' : col+'11';
+      lbl.style.borderColor = r.checked ? col+'88' : col+'33';
+      lbl.style.boxShadow   = r.checked ? `0 0 0 2px ${col}44` : 'none';
+    });
+  });
+
+  // Trigger initial score calc if pre-filled
+  _supScoreUpdate();
+}
+
+function _supScoreUpdate() {
+  const questions = Array.from(document.querySelectorAll('.sup-cl-question'));
+  if (!questions.length) return;
+
+  let totalWeight = 0, earnedWeight = 0, majorNC = 0, minorNC = 0, obs = 0, na = 0, answered = 0;
+  const clauseMap = {};
+
+  questions.forEach(el => {
+    const id  = el.dataset.id;
+    const wt  = parseFloat(el.dataset.wt) || 3;
+    const idx = el.querySelector('input[type=radio]')?.dataset?.idx || id;
+    const name = el.querySelector('input[type=radio]')?.name || '';
+    const checked = el.querySelector(`input[name="${name}"]:checked`);
+    const status = checked?.value || '';
+
+    // Clause key (parent div's id attr set during build)
+    const clauseEl = el.closest('[data-clause]');
+    const clauseKey = clauseEl?.dataset?.clause || '';
+
+    if (status && status !== 'N/A') { totalWeight += wt; answered++; }
+    if (status === 'N/A') { na++; }
+
+    let earned = 0;
+    if (status === 'Conforming')   { earned = wt; earnedWeight += wt; totalWeight += 0; }
+    else if (status === 'Observation') { earned = wt * 0.75; earnedWeight += earned; }
+    else if (status === 'Minor NC')    { earned = wt * 0.5;  earnedWeight += earned; minorNC++; }
+    else if (status === 'Major NC')    { earned = 0;          majorNC++; }
+    if (status && status !== 'N/A') {
+      if (!clauseMap[clauseKey]) clauseMap[clauseKey] = { total: 0, earned: 0 };
+      clauseMap[clauseKey].total  += wt;
+      clauseMap[clauseKey].earned += earned;
+    }
+  });
+
+  // Recalculate totalWeight properly
+  let tw = 0, ew = 0;
+  questions.forEach(el => {
+    const wt = parseFloat(el.dataset.wt)||3;
+    const name = el.querySelector('input[type=radio]')?.name||'';
+    const checked = el.querySelector(`input[name="${name}"]:checked`);
+    const status = checked?.value||'';
+    if (!status || status === 'N/A') return;
+    tw += wt;
+    if (status === 'Conforming')       ew += wt;
+    else if (status === 'Observation') ew += wt * 0.75;
+    else if (status === 'Minor NC')    ew += wt * 0.5;
+    else if (status === 'Major NC')    ew += 0;
+    if (status === 'Minor NC') minorNC++;
+    else if (status === 'Major NC') majorNC++;
+  });
+  // reset counts (dedupe from above double-pass)
+  majorNC = 0; minorNC = 0; obs = 0;
+  questions.forEach(el => {
+    const name = el.querySelector('input[type=radio]')?.name||'';
+    const checked = el.querySelector(`input[name="${name}"]:checked`);
+    const status = checked?.value||'';
+    if (status === 'Major NC')    majorNC++;
+    else if (status === 'Minor NC')    minorNC++;
+    else if (status === 'Observation') obs++;
+  });
+
+  const pct = tw > 0 ? Math.round((ew / tw) * 100) : null;
+  const scoreEl  = document.getElementById('audLiveScoreText');
+  const fillEl   = document.getElementById('audLiveScoreFill');
+  const bdownEl  = document.getElementById('audLiveScoreBreakdown');
+  const scoreInp = document.getElementById('audMagicScore');
+  const majInp   = document.getElementById('audMagicMajorNC');
+  const minInp   = document.getElementById('audMagicMinorNC');
+  const obsInp   = document.getElementById('audMagicObs');
+
+  const col = pct === null ? '#9ca3af' : pct >= 85 ? '#16a34a' : pct >= 70 ? '#d97706' : '#dc2626';
+  if (scoreEl)  { scoreEl.textContent = pct !== null ? pct+'%' : '—'; scoreEl.style.color = col; }
+  if (fillEl)   { fillEl.style.width = (pct||0)+'%'; fillEl.style.background = col; }
+  if (bdownEl)  { bdownEl.textContent = `${answered} answered · ${majorNC} Major NC · ${minorNC} Minor NC · ${obs} Observations · ${na} N/A`; }
+  if (scoreInp && pct !== null) scoreInp.value = pct;
+  if (majInp)  majInp.value  = majorNC;
+  if (minInp)  minInp.value  = minorNC;
+  if (obsInp)  obsInp.value  = obs;
 }
 
 async function handleAuditorEvidenceUpload(input, auditId, token) {
@@ -13467,14 +13679,25 @@ async function _loadAuditorEvidenceList(auditId, token) {
 async function submitAuditorChecksheet(auditId, token) {
   const msgEl = document.getElementById('audMagicSubmitMsg');
 
-  // Gather checklist
-  const checklistAreas = ['Quality Management System','Production Process & Controls','Inspection & Testing','Document Control','Corrective Actions & NCRs','Housekeeping & Safety'];
-  const checklist = checklistAreas.map((area, i) => {
-    const statusRadio = document.querySelector(`input[name="cl_status_${i}"]:checked`);
+  // Gather checklist — works for both dynamic (master) and generic fallback
+  const checklist = Array.from(document.querySelectorAll('.sup-cl-question')).map(el => {
+    const questionId = el.dataset.id;
+    const wt = parseFloat(el.dataset.wt) || 3;
+    const crit = el.dataset.crit || '';
+    const name = el.querySelector('input[type=radio]')?.name || '';
+    const checked = name ? document.querySelector(`input[name="${name}"]:checked`) : null;
+    const obsId = el.querySelector('textarea')?.id || '';
+    const obsVal = obsId ? (document.getElementById(obsId)?.value.trim() || '') : '';
+    // Extract question text from the DOM
+    const questionText = el.querySelector('[style*="font-weight:600;color:#111827"]')?.textContent?.trim()
+                      || el.querySelector('[style*="font-weight:700;font-size:14px"]')?.textContent?.replace(/^\d+\.\s*/,'').trim() || '';
     return {
-      area,
-      status: statusRadio?.value || '',
-      observation: document.getElementById(`cl_obs_${i}`)?.value.trim() || ''
+      questionId,
+      question: questionText,
+      status: checked?.value || '',
+      observation: obsVal,
+      weightage: wt,
+      criticality: crit,
     };
   });
 
