@@ -913,11 +913,24 @@ async function renderDashboard(){
   }catch(err){dv.innerHTML=`<div class="notice error">Failed to load dashboard: ${esc(err.message)}</div>`;}
 }
 
-function visibleRequests(){
-  let q=db.collection("giftRequests");
-  if(profile.role==="employee")q=q.where("requestedBy","==",currentUser.uid);
-  else if(profile.role==="plant_admin")q=q.where("plantId","==",profile.plantId);
-  return q.orderBy("createdAt","desc").limit(300).get();
+async function visibleRequests(){
+  const col=db.collection("giftRequests");
+  let snap;
+  if(profile.role==="employee"){
+    snap=await col.where("requestedBy","==",currentUser.uid).limit(300).get();
+  } else if(profile.role==="plant_admin"){
+    // Support multi-plant (plantIds array) or single plantId
+    const plants=profile.plantIds&&profile.plantIds.length?profile.plantIds:(profile.plantId?[profile.plantId]:[]);
+    if(plants.length===0)       snap=await col.limit(300).get();
+    else if(plants.length===1)  snap=await col.where("plantId","==",plants[0]).limit(300).get();
+    else                        snap=await col.where("plantId","in",plants.slice(0,10)).limit(300).get();
+  } else {
+    snap=await col.limit(300).get();
+  }
+  // Sort client-side by createdAt desc (avoids composite Firestore index)
+  const docs=[];snap.forEach(d=>docs.push(d));
+  docs.sort((a,b)=>{const ta=a.data().createdAt?.toMillis?.()||0,tb=b.data().createdAt?.toMillis?.()||0;return tb-ta;});
+  return {forEach:cb=>docs.forEach(cb),size:docs.length,docs};
 }
 
 /* ═══════════════════════════════════════════════
@@ -1866,7 +1879,7 @@ async function loadPendingUsers(){
           <option value="top_management">Top Management</option>
           <option value="superadmin">Super Admin</option>
         </select></div>
-        <div><label>Plant</label><select id="cu_plant"><option value="">-- Select Plant --</option>${Object.entries(PLANTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("")}</select></div>
+        <div><label>Plant(s) <span style="font-weight:400;text-transform:none;font-size:11px">(Hold Ctrl for multiple)</span></label><select id="cu_plant" multiple size="3" style="height:auto">${Object.entries(PLANTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("")}</select></div>
         <div><label>Department</label><select id="cu_dept"><option value="">-- Select Dept --</option>${Object.entries(DEPTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("")}</select></div>
       </div>
       <div class="actions"><button id="createUserBtn">👤 Create User</button></div>
@@ -1880,7 +1893,9 @@ async function loadPendingUsers(){
       const email=document.getElementById("cu_email").value.trim();
       const pass=document.getElementById("cu_pass").value;
       const role=document.getElementById("cu_role").value;
-      const plant=document.getElementById("cu_plant").value;
+      const plantSel=document.getElementById("cu_plant");
+      const plantIds=Array.from(plantSel.selectedOptions).map(o=>o.value).filter(Boolean);
+      const plant=plantIds[0]||"";
       const dept=document.getElementById("cu_dept").value;
       const desig=document.getElementById("cu_desig").value.trim();
       const mobile=document.getElementById("cu_mobile").value.trim();
@@ -1901,13 +1916,13 @@ async function loadPendingUsers(){
         // Write Firestore doc with status:active
         await db.collection("users").doc(uid).set({
           employeeCode:empCode,name,email,designation:desig,mobile,
-          role,plantId:plant,departmentId:dept,
+          role,plantId:plant||null,plantIds:plantIds,departmentId:dept,
           status:"active",createdAt:ts(),createdBy:currentUser.uid
         });
         msgEl.innerHTML=`<span style="color:var(--success)">✅ User "${name}" created successfully.</span>`;
         ["cu_empCode","cu_name","cu_email","cu_pass","cu_desig","cu_mobile"].forEach(id=>{document.getElementById(id).value="";});
         document.getElementById("cu_role").value="employee";
-        document.getElementById("cu_plant").value="";
+        Array.from(document.getElementById("cu_plant").options).forEach(o=>o.selected=false);
         document.getElementById("cu_dept").value="";
         await refreshPendingList(isSA);
       }catch(err){
@@ -1922,19 +1937,35 @@ async function loadPendingUsers(){
 async function refreshPendingList(isSA){
   const pendEl=document.getElementById("pendingUsers");
   if(!pendEl)return;
+  // Helper: get plant scope for plant_admin (supports plantIds[] array or single plantId)
+  const adminPlants=profile.role==="plant_admin"
+    ?(profile.plantIds&&profile.plantIds.length?profile.plantIds:(profile.plantId?[profile.plantId]:[]))
+    :[];
+
   // Load pending users
-  let q=db.collection("users").where("status","==","pending");
-  if(profile.role==="plant_admin")q=q.where("plantId","==",profile.plantId);
-  const snap=await q.limit(100).get();
+  let pendSnap;
+  if(profile.role==="plant_admin"&&adminPlants.length===1){
+    pendSnap=await db.collection("users").where("status","==","pending").where("plantId","==",adminPlants[0]).limit(100).get();
+  } else if(profile.role==="plant_admin"&&adminPlants.length>1){
+    pendSnap=await db.collection("users").where("status","==","pending").where("plantId","in",adminPlants.slice(0,10)).limit(100).get();
+  } else {
+    pendSnap=await db.collection("users").where("status","==","pending").limit(100).get();
+  }
+  const snap=pendSnap;
   let pRows=[];
   snap.forEach(d=>{
     const u=d.data();
     pRows.push(`<tr><td>${esc(u.employeeCode)}</td><td>${esc(u.name)}</td><td>${esc(u.designation)}</td><td>${esc(u.email)}</td><td>${esc(PLANTS[u.plantId]||u.plantId||"—")}</td><td>${esc(displayRole(u.role))}</td><td><button data-uid="${d.id}" class="activate-btn" style="font-size:12px;padding:5px 10px">✅ Activate</button></td></tr>`);
   });
   // Load active users
-  let aq=db.collection("users").where("status","==","active");
-  if(profile.role==="plant_admin")aq=aq.where("plantId","==",profile.plantId);
-  const aSnap=await aq.limit(200).get();
+  let aSnap;
+  if(profile.role==="plant_admin"&&adminPlants.length===1){
+    aSnap=await db.collection("users").where("status","==","active").where("plantId","==",adminPlants[0]).limit(200).get();
+  } else if(profile.role==="plant_admin"&&adminPlants.length>1){
+    aSnap=await db.collection("users").where("status","==","active").where("plantId","in",adminPlants.slice(0,10)).limit(200).get();
+  } else {
+    aSnap=await db.collection("users").where("status","==","active").limit(200).get();
+  }
   let aRows=[];
   const plantOpts=Object.entries(PLANTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("");
   const deptOpts=Object.entries(DEPTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("");
@@ -1948,7 +1979,11 @@ async function refreshPendingList(isSA){
       <td><span class="uv">${esc(u.name)}</span><input class="ue hidden" data-f="name" value="${esc(u.name||"")}" style="width:110px;font-size:12px;padding:2px 4px"></td>
       <td><span class="uv">${esc(u.designation)}</span><input class="ue hidden" data-f="designation" value="${esc(u.designation||"")}" style="width:100px;font-size:12px;padding:2px 4px"></td>
       <td><span class="uv">${esc(u.email)}</span></td>
-      <td><span class="uv">${esc(PLANTS[u.plantId]||u.plantId||"—")}</span><select class="ue hidden" data-f="plantId" style="font-size:12px;padding:2px 4px"><option value="">--</option>${plantOpts.replace(`value="${u.plantId}"`,`value="${u.plantId}" selected`)}</select></td>
+      <td>
+        <span class="uv">${(()=>{const ids=[...new Set([...(u.plantIds||[]),(u.plantId?[u.plantId]:[])])].filter(Boolean);return ids.length?ids.map(p=>`<span style="display:inline-block;background:#dbeafe;color:#1e40af;border-radius:4px;padding:1px 7px;font-size:11px;margin:1px">${esc(PLANTS[p]||p)}</span>`).join(""):"—";})()}</span>
+        <select class="ue hidden" data-f="plantIds" multiple size="3" style="font-size:12px;padding:2px 4px;width:150px">${Object.entries(PLANTS).map(([k,v])=>`<option value="${k}"${(u.plantIds||[u.plantId]).includes(k)?" selected":""}>${esc(v)}</option>`).join("")}</select>
+        <div class="ue hidden" style="font-size:10px;color:var(--muted);margin-top:2px">Hold Ctrl to select multiple</div>
+      </td>
       <td><span class="uv">${esc(displayRole(u.role))}</span><select class="ue hidden" data-f="role" style="font-size:12px;padding:2px 4px">
         <option value="employee"${u.role==="employee"?" selected":""}>Employee</option>
         <option value="plant_admin"${u.role==="plant_admin"?" selected":""}>Plant Admin</option>
@@ -1999,7 +2034,16 @@ async function refreshPendingList(isSA){
     };
     tr.querySelector(".u-save").onclick=async()=>{
       const updates={updatedAt:ts(),updatedBy:currentUser.uid};
-      tr.querySelectorAll(".ue").forEach(el=>{updates[el.dataset.f]=el.value.trim();});
+      tr.querySelectorAll(".ue[data-f]").forEach(el=>{
+        if(el.tagName==="SELECT"&&el.multiple){
+          // multi-select → collect all selected options
+          const selected=Array.from(el.selectedOptions).map(o=>o.value).filter(Boolean);
+          updates.plantIds=selected;
+          updates.plantId=selected[0]||null; // legacy single-plant field
+        } else if(el.tagName!=="DIV"){
+          updates[el.dataset.f]=el.value.trim();
+        }
+      });
       if(!updates.name){message("Name is required.","error");return;}
       await db.collection("users").doc(uid).update(updates);
       await refreshPendingList(isSA);message("User updated.","success");
