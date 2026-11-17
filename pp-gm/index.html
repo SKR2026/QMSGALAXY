@@ -834,34 +834,20 @@ async function notifyPlantAdminsOnSubmit(payload){
   try{
     // Find plant admins for this employee's plant
     const plantId=payload.plantId;
-    let adminSnap;
-    if(plantId){
-      adminSnap=await db.collection("users")
-        .where("role","==","plant_admin")
-        .where("status","==","active")
-        .where("plantId","==",plantId)
-        .limit(10).get();
-      // Also check plantIds array (multi-plant admins)
-      if(adminSnap.empty){
-        adminSnap=await db.collection("users")
-          .where("role","==","plant_admin")
-          .where("status","==","active")
-          .limit(50).get();
-        // filter client-side for multi-plant admins that cover this plant
-        const filtered=adminSnap.docs.filter(d=>{
-          const u=d.data();
-          return (u.plantIds&&u.plantIds.includes(plantId))||u.allPlants;
-        });
-        adminSnap={docs:filtered,empty:filtered.length===0};
-      }
-    } else {
-      // No plantId — notify all plant admins
-      adminSnap=await db.collection("users")
-        .where("role","==","plant_admin")
-        .where("status","==","active")
-        .limit(10).get();
-    }
-    if(adminSnap.empty) return;
+    // Fetch all active plant admins, then filter by plant scope client-side
+    const allAdminSnap=await db.collection("users")
+      .where("role","==","plant_admin")
+      .where("status","==","active")
+      .limit(50).get();
+    const adminDocs=allAdminSnap.docs.filter(d=>{
+      if(!plantId) return true; // null plantId → email all group admins
+      const u=d.data();
+      return u.plantId===plantId
+        || (u.plantIds&&u.plantIds.includes(plantId))
+        || u.allPlants===true;
+    });
+    if(!adminDocs.length) return;
+    const adminSnap={docs:adminDocs};
 
     const tmpl=EMAIL_TEMPLATES.request_submitted||defaultEmailTemplates().request_submitted;
     const companyName=EMAIL_CONFIG.fromName||'Gift Management System';
@@ -994,9 +980,22 @@ async function visibleRequests(){
   } else if(profile.role==="plant_admin"){
     // Support multi-plant (plantIds array) or single plantId
     const plants=profile.plantIds&&profile.plantIds.length?profile.plantIds:(profile.plantId?[profile.plantId]:[]);
-    if(plants.length===0)       snap=await col.limit(300).get();
-    else if(plants.length===1)  snap=await col.where("plantId","==",plants[0]).limit(300).get();
-    else                        snap=await col.where("plantId","in",plants.slice(0,10)).limit(300).get();
+    if(plants.length===0){
+      snap=await col.limit(300).get();
+    } else {
+      // Also fetch requests where plantId is null/missing (employees with no plant assigned)
+      const [plantSnap,nullSnap]=await Promise.all([
+        plants.length===1
+          ? col.where("plantId","==",plants[0]).limit(300).get()
+          : col.where("plantId","in",plants.slice(0,10)).limit(300).get(),
+        col.where("plantId","==",null).limit(100).get()
+      ]);
+      // Merge, deduplicate by doc id
+      const seen=new Set();const merged=[];
+      for(const s of [plantSnap,nullSnap])
+        s.forEach(d=>{if(!seen.has(d.id)){seen.add(d.id);merged.push(d);}});
+      snap={forEach:cb=>merged.forEach(cb),size:merged.length,docs:merged};
+    }
   } else {
     snap=await col.limit(300).get();
   }
