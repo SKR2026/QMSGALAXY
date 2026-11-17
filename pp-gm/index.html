@@ -911,11 +911,29 @@ async function renderDashboard(){
   }catch(err){dv.innerHTML=`<div class="notice error">Failed to load dashboard: ${esc(err.message)}</div>`;}
 }
 
-function visibleRequests(){
-  let q=db.collection("giftRequests");
-  if(profile.role==="employee")q=q.where("requestedBy","==",currentUser.uid);
-  else if(profile.role==="plant_admin")q=q.where("plantId","==",profile.plantId);
-  return q.orderBy("createdAt","desc").limit(300).get();
+async function visibleRequests(){
+  let snap;
+  const col=db.collection("giftRequests");
+  if(profile.role==="employee"){
+    snap=await col.where("requestedBy","==",currentUser.uid).limit(300).get();
+  } else if(profile.role==="plant_admin"){
+    // Support multiple plants (plantIds array) or legacy single plantId
+    const plants=profile.plantIds&&profile.plantIds.length?profile.plantIds:(profile.plantId?[profile.plantId]:[]);
+    if(plants.length===0){snap=await col.limit(300).get();}
+    else if(plants.length===1){snap=await col.where("plantId","==",plants[0]).limit(300).get();}
+    else{snap=await col.where("plantId","in",plants.slice(0,10)).limit(300).get();}
+  } else {
+    snap=await col.limit(300).get();
+  }
+  // Sort client-side by createdAt desc (avoids composite index requirement)
+  const docs=[];snap.forEach(d=>docs.push(d));
+  docs.sort((a,b)=>{
+    const ta=a.data().createdAt?.toMillis?.()||0;
+    const tb=b.data().createdAt?.toMillis?.()||0;
+    return tb-ta;
+  });
+  // Return snap-like object
+  return {forEach:cb=>docs.forEach(cb),size:docs.length,docs};
 }
 
 /* ═══════════════════════════════════════════════
@@ -1887,32 +1905,43 @@ async function refreshPendingList(isSA){
   const pendEl=document.getElementById("pendingUsers");
   if(!pendEl)return;
   // Load pending users
-  let q=db.collection("users").where("status","==","pending");
-  if(profile.role==="plant_admin")q=q.where("plantId","==",profile.plantId);
-  const snap=await q.limit(100).get();
+  const myPlants=profile.plantIds&&profile.plantIds.length?profile.plantIds:(profile.plantId?[profile.plantId]:[]);
+  const isPlantAdmin=profile.role==="plant_admin";
+  let pendSnap;
+  if(isPlantAdmin&&myPlants.length===1) pendSnap=await db.collection("users").where("status","==","pending").where("plantId","==",myPlants[0]).limit(100).get();
+  else pendSnap=await db.collection("users").where("status","==","pending").limit(100).get();
+  const snap={forEach:cb=>{const docs=[];pendSnap.forEach(d=>docs.push(d));docs.forEach(cb);},size:pendSnap.size};
   let pRows=[];
   snap.forEach(d=>{
     const u=d.data();
+    if(isPlantAdmin&&myPlants.length>1&&!myPlants.includes(u.plantId))return;
     pRows.push(`<tr><td>${esc(u.employeeCode)}</td><td>${esc(u.name)}</td><td>${esc(u.designation)}</td><td>${esc(u.email)}</td><td>${esc(PLANTS[u.plantId]||u.plantId||"—")}</td><td>${esc(displayRole(u.role))}</td><td><button data-uid="${d.id}" class="activate-btn" style="font-size:12px;padding:5px 10px">✅ Activate</button></td></tr>`);
   });
   // Load active users
-  let aq=db.collection("users").where("status","==","active");
-  if(profile.role==="plant_admin")aq=aq.where("plantId","==",profile.plantId);
-  const aSnap=await aq.limit(200).get();
+  let activeSnap;
+  if(isPlantAdmin&&myPlants.length===1) activeSnap=await db.collection("users").where("status","==","active").where("plantId","==",myPlants[0]).limit(200).get();
+  else activeSnap=await db.collection("users").where("status","==","active").limit(200).get();
+  const aq={forEach:cb=>{const docs=[];activeSnap.forEach(d=>docs.push(d));docs.forEach(cb);}};
   let aRows=[];
   const plantOpts=Object.entries(PLANTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("");
-  const deptOpts=Object.entries(DEPTS).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("");
-  // Sort client-side to avoid composite index requirement
-  const aDocs=[]; aSnap.forEach(d=>aDocs.push(d));
+  const aDocs=[]; aq.forEach(d=>aDocs.push(d));
   aDocs.sort((a,b)=>(a.data().name||"").localeCompare(b.data().name||""));
   aDocs.forEach(d=>{
     const u=d.data();
+    if(isPlantAdmin&&myPlants.length>1&&!myPlants.includes(u.plantId))return;
+    // For plant_admin users: show all assigned plants as chips, edit with multi-select
+    const assignedPlants=(u.plantIds&&u.plantIds.length?u.plantIds:(u.plantId?[u.plantId]:[]));
+    const plantChips=assignedPlants.map(p=>`<span style="display:inline-block;background:#dbeafe;color:#1e40af;border-radius:4px;padding:1px 6px;font-size:11px;margin:1px">${esc(PLANTS[p]||p)}</span>`).join("");
+    const multiPlantSelect=Object.entries(PLANTS).map(([k,v])=>`<option value="${k}"${assignedPlants.includes(k)?" selected":""}>${esc(v)}</option>`).join("");
     aRows.push(`<tr data-uid="${d.id}">
       <td><span class="uv">${esc(u.employeeCode)}</span><input class="ue hidden" data-f="employeeCode" value="${esc(u.employeeCode||"")}" style="width:80px;font-size:12px;padding:2px 4px"></td>
       <td><span class="uv">${esc(u.name)}</span><input class="ue hidden" data-f="name" value="${esc(u.name||"")}" style="width:110px;font-size:12px;padding:2px 4px"></td>
       <td><span class="uv">${esc(u.designation)}</span><input class="ue hidden" data-f="designation" value="${esc(u.designation||"")}" style="width:100px;font-size:12px;padding:2px 4px"></td>
       <td><span class="uv">${esc(u.email)}</span></td>
-      <td><span class="uv">${esc(PLANTS[u.plantId]||u.plantId||"—")}</span><select class="ue hidden" data-f="plantId" style="font-size:12px;padding:2px 4px"><option value="">--</option>${plantOpts.replace(`value="${u.plantId}"`,`value="${u.plantId}" selected`)}</select></td>
+      <td>
+        <span class="uv">${plantChips||'<span style="color:var(--muted)">—</span>'}</span>
+        <select class="ue hidden" data-f="plantIds" multiple size="3" style="font-size:11px;padding:2px 4px;min-width:130px" title="Hold Ctrl/Cmd to select multiple">${multiPlantSelect}</select>
+      </td>
       <td><span class="uv">${esc(displayRole(u.role))}</span><select class="ue hidden" data-f="role" style="font-size:12px;padding:2px 4px">
         <option value="employee"${u.role==="employee"?" selected":""}>Employee</option>
         <option value="plant_admin"${u.role==="plant_admin"?" selected":""}>Plant Admin</option>
@@ -1933,7 +1962,7 @@ async function refreshPendingList(isSA){
     <div style="overflow:auto;margin-bottom:14px"><table><thead><tr><th>Code</th><th>Name</th><th>Designation</th><th>Email</th><th>Plant</th><th>Role</th><th>Action</th></tr></thead>
     <tbody>${pRows.join("")||'<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:16px">No pending accounts.</td></tr>'}</tbody></table></div>
     <h4 style="margin-bottom:6px">✅ Active Users (${aRows.length})</h4>
-    <div style="overflow:auto"><table><thead><tr><th>Code</th><th>Name</th><th>Designation</th><th>Email</th><th>Plant</th><th>Role</th><th style="width:110px"></th></tr></thead>
+    <div style="overflow:auto"><table><thead><tr><th>Code</th><th>Name</th><th>Designation</th><th>Email</th><th>Plants Assigned</th><th>Role</th><th style="width:110px"></th></tr></thead>
     <tbody id="activeUsersTbody">${aRows.join("")}</tbody></table></div>`;
 
   // Wire pending activate buttons
@@ -1963,7 +1992,16 @@ async function refreshPendingList(isSA){
     };
     tr.querySelector(".u-save").onclick=async()=>{
       const updates={updatedAt:ts(),updatedBy:currentUser.uid};
-      tr.querySelectorAll(".ue").forEach(el=>{updates[el.dataset.f]=el.value.trim();});
+      tr.querySelectorAll(".ue").forEach(el=>{
+        if(el.dataset.f==="plantIds"){
+          // Multi-select: get all selected options
+          const selected=Array.from(el.selectedOptions).map(o=>o.value).filter(Boolean);
+          updates.plantIds=selected;
+          updates.plantId=selected[0]||null; // keep legacy field too
+        } else {
+          updates[el.dataset.f]=el.value.trim();
+        }
+      });
       if(!updates.name){message("Name is required.","error");return;}
       await db.collection("users").doc(uid).update(updates);
       await refreshPendingList(isSA);message("User updated.","success");
