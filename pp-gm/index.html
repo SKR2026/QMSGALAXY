@@ -7,32 +7,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
-<script>
-/* Inline minimal SMTP.js — no CDN needed; posts to smtpjs.com relay endpoint */
-window.Email={
-  send:function(cfg){
-    return new Promise(function(resolve,reject){
-      var params=[
-        'nocache='+Math.floor(1e6*Math.random()+1),
-        'to='+encodeURIComponent(cfg.To||''),
-        'from='+encodeURIComponent(cfg.From||cfg.Username||''),
-        'host='+encodeURIComponent(cfg.Host||'smtp.gmail.com'),
-        'username='+encodeURIComponent(cfg.Username||''),
-        'password='+encodeURIComponent(cfg.Password||''),
-        'subject='+encodeURIComponent(cfg.Subject||''),
-        'body='+encodeURIComponent(cfg.Body||''),
-        'ishtml=true'
-      ].join('&');
-      var x=new XMLHttpRequest();
-      x.open('POST','https://smtpjs.com/v3/smtpjs.aspx',true);
-      x.setRequestHeader('Content-type','application/x-www-form-urlencoded');
-      x.onload=function(){resolve(x.responseText);};
-      x.onerror=function(){reject(new Error('Network error reaching mail relay. Check internet connection.'));};
-      x.send(params);
-    });
-  }
-};
-</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 .hidden{display:none!important}
@@ -619,7 +593,7 @@ let SETTINGS={allowDummyRequests:false};
 // In-memory master caches (refreshed on login & after mutations)
 let PLANTS={}, DEPTS={}, ORGS={}, GCATS=[];
 const charts={};
-let EMAIL_CONFIG={gmailUser:'',gmailPass:'',fromName:'Gift Management System'};
+let EMAIL_CONFIG={gasUrl:'',fromName:'Gift Management System',gmailUser:'',gmailPass:''};
 let EMAIL_TEMPLATES={}; // loaded from Firestore settings/emailTemplates
 
 const $=id=>document.getElementById(id);
@@ -2729,7 +2703,7 @@ async function freshStartAction(type){
       await db.collection("settings").doc("emailTemplates").delete().catch(()=>{});
       await db.collection("settings").doc("appSettings").delete().catch(()=>{});
       summary.push(`⚙️ Settings & email config cleared`);
-      EMAIL_CONFIG={gmailUser:'',gmailPass:'',fromName:'Gift Management System'};
+      EMAIL_CONFIG={gasUrl:'',fromName:'Gift Management System',gmailUser:'',gmailPass:''};
       EMAIL_TEMPLATES={};
     }
     if(log) log.innerHTML=summary.map(s=>`<div style="color:var(--success);margin-top:4px">✅ ${s}</div>`).join('');
@@ -2752,7 +2726,7 @@ async function loadEmailConfig(){
       db.collection("settings").doc("emailConfig").get(),
       db.collection("settings").doc("emailTemplates").get()
     ]);
-    if(cfgDoc.exists){const d=cfgDoc.data();EMAIL_CONFIG={gmailUser:d.gmailUser||'',gmailPass:d.gmailPass||'',fromName:d.fromName||'Gift Management System'};}
+    if(cfgDoc.exists){const d=cfgDoc.data();EMAIL_CONFIG={gasUrl:d.gasUrl||'',fromName:d.fromName||'Gift Management System',gmailUser:d.gmailUser||'',gmailPass:d.gmailPass||''};}
     if(tmplDoc.exists) EMAIL_TEMPLATES={...defaultEmailTemplates(),...tmplDoc.data()};
     else EMAIL_TEMPLATES=defaultEmailTemplates();
   }catch(e){EMAIL_TEMPLATES=defaultEmailTemplates();}
@@ -2852,24 +2826,15 @@ function buildSalutation(name){
   return 'Dear '+name.trim();
 }
 
-/* ── Core send function via SMTP.js relay (Gmail App Password) ────── */
+/* ── Core send via Google Apps Script relay ─────────────────────── */
 async function sendEmail(toEmail, toName, subject, htmlBody){
-  if(!EMAIL_CONFIG.gmailUser||!EMAIL_CONFIG.gmailPass)
-    throw new Error('Gmail not configured. Go to Admin → Email Settings.');
-  return new Promise((resolve,reject)=>{
-    Email.send({
-      Host:'smtp.gmail.com',
-      Username:EMAIL_CONFIG.gmailUser,
-      Password:EMAIL_CONFIG.gmailPass,
-      To:toName?`"${toName}" <${toEmail}>`:toEmail,
-      From:`"${EMAIL_CONFIG.fromName||'Gift Management System'}" <${EMAIL_CONFIG.gmailUser}>`,
-      Subject:subject,
-      Body:htmlBody
-    }).then(msg=>{
-      if(msg==='OK') resolve();
-      else reject(new Error('SMTP error: '+(msg||'Unknown response from mail server')));
-    }).catch(e=>reject(new Error('Send failed: '+e.message)));
-  });
+  if(!EMAIL_CONFIG.gasUrl)
+    throw new Error('Email relay not configured. Go to Admin → Email Settings and paste your Google Apps Script URL.');
+  const payload={to:toEmail,toName:toName||'',subject,body:htmlBody,fromName:EMAIL_CONFIG.fromName||'Gift Management System'};
+  const resp=await fetch(EMAIL_CONFIG.gasUrl,{method:'POST',body:JSON.stringify(payload)});
+  const text=await resp.text();
+  if(!resp.ok||text.startsWith('ERROR'))
+    throw new Error('Mail relay error: '+(text||resp.status));
 }
 
 /* ── Log email to Firestore ──────────────────────────────────────── */
@@ -3238,31 +3203,60 @@ async function loadEmailLog(){
 }
 
 /* ═══ EMAIL SETTINGS (Admin sub-tab) ═══ */
+const GAS_CODE=`function doPost(e){
+  try{
+    var p=JSON.parse(e.postData.contents);
+    GmailApp.sendEmail(p.to,p.subject,'',{
+      htmlBody:p.body,
+      name:p.fromName||'Gift Management System'
+    });
+    return ContentService.createTextOutput('OK')
+      .setMimeType(ContentService.MimeType.TEXT);
+  }catch(err){
+    return ContentService.createTextOutput('ERROR: '+err.message)
+      .setMimeType(ContentService.MimeType.TEXT);
+  }
+}`;
+
 function renderEmailSettings(){
   const el=$("adminEmail");if(!el)return;
   const tmpl=EMAIL_TEMPLATES;
   const cfg=EMAIL_CONFIG;
+  const hasUrl=!!(cfg.gasUrl&&cfg.gasUrl.startsWith('https://'));
 
   el.innerHTML=`
     <h3 style="margin-bottom:6px">📧 Email Settings</h3>
-    <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Enter your Gmail address and 16-digit App Password — emails are sent directly from your Gmail account.</p>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Emails are sent via a Google Apps Script relay — uses your own Gmail, works on any network, no password stored.</p>
 
-    <div class="panel" style="margin:0 0 10px;background:linear-gradient(135deg,#fffbeb,#fef9c3);border:1px solid #fde68a">
-      <div style="font-size:13px;color:#78350f;line-height:1.7">
-        <strong>🔑 How to get your 16-digit App Password:</strong><br>
-        1. Go to <a href="https://myaccount.google.com/security" target="_blank" style="color:#92400e;font-weight:600">myaccount.google.com/security</a><br>
-        2. Enable <strong>2-Step Verification</strong> (if not already on)<br>
-        3. Search for <strong>"App passwords"</strong> → Select app: <em>Mail</em> → Select device: <em>Other</em> → <strong>Generate</strong><br>
-        4. Copy the 16-character password shown and paste below
+    <!-- Setup guide -->
+    <div class="panel" style="margin:0 0 12px;background:linear-gradient(135deg,#eff6ff,#dbeafe);border:1px solid #bfdbfe">
+      <div style="font-size:13px;font-weight:700;color:#1e40af;margin-bottom:10px">🚀 One-time Setup (5 minutes) — do this once, then forget it</div>
+      <div style="font-size:13px;color:#1e3a8a;line-height:1.9">
+        <b>Step 1 —</b> Open <a href="https://script.google.com" target="_blank" style="color:#1d4ed8;font-weight:600">script.google.com</a> (sign in with your Gmail) → click <b>New project</b><br>
+        <b>Step 2 —</b> Delete all default code, paste the code below, then click 💾 Save<br>
+        <b>Step 3 —</b> Click <b>Deploy → New deployment</b> → type: <b>Web app</b> → Execute as: <b>Me</b> → Who has access: <b>Anyone</b> → <b>Deploy</b><br>
+        <b>Step 4 —</b> Copy the <b>Web app URL</b> shown and paste it in the field below
+      </div>
+      <div style="margin-top:10px">
+        <div style="font-size:11px;font-weight:600;color:#1e40af;margin-bottom:4px">📋 Paste this code in Step 2:</div>
+        <div style="position:relative">
+          <textarea id="gasCodeBox" readonly rows="12" style="width:100%;font-family:monospace;font-size:11px;padding:10px;background:#0f172a;color:#e2e8f0;border-radius:8px;border:none;resize:none;line-height:1.5">${GAS_CODE}</textarea>
+          <button onclick="navigator.clipboard.writeText(document.getElementById('gasCodeBox').value);this.textContent='✅ Copied!';setTimeout(()=>this.textContent='📋 Copy Code',2000)"
+            style="position:absolute;top:8px;right:8px;font-size:11px;padding:4px 10px;background:#3b82f6;color:#fff;border:none;border-radius:6px;cursor:pointer">📋 Copy Code</button>
+        </div>
       </div>
     </div>
 
     <div class="panel" style="margin:0 0 14px">
-      <div style="font-size:14px;font-weight:700;margin-bottom:12px">🔧 Gmail Configuration</div>
-      <div class="email-cfg-row">
-        <div><label>Gmail Address *</label><input id="em_gmailUser" type="email" placeholder="yourname@gmail.com" value="${esc(cfg.gmailUser||'')}"></div>
-        <div><label>App Password * (16 digits, no spaces)</label><input id="em_gmailPass" type="password" placeholder="xxxxxxxxxxxxxxxx" value="${esc(cfg.gmailPass||'')}"><small style="font-size:11px;color:var(--muted)">Stored securely in Firestore. Never shared externally.</small></div>
-        <div><label>From Name (shown in emails)</label><input id="em_fromName" placeholder="Gift Management System" value="${esc(cfg.fromName||'')}"></div>
+      <div style="font-size:14px;font-weight:700;margin-bottom:12px">🔧 Relay Configuration ${hasUrl?'<span style="font-size:12px;color:var(--success);font-weight:400">✅ Connected</span>':'<span style="font-size:12px;color:var(--danger);font-weight:400">⚠ Not configured</span>'}</div>
+      <div style="margin-bottom:12px">
+        <label>Google Apps Script Web App URL *</label>
+        <input id="em_gasUrl" type="url" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(cfg.gasUrl||'')}" style="font-size:12px">
+        <small style="font-size:11px;color:var(--muted)">Paste the URL from Step 4 above. Emails will be sent from the Gmail account you used in script.google.com.</small>
+      </div>
+      <div style="margin-bottom:12px">
+        <label>From Name (shown in emails)</label>
+        <input id="em_fromName" placeholder="Gift Management System" value="${esc(cfg.fromName||'')}" style="max-width:320px">
       </div>
       <div class="actions" style="margin-top:4px">
         <button id="saveEmailCfgBtn">💾 Save Configuration</button>
@@ -3304,18 +3298,13 @@ function renderEmailSettings(){
 
   // Wire config save
   $("saveEmailCfgBtn").onclick=async()=>{
-    const cfg2={
-      gmailUser:$("em_gmailUser").value.trim(),
-      gmailPass:$("em_gmailPass").value.replace(/\s/g,''),
-      fromName:$("em_fromName").value.trim()||'Gift Management System'
-    };
-    if(!cfg2.gmailUser||!cfg2.gmailPass){
-      $("emailCfgMsg").innerHTML=`<span style="color:var(--danger)">Gmail address and App Password are required.</span>`;return;
-    }
-    if(cfg2.gmailPass.length!==16){
-      $("emailCfgMsg").innerHTML=`<span style="color:var(--danger)">App Password must be exactly 16 characters (spaces are stripped automatically).</span>`;return;
+    const gasUrl=$("em_gasUrl").value.trim();
+    const fromName=$("em_fromName").value.trim()||'Gift Management System';
+    if(!gasUrl||!gasUrl.startsWith('https://')){
+      $("emailCfgMsg").innerHTML=`<span style="color:var(--danger)">Please paste the Google Apps Script Web App URL (must start with https://).</span>`;return;
     }
     $("saveEmailCfgBtn").disabled=true;$("saveEmailCfgBtn").textContent="Saving…";
+    const cfg2={gasUrl,fromName};
     await db.collection("settings").doc("emailConfig").set({...cfg2,updatedAt:ts(),updatedBy:currentUser.uid},{merge:true});
     EMAIL_CONFIG={...EMAIL_CONFIG,...cfg2};
     $("emailCfgMsg").innerHTML=`<span style="color:var(--success)">✅ Configuration saved.</span>`;
