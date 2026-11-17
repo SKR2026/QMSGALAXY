@@ -884,7 +884,93 @@ async function notifyPlantAdminsOnSubmit(payload){
         await logEmail(admin.email,admin.name||'',subject,'request_submitted','failed',e.message);
       }
     }
-  }catch(e){/* silent — don't block the user flow */}
+  }catch(e){
+    // Log the failure so admin can see it in Email Log
+    try{
+      await db.collection("emailLogs").add({
+        to:'(group admins)',toName:'',subject:'Request Submitted Notification',
+        type:'request_submitted',status:'failed',error:e.message||String(e),
+        sentBy:currentUser.uid,sentByName:profile.name||'',sentAt:ts()
+      });
+    }catch(_){}
+  }
+}
+
+/* ── Consolidated multi-guest notification to Group Admin ────────── */
+async function notifyPlantAdminsOnSubmitMulti(basePayload, guests){
+  if(!EMAIL_CONFIG.gasUrl) return;
+  try{
+    const plantId=basePayload.plantId;
+    const allAdminSnap=await db.collection("users").where("role","==","plant_admin").where("status","==","active").limit(50).get();
+    const adminDocs=allAdminSnap.docs.filter(d=>{
+      if(!plantId) return true;
+      const u=d.data();
+      return u.plantId===plantId||(u.plantIds&&u.plantIds.includes(plantId))||u.allPlants===true;
+    });
+    if(!adminDocs.length) return;
+    const companyName=EMAIL_CONFIG.fromName||'Gift Management System';
+    const plantName=PLANTS[basePayload.plantId]||basePayload.plantId||'—';
+    const deptName=DEPTS[basePayload.departmentId]||basePayload.departmentId||'—';
+
+    // Build guest rows table
+    const guestRows=guests.map((g,i)=>`
+      <tr style="${i%2===0?'background:#f8fafc':''}">
+        <td style="padding:7px 10px;border:1px solid #e2e8f0;text-align:center">${i+1}</td>
+        <td style="padding:7px 10px;border:1px solid #e2e8f0">${esc(g.guestSalutation||'')} ${esc(g.guestName||'—')}</td>
+        <td style="padding:7px 10px;border:1px solid #e2e8f0">${esc(g.guestEmail||'—')}</td>
+        <td style="padding:7px 10px;border:1px solid #e2e8f0">${esc(g.guestDesignation||'—')}</td>
+        <td style="padding:7px 10px;border:1px solid #e2e8f0">${esc(g.guestOrganisation||'—')}</td>
+      </tr>`).join('');
+
+    const body=`<div style="font-family:Arial,sans-serif;padding:30px;background:#f1f5f9">
+      <div style="background:#ffffff;border-radius:12px;max-width:680px;margin:0 auto;border:1px solid #e2e8f0;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#2563eb,#1d4ed8);padding:28px 32px;text-align:center">
+          <div style="font-size:44px;line-height:1;margin-bottom:10px">🎁</div>
+          <h2 style="color:#ffffff;font-size:20px;margin:0 0 4px;font-weight:700;font-family:Arial,sans-serif">New Gift Request Submitted</h2>
+          <p style="color:rgba(255,255,255,0.75);margin:0;font-size:13px;font-family:Arial,sans-serif">${companyName}</p>
+        </div>
+        <div style="padding:28px 32px">
+          <p style="font-size:14px;color:#475569;margin:0 0 20px;line-height:1.7;font-family:Arial,sans-serif">The following gift request has been submitted and is <strong>pending your review</strong>.</p>
+          <table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:13px;font-family:Arial,sans-serif">
+            <tr style="background:#f8fafc"><td style="padding:9px 12px;border:1px solid #e2e8f0;font-weight:700;width:40%;color:#374151">Gift / Occasion</td><td style="padding:9px 12px;border:1px solid #e2e8f0;color:#1f2937">${esc(basePayload.giftName)} / ${esc(basePayload.occasion)}</td></tr>
+            <tr><td style="padding:9px 12px;border:1px solid #e2e8f0;font-weight:700;color:#374151">Category</td><td style="padding:9px 12px;border:1px solid #e2e8f0;color:#1f2937">${esc(basePayload.giftCategory||'&mdash;')}</td></tr>
+            <tr style="background:#f8fafc"><td style="padding:9px 12px;border:1px solid #e2e8f0;font-weight:700;color:#374151">Quantity / Est. Cost</td><td style="padding:9px 12px;border:1px solid #e2e8f0;color:#1f2937">${basePayload.requestedQuantity} &times; &#8377;${(basePayload.estimatedUnitCost||0).toLocaleString('en-IN')} = &#8377;${(basePayload.estimatedTotal||0).toLocaleString('en-IN')}</td></tr>
+            <tr><td style="padding:9px 12px;border:1px solid #e2e8f0;font-weight:700;color:#374151">Distribution Date</td><td style="padding:9px 12px;border:1px solid #e2e8f0;color:#1f2937">${basePayload.distributionDate||'&mdash;'}</td></tr>
+            <tr style="background:#f8fafc"><td style="padding:9px 12px;border:1px solid #e2e8f0;font-weight:700;color:#374151">Requested By</td><td style="padding:9px 12px;border:1px solid #e2e8f0;color:#1f2937">${esc(basePayload.requesterName)} (${esc(basePayload.employeeCode||'')})</td></tr>
+            <tr><td style="padding:9px 12px;border:1px solid #e2e8f0;font-weight:700;color:#374151">Plant / Dept</td><td style="padding:9px 12px;border:1px solid #e2e8f0;color:#1f2937">${esc(plantName)} / ${esc(deptName)}</td></tr>
+          </table>
+          <p style="font-size:14px;font-weight:700;color:#1e293b;margin:0 0 10px;font-family:Arial,sans-serif">Guest List &mdash; ${guests.length} Recipient${guests.length!==1?'s':''}</p>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;font-family:Arial,sans-serif">
+            <thead><tr style="background:#2563eb;color:#ffffff">
+              <th style="padding:9px 10px;text-align:center;font-weight:600">#</th>
+              <th style="padding:9px 10px;text-align:left;font-weight:600">Name</th>
+              <th style="padding:9px 10px;text-align:left;font-weight:600">Email</th>
+              <th style="padding:9px 10px;text-align:left;font-weight:600">Designation</th>
+              <th style="padding:9px 10px;text-align:left;font-weight:600">Organisation</th>
+            </tr></thead>
+            <tbody>${guestRows}</tbody>
+          </table>
+          <div style="margin-top:24px;padding:14px 18px;background:#eff6ff;border-left:4px solid #2563eb;border-radius:0 8px 8px 0;font-size:13px;color:#1e40af;font-family:Arial,sans-serif">
+            Please log in to the <strong>Gift Management System</strong> to review and approve / reject / return this request.
+          </div>
+        </div>
+        <div style="padding:14px 32px;background:#f8fafc;border-top:1px solid #e2e8f0;text-align:center;font-size:11px;color:#94a3b8;font-family:Arial,sans-serif">&#169; ${companyName} &middot; Gift Management System</div>
+      </div></div>`;
+
+    const subject=`Gift Request: ${basePayload.giftName} — ${guests.length} Guest${guests.length!==1?'s':''} (${basePayload.occasion})`;
+    for(const doc of adminDocs){
+      const admin=doc.data();
+      if(!admin.email) continue;
+      try{
+        await sendEmail(admin.email,admin.name||'Group Admin',subject,body);
+        await logEmail(admin.email,admin.name||'',subject,'request_submitted','success');
+      }catch(e){
+        await logEmail(admin.email,admin.name||'',subject,'request_submitted','failed',e.message);
+      }
+    }
+  }catch(e){
+    try{await db.collection("emailLogs").add({to:'(group admins)',toName:'',subject:'Multi-Guest Submission Notification',type:'request_submitted',status:'failed',error:e.message||String(e),sentBy:currentUser.uid,sentByName:profile.name||'',sentAt:ts()});}catch(_){}
+  }
 }
 
 async function renderDashboard(){
@@ -1039,37 +1125,29 @@ function renderNewRequestForm(){
       <div style="margin-top:14px"><label>Remarks</label><textarea id="remarks"></textarea></div>
 
       <div class="guest-section" style="margin-top:22px">
-        <div class="guest-title">👤 Guest / Recipient Information <span style="font-size:11px;font-weight:400;color:#0369a1">(optional — fill if gift is for an external guest)</span></div>
-        <div class="grid-3">
-          <div style="display:flex;gap:8px;align-items:flex-end">
-            <div style="width:110px;flex-shrink:0"><label>Salutation</label>
-              <select id="guestSalutation" style="height:38px">
-                <option value="Mr.">Mr.</option>
-                <option value="Mrs.">Mrs.</option>
-                <option value="Ms.">Ms.</option>
-                <option value="Dr.">Dr.</option>
-                <option value="Prof.">Prof.</option>
-                <option value="Shri">Shri</option>
-                <option value="Smt.">Smt.</option>
-                <option value="Er.">Er.</option>
-              </select>
-            </div>
-            <div style="flex:1"><label>Guest Name</label><input id="guestName" placeholder="Full name"></div>
-          </div>
-          <div><label>Guest Email</label><input id="guestEmail" type="email" placeholder="guest@company.com"></div>
-          <div><label>Guest Contact No.</label><input id="guestContact" inputmode="tel" placeholder="+91 XXXXX XXXXX"></div>
-          <div><label>Guest Designation</label><input id="guestDesignation" placeholder="Director, Manager…"></div>
-          <div><label>Guest Department</label><input id="guestDept" placeholder="Department / function"></div>
-          <div>
-            <label>Guest Organisation</label>
-            <select id="guestOrg">
-              <option value="">Select or type below</option>
-              ${orgOptions}
-              <option value="__other__">Other (type below)</option>
-            </select>
-          </div>
-          <div id="guestOrgOtherWrap" style="display:none"><label>Specify Organisation</label><input id="guestOrgOther" placeholder="Organisation name"></div>
+        <div class="guest-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+          <span>👤 Guest / Recipient Information <span style="font-size:11px;font-weight:400;color:#0369a1">(optional — add one or more guests)</span></span>
+          <button type="button" id="addGuestRowBtn" onclick="addGuestRow()" style="font-size:12px;padding:5px 12px;background:#0369a1;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600">+ Add Guest Row</button>
         </div>
+        <div style="overflow-x:auto">
+          <table id="guestTable" style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead>
+              <tr style="background:#e0f2fe;color:#0c4a6e">
+                <th style="padding:7px 8px;white-space:nowrap;text-align:center;width:36px">#</th>
+                <th style="padding:7px 8px;white-space:nowrap;width:80px">Salutation</th>
+                <th style="padding:7px 8px;white-space:nowrap;min-width:140px">Guest Name</th>
+                <th style="padding:7px 8px;white-space:nowrap;min-width:160px">Email</th>
+                <th style="padding:7px 8px;white-space:nowrap;min-width:130px">Contact No.</th>
+                <th style="padding:7px 8px;white-space:nowrap;min-width:130px">Designation</th>
+                <th style="padding:7px 8px;white-space:nowrap;min-width:120px">Department</th>
+                <th style="padding:7px 8px;white-space:nowrap;min-width:160px">Organisation</th>
+                <th style="padding:7px 8px;width:36px"></th>
+              </tr>
+            </thead>
+            <tbody id="guestTbody"></tbody>
+          </table>
+        </div>
+        <div id="noGuestNote" style="font-size:12px;color:#0369a1;padding:8px 4px">No guests added — gift is for internal distribution only. Click <strong>+ Add Guest Row</strong> to add recipients.</div>
       </div>
 
       ${SETTINGS.allowDummyRequests?`
@@ -1089,13 +1167,15 @@ function renderNewRequestForm(){
     if(this.value==="__other__")$("giftCategoryOther").required=true;
     else{$("giftCategoryOther").required=false;$("giftCategoryOther").value="";}
   };
-  // Org "Other" toggle
-  $("guestOrg").onchange=function(){
-    $("guestOrgOtherWrap").style.display=this.value==="__other__"?"block":"none";
-  };
 
   // expose fillDummyFormData globally for the button
   window.fillDummyFormData=fillDummyFormData;
+  // expose addGuestRow globally
+  window.addGuestRow=addGuestRow;
+  window.removeGuestRow=removeGuestRow;
+
+  // Render org options for guest rows
+  window._guestOrgOptions=Object.entries(ORGS).map(([,name])=>`<option value="${esc(name)}">${esc(name)}</option>`).join("");
 
   $("requestForm").addEventListener("submit",async e=>{
     e.preventDefault();
@@ -1103,68 +1183,131 @@ function renderNewRequestForm(){
       const qty=Number($("quantity").value),cost=Number($("unitCost").value||0);
       let giftCat=$("giftCategory").value;
       if(giftCat==="__other__")giftCat=$("giftCategoryOther").value.trim();
-      let guestOrg=$("guestOrg").value;
-      if(guestOrg==="__other__")guestOrg=$("guestOrgOther").value.trim();
-      const guestEmail=$("guestEmail").value.trim();
-      const guestName=$("guestName").value.trim();
-      const distDate=$("distributionDate").value; // "YYYY-MM-DD"
+      const distDate=$("distributionDate").value;
       const distYear=distDate?distDate.slice(0,4):"";
+      const isDummy=SETTINGS.allowDummyRequests&&!!($("isDummyRequest")?.checked);
 
-      // ── One gift per guest per calendar year ──────────────────────────
-      if((guestEmail||guestName)&&distYear){
-        // Build year range strings for comparison against distributionDate
-        const yearStart=`${distYear}-01-01`, yearEnd=`${distYear}-12-31`;
-        // Query by requestedBy first (avoids broad read that employees can't do),
-        // then filter by date client-side to avoid composite index requirement
-        let dupQuery=db.collection("giftRequests")
-          .where("requestedBy","==",currentUser.uid);
-        const dupSnap=await dupQuery.get();
+      // Collect guest rows
+      const guestRows=getGuestRows();
+
+      // ── Dup check for each guest ──────────────────────────────────────
+      if(guestRows.length>0&&distYear){
+        const dupSnap=await db.collection("giftRequests").where("requestedBy","==",currentUser.uid).get();
         const activeStatuses=new Set(["approved","partially_approved","distributed","pending_plant_review","pending_top_management"]);
-        const dup=dupSnap.docs.find(d=>{
-          const x=d.data();
-          // Filter by year client-side
-          if(!x.distributionDate||!x.distributionDate.startsWith(distYear))return false;
-          if(!activeStatuses.has(x.status))return false; // skip rejected/returned
-          if(guestEmail&&x.guestEmail&&x.guestEmail.toLowerCase()===guestEmail.toLowerCase())return true;
-          if(!guestEmail&&guestName&&x.guestName&&x.guestName.toLowerCase()===guestName.toLowerCase()
-            &&(guestOrg?x.guestOrganisation===guestOrg:true))return true;
-          return false;
-        });
-        if(dup){
-          const dx=dup.data();
-          throw new Error(`${dx.guestName||guestEmail} already has a gift request in ${distYear} (${dx.giftName} — ${(dx.status||"").replace(/_/g," ")}). Only one gift per recipient per year is allowed.`);
+        for(const g of guestRows){
+          if(!g.guestName&&!g.guestEmail) continue;
+          const dup=dupSnap.docs.find(d=>{
+            const x=d.data();
+            if(!x.distributionDate||!x.distributionDate.startsWith(distYear))return false;
+            if(!activeStatuses.has(x.status))return false;
+            if(g.guestEmail&&x.guestEmail&&x.guestEmail.toLowerCase()===g.guestEmail.toLowerCase())return true;
+            if(!g.guestEmail&&g.guestName&&x.guestName&&x.guestName.toLowerCase()===g.guestName.toLowerCase())return true;
+            return false;
+          });
+          if(dup){
+            const dx=dup.data();
+            throw new Error(`${g.guestName||g.guestEmail} already has a gift request in ${distYear} (${dx.giftName} — ${(dx.status||"").replace(/_/g," ")}). Only one gift per recipient per year is allowed.`);
+          }
         }
       }
       // ─────────────────────────────────────────────────────────────────
 
-      const payload={
+      const basePayload={
         occasion:$("occasion").value.trim(),distributionDate:distDate,
         giftName:$("giftName").value.trim(),giftCategory:giftCat,
         requestedQuantity:qty,estimatedUnitCost:cost,estimatedTotal:qty*cost,
         remarks:$("remarks").value.trim(),
         plantId:profile.plantId||null,departmentId:profile.departmentId||null,
         requestedBy:currentUser.uid,requesterName:profile.name||"",employeeCode:profile.employeeCode||"",
-        // Guest info
-        guestSalutation:$("guestSalutation")?.value||'Mr.',
-        guestName:guestName,
-        guestEmail:guestEmail,
-        guestContact:$("guestContact").value.trim(),
-        guestDesignation:$("guestDesignation").value.trim(),
-        guestDept:$("guestDept").value.trim(),
-        guestOrganisation:guestOrg,
         status:"pending_plant_review",createdAt:ts(),
-        _isDummy:SETTINGS.allowDummyRequests&&!!($("isDummyRequest")?.checked)
+        _isDummy:isDummy
       };
-      await db.collection("giftRequests").add(payload);
+
+      const col=db.collection("giftRequests");
+      if(guestRows.length===0){
+        // No guests — single request with no guest info
+        await col.add(basePayload);
+        notifyPlantAdminsOnSubmit(basePayload).catch(()=>{});
+      } else {
+        // One Firestore doc per guest, batch write
+        const batch=db.batch();
+        const payloads=guestRows.map(g=>({
+          ...basePayload,
+          guestSalutation:g.guestSalutation||'',
+          guestName:g.guestName||'',
+          guestEmail:g.guestEmail||'',
+          guestContact:g.guestContact||'',
+          guestDesignation:g.guestDesignation||'',
+          guestDept:g.guestDept||'',
+          guestOrganisation:g.guestOrganisation||''
+        }));
+        const refs=payloads.map(()=>col.doc());
+        payloads.forEach((p,i)=>batch.set(refs[i],p));
+        await batch.commit();
+        // Send ONE consolidated email to Group Admin
+        notifyPlantAdminsOnSubmitMulti(basePayload,guestRows).catch(()=>{});
+      }
+
       e.target.reset();
       $("giftCategoryOtherWrap").style.display="none";
-      $("guestOrgOtherWrap").style.display="none";
-      message("Gift request submitted for Group Admin review.","success");
-      // Auto-notify plant admin(s) by email
-      notifyPlantAdminsOnSubmit(payload).catch(()=>{});
+      $("guestTbody").innerHTML="";
+      $("noGuestNote").style.display="block";
+      message(`Gift request${guestRows.length>1?" for "+guestRows.length+" guests":""} submitted for Group Admin review.`,"success");
       await renderDashboard();showView("requests");
     }catch(err){message(err.message,"error");}
   });
+}
+
+/* ── Multi-guest row helpers ─────────────────────────────────────── */
+function addGuestRow(){
+  const tbody=$("guestTbody");
+  const idx=tbody.rows.length+1;
+  const orgOpts=window._guestOrgOptions||"";
+  const tr=document.createElement("tr");
+  tr.style.cssText="border-bottom:1px solid #e0f2fe";
+  tr.innerHTML=`
+    <td style="text-align:center;color:#94a3b8;font-size:12px;padding:4px 6px">${idx}</td>
+    <td style="padding:3px 4px"><select class="g-sal" style="font-size:12px;padding:3px 6px;width:75px;border:1px solid #bae6fd;border-radius:5px;background:var(--card)">
+      <option>Mr.</option><option>Mrs.</option><option>Ms.</option><option>Dr.</option><option>Prof.</option><option>Shri</option><option>Smt.</option><option>Er.</option>
+    </select></td>
+    <td style="padding:3px 4px"><input class="g-name" placeholder="Full name" style="font-size:12px;padding:4px 7px;width:100%;box-sizing:border-box;border:1px solid #bae6fd;border-radius:5px"></td>
+    <td style="padding:3px 4px"><input class="g-email" type="email" placeholder="email@co.com" style="font-size:12px;padding:4px 7px;width:100%;box-sizing:border-box;border:1px solid #bae6fd;border-radius:5px"></td>
+    <td style="padding:3px 4px"><input class="g-contact" placeholder="+91 XXXXX" style="font-size:12px;padding:4px 7px;width:100%;box-sizing:border-box;border:1px solid #bae6fd;border-radius:5px"></td>
+    <td style="padding:3px 4px"><input class="g-desig" placeholder="Designation" style="font-size:12px;padding:4px 7px;width:100%;box-sizing:border-box;border:1px solid #bae6fd;border-radius:5px"></td>
+    <td style="padding:3px 4px"><input class="g-dept" placeholder="Department" style="font-size:12px;padding:4px 7px;width:100%;box-sizing:border-box;border:1px solid #bae6fd;border-radius:5px"></td>
+    <td style="padding:3px 4px"><select class="g-org" style="font-size:12px;padding:4px 7px;width:100%;box-sizing:border-box;border:1px solid #bae6fd;border-radius:5px;background:var(--card)">
+      <option value="">Select…</option>${orgOpts}<option value="__other__">Other…</option>
+    </select>
+    <input class="g-org-other" placeholder="Specify org" style="display:none;font-size:12px;padding:4px 7px;width:100%;box-sizing:border-box;margin-top:3px;border:1px solid #bae6fd;border-radius:5px">
+    </td>
+    <td style="padding:3px 6px;text-align:center"><button type="button" onclick="removeGuestRow(this)" style="background:none;border:none;cursor:pointer;color:#ef4444;font-size:16px;padding:2px 4px" title="Remove">✕</button></td>`;
+  tbody.appendChild(tr);
+  // wire org other
+  tr.querySelector(".g-org").onchange=function(){
+    tr.querySelector(".g-org-other").style.display=this.value==="__other__"?"block":"none";
+  };
+  $("noGuestNote").style.display="none";
+  // renumber
+  refreshGuestRowNumbers();
+}
+function removeGuestRow(btn){
+  btn.closest("tr").remove();
+  refreshGuestRowNumbers();
+  if($("guestTbody").rows.length===0) $("noGuestNote").style.display="block";
+}
+function refreshGuestRowNumbers(){
+  Array.from($("guestTbody").rows).forEach((r,i)=>{r.cells[0].textContent=i+1;});
+}
+function getGuestRows(){
+  return Array.from($("guestTbody").rows).map(r=>({
+    guestSalutation:r.querySelector(".g-sal")?.value||"",
+    guestName:(r.querySelector(".g-name")?.value||"").trim(),
+    guestEmail:(r.querySelector(".g-email")?.value||"").trim(),
+    guestContact:(r.querySelector(".g-contact")?.value||"").trim(),
+    guestDesignation:(r.querySelector(".g-desig")?.value||"").trim(),
+    guestDept:(r.querySelector(".g-dept")?.value||"").trim(),
+    guestOrganisation:(()=>{const s=r.querySelector(".g-org");if(s.value==="__other__")return(r.querySelector(".g-org-other")?.value||"").trim();return s.value||"";})()
+  })).filter(g=>g.guestName||g.guestEmail);
 }
 
 /* ═══════════════════════════════════════════════
@@ -1266,7 +1409,8 @@ async function loadRequests(){
     $("requestsView").innerHTML=`
       <div class="view-header">
         <div><h2>Gift Requests</h2><span style="font-size:12px;color:var(--muted)">${snap.size} records</span></div>
-        <div style="display:flex;gap:6px">
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${["plant_admin","superadmin"].includes(profile.role)?`<button onclick="publishApprovalEmails()" style="font-size:12px;padding:5px 12px;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600">📢 Publish Approvals</button>`:''}
           <button class="secondary" onclick="exportRequestsExcel()" style="font-size:12px;padding:5px 10px">📊 Excel</button>
           <button class="secondary" onclick="exportRequestsPDF()" style="font-size:12px;padding:5px 10px">📄 PDF</button>
         </div>
@@ -1296,21 +1440,27 @@ async function loadRequests(){
 function showDistributeModal(req, loggedInProfile){
   return new Promise(resolve=>{
     const overlay=document.createElement("div");
-    overlay.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9999;display:flex;align-items:center;justify-content:center";
+    overlay.style.cssText="position:fixed;inset:0;background:rgba(15,23,42,0.75);z-index:9999;display:flex;align-items:center;justify-content:center";
     overlay.innerHTML=`
-      <div style="background:var(--card);border-radius:16px;padding:28px 32px;width:420px;max-width:95vw;box-shadow:0 8px 40px rgba(0,0,0,0.18)">
-        <h3 style="margin:0 0 4px;font-size:17px">🚚 Mark as Distributed</h3>
-        <p style="margin:0 0 18px;font-size:13px;color:var(--muted)">Enter details of the person who physically distributed the gift.</p>
-        <div style="background:var(--bg);border-radius:10px;padding:12px 14px;margin-bottom:18px;font-size:13px">
-          <div style="font-weight:600;margin-bottom:2px">${esc(req.giftName||"")}</div>
-          <div style="color:var(--muted)">Guest: ${esc(req.guestName||"—")} &nbsp;·&nbsp; Occasion: ${esc(req.occasion||"—")}</div>
+      <div style="background:#ffffff;border-radius:16px;padding:28px 32px;width:460px;max-width:95vw;box-shadow:0 12px 48px rgba(0,0,0,0.3);border:1px solid #e2e8f0">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+          <div style="width:36px;height:36px;background:#ecfdf5;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">&#128666;</div>
+          <h3 style="margin:0;font-size:17px;font-weight:700;color:#0f172a">Mark as Distributed</h3>
         </div>
-        <label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px">Distributed By — Name <span style="color:#ef4444">*</span></label>
+        <p style="margin:0 0 16px 46px;font-size:13px;color:#64748b">Enter details of the person who physically distributed the gift.</p>
+        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:12px 14px;margin-bottom:20px;font-size:13px">
+          <div style="font-weight:700;color:#0f172a;margin-bottom:3px">${esc(req.giftName||"")}</div>
+          <div style="color:#475569">Guest: ${esc(req.guestName||"&mdash;")} &nbsp;&middot;&nbsp; Occasion: ${esc(req.occasion||"&mdash;")}</div>
+        </div>
+        <label style="font-size:12px;font-weight:700;display:block;margin-bottom:5px;color:#374151">Distributed By &mdash; Name <span style="color:#ef4444">*</span></label>
         <input id="distName" placeholder="Full name of person who distributed" value="${esc(loggedInProfile.name||"")}"
-          style="width:100%;box-sizing:border-box;padding:9px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:14px;background:var(--bg);color:var(--text);margin-bottom:12px">
-        <label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px">Employee Code</label>
+          style="width:100%;box-sizing:border-box;padding:9px 12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:14px;background:#fff;color:#0f172a;margin-bottom:12px;outline:none">
+        <label style="font-size:12px;font-weight:700;display:block;margin-bottom:5px;color:#374151">Employee Code</label>
         <input id="distCode" placeholder="Employee code (optional)" value="${esc(loggedInProfile.employeeCode||"")}"
-          style="width:100%;box-sizing:border-box;padding:9px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:14px;background:var(--bg);color:var(--text);margin-bottom:20px">
+          style="width:100%;box-sizing:border-box;padding:9px 12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:14px;background:#fff;color:#0f172a;margin-bottom:12px;outline:none">
+        <label style="font-size:12px;font-weight:700;display:block;margin-bottom:5px;color:#374151">Remarks <span style="font-size:11px;font-weight:400;color:#94a3b8">(e.g. gift not distributed, returned by guest, partial delivery…)</span></label>
+        <textarea id="distRemarks" placeholder="Add any remarks about this distribution (optional)" rows="3"
+          style="width:100%;box-sizing:border-box;padding:9px 12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:14px;background:#fff;color:#0f172a;margin-bottom:20px;resize:vertical;outline:none;font-family:inherit"></textarea>
         <div style="display:flex;gap:10px;justify-content:flex-end">
           <button id="distCancel" class="secondary" style="padding:9px 20px">Cancel</button>
           <button id="distConfirm" style="padding:9px 20px;background:linear-gradient(135deg,#059669,#047857);color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer">Confirm Distribution</button>
@@ -1321,10 +1471,18 @@ function showDistributeModal(req, loggedInProfile){
     overlay.querySelector("#distCancel").onclick=()=>cleanup(null);
     overlay.querySelector("#distConfirm").onclick=()=>{
       const name=overlay.querySelector("#distName").value.trim();
-      if(!name){overlay.querySelector("#distName").style.borderColor="#ef4444";overlay.querySelector("#distName").focus();return;}
-      cleanup({name,code:overlay.querySelector("#distCode").value.trim()});
+      if(!name){
+        const inp=overlay.querySelector("#distName");
+        inp.style.borderColor="#ef4444";inp.focus();
+        return;
+      }
+      cleanup({
+        name,
+        code:overlay.querySelector("#distCode").value.trim(),
+        remarks:overlay.querySelector("#distRemarks").value.trim()
+      });
     };
-    overlay.addEventListener("click",e=>{if(e.target===overlay)cleanup(null);});
+    // Do NOT close on backdrop click — user may have typed remarks
     setTimeout(()=>overlay.querySelector("#distName").focus(),50);
   });
 }
@@ -1399,6 +1557,7 @@ async function processRequest(id,action){
       u.distributedByName=distResult.name;
       u.distributedByCode=distResult.code;
       u.distributedAt=ts();
+      if(distResult.remarks) u.distributionRemarks=distResult.remarks;
     }
     if(action==="delete"){
       if(profile.role!=="superadmin") return message("Only superadmin can delete requests.","error");
@@ -1542,6 +1701,7 @@ function renderGuestTable(rows){
       <td>
         ${x.distributedByName?`<div style="font-size:12px;font-weight:600;color:var(--text)">${esc(x.distributedByName)}</div>`:''}
         ${x.distributedByCode?`<div style="font-size:11px;color:var(--muted)">${esc(x.distributedByCode)}</div>`:(!x.distributedByName?`<span style="color:var(--muted);font-size:12px">—</span>`:'')}
+        ${x.distributionRemarks?`<div style="font-size:11px;color:#b45309;font-style:italic;margin-top:2px" title="Distribution Remarks">&#128172; ${esc(x.distributionRemarks)}</div>`:''}
       </td>
       <td style="font-size:12px;color:var(--muted)">${esc(plant)}</td>
       <td style="font-size:12px;color:var(--muted);white-space:nowrap">${esc(distDate)}</td>
@@ -2808,6 +2968,118 @@ function reqRows(snap){
   return out;
 }
 let _lastReqSnap=null; // set after each loadRequests
+/* ── Publish Approvals: one consolidated email per employee ───────── */
+async function publishApprovalEmails(){
+  if(!EMAIL_CONFIG.gasUrl){
+    message("Email not configured. Go to Admin → Email Settings first.","warn");return;
+  }
+  const allReqData=window._lastReqSnap?[]:[];
+  const snap=window._lastReqSnap||await visibleRequests();
+  const all=[];snap.forEach(d=>all.push({id:d.id,...d.data()}));
+
+  const eligible=all.filter(x=>["approved","partially_approved"].includes(x.status));
+  if(!eligible.length){
+    message("No approved requests to publish notifications for.","warn");return;
+  }
+
+  // Group by requestedBy (employee uid)
+  const byEmp={};
+  for(const r of eligible){
+    if(!byEmp[r.requestedBy]) byEmp[r.requestedBy]={name:r.requesterName||'',employeeCode:r.employeeCode||'',uid:r.requestedBy,requests:[]};
+    byEmp[r.requestedBy].requests.push(r);
+  }
+
+  // Show confirmation modal
+  const empCount=Object.keys(byEmp).length;
+  const reqCount=eligible.length;
+  const confirmed=await new Promise(resolve=>{
+    const ov=document.createElement("div");
+    ov.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9999;display:flex;align-items:center;justify-content:center";
+    ov.innerHTML=`<div style="background:var(--card);border-radius:16px;padding:28px 32px;width:460px;max-width:95vw;box-shadow:0 8px 40px rgba(0,0,0,0.18)">
+      <h3 style="margin:0 0 12px;color:#7c3aed">📢 Publish Approval Notifications</h3>
+      <p style="font-size:14px;color:var(--text);margin:0 0 16px">This will send <strong>one consolidated email per employee</strong> listing all their approved requests.</p>
+      <div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:12px 16px;font-size:13px;margin-bottom:16px">
+        <div>📋 <strong>${reqCount}</strong> approved request${reqCount!==1?'s':''}</div>
+        <div style="margin-top:4px">👥 <strong>${empCount}</strong> employee${empCount!==1?'s':''} will receive email</div>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button id="_pub_cancel" class="secondary" style="padding:9px 20px">Cancel</button>
+        <button id="_pub_ok" style="padding:9px 20px;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer">📢 Send Now</button>
+      </div></div>`;
+    document.body.appendChild(ov);
+    ov.querySelector("#_pub_cancel").onclick=()=>{document.body.removeChild(ov);resolve(false);};
+    ov.querySelector("#_pub_ok").onclick=()=>{document.body.removeChild(ov);resolve(true);};
+  });
+  if(!confirmed) return;
+
+  let sent=0,failed=0;
+  const companyName=EMAIL_CONFIG.fromName||'Gift Management System';
+
+  // For each employee, fetch their email from users collection and send one mail
+  for(const [uid,emp] of Object.entries(byEmp)){
+    try{
+      const userDoc=await db.collection("users").doc(uid).get();
+      const empEmail=userDoc.exists?userDoc.data().email||'':'';
+      if(!empEmail){failed++;continue;}
+
+      const rows=emp.requests.map((r,i)=>`
+        <tr style="${i%2===0?'background:#f8fafc':''}">
+          <td style="padding:8px 10px;border:1px solid #e2e8f0;text-align:center">${i+1}</td>
+          <td style="padding:8px 10px;border:1px solid #e2e8f0"><strong>${esc(r.giftName)}</strong><br><small style="color:#64748b">${esc(r.occasion)}</small></td>
+          <td style="padding:8px 10px;border:1px solid #e2e8f0">${esc(r.giftCategory||'—')}</td>
+          <td style="padding:8px 10px;border:1px solid #e2e8f0;text-align:right">${r.requestedQuantity}</td>
+          <td style="padding:8px 10px;border:1px solid #e2e8f0;text-align:right;font-family:Arial,sans-serif">&#8377;${Number(r.estimatedTotal||0).toLocaleString('en-IN')}</td>
+          <td style="padding:8px 10px;border:1px solid #e2e8f0;font-family:Arial,sans-serif">${r.guestName?esc(r.guestName):'&mdash;'}</td>
+          <td style="padding:8px 10px;border:1px solid #e2e8f0;text-align:center"><span style="background:#d1fae5;color:#065f46;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;font-family:Arial,sans-serif">${r.status==='partially_approved'?'Partial Approved':'Approved'}</span></td>
+        </tr>`).join('');
+
+      const totalAmt=emp.requests.reduce((s,r)=>s+(Number(r.estimatedTotal)||0),0);
+      const body=`<div style="font-family:Arial,sans-serif;padding:30px;background:#f1f5f9">
+        <div style="background:#ffffff;border-radius:12px;max-width:700px;margin:0 auto;border:1px solid #e2e8f0;overflow:hidden">
+          <div style="background:linear-gradient(135deg,#16a34a,#15803d);padding:28px 32px;text-align:center">
+            <div style="font-size:44px;line-height:1;margin-bottom:10px">✅</div>
+            <h2 style="color:#ffffff;font-size:20px;margin:0 0 4px;font-weight:700;font-family:Arial,sans-serif">Gift Requests &mdash; Approval Update</h2>
+            <p style="color:rgba(255,255,255,0.75);margin:0;font-size:13px;font-family:Arial,sans-serif">${companyName}</p>
+          </div>
+          <div style="padding:28px 32px">
+            <p style="font-size:15px;color:#0f172a;margin:0 0 6px;font-family:Arial,sans-serif">Dear <strong>${esc(emp.name||'Employee')}</strong>,</p>
+            <p style="font-size:14px;color:#475569;margin:0 0 24px;line-height:1.7;font-family:Arial,sans-serif">Your gift request${emp.requests.length!==1?'s have':' has'} been reviewed. Here is the consolidated status:</p>
+            <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px;font-family:Arial,sans-serif">
+              <thead><tr style="background:#16a34a;color:#ffffff">
+                <th style="padding:9px 10px;text-align:center;font-weight:600">#</th>
+                <th style="padding:9px 10px;text-align:left;font-weight:600">Gift / Occasion</th>
+                <th style="padding:9px 10px;text-align:left;font-weight:600">Category</th>
+                <th style="padding:9px 10px;text-align:right;font-weight:600">Qty</th>
+                <th style="padding:9px 10px;text-align:right;font-weight:600">Est. Total</th>
+                <th style="padding:9px 10px;text-align:left;font-weight:600">Guest</th>
+                <th style="padding:9px 10px;text-align:center;font-weight:600">Status</th>
+              </tr></thead>
+              <tbody>${rows}</tbody>
+              <tfoot><tr style="background:#f0fdf4;font-weight:700;font-family:Arial,sans-serif">
+                <td colspan="4" style="padding:9px 10px;border-top:2px solid #bbf7d0;text-align:right;color:#374151">Total Amount</td>
+                <td style="padding:9px 10px;border-top:2px solid #bbf7d0;text-align:right;color:#065f46">&#8377;${totalAmt.toLocaleString('en-IN')}</td>
+                <td colspan="2" style="border-top:2px solid #bbf7d0"></td>
+              </tr></tfoot>
+            </table>
+            <div style="padding:14px 18px;background:#f0fdf4;border-left:4px solid #16a34a;border-radius:0 8px 8px 0;font-size:13px;color:#166534;font-family:Arial,sans-serif">
+              Please log in to the <strong>Gift Management System</strong> to distribute your approved gifts.
+            </div>
+          </div>
+          <div style="padding:14px 32px;background:#f8fafc;border-top:1px solid #e2e8f0;text-align:center;font-size:11px;color:#94a3b8;font-family:Arial,sans-serif">&#169; ${companyName} &middot; Gift Management System</div>
+        </div></div>`;
+
+      const subject=`Gift Approval Update — ${emp.requests.length} Request${emp.requests.length!==1?'s':''} Approved`;
+      await sendEmail(empEmail,emp.name||'Employee',subject,body);
+      await logEmail(empEmail,emp.name||'',subject,'approval_publish','success');
+      sent++;
+    }catch(e){
+      failed++;
+      await logEmail('',emp.name||'',`Publish to ${emp.name}`,'approval_publish','failed',e.message).catch(()=>{});
+    }
+  }
+  message(`📢 Published! ${sent} email${sent!==1?'s':''} sent.${failed?' '+failed+' failed — check Email Log.':''}`,"success");
+}
+
 function exportRequestsExcel(){
   if(!_lastReqSnap){message("Load Gift Requests first.","warn");return;}
   exportToExcel(REQ_HEADERS,reqRows(_lastReqSnap),`GiftRequests_${new Date().toISOString().slice(0,10)}.xlsx`,"Gift Requests");
@@ -2946,61 +3218,63 @@ async function loadEmailConfig(){
 }
 
 function defaultEmailTemplates(){
+  // Email-safe icon: coloured square with letter, renders in ALL email clients (no emoji)
+  const iconBox=(emoji)=>`<div style="font-size:44px;line-height:1;margin-bottom:10px">${emoji}</div>`;
   return {
     request_submitted:{
       subject:"Gift Request Submitted — {{giftName}} ({{occasion}})",
-      body:`<div style="font-family:Segoe UI,system-ui,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px;border-radius:0">
-<div style="background:linear-gradient(135deg,#2563eb,#1d4ed8);border-radius:16px 16px 0 0;padding:28px 32px;text-align:center">
-  <div style="font-size:40px;margin-bottom:8px">🎁</div>
-  <h1 style="color:#fff;font-size:20px;margin:0;font-weight:700">Gift Request Submitted</h1>
-  <p style="color:rgba(255,255,255,.8);margin:6px 0 0;font-size:13px">{{companyName}}</p>
+      body:`<div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px">
+<div style="background:linear-gradient(135deg,#2563eb,#1d4ed8);border-radius:12px 12px 0 0;padding:32px;text-align:center">
+  ${iconBox('🎁')}
+  <h1 style="color:#ffffff;font-size:21px;margin:0 0 6px;font-weight:700;font-family:Arial,sans-serif">Gift Request Submitted</h1>
+  <p style="color:rgba(255,255,255,0.75);margin:0;font-size:13px;font-family:Arial,sans-serif">{{companyName}}</p>
 </div>
-<div style="background:#fff;border-radius:0 0 16px 16px;padding:28px 32px;border:1px solid #e2e8f0;border-top:none">
-  <p style="font-size:15px;color:#0f172a;margin:0 0 20px">{{salutation}},</p>
-  <p style="font-size:14px;color:#334155;margin:0 0 20px;line-height:1.6">The following gift request has been submitted and is pending your review:</p>
+<div style="background:#ffffff;border-radius:0 0 12px 12px;padding:32px;border:1px solid #e2e8f0;border-top:none">
+  <p style="font-size:15px;color:#0f172a;margin:0 0 6px;font-family:Arial,sans-serif">{{salutation}},</p>
+  <p style="font-size:14px;color:#475569;margin:0 0 24px;line-height:1.7;font-family:Arial,sans-serif">The following gift request has been submitted and is <strong>pending your review</strong>. Please log in to approve, reject, or return it.</p>
   {{items}}
-  <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:16px;margin:20px 0">
-    <p style="font-size:13px;color:#1e40af;margin:0;line-height:1.6">Please log in to the Gift Management System to review and take action on the request(s) above.</p>
+  <div style="background:#eff6ff;border-left:4px solid #2563eb;border-radius:0 8px 8px 0;padding:14px 18px;margin:24px 0 20px">
+    <p style="font-size:13px;color:#1e40af;margin:0;line-height:1.6;font-family:Arial,sans-serif">Please log in to the <strong>Gift Management System</strong> to review and take action on this request.</p>
   </div>
-  <p style="font-size:13px;color:#64748b;margin:0;line-height:1.6">This is an automated notification. Please do not reply to this email.</p>
+  <p style="font-size:12px;color:#94a3b8;margin:0;font-family:Arial,sans-serif">This is an automated notification. Please do not reply to this email.</p>
 </div>
-<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:16px">© {{companyName}} · Gift Management System</p>
+<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:14px;font-family:Arial,sans-serif">&#169; {{companyName}} &middot; Gift Management System</p>
 </div>`
     },
     approval_notification:{
       subject:"Gift Request Update — {{occasion}}",
-      body:`<div style="font-family:Segoe UI,system-ui,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px;border-radius:0">
-<div style="background:linear-gradient(135deg,#16a34a,#15803d);border-radius:16px 16px 0 0;padding:28px 32px;text-align:center">
-  <div style="font-size:40px;margin-bottom:8px">✅</div>
-  <h1 style="color:#fff;font-size:20px;margin:0;font-weight:700">Gift Request Status Update</h1>
-  <p style="color:rgba(255,255,255,.8);margin:6px 0 0;font-size:13px">{{companyName}}</p>
+      body:`<div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px">
+<div style="background:linear-gradient(135deg,#16a34a,#15803d);border-radius:12px 12px 0 0;padding:32px;text-align:center">
+  ${iconBox('✅')}
+  <h1 style="color:#ffffff;font-size:21px;margin:0 0 6px;font-weight:700;font-family:Arial,sans-serif">Gift Request Status Update</h1>
+  <p style="color:rgba(255,255,255,0.75);margin:0;font-size:13px;font-family:Arial,sans-serif">{{companyName}}</p>
 </div>
-<div style="background:#fff;border-radius:0 0 16px 16px;padding:28px 32px;border:1px solid #e2e8f0;border-top:none">
-  <p style="font-size:15px;color:#0f172a;margin:0 0 20px">{{salutation}},</p>
-  <p style="font-size:14px;color:#334155;margin:0 0 20px;line-height:1.6">Here is an update on your gift request(s):</p>
+<div style="background:#ffffff;border-radius:0 0 12px 12px;padding:32px;border:1px solid #e2e8f0;border-top:none">
+  <p style="font-size:15px;color:#0f172a;margin:0 0 6px;font-family:Arial,sans-serif">{{salutation}},</p>
+  <p style="font-size:14px;color:#475569;margin:0 0 24px;line-height:1.7;font-family:Arial,sans-serif">Here is the latest status update on your gift request(s). Please review the details below:</p>
   {{items}}
-  <p style="font-size:13px;color:#64748b;margin:20px 0 0;line-height:1.6">For questions, please contact your Group Admin or Top Management team.</p>
+  <p style="font-size:13px;color:#64748b;margin:20px 0 0;line-height:1.6;font-family:Arial,sans-serif">For any questions, please contact your Group Admin or Top Management team.</p>
 </div>
-<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:16px">© {{companyName}} · Gift Management System</p>
+<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:14px;font-family:Arial,sans-serif">&#169; {{companyName}} &middot; Gift Management System</p>
 </div>`
     },
     guest_wishes:{
-      subject:"Season's Greetings from {{companyName}} 🎁",
-      body:`<div style="font-family:Segoe UI,system-ui,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px;border-radius:0">
-<div style="background:linear-gradient(135deg,#c2255c,#a61e4d);border-radius:16px 16px 0 0;padding:32px;text-align:center">
-  <div style="font-size:48px;margin-bottom:10px">🎁</div>
-  <h1 style="color:#fff;font-size:22px;margin:0;font-weight:700">With Our Warmest Wishes</h1>
-  <p style="color:rgba(255,255,255,.85);margin:8px 0 0;font-size:14px">{{companyName}}</p>
+      subject:"Season's Greetings from {{companyName}}",
+      body:`<div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px">
+<div style="background:linear-gradient(135deg,#c2255c,#a61e4d);border-radius:12px 12px 0 0;padding:36px;text-align:center">
+  ${iconBox('🎊')}
+  <h1 style="color:#ffffff;font-size:22px;margin:0 0 6px;font-weight:700;font-family:Arial,sans-serif">With Our Warmest Wishes</h1>
+  <p style="color:rgba(255,255,255,0.8);margin:0;font-size:13px;font-family:Arial,sans-serif">{{companyName}}</p>
 </div>
-<div style="background:#fff;border-radius:0 0 16px 16px;padding:32px;border:1px solid #e2e8f0;border-top:none">
-  <p style="font-size:16px;color:#0f172a;margin:0 0 20px">{{salutation}},</p>
-  <div style="background:linear-gradient(135deg,#fff0f6,#fce7f3);border-left:4px solid #c2255c;border-radius:0 12px 12px 0;padding:20px;margin:0 0 24px">
-    <p style="font-size:15px;color:#831843;line-height:1.7;margin:0">{{messageBody}}</p>
+<div style="background:#ffffff;border-radius:0 0 12px 12px;padding:32px;border:1px solid #e2e8f0;border-top:none">
+  <p style="font-size:16px;color:#0f172a;margin:0 0 20px;font-family:Arial,sans-serif">{{salutation}},</p>
+  <div style="background:#fff0f6;border-left:4px solid #c2255c;border-radius:0 10px 10px 0;padding:20px 24px;margin:0 0 24px">
+    <p style="font-size:15px;color:#831843;line-height:1.75;margin:0;font-family:Arial,sans-serif">{{messageBody}}</p>
   </div>
-  <p style="font-size:14px;color:#334155;line-height:1.6;margin:0 0 20px">We value your partnership and look forward to continuing our journey together.</p>
-  <p style="font-size:14px;color:#334155;margin:0;line-height:1.6">Warm regards,<br><strong>{{senderName}}</strong><br>{{companyName}}</p>
+  <p style="font-size:14px;color:#475569;line-height:1.7;margin:0 0 20px;font-family:Arial,sans-serif">We value your partnership and look forward to continuing our journey together.</p>
+  <p style="font-size:14px;color:#334155;margin:0;line-height:1.6;font-family:Arial,sans-serif">Warm regards,<br><strong>{{senderName}}</strong><br><span style="color:#64748b">{{companyName}}</span></p>
 </div>
-<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:16px">© {{companyName}}</p>
+<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:14px;font-family:Arial,sans-serif">&#169; {{companyName}}</p>
 </div>`
     }
   };
@@ -3012,22 +3286,28 @@ function buildRequestItemsHTML(items){
   const statusColors={pending_plant_review:"#f59e0b",pending_top_management:"#8b5cf6",approved:"#16a34a",partially_approved:"#0891b2",distributed:"#059669",returned:"#f97316",rejected:"#ef4444"};
   const statusBg={pending_plant_review:"#fef9c3",pending_top_management:"#ede9fe",approved:"#d1fae5",partially_approved:"#e0f2fe",distributed:"#f0fdf4",returned:"#fff7ed",rejected:"#fee2e2"};
   return items.map(r=>`
-    <div style="border:1px solid #e2e8f0;border-radius:12px;padding:16px;margin-bottom:12px;background:#fafbfc">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
-        <div>
-          <div style="font-size:15px;font-weight:700;color:#0f172a;margin-bottom:4px">🎁 ${esc(r.giftName||'')}</div>
-          <div style="font-size:12px;color:#64748b">${esc(r.occasion||'')} ${r.giftCategory?'· '+esc(r.giftCategory):''}</div>
-        </div>
-        <span style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;background:${statusBg[r.status]||'#f1f5f9'};color:${statusColors[r.status]||'#334155'}">${(r.status||'').replace(/_/g,' ').toUpperCase()}</span>
-      </div>
-      <div style="margin-top:12px;display:flex;gap:12px;flex-wrap:wrap">
-        <div style="background:#eff6ff;border-radius:8px;padding:8px 12px;font-size:12px;color:#1e40af"><strong>Qty:</strong> ${r.requestedQuantity||0}</div>
-        <div style="background:#f0fdf4;border-radius:8px;padding:8px 12px;font-size:12px;color:#14532d"><strong>Est. Value:</strong> ₹${Number(r.estimatedTotal||0).toLocaleString('en-IN')}</div>
-        ${r.distributionDate?`<div style="background:#fafbfc;border-radius:8px;padding:8px 12px;font-size:12px;color:#334155"><strong>Dist. Date:</strong> ${esc(r.distributionDate)}</div>`:''}
-        ${r.approvedQuantity?`<div style="background:#d1fae5;border-radius:8px;padding:8px 12px;font-size:12px;color:#065f46"><strong>Approved Qty:</strong> ${r.approvedQuantity}</div>`:''}
-      </div>
-      ${r.lastComment?`<div style="margin-top:10px;background:#fef2f2;border-radius:8px;padding:8px 12px;font-size:12px;color:#991b1b"><strong>Comment:</strong> ${esc(r.lastComment)}</div>`:''}
-      ${r.guestName?`<div style="margin-top:10px;font-size:12px;color:#64748b">👤 For: <strong>${esc(r.guestName)}</strong>${r.guestOrganisation?' · '+esc(r.guestOrganisation):''}</div>`:''}
+    <div style="border:1px solid #e2e8f0;border-radius:10px;padding:16px;margin-bottom:12px;background:#fafbfc;font-family:Arial,sans-serif">
+      <table style="width:100%;border-collapse:collapse"><tr>
+        <td style="vertical-align:top">
+          <div style="font-size:15px;font-weight:700;color:#0f172a;margin-bottom:4px;font-family:Arial,sans-serif">🎁 ${esc(r.giftName||'')}</div>
+          <div style="font-size:12px;color:#64748b;font-family:Arial,sans-serif">${esc(r.occasion||'')} ${r.giftCategory?'&middot; '+esc(r.giftCategory):''}</div>
+        </td>
+        <td style="vertical-align:top;text-align:right;white-space:nowrap;padding-left:12px">
+          <span style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;font-family:Arial,sans-serif;background:${statusBg[r.status]||'#f1f5f9'};color:${statusColors[r.status]||'#334155'}">${(r.status||'').replace(/_/g,' ').toUpperCase()}</span>
+        </td>
+      </tr></table>
+      <div style="display:none">
+      </div><!-- end display:none hack -->
+      <table style="width:100%;border-collapse:collapse;margin-top:12px"><tr>
+        <td style="padding:7px 10px;background:#eff6ff;border-radius:7px;font-size:12px;color:#1e40af;font-family:Arial,sans-serif;width:1%;white-space:nowrap"><strong>Qty:</strong> ${r.requestedQuantity||0}</td>
+        <td style="padding:0 6px"></td>
+        <td style="padding:7px 10px;background:#f0fdf4;border-radius:7px;font-size:12px;color:#14532d;font-family:Arial,sans-serif;width:1%;white-space:nowrap"><strong>Est. Value:</strong> &#8377;${Number(r.estimatedTotal||0).toLocaleString('en-IN')}</td>
+        ${r.distributionDate?`<td style="padding:0 6px"></td><td style="padding:7px 10px;background:#f8fafc;border-radius:7px;font-size:12px;color:#334155;font-family:Arial,sans-serif;width:1%;white-space:nowrap"><strong>Dist. Date:</strong> ${esc(r.distributionDate)}</td>`:''}
+        ${r.approvedQuantity?`<td style="padding:0 6px"></td><td style="padding:7px 10px;background:#d1fae5;border-radius:7px;font-size:12px;color:#065f46;font-family:Arial,sans-serif;width:1%;white-space:nowrap"><strong>Approved Qty:</strong> ${r.approvedQuantity}</td>`:''}
+        <td></td>
+      </tr></table>
+      ${r.lastComment?`<div style="margin-top:10px;background:#fef2f2;border-left:3px solid #ef4444;border-radius:0 6px 6px 0;padding:8px 12px;font-size:12px;color:#991b1b;font-family:Arial,sans-serif"><strong>Comment:</strong> ${esc(r.lastComment)}</div>`:''}
+      ${r.guestName?`<div style="margin-top:10px;padding:8px 12px;background:#f8fafc;border-top:1px solid #e2e8f0;font-size:12px;color:#475569;font-family:Arial,sans-serif">👤 Recipient: <strong>${esc(r.guestName)}</strong>${r.guestOrganisation?' &mdash; '+esc(r.guestOrganisation):''}</div>`:''}
     </div>`).join('');
 }
 
@@ -3044,10 +3324,20 @@ async function sendEmail(toEmail, toName, subject, htmlBody){
   if(!EMAIL_CONFIG.gasUrl)
     throw new Error('Email relay not configured. Go to Admin → Email Settings and paste your Google Apps Script URL.');
   const payload={to:toEmail,toName:toName||'',subject,body:htmlBody,fromName:EMAIL_CONFIG.fromName||'Gift Management System'};
-  const resp=await fetch(EMAIL_CONFIG.gasUrl,{method:'POST',body:JSON.stringify(payload)});
-  const text=await resp.text();
-  if(!resp.ok||text.startsWith('ERROR'))
-    throw new Error('Mail relay error: '+(text||resp.status));
+  // Google Apps Script requires no-cors (browser CORS restriction).
+  // We use no-cors so the request fires; we can't read the response body,
+  // but GAS will process it and send the email regardless.
+  try{
+    await fetch(EMAIL_CONFIG.gasUrl,{
+      method:'POST',
+      mode:'no-cors',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)
+    });
+  }catch(e){
+    // Network error (offline, bad URL, etc.)
+    throw new Error('Email network error: '+e.message);
+  }
 }
 
 /* ── Log email to Firestore ──────────────────────────────────────── */
@@ -3423,12 +3713,17 @@ const GAS_CODE=`function doPost(e){
       htmlBody:p.body,
       name:p.fromName||'Gift Management System'
     });
-    return ContentService.createTextOutput('OK')
-      .setMimeType(ContentService.MimeType.TEXT);
+    return ContentService.createTextOutput(JSON.stringify({status:'OK'}))
+      .setMimeType(ContentService.MimeType.JSON);
   }catch(err){
-    return ContentService.createTextOutput('ERROR: '+err.message)
-      .setMimeType(ContentService.MimeType.TEXT);
+    return ContentService.createTextOutput(JSON.stringify({status:'ERROR',message:err.message}))
+      .setMimeType(ContentService.MimeType.JSON);
   }
+}
+
+function doGet(e){
+  return ContentService.createTextOutput(JSON.stringify({status:'OK',message:'GMS Email Relay is running'}))
+    .setMimeType(ContentService.MimeType.JSON);
 }`;
 
 function renderEmailSettings(){
@@ -3541,7 +3836,7 @@ function renderEmailSettings(){
           </div>
         </div>`);
       await logEmail(to,profile.name||'','[Test] GMS Email Notification','test','success');
-      $("emailCfgMsg").innerHTML=`<span style="color:var(--success)">✅ Test email sent to ${esc(to)}</span>`;
+      $("emailCfgMsg").innerHTML=`<span style="color:var(--success)">✅ Request sent to ${esc(to)} — check inbox in 1–2 minutes (also check Spam).</span>`;
     }catch(err){
       $("emailCfgMsg").innerHTML=`<span style="color:var(--danger)">❌ ${esc(err.message)}</span>`;
     }
