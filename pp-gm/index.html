@@ -506,7 +506,7 @@ tr:hover td{background:#fafbfc}
 
         <!-- Register Form -->
         <form id="registerForm" style="display:none" onsubmit="handleRegister(event)">
-          <div class="kpi-reg-notice">New accounts are pending until a Plant Admin or Super Admin activates them.</div>
+          <div class="kpi-reg-notice">New accounts are pending until a Group Admin or Super Admin activates them.</div>
           <div class="kpi-reg-grid">
             <div class="kpi-reg-field"><label>Employee Code *</label><input class="bio-input-sm" id="regCode" required placeholder="EMP001"></div>
             <div class="kpi-reg-field"><label>Full Name *</label><input class="bio-input-sm" id="regName" required placeholder="Your name"></div>
@@ -516,7 +516,7 @@ tr:hover td{background:#fafbfc}
               <select class="bio-input-sm" id="regRole" required onchange="onRegRoleChange()">
                 <option value="employee">Employee</option>
                 <option value="top_management">Top Management</option>
-                <option value="plant_admin">Plant Admin</option>
+                <option value="plant_admin">Group Admin</option>
               </select>
             </div>
             <div class="kpi-reg-field"></div>
@@ -606,7 +606,7 @@ function normaliseRole(r){
   return m[(r||"").toLowerCase().trim()]||((r||"").toLowerCase().replace(/\s+/g,"_"));
 }
 function displayRole(r){
-  const m={superadmin:"Super Admin",plant_admin:"Plant Admin",top_management:"Top Management",employee:"Employee"};
+  const m={superadmin:"Super Admin",plant_admin:"Group Admin",top_management:"Top Management",employee:"Employee"};
   return m[r]||r||"Unknown";
 }
 function message(msg,type="notice"){$("message").textContent=msg;$("message").className="notice "+type;window.scrollTo({top:0,behavior:"smooth"});}
@@ -773,7 +773,7 @@ auth.onAuthStateChanged(async user=>{
     profile={...raw,role:normaliseRole(raw.role),name:raw.name||raw.email||"User"};
     if(profile.status!=="active"){
       await auth.signOut();
-      loginMsg("Your account is pending activation. Please contact your Plant Admin.","error");
+      loginMsg("Your account is pending activation. Please contact your Group Admin.","error");
       return;
     }
     await Promise.all([loadAllMasters(), loadAppSettings(), loadEmailConfig()]);
@@ -826,6 +826,79 @@ function mkChart(canvasId,key,type,data,opts={}){
   destroyChart(key);
   const ctx=document.getElementById(canvasId);if(!ctx)return;
   charts[key]=new Chart(ctx,{type,data,options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{font:{size:11},boxWidth:12}},tooltip:{mode:"index"}},...opts}});
+}
+
+/* ── Auto-notify plant admin(s) when employee submits a request ─────── */
+async function notifyPlantAdminsOnSubmit(payload){
+  if(!EMAIL_CONFIG.gasUrl) return; // email not configured — skip silently
+  try{
+    // Find plant admins for this employee's plant
+    const plantId=payload.plantId;
+    let adminSnap;
+    if(plantId){
+      adminSnap=await db.collection("users")
+        .where("role","==","plant_admin")
+        .where("status","==","active")
+        .where("plantId","==",plantId)
+        .limit(10).get();
+      // Also check plantIds array (multi-plant admins)
+      if(adminSnap.empty){
+        adminSnap=await db.collection("users")
+          .where("role","==","plant_admin")
+          .where("status","==","active")
+          .limit(50).get();
+        // filter client-side for multi-plant admins that cover this plant
+        const filtered=adminSnap.docs.filter(d=>{
+          const u=d.data();
+          return (u.plantIds&&u.plantIds.includes(plantId))||u.allPlants;
+        });
+        adminSnap={docs:filtered,empty:filtered.length===0};
+      }
+    } else {
+      // No plantId — notify all plant admins
+      adminSnap=await db.collection("users")
+        .where("role","==","plant_admin")
+        .where("status","==","active")
+        .limit(10).get();
+    }
+    if(adminSnap.empty) return;
+
+    const tmpl=EMAIL_TEMPLATES.request_submitted||defaultEmailTemplates().request_submitted;
+    const companyName=EMAIL_CONFIG.fromName||'Gift Management System';
+    const plantName=PLANTS[payload.plantId]||payload.plantId||'—';
+    const deptName=DEPTS[payload.departmentId]||payload.departmentId||'—';
+
+    const itemRow=`
+      <table style="width:100%;border-collapse:collapse;margin:0 0 16px;font-size:13px">
+        <tr style="background:#f8fafc"><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:600;width:40%">Gift / Occasion</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${esc(payload.giftName)} / ${esc(payload.occasion)}</td></tr>
+        <tr><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:600">Category</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${esc(payload.giftCategory||'—')}</td></tr>
+        <tr style="background:#f8fafc"><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:600">Quantity / Est. Cost</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${payload.requestedQuantity} × ₹${(payload.estimatedUnitCost||0).toLocaleString('en-IN')} = ₹${(payload.estimatedTotal||0).toLocaleString('en-IN')}</td></tr>
+        <tr><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:600">Distribution Date</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${payload.distributionDate||'—'}</td></tr>
+        <tr style="background:#f8fafc"><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:600">Requested By</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${esc(payload.requesterName)} (${esc(payload.employeeCode||'')})</td></tr>
+        <tr><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:600">Plant / Dept</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${esc(plantName)} / ${esc(deptName)}</td></tr>
+        ${payload.guestName?`<tr style="background:#f8fafc"><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:600">Guest</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${esc(payload.guestName)}${payload.guestOrganisation?' — '+esc(payload.guestOrganisation):''}</td></tr>`:''}
+        ${payload.remarks?`<tr><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:600">Remarks</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${esc(payload.remarks)}</td></tr>`:''}
+      </table>`;
+
+    for(const doc of adminSnap.docs){
+      const admin=doc.data();
+      if(!admin.email) continue;
+      const salutation=`Dear ${admin.name||'Group Admin'}`;
+      const subject=(tmpl.subject||'Gift Request Submitted — {{giftName}} ({{occasion}})')
+        .replace('{{giftName}}',payload.giftName)
+        .replace('{{occasion}}',payload.occasion);
+      const body=(tmpl.body||'')
+        .replace('{{salutation}}',salutation)
+        .replace('{{items}}',itemRow)
+        .replace(/\{\{companyName\}\}/g,companyName);
+      try{
+        await sendEmail(admin.email,admin.name||'Group Admin',subject,body);
+        await logEmail(admin.email,admin.name||'',subject,'request_submitted','success');
+      }catch(e){
+        await logEmail(admin.email,admin.name||'',subject,'request_submitted','failed',e.message);
+      }
+    }
+  }catch(e){/* silent — don't block the user flow */}
 }
 
 async function renderDashboard(){
@@ -1006,7 +1079,7 @@ function renderNewRequestForm(){
           <div style="font-size:11px;color:#a16207">This request will be tagged as a test record and can be identified separately.</div>
         </div>
       </div>`:""}
-      <div class="actions"><button type="submit">Submit for Plant Admin review</button></div>
+      <div class="actions"><button type="submit">Submit for Group Admin review</button></div>
     </form>`;
 
   // Category "Other" toggle
@@ -1085,7 +1158,9 @@ function renderNewRequestForm(){
       e.target.reset();
       $("giftCategoryOtherWrap").style.display="none";
       $("guestOrgOtherWrap").style.display="none";
-      message("Gift request submitted for Plant Admin review.","success");
+      message("Gift request submitted for Group Admin review.","success");
+      // Auto-notify plant admin(s) by email
+      notifyPlantAdminsOnSubmit(payload).catch(()=>{});
       await renderDashboard();showView("requests");
     }catch(err){message(err.message,"error");}
   });
@@ -1877,7 +1952,7 @@ async function loadPendingUsers(){
         <div><label>Password *</label><input id="cu_pass" type="password" placeholder="Min 6 chars"></div>
         <div><label>Role *</label><select id="cu_role">
           <option value="employee">Employee</option>
-          <option value="plant_admin">Plant Admin</option>
+          <option value="plant_admin">Group Admin</option>
           <option value="top_management">Top Management</option>
           <option value="superadmin">Super Admin</option>
         </select></div>
@@ -1988,7 +2063,7 @@ async function refreshPendingList(isSA){
       </td>
       <td><span class="uv">${esc(displayRole(u.role))}</span><select class="ue hidden" data-f="role" style="font-size:12px;padding:2px 4px">
         <option value="employee"${u.role==="employee"?" selected":""}>Employee</option>
-        <option value="plant_admin"${u.role==="plant_admin"?" selected":""}>Plant Admin</option>
+        <option value="plant_admin"${u.role==="plant_admin"?" selected":""}>Group Admin</option>
         <option value="top_management"${u.role==="top_management"?" selected":""}>Top Management</option>
         ${isSA?`<option value="superadmin"${u.role==="superadmin"?" selected":""}>Super Admin</option>`:""}
       </select></td>
@@ -2848,7 +2923,7 @@ function defaultEmailTemplates(){
   <p style="font-size:15px;color:#0f172a;margin:0 0 20px">{{salutation}},</p>
   <p style="font-size:14px;color:#334155;margin:0 0 20px;line-height:1.6">Here is an update on your gift request(s):</p>
   {{items}}
-  <p style="font-size:13px;color:#64748b;margin:20px 0 0;line-height:1.6">For questions, please contact your Plant Admin or Top Management team.</p>
+  <p style="font-size:13px;color:#64748b;margin:20px 0 0;line-height:1.6">For questions, please contact your Group Admin or Top Management team.</p>
 </div>
 <p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:16px">© {{companyName}} · Gift Management System</p>
 </div>`
@@ -2971,7 +3046,7 @@ function openRequestNotifyModal(){
           <label style="margin-bottom:6px">Recipient Email *</label>
           <input id="rn_to_email" type="email" placeholder="admin@company.com" style="margin-bottom:8px">
           <label style="margin-bottom:6px">Recipient Name</label>
-          <input id="rn_to_name" placeholder="Plant Admin / Manager">
+          <input id="rn_to_name" placeholder="Group Admin / Manager">
         </div>
         <label style="margin-bottom:6px">Select Requests to Include</label>
         <div style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px;background:var(--bg)">${rows}</div>
