@@ -7,7 +7,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
-<!-- No external email SDK needed — sends via Google Apps Script relay -->
+<script src="https://smtpjs.com/v3/smtp.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 .hidden{display:none!important}
@@ -560,7 +560,7 @@ let SETTINGS={allowDummyRequests:false};
 // In-memory master caches (refreshed on login & after mutations)
 let PLANTS={}, DEPTS={}, ORGS={}, GCATS=[];
 const charts={};
-let EMAIL_CONFIG={gasUrl:'',fromName:'Gift Management System'};
+let EMAIL_CONFIG={gmailUser:'',gmailPass:'',fromName:'Gift Management System'};
 let EMAIL_TEMPLATES={}; // loaded from Firestore settings/emailTemplates
 
 const $=id=>document.getElementById(id);
@@ -602,11 +602,7 @@ function applyBranding(b){
   // Left panel
   const ll=$("brandLogoLeft"),tl=$("brandTextLeft");
   if(ll&&tl){ll.src=b.logoBase64;ll.style.display="block";tl.style.display="none";}
-  // Right panel logo
-  const rl=$("brandLogoRight");
-  if(rl){
-    rl.innerHTML=`<img src="${b.logoBase64}" style="width:28px;height:28px;object-fit:contain">`;
-  }
+  // Right panel logo — always keep the gift icon, logo goes to left panel only
   // Header
   const hl=$("headerLogo");
   if(hl){hl.src=b.logoBase64;hl.style.display="block";}
@@ -904,7 +900,21 @@ function renderNewRequestForm(){
       <div class="guest-section" style="margin-top:22px">
         <div class="guest-title">👤 Guest / Recipient Information <span style="font-size:11px;font-weight:400;color:#0369a1">(optional — fill if gift is for an external guest)</span></div>
         <div class="grid-3">
-          <div><label>Guest Name</label><input id="guestName" placeholder="Full name"></div>
+          <div style="display:flex;gap:8px;align-items:flex-end">
+            <div style="width:110px;flex-shrink:0"><label>Salutation</label>
+              <select id="guestSalutation" style="height:38px">
+                <option value="Mr.">Mr.</option>
+                <option value="Mrs.">Mrs.</option>
+                <option value="Ms.">Ms.</option>
+                <option value="Dr.">Dr.</option>
+                <option value="Prof.">Prof.</option>
+                <option value="Shri">Shri</option>
+                <option value="Smt.">Smt.</option>
+                <option value="Er.">Er.</option>
+              </select>
+            </div>
+            <div style="flex:1"><label>Guest Name</label><input id="guestName" placeholder="Full name"></div>
+          </div>
           <div><label>Guest Email</label><input id="guestEmail" type="email" placeholder="guest@company.com"></div>
           <div><label>Guest Contact No.</label><input id="guestContact" inputmode="tel" placeholder="+91 XXXXX XXXXX"></div>
           <div><label>Guest Designation</label><input id="guestDesignation" placeholder="Director, Manager…"></div>
@@ -992,6 +1002,7 @@ function renderNewRequestForm(){
         plantId:profile.plantId||null,departmentId:profile.departmentId||null,
         requestedBy:currentUser.uid,requesterName:profile.name||"",employeeCode:profile.employeeCode||"",
         // Guest info
+        guestSalutation:$("guestSalutation")?.value||'Mr.',
         guestName:guestName,
         guestEmail:guestEmail,
         guestContact:$("guestContact").value.trim(),
@@ -1130,11 +1141,14 @@ async function loadRequests(){
   }catch(err){$("requestsView").innerHTML=`<div class="notice error">${esc(err.message)}</div>`;}
 }
 function requestActions(id,x){
+  const delBtn=profile.role==="superadmin"
+    ?` <button class="danger" data-id="${id}" data-action="delete" title="Delete request" style="font-size:12px;padding:5px 8px">🗑</button>`
+    :'';
   if(profile.role==="plant_admin"&&x.status==="pending_plant_review")
-    return `<button data-id="${id}" data-action="forward" style="font-size:12px;padding:5px 10px">Forward ➜</button> <button class="secondary" data-id="${id}" data-action="return" style="font-size:12px;padding:5px 10px">Return</button>`;
+    return `<button data-id="${id}" data-action="forward" style="font-size:12px;padding:5px 10px">Forward ➜</button> <button class="secondary" data-id="${id}" data-action="return" style="font-size:12px;padding:5px 10px">Return</button>${delBtn}`;
   if(["top_management","superadmin"].includes(profile.role)&&["pending_top_management","returned"].includes(x.status))
-    return `<button data-id="${id}" data-action="approve" style="font-size:12px;padding:5px 10px">Approve</button> <button class="secondary" data-id="${id}" data-action="partial" style="font-size:12px;padding:5px 10px">Partial</button> <button class="danger" data-id="${id}" data-action="reject" style="font-size:12px;padding:5px 10px">Reject</button>`;
-  return `<span style="color:var(--muted)">—</span>`;
+    return `<button data-id="${id}" data-action="approve" style="font-size:12px;padding:5px 10px">Approve</button> <button class="secondary" data-id="${id}" data-action="partial" style="font-size:12px;padding:5px 10px">Partial</button> <button class="danger" data-id="${id}" data-action="reject" style="font-size:12px;padding:5px 10px">Reject</button>${delBtn}`;
+  return delBtn||`<span style="color:var(--muted)">—</span>`;
 }
 async function processRequest(id,action){
   try{
@@ -1149,6 +1163,14 @@ async function processRequest(id,action){
       u.status="partially_approved";u.approvedQuantity=q;u.approvedBudget=q*Number(x.estimatedUnitCost||0);
     }
     if(action==="reject"){u.status="rejected";u.lastComment=prompt("Reason for rejection:")||"";}
+    if(action==="delete"){
+      if(profile.role!=="superadmin") return message("Only superadmin can delete requests.","error");
+      const giftName=x.giftName||"this request";
+      if(!confirm(`Permanently delete "${giftName}"?\n\nThis cannot be undone.`)) return;
+      await ref.delete();
+      await loadRequests();await renderDashboard();
+      message(`Request "${giftName}" deleted.`,"success");return;
+    }
     await ref.update(u);await loadRequests();await renderDashboard();message("Request updated.","success");
   }catch(err){message(err.message,"error");}
 }
@@ -1647,6 +1669,7 @@ async function renderAdmin(){
       ${isSA?'<button data-sub="seeder">🌱 Seeder</button>':''}
       ${isSA?'<button data-sub="settings">⚙ Settings</button>':''}
       <button data-sub="email">📧 Email Settings</button>
+      ${isSA?'<button data-sub="freshStart" style="color:#dc2626;border-color:#fca5a5">🔄 Fresh Start</button>':''}
     </div>
     <div id="adminUsers" class="master-section active"></div>
     <div id="adminPlants" class="master-section"></div>
@@ -1656,7 +1679,8 @@ async function renderAdmin(){
     ${isSA?'<div id="adminBranding" class="master-section"></div>':''}
     ${isSA?'<div id="adminSeeder" class="master-section"></div>':''}
     ${isSA?'<div id="adminSettings" class="master-section"></div>':''}
-    <div id="adminEmail" class="master-section"></div>`;
+    <div id="adminEmail" class="master-section"></div>
+    ${isSA?'<div id="adminFreshStart" class="master-section"></div>':''}`;
 
   document.querySelectorAll("#adminSubTabs button").forEach(b=>{
     b.onclick=()=>{
@@ -1681,6 +1705,7 @@ async function loadAdminSection(sub){
   else if(sub==="seeder")renderSeederSection();
   else if(sub==="settings")renderSettingsSection();
   else if(sub==="email")renderEmailSettings();
+  else if(sub==="freshStart")renderFreshStart();
 }
 
 async function loadPendingUsers(){
@@ -2031,8 +2056,7 @@ function renderBrandingSection(){
     // Reset UI
     const ll=$("brandLogoLeft"),tl=$("brandTextLeft");
     if(ll&&tl){ll.style.display="none";tl.style.display="flex";}
-    const rl=$("brandLogoRight");
-    if(rl){rl.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8" width="26" height="26"><rect x="1" y="8" width="22" height="13" rx="2"/><path d="M12 2l-3 6h6l-3-6z"/><line x1="12" y1="8" x2="12" y2="21"/><line x1="1" y1="14" x2="23" y2="14"/></svg>`;}
+    // brandLogoRight keeps gift icon — no change needed
     const hl=$("headerLogo");if(hl)hl.style.display="none";
     message("Logo removed.","success");renderBrandingSection();
   };
@@ -2486,6 +2510,109 @@ function exportRequestsPDF(){
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+   FRESH START — superadmin reset utility
+═══════════════════════════════════════════════════════════════════════ */
+function renderFreshStart(){
+  const el=$("adminFreshStart");if(!el)return;
+  el.innerHTML=`
+    <h3 style="color:#dc2626;margin-bottom:4px">🔄 Fresh Start</h3>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Permanently delete selected data to reset the app. Master data (plants, departments, organisations, users) is never touched.</p>
+
+    <div class="panel" style="border:2px solid #fca5a5;background:#fff5f5;margin-bottom:14px">
+      <div style="font-size:14px;font-weight:700;color:#991b1b;margin-bottom:12px">⚠️ Destructive Actions — Cannot Be Undone</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+
+        <!-- Gift Requests -->
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:#fff;border-radius:10px;border:1px solid #fecaca;gap:12px;flex-wrap:wrap">
+          <div>
+            <div style="font-weight:600;color:#1e293b;margin-bottom:2px">🎁 Gift Requests</div>
+            <div style="font-size:12px;color:var(--muted)">All gift request records across all statuses</div>
+          </div>
+          <button id="deleteReqBtn" style="background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">🗑 Delete All Requests</button>
+        </div>
+
+        <!-- Email Logs -->
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:#fff;border-radius:10px;border:1px solid #fecaca;gap:12px;flex-wrap:wrap">
+          <div>
+            <div style="font-weight:600;color:#1e293b;margin-bottom:2px">📬 Email Logs</div>
+            <div style="font-size:12px;color:var(--muted)">All email delivery history records</div>
+          </div>
+          <button id="deleteLogsBtn" style="background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">🗑 Clear Email Logs</button>
+        </div>
+
+        <!-- Full Reset -->
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:#fff0f0;border-radius:10px;border:2px dashed #ef4444;gap:12px;flex-wrap:wrap">
+          <div>
+            <div style="font-weight:700;color:#991b1b;margin-bottom:2px">💥 Complete Fresh Start</div>
+            <div style="font-size:12px;color:#b91c1c">Deletes ALL gift requests + email logs + email config + app settings in one shot</div>
+          </div>
+          <button id="fullResetBtn" style="background:linear-gradient(135deg,#7f1d1d,#991b1b);color:#fff;border:none;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap">💥 Full Reset</button>
+        </div>
+      </div>
+    </div>
+    <div id="freshStartLog" style="font-size:13px;color:var(--muted)"></div>`;
+
+  $("deleteReqBtn").onclick=()=>freshStartAction("requests");
+  $("deleteLogsBtn").onclick=()=>freshStartAction("logs");
+  $("fullResetBtn").onclick=()=>freshStartAction("full");
+}
+
+async function freshStartAction(type){
+  const labels={
+    requests:"ALL gift requests",
+    logs:"all email logs",
+    full:"ALL gift requests, email logs, email config and app settings"
+  };
+  const confirmText=`DELETE ${labels[type].toUpperCase()}`;
+  const typed=prompt(`⚠️ This will permanently delete ${labels[type]}.\n\nType exactly:\n${confirmText}\n\n...to confirm:`);
+  if(typed!==confirmText){
+    if(typed!==null) message("Confirmation text did not match. No data was deleted.","warn");
+    return;
+  }
+  const log=$("freshStartLog");
+  if(log) log.innerHTML=`<div style="color:var(--muted)">⏳ Working…</div>`;
+
+  async function deleteCollection(colName){
+    let deleted=0;
+    let snap=await db.collection(colName).limit(400).get();
+    while(!snap.empty){
+      const batch=db.batch();
+      snap.docs.forEach(d=>batch.delete(d.ref));
+      await batch.commit();
+      deleted+=snap.docs.length;
+      snap=await db.collection(colName).limit(400).get();
+    }
+    return deleted;
+  }
+
+  try{
+    let summary=[];
+    if(type==="requests"||type==="full"){
+      const n=await deleteCollection("giftRequests");
+      summary.push(`🎁 ${n} gift request${n!==1?'s':''} deleted`);
+    }
+    if(type==="logs"||type==="full"){
+      const n=await deleteCollection("emailLogs");
+      summary.push(`📬 ${n} email log record${n!==1?'s':''} deleted`);
+    }
+    if(type==="full"){
+      await db.collection("settings").doc("emailConfig").delete().catch(()=>{});
+      await db.collection("settings").doc("emailTemplates").delete().catch(()=>{});
+      await db.collection("settings").doc("appSettings").delete().catch(()=>{});
+      summary.push(`⚙️ Settings & email config cleared`);
+      EMAIL_CONFIG={gmailUser:'',gmailPass:'',fromName:'Gift Management System'};
+      EMAIL_TEMPLATES={};
+    }
+    if(log) log.innerHTML=summary.map(s=>`<div style="color:var(--success);margin-top:4px">✅ ${s}</div>`).join('');
+    message("Fresh start complete: "+summary.join(' · '),"success");
+    await renderDashboard();
+  }catch(err){
+    if(log) log.innerHTML=`<div style="color:var(--danger)">❌ Error: ${esc(err.message)}</div>`;
+    message("Reset failed: "+err.message,"error");
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
    EMAIL SYSTEM  — config, templates, sending, logging
 ═══════════════════════════════════════════════════════════════════════ */
 
@@ -2496,7 +2623,7 @@ async function loadEmailConfig(){
       db.collection("settings").doc("emailConfig").get(),
       db.collection("settings").doc("emailTemplates").get()
     ]);
-    if(cfgDoc.exists){const d=cfgDoc.data();EMAIL_CONFIG={gasUrl:d.gasUrl||'',fromName:d.fromName||'Gift Management System'};}
+    if(cfgDoc.exists){const d=cfgDoc.data();EMAIL_CONFIG={gmailUser:d.gmailUser||'',gmailPass:d.gmailPass||'',fromName:d.fromName||'Gift Management System'};}
     if(tmplDoc.exists) EMAIL_TEMPLATES={...defaultEmailTemplates(),...tmplDoc.data()};
     else EMAIL_TEMPLATES=defaultEmailTemplates();
   }catch(e){EMAIL_TEMPLATES=defaultEmailTemplates();}
@@ -2513,7 +2640,7 @@ function defaultEmailTemplates(){
   <p style="color:rgba(255,255,255,.8);margin:6px 0 0;font-size:13px">{{companyName}}</p>
 </div>
 <div style="background:#fff;border-radius:0 0 16px 16px;padding:28px 32px;border:1px solid #e2e8f0;border-top:none">
-  <p style="font-size:15px;color:#0f172a;margin:0 0 20px">Dear <strong>{{recipientName}}</strong>,</p>
+  <p style="font-size:15px;color:#0f172a;margin:0 0 20px">{{salutation}},</p>
   <p style="font-size:14px;color:#334155;margin:0 0 20px;line-height:1.6">The following gift request has been submitted and is pending your review:</p>
   {{items}}
   <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:16px;margin:20px 0">
@@ -2533,7 +2660,7 @@ function defaultEmailTemplates(){
   <p style="color:rgba(255,255,255,.8);margin:6px 0 0;font-size:13px">{{companyName}}</p>
 </div>
 <div style="background:#fff;border-radius:0 0 16px 16px;padding:28px 32px;border:1px solid #e2e8f0;border-top:none">
-  <p style="font-size:15px;color:#0f172a;margin:0 0 20px">Dear <strong>{{recipientName}}</strong>,</p>
+  <p style="font-size:15px;color:#0f172a;margin:0 0 20px">{{salutation}},</p>
   <p style="font-size:14px;color:#334155;margin:0 0 20px;line-height:1.6">Here is an update on your gift request(s):</p>
   {{items}}
   <p style="font-size:13px;color:#64748b;margin:20px 0 0;line-height:1.6">For questions, please contact your Plant Admin or Top Management team.</p>
@@ -2550,7 +2677,7 @@ function defaultEmailTemplates(){
   <p style="color:rgba(255,255,255,.85);margin:8px 0 0;font-size:14px">{{companyName}}</p>
 </div>
 <div style="background:#fff;border-radius:0 0 16px 16px;padding:32px;border:1px solid #e2e8f0;border-top:none">
-  <p style="font-size:16px;color:#0f172a;margin:0 0 20px">Dear <strong>{{guestName}}</strong>,</p>
+  <p style="font-size:16px;color:#0f172a;margin:0 0 20px">{{salutation}},</p>
   <div style="background:linear-gradient(135deg,#fff0f6,#fce7f3);border-left:4px solid #c2255c;border-radius:0 12px 12px 0;padding:20px;margin:0 0 24px">
     <p style="font-size:15px;color:#831843;line-height:1.7;margin:0">{{messageBody}}</p>
   </div>
@@ -2588,28 +2715,32 @@ function buildRequestItemsHTML(items){
     </div>`).join('');
 }
 
-/* ── Core send function via Google Apps Script relay ────────────── */
+/* ── Salutation helper ───────────────────────────────────────────── */
+function buildSalutation(name){
+  if(!name) return 'Dear Sir/Madam';
+  const titled=/^(Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Shri|Smt\.|Er\.)\s/i.test(name.trim());
+  if(titled) return 'Dear '+name.trim();
+  return 'Dear '+name.trim();
+}
+
+/* ── Core send function via SMTP.js (Gmail App Password) ────────── */
 async function sendEmail(toEmail, toName, subject, htmlBody){
-  if(!EMAIL_CONFIG.gasUrl) throw new Error('Email relay not configured. Go to Admin → Email Settings.');
-  const payload={
-    to: toEmail,
-    toName: toName||'',
-    subject: subject,
-    html: htmlBody,
-    fromName: EMAIL_CONFIG.fromName||'Gift Management System'
-  };
-  // Use no-cors for GAS — GAS returns opaque response but email is sent
-  const resp = await fetch(EMAIL_CONFIG.gasUrl, {
-    method:'POST',
-    headers:{'Content-Type':'text/plain'}, // text/plain avoids CORS preflight
-    body: JSON.stringify(payload)
+  if(!EMAIL_CONFIG.gmailUser||!EMAIL_CONFIG.gmailPass)
+    throw new Error('Gmail not configured. Go to Admin → Email Settings.');
+  return new Promise((resolve,reject)=>{
+    Email.send({
+      Host:'smtp.gmail.com',
+      Username:EMAIL_CONFIG.gmailUser,
+      Password:EMAIL_CONFIG.gmailPass,
+      To:toName?`"${toName}" <${toEmail}>`:toEmail,
+      From:`"${EMAIL_CONFIG.fromName||'Gift Management System'}" <${EMAIL_CONFIG.gmailUser}>`,
+      Subject:subject,
+      Body:htmlBody
+    }).then(msg=>{
+      if(msg==='OK') resolve();
+      else reject(new Error(msg||'Send failed'));
+    }).catch(reject);
   });
-  // GAS with no-cors gives opaque response (status 0); treat as success
-  // If GAS URL is wrong it will throw a network error
-  if(resp.type!=='opaque'&&!resp.ok){
-    const txt=await resp.text().catch(()=>'');
-    throw new Error('Relay error: '+(txt||resp.status));
-  }
 }
 
 /* ── Log email to Firestore ──────────────────────────────────────── */
@@ -2698,7 +2829,7 @@ function previewRequestNotify(pending){
   const tmpl=EMAIL_TEMPLATES.request_submitted||defaultEmailTemplates().request_submitted;
   const co=BRANDING.companyName||'Gift Management System';
   const toName=document.getElementById('rn_to_name')?.value||'Admin';
-  const body=fillTemplate(tmpl.body,{companyName:co,recipientName:toName,items:buildRequestItemsHTML(selected)});
+  const body=fillTemplate(tmpl.body,{companyName:co,salutation:`Dear <strong>${toName}</strong>`,items:buildRequestItemsHTML(selected)});
   const preview=document.getElementById('rn_preview');
   if(preview)preview.innerHTML=body;
 }
@@ -2712,7 +2843,7 @@ async function sendRequestNotify(pending){
   if(!toEmail){message("Please enter recipient email address.","warn");return;}
   const tmpl=EMAIL_TEMPLATES.request_submitted||defaultEmailTemplates().request_submitted;
   const co=BRANDING.companyName||'Gift Management System';
-  const body=fillTemplate(tmpl.body,{companyName:co,recipientName:toName,items:buildRequestItemsHTML(selected)});
+  const body=fillTemplate(tmpl.body,{companyName:co,salutation:`Dear <strong>${toName}</strong>`,items:buildRequestItemsHTML(selected)});
   try{
     const btn=document.querySelector('#reqNotifyModal button:last-child');
     if(btn){btn.disabled=true;btn.textContent='Sending…';}
@@ -2792,7 +2923,7 @@ async function sendApprovalNotify(byUser,userKeys){
     const u=byUser[userKeys[i]];
     const toName=u.name||'Employee';
     const subject=fillTemplate(tmpl.subject||'Gift Request Status Update',{occasion:'Your Request Updates',giftName:'Multiple'});
-    const body=fillTemplate(tmpl.body,{companyName:co,recipientName:toName,items:buildRequestItemsHTML(u.items)});
+    const body=fillTemplate(tmpl.body,{companyName:co,salutation:`Dear <strong>${toName}</strong>`,items:buildRequestItemsHTML(u.items)});
     try{
       await sendEmail(toEmail,toName,subject,body);
       await logEmail(toEmail,toName,subject,'approval_notification','success');
@@ -2868,7 +2999,8 @@ function previewBulkGuest(guests){
   const first=guests[0];
   if(!first)return;
   const msg=document.getElementById('bg_message')?.value||'';
-  const body=fillTemplate(tmpl.body,{companyName:co,guestName:esc(first.guestName||'Guest'),messageBody:msg,senderName:profile.name||'GMS Team'});
+  const sal=`Dear <strong>${esc((first.guestSalutation?first.guestSalutation+' ':'')+first.guestName||'Guest')}</strong>`;
+  const body=fillTemplate(tmpl.body,{companyName:co,salutation:sal,guestName:esc(first.guestName||'Guest'),messageBody:msg,senderName:profile.name||'GMS Team'});
   const preview=document.getElementById('bg_preview');
   if(preview)preview.innerHTML=body;
 }
@@ -2886,7 +3018,8 @@ async function sendBulkGuest(guests){
     if(!cb||!cb.checked)continue;
     const g=guests[i];
     if(!g.guestEmail)continue;
-    const body=fillTemplate(tmpl.body,{companyName:co,guestName:esc(g.guestName||'Guest'),messageBody:msgBody,senderName:profile.name||'GMS Team'});
+    const gSal=`Dear <strong>${esc((g.guestSalutation?g.guestSalutation+' ':'')+g.guestName||'Guest')}</strong>`;
+    const body=fillTemplate(tmpl.body,{companyName:co,salutation:gSal,guestName:esc(g.guestName||'Guest'),messageBody:msgBody,senderName:profile.name||'GMS Team'});
     try{
       await sendEmail(g.guestEmail,g.guestName||'Guest',subject,body);
       await logEmail(g.guestEmail,g.guestName||'',subject,'guest_wishes','success');
@@ -2983,44 +3116,23 @@ function renderEmailSettings(){
 
   el.innerHTML=`
     <h3 style="margin-bottom:6px">📧 Email Settings</h3>
-    <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Emails are sent via your own Gmail account using a free Google Apps Script relay — no third-party service, no OAuth popup.</p>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Enter your Gmail address and 16-digit App Password — emails are sent directly from your Gmail account.</p>
 
-    <!-- Setup steps -->
-    <div class="panel" style="margin:0 0 14px;background:linear-gradient(135deg,#eff6ff,#f0fdf4)">
-      <div style="font-size:14px;font-weight:700;margin-bottom:10px">📋 One-Time Setup (2 minutes)</div>
-      <ol style="font-size:13px;color:#1e3a5f;margin:0;padding-left:18px;line-height:2">
-        <li>Open <a href="https://script.google.com" target="_blank" style="color:var(--primary);font-weight:600">script.google.com</a> → <strong>New project</strong></li>
-        <li>Paste the Apps Script code below → click <strong>Save</strong></li>
-        <li>Click <strong>Deploy → New deployment</strong> → Type: <strong>Web app</strong></li>
-        <li>Execute as: <strong>Me</strong> · Who has access: <strong>Anyone</strong> → <strong>Deploy</strong></li>
-        <li>Copy the <strong>Web app URL</strong> and paste it below</li>
-      </ol>
-      <div style="margin-top:12px">
-        <div style="font-size:12px;font-weight:600;color:#334155;margin-bottom:6px">📄 Apps Script Code — paste into script.google.com:</div>
-        <pre style="background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px;font-size:12px;overflow-x:auto;line-height:1.6;margin:0">function doPost(e){
-  try{
-    var p=JSON.parse(e.postData.contents);
-    GmailApp.sendEmail(p.to,p.subject,'',{
-      htmlBody:p.html,
-      name:p.fromName||'Gift Management System'
-    });
-    return ContentService
-      .createTextOutput(JSON.stringify({success:true}))
-      .setMimeType(ContentService.MimeType.JSON);
-  }catch(err){
-    return ContentService
-      .createTextOutput(JSON.stringify({success:false,error:err.message}))
-      .setMimeType(ContentService.MimeType.JSON);
-  }
-}</pre>
+    <div class="panel" style="margin:0 0 10px;background:linear-gradient(135deg,#fffbeb,#fef9c3);border:1px solid #fde68a">
+      <div style="font-size:13px;color:#78350f;line-height:1.7">
+        <strong>🔑 How to get your 16-digit App Password:</strong><br>
+        1. Go to <a href="https://myaccount.google.com/security" target="_blank" style="color:#92400e;font-weight:600">myaccount.google.com/security</a><br>
+        2. Enable <strong>2-Step Verification</strong> (if not already on)<br>
+        3. Search for <strong>"App passwords"</strong> → Select app: <em>Mail</em> → Select device: <em>Other</em> → <strong>Generate</strong><br>
+        4. Copy the 16-character password shown and paste below
       </div>
     </div>
 
-    <!-- Config -->
     <div class="panel" style="margin:0 0 14px">
-      <div style="font-size:14px;font-weight:700;margin-bottom:12px">🔧 Configuration</div>
+      <div style="font-size:14px;font-weight:700;margin-bottom:12px">🔧 Gmail Configuration</div>
       <div class="email-cfg-row">
-        <div style="grid-column:1/-1"><label>Google Apps Script Web App URL *</label><input id="em_gasUrl" placeholder="https://script.google.com/macros/s/xxxxxxxx/exec" value="${esc(cfg.gasUrl||'')}"><small style="font-size:11px;color:var(--muted)">From Deploy → Manage deployments → Web app URL</small></div>
+        <div><label>Gmail Address *</label><input id="em_gmailUser" type="email" placeholder="yourname@gmail.com" value="${esc(cfg.gmailUser||'')}"></div>
+        <div><label>App Password * (16 digits, no spaces)</label><input id="em_gmailPass" type="password" placeholder="xxxxxxxxxxxxxxxx" value="${esc(cfg.gmailPass||'')}"><small style="font-size:11px;color:var(--muted)">Stored securely in Firestore. Never shared externally.</small></div>
         <div><label>From Name (shown in emails)</label><input id="em_fromName" placeholder="Gift Management System" value="${esc(cfg.fromName||'')}"></div>
       </div>
       <div class="actions" style="margin-top:4px">
@@ -3033,7 +3145,7 @@ function renderEmailSettings(){
     <!-- Email Templates -->
     <div class="panel" style="margin:0 0 14px">
       <div style="font-size:14px;font-weight:700;margin-bottom:4px">📝 Email Templates</div>
-      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Edit the HTML body for each notification type. Supported placeholders: <code>{{companyName}}</code>, <code>{{recipientName}}</code>, <code>{{items}}</code>, <code>{{guestName}}</code>, <code>{{messageBody}}</code>, <code>{{senderName}}</code></p>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Edit the HTML body for each notification type. Supported placeholders: <code>{{salutation}}</code> (e.g. <em>Dear Mr. Amit Patel</em>), <code>{{companyName}}</code>, <code>{{items}}</code>, <code>{{guestName}}</code>, <code>{{messageBody}}</code>, <code>{{senderName}}</code></p>
       <div class="masters-tabs" id="tmplTabs" style="margin-bottom:12px">
         <button class="active" data-tmpl="request_submitted">📤 Request Submitted</button>
         <button data-tmpl="approval_notification">✅ Approval Update</button>
@@ -3064,11 +3176,15 @@ function renderEmailSettings(){
   // Wire config save
   $("saveEmailCfgBtn").onclick=async()=>{
     const cfg2={
-      gasUrl:$("em_gasUrl").value.trim(),
+      gmailUser:$("em_gmailUser").value.trim(),
+      gmailPass:$("em_gmailPass").value.replace(/\s/g,''),
       fromName:$("em_fromName").value.trim()||'Gift Management System'
     };
-    if(!cfg2.gasUrl||!cfg2.gasUrl.startsWith('https://script.google.com')){
-      $("emailCfgMsg").innerHTML=`<span style="color:var(--danger)">Please enter a valid Google Apps Script Web App URL.</span>`;return;
+    if(!cfg2.gmailUser||!cfg2.gmailPass){
+      $("emailCfgMsg").innerHTML=`<span style="color:var(--danger)">Gmail address and App Password are required.</span>`;return;
+    }
+    if(cfg2.gmailPass.length!==16){
+      $("emailCfgMsg").innerHTML=`<span style="color:var(--danger)">App Password must be exactly 16 characters (spaces are stripped automatically).</span>`;return;
     }
     $("saveEmailCfgBtn").disabled=true;$("saveEmailCfgBtn").textContent="Saving…";
     await db.collection("settings").doc("emailConfig").set({...cfg2,updatedAt:ts(),updatedBy:currentUser.uid},{merge:true});
