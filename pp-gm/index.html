@@ -2034,9 +2034,15 @@ function handleXlsxFile(file){
       const ws=wb.Sheets[sheetName];
       const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
       if(rows.length<2){message("The file appears empty or has no data rows.","error");return;}
-      const rawHeaders=rows[0].map(h=>String(h).trim().toLowerCase().replace(/\s+/g,""));
-      bulkParsed=rows.slice(1,501).map((row,i)=>{
-        const obj={_rowNum:i+2};
+      // Auto-detect header row: find first row that contains "giftname" (handles title rows above headers)
+      let headerRowIdx=0;
+      for(let ri=0;ri<Math.min(rows.length,5);ri++){
+        const cells=rows[ri].map(h=>String(h).trim().toLowerCase().replace(/\s+/g,""));
+        if(cells.includes("giftname")){headerRowIdx=ri;break;}
+      }
+      const rawHeaders=rows[headerRowIdx].map(h=>String(h).trim().toLowerCase().replace(/\s+/g,""));
+      bulkParsed=rows.slice(headerRowIdx+1,headerRowIdx+501).filter(row=>row.some(c=>String(c).trim()!=="")).map((row,i)=>{
+        const obj={_rowNum:headerRowIdx+i+2};
         BULK_COLS.forEach(col=>{
           const idx=rawHeaders.indexOf(col.toLowerCase());
           // also accept old column name "distributiondate" for backward compat
@@ -2084,15 +2090,32 @@ function renderBulkPreview(){
   $("bulkClearBtn").onclick=()=>{bulkParsed=[];$("bulkPreview").innerHTML="";$("bulkActions").style.display="none";if($("xlsxFile"))$("xlsxFile").value="";};
 }
 
+function updateBulkProgress(done,total,failed){
+  const pct=total>0?Math.round((done/total)*100):0;
+  const bar=$("bulkProgressBar");const lbl=$("bulkProgressLbl");
+  if(bar)bar.style.width=pct+"%";
+  if(lbl)lbl.textContent=`Submitting… ${done} / ${total}${failed>0?" ("+failed+" failed)":""}`;
+}
+
 async function submitBulk(){
   const valid=bulkParsed.filter(r=>r._valid);
   if(!valid.length)return;
   $("bulkSubmitBtn").disabled=true;
   $("bulkProgress").style.display="block";
-  $("bulkProgress").innerHTML=`<div class="notice">⏳ Submitting ${valid.length} requests…</div>`;
+  $("bulkProgress").innerHTML=`
+    <div style="margin:8px 0">
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:5px">
+        <span id="bulkProgressLbl">Submitting… 0 / ${valid.length}</span>
+        <span id="bulkProgressPct">0%</span>
+      </div>
+      <div style="background:#e2e8f0;border-radius:999px;height:10px;overflow:hidden">
+        <div id="bulkProgressBar" style="height:100%;background:linear-gradient(90deg,#2563eb,#3b82f6);border-radius:999px;width:0%;transition:width 0.3s ease"></div>
+      </div>
+    </div>`;
   let done=0,failed=0;
+  const total=valid.length;
   // Process in chunks of 499 (Firestore batch limit)
-  for(let chunk=0;chunk<valid.length;chunk+=499){
+  for(let chunk=0;chunk<total;chunk+=499){
     const slice=valid.slice(chunk,chunk+499);
     const batch=db.batch();
     for(const r of slice){
@@ -2109,13 +2132,25 @@ async function submitBulk(){
         status:"pending_plant_review",_bulkUpload:true,createdAt:ts()
       });
     }
-    try{await batch.commit();done+=slice.length;}
-    catch(e){failed+=slice.length;}
+    try{
+      await batch.commit();
+      done+=slice.length;
+    }catch(e){
+      failed+=slice.length;
+      done+=slice.length; // count toward progress anyway
+    }
+    // Update progress bar
+    const pct=Math.round((done/total)*100);
+    const bar=$("bulkProgressBar");const lbl=$("bulkProgressLbl");const pctEl=$("bulkProgressPct");
+    if(bar)bar.style.width=pct+"%";
+    if(pctEl)pctEl.textContent=pct+"%";
+    if(lbl)lbl.textContent=`Submitting… ${done} / ${total}${failed>0?" ("+failed+" failed)":""}`;
   }
+  const realDone=done-failed;
   if(failed===0){
-    $("bulkProgress").innerHTML=`<div class="notice success">✅ ${done} requests submitted successfully.</div>`;
+    $("bulkProgress").innerHTML=`<div class="notice success" style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">✅</span><span><strong>${realDone} request${realDone!==1?"s":""} submitted successfully.</strong></span></div>`;
   }else{
-    $("bulkProgress").innerHTML=`<div class="notice ${done>0?"":"error"}">${done>0?"✅ "+done+" submitted":""}${failed>0?" ⚠ "+failed+" failed":""}</div>`;
+    $("bulkProgress").innerHTML=`<div class="notice ${realDone>0?"":"error"}" style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">${realDone>0?"⚠":"❌"}</span><span>${realDone>0?"<strong>"+realDone+" submitted.</strong> ":""}<span style="color:var(--danger)">${failed} batch${failed!==1?"es":""} failed — check your connection and try again.</span></span></div>`;
   }
   bulkParsed=[];$("bulkPreview").innerHTML="";$("bulkActions").style.display="none";if($("xlsxFile"))$("xlsxFile").value="";
   $("bulkSubmitBtn").disabled=false;
