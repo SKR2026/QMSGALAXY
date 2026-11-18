@@ -726,8 +726,11 @@ async function handleRegister(e){
     $("regSubmitBtn").innerHTML=`<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg> Create Account`;
   }catch(err){
     window._isRegistering=false;
-    // If Firebase Auth error (not Firestore), no auth user to clean up
-    loginMsg(err.message,"error");
+    if(err.code==="auth/email-already-in-use"){
+      loginMsg("This email is already registered in Firebase Authentication. If this account was deleted from the app, a Super Admin must also remove it from Firebase Authentication → Users in the Firebase Console before it can be re-used.","error");
+    } else {
+      loginMsg(err.message,"error");
+    }
   }
   btn.disabled=false;
 }
@@ -1982,7 +1985,7 @@ function renderBulkUpload(){
 
     <div style="margin-bottom:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <button id="downloadTemplate" class="secondary">&#x2B07; Download Excel Template</button>
-      <span style="font-size:12px;color:var(--muted)">Required columns: <code>giftName, occasion, giftCategory, quantity</code> &nbsp;|&nbsp; Use <code>requiredByDate</code> for the needed-by date (YYYY-MM-DD)</span>
+      <span style="font-size:12px;color:var(--muted)">Required columns: <code>giftName, occasion, giftCategory, quantity</code> &nbsp;|&nbsp; Use <code>requiredByDate</code> for the needed-by date (DD-MM-YYYY)</span>
     </div>
 
     <div class="upload-zone" id="uploadZone">
@@ -2054,7 +2057,14 @@ function handleXlsxFile(file){
         if(!obj.occasion)errors.push("occasion required");
         if(!obj.giftCategory)errors.push("giftCategory required");
         if(!obj.quantity||isNaN(Number(obj.quantity))||Number(obj.quantity)<1)errors.push("quantity must be ≥ 1");
-        if(obj.requiredByDate&&!/^\d{4}-\d{2}-\d{2}$/.test(obj.requiredByDate))errors.push("requiredByDate must be YYYY-MM-DD");
+        // Accept DD-MM-YYYY and convert to YYYY-MM-DD for storage
+        if(obj.requiredByDate){
+          if(/^\d{2}-\d{2}-\d{4}$/.test(obj.requiredByDate)){
+            const p=obj.requiredByDate.split('-');obj.requiredByDate=`${p[2]}-${p[1]}-${p[0]}`;
+          } else if(!/^\d{4}-\d{2}-\d{2}$/.test(obj.requiredByDate)){
+            errors.push("requiredByDate must be DD-MM-YYYY");
+          }
+        }
         obj._errors=errors;obj._valid=errors.length===0;
         return obj;
       });
@@ -2371,7 +2381,7 @@ async function refreshPendingList(isSA){
   let pRows=[];
   snap.forEach(d=>{
     const u=d.data();
-    pRows.push(`<tr><td>${esc(u.employeeCode)}</td><td>${esc(u.name)}</td><td>${esc(u.designation)}</td><td>${esc(u.email)}</td><td>${esc(PLANTS[u.plantId]||u.plantId||"—")}</td><td>${esc(displayRole(u.role))}</td><td><button data-uid="${d.id}" class="activate-btn" style="font-size:12px;padding:5px 10px">✅ Activate</button></td></tr>`);
+    pRows.push(`<tr><td>${esc(u.employeeCode)}</td><td>${esc(u.name)}</td><td>${esc(u.designation)}</td><td>${esc(u.email)}</td><td>${esc(PLANTS[u.plantId]||u.plantId||"—")}</td><td>${esc(displayRole(u.role))}</td><td style="display:flex;gap:6px;align-items:center"><button data-uid="${d.id}" class="activate-btn" style="font-size:12px;padding:5px 10px">✅ Activate</button><button data-uid="${d.id}" data-email="${esc(u.email||'')}" class="del-pending-btn danger" style="font-size:12px;padding:5px 10px">🗑 Delete</button></td></tr>`);
   });
   // Load active users
   let aSnap;
@@ -2414,7 +2424,7 @@ async function refreshPendingList(isSA){
         <button class="icon-btn u-edit" title="Edit">✏️</button>
         <button class="icon-btn u-save hidden" title="Save" style="color:var(--success)">✔</button>
         <button class="icon-btn u-cancel hidden" title="Cancel">✕</button>
-        ${isSA?`<button class="icon-btn u-deact" title="Deactivate" style="color:var(--danger)">🚫</button>`:""}
+        ${isSA?`<button class="icon-btn u-deact" title="Deactivate" style="color:var(--danger)">🚫</button><button class="icon-btn u-del" title="Delete User" style="color:#dc2626;font-size:14px" data-email="${esc(u.email||'')}">🗑</button>`:""}
       </td>
     </tr>`);
   });
@@ -2431,6 +2441,18 @@ async function refreshPendingList(isSA){
   pendEl.querySelectorAll(".activate-btn").forEach(b=>b.onclick=async()=>{
     await db.collection("users").doc(b.dataset.uid).update({status:"active",updatedAt:ts()});
     await refreshPendingList(isSA);message("Account activated.","success");
+  });
+  // Wire pending delete buttons
+  pendEl.querySelectorAll(".del-pending-btn").forEach(b=>b.onclick=async()=>{
+    const userEmail=b.dataset.email||'this user';
+    if(!confirm(`Delete pending account "${userEmail}"?\n\nThis removes them from Firestore. You will also need to delete them from Firebase Authentication (a link will open).`))return;
+    try{
+      await db.collection("users").doc(b.dataset.uid).delete();
+      await refreshPendingList(isSA);
+      const firebaseProject=(firebase.app().options.projectId||'');
+      const authUrl=`https://console.firebase.google.com/project/${firebaseProject}/authentication/users`;
+      message(`Account deleted. <a href="${authUrl}" target="_blank" style="color:#1d4ed8;font-weight:600;text-decoration:underline">Also delete from Firebase Authentication →</a>`,'success');
+    }catch(e){message("Delete failed: "+e.message,"error");}
   });
 
   // Wire active user edit / save / cancel / deactivate
@@ -2473,6 +2495,21 @@ async function refreshPendingList(isSA){
       if(!confirm("Deactivate this user? They will not be able to log in."))return;
       await db.collection("users").doc(uid).update({status:"inactive",updatedAt:ts()});
       await refreshPendingList(isSA);message("User deactivated.","success");
+    };
+    const delBtn=tr.querySelector(".u-del");
+    if(delBtn)delBtn.onclick=async()=>{
+      const userEmail=delBtn.dataset.email||'this user';
+      if(!confirm(`Permanently delete "${userEmail}" from the app?\n\nThis removes their profile from Firestore. You will also need to delete them from Firebase Authentication (a link will open).`))return;
+      try{
+        await db.collection("users").doc(uid).delete();
+        await refreshPendingList(isSA);
+        // Show banner with Firebase Console Auth link
+        const firebaseProject=(firebase.app().options.projectId||'');
+        const authUrl=`https://console.firebase.google.com/project/${firebaseProject}/authentication/users`;
+        message(`User deleted from app. <a href="${authUrl}" target="_blank" style="color:#1d4ed8;font-weight:600;text-decoration:underline">Click here to also delete from Firebase Authentication →</a>`,'success');
+      }catch(e){
+        message("Delete failed: "+e.message,"error");
+      }
     };
   });
 }
