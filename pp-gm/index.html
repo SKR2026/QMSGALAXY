@@ -695,6 +695,10 @@ async function handleRegister(e){
     const allowedDomain=BRANDING.allowedEmailDomain||"";
     if(allowedDomain&&!email.toLowerCase().endsWith("@"+allowedDomain))
       throw new Error(`Only @${allowedDomain} email addresses are allowed to register.`);
+    // Set flag BEFORE creating auth user to prevent onAuthStateChanged race condition
+    // (onAuthStateChanged fires immediately on createUserWithEmailAndPassword, before the
+    //  Firestore users doc is written, causing "User profile not found" error)
+    window._isRegistering=true;
     // Create Firebase Auth user first (Firebase itself blocks duplicate emails)
     const cred=await auth.createUserWithEmailAndPassword(email,$("regPassword").value);
     // Check duplicate employee code after auth (now signed in, so read is allowed)
@@ -713,9 +717,9 @@ async function handleRegister(e){
       email,mobile:$("regMobile").value.trim(),role:regRole,status:"pending",createdAt:ts()
     });
     loginMsg("Account created! Please wait for administrator activation.","success");
-    await auth.signOut();setAuthMode("login");
+    await auth.signOut();window._isRegistering=false;setAuthMode("login");
     $("regSubmitBtn").innerHTML=`<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg> Create Account`;
-  }catch(err){loginMsg(err.message,"error");}
+  }catch(err){window._isRegistering=false;loginMsg(err.message,"error");}
   btn.disabled=false;
 }
 
@@ -754,6 +758,7 @@ async function loadMasters(){
 
 /* ═══ Auth state ═══ */
 auth.onAuthStateChanged(async user=>{
+  if(window._isRegistering) return; // registration in progress — Firestore doc not yet written; ignore this event
   currentUser=user;profile=null;
   if(!user){
     $("loginOverlay").classList.remove("hidden");
@@ -845,7 +850,10 @@ async function notifyPlantAdminsOnSubmit(payload){
         || (u.plantIds&&u.plantIds.includes(plantId))
         || u.allPlants===true;
     });
-    if(!adminDocs.length) return;
+    if(!adminDocs.length){
+      try{await db.collection("emailLogs").add({to:'(group admins)',toName:'',subject:'No Group Admin found — plant: '+(plantId||'any'),type:'request_submitted',status:'failed',error:'No active plant_admin users found matching plant "'+(plantId||'any')+'". Check Admin → User Activation to confirm Group Admin accounts exist and are active.',sentBy:currentUser.uid,sentByName:profile.name||'',sentAt:ts()});}catch(_){}
+      return;
+    }
     const adminSnap={docs:adminDocs};
 
     const tmpl=EMAIL_TEMPLATES.request_submitted||defaultEmailTemplates().request_submitted;
@@ -867,15 +875,14 @@ async function notifyPlantAdminsOnSubmit(payload){
 
     for(const doc of adminSnap.docs){
       const admin=doc.data();
-      if(!admin.email) continue;
-      const salutation=`Dear ${admin.name||'Group Admin'}`;
-      const subject=(tmpl.subject||'Gift Request Submitted — {{giftName}} ({{occasion}})')
-        .replace('{{giftName}}',payload.giftName)
-        .replace('{{occasion}}',payload.occasion);
-      const body=(tmpl.body||'')
-        .replace('{{salutation}}',salutation)
-        .replace('{{items}}',itemRow)
-        .replace(/\{\{companyName\}\}/g,companyName);
+      if(!admin.email){
+        const noEmailSubject=payload.giftName+' — '+payload.occasion;
+        await logEmail('(no email)',admin.name||'Group Admin',noEmailSubject,'request_submitted','failed','Group Admin "'+esc(admin.name||'Unknown')+'" has no email address stored in their user profile. Ask them to log in and ensure their email is saved.');
+        continue;
+      }
+      const salutation=buildSalutation(admin.name||'Group Admin');
+      const subject=fillTemplate(tmpl.subject||'Gift Request Submitted — {{giftName}} ({{occasion}})',{giftName:payload.giftName,occasion:payload.occasion});
+      const body=buildTemplateEmailHtml('request_submitted',tmpl.plainBody||defaultEmailTemplates().request_submitted.plainBody,{salutation,items:itemRow,companyName});
       try{
         await sendEmail(admin.email,admin.name||'Group Admin',subject,body);
         await logEmail(admin.email,admin.name||'',subject,'request_submitted','success');
@@ -906,7 +913,10 @@ async function notifyPlantAdminsOnSubmitMulti(basePayload, guests){
       const u=d.data();
       return u.plantId===plantId||(u.plantIds&&u.plantIds.includes(plantId))||u.allPlants===true;
     });
-    if(!adminDocs.length) return;
+    if(!adminDocs.length){
+      try{await db.collection("emailLogs").add({to:'(group admins)',toName:'',subject:'No Group Admin found — multi-guest submission',type:'request_submitted',status:'failed',error:'No active plant_admin users found matching plant "'+(plantId||'any')+'". Check Admin → User Activation.',sentBy:currentUser.uid,sentByName:profile.name||'',sentAt:ts()});}catch(_){}
+      return;
+    }
     const companyName=EMAIL_CONFIG.fromName||'Gift Management System';
     const plantName=PLANTS[basePayload.plantId]||basePayload.plantId||'—';
     const deptName=DEPTS[basePayload.departmentId]||basePayload.departmentId||'—';
@@ -959,7 +969,10 @@ async function notifyPlantAdminsOnSubmitMulti(basePayload, guests){
     const subject=`Gift Request: ${basePayload.giftName} — ${guests.length} Guest${guests.length!==1?'s':''} (${basePayload.occasion})`;
     for(const doc of adminDocs){
       const admin=doc.data();
-      if(!admin.email) continue;
+      if(!admin.email){
+        await logEmail('(no email)',admin.name||'Group Admin',subject,'request_submitted','failed','Group Admin "'+esc(admin.name||'Unknown')+'" has no email address stored in their user profile.');
+        continue;
+      }
       try{
         await sendEmail(admin.email,admin.name||'Group Admin',subject,body);
         await logEmail(admin.email,admin.name||'',subject,'request_submitted','success');
@@ -2136,8 +2149,8 @@ function renderWishesEmail(){
     <div style="max-width:760px">
       <h2 style="margin-bottom:6px">✉️ Wishes Email Template</h2>
       <p style="color:var(--muted);font-size:13px;margin-bottom:14px">
-        Edit the email sent to guests via <strong>Bulk Wishes Email</strong> in Guest List.<br>
-        Placeholders: <code>{{salutation}}</code> &nbsp;·&nbsp; <code>{{guestName}}</code> &nbsp;·&nbsp; <code>{{companyName}}</code> &nbsp;·&nbsp; <code>{{messageBody}}</code> &nbsp;·&nbsp; <code>{{senderName}}</code>
+        Edit the default message used in <strong>Bulk Wishes Email</strong> from the Guest List.<br>
+        You can also edit the message per-send when composing. Available placeholder: <code>{{companyName}}</code>
       </p>
       <div class="panel">
         <div style="margin-bottom:12px">
@@ -2145,18 +2158,17 @@ function renderWishesEmail(){
           <input id="tmpl_subject_guest_wishes" value="${esc(tmpl.subject||'')}">
         </div>
         <div style="margin-bottom:12px">
-          <label>Email Body (HTML)</label>
-          <div style="display:flex;gap:8px;margin-bottom:6px">
-            <button class="active" onclick="switchTmplMode('guest_wishes','edit',this)" style="font-size:12px;padding:4px 12px">✏️ Edit</button>
-            <button class="secondary" onclick="switchTmplMode('guest_wishes','preview',this)" style="font-size:12px;padding:4px 12px">👁 Preview</button>
-          </div>
-          <textarea class="tmpl-textarea" id="tmpl_body_guest_wishes" rows="14" style="width:100%;font-family:monospace;font-size:12px;padding:10px;border:1.5px solid var(--border);border-radius:8px;resize:vertical">${esc(tmpl.body||'')}</textarea>
-          <div class="tmpl-preview" id="tmpl_preview_guest_wishes" style="display:none;border:1.5px solid var(--border);border-radius:8px;padding:14px;min-height:120px;background:#f9fafb"></div>
+          <label>Wishes Email Body</label>
+          <textarea id="tmpl_body_guest_wishes" rows="6" style="font-size:13px;padding:10px 12px;border-radius:8px;border:1.5px solid var(--border);background:#ffffff;color:#0f172a;line-height:1.7;resize:vertical;width:100%;box-sizing:border-box">${esc(tmpl.plainBody||defaultEmailTemplates().guest_wishes.plainBody)}</textarea>
+          <p style="font-size:11px;color:var(--muted);margin:4px 0 0">Each line will appear as a paragraph in the email. No HTML needed.</p>
         </div>
+        <div style="margin-bottom:10px">
+          <button class="secondary" onclick="previewEmailTemplate('guest_wishes')" style="font-size:12px;padding:5px 12px">👁 Preview Email</button>
+        </div>
+        <div id="tmpl_preview_guest_wishes" style="display:none;border:1.5px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:12px"></div>
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
           <button onclick="saveEmailTemplate('guest_wishes')">💾 Save Template</button>
           <button class="secondary" onclick="resetEmailTemplate('guest_wishes')">↩ Reset to Default</button>
-          <span id="tmpl_msg_guest_wishes" style="font-size:13px"></span>
         </div>
       </div>
     </div>`;
@@ -3306,72 +3318,91 @@ async function loadEmailConfig(){
       db.collection("settings").doc("emailTemplates").get()
     ]);
     if(cfgDoc.exists){const d=cfgDoc.data();EMAIL_CONFIG={gasUrl:d.gasUrl||'',fromName:d.fromName||'Gift Management System',gmailUser:d.gmailUser||'',gmailPass:d.gmailPass||''};}
-    if(tmplDoc.exists) EMAIL_TEMPLATES={...defaultEmailTemplates(),...tmplDoc.data()};
-    else EMAIL_TEMPLATES=defaultEmailTemplates();
+    if(tmplDoc.exists){
+      const defs=defaultEmailTemplates();const saved=tmplDoc.data();EMAIL_TEMPLATES={};
+      ['request_submitted','approval_notification','guest_wishes'].forEach(k=>{
+        const s=saved[k]||{};
+        // Support both old 'body' (raw HTML) format and new 'plainBody' (plain text) format
+        EMAIL_TEMPLATES[k]={subject:s.subject||defs[k].subject,plainBody:s.plainBody||defs[k].plainBody};
+      });
+    } else EMAIL_TEMPLATES=defaultEmailTemplates();
   }catch(e){EMAIL_TEMPLATES=defaultEmailTemplates();}
 }
 
 function defaultEmailTemplates(){
-  // Email-safe icon: coloured square with letter, renders in ALL email clients (no emoji)
-  const iconBox=(emoji)=>`<div style="font-size:44px;line-height:1;margin-bottom:10px">${emoji}</div>`;
   return {
     request_submitted:{
       subject:"Gift Request Submitted — {{giftName}} ({{occasion}})",
-      body:`<div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px">
+      plainBody:"The following gift request has been submitted and is pending your review. Please log in to approve, reject, or return it."
+    },
+    approval_notification:{
+      subject:"Gift Request Update — {{occasion}}",
+      plainBody:"Here is the latest status update on your gift request(s). Please review the details below."
+    },
+    guest_wishes:{
+      subject:"Season's Greetings from {{companyName}}",
+      plainBody:"On behalf of the entire {{companyName}} family, we extend our warmest greetings and best wishes to you. It is our privilege to have you as a valued partner, and we look forward to continuing our association in the years ahead."
+    }
+  };
+}
+
+/* ── Build full HTML email from plain-text body + fixed visual wrapper ── */
+function buildTemplateEmailHtml(key, plainBody, vars){
+  const co=esc(vars.companyName||BRANDING.companyName||'Gift Management System');
+  const filled=fillTemplate(plainBody||'',vars);
+  const paras=filled.split('\n').filter(l=>l.trim())
+    .map(l=>`<p style="font-size:14px;color:#475569;margin:0 0 12px;line-height:1.7;font-family:Arial,sans-serif">${esc(l)}</p>`).join('');
+
+  if(key==='request_submitted') return `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px">
 <div style="background:linear-gradient(135deg,#2563eb,#1d4ed8);border-radius:12px 12px 0 0;padding:32px;text-align:center">
-  ${iconBox('🎁')}
+  <div style="font-size:44px;line-height:1;margin-bottom:10px">🎁</div>
   <h1 style="color:#ffffff;font-size:21px;margin:0 0 6px;font-weight:700;font-family:Arial,sans-serif">Gift Request Submitted</h1>
-  <p style="color:rgba(255,255,255,0.75);margin:0;font-size:13px;font-family:Arial,sans-serif">{{companyName}}</p>
+  <p style="color:rgba(255,255,255,0.75);margin:0;font-size:13px;font-family:Arial,sans-serif">${co}</p>
 </div>
 <div style="background:#ffffff;border-radius:0 0 12px 12px;padding:32px;border:1px solid #e2e8f0;border-top:none">
-  <p style="font-size:15px;color:#0f172a;margin:0 0 6px;font-family:Arial,sans-serif">{{salutation}},</p>
-  <p style="font-size:14px;color:#475569;margin:0 0 24px;line-height:1.7;font-family:Arial,sans-serif">The following gift request has been submitted and is <strong>pending your review</strong>. Please log in to approve, reject, or return it.</p>
-  {{items}}
+  <p style="font-size:15px;color:#0f172a;margin:0 0 16px;font-family:Arial,sans-serif">${esc(vars.salutation||'Dear Sir/Madam')},</p>
+  ${paras}
+  ${vars.items||''}
   <div style="background:#eff6ff;border-left:4px solid #2563eb;border-radius:0 8px 8px 0;padding:14px 18px;margin:24px 0 20px">
     <p style="font-size:13px;color:#1e40af;margin:0;line-height:1.6;font-family:Arial,sans-serif">Please log in to the <strong>Gift Management System</strong> to review and take action on this request.</p>
   </div>
   <p style="font-size:12px;color:#94a3b8;margin:0;font-family:Arial,sans-serif">This is an automated notification. Please do not reply to this email.</p>
 </div>
-<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:14px;font-family:Arial,sans-serif">&#169; {{companyName}} &middot; Gift Management System</p>
-</div>`
-    },
-    approval_notification:{
-      subject:"Gift Request Update — {{occasion}}",
-      body:`<div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px">
+<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:14px;font-family:Arial,sans-serif">&#169; ${co} &middot; Gift Management System</p>
+</div>`;
+
+  if(key==='approval_notification') return `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px">
 <div style="background:linear-gradient(135deg,#16a34a,#15803d);border-radius:12px 12px 0 0;padding:32px;text-align:center">
-  ${iconBox('✅')}
+  <div style="font-size:44px;line-height:1;margin-bottom:10px">✅</div>
   <h1 style="color:#ffffff;font-size:21px;margin:0 0 6px;font-weight:700;font-family:Arial,sans-serif">Gift Request Status Update</h1>
-  <p style="color:rgba(255,255,255,0.75);margin:0;font-size:13px;font-family:Arial,sans-serif">{{companyName}}</p>
+  <p style="color:rgba(255,255,255,0.75);margin:0;font-size:13px;font-family:Arial,sans-serif">${co}</p>
 </div>
 <div style="background:#ffffff;border-radius:0 0 12px 12px;padding:32px;border:1px solid #e2e8f0;border-top:none">
-  <p style="font-size:15px;color:#0f172a;margin:0 0 6px;font-family:Arial,sans-serif">{{salutation}},</p>
-  <p style="font-size:14px;color:#475569;margin:0 0 24px;line-height:1.7;font-family:Arial,sans-serif">Here is the latest status update on your gift request(s). Please review the details below:</p>
-  {{items}}
+  <p style="font-size:15px;color:#0f172a;margin:0 0 16px;font-family:Arial,sans-serif">${esc(vars.salutation||'Dear Sir/Madam')},</p>
+  ${paras}
+  ${vars.items||''}
   <p style="font-size:13px;color:#64748b;margin:20px 0 0;line-height:1.6;font-family:Arial,sans-serif">For any questions, please contact your Group Admin or Top Management team.</p>
 </div>
-<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:14px;font-family:Arial,sans-serif">&#169; {{companyName}} &middot; Gift Management System</p>
-</div>`
-    },
-    guest_wishes:{
-      subject:"Season's Greetings from {{companyName}}",
-      body:`<div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px">
+<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:14px;font-family:Arial,sans-serif">&#169; ${co} &middot; Gift Management System</p>
+</div>`;
+
+  if(key==='guest_wishes') return `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#f1f5f9;padding:24px">
 <div style="background:linear-gradient(135deg,#c2255c,#a61e4d);border-radius:12px 12px 0 0;padding:36px;text-align:center">
-  ${iconBox('🎊')}
+  <div style="font-size:44px;line-height:1;margin-bottom:10px">🎊</div>
   <h1 style="color:#ffffff;font-size:22px;margin:0 0 6px;font-weight:700;font-family:Arial,sans-serif">With Our Warmest Wishes</h1>
-  <p style="color:rgba(255,255,255,0.8);margin:0;font-size:13px;font-family:Arial,sans-serif">{{companyName}}</p>
+  <p style="color:rgba(255,255,255,0.8);margin:0;font-size:13px;font-family:Arial,sans-serif">${co}</p>
 </div>
 <div style="background:#ffffff;border-radius:0 0 12px 12px;padding:32px;border:1px solid #e2e8f0;border-top:none">
-  <p style="font-size:16px;color:#0f172a;margin:0 0 20px;font-family:Arial,sans-serif">{{salutation}},</p>
+  <p style="font-size:16px;color:#0f172a;margin:0 0 20px;font-family:Arial,sans-serif">${esc(vars.salutation||'Dear Guest')},</p>
   <div style="background:#fff0f6;border-left:4px solid #c2255c;border-radius:0 10px 10px 0;padding:20px 24px;margin:0 0 24px">
-    <p style="font-size:15px;color:#831843;line-height:1.75;margin:0;font-family:Arial,sans-serif">{{messageBody}}</p>
+    ${paras}
   </div>
-  <p style="font-size:14px;color:#475569;line-height:1.7;margin:0 0 20px;font-family:Arial,sans-serif">We value your partnership and look forward to continuing our journey together.</p>
-  <p style="font-size:14px;color:#334155;margin:0;line-height:1.6;font-family:Arial,sans-serif">Warm regards,<br><strong>{{senderName}}</strong><br><span style="color:#64748b">{{companyName}}</span></p>
+  <p style="font-size:14px;color:#334155;margin:0;line-height:1.6;font-family:Arial,sans-serif">Warm regards,<br><strong>${esc(vars.senderName||'GMS Team')}</strong><br><span style="color:#64748b">${co}</span></p>
 </div>
-<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:14px;font-family:Arial,sans-serif">&#169; {{companyName}}</p>
-</div>`
-    }
-  };
+<p style="text-align:center;font-size:11px;color:#94a3b8;margin-top:14px;font-family:Arial,sans-serif">&#169; ${co}</p>
+</div>`;
+
+  return `<div style="font-family:Arial,sans-serif;padding:30px;max-width:600px;margin:0 auto">${paras}</div>`;
 }
 
 /* ── Build request item HTML card for email ───────────────────────── */
@@ -3463,7 +3494,7 @@ function openBulkGuestEmailModal(guests){
   if(!withEmail.length){message("No guests have email addresses on record.","warn");return;}
   const co=BRANDING.companyName||'Gift Management System';
   const tmpl=EMAIL_TEMPLATES.guest_wishes||defaultEmailTemplates().guest_wishes;
-  const defaultMsg=`On behalf of the entire ${co} family, we extend our warmest greetings and best wishes to you. It is our privilege to have you as a valued partner, and we look forward to continuing our association in the years ahead.`;
+  const defaultMsg=fillTemplate(tmpl.plainBody||defaultEmailTemplates().guest_wishes.plainBody,{companyName:co});
 
   const rows=withEmail.map((g,i)=>`
     <div class="email-recipient-row">
@@ -3514,19 +3545,17 @@ function openBulkGuestEmailModal(guests){
 }
 
 function previewBulkGuest(guests){
-  const tmpl=EMAIL_TEMPLATES.guest_wishes||defaultEmailTemplates().guest_wishes;
   const co=BRANDING.companyName||'Gift Management System';
   const first=guests[0];
   if(!first)return;
   const msg=document.getElementById('bg_message')?.value||'';
-  const sal=`Dear <strong>${esc((first.guestSalutation?first.guestSalutation+' ':'')+first.guestName||'Guest')}</strong>`;
-  const body=fillTemplate(tmpl.body,{companyName:co,salutation:sal,guestName:esc(first.guestName||'Guest'),messageBody:msg,senderName:profile.name||'GMS Team'});
+  const salutation=buildSalutation((first.guestSalutation?first.guestSalutation+' ':'')+first.guestName||'Guest');
+  const body=buildTemplateEmailHtml('guest_wishes',msg,{companyName:co,salutation,guestName:esc(first.guestName||'Guest'),messageBody:msg,senderName:profile.name||'GMS Team'});
   const preview=document.getElementById('bg_preview');
   if(preview)preview.innerHTML=body;
 }
 
 async function sendBulkGuest(guests){
-  const tmpl=EMAIL_TEMPLATES.guest_wishes||defaultEmailTemplates().guest_wishes;
   const co=BRANDING.companyName||'Gift Management System';
   const subject=document.getElementById('bg_subject')?.value?.trim()||`Season's Greetings from ${co}`;
   const msgBody=document.getElementById('bg_message')?.value||'';
@@ -3538,8 +3567,8 @@ async function sendBulkGuest(guests){
     if(!cb||!cb.checked)continue;
     const g=guests[i];
     if(!g.guestEmail)continue;
-    const gSal=`Dear <strong>${esc((g.guestSalutation?g.guestSalutation+' ':'')+g.guestName||'Guest')}</strong>`;
-    const body=fillTemplate(tmpl.body,{companyName:co,salutation:gSal,guestName:esc(g.guestName||'Guest'),messageBody:msgBody,senderName:profile.name||'GMS Team'});
+    const gSal=buildSalutation((g.guestSalutation?g.guestSalutation+' ':'')+g.guestName||'Guest');
+    const body=buildTemplateEmailHtml('guest_wishes',msgBody,{companyName:co,salutation:gSal,guestName:esc(g.guestName||'Guest'),messageBody:msgBody,senderName:profile.name||'GMS Team'});
     try{
       await sendEmail(g.guestEmail,g.guestName||'Guest',subject,body);
       await logEmail(g.guestEmail,g.guestName||'',subject,'guest_wishes','success');
@@ -3699,7 +3728,7 @@ function renderEmailSettings(){
     <!-- Email Templates -->
     <div class="panel" style="margin:0 0 14px">
       <div style="font-size:14px;font-weight:700;margin-bottom:4px">📝 Email Templates</div>
-      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Edit the HTML body for each notification type. Supported placeholders: <code>{{salutation}}</code> (e.g. <em>Dear Mr. Amit Patel</em>), <code>{{companyName}}</code>, <code>{{items}}</code>, <code>{{guestName}}</code>, <code>{{messageBody}}</code>, <code>{{senderName}}</code></p>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Customise the message text for each email type. The email header, branding and gift details are added automatically — just write your message in plain text.</p>
       <div class="masters-tabs" id="tmplTabs" style="margin-bottom:12px">
         <button class="active" data-tmpl="request_submitted">📤 Request Submitted</button>
         <button data-tmpl="approval_notification">✅ Approval Update</button>
@@ -3707,20 +3736,16 @@ function renderEmailSettings(){
       </div>
       ${['request_submitted','approval_notification','guest_wishes'].map(k=>`
       <div id="tmpl_${k}" class="tmpl-pane" style="${k==='request_submitted'?'':'display:none'}">
-        <div style="margin-bottom:8px"><label>Subject</label><input id="tmpl_subject_${k}" value="${esc(tmpl[k]?.subject||defaultEmailTemplates()[k]?.subject||'')}"></div>
-        <div>
-          <div class="tmpl-editor">
-            <div class="tmpl-editor-tabs">
-              <button class="active" onclick="switchTmplMode('${k}','edit',this)">✏️ Edit</button>
-              <button onclick="switchTmplMode('${k}','preview',this)">👁 Preview</button>
-            </div>
-            <div class="tmpl-editor-body">
-              <textarea class="tmpl-textarea" id="tmpl_body_${k}" rows="10">${esc(tmpl[k]?.body||defaultEmailTemplates()[k]?.body||'')}</textarea>
-              <div id="tmpl_preview_${k}" style="display:none;border:1px solid var(--border);border-radius:8px;padding:12px;min-height:100px;background:#f9fafb;font-size:12px"></div>
-            </div>
-          </div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 10px">${k==='request_submitted'?'Sent to the Group Admin when an employee submits a new gift request. The gift details table is appended automatically.':k==='approval_notification'?'Sent to employees when their request status is published. The status details are appended automatically.':'Default message for Bulk Wishes emails to guests. Can also be edited per-send in the Guest List.'}</p>
+        <div style="margin-bottom:10px"><label>Subject</label><input id="tmpl_subject_${k}" value="${esc(tmpl[k]?.subject||defaultEmailTemplates()[k]?.subject||'')}"></div>
+        <div style="margin-bottom:10px">
+          <label>Email Message Body</label>
+          <textarea id="tmpl_body_${k}" rows="5" style="font-size:13px;padding:10px 12px;border-radius:8px;border:1.5px solid var(--border);background:#ffffff;color:#0f172a;line-height:1.7;resize:vertical;width:100%;box-sizing:border-box">${esc(tmpl[k]?.plainBody||defaultEmailTemplates()[k]?.plainBody||'')}</textarea>
+          <p style="font-size:11px;color:var(--muted);margin:4px 0 0">Each line will appear as a paragraph in the email. No HTML needed. Placeholder: <code>{{companyName}}</code></p>
         </div>
-        <div class="actions" style="margin-top:8px">
+        <div style="margin-bottom:8px"><button class="secondary" onclick="previewEmailTemplate('${k}')" style="font-size:12px;padding:5px 12px">👁 Preview Email</button></div>
+        <div id="tmpl_preview_${k}" style="display:none;border:1.5px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:10px"></div>
+        <div class="actions" style="margin-top:4px">
           <button onclick="saveEmailTemplate('${k}')">💾 Save Template</button>
           <button class="secondary" onclick="resetEmailTemplate('${k}')">↩ Reset to Default</button>
         </div>
@@ -3778,24 +3803,34 @@ function renderEmailSettings(){
 }
 
 function switchTmplMode(key,mode,btn){
-  btn.parentElement.querySelectorAll("button").forEach(b=>b.classList.remove("active"));
-  btn.classList.add("active");
+  // Legacy stub — no longer used by the new plain-text editor; kept for backward compat
   const ta=document.getElementById(`tmpl_body_${key}`);
   const pv=document.getElementById(`tmpl_preview_${key}`);
-  if(mode==='preview'){
-    if(ta)ta.style.display="none";
-    if(pv){pv.style.display="";pv.innerHTML=ta?.value||'';}
-  } else {
-    if(ta)ta.style.display="";
-    if(pv)pv.style.display="none";
-  }
+  if(mode==='preview'){if(ta)ta.style.display="none";if(pv){pv.style.display="";pv.innerHTML=ta?.value||'';}}
+  else{if(ta)ta.style.display="";if(pv)pv.style.display="none";}
+}
+
+function previewEmailTemplate(key){
+  const ta=document.getElementById(`tmpl_body_${key}`);
+  const pv=document.getElementById(`tmpl_preview_${key}`);
+  if(!ta||!pv) return;
+  if(pv.style.display!=='none'){pv.style.display='none';return;}
+  const plainBody=ta.value||'';
+  const co=BRANDING.companyName||EMAIL_CONFIG.fromName||'Gift Management System';
+  const sampleVars={
+    salutation:'Dear Amit Patel',companyName:co,
+    items:'<div style="border:1px solid #e2e8f0;border-radius:8px;padding:14px;background:#fafafa;font-size:13px;color:#334155;margin:12px 0">🎁 <strong>Sample Gift</strong> — Diwali &middot; Premium Dry Fruit Box &nbsp;|&nbsp; Qty: 5 &nbsp;|&nbsp; &#8377;4,250</div>',
+    guestName:'Ramesh Kumar',senderName:(profile&&profile.name)||'GMS Team',messageBody:plainBody
+  };
+  pv.style.display='';
+  pv.innerHTML=buildTemplateEmailHtml(key,plainBody,sampleVars);
 }
 
 async function saveEmailTemplate(key){
   const subject=document.getElementById(`tmpl_subject_${key}`)?.value?.trim()||'';
-  const body=document.getElementById(`tmpl_body_${key}`)?.value||'';
-  await db.collection("settings").doc("emailTemplates").set({[key]:{subject,body},updatedAt:ts(),updatedBy:currentUser.uid},{merge:true});
-  EMAIL_TEMPLATES[key]={subject,body};
+  const plainBody=document.getElementById(`tmpl_body_${key}`)?.value||'';
+  await db.collection("settings").doc("emailTemplates").set({[key]:{subject,plainBody},updatedAt:ts(),updatedBy:currentUser.uid},{merge:true});
+  EMAIL_TEMPLATES[key]={subject,plainBody};
   message(`Template "${key}" saved.`,"success");
 }
 
@@ -3805,8 +3840,10 @@ function resetEmailTemplate(key){
   if(!def)return;
   const ta=document.getElementById(`tmpl_body_${key}`);
   const su=document.getElementById(`tmpl_subject_${key}`);
-  if(ta)ta.value=def.body||'';
+  if(ta)ta.value=def.plainBody||'';
   if(su)su.value=def.subject||'';
+  const pv=document.getElementById(`tmpl_preview_${key}`);
+  if(pv)pv.style.display='none';
 }
 
 loadBranding(); // Public read — loads logo before auth, fails silently if no branding set
