@@ -595,6 +595,7 @@ let PLANTS={}, DEPTS={}, ORGS={}, GCATS=[];
 const charts={};
 let EMAIL_CONFIG={gasUrl:'',fromName:'Gift Management System',gmailUser:'',gmailPass:''};
 let EMAIL_TEMPLATES={}; // loaded from Firestore settings/emailTemplates
+let EMAIL_NOTIFICATION_RECIPIENTS=[]; // [{name,email}] loaded from settings/notificationRecipients
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -844,29 +845,13 @@ function mkChart(canvasId,key,type,data,opts={}){
 async function notifyPlantAdminsOnSubmit(payload){
   if(!EMAIL_CONFIG.gasUrl) return; // email not configured — skip silently
   try{
-    // Find plant admins for this employee's plant
-    const plantId=payload.plantId;
-    // Fetch all active plant admins, then filter by plant scope client-side
-    // Query all possible stored formats for Group Admin role
-    const [snap1,snap2,snap3]=await Promise.all([
-      db.collection("users").where("role","==","plant_admin").where("status","==","active").limit(50).get(),
-      db.collection("users").where("role","==","Plant Admin").where("status","==","active").limit(50).get(),
-      db.collection("users").where("role","==","Group Admin").where("status","==","active").limit(50).get()
-    ]);
-    const seenIds=new Set();
-    const allAdminDocs=[...snap1.docs,...snap2.docs,...snap3.docs].filter(d=>{if(seenIds.has(d.id))return false;seenIds.add(d.id);return true;});
-    const adminDocs=allAdminDocs.filter(d=>{
-      if(!plantId) return true; // null plantId → email all group admins
-      const u=d.data();
-      return u.plantId===plantId
-        || (u.plantIds&&u.plantIds.includes(plantId))
-        || u.allPlants===true;
-    });
-    if(!adminDocs.length){
-      try{await db.collection("emailLogs").add({to:'(group admins)',toName:'',subject:'No Group Admin found — plant: '+(plantId||'any'),type:'request_submitted',status:'failed',error:'No active plant_admin users found matching plant "'+(plantId||'any')+'". Check Admin → User Activation to confirm Group Admin accounts exist and are active.',sentBy:currentUser.uid,sentByName:profile.name||'',sentAt:ts()});}catch(_){}
+    // Use pre-configured notification recipients from settings/notificationRecipients
+    // (avoids querying users collection which is blocked by Firestore rules for employees)
+    const recipients=EMAIL_NOTIFICATION_RECIPIENTS||[];
+    if(!recipients.length){
+      try{await db.collection("emailLogs").add({to:'(group admins)',toName:'',subject:'No notification recipients configured',type:'request_submitted',status:'failed',error:'No notification recipients configured. Go to Admin → Settings → Email → Notification Recipients and add Group Admin email addresses.',sentBy:currentUser.uid,sentByName:profile.name||'',sentAt:ts()});}catch(_){}
       return;
     }
-    const adminSnap={docs:adminDocs};
 
     const tmpl=EMAIL_TEMPLATES.request_submitted||defaultEmailTemplates().request_submitted;
     const companyName=EMAIL_CONFIG.fromName||'Gift Management System';
@@ -885,13 +870,8 @@ async function notifyPlantAdminsOnSubmit(payload){
         ${payload.remarks?`<tr><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:600">Remarks</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${esc(payload.remarks)}</td></tr>`:''}
       </table>`;
 
-    for(const doc of adminSnap.docs){
-      const admin=doc.data();
-      if(!admin.email){
-        const noEmailSubject=payload.giftName+' — '+payload.occasion;
-        await logEmail('(no email)',admin.name||'Group Admin',noEmailSubject,'request_submitted','failed','Group Admin "'+esc(admin.name||'Unknown')+'" has no email address stored in their user profile. Ask them to log in and ensure their email is saved.');
-        continue;
-      }
+    for(const admin of recipients){
+      if(!admin.email) continue;
       const salutation=buildSalutation(admin.name||'Group Admin');
       const subject=fillTemplate(tmpl.subject||'Gift Request Submitted — {{giftName}} ({{occasion}})',{giftName:payload.giftName,occasion:payload.occasion});
       const body=buildTemplateEmailHtml('request_submitted',tmpl.plainBody||defaultEmailTemplates().request_submitted.plainBody,{salutation,items:itemRow,companyName,signature:tmpl.signature!==undefined?tmpl.signature:defaultEmailTemplates().request_submitted.signature,senderName:profile.name||'GMS Team'});
@@ -918,20 +898,10 @@ async function notifyPlantAdminsOnSubmit(payload){
 async function notifyPlantAdminsOnSubmitMulti(basePayload, guests){
   if(!EMAIL_CONFIG.gasUrl) return;
   try{
-    const plantId=basePayload.plantId;
-    const [snap1m,snap2m,snap3m]=await Promise.all([
-      db.collection("users").where("role","==","plant_admin").where("status","==","active").limit(50).get(),
-      db.collection("users").where("role","==","Plant Admin").where("status","==","active").limit(50).get(),
-      db.collection("users").where("role","==","Group Admin").where("status","==","active").limit(50).get()
-    ]);
-    const seenIdsM=new Set();
-    const adminDocs=[...snap1m.docs,...snap2m.docs,...snap3m.docs].filter(d=>{if(seenIdsM.has(d.id))return false;seenIdsM.add(d.id);return true;}).filter(d=>{
-      if(!plantId) return true;
-      const u=d.data();
-      return u.plantId===plantId||(u.plantIds&&u.plantIds.includes(plantId))||u.allPlants===true;
-    });
+    // Use pre-configured notification recipients from settings/notificationRecipients
+    const adminDocs=EMAIL_NOTIFICATION_RECIPIENTS||[];
     if(!adminDocs.length){
-      try{await db.collection("emailLogs").add({to:'(group admins)',toName:'',subject:'No Group Admin found — multi-guest submission',type:'request_submitted',status:'failed',error:'No active plant_admin users found matching plant "'+(plantId||'any')+'". Check Admin → User Activation.',sentBy:currentUser.uid,sentByName:profile.name||'',sentAt:ts()});}catch(_){}
+      try{await db.collection("emailLogs").add({to:'(group admins)',toName:'',subject:'No notification recipients configured',type:'request_submitted',status:'failed',error:'No notification recipients configured. Go to Admin → Settings → Email → Notification Recipients.',sentBy:currentUser.uid,sentByName:profile.name||'',sentAt:ts()});}catch(_){}
       return;
     }
     const companyName=EMAIL_CONFIG.fromName||'Gift Management System';
@@ -984,12 +954,8 @@ async function notifyPlantAdminsOnSubmitMulti(basePayload, guests){
       </div></div>`;
 
     const subject=`Gift Request: ${basePayload.giftName} — ${guests.length} Guest${guests.length!==1?'s':''} (${basePayload.occasion})`;
-    for(const doc of adminDocs){
-      const admin=doc.data();
-      if(!admin.email){
-        await logEmail('(no email)',admin.name||'Group Admin',subject,'request_submitted','failed','Group Admin "'+esc(admin.name||'Unknown')+'" has no email address stored in their user profile.');
-        continue;
-      }
+    for(const admin of adminDocs){
+      if(!admin.email) continue;
       try{
         await sendEmail(admin.email,admin.name||'Group Admin',subject,body);
         await logEmail(admin.email,admin.name||'',subject,'request_submitted','success');
@@ -3335,11 +3301,13 @@ async function freshStartAction(type){
 /* ── Load email config & templates from Firestore ────────────────────── */
 async function loadEmailConfig(){
   try{
-    const [cfgDoc,tmplDoc]=await Promise.all([
+    const [cfgDoc,tmplDoc,rcptDoc]=await Promise.all([
       db.collection("settings").doc("emailConfig").get(),
-      db.collection("settings").doc("emailTemplates").get()
+      db.collection("settings").doc("emailTemplates").get(),
+      db.collection("settings").doc("notificationRecipients").get()
     ]);
     if(cfgDoc.exists){const d=cfgDoc.data();EMAIL_CONFIG={gasUrl:d.gasUrl||'',fromName:d.fromName||'Gift Management System',gmailUser:d.gmailUser||'',gmailPass:d.gmailPass||''};}
+    if(rcptDoc.exists){EMAIL_NOTIFICATION_RECIPIENTS=rcptDoc.data().recipients||[];}
     if(tmplDoc.exists){
       const defs=defaultEmailTemplates();const saved=tmplDoc.data();EMAIL_TEMPLATES={};
       ['request_submitted','approval_notification','guest_wishes'].forEach(k=>{
@@ -3758,6 +3726,18 @@ function renderEmailSettings(){
       <div id="emailCfgMsg" style="margin-top:8px;font-size:13px"></div>
     </div>
 
+    <!-- Notification Recipients -->
+    <div class="panel" style="margin:0 0 14px">
+      <div style="font-size:14px;font-weight:700;margin-bottom:4px">👥 Notification Recipients — Request Submitted</div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">When an employee submits a gift request, these people receive the email. Add all Group Admins / reviewers here. Stored in <code>settings/notificationRecipients</code> — readable by all users.</p>
+      <div id="rcptList" style="margin-bottom:10px"></div>
+      <button class="secondary" id="addRcptBtn" style="font-size:12px;padding:5px 12px">➕ Add Recipient</button>
+      <div class="actions" style="margin-top:10px">
+        <button id="saveRcptsBtn">💾 Save Recipients</button>
+      </div>
+      <div id="rcptMsg" style="margin-top:8px;font-size:13px"></div>
+    </div>
+
     <!-- Email Templates -->
     <div class="panel" style="margin:0 0 14px">
       <div style="font-size:14px;font-weight:700;margin-bottom:4px">📝 Email Templates</div>
@@ -3827,6 +3807,53 @@ function renderEmailSettings(){
       $("emailCfgMsg").innerHTML=`<span style="color:var(--danger)">❌ ${esc(err.message)}</span>`;
     }
     $("testEmailBtn").disabled=false;$("testEmailBtn").textContent="🧪 Send Test Email";
+  };
+
+  // Wire notification recipients UI
+  function renderRcptList(){
+    const list=$("rcptList");if(!list)return;
+    const rr=EMAIL_NOTIFICATION_RECIPIENTS;
+    if(!rr.length){list.innerHTML=`<p style="font-size:12px;color:var(--muted);margin:0 0 8px">No recipients yet. Click ➕ Add Recipient to add the Group Admin email(s).</p>`;return;}
+    list.innerHTML=rr.map((r,i)=>`
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <input class="rcpt-name" data-i="${i}" placeholder="Name" value="${esc(r.name||'')}" style="flex:1;max-width:200px;font-size:13px">
+        <input class="rcpt-email" data-i="${i}" placeholder="email@example.com" value="${esc(r.email||'')}" style="flex:2;font-size:13px">
+        <button class="secondary rcpt-del" data-i="${i}" style="font-size:12px;padding:4px 10px;color:var(--danger)">✕</button>
+      </div>`).join('');
+    list.querySelectorAll('.rcpt-del').forEach(b=>b.onclick=()=>{
+      const i=parseInt(b.dataset.i);
+      EMAIL_NOTIFICATION_RECIPIENTS.splice(i,1);
+      renderRcptList();
+    });
+  }
+  renderRcptList();
+  $("addRcptBtn").onclick=()=>{
+    EMAIL_NOTIFICATION_RECIPIENTS.push({name:'',email:''});
+    renderRcptList();
+    // Focus the last name input
+    const inputs=$("rcptList").querySelectorAll('.rcpt-name');
+    if(inputs.length)inputs[inputs.length-1].focus();
+  };
+  $("saveRcptsBtn").onclick=async()=>{
+    // Collect from inputs
+    const names=$("rcptList").querySelectorAll('.rcpt-name');
+    const emails=$("rcptList").querySelectorAll('.rcpt-email');
+    const recipients=[];
+    names.forEach((n,i)=>{
+      const email=(emails[i]?.value||'').trim().toLowerCase();
+      const name=(n.value||'').trim();
+      if(email)recipients.push({name,email});
+    });
+    EMAIL_NOTIFICATION_RECIPIENTS=recipients;
+    $("saveRcptsBtn").disabled=true;$("saveRcptsBtn").textContent="Saving…";
+    try{
+      await db.collection("settings").doc("notificationRecipients").set({recipients,updatedAt:ts(),updatedBy:currentUser.uid});
+      $("rcptMsg").innerHTML=`<span style="color:var(--success)">✅ ${recipients.length} recipient(s) saved.</span>`;
+      renderRcptList();
+    }catch(e){
+      $("rcptMsg").innerHTML=`<span style="color:var(--danger)">❌ ${esc(e.message)}</span>`;
+    }
+    $("saveRcptsBtn").disabled=false;$("saveRcptsBtn").textContent="💾 Save Recipients";
   };
 
   // Wire template tabs
