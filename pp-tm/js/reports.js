@@ -22,7 +22,7 @@ export async function showReportsPage(container, user) {
     <div class="card section">
       <div class="card-header">Generate Report</div>
       <div class="card-body">
-        <div class="filter-bar">
+        <div class="filter-bar" style="align-items:flex-end;flex-wrap:wrap;gap:1rem">
           <div class="form-group" style="display:inline-block">
             <label style="font-size:.8rem;font-weight:600;color:#4a4a6a">From Date</label>
             <input type="date" id="rptFrom" value="${fromDefault}">
@@ -75,6 +75,22 @@ export async function showReportsPage(container, user) {
 
   // Store results for CSV export
   let currentRows = [];
+
+  // Wire type pills
+  container.querySelectorAll(".rpt-pill").forEach(pill => {
+    pill.addEventListener("click", () => {
+      container.querySelectorAll(".rpt-pill").forEach(p => {
+        p.classList.remove("active");
+        const cols = {dispatched:"#1565c0", received:"#2e7d32", discrepancy:"#c62828", all:"#555"};
+        p.style.background = "#fff";
+        p.style.color = cols[p.dataset.val];
+      });
+      const cols = {dispatched:"#1565c0", received:"#2e7d32", discrepancy:"#c62828", all:"#555"};
+      pill.classList.add("active");
+      pill.style.background = cols[pill.dataset.val];
+      pill.style.color = "#fff";
+    });
+  });
 
   container.querySelector("#runReportBtn").addEventListener("click", async () => {
     const from    = container.querySelector("#rptFrom").value;
