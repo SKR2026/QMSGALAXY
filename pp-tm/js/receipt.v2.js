@@ -76,16 +76,17 @@ async function loadPendingList(user, listEl, countEl) {
     let rows = "";
     snap.docs.forEach(d => {
       const dp = d.data();
+      const dispDT=dp.createdAt?.toDate?dp.createdAt.toDate().toLocaleString("en-IN"):(dp.date||"—");
       rows += `<tr>
         <td><span class="dispatch-id">${dp.dispatchId}</span></td>
-        <td>${dp.date||"—"}</td><td>${dp.fromPlantName}</td><td>${dp.material}</td>
+        <td>${dispDT}</td><td>${dp.fromPlantName}</td><td>${dp.material}</td>
         <td>${dp.qtyDispatched} ${dp.unit}</td><td>${dp.vehicleNo}</td><td>${dp.driverName}</td>
         <td><span class="badge status-${dp.status}">${statusLabel(dp.status)}</span></td>
         <td><button class="btn btn-success btn-sm" onclick="openReceiptModal('${d.id}')">Confirm Receipt</button></td>
       </tr>`;
     });
     listEl.innerHTML = `<div class="table-wrap"><table>
-      <thead><tr><th>Dispatch ID</th><th>Date</th><th>From</th><th>Material</th>
+      <thead><tr><th>Dispatch ID</th><th>Dispatch Date/Time</th><th>From</th><th>Material</th>
         <th>Dispatched Qty</th><th>Vehicle</th><th>Driver</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
   } catch(e) { listEl.innerHTML = `<div class="error-msg">Error: ${e.message}</div>`; }
@@ -119,9 +120,10 @@ async function loadReceivedList(user, listEl, filters) {
             ${dp.photoEvidence.map(url=>`<img src="${url}" onclick="window.open('${url}','_blank')"
               style="width:38px;height:38px;object-fit:cover;border-radius:5px;border:2px solid #c62828;cursor:pointer" title="View photo">`).join("")}
            </div>` : "";
+      const dispDT2=dp.createdAt?.toDate?dp.createdAt.toDate().toLocaleString("en-IN"):(dp.date||"—");
       rows += `<tr>
         <td><span class="dispatch-id">${dp.dispatchId}</span></td>
-        <td>${recvDate}</td><td>${dp.fromPlantName}</td><td>${dp.material}</td>
+        <td>${dispDT2}</td><td>${recvDate}</td><td>${dp.fromPlantName}</td><td>${dp.material}</td>
         <td>${dp.qtyDispatched} ${dp.unit}</td><td>${dp.qtyReceived??'—'} ${dp.unit}</td>
         <td>${diffStr}</td>
         <td><span class="badge status-${dp.status}">${statusLabel(dp.status)}</span></td>
@@ -129,7 +131,7 @@ async function loadReceivedList(user, listEl, filters) {
       </tr>`;
     });
     listEl.innerHTML = `<div class="table-wrap"><table>
-      <thead><tr><th>Dispatch ID</th><th>Received Date</th><th>From</th><th>Material</th>
+      <thead><tr><th>Dispatch ID</th><th>Dispatch Date/Time</th><th>Receipt Date/Time</th><th>From</th><th>Material</th>
         <th>Dispatched</th><th>Received</th><th>Difference</th><th>Status</th><th>Photos</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
   } catch(e) { listEl.innerHTML = `<div class="error-msg">Error: ${e.message}</div>`; }

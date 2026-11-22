@@ -87,8 +87,10 @@ async function loadDispatchList(user, listEl, filters = {}) {
         : "";
       rows += `
         <tr>
+          const recvDT=(dp.arrivalDate&&dp.arrivalTime)?dp.arrivalDate+" "+dp.arrivalTime:(dp.arrivalDate||"—");
           <td><span class="dispatch-id">${dp.dispatchId}</span></td>
           <td>${created}</td>
+          <td>${recvDT}</td>
           <td>${dp.material}</td>
           <td>${dp.qtyDispatched} ${dp.unit}</td>
           <td>${dp.vehicleNo}</td>
@@ -102,7 +104,7 @@ async function loadDispatchList(user, listEl, filters = {}) {
       <div class="table-wrap">
         <table>
           <thead><tr>
-            <th>Dispatch ID</th><th>Date</th><th>Material</th>
+            <th>Dispatch ID</th><th>Dispatch Date/Time</th><th>Receipt Date/Time</th><th>Material</th>
             <th>Qty</th><th>Vehicle No.</th><th>To Plant</th>
             <th>Status</th><th></th>
           </tr></thead>
