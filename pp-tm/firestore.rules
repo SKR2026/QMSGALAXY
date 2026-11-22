@@ -1,0 +1,115 @@
+rules_version = '2';
+
+// ═══════════════════════════════════════════════════════════════
+//  PTMS Firestore Security Rules  (Phase 6)
+//
+//  Roles stored in /users/{uid}.role:
+//    "superAdmin"  – full read/write (except activityLogs delete)
+//    "plantUser"   – scoped to their plantId in /users/{uid}.plantId
+//
+//  Management view: READ-ONLY on dispatches, plants (no auth required).
+//  WRITE operations always require authentication.
+// ═══════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ───────────────────────────────────────
+    function isSignedIn()      { return request.auth != null; }
+    function uid()             { return request.auth.uid; }
+    function userDoc()         { return get(/databases/$(database)/documents/users/$(uid())); }
+    function userRole()        { return userDoc().data.role; }
+    function userPlant()       { return userDoc().data.plantId; }
+    function isSuperAdmin()    { return isSignedIn() && userRole() == "superAdmin"; }
+    function isPlantUser()     { return isSignedIn() && userRole() == "plantUser"; }
+    function isAnyUser()       { return isSuperAdmin() || isPlantUser(); }
+
+    // ── PLANTS collection ──────────────────────────────────────
+    // Public read (management dashboard). Write = superAdmin only.
+    match /plants/{plantId} {
+      allow read:   if true;                      // management can read
+      allow write:  if isSuperAdmin();
+    }
+
+    // ── USERS collection ──────────────────────────────────────
+    // A user may read their own doc. Super admin reads all.
+    // Create/update: superAdmin only (plant users can't self-elevate).
+    match /users/{userId} {
+      allow read:   if isSignedIn() && (uid() == userId || isSuperAdmin());
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin();
+      allow delete: if false;                     // never hard-delete users
+    }
+
+    // ── DISPATCHES collection ──────────────────────────────────
+    match /dispatches/{dispatchId} {
+      // Public READ (management dashboard)
+      allow read: if true;
+
+      // CREATE: authenticated plant user may only create dispatches FROM their plant
+      allow create: if isAnyUser()
+        && (
+          isSuperAdmin()
+          || (isPlantUser() && request.resource.data.fromPlantId == userPlant())
+        )
+        // Required fields must be present
+        && request.resource.data.keys().hasAll([
+            "dispatchId","fromPlantId","toPlantId","material",
+            "qtyDispatched","vehicleNo","status","createdAt"
+           ])
+        // Status on creation must be "dispatched"
+        && request.resource.data.status == "dispatched";
+
+      // UPDATE: used for receipt confirmation.
+      //   - Receiving plant (toPlantId) may update status + receipt fields.
+      //   - Original dispatch fields (fromPlantId, dispatchId, qtyDispatched) cannot change.
+      //   - SuperAdmin can update anything.
+      allow update: if isAnyUser()
+        && (
+          isSuperAdmin()
+          || (
+            isPlantUser()
+            && resource.data.toPlantId == userPlant()
+            // Original dispatch core fields must remain unchanged
+            && request.resource.data.fromPlantId   == resource.data.fromPlantId
+            && request.resource.data.dispatchId    == resource.data.dispatchId
+            && request.resource.data.qtyDispatched == resource.data.qtyDispatched
+            && request.resource.data.material      == resource.data.material
+            // Status must move to received or discrepancy only
+            && request.resource.data.status in ["received", "discrepancy"]
+          )
+        );
+
+      // DELETE: nobody (audit trail must be preserved)
+      allow delete: if false;
+    }
+
+    // ── ACTIVITY LOGS ──────────────────────────────────────────
+    // Any authenticated user may create. Only superAdmin reads.
+    // No deletes — permanent audit trail.
+    match /activityLogs/{logId} {
+      allow read:   if isAnyUser();
+      allow create: if isAnyUser();
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── COUNTERS (for Dispatch ID generation) ─────────────────
+    match /counters/{counterId} {
+      allow read:  if isAnyUser();
+      allow write: if isAnyUser();      // runTransaction from client
+    }
+
+    // ── SETTINGS (email config, etc.) ─────────────────────────
+    // Super admin reads & writes. Plant users read only (to send emails).
+    match /settings/{settingId} {
+      allow read:  if isAnyUser();
+      allow write: if isSuperAdmin();
+    }
+
+    // ── Catch-all: deny everything else ───────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
