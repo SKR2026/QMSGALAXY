@@ -4,14 +4,14 @@
 //  Dispatch ID format: PTMS-YYYY-00001
 // ─────────────────────────────────────────────────────────────
 
-import { db } from "./firebase.js";
+import { db } from "./firebase.v2.js";
 import {
   collection, doc, getDocs, addDoc, query,
   orderBy, where, serverTimestamp, getDoc,
   runTransaction
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
-import { requirePlantUser } from "./auth.js";
-import { sendDispatchEmail } from "./email.js";
+import { requirePlantUser } from "./auth.v2.js";
+import { sendDispatchEmail } from "./email.v2.js";
 
 // ── Entry point ───────────────────────────────────────────────
 export async function showDispatchPage(container, user) {
@@ -82,6 +82,9 @@ async function loadDispatchList(user, listEl, filters = {}) {
     snap.forEach(d => {
       const dp = d.data();
       const created = dp.createdAt?.toDate ? dp.createdAt.toDate().toLocaleDateString("en-IN") : "—";
+      const photoThumb = dp.photoEvidence?.length
+        ? `<div style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:4px">${dp.photoEvidence.map(url=>`<img src="${url}" onclick="window.open('${url}','_blank')" style="width:38px;height:38px;object-fit:cover;border-radius:5px;border:2px solid #c62828;cursor:pointer" title="View photo">`).join("")}</div>`
+        : "";
       rows += `
         <tr>
           <td><span class="dispatch-id">${dp.dispatchId}</span></td>
