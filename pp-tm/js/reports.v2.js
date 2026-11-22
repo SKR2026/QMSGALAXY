@@ -207,7 +207,7 @@ function renderReportTable(rows){
   let html=`<table><thead><tr>
     <th>Dispatch ID</th><th>Date</th><th>From</th><th>To</th>
     <th>Material</th><th>Unit</th><th>Dispatched</th><th>Received</th>
-    <th>Diff</th><th>Vehicle</th><th>Driver</th><th>Status</th>
+    <th>Diff</th><th>Vehicle</th><th>Driver</th><th>Status</th><th>Photos</th>
   </tr></thead><tbody>`;
   rows.forEach(r=>{
     const diff=r.qtyReceived!=null?r.qtyReceived-r.qtyDispatched:null;
@@ -221,6 +221,7 @@ function renderReportTable(rows){
       <td style="${dc};font-weight:700">${ds}</td>
       <td>${r.vehicleNo||"—"}</td><td>${r.driverName||"—"}</td>
       <td><span class="badge status-${r.status}">${statusLabel(r.status)}</span></td>
+      <td>${r.photoEvidence?.length?r.photoEvidence.map(url=>`<img src="${url}" onclick="window.open('${url}','_blank')" style="width:38px;height:38px;object-fit:cover;border-radius:5px;border:2px solid #c62828;cursor:pointer">`).join(""):"—"}</td>
     </tr>`;
   });
   return html+`</tbody></table>`;
