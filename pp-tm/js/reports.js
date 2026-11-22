@@ -33,12 +33,12 @@ export async function showReportsPage(container, user) {
           </div>
           <div class="form-group" style="display:inline-block">
             <label style="font-size:.8rem;font-weight:600;color:#4a4a6a">Type</label>
-            <select id="rptType">
-              <option value="dispatched">Dispatched (Outgoing)</option>
-              <option value="received">Received (Incoming)</option>
-              <option value="discrepancy">Discrepancies Only</option>
-              <option value="all">All Transactions</option>
-            </select>
+            <div id="rptType" style="display:flex;gap:0.5rem;flex-wrap:wrap">
+              <button class="rpt-pill active" data-val="dispatched" style="padding:0.4rem 1rem;border-radius:999px;border:2px solid #1565c0;background:#1565c0;color:#fff;cursor:pointer;font-size:0.85rem;font-weight:600">🚚 Dispatched</button>
+              <button class="rpt-pill" data-val="received" style="padding:0.4rem 1rem;border-radius:999px;border:2px solid #2e7d32;background:#fff;color:#2e7d32;cursor:pointer;font-size:0.85rem;font-weight:600">📥 Received</button>
+              <button class="rpt-pill" data-val="discrepancy" style="padding:0.4rem 1rem;border-radius:999px;border:2px solid #c62828;background:#fff;color:#c62828;cursor:pointer;font-size:0.85rem;font-weight:600">⚠️ Discrepancies</button>
+              <button class="rpt-pill" data-val="all" style="padding:0.4rem 1rem;border-radius:999px;border:2px solid #666;background:#fff;color:#666;cursor:pointer;font-size:0.85rem;font-weight:600">📋 All</button>
+            </div>
           </div>
           ${user.role === "superAdmin" ? `
           <div class="form-group" style="display:inline-block">
@@ -79,7 +79,7 @@ export async function showReportsPage(container, user) {
   container.querySelector("#runReportBtn").addEventListener("click", async () => {
     const from    = container.querySelector("#rptFrom").value;
     const to      = container.querySelector("#rptTo").value;
-    const type    = container.querySelector("#rptType").value;
+    const type    = container.querySelector("#rptType .rpt-pill.active")?.dataset.val || "dispatched";
     const plantId = container.querySelector("#rptPlant")?.value || "";
 
     const result  = await runReport({ from, to, type, plantId, user });
