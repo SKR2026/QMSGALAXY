@@ -64,27 +64,27 @@ async function renderPlantDashboard(container, user) {
     <div class="page-title">📊 ${user.plantName || "Plant"} — Dashboard</div>
 
     <div class="stat-grid">
-      <div class="stat-tile" style="cursor:pointer" onclick="window.dispatchEvent(new CustomEvent('ptms-navigate',{detail:'dispatch'}))">
+      <div class="stat-tile">
         <div class="stat-label">TOTAL DISPATCHED</div>
         <div class="stat-value">${totalOut}</div>
         <div class="stat-sub">Outgoing shipments</div>
       </div>
-      <div class="stat-tile orange" style="cursor:pointer" onclick="window.dispatchEvent(new CustomEvent('ptms-navigate',{detail:'dispatch'}))">
+      <div class="stat-tile orange">
         <div class="stat-label">PENDING OUT</div>
         <div class="stat-value">${pendingOut}</div>
         <div class="stat-sub">Awaiting receipt</div>
       </div>
-      <div class="stat-tile green" style="cursor:pointer" onclick="window.dispatchEvent(new CustomEvent('ptms-navigate',{detail:'receipt'}))">
+      <div class="stat-tile green">
         <div class="stat-label">TOTAL RECEIVED</div>
         <div class="stat-value">${totalIn}</div>
         <div class="stat-sub">Incoming shipments</div>
       </div>
-      <div class="stat-tile ${pendingIn > 0 ? 'orange' : ''}" style="cursor:pointer" onclick="window.dispatchEvent(new CustomEvent('ptms-navigate',{detail:'receipt'}))">
+      <div class="stat-tile ${pendingIn > 0 ? 'orange' : ''}">
         <div class="stat-label">PENDING RECEIPT</div>
         <div class="stat-value">${pendingIn}</div>
         <div class="stat-sub">Vehicles en route</div>
       </div>
-      <div class="stat-tile ${discrepancies > 0 ? 'red' : ''}" style="cursor:pointer" onclick="window.dispatchEvent(new CustomEvent('ptms-navigate',{detail:'reports'}))">
+      <div class="stat-tile ${discrepancies > 0 ? 'red' : ''}">
         <div class="stat-label">DISCREPANCIES</div>
         <div class="stat-value">${discrepancies}</div>
         <div class="stat-sub">Qty mismatches</div>
@@ -112,6 +112,15 @@ async function renderPlantDashboard(container, user) {
   // Wire quick-action buttons
   container.querySelectorAll("[data-nav]").forEach(el => {
     el.addEventListener("click", () => window.dispatchEvent(new CustomEvent("ptms-navigate", { detail: el.dataset.nav })));
+  });
+  // Wire stat tiles
+  container.querySelectorAll(".stat-tile").forEach(el => {
+    const lbl = el.querySelector(".stat-label")?.textContent || "";
+    let nav = "dispatch";
+    if (lbl.includes("RECEIVED") || lbl.includes("RECEIPT")) nav = "receipt";
+    else if (lbl.includes("DISCREPAN")) nav = "reports";
+    el.style.cursor = "pointer";
+    el.addEventListener("click", () => window.dispatchEvent(new CustomEvent("ptms-navigate", { detail: nav })));
   });
 }
 
@@ -173,17 +182,17 @@ async function renderAdminDashboard(container, user) {
     <div class="page-title">📊 System Overview — Super Admin</div>
 
     <div class="stat-grid">
-      <div class="stat-tile" style="cursor:pointer" onclick="window.dispatchEvent(new CustomEvent('ptms-navigate',{detail:'dispatch'}))">
+      <div class="stat-tile">
         <div class="stat-label">TOTAL SHIPMENTS</div>
         <div class="stat-value">${total}</div>
         <div class="stat-sub">All time</div>
       </div>
-      <div class="stat-tile orange" style="cursor:pointer" onclick="window.dispatchEvent(new CustomEvent('ptms-navigate',{detail:'dispatch'}))">
+      <div class="stat-tile orange">
         <div class="stat-label">DISPATCHED</div>
         <div class="stat-value">${dispatched}</div>
         <div class="stat-sub">In transit / waiting</div>
       </div>
-      <div class="stat-tile green" style="cursor:pointer" onclick="window.dispatchEvent(new CustomEvent('ptms-navigate',{detail:'receipt'}))">
+      <div class="stat-tile green">
         <div class="stat-label">RECEIVED OK</div>
         <div class="stat-value">${received}</div>
         <div class="stat-sub">No issues</div>
@@ -193,7 +202,7 @@ async function renderAdminDashboard(container, user) {
         <div class="stat-value">${discrepancy}</div>
         <div class="stat-sub">Qty mismatches</div>
       </div>
-      <div class="stat-tile" style="cursor:pointer" onclick="window.dispatchEvent(new CustomEvent('ptms-navigate',{detail:'dispatch'}))">
+      <div class="stat-tile">
         <div class="stat-label">ACTIVE PLANTS</div>
         <div class="stat-value">${plantCount}</div>
         <div class="stat-sub">In system</div>

@@ -28,11 +28,13 @@ export async function showAdminPage(container, user) {
       <button class="tab-btn" data-tab="users">👥 Users</button>
       <button class="tab-btn" data-tab="email">📧 Email Settings</button>
       <button class="tab-btn" data-tab="gmail">🔑 Gmail Credentials</button>
+      <button class="tab-btn" data-tab="danger" style="color:#c62828">🗑️ Danger Zone</button>
     </div>
     <div id="tabPlants" class="tab-panel active"></div>
     <div id="tabUsers"  class="tab-panel"></div>
     <div id="tabEmail"  class="tab-panel"></div>
     <div id="tabGmail"  class="tab-panel"></div>
+    <div id="tabDanger" class="tab-panel"></div>
   `;
 
   // Tab switching
@@ -50,6 +52,7 @@ export async function showAdminPage(container, user) {
     renderUsersTab(container.querySelector("#tabUsers")),
     renderEmailTab(container.querySelector("#tabEmail")),
     renderGmailTab(container.querySelector("#tabGmail")),
+    renderDangerTab(container.querySelector("#tabDanger"), user),
   ]);
 }
 
@@ -797,3 +800,45 @@ async function renderGmailTab(el) {
 
 // ── Helpers ───────────────────────────────────────────────────
 function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+
+// ── Danger Zone Tab ──────────────────────────────────────────
+async function renderDangerTab(el, user) {
+  if (user.role !== "superAdmin") {
+    el.innerHTML = `<div class="card"><p style="color:#666">Access restricted to Super Admin.</p></div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="card" style="border:2px solid #c62828">
+      <div class="card-header" style="background:#c62828;color:#fff">⚠️ Danger Zone — Irreversible Actions</div>
+      <div style="padding:1.5rem">
+        <p style="color:#c62828;font-weight:600">These actions permanently delete data and cannot be undone.</p>
+        <hr style="margin:1rem 0">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:1rem;background:#fff3f3;border-radius:8px;margin-bottom:1rem">
+          <div>
+            <strong>Wipe All Dispatches & Logs</strong>
+            <p style="margin:0.3rem 0 0;color:#666;font-size:0.9rem">Permanently deletes all dispatch records and activity logs. Plants and users are kept.</p>
+          </div>
+          <button class="btn" style="background:#c62828;color:#fff;white-space:nowrap" onclick="wipeAllData()">🗑️ Wipe Data</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── Wipe All Data (superAdmin only) ──────────────────────────
+export async function wipeAllData() {
+  if (!confirm("⚠️ WARNING: This will permanently delete ALL dispatches and activity logs. This cannot be undone.\n\nType 'WIPE' to confirm:")) return;
+  const input = prompt("Type WIPE to confirm permanent deletion:");
+  if (input !== "WIPE") { alert("Cancelled."); return; }
+  
+  const batch1 = [];
+  const dispSnap = await getDocs(collection(db, "dispatches"));
+  dispSnap.forEach(d => batch1.push(deleteDoc(doc(db, "dispatches", d.id))));
+  const logSnap = await getDocs(collection(db, "activityLogs"));
+  logSnap.forEach(d => batch1.push(deleteDoc(doc(db, "activityLogs", d.id))));
+  
+  await Promise.all(batch1);
+  alert("✅ All dispatches and logs have been wiped.");
+  location.reload();
+}
+window.wipeAllData = wipeAllData;
