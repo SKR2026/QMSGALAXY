@@ -181,88 +181,143 @@ exports.sendPtmsEmail = onCall(async (request) => {
 
 
 // ═════════════════════════════════════════════════════════════
-//  EMAIL TEMPLATES
+//  EMAIL TEMPLATES  — Beautiful rounded-card design
 // ═════════════════════════════════════════════════════════════
 
-function emailWrapper(title, accentColor, bodyHtml) {
+function emailWrapper(title, subtitle, accentGrad, iconEmoji, bodyHtml) {
   return `<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f4f6fb;font-family:Segoe UI,Arial,sans-serif">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6fb;padding:32px 0">
-  <tr><td align="center">
-    <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.1)">
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${title}</title>
+</head>
+<body style="margin:0;padding:0;background:#eef1f8;font-family:'Segoe UI',Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased">
 
-      <!-- Header -->
-      <tr><td style="background:${accentColor};padding:24px 32px">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f8;padding:40px 16px">
+  <tr><td align="center">
+
+    <!-- Outer card -->
+    <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:20px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.12)">
+
+      <!-- ── HEADER GRADIENT ── -->
+      <tr><td style="background:${accentGrad};padding:36px 36px 32px">
         <table width="100%" cellpadding="0" cellspacing="0">
           <tr>
-            <td>
-              <div style="color:#fff;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.8">PTMS Notification</div>
-              <div style="color:#fff;font-size:20px;font-weight:700;margin-top:4px">${title}</div>
+            <td style="vertical-align:top">
+              <div style="display:inline-block;background:rgba(255,255,255,.18);border-radius:50px;padding:5px 14px;font-size:11px;font-weight:700;color:rgba(255,255,255,.95);letter-spacing:.1em;text-transform:uppercase;margin-bottom:14px">
+                📦 PTMS Notification
+              </div>
+              <div style="font-size:24px;font-weight:800;color:#ffffff;line-height:1.2;margin-bottom:6px">${title}</div>
+              <div style="font-size:13px;color:rgba(255,255,255,.8);font-weight:400">${subtitle}</div>
             </td>
-            <td align="right" style="color:#fff;font-size:28px">🏭</td>
+            <td align="right" style="vertical-align:top;padding-left:16px">
+              <div style="width:60px;height:60px;background:rgba(255,255,255,.2);border-radius:16px;text-align:center;line-height:60px;font-size:28px">
+                ${iconEmoji}
+              </div>
+            </td>
           </tr>
         </table>
       </td></tr>
 
-      <!-- Body -->
-      <tr><td style="padding:28px 32px">${bodyHtml}</td></tr>
+      <!-- ── BODY ── -->
+      <tr><td style="padding:32px 36px">${bodyHtml}</td></tr>
 
-      <!-- Footer -->
-      <tr><td style="background:#f4f6fb;padding:16px 32px;border-top:1px solid #e0e4ed">
-        <div style="font-size:11px;color:#8e8ea8;text-align:center">
-          Plant Transport &amp; Material Tracking System (PTMS) &nbsp;|&nbsp; This is an automated notification. Do not reply.
-        </div>
+      <!-- ── FOOTER ── -->
+      <tr><td style="background:#f7f9fc;border-top:1px solid #e8ecf4;border-radius:0 0 20px 20px;padding:20px 36px">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="font-size:11px;color:#9aa3b7;line-height:1.6">
+              <strong style="color:#6b7280">PTMS</strong> — Plant Transport &amp; Material Tracking System<br>
+              This is an automated notification. Please do not reply to this email.
+            </td>
+            <td align="right" style="font-size:20px;opacity:.35">🏭</td>
+          </tr>
+        </table>
       </td></tr>
 
     </table>
+
   </td></tr>
 </table>
+
 </body></html>`;
 }
 
+// Single detail row inside a card
 function row(label, value, highlight) {
+  const valStyle = `font-size:13.5px;color:${highlight || "#1f2937"};${highlight ? "font-weight:700;" : ""}`;
   return `<tr>
-    <td style="padding:8px 12px;font-size:13px;color:#4a4a6a;font-weight:600;width:40%;border-bottom:1px solid #f0f0f0">${label}</td>
-    <td style="padding:8px 12px;font-size:13px;color:#1a1a2e;border-bottom:1px solid #f0f0f0${highlight ? ';font-weight:700;color:' + highlight : ''}">${value ?? "—"}</td>
+    <td style="padding:11px 16px;font-size:12.5px;font-weight:600;color:#6b7280;width:42%;border-bottom:1px solid #f1f3f8;white-space:nowrap">${label}</td>
+    <td style="padding:11px 16px;${valStyle};border-bottom:1px solid #f1f3f8">${value ?? "—"}</td>
   </tr>`;
 }
 
-function section(title, rows) {
+// Section card with rounded corners
+function section(title, iconEmoji, rows) {
   return `
-    <div style="font-size:11px;font-weight:700;color:#8e8ea8;text-transform:uppercase;letter-spacing:.06em;margin:20px 0 8px">${title}</div>
-    <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e0e4ed;border-radius:6px;overflow:hidden">
+  <div style="margin-bottom:20px">
+    <div style="display:flex;align-items:center;margin-bottom:10px">
+      <span style="font-size:14px;margin-right:7px">${iconEmoji}</span>
+      <span style="font-size:11.5px;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.07em">${title}</span>
+    </div>
+    <table width="100%" cellpadding="0" cellspacing="0"
+      style="background:#ffffff;border:1.5px solid #e8ecf4;border-radius:14px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.04)">
       ${rows}
-    </table>`;
+    </table>
+  </div>`;
+}
+
+// Pill / badge
+function pill(text, bg, color) {
+  return `<span style="display:inline-block;background:${bg};color:${color};padding:3px 12px;border-radius:50px;font-size:12px;font-weight:700">${text}</span>`;
+}
+
+// Route arrow banner
+function routeBanner(from, to, bgColor, borderColor, textColor) {
+  return `
+  <div style="background:${bgColor};border:1.5px solid ${borderColor};border-radius:14px;padding:18px 22px;margin-bottom:24px">
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td align="center" style="width:40%">
+          <div style="font-size:11px;font-weight:600;color:${textColor};opacity:.7;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">From</div>
+          <div style="font-size:15px;font-weight:800;color:${textColor}">${from}</div>
+        </td>
+        <td align="center" style="width:20%;font-size:22px;color:${textColor};opacity:.5">→</td>
+        <td align="center" style="width:40%">
+          <div style="font-size:11px;font-weight:600;color:${textColor};opacity:.7;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">To</div>
+          <div style="font-size:15px;font-weight:800;color:${textColor}">${to}</div>
+        </td>
+      </tr>
+    </table>
+  </div>`;
 }
 
 function buildDispatchEmail(d) {
   return emailWrapper(
-    `Dispatch Created — ${d.dispatchId}`,
-    "#0d2137",
+    `New Dispatch Created`,
+    `Dispatch ID: ${d.dispatchId}  •  ${d.date}`,
+    `linear-gradient(135deg, #1a237e 0%, #0d47a1 60%, #1565c0 100%)`,
+    "🚚",
     `
-    <div style="background:#e3f2fd;border-left:4px solid #1e88e5;padding:12px 16px;border-radius:4px;margin-bottom:20px;font-size:14px;color:#0d47a1">
-      <strong>${d.fromPlantName}</strong> has dispatched material to <strong>${d.toPlantName}</strong>
-    </div>
+    ${routeBanner(d.fromPlantName, d.toPlantName, "#eff6ff", "#bfdbfe", "#1e3a8a")}
 
-    ${section("Dispatch Details",
-      row("Dispatch ID",    `<span style="font-family:monospace;font-weight:700;color:#1565c0">${d.dispatchId}</span>`) +
-      row("Dispatch Date",  d.date) +
-      row("From Plant",     d.fromPlantName) +
-      row("To Plant",       d.toPlantName) +
-      row("Dispatched By",  d.dispatchedByName)
+    ${section("Dispatch Details", "🔖",
+      row("Dispatch ID",   `<span style="font-family:monospace;font-size:13px;font-weight:700;color:#1d4ed8;background:#eff6ff;padding:2px 8px;border-radius:6px">${d.dispatchId}</span>`) +
+      row("Dispatch Date", d.date) +
+      row("Dispatched By", d.dispatchedByName) +
+      row("Status",        pill("Dispatched", "#dbeafe", "#1d4ed8"))
     )}
 
-    ${section("Material",
+    ${section("Material Details", "📦",
       row("Description",    d.material) +
-      row("Quantity",       `<strong>${d.qtyDispatched} ${d.unit}</strong>`) +
-      row("No. of Boxes",   d.boxes || "—") +
-      row("Batch / Lot No.",d.batch  || "—")
+      row("Quantity",       `<strong style="font-size:15px;color:#1d4ed8">${d.qtyDispatched}</strong> <span style="color:#6b7280">${d.unit}</span>`) +
+      row("No. of Boxes",   d.boxes  || "—") +
+      row("Batch / Lot No.", d.batch || "—")
     )}
 
-    ${section("Vehicle & Driver",
-      row("Vehicle No.",    d.vehicleNo) +
+    ${section("Vehicle & Driver", "🚛",
+      row("Vehicle No.",    `<strong>${d.vehicleNo}</strong>`) +
       row("Vehicle Type",   d.vehicleType) +
       row("Driver Name",    d.driverName) +
       row("Driver Phone",   d.driverPhone) +
@@ -270,56 +325,109 @@ function buildDispatchEmail(d) {
       row("E-Way Bill",     d.ewayBill || "—")
     )}
 
-    ${d.remarks ? `<div style="margin-top:16px;padding:12px 16px;background:#f9f9f9;border-radius:6px;font-size:13px;color:#4a4a6a"><strong>Remarks:</strong> ${d.remarks}</div>` : ""}
+    ${d.remarks ? `
+    <div style="background:#fffbeb;border:1.5px solid #fde68a;border-radius:14px;padding:16px 20px;margin-bottom:20px">
+      <div style="font-size:11.5px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">📝 Remarks</div>
+      <div style="font-size:13.5px;color:#78350f">${d.remarks}</div>
+    </div>` : ""}
 
-    <div style="margin-top:24px;padding:12px 16px;background:#fff3e0;border-radius:6px;font-size:13px;color:#bf360c">
-      ⏳ Please confirm receipt once the vehicle arrives at <strong>${d.toPlantName}</strong>.
+    <div style="background:linear-gradient(135deg,#fff7ed,#ffedd5);border:1.5px solid #fed7aa;border-radius:14px;padding:18px 22px;text-align:center">
+      <div style="font-size:22px;margin-bottom:8px">⏳</div>
+      <div style="font-size:14px;font-weight:700;color:#9a3412;margin-bottom:4px">Action Required</div>
+      <div style="font-size:13px;color:#c2410c">Please confirm receipt once the vehicle arrives at <strong>${d.toPlantName}</strong>.</div>
     </div>
     `
   );
 }
 
 function buildReceiptEmail(d, r, isDiscrep) {
-  const diff     = r.qtyReceived - d.qtyDispatched;
-  const diffStr  = `${diff >= 0 ? "+" : ""}${diff.toFixed(3)} ${d.unit}`;
-  const diffColor = diff < 0 ? "#c62828" : diff > 0 ? "#1565c0" : "#2e7d32";
-  const accentColor = isDiscrep ? "#c62828" : "#2e7d32";
-  const statusBanner = isDiscrep
-    ? `<div style="background:#ffebee;border-left:4px solid #c62828;padding:12px 16px;border-radius:4px;margin-bottom:20px;font-size:14px;color:#b71c1c">
-        ⚠️ <strong>Discrepancy Detected!</strong> Quantity received does not match quantity dispatched. Difference: <strong>${diffStr}</strong>
-       </div>`
-    : `<div style="background:#e8f5e9;border-left:4px solid #2e7d32;padding:12px 16px;border-radius:4px;margin-bottom:20px;font-size:14px;color:#1b5e20">
-        ✅ <strong>Receipt Confirmed Successfully.</strong> Quantities match.
-       </div>`;
+  const diff      = r.qtyReceived - d.qtyDispatched;
+  const diffStr   = `${diff >= 0 ? "+" : ""}${diff.toFixed(3)} ${d.unit}`;
+  const diffColor = diff < 0 ? "#b91c1c" : diff > 0 ? "#1d4ed8" : "#15803d";
 
-  return emailWrapper(
-    isDiscrep ? `⚠️ Discrepancy — ${d.dispatchId}` : `✅ Receipt Confirmed — ${d.dispatchId}`,
-    accentColor,
-    `
-    ${statusBanner}
+  if (isDiscrep) {
+    // ── DISCREPANCY email ──────────────────────────────────────
+    return emailWrapper(
+      `Discrepancy Alert`,
+      `Dispatch ID: ${d.dispatchId}`,
+      `linear-gradient(135deg, #7f1d1d 0%, #b91c1c 60%, #dc2626 100%)`,
+      "⚠️",
+      `
+      <div style="background:linear-gradient(135deg,#fef2f2,#fee2e2);border:1.5px solid #fca5a5;border-radius:14px;padding:20px 22px;margin-bottom:24px;text-align:center">
+        <div style="font-size:32px;margin-bottom:8px">⚠️</div>
+        <div style="font-size:16px;font-weight:800;color:#991b1b;margin-bottom:6px">Quantity Mismatch Detected</div>
+        <div style="font-size:13.5px;color:#b91c1c">The received quantity does not match the dispatched quantity.</div>
+        <div style="margin-top:12px;display:inline-block;background:#991b1b;color:#fff;padding:6px 20px;border-radius:50px;font-size:14px;font-weight:700">
+          Difference: ${diffStr}
+        </div>
+      </div>
 
-    ${section("Receipt Details",
-      row("Dispatch ID",    `<span style="font-family:monospace;font-weight:700;color:#1565c0">${d.dispatchId}</span>`) +
-      row("Arrival Date",   r.arrivalDate) +
-      row("Arrival Time",   r.arrivalTime) +
-      row("Received By",    r.receivedByName) +
-      row("From Plant",     d.fromPlantName) +
-      row("To Plant",       d.toPlantName)
-    )}
+      ${routeBanner(d.fromPlantName, d.toPlantName, "#fff1f2", "#fecaca", "#7f1d1d")}
 
-    ${section("Quantity Reconciliation",
-      row("Material",          d.material) +
-      row("Qty Dispatched",    `${d.qtyDispatched} ${d.unit}`) +
-      row("Qty Received",      `${r.qtyReceived} ${d.unit}`) +
-      row("Difference",        diffStr, diffColor) +
-      row("Status",            isDiscrep ? "⚠️ DISCREPANCY" : "✅ OK", accentColor)
-    )}
+      ${section("Receipt Details", "📋",
+        row("Dispatch ID",   `<span style="font-family:monospace;font-size:13px;font-weight:700;color:#1d4ed8;background:#eff6ff;padding:2px 8px;border-radius:6px">${d.dispatchId}</span>`) +
+        row("Arrival Date",  r.arrivalDate) +
+        row("Arrival Time",  r.arrivalTime) +
+        row("Received By",   r.receivedByName)
+      )}
 
-    ${r.receiptRemarks ? `<div style="margin-top:16px;padding:12px 16px;background:#f9f9f9;border-radius:6px;font-size:13px;color:#4a4a6a"><strong>Receipt Remarks:</strong> ${r.receiptRemarks}</div>` : ""}
+      ${section("Quantity Reconciliation", "⚖️",
+        row("Material",       d.material) +
+        row("Qty Dispatched", `${d.qtyDispatched} ${d.unit}`) +
+        row("Qty Received",   `<strong style="color:#b91c1c">${r.qtyReceived} ${d.unit}</strong>`) +
+        row("Difference",     `<strong style="font-size:14px">${diffStr}</strong>`, diffColor) +
+        row("Status",         pill("⚠️ DISCREPANCY", "#fee2e2", "#b91c1c"))
+      )}
 
-    ${isDiscrep ? `<div style="margin-top:16px;padding:12px 16px;background:#ffebee;border-radius:6px;font-size:13px;color:#c62828">
-      Please investigate the discrepancy and take necessary action.
-    </div>` : ""}
-    `
-  );
+      ${r.receiptRemarks ? `
+      <div style="background:#fffbeb;border:1.5px solid #fde68a;border-radius:14px;padding:16px 20px;margin-bottom:20px">
+        <div style="font-size:11.5px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">📝 Receipt Remarks</div>
+        <div style="font-size:13.5px;color:#78350f">${r.receiptRemarks}</div>
+      </div>` : ""}
+
+      <div style="background:linear-gradient(135deg,#fef2f2,#fee2e2);border:1.5px solid #fca5a5;border-radius:14px;padding:18px 22px;text-align:center">
+        <div style="font-size:14px;font-weight:700;color:#991b1b;margin-bottom:4px">🔍 Investigation Required</div>
+        <div style="font-size:13px;color:#b91c1c">Please investigate the discrepancy and take necessary corrective action.</div>
+      </div>
+      `
+    );
+  } else {
+    // ── RECEIPT CONFIRMED email ────────────────────────────────
+    return emailWrapper(
+      `Receipt Confirmed`,
+      `Dispatch ID: ${d.dispatchId}  •  ${r.arrivalDate}`,
+      `linear-gradient(135deg, #064e3b 0%, #065f46 60%, #047857 100%)`,
+      "✅",
+      `
+      <div style="background:linear-gradient(135deg,#f0fdf4,#dcfce7);border:1.5px solid #86efac;border-radius:14px;padding:20px 22px;margin-bottom:24px;text-align:center">
+        <div style="font-size:32px;margin-bottom:8px">✅</div>
+        <div style="font-size:16px;font-weight:800;color:#14532d;margin-bottom:6px">Receipt Confirmed Successfully</div>
+        <div style="font-size:13.5px;color:#166534">Quantities match — no discrepancy found.</div>
+      </div>
+
+      ${routeBanner(d.fromPlantName, d.toPlantName, "#f0fdf4", "#bbf7d0", "#14532d")}
+
+      ${section("Receipt Details", "📋",
+        row("Dispatch ID",   `<span style="font-family:monospace;font-size:13px;font-weight:700;color:#1d4ed8;background:#eff6ff;padding:2px 8px;border-radius:6px">${d.dispatchId}</span>`) +
+        row("Arrival Date",  r.arrivalDate) +
+        row("Arrival Time",  r.arrivalTime) +
+        row("Received By",   r.receivedByName)
+      )}
+
+      ${section("Quantity Reconciliation", "⚖️",
+        row("Material",       d.material) +
+        row("Qty Dispatched", `${d.qtyDispatched} ${d.unit}`) +
+        row("Qty Received",   `<strong style="color:#15803d">${r.qtyReceived} ${d.unit}</strong>`) +
+        row("Difference",     `<strong style="font-size:14px">${diffStr}</strong>`, diffColor) +
+        row("Status",         pill("✅ MATCHED", "#dcfce7", "#15803d"))
+      )}
+
+      ${r.receiptRemarks ? `
+      <div style="background:#fffbeb;border:1.5px solid #fde68a;border-radius:14px;padding:16px 20px;">
+        <div style="font-size:11.5px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">📝 Receipt Remarks</div>
+        <div style="font-size:13.5px;color:#78350f">${r.receiptRemarks}</div>
+      </div>` : ""}
+      `
+    );
+  }
 }
