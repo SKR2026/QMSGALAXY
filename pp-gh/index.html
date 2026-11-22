@@ -1649,6 +1649,41 @@ const formatDateTimeDisplay = (date, time) => {
   const parts = [datePart, normalizeOptionalText(time)].filter(Boolean);
   return parts.length > 0 ? parts.join(' ') : 'Not provided';
 };
+// Convert an Excel date serial number (e.g. 46266) to DD-MM-YYYY string.
+// Also accepts values already in DD-MM-YYYY or YYYY-MM-DD — returns them unchanged.
+const excelSerialToDateStr = val => {
+  const s = `${val ?? ''}`.trim();
+  if (!s) return '';
+  // Already looks like a date string with dashes — pass through
+  if (/^\d{2}-\d{2}-\d{4}$/.test(s) || /^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 1 || n > 2958465) return s; // not a plausible serial
+  // Excel epoch: Dec 30 1899 (accounts for the Lotus 1-2-3 leap-year bug)
+  const epoch = new Date(Date.UTC(1899, 11, 30));
+  const ms = epoch.getTime() + Math.floor(n) * 86400000;
+  const d = new Date(ms);
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = d.getUTCFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+};
+
+// Convert an Excel time fraction (e.g. 0.333...) to HH:MM string.
+// Also accepts values already in HH:MM or HH:MM:SS — returns them unchanged.
+const excelSerialToTimeStr = val => {
+  const s = `${val ?? ''}`.trim();
+  if (!s) return '';
+  if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) return s; // already a time string
+  const n = Number(s);
+  if (!Number.isFinite(n)) return s;
+  // A pure fraction 0–1 represents a time within a day; whole-number part is ignored (date portion)
+  const frac = n - Math.floor(n);
+  const totalSeconds = Math.round(frac * 86400);
+  const hh = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const minPart = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+  return `${hh}:${minPart}`;
+};
+
 const formatCurrencyDisplay = value => {
   if (value === '' || value === null || value === undefined) {
     return '-';
@@ -3248,7 +3283,7 @@ const App = () => {
     rows.slice(1).forEach((row, index) => {
       const lineNumber = index + 2;
       const getValue = column => column >= 0 ? `${row[column] ?? ''}`.trim() : '';
-      const date = getValue(columnIndex.date);
+      const date = excelSerialToDateStr(getValue(columnIndex.date));
       const plant = getValue(columnIndex.plant);
       const guestHouseName = getValue(columnIndex.guestHouse);
       const categoryInput = getValue(columnIndex.category);
@@ -3258,10 +3293,10 @@ const App = () => {
       const employeeId = getValue(columnIndex.employeeId);
       const guestDesignation = getValue(columnIndex.guestDesignation);
       const guestDepartment = getValue(columnIndex.guestDepartment);
-      const checkInDate = getValue(columnIndex.checkInDate);
-      const checkInTime = getValue(columnIndex.checkInTime);
-      const checkOutDate = getValue(columnIndex.checkOutDate);
-      const checkOutTime = getValue(columnIndex.checkOutTime);
+      const checkInDate = excelSerialToDateStr(getValue(columnIndex.checkInDate));
+      const checkInTime = excelSerialToTimeStr(getValue(columnIndex.checkInTime));
+      const checkOutDate = excelSerialToDateStr(getValue(columnIndex.checkOutDate));
+      const checkOutTime = excelSerialToTimeStr(getValue(columnIndex.checkOutTime));
       const visitedFrom = getValue(columnIndex.visitedFrom);
       const caretakerName = getValue(columnIndex.caretakerName);
       const guestMobile = getValue(columnIndex.guestMobile);
@@ -5133,8 +5168,28 @@ const BulkUploadExpensesForm = ({
         const workbook = XLSX.read(arrayBuffer, { type: 'array', cellDates: false, raw: false });
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
-        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+        const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
           .filter(row => row.some(cell => `${cell ?? ''}`.trim() !== ''));
+        // Identify date/time column indices from the header row so we can
+        // convert Excel serial numbers to human-readable strings in the preview.
+        const DATE_COL_PATTERNS = [/^date$/i, /^check.?in.?date$/i, /^check.?out.?date$/i];
+        const TIME_COL_PATTERNS = [/^check.?in.?time$/i, /^check.?out.?time$/i];
+        const headerRow = rawRows[0] || [];
+        const dateColIdxSet = new Set();
+        const timeColIdxSet = new Set();
+        headerRow.forEach((h, i) => {
+          const hn = `${h ?? ''}`.trim();
+          if (DATE_COL_PATTERNS.some(p => p.test(hn))) dateColIdxSet.add(i);
+          if (TIME_COL_PATTERNS.some(p => p.test(hn))) timeColIdxSet.add(i);
+        });
+        const rows = rawRows.map((row, ri) => {
+          if (ri === 0) return row; // keep header as-is
+          return row.map((cell, ci) => {
+            if (dateColIdxSet.has(ci)) return excelSerialToDateStr(cell);
+            if (timeColIdxSet.has(ci)) return excelSerialToTimeStr(cell);
+            return cell;
+          });
+        });
         setPreview({
           rows: rows.slice(0, 6),
           total: Math.max(0, rows.length - 1),
