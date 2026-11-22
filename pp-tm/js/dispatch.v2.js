@@ -94,9 +94,7 @@ async function loadDispatchList(user, listEl, filters = {}) {
           <td>${dp.vehicleNo}</td>
           <td>${dp.toPlantName || "—"}</td>
           <td><span class="badge status-${dp.status}">${statusLabel(dp.status)}</span></td>
-          <td>
-            <button class="btn btn-outline btn-sm" onclick="viewDispatch('${d.id}')">View</button>
-          </td>
+          <td>${photoThumb}<button class="btn btn-outline btn-sm" onclick="viewDispatch('${d.id}')">View</button></td>
         </tr>`;
     });
 
