@@ -1,0 +1,131 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helper Functions ───────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function isSuperAdmin() {
+      return isAuthenticated() && getUserData().role == 'Super Admin';
+    }
+    function isPlantAdmin() {
+      return isAuthenticated() && getUserData().role in ['Super Admin', 'Plant Admin'];
+    }
+    function hasPlantAccess(plantId) {
+      let u = getUserData();
+      return u.role == 'Super Admin' || (plantId in u.plantIds);
+    }
+    function isApprover() {
+      return isAuthenticated() && getUserData().role in ['Super Admin', 'Plant Admin', 'Approver'];
+    }
+    function isOwner(uid) {
+      return request.auth.uid == uid;
+    }
+    function notChangingProtectedFields() {
+      return !('approvalHistory' in request.resource.data) &&
+             !('currentApproverId' in request.resource.data) &&
+             !('status' in request.resource.data);
+    }
+
+    // ─── Users ──────────────────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (isOwner(userId) || isSuperAdmin() || isPlantAdmin());
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin() || (isOwner(userId) && 
+        !('role' in request.resource.data.diff(resource.data).affectedKeys()) &&
+        !('plantIds' in request.resource.data.diff(resource.data).affectedKeys()));
+      allow delete: if isSuperAdmin();
+    }
+
+    // ─── Plants ─────────────────────────────────────────────────────────────
+    match /plants/{plantId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Approval Matrices ──────────────────────────────────────────────────
+    match /approvalMatrices/{matrixId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Proposals ──────────────────────────────────────────────────────────
+    match /proposals/{proposalId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() ||
+        isOwner(resource.data.createdBy) ||
+        resource.data.currentApproverId == request.auth.uid ||
+        hasPlantAccess(resource.data.plantId)
+      );
+      // Create: authenticated users with plant access
+      allow create: if isAuthenticated() && hasPlantAccess(request.resource.data.plantId) &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.status == 'Draft' &&
+        !('approvalHistory' in request.resource.data);
+      // Update: only draft editing by owner (no status/approval manipulation)
+      allow update: if isAuthenticated() && (
+        (isOwner(resource.data.createdBy) && resource.data.status in ['Draft','Returned'] && notChangingProtectedFields()) ||
+        isSuperAdmin()
+      );
+      allow delete: if isSuperAdmin();
+
+      // Approval history: server-only via Cloud Functions
+      match /approvalHistory/{historyId} {
+        allow read: if isAuthenticated() && (
+          isSuperAdmin() ||
+          isOwner(get(/databases/$(database)/documents/proposals/$(proposalId)).data.createdBy) ||
+          hasPlantAccess(get(/databases/$(database)/documents/proposals/$(proposalId)).data.plantId)
+        );
+        allow write: if false; // Only Cloud Functions write here
+      }
+    }
+
+    // ─── Notifications ──────────────────────────────────────────────────────
+    match /notifications/{notifId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() && resource.data.userId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read','readAt']);
+      allow create, delete: if false; // Cloud Functions only
+    }
+
+    // ─── Reminders ──────────────────────────────────────────────────────────
+    match /reminders/{reminderId} {
+      allow read: if isSuperAdmin();
+      allow write: if false; // Cloud Functions only
+    }
+
+    // ─── Email Templates ────────────────────────────────────────────────────
+    match /emailTemplates/{templateId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Settings ───────────────────────────────────────────────────────────
+    match /settings/{settingId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Audit Logs ─────────────────────────────────────────────────────────
+    match /auditLogs/{logId} {
+      allow read: if isSuperAdmin() || isPlantAdmin();
+      allow write: if false; // Cloud Functions only
+    }
+
+    // ─── Counters (proposal numbering) ──────────────────────────────────────
+    match /counters/{counterId} {
+      allow read: if isAuthenticated();
+      allow write: if false; // Cloud Functions only via transaction
+    }
+
+    // ─── Magic Link Tokens ──────────────────────────────────────────────────
+    match /magicLinkTokens/{tokenId} {
+      allow read: if false; // Cloud Functions only
+      allow write: if false; // Cloud Functions only
+    }
+  }
+}

@@ -1,0 +1,101 @@
+rules_version = '2';
+
+// ═══════════════════════════════════════════════════════════════
+//  PTMS Firestore Security Rules
+//
+//  Roles stored in /users/{uid}.role:
+//    "superAdmin"  – full read/write
+//    "plantUser"   – scoped to their plantId
+//
+//  Management view: READ-ONLY on dispatches, plants (no auth needed).
+// ═══════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ───────────────────────────────────────
+    function isSignedIn()   { return request.auth != null; }
+    function uid()          { return request.auth.uid; }
+
+    function getUserData()  {
+      return get(/databases/$(database)/documents/users/$(uid())).data;
+    }
+    function userRole()     { return getUserData().role; }
+    function userPlant()    { return getUserData().plantId; }
+
+    function isSuperAdmin() { return isSignedIn() && userRole() == "superAdmin"; }
+    function isPlantUser()  { return isSignedIn() && userRole() == "plantUser"; }
+    function isAnyUser()    { return isSuperAdmin() || isPlantUser(); }
+
+    // ── PLANTS ─────────────────────────────────────────────────
+    // Public read (management dashboard). Write = superAdmin only.
+    match /plants/{plantId} {
+      allow read:   if true;
+      allow write:  if isSuperAdmin();
+    }
+
+    // ── USERS ──────────────────────────────────────────────────
+    // A user reads their own doc to get their role on login.
+    // SuperAdmin reads/writes all.
+    match /users/{userId} {
+      allow read:   if isSignedIn() && (uid() == userId || isSuperAdmin());
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin();
+      allow delete: if false;
+    }
+
+    // ── DISPATCHES ─────────────────────────────────────────────
+    match /dispatches/{dispatchId} {
+      // Public read for management dashboard
+      allow read: if true;
+
+      // Create: plant user dispatches FROM their own plant only
+      allow create: if isAnyUser()
+        && (isSuperAdmin()
+            || (isPlantUser()
+                && request.resource.data.fromPlantId == userPlant()
+                && request.resource.data.status == "dispatched"));
+
+      // Update: receiving plant confirms receipt; core fields locked
+      allow update: if isAnyUser()
+        && (isSuperAdmin()
+            || (isPlantUser()
+                && resource.data.toPlantId == userPlant()
+                && request.resource.data.fromPlantId   == resource.data.fromPlantId
+                && request.resource.data.dispatchId    == resource.data.dispatchId
+                && request.resource.data.qtyDispatched == resource.data.qtyDispatched
+                && request.resource.data.status in ["received", "discrepancy"]));
+
+      allow delete: if false;
+    }
+
+    // ── ACTIVITY LOGS ──────────────────────────────────────────
+    match /activityLogs/{logId} {
+      allow read:   if isAnyUser();
+      allow create: if isAnyUser();
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── COUNTERS ───────────────────────────────────────────────
+    match /counters/{counterId} {
+      allow read:  if isAnyUser();
+      allow write: if isAnyUser();
+    }
+
+    // ── SETTINGS ───────────────────────────────────────────────
+    // All settings readable by any logged-in user.
+    // Write restricted to superAdmin.
+    // Note: gmailConfig credentials are write-only from browser;
+    // the Cloud Function reads them server-side (Admin SDK bypasses rules).
+    match /settings/{settingId} {
+      allow read:  if isAnyUser();
+      allow write: if isSuperAdmin();
+    }
+
+    // ── Deny everything else ───────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

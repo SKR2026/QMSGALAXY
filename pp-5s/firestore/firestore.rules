@@ -1,0 +1,145 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ──────────────────────────────────────────────────────
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() && userRole() == 'superadmin';
+    }
+
+    function isPlantAdmin() {
+      return isSignedIn() && userRole() == 'plant_admin';
+    }
+
+    function isAdmin() {
+      return isSuperAdmin() || isPlantAdmin();
+    }
+
+    function userPlantIds() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.plantIds;
+    }
+
+    function canAccessPlant(plantId) {
+      return isSuperAdmin() || plantId in userPlantIds();
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // ── Users ────────────────────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read:   if isSignedIn();
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin()
+                    || (isOwner(userId) && !request.resource.data.diff(resource.data).affectedKeys()
+                        .hasAny(['role', 'plantIds', 'status']));
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Plants ───────────────────────────────────────────────────────────────
+    match /plants/{plantId} {
+      allow read:   if isSignedIn();
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin()
+                    || (isPlantAdmin() && canAccessPlant(plantId)
+                        && !request.resource.data.diff(resource.data).affectedKeys()
+                            .hasAny(['orgId', 'adminIds']));
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Departments ──────────────────────────────────────────────────────────
+    match /departments/{deptId} {
+      allow read:  if isSignedIn() && canAccessPlant(resource.data.plantId);
+      allow write: if isAdmin() && canAccessPlant(request.resource.data.plantId);
+    }
+
+    // ── Areas ────────────────────────────────────────────────────────────────
+    match /areas/{areaId} {
+      allow read:  if isSignedIn() && canAccessPlant(resource.data.plantId);
+      allow write: if isAdmin() && canAccessPlant(request.resource.data.plantId);
+    }
+
+    // ── Audit Templates ───────────────────────────────────────────────────────
+    match /auditTemplates/{templateId} {
+      allow read:   if isSignedIn();
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Audit Schedules ───────────────────────────────────────────────────────
+    match /auditSchedules/{scheduleId} {
+      allow read:   if isSignedIn() && canAccessPlant(resource.data.plantId);
+      allow create: if isAdmin() && canAccessPlant(request.resource.data.plantId);
+      allow update: if isAdmin() && canAccessPlant(resource.data.plantId);
+      allow delete: if isAdmin() && canAccessPlant(resource.data.plantId);
+    }
+
+    // ── Audits ────────────────────────────────────────────────────────────────
+    match /audits/{auditId} {
+      allow read: if isSignedIn() && canAccessPlant(resource.data.plantId);
+      allow create: if isSignedIn() && canAccessPlant(request.resource.data.plantId);
+      allow update: if isSignedIn() && canAccessPlant(resource.data.plantId)
+                    && (
+                      // Auditor can update their own Draft/Reopened audits
+                      (resource.data.auditorId == request.auth.uid
+                       && resource.data.status in ['Draft', 'Reopened'])
+                      // Admin can always update within their plant
+                      || isAdmin()
+                    );
+      allow delete: if isSuperAdmin();
+
+      match /responses/{responseId} {
+        allow read:  if isSignedIn() && canAccessPlant(get(/databases/$(database)/documents/audits/$(auditId)).data.plantId);
+        allow write: if isSignedIn() && canAccessPlant(get(/databases/$(database)/documents/audits/$(auditId)).data.plantId);
+      }
+    }
+
+    // ── Corrective Actions ───────────────────────────────────────────────────
+    match /actions/{actionId} {
+      allow read: if isSignedIn() && canAccessPlant(resource.data.plantId);
+      allow create: if isSignedIn() && canAccessPlant(request.resource.data.plantId);
+      allow update: if isSignedIn() && canAccessPlant(resource.data.plantId)
+                    && (
+                      isAdmin()
+                      || resource.data.ownerId == request.auth.uid
+                      || resource.data.reviewerId == request.auth.uid
+                    );
+      allow delete: if isAdmin() && canAccessPlant(resource.data.plantId);
+    }
+
+    // ── Notification Settings (Superadmin only) ───────────────────────────────
+    match /notificationSettings/{settingId} {
+      allow read:  if isAdmin();
+      allow write: if isSuperAdmin();
+    }
+
+    // ── Notification Logs (read-only for admins) ──────────────────────────────
+    match /notificationLogs/{logId} {
+      allow read:  if isAdmin();
+      allow write: if false; // Cloud Functions only
+    }
+
+    // ── Activity Logs (read-only for admins) ──────────────────────────────────
+    match /activityLogs/{logId} {
+      allow read:  if isAdmin();
+      allow write: if false; // Cloud Functions only
+    }
+
+    // ── Organizations ─────────────────────────────────────────────────────────
+    match /organizations/{orgId} {
+      allow read:  if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+  }
+}

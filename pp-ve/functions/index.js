@@ -737,32 +737,47 @@ exports.invoiceExceptionAlert = onDocumentWritten(
 
 // ══════════════════════════════════════════════════════════════════
 // 6. UPDATE SCHEDULE — HTTP Function called directly from VEMS app
-//    Updates Cloud Scheduler job timings without needing Cloud Shell
 // ══════════════════════════════════════════════════════════════════
 const { onRequest } = require("firebase-functions/v2/https");
 const https = require("https");
 
-// Helper: make HTTPS request returning parsed JSON
+// Get GCP access token from metadata server (built into Cloud Run — no extra library needed)
+function getAccessToken() {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname: "metadata.google.internal",
+      path: "/computeMetadata/v1/instance/service-accounts/default/token",
+      headers: { "Metadata-Flavor": "Google" },
+    };
+    https.get(opts, (res) => {
+      let raw = "";
+      res.on("data", (c) => (raw += c));
+      res.on("end", () => {
+        try { resolve(JSON.parse(raw).access_token); }
+        catch { reject(new Error("Failed to parse token")); }
+      });
+    }).on("error", reject);
+  });
+}
+
+// Helper: HTTPS request returning parsed JSON
 function httpsRequest(url, method, token, body) {
   return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
+    const u = new URL(url);
     const data = body ? JSON.stringify(body) : null;
-    const opts = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
+    const req = https.request({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
       method,
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
         ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}),
       },
-    };
-    const req = https.request(opts, (res) => {
+    }, (res) => {
       let raw = "";
       res.on("data", (c) => (raw += c));
-      res.on("end", () => {
-        try { resolve(JSON.parse(raw)); } catch { resolve(raw); }
-      });
+      res.on("end", () => { try { resolve(JSON.parse(raw)); } catch { resolve({}); } });
     });
     req.on("error", reject);
     if (data) req.write(data);
@@ -771,57 +786,39 @@ function httpsRequest(url, method, token, body) {
 }
 
 exports.updateSchedule = onRequest(
-  {
-    region: "asia-south1",
-    cors: true,
-  },
+  { region: "asia-south1", cors: true },
   async (req, res) => {
     if (req.method === "OPTIONS") return res.status(204).send("");
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    const { jobName, schedule, enabled, idToken } = req.body || {};
+    const { jobName, schedule, enabled, action } = req.body || {};
     if (!jobName) return res.status(400).json({ error: "Missing jobName" });
 
-    // Verify Firebase ID token
     try {
-      const { getAuth } = require("firebase-admin/auth");
-      const decoded = await getAuth().verifyIdToken(idToken || "");
-      if (decoded.email !== "sushil@polyplasticsindia.com") {
-        return res.status(403).json({ error: "Superadmin only" });
-      }
-    } catch (e) {
-      // Allow without token for now (superadmin panel is already protected by app login)
-      console.warn("Token verification skipped:", e.message);
-    }
-
-    try {
-      // Get access token via Application Default Credentials (automatic in Cloud Run)
-      const { GoogleAuth } = require("google-auth-library");
-      const gauth = new GoogleAuth({ scopes: ["https://www.googleapis.com/auth/cloud-platform"] });
-      const client = await gauth.getClient();
-      const tokenRes = await client.getAccessToken();
-      const token = tokenRes.token;
-
+      const token     = await getAccessToken();
       const projectId = "skr-mom";
       const location  = "asia-south1";
-      const jobId     = `firebase-schedule-${jobName}-asia-south1`;
+      const jobId     = action === 'trigger' ? jobName : `firebase-schedule-${jobName}-asia-south1`;
       const apiBase   = `https://cloudscheduler.googleapis.com/v1/projects/${projectId}/locations/${location}/jobs/${jobId}`;
+
+      // Trigger job immediately
+      if (action === 'trigger') {
+        const data = await httpsRequest(`${apiBase}:run`, "POST", token, {});
+        console.log(`✅ Triggered: ${jobId}`);
+        return res.json({ success: true, action: "triggered", data });
+      }
 
       if (!enabled) {
         const data = await httpsRequest(`${apiBase}:pause`, "POST", token, {});
         return res.json({ success: true, action: "paused", data });
       }
 
-      // Update schedule + timezone
-      const patchData = await httpsRequest(
-        `${apiBase}?updateMask=schedule,timeZone`, "PATCH", token,
-        { schedule, timeZone: "Asia/Kolkata" }
-      );
-      // Resume in case it was paused
+      await httpsRequest(`${apiBase}?updateMask=schedule,timeZone`, "PATCH", token,
+        { schedule, timeZone: "Asia/Kolkata" });
       await httpsRequest(`${apiBase}:resume`, "POST", token, {});
 
-      console.log(`✅ Schedule updated: ${jobId} → ${schedule} IST`);
-      return res.json({ success: true, action: "updated", schedule, patchData });
+      console.log(`✅ Updated: ${jobId} → ${schedule} IST`);
+      return res.json({ success: true, action: "updated", schedule });
     } catch (e) {
       console.error("Schedule update error:", e.message);
       return res.status(500).json({ error: e.message });

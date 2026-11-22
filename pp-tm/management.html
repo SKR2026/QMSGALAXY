@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PTMS – Management Dashboard</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="mgmtPage">
+  <!-- Header -->
+  <div class="mgmt-header">
+    <div>
+      <h1>🏭 PTMS – Management Dashboard</h1>
+      <p>Plant Transport & Material Tracking System &nbsp;|&nbsp; Read-Only View</p>
+    </div>
+    <div>
+      <span class="badge badge-grey" id="mgmtClock" style="font-size:.85rem;padding:.4rem .9rem"></span>
+    </div>
+  </div>
+
+  <div class="mgmt-body">
+    <!-- KPI tiles -->
+    <div class="stat-grid" id="mgmtKpis">
+      <div class="spinner" style="grid-column:1/-1"></div>
+    </div>
+
+    <!-- Per-plant status -->
+    <div class="card section" id="mgmtPlantCard">
+      <div class="card-header">Plant-wise Summary</div>
+      <div class="card-body table-wrap" id="mgmtPlantTable">
+        <div class="spinner"></div>
+      </div>
+    </div>
+
+    <!-- Recent dispatches -->
+    <div class="card section">
+      <div class="card-header">
+        <span>Recent Dispatches</span>
+        <div class="filter-bar" style="margin:0">
+          <input type="date" id="mgmtFrom" title="From">
+          <input type="date" id="mgmtTo"   title="To">
+          <button class="btn btn-outline btn-sm" id="mgmtFilter">Filter</button>
+        </div>
+      </div>
+      <div class="card-body table-wrap" id="mgmtDispatchTable">
+        <div class="spinner"></div>
+      </div>
+    </div>
+
+    <!-- Discrepancies -->
+    <div class="card section">
+      <div class="card-header" style="color:#c62828">⚠️ Discrepancy Alerts</div>
+      <div class="card-body table-wrap" id="mgmtDiscTable">
+        <div class="spinner"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toastContainer"></div>
+
+<script type="module">
+// ─── Management public dashboard ───────────────────────────────────
+// IMPORTANT: This page accesses Firestore using restricted read-only
+// rules. No auth required for management view.
+// No write operations are performed here.
+// ──────────────────────────────────────────────────────────────────
+
+import { initializeApp }  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, collection, getDocs, query, orderBy, where, limit }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ── Paste your Firebase config here (same as js/firebase.js) ──────
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyC0vOWt3PBDu5DzgF37keVvFzll4nriYv0",
+  authDomain:        "skr-tm.firebaseapp.com",
+  projectId:         "skr-tm",
+  storageBucket:     "skr-tm.firebasestorage.app",
+  messagingSenderId: "703644096773",
+  appId:             "1:703644096773:web:2e156592690f23e4547f6c",
+  measurementId:     "G-LP6H8RX4ZN"
+};
+
+const app = initializeApp(FIREBASE_CONFIG, "mgmt");
+const db  = getFirestore(app);
+
+// ── Clock ──────────────────────────────────────────────────────────
+function tickClock() {
+  document.getElementById("mgmtClock").textContent =
+    new Date().toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
+}
+setInterval(tickClock, 10000);
+tickClock();
+
+// ── Filters ────────────────────────────────────────────────────────
+document.getElementById("mgmtFilter").addEventListener("click", loadAll);
+
+// ── Load all ───────────────────────────────────────────────────────
+async function loadAll() {
+  await Promise.all([loadKpis(), loadPlantSummary(), loadDispatches(), loadDiscrepancies()]);
+}
+
+async function loadKpis() {
+  const snap = await getDocs(collection(db, "dispatches"));
+  const total      = snap.size;
+  const received   = snap.docs.filter(d => d.data().status === "received").length;
+  const pending    = snap.docs.filter(d => ["dispatched","in-transit"].includes(d.data().status)).length;
+  const discrepancy= snap.docs.filter(d => d.data().status === "discrepancy").length;
+
+  document.getElementById("mgmtKpis").innerHTML = `
+    <div class="stat-tile">
+      <div class="stat-label">Total Shipments</div>
+      <div class="stat-value">${total}</div>
+    </div>
+    <div class="stat-tile green">
+      <div class="stat-label">Received OK</div>
+      <div class="stat-value">${received}</div>
+    </div>
+    <div class="stat-tile orange">
+      <div class="stat-label">In Transit</div>
+      <div class="stat-value">${pending}</div>
+    </div>
+    <div class="stat-tile ${discrepancy > 0 ? 'red' : ''}">
+      <div class="stat-label">Discrepancies</div>
+      <div class="stat-value">${discrepancy}</div>
+    </div>
+  `;
+}
+
+async function loadPlantSummary() {
+  const [pSnap, dSnap] = await Promise.all([
+    getDocs(query(collection(db, "plants"), orderBy("name"))),
+    getDocs(collection(db, "dispatches"))
+  ]);
+  const plantMap = {};
+  pSnap.forEach(d => { plantMap[d.id] = { ...d.data(), out: 0, inbound: 0, disc: 0, recvOk: 0 }; });
+  dSnap.docs.forEach(d => {
+    const dp = d.data();
+    if (plantMap[dp.fromPlantId]) plantMap[dp.fromPlantId].out++;
+    if (plantMap[dp.toPlantId])   {
+      plantMap[dp.toPlantId].inbound++;
+      if (dp.status === "received")    plantMap[dp.toPlantId].recvOk++;
+      if (dp.status === "discrepancy") plantMap[dp.toPlantId].disc++;
+    }
+  });
+  let rows = "";
+  Object.values(plantMap).forEach(p => {
+    rows += `<tr>
+      <td><span class="dispatch-id">${p.code}</span></td>
+      <td><strong>${p.name}</strong></td>
+      <td>${p.location || "—"}</td>
+      <td>${p.out}</td>
+      <td>${p.inbound}</td>
+      <td>${p.recvOk}</td>
+      <td>${p.disc > 0 ? `<span class="badge badge-red">${p.disc}</span>` : "0"}</td>
+    </tr>`;
+  });
+  document.getElementById("mgmtPlantTable").innerHTML = rows
+    ? `<table>
+        <thead><tr>
+          <th>Code</th><th>Plant</th><th>Location</th>
+          <th>Outgoing</th><th>Incoming</th><th>Received OK</th><th>Discrepancies</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+       </table>`
+    : `<div class="empty-state"><p>No plant data.</p></div>`;
+}
+
+async function loadDispatches() {
+  const from = document.getElementById("mgmtFrom").value;
+  const to   = document.getElementById("mgmtTo").value;
+  const snap = await getDocs(query(collection(db, "dispatches"), orderBy("createdAt","desc"), limit(50)));
+
+  let rows = [];
+  snap.docs.forEach(d => {
+    const dp = d.data();
+    if (from && dp.date && dp.date < from) return;
+    if (to   && dp.date && dp.date > to)   return;
+    rows.push(dp);
+  });
+
+  let html = rows.length ? `
+    <table>
+      <thead><tr>
+        <th>Dispatch ID</th><th>Date</th><th>From</th><th>To</th>
+        <th>Material</th><th>Qty</th><th>Vehicle</th><th>Status</th>
+      </tr></thead>
+      <tbody>` : "";
+  rows.forEach(dp => {
+    html += `<tr>
+      <td><span class="dispatch-id">${dp.dispatchId}</span></td>
+      <td>${dp.date || "—"}</td>
+      <td>${dp.fromPlantName}</td>
+      <td>${dp.toPlantName}</td>
+      <td>${dp.material}</td>
+      <td>${dp.qtyDispatched} ${dp.unit}</td>
+      <td>${dp.vehicleNo}</td>
+      <td><span class="badge status-${dp.status}">${statusLabel(dp.status)}</span></td>
+    </tr>`;
+  });
+  if (rows.length) html += `</tbody></table>`;
+  else html = `<div class="empty-state"><div class="empty-icon">📦</div><p>No dispatches for selected period.</p></div>`;
+  document.getElementById("mgmtDispatchTable").innerHTML = html;
+}
+
+async function loadDiscrepancies() {
+  const snap = await getDocs(query(collection(db, "dispatches"),
+    where("status", "==", "discrepancy"), orderBy("updatedAt", "desc")));
+  if (snap.empty) {
+    document.getElementById("mgmtDiscTable").innerHTML =
+      `<div class="empty-state"><div class="empty-icon">✅</div><p>No discrepancies recorded.</p></div>`;
+    return;
+  }
+  let rows = "";
+  snap.docs.forEach(d => {
+    const dp = d.data();
+    const diff = (dp.qtyReceived ?? 0) - dp.qtyDispatched;
+    rows += `<tr>
+      <td><span class="dispatch-id">${dp.dispatchId}</span></td>
+      <td>${dp.date || "—"}</td>
+      <td>${dp.fromPlantName}</td>
+      <td>${dp.toPlantName}</td>
+      <td>${dp.material}</td>
+      <td>${dp.qtyDispatched} ${dp.unit}</td>
+      <td>${dp.qtyReceived ?? "—"} ${dp.unit}</td>
+      <td style="color:#c62828;font-weight:700">${diff.toFixed(2)}</td>
+      <td>${dp.receiptRemarks || "—"}</td>
+    </tr>`;
+  });
+  document.getElementById("mgmtDiscTable").innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Dispatch ID</th><th>Date</th><th>From</th><th>To</th>
+        <th>Material</th><th>Dispatched</th><th>Received</th>
+        <th>Difference</th><th>Remarks</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function statusLabel(s) {
+  const m = { dispatched: "Dispatched", "in-transit": "In Transit", received: "Received", discrepancy: "Discrepancy" };
+  return m[s] || s;
+}
+
+loadAll();
+</script>
+</body>
+</html>

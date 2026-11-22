@@ -13,6 +13,7 @@
     };
   </script>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
   <style>
     body.theme-dark-blue {
       background:
@@ -1632,11 +1633,14 @@ const normalizeExpenseRecord = expense => {
 };
 const formatDateDisplay = isoDate => {
   if (!isoDate) return '';
-  // Accepts YYYY-MM-DD and returns DD-MM-YY
-  const parts = `${isoDate}`.trim().split('-');
+  // Accepts YYYY-MM-DD or DD-MM-YYYY and returns DD-MM-YYYY
+  const s = `${isoDate}`.trim();
+  const parts = s.split('-');
   if (parts.length === 3) {
+    // Already DD-MM-YYYY (day part ≤ 31, year part > 31)
+    if (parts[0].length <= 2 && parts[2].length === 4) return s;
     const [y, m, d] = parts;
-    return `${d.padStart(2, '0')}-${m.padStart(2, '0')}-${y.slice(-2)}`;
+    return `${d.padStart(2, '0')}-${m.padStart(2, '0')}-${y}`;
   }
   return isoDate;
 };
@@ -1645,6 +1649,41 @@ const formatDateTimeDisplay = (date, time) => {
   const parts = [datePart, normalizeOptionalText(time)].filter(Boolean);
   return parts.length > 0 ? parts.join(' ') : 'Not provided';
 };
+// Convert an Excel date serial number (e.g. 46266) to DD-MM-YYYY string.
+// Also accepts values already in DD-MM-YYYY or YYYY-MM-DD — returns them unchanged.
+const excelSerialToDateStr = val => {
+  const s = `${val ?? ''}`.trim();
+  if (!s) return '';
+  // Already looks like a date string with dashes — pass through
+  if (/^\d{2}-\d{2}-\d{4}$/.test(s) || /^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 1 || n > 2958465) return s; // not a plausible serial
+  // Excel epoch: Dec 30 1899 (accounts for the Lotus 1-2-3 leap-year bug)
+  const epoch = new Date(Date.UTC(1899, 11, 30));
+  const ms = epoch.getTime() + Math.floor(n) * 86400000;
+  const d = new Date(ms);
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = d.getUTCFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+};
+
+// Convert an Excel time fraction (e.g. 0.333...) to HH:MM string.
+// Also accepts values already in HH:MM or HH:MM:SS — returns them unchanged.
+const excelSerialToTimeStr = val => {
+  const s = `${val ?? ''}`.trim();
+  if (!s) return '';
+  if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) return s; // already a time string
+  const n = Number(s);
+  if (!Number.isFinite(n)) return s;
+  // A pure fraction 0–1 represents a time within a day; whole-number part is ignored (date portion)
+  const frac = n - Math.floor(n);
+  const totalSeconds = Math.round(frac * 86400);
+  const hh = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const minPart = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+  return `${hh}:${minPart}`;
+};
+
 const formatCurrencyDisplay = value => {
   if (value === '' || value === null || value === undefined) {
     return '-';
@@ -2287,13 +2326,8 @@ const LicenseExpiryBadge = () => {
   const exp = lic.expiryDate ? lic.expiryDate instanceof Date ? lic.expiryDate : new Date(lic.expiryDate) : lic.expiryIso ? new Date(lic.expiryIso) : null;
   const days = exp ? Math.ceil((exp - new Date()) / 86400000) : null;
 
-  // Compact date format for the badge — DD MMM YYYY in en-IN
-  // (matches the locale used everywhere else in the app)
-  const fmtExpiry = d => d.toLocaleDateString('en-IN', {
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric'
-  });
+  // Compact date format for the badge — DD-MM-YYYY
+  const fmtExpiry = d => { const dd=String(d.getDate()).padStart(2,'0'),mm=String(d.getMonth()+1).padStart(2,'0'),yyyy=d.getFullYear(); return `${dd}-${mm}-${yyyy}`; };
   let bg, border, color, icon, label;
   if (days === null) {
     bg = 'rgba(20,184,166,.10)';
@@ -2326,7 +2360,8 @@ const LicenseExpiryBadge = () => {
     icon = '\u2713';
     label = fmtExpiry(exp);
   }
-  const tooltip = ['License: ' + (lic.key || '\u2014'), exp ? 'Expires: ' + exp.toLocaleDateString('en-IN') : 'No expiry date', days === null ? '' : days < 0 ? 'Expired ' + Math.abs(days) + ' day(s) ago' : days + ' day(s) left', lic.property ? 'Property: ' + lic.property : ''].filter(Boolean).join('\n');
+  const fmtDDMMYYYY = d => { const dd=String(d.getDate()).padStart(2,'0'),mm=String(d.getMonth()+1).padStart(2,'0'),yyyy=d.getFullYear(); return `${dd}-${mm}-${yyyy}`; };
+  const tooltip = ['License: ' + (lic.key || '\u2014'), exp ? 'Expires: ' + fmtDDMMYYYY(exp) : 'No expiry date', days === null ? '' : days < 0 ? 'Expired ' + Math.abs(days) + ' day(s) ago' : days + ' day(s) left', lic.property ? 'Property: ' + lic.property : ''].filter(Boolean).join('\n');
   return /*#__PURE__*/React.createElement("div", {
     title: tooltip,
     style: {
@@ -2401,7 +2436,7 @@ const LicenseSettingsView = function() {
         window.__GHM_LICENSE__ = { key: fmtKey, expired: false, expiryDate: r.data.expiryDate || null, clientName: r.data.clientName || '' };
         setCurrentKey(fmtKey);
         setLicKey('');
-        var expStr = r.data.expiryDate ? ' · Expires ' + new Date(r.data.expiryDate).toLocaleDateString('en-IN') : ' · No expiry';
+        var _expD = r.data.expiryDate ? new Date(r.data.expiryDate) : null; var expStr = _expD ? ' · Expires ' + String(_expD.getDate()).padStart(2,'0')+'-'+String(_expD.getMonth()+1).padStart(2,'0')+'-'+_expD.getFullYear() : ' · No expiry';
         setStatus({ type:'success', msg: 'License activated successfully!' + expStr });
       }
     } catch(e) {
@@ -2422,7 +2457,7 @@ const LicenseSettingsView = function() {
   };
 
   var expInfo = window.__GHM_LICENSE__ && window.__GHM_LICENSE__.expiryDate
-    ? 'Expires ' + new Date(window.__GHM_LICENSE__.expiryDate).toLocaleDateString('en-IN')
+    ? (() => { const _d=new Date(window.__GHM_LICENSE__.expiryDate); return 'Expires '+String(_d.getDate()).padStart(2,'0')+'-'+String(_d.getMonth()+1).padStart(2,'0')+'-'+_d.getFullYear(); })()
     : 'No expiry set';
 
   return /*#__PURE__*/React.createElement("div", { className: "max-w-xl" },
@@ -3174,19 +3209,23 @@ const App = () => {
   };
   const handleBulkUploadExpenses = async data => {
     if (!data.file) {
-      window.alert('Choose a CSV file before importing.');
+      window.alert('Choose an Excel file before importing.');
       return;
     }
-    let csvText = '';
+    let rows = [];
     try {
-      csvText = await data.file.text();
+      const arrayBuffer = await data.file.arrayBuffer();
+      const workbook = XLSX.read(arrayBuffer, { type: 'array', cellDates: false, raw: false });
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+      const jsonRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+      rows = jsonRows.filter(row => row.some(cell => `${cell ?? ''}`.trim() !== ''));
     } catch (error) {
-      window.alert('The selected CSV file could not be read.');
+      window.alert('The selected Excel file could not be read. Please use a valid .xlsx file.');
       return;
     }
-    const rows = parseCsv(csvText).filter(row => row.some(cell => `${cell ?? ''}`.trim() !== ''));
     if (rows.length < 2) {
-      window.alert('The CSV file is empty or only contains headers.');
+      window.alert('The Excel file is empty or only contains headers.');
       return;
     }
     const headers = rows[0].map(normalizeHeader);
@@ -3244,7 +3283,7 @@ const App = () => {
     rows.slice(1).forEach((row, index) => {
       const lineNumber = index + 2;
       const getValue = column => column >= 0 ? `${row[column] ?? ''}`.trim() : '';
-      const date = getValue(columnIndex.date);
+      const date = excelSerialToDateStr(getValue(columnIndex.date));
       const plant = getValue(columnIndex.plant);
       const guestHouseName = getValue(columnIndex.guestHouse);
       const categoryInput = getValue(columnIndex.category);
@@ -3254,10 +3293,10 @@ const App = () => {
       const employeeId = getValue(columnIndex.employeeId);
       const guestDesignation = getValue(columnIndex.guestDesignation);
       const guestDepartment = getValue(columnIndex.guestDepartment);
-      const checkInDate = getValue(columnIndex.checkInDate);
-      const checkInTime = getValue(columnIndex.checkInTime);
-      const checkOutDate = getValue(columnIndex.checkOutDate);
-      const checkOutTime = getValue(columnIndex.checkOutTime);
+      const checkInDate = excelSerialToDateStr(getValue(columnIndex.checkInDate));
+      const checkInTime = excelSerialToTimeStr(getValue(columnIndex.checkInTime));
+      const checkOutDate = excelSerialToDateStr(getValue(columnIndex.checkOutDate));
+      const checkOutTime = excelSerialToTimeStr(getValue(columnIndex.checkOutTime));
       const visitedFrom = getValue(columnIndex.visitedFrom);
       const caretakerName = getValue(columnIndex.caretakerName);
       const guestMobile = getValue(columnIndex.guestMobile);
@@ -3384,7 +3423,7 @@ const App = () => {
         imported: 0,
         skipped: skippedRows,
         fileName: data.file ? data.file.name : 'upload',
-        timestamp: new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
+        timestamp: (() => { const _t=new Date(); return String(_t.getDate()).padStart(2,'0')+'-'+String(_t.getMonth()+1).padStart(2,'0')+'-'+_t.getFullYear()+', '+_t.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}); })()
       });
       return;
     }
@@ -3421,7 +3460,7 @@ const App = () => {
       imported: importedExpenses.length,
       skipped: skippedRows,
       fileName: data.file ? data.file.name : 'upload',
-      timestamp: new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
+      timestamp: (() => { const _t=new Date(); return String(_t.getDate()).padStart(2,'0')+'-'+String(_t.getMonth()+1).padStart(2,'0')+'-'+_t.getFullYear()+', '+_t.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}); })()
     });
   };
 
@@ -3431,11 +3470,18 @@ const App = () => {
       expenses: filteredExpenses
     } = getAccessibleData();
     const filtered = applyFilters(filteredExpenses);
-    const csv = buildCsv([['Date', 'Plant', 'Guest House', 'Employee ID', 'Guest Name', 'Mobile No', 'Designation', 'Department', 'Check-In Date', 'Check-In Time', 'Check-Out Date', 'Check-Out Time', 'Visited From Location', 'Caretaker Name', 'Category', 'Amount', 'Payment Collected From Guest', 'Description'], ...filtered.map(e => {
+    const fmtD = v => { if (!v) return ''; const p = `${v}`.trim().split('-'); if (p.length === 3) { if (p[0].length <= 2 && p[2].length === 4) return `${v}`; return `${p[2].padStart(2,'0')}-${p[1].padStart(2,'0')}-${p[0]}`; } return `${v}`; };
+    const headers = ['Date', 'Plant', 'Guest House', 'Employee ID', 'Guest Name', 'Mobile No', 'Designation', 'Department', 'Check-In Date', 'Check-In Time', 'Check-Out Date', 'Check-Out Time', 'Visited From Location', 'Caretaker Name', 'Category', 'Amount', 'Payment Collected From Guest', 'Description'];
+    const dataRows = filtered.map(e => {
       const gh = guestHouses.find(g => g.id === e.guestHouseId);
-      return [e.date, e.plant, gh?.name || '', e.employeeId, e.guestName, e.guestMobile, e.guestDesignation, e.guestDepartment, e.checkInDate, e.checkInTime, e.checkOutDate, e.checkOutTime, e.visitedFrom, e.caretakerName, e.category, e.amount, e.paymentCollected, e.description];
-    })]);
-    downloadFile(`expenses_${new Date().toISOString().split('T')[0]}.csv`, csv, 'text/csv;charset=utf-8;');
+      return [fmtD(e.date), e.plant, gh?.name || '', e.employeeId, e.guestName, e.guestMobile, e.guestDesignation, e.guestDepartment, fmtD(e.checkInDate), e.checkInTime, fmtD(e.checkOutDate), e.checkOutTime, e.visitedFrom, e.caretakerName, e.category, e.amount, e.paymentCollected, e.description];
+    });
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...dataRows]);
+    ws['!cols'] = headers.map((h, i) => ({ wch: Math.max(h.length, ...dataRows.map(r => `${r[i] ?? ''}`.length), 12) }));
+    XLSX.utils.book_append_sheet(wb, ws, 'Expenses');
+    const _ed = new Date(); const _edStr = `${String(_ed.getDate()).padStart(2,'0')}-${String(_ed.getMonth()+1).padStart(2,'0')}-${_ed.getFullYear()}`;
+    XLSX.writeFile(wb, `expenses_${_edStr}.xlsx`);
   };
 
   // Export guest list
@@ -3444,11 +3490,18 @@ const App = () => {
       expenses: filteredExpenses
     } = getAccessibleData();
     const filtered = applyFilters(filteredExpenses).filter(e => e.guestName && e.guestName.trim() !== '');
-    const csv = buildCsv([['Employee ID', 'Guest Name', 'Mobile No', 'Designation', 'Department', 'Visited From', 'Plant', 'Guest House', 'Check-In Date', 'Check-In Time', 'Check-Out Date', 'Check-Out Time', 'Caretaker Name', 'Category', 'Amount', 'Payment Collected From Guest', 'Date'], ...filtered.map(e => {
+    const fmtD = v => { if (!v) return ''; const p = `${v}`.trim().split('-'); if (p.length === 3) { if (p[0].length <= 2 && p[2].length === 4) return `${v}`; return `${p[2].padStart(2,'0')}-${p[1].padStart(2,'0')}-${p[0]}`; } return `${v}`; };
+    const headers = ['Employee ID', 'Guest Name', 'Mobile No', 'Designation', 'Department', 'Visited From', 'Plant', 'Guest House', 'Check-In Date', 'Check-In Time', 'Check-Out Date', 'Check-Out Time', 'Caretaker Name', 'Category', 'Amount', 'Payment Collected From Guest', 'Date'];
+    const dataRows = filtered.map(e => {
       const gh = guestHouses.find(g => g.id === e.guestHouseId);
-      return [e.employeeId, e.guestName, e.guestMobile, e.guestDesignation, e.guestDepartment, e.visitedFrom, e.plant, gh?.name || '', e.checkInDate, e.checkInTime, e.checkOutDate, e.checkOutTime, e.caretakerName, e.category, e.amount, e.paymentCollected, e.date];
-    })]);
-    downloadFile(`guest_list_${new Date().toISOString().split('T')[0]}.csv`, csv, 'text/csv;charset=utf-8;');
+      return [e.employeeId, e.guestName, e.guestMobile, e.guestDesignation, e.guestDepartment, e.visitedFrom, e.plant, gh?.name || '', fmtD(e.checkInDate), e.checkInTime, fmtD(e.checkOutDate), e.checkOutTime, e.caretakerName, e.category, e.amount, e.paymentCollected, fmtD(e.date)];
+    });
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...dataRows]);
+    ws['!cols'] = headers.map((h, i) => ({ wch: Math.max(h.length, ...dataRows.map(r => `${r[i] ?? ''}`.length), 12) }));
+    XLSX.utils.book_append_sheet(wb, ws, 'Guest List');
+    const _gd = new Date(); const _gdStr = `${String(_gd.getDate()).padStart(2,'0')}-${String(_gd.getMonth()+1).padStart(2,'0')}-${_gd.getFullYear()}`;
+    XLSX.writeFile(wb, `guest_list_${_gdStr}.xlsx`);
   };
 
   // Apply filters — date range is handled locally inside each view's own year/month tabs
@@ -3605,10 +3658,10 @@ const App = () => {
     setThemeMode: setThemeMode
   })), /*#__PURE__*/React.createElement("button", {
     onClick: handleLogout,
-    className: "flex items-center gap-2 px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg transition-colors font-medium"
+    className: "flex items-center justify-center p-2 bg-red-500 hover:bg-red-600 text-white rounded-lg transition-colors", title: "Logout"
   }, /*#__PURE__*/React.createElement(LogOut, {
-    className: "w-4 h-4"
-  }), "Logout"))))), /*#__PURE__*/React.createElement("nav", {
+    className: "w-5 h-5"
+  })))))), /*#__PURE__*/React.createElement("nav", {
     className: "ghm-top-nav bg-white/70 dark:bg-slate-900/70 backdrop-blur-xl border-b border-slate-200 dark:border-slate-800"
   }, /*#__PURE__*/React.createElement("div", {
     className: "w-full mx-auto px-4 flex items-center justify-between gap-2"
@@ -4834,7 +4887,7 @@ const ExpensesView = ({
   }, /*#__PURE__*/React.createElement("thead", {
     className: "bg-slate-50 dark:bg-slate-800"
   }, /*#__PURE__*/React.createElement("tr", null, isSuperAdmin && /*#__PURE__*/React.createElement("th", {
-    className: "py-3 px-3 text-left"
+    className: "py-2 px-3 text-left"
   }, /*#__PURE__*/React.createElement("input", {
     type: "checkbox",
     checked: allSelected,
@@ -4842,73 +4895,75 @@ const ExpensesView = ({
     className: "w-4 h-4 rounded accent-blue-600 cursor-pointer",
     title: "Select all"
   })), /*#__PURE__*/React.createElement("th", {
-    className: "text-left py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-left py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Date"), currentUser.role !== 'User' && /*#__PURE__*/React.createElement("th", {
-    className: "text-left py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-left py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Plant"), /*#__PURE__*/React.createElement("th", {
-    className: "text-left py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-left py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Guest House"), /*#__PURE__*/React.createElement("th", {
-    className: "text-left py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-left py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Guest"), /*#__PURE__*/React.createElement("th", {
-    className: "text-left py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-left py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Stay"), /*#__PURE__*/React.createElement("th", {
-    className: "text-left py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-left py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Category"), /*#__PURE__*/React.createElement("th", {
-    className: "text-left py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-left py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Description"), /*#__PURE__*/React.createElement("th", {
-    className: "text-right py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-right py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Amount"), /*#__PURE__*/React.createElement("th", {
-    className: "text-right py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-right py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Payment Collected"), /*#__PURE__*/React.createElement("th", {
-    className: "text-right py-3 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
+    className: "text-right py-2 px-3 text-xs font-bold text-slate-700 dark:text-slate-300 whitespace-nowrap"
   }, "Actions"))), /*#__PURE__*/React.createElement("tbody", null, pageRows.map(expense => {
     const gh = guestHouses.find(g => g.id === expense.guestHouseId);
     return /*#__PURE__*/React.createElement("tr", {
       key: expense.id,
-      className: "border-b border-slate-100 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+      className: "border-b border-slate-100 dark:border-slate-800 align-middle hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
     }, isSuperAdmin && /*#__PURE__*/React.createElement("td", {
-      className: "py-4 px-4"
+      className: "py-1.5 px-3"
     }, /*#__PURE__*/React.createElement("input", {
       type: "checkbox",
       checked: selectedIds.has(expense.id),
       onChange: () => toggleSelectOne(expense.id),
       className: "w-4 h-4 rounded accent-blue-600 cursor-pointer"
     })), /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3 text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap"
+      className: "py-1.5 px-3 text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap"
     }, formatDateDisplay(expense.date)), currentUser.role !== 'User' && /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3 text-xs text-slate-900 dark:text-slate-100 font-medium whitespace-nowrap"
+      className: "py-1.5 px-3 text-xs text-slate-900 dark:text-slate-100 font-medium whitespace-nowrap"
     }, expense.plant), /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3 text-xs text-slate-900 dark:text-slate-100 whitespace-nowrap"
+      className: "py-1.5 px-3 text-xs text-slate-900 dark:text-slate-100 whitespace-nowrap max-w-[11rem] truncate",
+      title: gh?.name || ''
     }, gh?.name), /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3"
+      className: "py-1.5 px-3"
     }, /*#__PURE__*/React.createElement(GuestInfoCell, {
       expense: expense
     })), /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3"
+      className: "py-1.5 px-3"
     }, /*#__PURE__*/React.createElement(StayDetailsCell, {
       expense: expense
     })), /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3"
+      className: "py-1.5 px-3"
     }, /*#__PURE__*/React.createElement("span", {
       className: `px-2 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap ${getCategoryColor(expense.category)}`
     }, expense.category)), /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3 text-xs text-slate-600 dark:text-slate-400 max-w-[120px] truncate"
-    }, expense.description), /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3 text-xs font-bold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap"
+      className: "py-1.5 px-3 text-xs text-slate-600 dark:text-slate-400 max-w-[180px] truncate",
+      title: expense.description || ''
+    }, expense.description || '\u2014'), /*#__PURE__*/React.createElement("td", {
+      className: "py-1.5 px-3 text-xs font-bold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap"
     }, "\u20b9", expense.amount.toLocaleString('en-IN')), /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3 text-xs font-bold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap"
+      className: "py-1.5 px-3 text-xs font-bold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap"
     }, formatCurrencyDisplay(expense.paymentCollected)), /*#__PURE__*/React.createElement("td", {
-      className: "py-3 px-3"
+      className: "py-1.5 px-3"
     }, /*#__PURE__*/React.createElement("div", {
       className: "flex items-center justify-end gap-1"
     }, /*#__PURE__*/React.createElement("button", {
       onClick: () => onEdit(expense),
-      className: "p-2 hover:bg-blue-50 dark:hover:bg-blue-900/20 text-blue-600 dark:text-blue-400 rounded-lg transition-colors"
+      className: "p-1.5 hover:bg-blue-50 dark:hover:bg-blue-900/20 text-blue-600 dark:text-blue-400 rounded-lg transition-colors"
     }, /*#__PURE__*/React.createElement(Edit2, {
       className: "w-4 h-4"
     })), currentUser.role === 'Super Admin' && /*#__PURE__*/React.createElement("button", {
       onClick: () => onDelete(expense.id),
-      className: "p-2 hover:bg-red-50 dark:hover:bg-red-900/20 text-red-600 dark:text-red-400 rounded-lg transition-colors"
+      className: "p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 text-red-600 dark:text-red-400 rounded-lg transition-colors"
     }, /*#__PURE__*/React.createElement(Trash2, {
       className: "w-4 h-4"
     })))));
@@ -5092,69 +5147,66 @@ const BulkUploadExpensesForm = ({
   const REQUIRED = ['Date', 'Guest House', 'Category', 'Amount'];
   const SAMPLE_ROW = ['15-04-2026', 'Plant A', 'Executive House A', 'Food', '3500', 'Dinner for visiting delegation', 'EMP-1042', 'Rajesh Kumar', '9876543210', 'GM \u2013 Operations', 'Supply Chain', '14-04-2026', '19:00', '15-04-2026', '11:00', 'Mumbai', 'Suresh', '500'];
   const downloadTemplate = () => {
-    const esc = v => {
-      const s = `${v ?? ''}`;
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const csv = [TEMPLATE_HEADERS, SAMPLE_ROW].map(r => r.map(esc).join(',')).join('\n');
-    const blob = new Blob([csv], {
-      type: 'text/csv;charset=utf-8;'
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'bulk_upload_template.csv';
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 0);
+    const wb = XLSX.utils.book_new();
+    const wsData = [TEMPLATE_HEADERS, SAMPLE_ROW];
+    const ws = XLSX.utils.aoa_to_sheet(wsData);
+    // Auto-width columns
+    const colWidths = TEMPLATE_HEADERS.map((h, i) => ({
+      wch: Math.max(h.length, `${SAMPLE_ROW[i] ?? ''}`.length, 14)
+    }));
+    ws['!cols'] = colWidths;
+    XLSX.utils.book_append_sheet(wb, ws, 'Expenses');
+    XLSX.writeFile(wb, 'bulk_upload_template.xlsx');
   };
   const processFile = file => {
     if (!file) return;
     handleChange('file', file);
     const reader = new FileReader();
     reader.onload = e => {
-      const text = e.target.result;
-      const lines = text.split(/\r?\n/).filter(l => l.trim());
-      const parseRow = line => {
-        const cells = [];
-        let cell = '',
-          inQ = false;
-        for (let i = 0; i < line.length; i++) {
-          const c = line[i];
-          if (inQ) {
-            if (c === '"' && line[i + 1] === '"') {
-              cell += '"';
-              i++;
-            } else if (c === '"') {
-              inQ = false;
-            } else {
-              cell += c;
-            }
-          } else if (c === '"') {
-            inQ = true;
-          } else if (c === ',') {
-            cells.push(cell);
-            cell = '';
-          } else {
-            cell += c;
-          }
-        }
-        cells.push(cell);
-        return cells;
-      };
-      const rows = lines.map(parseRow);
-      setPreview({
-        rows: rows.slice(0, 6),
-        total: lines.length - 1,
-        fileName: file.name
-      });
+      try {
+        const arrayBuffer = e.target.result;
+        const workbook = XLSX.read(arrayBuffer, { type: 'array', cellDates: false, raw: false });
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+          .filter(row => row.some(cell => `${cell ?? ''}`.trim() !== ''));
+        // Identify date/time column indices from the header row so we can
+        // convert Excel serial numbers to human-readable strings in the preview.
+        const DATE_COL_PATTERNS = [/^date$/i, /^check.?in.?date$/i, /^check.?out.?date$/i];
+        const TIME_COL_PATTERNS = [/^check.?in.?time$/i, /^check.?out.?time$/i];
+        const headerRow = rawRows[0] || [];
+        const dateColIdxSet = new Set();
+        const timeColIdxSet = new Set();
+        headerRow.forEach((h, i) => {
+          const hn = `${h ?? ''}`.trim();
+          if (DATE_COL_PATTERNS.some(p => p.test(hn))) dateColIdxSet.add(i);
+          if (TIME_COL_PATTERNS.some(p => p.test(hn))) timeColIdxSet.add(i);
+        });
+        const rows = rawRows.map((row, ri) => {
+          if (ri === 0) return row; // keep header as-is
+          return row.map((cell, ci) => {
+            if (dateColIdxSet.has(ci)) return excelSerialToDateStr(cell);
+            if (timeColIdxSet.has(ci)) return excelSerialToTimeStr(cell);
+            return cell;
+          });
+        });
+        setPreview({
+          rows: rows.slice(0, 6),
+          total: Math.max(0, rows.length - 1),
+          fileName: file.name
+        });
+      } catch (err) {
+        setPreview(null);
+        window.alert('Could not read the Excel file. Please use a valid .xlsx file.');
+      }
     };
-    reader.readAsText(file);
+    reader.readAsArrayBuffer(file);
   };
   const handleDrop = e => {
     e.preventDefault();
     setDragOver(false);
     const file = e.dataTransfer.files?.[0];
-    if (file && (file.name.endsWith('.csv') || file.type === 'text/csv')) processFile(file);
+    if (file && (file.name.endsWith('.xlsx') || file.name.endsWith('.xls') || file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || file.type === 'application/vnd.ms-excel')) processFile(file);
   };
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-4 flex-1 flex flex-col"
@@ -5164,7 +5216,7 @@ const BulkUploadExpensesForm = ({
     className: "flex items-center justify-between px-4 py-2 border-b border-blue-100 dark:border-blue-900/50"
   }, /*#__PURE__*/React.createElement("p", {
     className: "text-sm font-semibold text-blue-900 dark:text-blue-200"
-  }, "CSV Column Reference"), /*#__PURE__*/React.createElement("button", {
+  }, "Excel Column Reference"), /*#__PURE__*/React.createElement("button", {
     type: "button",
     onClick: downloadTemplate,
     className: "flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
@@ -5205,11 +5257,11 @@ const BulkUploadExpensesForm = ({
     className: "text-center"
   }, /*#__PURE__*/React.createElement("p", {
     className: "text-sm font-semibold text-slate-700 dark:text-slate-200"
-  }, dragOver ? 'Drop your CSV here' : 'Drag & drop your CSV, or click to browse'), /*#__PURE__*/React.createElement("p", {
+  }, dragOver ? 'Drop your Excel file here' : 'Drag & drop your Excel file, or click to browse'), /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-slate-500 dark:text-slate-400 mt-0.5"
-  }, "Accepts .csv files")), /*#__PURE__*/React.createElement("input", {
+  }, "Accepts .xlsx files")), /*#__PURE__*/React.createElement("input", {
     type: "file",
-    accept: ".csv,text/csv",
+    accept: ".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel",
     className: "absolute inset-0 opacity-0 cursor-pointer",
     onChange: e => processFile(e.target.files?.[0] || null)
   }))), preview && preview.rows.length > 1 && /*#__PURE__*/React.createElement("div", {
@@ -5704,43 +5756,35 @@ const Modal = ({
 const GuestInfoCell = ({
   expense
 }) => {
-  const secondaryDetails = [];
-  if (expense.guestMobile) {
-    secondaryDetails.push(`📱 ${expense.guestMobile}`);
-  }
-  if (expense.guestDesignation) {
-    secondaryDetails.push(`Designation: ${expense.guestDesignation}`);
-  }
-  if (expense.guestDepartment) {
-    secondaryDetails.push(`Department: ${expense.guestDepartment}`);
-  }
-  if (expense.visitedFrom) {
-    secondaryDetails.push(`From: ${expense.visitedFrom}`);
-  }
-  if (expense.caretakerName) {
-    secondaryDetails.push(`Caretaker: ${expense.caretakerName}`);
-  }
+  const tip = [
+    expense.employeeId && `ID: ${expense.employeeId}`,
+    expense.guestMobile && `Mobile: ${expense.guestMobile}`,
+    expense.guestDesignation && `Designation: ${expense.guestDesignation}`,
+    expense.guestDepartment && `Department: ${expense.guestDepartment}`,
+    expense.visitedFrom && `From: ${expense.visitedFrom}`,
+    expense.caretakerName && `Caretaker: ${expense.caretakerName}`
+  ].filter(Boolean).join('\n');
   return /*#__PURE__*/React.createElement("div", {
-    className: "min-w-[9rem]"
+    className: "min-w-[10rem] leading-tight",
+    title: tip
   }, /*#__PURE__*/React.createElement("p", {
-    className: "text-xs font-semibold text-blue-600 dark:text-blue-400 mb-0.5 tracking-wide"
-  }, "\uD83C\uDD94 ", expense.employeeId || '\u2014'), /*#__PURE__*/React.createElement("p", {
-    className: "text-xs font-medium text-slate-900 dark:text-slate-100"
-  }, expense.guestName || expense.guestDetails || 'Not provided'), secondaryDetails.length > 0 ? /*#__PURE__*/React.createElement("p", {
-    className: "mt-0.5 text-xs text-slate-500 dark:text-slate-400 truncate max-w-[9rem]"
-  }, secondaryDetails[0]) : null);
+    className: "text-xs whitespace-nowrap"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "font-medium text-slate-900 dark:text-slate-100"
+  }, expense.guestName || expense.guestDetails || 'Not provided'), expense.employeeId ? /*#__PURE__*/React.createElement("span", {
+    className: "ml-1.5 text-[11px] font-semibold text-blue-600 dark:text-blue-400"
+  }, "#", expense.employeeId) : null), expense.guestMobile ? /*#__PURE__*/React.createElement("p", {
+    className: "text-[11px] text-slate-500 dark:text-slate-400 whitespace-nowrap"
+  }, "\uD83D\uDCF1 ", expense.guestMobile) : null);
 };
 const StayDetailsCell = ({
   expense
 }) => /*#__PURE__*/React.createElement("div", {
-  className: "min-w-[8rem] text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap"
-}, /*#__PURE__*/React.createElement("p", null, /*#__PURE__*/React.createElement("span", {
-  className: "font-semibold text-slate-900 dark:text-slate-100"
-}, "In:"), ' ', formatDateTimeDisplay(expense.checkInDate, expense.checkInTime)), /*#__PURE__*/React.createElement("p", {
-  className: "mt-0.5"
-}, /*#__PURE__*/React.createElement("span", {
-  className: "font-semibold text-slate-900 dark:text-slate-100"
-}, "Out:"), ' ', formatDateTimeDisplay(expense.checkOutDate, expense.checkOutTime)));
+  className: "text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap",
+  title: `Check-in: ${formatDateTimeDisplay(expense.checkInDate, expense.checkInTime)}\nCheck-out: ${formatDateTimeDisplay(expense.checkOutDate, expense.checkOutTime)}`
+}, formatDateTimeDisplay(expense.checkInDate, expense.checkInTime), /*#__PURE__*/React.createElement("span", {
+  className: "mx-1 text-slate-400"
+}, "\u2192"), formatDateTimeDisplay(expense.checkOutDate, expense.checkOutTime));
 
 // Stat Card
 const StatCard = ({
