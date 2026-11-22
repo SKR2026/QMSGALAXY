@@ -205,7 +205,7 @@ async function runReport({from,to,type,plantId,user}){
 function renderReportTable(rows){
   if(!rows.length)return`<div class="empty-state"><div class="empty-icon">📋</div><p>No records found.</p></div>`;
   let html=`<table><thead><tr>
-    <th>Dispatch ID</th><th>Date</th><th>From</th><th>To</th>
+    <th>Dispatch ID</th><th>Dispatch Date/Time</th><th>Receipt Date/Time</th><th>From</th><th>To</th>
     <th>Material</th><th>Unit</th><th>Dispatched</th><th>Received</th>
     <th>Diff</th><th>Vehicle</th><th>Driver</th><th>Status</th><th>Photos</th>
   </tr></thead><tbody>`;
@@ -213,9 +213,11 @@ function renderReportTable(rows){
     const diff=r.qtyReceived!=null?r.qtyReceived-r.qtyDispatched:null;
     const ds=diff!=null?`${diff>=0?"+":""}${diff.toFixed(2)}`:"—";
     const dc=diff==null?"":diff<0?"color:#c62828":diff>0?"color:#1565c0":"color:#2e7d32";
+    const dispDT=r.createdAt?.toDate?r.createdAt.toDate().toLocaleString("en-IN"):(r.date||"—");
+    const recvDT=(r.arrivalDate&&r.arrivalTime)?r.arrivalDate+" "+r.arrivalTime:(r.arrivalDate||"—");
     html+=`<tr>
       <td><span class="dispatch-id">${r.dispatchId}</span></td>
-      <td>${r.date||"—"}</td><td>${r.fromPlantName}</td><td>${r.toPlantName}</td>
+      <td>${dispDT}</td><td>${recvDT}</td><td>${r.fromPlantName}</td><td>${r.toPlantName}</td>
       <td>${r.material}</td><td>${r.unit}</td>
       <td>${r.qtyDispatched}</td><td>${r.qtyReceived??"—"}</td>
       <td style="${dc};font-weight:700">${ds}</td>
