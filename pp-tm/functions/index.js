@@ -1,98 +1,88 @@
 // ─────────────────────────────────────────────────────────────
-//  PTMS – Firebase Cloud Functions
+//  PTMS – Firebase Cloud Functions  (Gen 2 / firebase-functions v4+)
 //
 //  1. createPtmsUser  – creates Firebase Auth user + Firestore
 //                       profile (requires superAdmin caller)
 //  2. sendPtmsEmail   – sends Gmail via Nodemailer
 //
-//  Deploy credentials first:
-//    firebase functions:config:set gmail.user="you@gmail.com" gmail.pass="xxxx xxxx xxxx xxxx"
-//    firebase deploy --only functions
+//  Gmail credentials are stored in Firestore settings/gmailConfig
+//  (set them via Admin → 🔑 Gmail Credentials in the app).
 // ─────────────────────────────────────────────────────────────
 
-const functions  = require("firebase-functions");
-const admin      = require("firebase-admin");
-const nodemailer = require("nodemailer");
+const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { setGlobalOptions }   = require("firebase-functions/v2");
+const admin                  = require("firebase-admin");
+const nodemailer             = require("nodemailer");
 
 admin.initializeApp();
 const db = admin.firestore();
+
+// Set region for all functions
+setGlobalOptions({ region: "asia-south1" });
 
 // ═════════════════════════════════════════════════════════════
 //  HTTPS callable: createPtmsUser
 //  Creates a Firebase Auth user + Firestore profile.
 //  Only a verified superAdmin may call this.
 // ═════════════════════════════════════════════════════════════
-exports.createPtmsUser = functions
-  .region("asia-south1")
-  .https.onCall(async (data, context) => {
+exports.createPtmsUser = onCall(async (request) => {
 
-    // ── Must be signed-in ─────────────────────────────────────
-    if (!context.auth) {
-      throw new functions.https.HttpsError(
-        "unauthenticated", "You must be logged in."
-      );
+  // ── Must be signed-in ─────────────────────────────────────
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "You must be logged in.");
+  }
+
+  // ── Caller must be superAdmin ─────────────────────────────
+  const callerDoc = await db.doc(`users/${request.auth.uid}`).get();
+  if (!callerDoc.exists || callerDoc.data().role !== "superAdmin") {
+    throw new HttpsError("permission-denied", "Only Super Admins can create users.");
+  }
+
+  const { name, email, password, role, plantId } = request.data;
+
+  // ── Basic validation ──────────────────────────────────────
+  if (!name || !email || !password || !role) {
+    throw new HttpsError("invalid-argument", "name, email, password and role are required.");
+  }
+  if (password.length < 6) {
+    throw new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+  }
+  if (role === "plantUser" && !plantId) {
+    throw new HttpsError("invalid-argument", "plantId is required for Plant User role.");
+  }
+
+  // ── Create Auth user ──────────────────────────────────────
+  let userRecord;
+  try {
+    userRecord = await admin.auth().createUser({ email, password, displayName: name });
+  } catch (e) {
+    if (e.code === "auth/email-already-exists") {
+      throw new HttpsError("already-exists", "Email already in use.");
     }
+    throw new HttpsError("internal", e.message);
+  }
 
-    // ── Caller must be superAdmin ─────────────────────────────
-    const callerDoc = await db.doc(`users/${context.auth.uid}`).get();
-    if (!callerDoc.exists || callerDoc.data().role !== "superAdmin") {
-      throw new functions.https.HttpsError(
-        "permission-denied", "Only Super Admins can create users."
-      );
-    }
-
-    const { name, email, password, role, plantId } = data;
-
-    // ── Basic validation ──────────────────────────────────────
-    if (!name || !email || !password || !role) {
-      throw new functions.https.HttpsError(
-        "invalid-argument", "name, email, password and role are required."
-      );
-    }
-    if (password.length < 6) {
-      throw new functions.https.HttpsError(
-        "invalid-argument", "Password must be at least 6 characters."
-      );
-    }
-    if (role === "plantUser" && !plantId) {
-      throw new functions.https.HttpsError(
-        "invalid-argument", "plantId is required for Plant User role."
-      );
-    }
-
-    // ── Create Auth user ──────────────────────────────────────
-    let userRecord;
-    try {
-      userRecord = await admin.auth().createUser({ email, password, displayName: name });
-    } catch (e) {
-      // Surface friendly Firebase Auth errors to the client
-      if (e.code === "auth/email-already-exists") {
-        throw new functions.https.HttpsError("already-exists", "Email already in use.");
-      }
-      throw new functions.https.HttpsError("internal", e.message);
-    }
-
-    // ── Write Firestore profile ───────────────────────────────
-    await db.doc(`users/${userRecord.uid}`).set({
-      name,
-      email,
-      role,
-      plantId: role === "plantUser" ? (plantId || null) : null,
-      isActive: true,
-      mustChangePassword: true,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      createdBy: context.auth.uid,
-    });
-
-    console.log(`✅ User created: ${email} (${role}) by ${context.auth.uid}`);
-    return { uid: userRecord.uid };
+  // ── Write Firestore profile ───────────────────────────────
+  await db.doc(`users/${userRecord.uid}`).set({
+    name,
+    email,
+    role,
+    plantId: role === "plantUser" ? (plantId || null) : null,
+    isActive: true,
+    mustChangePassword: true,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    createdBy: request.auth.uid,
   });
+
+  console.log(`✅ User created: ${email} (${role}) by ${request.auth.uid}`);
+  return { uid: userRecord.uid };
+});
 
 // ── Gmail transporter (credentials from Firestore settings/gmailConfig) ──
 async function createTransporter() {
   const snap = await db.doc("settings/gmailConfig").get();
   if (!snap.exists) {
-    throw new Error("Gmail credentials not configured. Please set them in Admin → Email Settings.");
+    throw new Error("Gmail credentials not configured. Please set them in Admin → Gmail Credentials.");
   }
   const cfg = snap.data();
   if (!cfg.user || !cfg.pass) {
@@ -112,84 +102,82 @@ async function createTransporter() {
 //  Called from browser via Firebase Functions SDK.
 //  Requires authenticated user (Firebase Auth token validated).
 // ═════════════════════════════════════════════════════════════
-exports.sendPtmsEmail = functions
-  .region("asia-south1")
-  .https.onCall(async (data, context) => {
+exports.sendPtmsEmail = onCall(async (request) => {
 
-    // ── Auth check: must be signed-in plant user or superAdmin ─
-    if (!context.auth) {
-      throw new functions.https.HttpsError(
-        "unauthenticated",
-        "You must be logged in to send notifications."
-      );
+  // ── Auth check: must be signed-in plant user or superAdmin ─
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "You must be logged in to send notifications.");
+  }
+
+  const { type, dispatchData, receiptData } = request.data;
+  if (!type || !dispatchData) {
+    throw new HttpsError("invalid-argument", "Missing email data.");
+  }
+
+  // ── Load recipient config from Firestore ──────────────────
+  let emailConfig = {
+    onDispatch: { to: [], cc: [] },
+    onReceipt:  { to: [], cc: [] },
+    onDiscrepancy: { to: [], cc: [] },
+  };
+  try {
+    const cfgSnap = await db.doc("settings/emailConfig").get();
+    if (cfgSnap.exists) emailConfig = { ...emailConfig, ...cfgSnap.data() };
+  } catch (e) {
+    console.warn("Could not load emailConfig from Firestore:", e.message);
+  }
+
+  // ── Build email content ───────────────────────────────────
+  let subject, htmlBody, cfg;
+
+  if (type === "dispatch") {
+    cfg = emailConfig.onDispatch;
+    subject = `🚚 New Dispatch: ${dispatchData.dispatchId} | ${dispatchData.fromPlantName} → ${dispatchData.toPlantName}`;
+    htmlBody = buildDispatchEmail(dispatchData);
+
+  } else if (type === "receipt") {
+    const isDiscrep = receiptData && Math.abs(receiptData.qtyReceived - dispatchData.qtyDispatched) > 0.001;
+    cfg = isDiscrep ? emailConfig.onDiscrepancy : emailConfig.onReceipt;
+    if (isDiscrep && emailConfig.onReceipt.to?.length) {
+      cfg = {
+        to: cfg.to || [],
+        cc: [...new Set([...(cfg.cc || []), ...(emailConfig.onReceipt.to || [])])],
+      };
     }
+    subject = isDiscrep
+      ? `⚠️ Discrepancy Alert: ${dispatchData.dispatchId} | ${dispatchData.fromPlantName} → ${dispatchData.toPlantName}`
+      : `✅ Receipt Confirmed: ${dispatchData.dispatchId} | ${dispatchData.fromPlantName} → ${dispatchData.toPlantName}`;
+    htmlBody = buildReceiptEmail(dispatchData, receiptData, isDiscrep);
 
-    const { type, dispatchData, receiptData } = data;
-    if (!type || !dispatchData) {
-      throw new functions.https.HttpsError("invalid-argument", "Missing email data.");
-    }
+  } else {
+    throw new HttpsError("invalid-argument", `Unknown email type: ${type}`);
+  }
 
-    // ── Load recipient config from Firestore ──────────────────
-    let emailConfig = { onDispatch: { to: [], cc: [] }, onReceipt: { to: [], cc: [] }, onDiscrepancy: { to: [], cc: [] } };
-    try {
-      const cfgSnap = await db.doc("settings/emailConfig").get();
-      if (cfgSnap.exists) emailConfig = { ...emailConfig, ...cfgSnap.data() };
-    } catch (e) {
-      console.warn("Could not load emailConfig from Firestore:", e.message);
-    }
+  // ── Validate recipients ───────────────────────────────────
+  const toList = (cfg.to || []).filter(Boolean);
+  const ccList = (cfg.cc || []).filter(Boolean);
+  if (toList.length === 0) {
+    console.log(`No recipients configured for type "${type}" — skipping email.`);
+    return { sent: false, reason: "No recipients configured" };
+  }
 
-    // ── Build email content ───────────────────────────────────
-    let subject, htmlBody, cfg;
+  // ── Send via Gmail ────────────────────────────────────────
+  const transporter = await createTransporter();
+  const gmailSnap   = await db.doc("settings/gmailConfig").get();
+  const gmailUser   = gmailSnap.data().user;
 
-    if (type === "dispatch") {
-      cfg = emailConfig.onDispatch;
-      subject = `🚚 New Dispatch: ${dispatchData.dispatchId} | ${dispatchData.fromPlantName} → ${dispatchData.toPlantName}`;
-      htmlBody = buildDispatchEmail(dispatchData);
+  const mailOptions = {
+    from:    `"PTMS Notifications" <${gmailUser}>`,
+    to:      toList.join(", "),
+    cc:      ccList.length ? ccList.join(", ") : undefined,
+    subject,
+    html:    htmlBody,
+  };
 
-    } else if (type === "receipt") {
-      const isDiscrep = receiptData && Math.abs(receiptData.qtyReceived - dispatchData.qtyDispatched) > 0.001;
-      cfg = isDiscrep ? emailConfig.onDiscrepancy : emailConfig.onReceipt;
-      // Also CC the normal receipt list on discrepancy
-      if (isDiscrep && emailConfig.onReceipt.to?.length) {
-        cfg = {
-          to: cfg.to || [],
-          cc: [...new Set([...(cfg.cc || []), ...(emailConfig.onReceipt.to || [])])],
-        };
-      }
-      subject = isDiscrep
-        ? `⚠️ Discrepancy Alert: ${dispatchData.dispatchId} | ${dispatchData.fromPlantName} → ${dispatchData.toPlantName}`
-        : `✅ Receipt Confirmed: ${dispatchData.dispatchId} | ${dispatchData.fromPlantName} → ${dispatchData.toPlantName}`;
-      htmlBody = buildReceiptEmail(dispatchData, receiptData, isDiscrep);
-
-    } else {
-      throw new functions.https.HttpsError("invalid-argument", `Unknown email type: ${type}`);
-    }
-
-    // ── Validate recipients ───────────────────────────────────
-    const toList = (cfg.to || []).filter(Boolean);
-    const ccList = (cfg.cc || []).filter(Boolean);
-    if (toList.length === 0) {
-      console.log(`No recipients configured for type "${type}" — skipping email.`);
-      return { sent: false, reason: "No recipients configured" };
-    }
-
-    // ── Send via Gmail ────────────────────────────────────────
-    const transporter = await createTransporter();
-    const gmailSnap   = await db.doc("settings/gmailConfig").get();
-    const gmailUser   = gmailSnap.data().user;
-
-    const mailOptions = {
-      from:    `"PTMS Notifications" <${gmailUser}>`,
-      to:      toList.join(", "),
-      cc:      ccList.length ? ccList.join(", ") : undefined,
-      subject,
-      html:    htmlBody,
-    };
-
-    await transporter.sendMail(mailOptions);
-    console.log(`✅ Email sent [${type}] to: ${toList.join(", ")}`);
-    return { sent: true };
-  });
+  await transporter.sendMail(mailOptions);
+  console.log(`✅ Email sent [${type}] to: ${toList.join(", ")}`);
+  return { sent: true };
+});
 
 
 // ═════════════════════════════════════════════════════════════
