@@ -1,13 +1,12 @@
 // ─────────────────────────────────────────────────────────────
-//  PTMS – Dashboard Module  (Phase 4 & 5)
+//  PTMS – Dashboard Module
 //  Plant user: their plant's stats.
 //  Super admin: all-plant overview.
 // ─────────────────────────────────────────────────────────────
 
 import { db } from "./firebase.js";
 import {
-  collection, getDocs, query, where, orderBy,
-  limit, serverTimestamp
+  collection, getDocs, query, where, orderBy, limit
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
 export async function showDashboardPage(container, user) {
@@ -29,53 +28,62 @@ export async function showDashboardPage(container, user) {
 async function renderPlantDashboard(container, user) {
   const plantId = user.plantId;
 
-  // Fetch dispatches FROM and TO this plant
+  // Simple queries — no composite index needed
   const [outSnap, inSnap] = await Promise.all([
     getDocs(query(collection(db, "dispatches"), where("fromPlantId", "==", plantId))),
     getDocs(query(collection(db, "dispatches"), where("toPlantId",   "==", plantId))),
   ]);
 
-  // Counts
-  const totalOut = outSnap.size;
-  const pendingOut = outSnap.docs.filter(d => ["dispatched","in-transit"].includes(d.data().status)).length;
-  const totalIn  = inSnap.size;
-  const pendingIn = inSnap.docs.filter(d => ["dispatched","in-transit"].includes(d.data().status)).length;
-  const discrepancies = [...outSnap.docs, ...inSnap.docs].filter(d => d.data().status === "discrepancy").length;
+  const totalOut      = outSnap.size;
+  const pendingOut    = outSnap.docs.filter(d => d.data().status === "dispatched").length;
+  const totalIn       = inSnap.size;
+  const pendingIn     = inSnap.docs.filter(d => d.data().status === "dispatched").length;
+  const discrepancies = [...outSnap.docs, ...inSnap.docs]
+                          .filter(d => d.data().status === "discrepancy").length;
 
-  // Recent activity (last 10)
-  const recentSnap = await getDocs(query(
-    collection(db, "activityLogs"),
-    where("plantId", "==", plantId),
-    orderBy("timestamp", "desc"),
-    limit(10)
-  ));
+  // Recent activity — simple orderBy on single field, no composite needed
+  let recentSnap = null;
+  try {
+    recentSnap = await getDocs(query(
+      collection(db, "activityLogs"),
+      where("plantId", "==", plantId),
+      orderBy("timestamp", "desc"),
+      limit(10)
+    ));
+  } catch (e) {
+    // Index may still be building — show empty gracefully
+    recentSnap = null;
+  }
+
+  // Pending vehicles for alert table
+  const pendingDocs = inSnap.docs.filter(d => d.data().status === "dispatched");
 
   container.innerHTML = `
-    <div class="page-title">📊 ${user.plantName} — Dashboard</div>
+    <div class="page-title">📊 ${user.plantName || "Plant"} — Dashboard</div>
 
     <div class="stat-grid">
       <div class="stat-tile">
-        <div class="stat-label">Total Dispatched</div>
+        <div class="stat-label">TOTAL DISPATCHED</div>
         <div class="stat-value">${totalOut}</div>
         <div class="stat-sub">Outgoing shipments</div>
       </div>
       <div class="stat-tile orange">
-        <div class="stat-label">Pending Out</div>
+        <div class="stat-label">PENDING OUT</div>
         <div class="stat-value">${pendingOut}</div>
         <div class="stat-sub">Awaiting receipt</div>
       </div>
       <div class="stat-tile green">
-        <div class="stat-label">Total Received</div>
+        <div class="stat-label">TOTAL RECEIVED</div>
         <div class="stat-value">${totalIn}</div>
         <div class="stat-sub">Incoming shipments</div>
       </div>
       <div class="stat-tile ${pendingIn > 0 ? 'orange' : ''}">
-        <div class="stat-label">Pending Receipt</div>
+        <div class="stat-label">PENDING RECEIPT</div>
         <div class="stat-value">${pendingIn}</div>
         <div class="stat-sub">Vehicles en route</div>
       </div>
       <div class="stat-tile ${discrepancies > 0 ? 'red' : ''}">
-        <div class="stat-label">Discrepancies</div>
+        <div class="stat-label">DISCREPANCIES</div>
         <div class="stat-value">${discrepancies}</div>
         <div class="stat-sub">Qty mismatches</div>
       </div>
@@ -83,9 +91,9 @@ async function renderPlantDashboard(container, user) {
 
     <!-- Quick actions -->
     <div style="display:flex;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap">
-      <button class="btn btn-primary" onclick="navigate('dispatch')">🚚 New Dispatch</button>
-      <button class="btn btn-outline" onclick="navigate('receipt')">📥 Confirm Receipt</button>
-      <button class="btn btn-outline" onclick="navigate('reports')">📋 Reports</button>
+      <button class="btn btn-primary" data-nav="dispatch">🚚 New Dispatch</button>
+      <button class="btn btn-outline" data-nav="receipt">📥 Confirm Receipt</button>
+      <button class="btn btn-outline" data-nav="reports">📋 Reports</button>
     </div>
 
     <!-- Recent Activity -->
@@ -96,18 +104,12 @@ async function renderPlantDashboard(container, user) {
       </div>
     </div>
 
-    <!-- Pending vehicles table -->
-    ${pendingIn > 0 ? renderPendingAlert(inSnap.docs.filter(d => ["dispatched","in-transit"].includes(d.data().status))) : ""}
+    ${pendingIn > 0 ? renderPendingAlert(pendingDocs) : ""}
   `;
 
   // Wire quick-action buttons
-  container.querySelectorAll("[onclick]").forEach(el => {
-    const fn = el.getAttribute("onclick");
-    el.removeAttribute("onclick");
-    el.addEventListener("click", () => {
-      const match = fn.match(/navigate\('(.+?)'\)/);
-      if (match) window.navigate(match[1]);
-    });
+  container.querySelectorAll("[data-nav]").forEach(el => {
+    el.addEventListener("click", () => window.navigate(el.dataset.nav));
   });
 }
 
@@ -115,18 +117,30 @@ async function renderPlantDashboard(container, user) {
 //  SUPER ADMIN DASHBOARD
 // ══════════════════════════════════════════════════════════════
 async function renderAdminDashboard(container, user) {
-  const [allDispatch, allPlants, recentLogs] = await Promise.all([
+
+  // Fetch all dispatches ordered by createdAt — single field index, no composite needed
+  const [allDispatch, allPlants] = await Promise.all([
     getDocs(query(collection(db, "dispatches"), orderBy("createdAt", "desc"))),
     getDocs(collection(db, "plants")),
-    getDocs(query(collection(db, "activityLogs"), orderBy("timestamp", "desc"), limit(15))),
   ]);
 
-  const total        = allDispatch.size;
-  const dispatched   = allDispatch.docs.filter(d => d.data().status === "dispatched").length;
-  const inTransit    = allDispatch.docs.filter(d => d.data().status === "in-transit").length;
-  const received     = allDispatch.docs.filter(d => d.data().status === "received").length;
-  const discrepancy  = allDispatch.docs.filter(d => d.data().status === "discrepancy").length;
-  const plantCount   = allPlants.size;
+  // Fetch recent logs — single field orderBy, no composite needed
+  let recentLogs = null;
+  try {
+    recentLogs = await getDocs(query(
+      collection(db, "activityLogs"),
+      orderBy("timestamp", "desc"),
+      limit(15)
+    ));
+  } catch(e) {
+    recentLogs = null;
+  }
+
+  const total       = allDispatch.size;
+  const dispatched  = allDispatch.docs.filter(d => d.data().status === "dispatched").length;
+  const received    = allDispatch.docs.filter(d => d.data().status === "received").length;
+  const discrepancy = allDispatch.docs.filter(d => d.data().status === "discrepancy").length;
+  const plantCount  = allPlants.size;
 
   // Per-plant breakdown
   const plantMap = {};
@@ -144,7 +158,7 @@ async function renderAdminDashboard(container, user) {
   Object.values(plantMap).forEach(p => {
     plantRows += `
       <tr>
-        <td><span class="dispatch-id">${p.code}</span></td>
+        <td><span class="dispatch-id">${p.code || "—"}</span></td>
         <td><strong>${p.name}</strong></td>
         <td>${p.out}</td>
         <td>${p.inbound}</td>
@@ -158,34 +172,33 @@ async function renderAdminDashboard(container, user) {
 
     <div class="stat-grid">
       <div class="stat-tile">
-        <div class="stat-label">Total Shipments</div>
+        <div class="stat-label">TOTAL SHIPMENTS</div>
         <div class="stat-value">${total}</div>
         <div class="stat-sub">All time</div>
       </div>
       <div class="stat-tile orange">
-        <div class="stat-label">Dispatched</div>
+        <div class="stat-label">DISPATCHED</div>
         <div class="stat-value">${dispatched}</div>
         <div class="stat-sub">In transit / waiting</div>
       </div>
       <div class="stat-tile green">
-        <div class="stat-label">Received OK</div>
+        <div class="stat-label">RECEIVED OK</div>
         <div class="stat-value">${received}</div>
         <div class="stat-sub">No issues</div>
       </div>
       <div class="stat-tile ${discrepancy > 0 ? 'red' : ''}">
-        <div class="stat-label">Discrepancies</div>
+        <div class="stat-label">DISCREPANCIES</div>
         <div class="stat-value">${discrepancy}</div>
         <div class="stat-sub">Qty mismatches</div>
       </div>
       <div class="stat-tile">
-        <div class="stat-label">Active Plants</div>
+        <div class="stat-label">ACTIVE PLANTS</div>
         <div class="stat-value">${plantCount}</div>
         <div class="stat-sub">In system</div>
       </div>
     </div>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;flex-wrap:wrap">
-      <!-- Per-plant table -->
       <div class="card">
         <div class="card-header">Plant-wise Summary</div>
         <div class="card-body table-wrap">
@@ -195,12 +208,11 @@ async function renderAdminDashboard(container, user) {
               <th>Outgoing</th><th>Incoming</th>
               <th>Discrepancies</th><th>Status</th>
             </tr></thead>
-            <tbody>${plantRows}</tbody>
+            <tbody>${plantRows || '<tr><td colspan="6" style="text-align:center;color:#8e8ea8">No plants added yet</td></tr>'}</tbody>
           </table>
         </div>
       </div>
 
-      <!-- Activity log -->
       <div class="card">
         <div class="card-header">Recent Activity</div>
         <div class="card-body">
@@ -214,19 +226,28 @@ async function renderAdminDashboard(container, user) {
 // ── Helpers ───────────────────────────────────────────────────
 function renderActivityLog(snap) {
   if (!snap || snap.empty) {
-    return `<div class="empty-state" style="padding:1rem"><div class="empty-icon" style="font-size:1.5rem">📋</div><p>No activity yet.</p></div>`;
+    return `<div class="empty-state" style="padding:1rem">
+      <div class="empty-icon" style="font-size:1.5rem">📋</div>
+      <p>No activity yet.</p>
+    </div>`;
   }
   let html = `<div style="display:flex;flex-direction:column;gap:.5rem">`;
   snap.docs.forEach(d => {
-    const a = d.data();
-    const ts = a.timestamp?.toDate ? a.timestamp.toDate().toLocaleString("en-IN") : "—";
-    const icon = { DISPATCH_CREATED: "🚚", RECEIPT_CONFIRMED: "✅" }[a.action] || "📌";
+    const a  = d.data();
+    const ts = a.timestamp?.toDate
+      ? a.timestamp.toDate().toLocaleString("en-IN")
+      : "—";
+    const icon = {
+      DISPATCH_CREATED:  "🚚",
+      RECEIPT_CONFIRMED: "✅",
+      DISCREPANCY:       "⚠️",
+    }[a.action] || "📌";
     html += `
       <div style="display:flex;gap:.75rem;align-items:flex-start;padding:.5rem 0;border-bottom:1px solid #eee">
         <span style="font-size:1.1rem">${icon}</span>
         <div>
           <div style="font-size:.85rem;font-weight:600">${a.details || a.action}</div>
-          <div style="font-size:.75rem;color:#8e8ea8">${a.userName} · ${ts}</div>
+          <div style="font-size:.75rem;color:#8e8ea8">${a.userName || "—"} · ${ts}</div>
         </div>
       </div>`;
   });
@@ -249,7 +270,7 @@ function renderPendingAlert(docs) {
     </tr>`;
   });
   return `
-    <div class="card mt-2" style="border-left:4px solid #f57c00">
+    <div class="card" style="margin-top:1.5rem;border-left:4px solid #f57c00">
       <div class="card-header" style="color:#f57c00">🚛 Vehicles En Route to Your Plant</div>
       <div class="card-body table-wrap">
         <table>

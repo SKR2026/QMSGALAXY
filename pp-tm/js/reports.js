@@ -125,38 +125,32 @@ export async function showReportsPage(container, user) {
 
 // ── Run Report Query ──────────────────────────────────────────
 async function runReport({ from, to, type, plantId, user }) {
-  let constraints = [];
+  // Fetch all dispatches with simple single-field orderBy (no composite index needed)
+  // Then filter client-side for status, plant, date
+  const baseQuery = plantId
+    ? query(collection(db, "dispatches"), where("fromPlantId", "==", plantId), orderBy("createdAt", "desc"))
+    : query(collection(db, "dispatches"), orderBy("createdAt", "desc"));
 
-  // Plant filter
-  if (user.role !== "superAdmin") {
-    // Plant user sees dispatches where they are from OR to plant
-    // We'll fetch both and merge
-  }
-
-  if (plantId) {
-    constraints.push(where("fromPlantId", "==", plantId));
-  }
-
-  // Status filter
-  if (type === "dispatched")  constraints.push(where("status", "in", ["dispatched", "in-transit"]));
-  if (type === "received")    constraints.push(where("status", "==", "received"));
-  if (type === "discrepancy") constraints.push(where("status", "==", "discrepancy"));
-
-  constraints.push(orderBy("createdAt", "desc"));
-
-  const q = query(collection(db, "dispatches"), ...constraints);
-  const snap = await getDocs(q);
+  const snap = await getDocs(baseQuery);
 
   let rows = [];
   snap.forEach(d => {
     const dp = d.data();
+
     // Plant user: only see their outgoing or incoming
     if (user.role !== "superAdmin") {
       if (dp.fromPlantId !== user.plantId && dp.toPlantId !== user.plantId) return;
     }
-    // Date filter (Firestore can't filter by string date easily; filter client-side)
+
+    // Status filter (client-side)
+    if (type === "dispatched"  && !["dispatched","in-transit"].includes(dp.status)) return;
+    if (type === "received"    && dp.status !== "received")    return;
+    if (type === "discrepancy" && dp.status !== "discrepancy") return;
+
+    // Date filter (client-side)
     if (from && dp.date && dp.date < from) return;
     if (to   && dp.date && dp.date > to)   return;
+
     rows.push({ id: d.id, ...dp });
   });
 

@@ -64,16 +64,23 @@ export async function showReceiptPage(container, user) {
 async function loadPendingList(user, listEl, countEl) {
   listEl.innerHTML = `<div class="spinner"></div>`;
   try {
-    const qFilter = user.role === "superAdmin"
-      ? query(collection(db, "dispatches"),
-          where("status", "in", ["dispatched", "in-transit"]),
-          orderBy("createdAt", "asc"))
+    // Use simple query + client-side filter to avoid composite index requirement
+    const baseQuery = user.role === "superAdmin"
+      ? query(collection(db, "dispatches"), orderBy("createdAt", "asc"))
       : query(collection(db, "dispatches"),
           where("toPlantId", "==", user.plantId),
-          where("status", "in", ["dispatched", "in-transit"]),
           orderBy("createdAt", "asc"));
 
-    const snap = await getDocs(qFilter);
+    const allSnap = await getDocs(baseQuery);
+    // Filter client-side for pending statuses
+    const snap = {
+      size: 0,
+      empty: true,
+      docs: allSnap.docs.filter(d => ["dispatched","in-transit"].includes(d.data().status)),
+      forEach: function(fn) { this.docs.forEach(fn); }
+    };
+    snap.size = snap.docs.length;
+    snap.empty = snap.size === 0;
     countEl.textContent = snap.size;
 
     if (snap.empty) {
@@ -121,16 +128,24 @@ async function loadPendingList(user, listEl, countEl) {
 async function loadReceivedList(user, listEl, filters) {
   listEl.innerHTML = `<div class="spinner"></div>`;
   try {
-    const qFilter = user.role === "superAdmin"
-      ? query(collection(db, "dispatches"),
-          where("status", "in", ["received", "discrepancy"]),
-          orderBy("updatedAt", "desc"))
+    // Simple query + client-side filter to avoid composite index requirement
+    const baseQuery = user.role === "superAdmin"
+      ? query(collection(db, "dispatches"), orderBy("createdAt", "desc"))
       : query(collection(db, "dispatches"),
           where("toPlantId", "==", user.plantId),
-          where("status", "in", ["received", "discrepancy"]),
-          orderBy("updatedAt", "desc"));
+          orderBy("createdAt", "desc"));
 
-    const snap = await getDocs(qFilter);
+    const allSnap = await getDocs(baseQuery);
+    // Filter client-side for received/discrepancy statuses
+    const filteredDocs = allSnap.docs.filter(d =>
+      ["received","discrepancy"].includes(d.data().status)
+    );
+    const snap = {
+      size: filteredDocs.length,
+      empty: filteredDocs.length === 0,
+      docs: filteredDocs,
+      forEach: function(fn) { this.docs.forEach(fn); }
+    };
 
     if (snap.empty) {
       listEl.innerHTML = `<div class="empty-state"><div class="empty-icon">📦</div><p>No receipts recorded yet.</p></div>`;
