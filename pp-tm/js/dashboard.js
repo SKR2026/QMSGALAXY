@@ -232,6 +232,16 @@ async function renderAdminDashboard(container, user) {
       </div>
     </div>
   `;
+  // Wire stat tiles for admin dashboard
+  container.querySelectorAll(".stat-tile").forEach(el => {
+    const lbl = el.querySelector(".stat-label")?.textContent || "";
+    let nav = "dispatch";
+    if (lbl.includes("RECEIVED") || lbl.includes("RECEIPT")) nav = "receipt";
+    else if (lbl.includes("DISCREPAN")) nav = "reports";
+    else if (lbl.includes("PLANTS")) nav = "admin";
+    el.style.cursor = "pointer";
+    el.addEventListener("click", () => window.dispatchEvent(new CustomEvent("ptms-navigate", { detail: nav })));
+  });
 }
 
 // ── Helpers ───────────────────────────────────────────────────
