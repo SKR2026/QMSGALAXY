@@ -1,9 +1,11 @@
 // ─────────────────────────────────────────────────────────────
-//  PTMS – Firebase Configuration
-//  Replace the values below with your own Firebase project keys.
-//  NEVER commit real credentials to a public GitHub repository.
-//  Use environment variables or Firebase Hosting env config.
+//  PTMS – Firebase Configuration  (project: skr-tm)
 // ─────────────────────────────────────────────────────────────
+
+import { initializeApp }    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth }          from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager }
+                            from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
 const FIREBASE_CONFIG = {
   apiKey:            "AIzaSyC0vOWt3PBDu5DzgF37keVvFzll4nriYv0",
@@ -15,22 +17,18 @@ const FIREBASE_CONFIG = {
   measurementId:     "G-LP6H8RX4ZN"
 };
 
-// ── Initialise Firebase ──────────────────────────────────────
-import { initializeApp }                    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getAuth }                          from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-import { getFirestore, enableIndexedDbPersistence }
-                                            from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
-
-const app = initializeApp(FIREBASE_CONFIG);
+export const app = initializeApp(FIREBASE_CONFIG);
 
 export const auth = getAuth(app);
-export const db   = getFirestore(app);
 
-// Optional offline persistence
-enableIndexedDbPersistence(db).catch(err => {
-  if (err.code === "failed-precondition") {
-    console.warn("PTMS: Persistence unavailable – multiple tabs open.");
-  } else if (err.code === "unimplemented") {
-    console.warn("PTMS: Persistence not supported in this browser.");
-  }
-});
+// Use new persistent cache API (replaces deprecated enableIndexedDbPersistence)
+let db;
+try {
+  db = initializeFirestore(app, {
+    localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+  });
+} catch (e) {
+  // Falls back to in-memory if already initialized or unsupported
+  db = getFirestore(app);
+}
+export { db };

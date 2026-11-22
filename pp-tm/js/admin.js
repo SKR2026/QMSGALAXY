@@ -3,16 +3,20 @@
 //  Super Admin only: manage plants, manage users.
 // ─────────────────────────────────────────────────────────────
 
-import { db, auth } from "./firebase.js";
+import { db, auth, app } from "./firebase.js";
 import {
   collection, doc, getDocs, addDoc, updateDoc, deleteDoc,
   query, orderBy, serverTimestamp, getDoc
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
-import {
-  createUserWithEmailAndPassword, sendPasswordResetEmail
-} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { sendPasswordResetEmail }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFunctions, httpsCallable }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-functions.js";
 import { requireSuperAdmin } from "./auth.js";
 import { getEmailConfig, saveEmailConfig, loadEmailConfig } from "./email.js";
+
+// ── Cloud Functions client ────────────────────────────────────
+const fns = getFunctions(app, "asia-south1");
 
 // ── Entry point ───────────────────────────────────────────────
 export async function showAdminPage(container, user) {
@@ -320,7 +324,7 @@ async function openUserModal() {
         <div class="form-row">
           <div class="form-group">
             <label>Temporary Password *</label>
-            <input type="password" id="uPassword" placeholder="Min 8 characters">
+            <input type="password" id="uPassword" placeholder="Min 6 characters">
           </div>
           <div class="form-group">
             <label>Confirm Password *</label>
@@ -350,47 +354,43 @@ async function openUserModal() {
 }
 
 async function createUser(backdrop) {
-  const errEl    = backdrop.querySelector("#userFormError");
-  const name     = backdrop.querySelector("#uName").value.trim();
-  const email    = backdrop.querySelector("#uEmail").value.trim();
-  const role     = backdrop.querySelector("#uRole").value;
-  const plantId  = backdrop.querySelector("#uPlant").value;
-  const pwd      = backdrop.querySelector("#uPassword").value;
-  const pwd2     = backdrop.querySelector("#uPassword2").value;
+  const errEl   = backdrop.querySelector("#userFormError");
+  const saveBtn = backdrop.querySelector("#saveUserBtn");
+  const name    = backdrop.querySelector("#uName").value.trim();
+  const email   = backdrop.querySelector("#uEmail").value.trim();
+  const role    = backdrop.querySelector("#uRole").value;
+  const plantId = backdrop.querySelector("#uPlant").value;
+  const pwd     = backdrop.querySelector("#uPassword").value;
+  const pwd2    = backdrop.querySelector("#uPassword2").value;
 
+  const showErr = msg => {
+    errEl.textContent = msg;
+    errEl.classList.remove("hidden");
+  };
   errEl.classList.add("hidden");
 
-  if (!name || !email || !pwd) { errEl.textContent = "All fields are required."; errEl.classList.remove("hidden"); return; }
-  if (pwd !== pwd2)             { errEl.textContent = "Passwords do not match."; errEl.classList.remove("hidden"); return; }
-  if (pwd.length < 8)           { errEl.textContent = "Password must be at least 8 characters."; errEl.classList.remove("hidden"); return; }
-  if (role === "plantUser" && !plantId) { errEl.textContent = "Please assign a plant."; errEl.classList.remove("hidden"); return; }
+  if (!name || !email || !pwd)                       return showErr("All fields are required.");
+  if (pwd !== pwd2)                                  return showErr("Passwords do not match.");
+  if (pwd.length < 6)                                return showErr("Password must be at least 6 characters.");
+  if (role === "plantUser" && !plantId)              return showErr("Please assign a plant.");
+
+  saveBtn.disabled = true;
+  saveBtn.textContent = "Creating…";
 
   try {
-    // Create Firebase Auth user
-    const cred = await createUserWithEmailAndPassword(auth, email, pwd);
-    // Write Firestore profile
-    await updateDoc(doc(db, "users", cred.user.uid), {
-      name, email, role,
-      plantId: role === "plantUser" ? plantId : null,
-      isActive: true,
-      createdAt: serverTimestamp(),
-    }).catch(async () => {
-      // Document may not exist yet — use setDoc
-      const { setDoc } = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js");
-      await setDoc(doc(db, "users", cred.user.uid), {
-        name, email, role,
-        plantId: role === "plantUser" ? plantId : null,
-        isActive: true,
-        createdAt: serverTimestamp(),
-      });
-    });
+    // ── Call Cloud Function (uses Admin SDK — no permission issues) ──
+    const createPtmsUser = httpsCallable(fns, "createPtmsUser");
+    await createPtmsUser({ name, email, password: pwd, role, plantId: plantId || null });
+
     window.showToast("User created successfully.", "success");
     backdrop.remove();
     const wrap = document.querySelector("#usersTableWrap");
     if (wrap) await loadUsersTable(wrap);
   } catch (e) {
-    errEl.textContent = e.message;
-    errEl.classList.remove("hidden");
+    // HttpsError surfaces as e.message; raw Firebase errors as e.message too
+    showErr(e?.message || "Failed to create user.");
+    saveBtn.disabled = false;
+    saveBtn.textContent = "Create User";
   }
 }
 
@@ -420,10 +420,9 @@ async function renderEmailTab(el) {
       <div class="card-header">📧 Email Notification Settings</div>
       <div class="card-body">
         <p class="text-muted mb-2" style="font-size:.88rem;line-height:1.6">
-          Emails are sent via <strong>EmailJS</strong> connected to your Gmail account using a
-          <strong>16-digit App Password</strong>. Configure the EmailJS credentials inside
-          <code>js/email.js</code>. Here you define <em>who receives</em> each type of notification.
-          Separate multiple addresses with commas.
+          Emails are sent via <strong>Gmail SMTP</strong> using your 16-digit App Password,
+          securely stored in Firebase Cloud Functions (never in the browser).
+          Configure who receives each notification type below — separate multiple addresses with commas.
         </p>
 
         <!-- On Dispatch -->
@@ -497,47 +496,37 @@ async function renderEmailTab(el) {
       </div>
     </div>
 
-    <!-- EmailJS Setup Guide -->
+    <!-- Gmail Setup Guide -->
     <div class="card section">
-      <div class="card-header">🔧 EmailJS + Gmail Setup Guide</div>
+      <div class="card-header">🔧 Gmail SMTP Setup Guide</div>
       <div class="card-body" style="font-size:.88rem;line-height:1.8">
         <ol style="padding-left:1.25rem">
           <li>
-            Go to <a href="https://www.emailjs.com" target="_blank">emailjs.com</a> → Sign up (free — 200 emails/month)
+            <strong>Enable 2-Step Verification</strong> on your Google Account:<br>
+            myaccount.google.com → Security → 2-Step Verification
           </li>
           <li>
-            Click <strong>Email Services</strong> → <strong>Add New Service</strong> → choose <strong>Gmail</strong><br>
-            Enter your Gmail address. When prompted for password, use your
-            <strong>16-digit App Password</strong> (not your regular Gmail password).
+            <strong>Generate an App Password</strong>:<br>
+            myaccount.google.com → Security → App Passwords<br>
+            → Select app: <em>Mail</em>, device: <em>Other</em> → Generate<br>
+            → Copy the <strong>16-character password</strong> (shown once — save it!)
           </li>
           <li>
-            Get Gmail App Password:<br>
-            &nbsp;• Google Account → Security → 2-Step Verification (enable if not done)<br>
-            &nbsp;• Security → <strong>App Passwords</strong> → Select app: Mail → Select device → Generate<br>
-            &nbsp;• Copy the <strong>16-character password</strong> (shown once — save it!)
-          </li>
-          <li>
-            In EmailJS → <strong>Email Templates</strong> → Create two templates:
-            <ul style="margin:.5rem 0 .5rem 1rem">
-              <li><strong>Dispatch Template</strong> — use variables like <code>{{dispatch_id}}</code>, <code>{{from_plant}}</code>, <code>{{material}}</code>, <code>{{qty_dispatched}}</code>, <code>{{vehicle_no}}</code>, <code>{{driver_name}}</code>, <code>{{departure_time}}</code></li>
-              <li><strong>Receipt Template</strong> — use <code>{{dispatch_id}}</code>, <code>{{qty_dispatched}}</code>, <code>{{qty_received}}</code>, <code>{{difference}}</code>, <code>{{status}}</code>, <code>{{arrival_date}}</code>, <code>{{receipt_remarks}}</code></li>
-            </ul>
-            Set <strong>To Email</strong> field in template to: <code>{{to_email}}</code><br>
-            Set <strong>CC</strong> field to: <code>{{cc_email}}</code>
-          </li>
-          <li>
-            Go to EmailJS → <strong>Account</strong> → copy your <strong>Public Key</strong>
-          </li>
-          <li>
-            Open <code>js/email.js</code> and paste:<br>
-            <code style="display:block;background:#f4f6fb;padding:.5rem;border-radius:4px;margin:.25rem 0">
-              EMAILJS_PUBLIC_KEY = "your_public_key"<br>
-              EMAILJS_SERVICE_ID = "service_xxxxxx"<br>
-              EMAILJS_DISPATCH_TMPL = "template_xxxxxx"<br>
-              EMAILJS_RECEIPT_TMPL  = "template_xxxxxx"
+            <strong>Set credentials in Firebase</strong> (run once from your terminal):<br>
+            <code style="display:block;background:#f4f6fb;padding:.5rem;border-radius:4px;margin:.25rem 0;word-break:break-all">
+              firebase functions:config:set gmail.user="you@gmail.com" gmail.pass="xxxx xxxx xxxx xxxx"
             </code>
           </li>
-          <li>Redeploy: <code>firebase deploy --only hosting</code></li>
+          <li>
+            <strong>Deploy the Cloud Function</strong>:<br>
+            <code style="display:block;background:#f4f6fb;padding:.5rem;border-radius:4px;margin:.25rem 0">
+              firebase deploy --only functions
+            </code>
+          </li>
+          <li>
+            Come back here and configure the recipient email addresses above, then click
+            <strong>Send Test Email</strong> to verify everything works.
+          </li>
         </ol>
       </div>
     </div>
