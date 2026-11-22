@@ -1,9 +1,7 @@
-// v1795361569
-// cache-bust-v3
 // ─────────────────────────────────────────────────────────────
 //  PTMS – Receipt / Incoming Vehicle Module  (Phase 3)
 //  Receiving plant confirms arrival, qty received.
-//  Only the receiving plant can confirm receipt.
+//  Photo evidence support for discrepancies.
 // ─────────────────────────────────────────────────────────────
 
 import { db } from "./firebase.js";
@@ -11,8 +9,12 @@ import {
   collection, doc, getDocs, updateDoc, addDoc,
   query, orderBy, where, serverTimestamp, getDoc
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getStorage, ref, uploadBytes, getDownloadURL }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
 import { requirePlantUser } from "./auth.js";
 import { sendReceiptEmail } from "./email.js";
+
+const storage = getStorage();
 
 // ── Entry point ───────────────────────────────────────────────
 export async function showReceiptPage(container, user) {
@@ -20,23 +22,15 @@ export async function showReceiptPage(container, user) {
 
   container.innerHTML = `
     <div class="page-title">📥 Incoming Vehicles</div>
-
-    <!-- Pending receipts -->
     <div class="card section">
       <div class="card-header">
         <span>Awaiting Receipt Confirmation</span>
         <span class="badge badge-orange" id="pendingCount">…</span>
       </div>
-      <div class="card-body" id="pendingList">
-        <div class="spinner"></div>
-      </div>
+      <div class="card-body" id="pendingList"><div class="spinner"></div></div>
     </div>
-
-    <!-- All received -->
     <div class="card section">
-      <div class="card-header">
-        <span>Received — History</span>
-      </div>
+      <div class="card-header"><span>Received — History</span></div>
       <div class="card-body">
         <div class="filter-bar">
           <input type="date" id="recvFilterFrom" title="From date">
@@ -45,8 +39,7 @@ export async function showReceiptPage(container, user) {
         </div>
         <div id="receivedList"><div class="spinner"></div></div>
       </div>
-    </div>
-  `;
+    </div>`;
 
   container.querySelector("#recvFilterBtn").addEventListener("click", () => {
     loadReceivedList(user, container.querySelector("#receivedList"), {
@@ -62,134 +55,84 @@ export async function showReceiptPage(container, user) {
   ]);
 }
 
-// ── Pending (dispatched / in-transit) ────────────────────────
+// ── Pending ───────────────────────────────────────────────────
 async function loadPendingList(user, listEl, countEl) {
   listEl.innerHTML = `<div class="spinner"></div>`;
   try {
-    // Use simple query + client-side filter to avoid composite index requirement
     const baseQuery = user.role === "superAdmin"
       ? query(collection(db, "dispatches"))
-      : query(collection(db, "dispatches"),
-          where("toPlantId", "==", user.plantId))
+      : query(collection(db, "dispatches"), where("toPlantId", "==", user.plantId));
     const allSnap = await getDocs(baseQuery);
-    // Filter client-side for pending statuses
     const snap = {
-      size: 0,
-      empty: true,
-      docs: allSnap.docs.filter(d => ["dispatched","in-transit"].includes(d.data().status)),
-      forEach: function(fn) { this.docs.forEach(fn); }
+      docs: allSnap.docs
+        .filter(d => ["dispatched","in-transit"].includes(d.data().status))
+        .sort((a,b) => (a.data().createdAt?.seconds||0) - (b.data().createdAt?.seconds||0))
     };
-    snap.size = snap.docs.length;
-    snap.empty = snap.size === 0;
-    countEl.textContent = snap.size;
-
-    if (snap.empty) {
+    countEl.textContent = snap.docs.length;
+    if (!snap.docs.length) {
       listEl.innerHTML = `<div class="empty-state"><div class="empty-icon">✅</div><p>No pending receipts. All clear!</p></div>`;
       return;
     }
-
     let rows = "";
-    snap.forEach(d => {
+    snap.docs.forEach(d => {
       const dp = d.data();
-      const dDate = dp.date || "—";
-      rows += `
-        <tr>
-          <td><span class="dispatch-id">${dp.dispatchId}</span></td>
-          <td>${dDate}</td>
-          <td>${dp.fromPlantName}</td>
-          <td>${dp.material}</td>
-          <td>${dp.qtyDispatched} ${dp.unit}</td>
-          <td>${dp.vehicleNo}</td>
-          <td>${dp.driverName}</td>
-          <td><span class="badge status-${dp.status}">${statusLabel(dp.status)}</span></td>
-          <td>
-            <button class="btn btn-success btn-sm" onclick="openReceiptModal('${d.id}')">Confirm Receipt</button>
-          </td>
-        </tr>`;
+      rows += `<tr>
+        <td><span class="dispatch-id">${dp.dispatchId}</span></td>
+        <td>${dp.date||"—"}</td><td>${dp.fromPlantName}</td><td>${dp.material}</td>
+        <td>${dp.qtyDispatched} ${dp.unit}</td><td>${dp.vehicleNo}</td><td>${dp.driverName}</td>
+        <td><span class="badge status-${dp.status}">${statusLabel(dp.status)}</span></td>
+        <td><button class="btn btn-success btn-sm" onclick="openReceiptModal('${d.id}')">Confirm Receipt</button></td>
+      </tr>`;
     });
-
-    listEl.innerHTML = `
-      <div class="table-wrap">
-        <table>
-          <thead><tr>
-            <th>Dispatch ID</th><th>Dispatch Date</th><th>From</th><th>Material</th>
-            <th>Dispatched Qty</th><th>Vehicle No.</th><th>Driver</th>
-            <th>Status</th><th></th>
-          </tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>`;
-  } catch (e) {
-    listEl.innerHTML = `<div class="error-msg">Error: ${e.message}</div>`;
-  }
+    listEl.innerHTML = `<div class="table-wrap"><table>
+      <thead><tr><th>Dispatch ID</th><th>Date</th><th>From</th><th>Material</th>
+        <th>Dispatched Qty</th><th>Vehicle</th><th>Driver</th><th>Status</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  } catch(e) { listEl.innerHTML = `<div class="error-msg">Error: ${e.message}</div>`; }
 }
 
 // ── Received history ──────────────────────────────────────────
 async function loadReceivedList(user, listEl, filters) {
   listEl.innerHTML = `<div class="spinner"></div>`;
   try {
-    // Simple query + client-side filter to avoid composite index requirement
     const baseQuery = user.role === "superAdmin"
       ? query(collection(db, "dispatches"))
-      : query(collection(db, "dispatches"),
-          where("toPlantId", "==", user.plantId))
-
-
+      : query(collection(db, "dispatches"), where("toPlantId", "==", user.plantId));
     const allSnap = await getDocs(baseQuery);
-    // Filter client-side for received/discrepancy statuses
-    const filteredDocs = allSnap.docs.filter(d =>
-      ["received","discrepancy"].includes(d.data().status)
-    );
-    const snap = {
-      size: filteredDocs.length,
-      empty: filteredDocs.length === 0,
-      docs: filteredDocs,
-      forEach: function(fn) { this.docs.forEach(fn); }
-    };
-
-    if (snap.empty) {
+    const docs = allSnap.docs
+      .filter(d => ["received","discrepancy"].includes(d.data().status))
+      .sort((a,b) => (b.data().createdAt?.seconds||0) - (a.data().createdAt?.seconds||0));
+    if (!docs.length) {
       listEl.innerHTML = `<div class="empty-state"><div class="empty-icon">📦</div><p>No receipts recorded yet.</p></div>`;
       return;
     }
-
     let rows = "";
-    snap.forEach(d => {
+    docs.forEach(d => {
       const dp = d.data();
       const recvDate = dp.updatedAt?.toDate ? dp.updatedAt.toDate().toLocaleDateString("en-IN") : "—";
-      const diff = dp.qtyReceived != null ? (dp.qtyReceived - dp.qtyDispatched) : null;
+      const diff = dp.qtyReceived != null ? dp.qtyReceived - dp.qtyDispatched : null;
       const diffStr = diff != null
-        ? `<span style="color:${diff < 0 ? '#c62828' : diff > 0 ? '#1565c0' : '#2e7d32'}">${diff > 0 ? "+" : ""}${diff}</span>`
+        ? `<span style="color:${diff<0?"#c62828":diff>0?"#1565c0":"#2e7d32"};font-weight:700">${diff>0?"+":""}${diff}</span>`
         : "—";
-      rows += `
-        <tr>
-          <td><span class="dispatch-id">${dp.dispatchId}</span></td>
-          <td>${recvDate}</td>
-          <td>${dp.fromPlantName}</td>
-          <td>${dp.material}</td>
-          <td>${dp.qtyDispatched} ${dp.unit}</td>
-          <td>${dp.qtyReceived ?? "—"} ${dp.unit}</td>
-          <td>${diffStr}</td>
-          <td><span class="badge status-${dp.status}">${statusLabel(dp.status)}</span></td>
-          <td>
-            <button class="btn btn-outline btn-sm" onclick="viewDispatch('${d.id}')">View</button>
-          </td>
-        </tr>`;
+      const photoThumb = dp.photoEvidence?.length
+        ? `<div style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:4px">
+            ${dp.photoEvidence.map(url=>`<img src="${url}" onclick="window.open('${url}','_blank')"
+              style="width:38px;height:38px;object-fit:cover;border-radius:5px;border:2px solid #c62828;cursor:pointer" title="View photo">`).join("")}
+           </div>` : "";
+      rows += `<tr>
+        <td><span class="dispatch-id">${dp.dispatchId}</span></td>
+        <td>${recvDate}</td><td>${dp.fromPlantName}</td><td>${dp.material}</td>
+        <td>${dp.qtyDispatched} ${dp.unit}</td><td>${dp.qtyReceived??'—'} ${dp.unit}</td>
+        <td>${diffStr}</td>
+        <td><span class="badge status-${dp.status}">${statusLabel(dp.status)}</span></td>
+        <td>${photoThumb}<button class="btn btn-outline btn-sm" onclick="viewDispatch('${d.id}')">View</button></td>
+      </tr>`;
     });
-
-    listEl.innerHTML = `
-      <div class="table-wrap">
-        <table>
-          <thead><tr>
-            <th>Dispatch ID</th><th>Received Date</th><th>From</th><th>Material</th>
-            <th>Dispatched</th><th>Received</th><th>Difference</th>
-            <th>Status</th><th></th>
-          </tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>`;
-  } catch (e) {
-    listEl.innerHTML = `<div class="error-msg">Error: ${e.message}</div>`;
-  }
+    listEl.innerHTML = `<div class="table-wrap"><table>
+      <thead><tr><th>Dispatch ID</th><th>Received Date</th><th>From</th><th>Material</th>
+        <th>Dispatched</th><th>Received</th><th>Difference</th><th>Status</th><th>Photos</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  } catch(e) { listEl.innerHTML = `<div class="error-msg">Error: ${e.message}</div>`; }
 }
 
 // ── Confirm Receipt Modal ─────────────────────────────────────
@@ -197,7 +140,6 @@ window.openReceiptModal = async (dispatchDocId) => {
   const snap = await getDoc(doc(db, "dispatches", dispatchDocId));
   if (!snap.exists()) return;
   const dp = snap.data();
-
   const today = new Date().toISOString().split("T")[0];
   const now   = new Date().toTimeString().slice(0,5);
 
@@ -210,7 +152,6 @@ window.openReceiptModal = async (dispatchDocId) => {
         <button class="btn-close">✕</button>
       </div>
       <div class="modal-body">
-        <!-- Dispatch summary (read-only) -->
         <div class="card mb-2" style="background:#f4f6fb">
           <div class="card-body" style="padding:.75rem 1rem">
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem 1rem;font-size:.88rem">
@@ -224,7 +165,6 @@ window.openReceiptModal = async (dispatchDocId) => {
           </div>
         </div>
 
-        <!-- Receipt form -->
         <div class="form-row">
           <div class="form-group">
             <label>Arrival Date *</label>
@@ -238,12 +178,11 @@ window.openReceiptModal = async (dispatchDocId) => {
         <div class="form-row">
           <div class="form-group">
             <label>Quantity Received *</label>
-            <input type="number" id="rQtyRecv" placeholder="0.00" min="0" step="0.01"
-              value="${dp.qtyDispatched}">
+            <input type="number" id="rQtyRecv" placeholder="0.00" min="0" step="0.01" value="${dp.qtyDispatched}">
           </div>
           <div class="form-group">
             <label>No. of Boxes/Bags Received</label>
-            <input type="number" id="rBoxesRecv" placeholder="0" min="0" value="${dp.boxes || 0}">
+            <input type="number" id="rBoxesRecv" placeholder="0" min="0" value="${dp.boxes||0}">
           </div>
         </div>
         <div class="form-row single">
@@ -253,10 +192,32 @@ window.openReceiptModal = async (dispatchDocId) => {
           </div>
         </div>
 
+        <!-- Photo evidence -->
+        <div class="form-row single">
+          <div class="form-group">
+            <label>📷 Photo Evidence
+              <span style="font-weight:400;color:#888;font-size:.78rem"> — optional, for discrepancies (max 5)</span>
+            </label>
+            <div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem">
+              <label for="rPhotoCam" style="display:inline-flex;align-items:center;gap:.4rem;padding:.42rem 1rem;
+                border-radius:8px;border:1.5px solid #1565c0;color:#1565c0;font-weight:700;font-size:.85rem;cursor:pointer;background:#fff">
+                📷 Camera
+                <input type="file" id="rPhotoCam" accept="image/*" capture="environment" multiple style="display:none">
+              </label>
+              <label for="rPhotoGal" style="display:inline-flex;align-items:center;gap:.4rem;padding:.42rem 1rem;
+                border-radius:8px;border:1.5px solid #2e7d32;color:#2e7d32;font-weight:700;font-size:.85rem;cursor:pointer;background:#fff">
+                🖼 Gallery
+                <input type="file" id="rPhotoGal" accept="image/*" multiple style="display:none">
+              </label>
+            </div>
+            <div id="rPhotoPreview" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem"></div>
+            <div id="rPhotoCount" style="font-size:.78rem;color:#888;margin-top:.3rem"></div>
+          </div>
+        </div>
+
         <div id="receiptCalc" class="card mt-1" style="background:#e3f2fd;border:1px solid #90caf9;display:none">
           <div class="card-body" style="padding:.6rem 1rem;font-size:.88rem" id="receiptCalcContent"></div>
         </div>
-
         <div id="receiptFormError" class="error-msg hidden mt-1"></div>
       </div>
       <div class="modal-footer">
@@ -264,12 +225,49 @@ window.openReceiptModal = async (dispatchDocId) => {
         <button class="btn btn-success" id="confirmReceiptBtn">✅ Confirm Receipt</button>
       </div>
     </div>`;
+
   document.body.appendChild(backdrop);
   backdrop.querySelector(".btn-close").onclick       = () => backdrop.remove();
   backdrop.querySelector("#cancelReceiptBtn").onclick = () => backdrop.remove();
 
-  // Live difference calc
-  const qtyEl  = backdrop.querySelector("#rQtyRecv");
+  // ── Photo selection ───────────────────────────────────────────
+  const selectedFiles = [];
+  function addFiles(files) {
+    Array.from(files).forEach(file => {
+      if (!file.type.startsWith("image/")) return;
+      if (selectedFiles.length >= 5) { window.showToast("Max 5 photos allowed","error"); return; }
+      selectedFiles.push(file);
+      const reader = new FileReader();
+      reader.onload = e => {
+        const preview = backdrop.querySelector("#rPhotoPreview");
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "position:relative;display:inline-block";
+        const idx = selectedFiles.length - 1;
+        wrap.innerHTML = `
+          <img src="${e.target.result}" style="width:72px;height:72px;object-fit:cover;border-radius:8px;border:2px solid #d0d0e8">
+          <button data-idx="${idx}" style="position:absolute;top:-6px;right:-6px;background:#c62828;
+            color:#fff;border:none;border-radius:50%;width:20px;height:20px;font-size:.7rem;cursor:pointer;line-height:1">✕</button>`;
+        wrap.querySelector("button").addEventListener("click", ev => {
+          const i = parseInt(ev.target.dataset.idx);
+          selectedFiles.splice(i,1);
+          wrap.remove();
+          backdrop.querySelector("#rPhotoCount").textContent =
+            selectedFiles.length ? `${selectedFiles.length} photo(s) selected` : "";
+          backdrop.querySelectorAll("#rPhotoPreview button[data-idx]")
+            .forEach((btn,ni) => btn.dataset.idx = ni);
+        });
+        preview.appendChild(wrap);
+        backdrop.querySelector("#rPhotoCount").textContent = `${selectedFiles.length} photo(s) selected`;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+  backdrop.querySelector("#rPhotoCam").addEventListener("change", e => addFiles(e.target.files));
+  backdrop.querySelector("#rPhotoGal").addEventListener("change", e => addFiles(e.target.files));
+  backdrop.__photos = selectedFiles;
+
+  // ── Live diff calc ────────────────────────────────────────────
+  const qtyEl = backdrop.querySelector("#rQtyRecv");
   const calcEl = backdrop.querySelector("#receiptCalc");
   const calcContent = backdrop.querySelector("#receiptCalcContent");
   qtyEl.addEventListener("input", () => {
@@ -288,25 +286,18 @@ window.openReceiptModal = async (dispatchDocId) => {
   };
 };
 
+// ── Save Receipt ──────────────────────────────────────────────
 async function saveReceipt(backdrop, dispatchDocId, dp, user) {
   const errEl    = backdrop.querySelector("#receiptFormError");
   const arrDate  = backdrop.querySelector("#rArrDate").value;
   const arrTime  = backdrop.querySelector("#rArrTime").value;
   const qtyRecv  = parseFloat(backdrop.querySelector("#rQtyRecv").value);
-  const boxesRecv = parseInt(backdrop.querySelector("#rBoxesRecv").value || "0");
+  const boxesRecv= parseInt(backdrop.querySelector("#rBoxesRecv").value||"0");
   const remarks  = backdrop.querySelector("#rRemarks").value.trim();
 
   errEl.classList.add("hidden");
-  if (!arrDate || !arrTime) {
-    errEl.textContent = "Arrival date and time are required.";
-    errEl.classList.remove("hidden");
-    return;
-  }
-  if (isNaN(qtyRecv) || qtyRecv < 0) {
-    errEl.textContent = "Please enter a valid quantity received.";
-    errEl.classList.remove("hidden");
-    return;
-  }
+  if (!arrDate||!arrTime) { errEl.textContent="Arrival date and time required."; errEl.classList.remove("hidden"); return; }
+  if (isNaN(qtyRecv)||qtyRecv<0) { errEl.textContent="Enter a valid quantity."; errEl.classList.remove("hidden"); return; }
 
   const diff   = qtyRecv - dp.qtyDispatched;
   const status = Math.abs(diff) > 0.001 ? "discrepancy" : "received";
@@ -316,60 +307,60 @@ async function saveReceipt(backdrop, dispatchDocId, dp, user) {
   confirmBtn.textContent = "Saving…";
 
   try {
+    // Upload photos
+    const photoUrls = [];
+    const photos = backdrop.__photos || [];
+    for (let i = 0; i < photos.length; i++) {
+      confirmBtn.textContent = `Uploading photo ${i+1}/${photos.length}…`;
+      const ext = photos[i].name.split(".").pop() || "jpg";
+      const storRef = ref(storage, `discrepancy-photos/${dispatchDocId}/${Date.now()}_${i}.${ext}`);
+      await uploadBytes(storRef, photos[i]);
+      photoUrls.push(await getDownloadURL(storRef));
+    }
+    confirmBtn.textContent = "Saving…";
+
     await updateDoc(doc(db, "dispatches", dispatchDocId), {
-      status,
-      arrivalDate:    arrDate,
-      arrivalTime:    arrTime,
-      qtyReceived:    qtyRecv,
-      boxesReceived:  boxesRecv,
-      diffQty:        diff,
-      receiptRemarks: remarks,
-      receivedBy:     user.uid,
-      receivedByName: user.name,
-      receivedByPlant: user.plantId,
-      updatedAt:      serverTimestamp(),
+      status, arrivalDate:arrDate, arrivalTime:arrTime,
+      qtyReceived:qtyRecv, boxesReceived:boxesRecv,
+      diffQty:diff, receiptRemarks:remarks,
+      receivedBy:user.uid, receivedByName:user.name,
+      receivedByPlant:user.plantId,
+      photoEvidence: photoUrls,
+      updatedAt:serverTimestamp(),
     });
 
-    // Activity log
-    await addDoc(collection(db, "activityLogs"), {
-      action:     "RECEIPT_CONFIRMED",
-      dispatchId: dp.dispatchId,
-      userId:     user.uid,
-      userName:   user.name,
-      plantId:    user.plantId,
-      plantName:  user.plantName,
-      timestamp:  serverTimestamp(),
-      details:    `Received ${qtyRecv} ${dp.unit}. Diff: ${diff}. Status: ${status}`,
+    await addDoc(collection(db,"activityLogs"),{
+      action:"RECEIPT_CONFIRMED", dispatchId:dp.dispatchId,
+      userId:user.uid, userName:user.name,
+      plantId:user.plantId, plantName:user.plantName,
+      timestamp:serverTimestamp(),
+      details:`Received ${qtyRecv} ${dp.unit}. Diff: ${diff}. Status: ${status}. Photos: ${photoUrls.length}`,
     });
 
-    window.showToast(`Receipt confirmed — ${status === "discrepancy" ? "Discrepancy noted!" : "All good!"}`,
-                     status === "discrepancy" ? "error" : "success");
+    window.showToast(
+      status==="discrepancy" ? "⚠️ Discrepancy noted!" : "✅ Receipt confirmed!",
+      status==="discrepancy" ? "error" : "success"
+    );
     backdrop.remove();
 
-    // Send receipt / discrepancy email (non-blocking)
-    sendReceiptEmail(dp, { arrivalDate: arrDate, arrivalTime: arrTime,
-                           qtyReceived: qtyRecv, receiptRemarks: remarks }, user)
-      .then(r => { if (r.sent) window.showToast("📧 Notification email sent.", "info", 2500); })
-      .catch(() => {});
+    sendReceiptEmail(dp,{arrivalDate:arrDate,arrivalTime:arrTime,qtyReceived:qtyRecv,receiptRemarks:remarks},user)
+      .then(r=>{ if(r.sent) window.showToast("📧 Notification sent.","info",2500); })
+      .catch(()=>{});
 
-    // Refresh lists
-    const user2 = window.__ptmsUser;
-    const pend = document.querySelector("#pendingList");
-    const pCnt = document.querySelector("#pendingCount");
-    const recv = document.querySelector("#receivedList");
-    if (pend && pCnt) await loadPendingList(user2, pend, pCnt);
-    if (recv)         await loadReceivedList(user2, recv, {});
-  } catch (e) {
-    errEl.textContent = e.message;
+    const user2=window.__ptmsUser;
+    const pend=document.querySelector("#pendingList");
+    const pCnt=document.querySelector("#pendingCount");
+    const recv=document.querySelector("#receivedList");
+    if(pend&&pCnt) await loadPendingList(user2,pend,pCnt);
+    if(recv)       await loadReceivedList(user2,recv,{});
+  } catch(e) {
+    errEl.textContent=e.message;
     errEl.classList.remove("hidden");
-    confirmBtn.disabled = false;
-    confirmBtn.textContent = "✅ Confirm Receipt";
+    confirmBtn.disabled=false;
+    confirmBtn.textContent="✅ Confirm Receipt";
   }
 }
 
-// ── Helpers ───────────────────────────────────────────────────
-function statusLabel(s) {
-  const m = { dispatched: "Dispatched", "in-transit": "In Transit", received: "Received", discrepancy: "Discrepancy" };
-  return m[s] || s;
+function statusLabel(s){
+  return{dispatched:"Dispatched","in-transit":"In Transit",received:"Received",discrepancy:"Discrepancy"}[s]||s;
 }
-
