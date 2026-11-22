@@ -186,7 +186,7 @@ async function runReport({from,to,type,plantId,user}){
     if(user.role!=="superAdmin"){
       if(dp.fromPlantId!==user.plantId&&dp.toPlantId!==user.plantId)return;
     }
-    if(plantId&&dp.fromPlantId!==plantId&&dp.toPlantId!==plantId)return;
+    if(plantId){if(type==="dispatched"&&dp.fromPlantId!==plantId)return;else if(type==="received"&&dp.toPlantId!==plantId)return;else if((type==="discrepancy"||type==="all")&&dp.fromPlantId!==plantId&&dp.toPlantId!==plantId)return;}
     if(type==="dispatched"&&!["dispatched","in-transit"].includes(dp.status))return;
     if(type==="received"&&dp.status!=="received")return;
     if(type==="discrepancy"&&dp.status!=="discrepancy")return;
