@@ -88,14 +88,21 @@ exports.createPtmsUser = functions
     return { uid: userRecord.uid };
   });
 
-// ── Gmail transporter (credentials from Firebase env config) ──
-function createTransporter() {
-  const cfg = functions.config().gmail;
+// ── Gmail transporter (credentials from Firestore settings/gmailConfig) ──
+async function createTransporter() {
+  const snap = await db.doc("settings/gmailConfig").get();
+  if (!snap.exists) {
+    throw new Error("Gmail credentials not configured. Please set them in Admin → Email Settings.");
+  }
+  const cfg = snap.data();
+  if (!cfg.user || !cfg.pass) {
+    throw new Error("Gmail user/password missing in settings/gmailConfig.");
+  }
   return nodemailer.createTransport({
     service: "gmail",
     auth: {
-      user: cfg.user,   // set via: firebase functions:config:set gmail.user="..."
-      pass: cfg.pass,   // 16-digit App Password (spaces don't matter)
+      user: cfg.user,
+      pass: cfg.pass.replace(/\s+/g, ""), // strip spaces from 16-digit app password
     },
   });
 }
@@ -167,8 +174,9 @@ exports.sendPtmsEmail = functions
     }
 
     // ── Send via Gmail ────────────────────────────────────────
-    const transporter = createTransporter();
-    const gmailUser   = functions.config().gmail.user;
+    const transporter = await createTransporter();
+    const gmailSnap   = await db.doc("settings/gmailConfig").get();
+    const gmailUser   = gmailSnap.data().user;
 
     const mailOptions = {
       from:    `"PTMS Notifications" <${gmailUser}>`,
