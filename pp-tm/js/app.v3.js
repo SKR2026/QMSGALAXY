@@ -66,7 +66,7 @@ function buildNav(user) {
       title: "Operations",
       items: [
         { id: "dashboard",  icon: "📊", label: "Dashboard" },
-        { id: "dispatch",   icon: "🚚", label: "New Dispatch" },
+        { id: "dispatch",   icon: "🚚", label: "All Dispatches" },
         { id: "receipt",    icon: "📥", label: "Incoming Vehicles" },
         { id: "reports",    icon: "📋", label: "Reports" },
       ]
@@ -112,7 +112,7 @@ export function navigate(route) {
   // Page titles
   const titles = {
     dashboard: "Dashboard",
-    dispatch:  "New Dispatch",
+    dispatch:  "All Dispatches",
     receipt:   "Incoming Vehicles",
     reports:   "Reports",
     admin:     "Admin Panel",
