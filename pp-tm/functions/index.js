@@ -17,8 +17,8 @@ const nodemailer             = require("nodemailer");
 admin.initializeApp();
 const db = admin.firestore();
 
-// Set region for all functions
-setGlobalOptions({ region: "asia-south1" });
+// Set region + allow all origins for CORS (site hosted on custom domain qmsgalaxy.com)
+setGlobalOptions({ region: "asia-south1", cors: true });
 
 // ═════════════════════════════════════════════════════════════
 //  HTTPS callable: createPtmsUser
