@@ -5,11 +5,34 @@
 // ─────────────────────────────────────────────────────────────
 
 import { observeAuth, logoutUser, currentUser as _cu } from "./auth.v2.js";
+import { doc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { db } from "./firebase.v2.js";
 import { showDispatchPage }  from "./dispatch.v2.js";
 import { showReceiptPage }   from "./receipt.v3.js";
 import { showDashboardPage } from "./dashboard.v2.js";
 import { showReportsPage }   from "./reports.v3.js";
 import { showAdminPage }     from "./admin.v2.js";
+
+// ── Load branding logo from Firestore on startup ──────────────
+(async () => {
+  try {
+    const snap = await getDoc(doc(db, "settings", "branding"));
+    if (snap.exists()) {
+      const url = snap.data().logoUrl;
+      if (url) applyLogoUrl(url);
+    }
+  } catch (_) { /* silently ignore — static logo.png stays as fallback */ }
+})();
+
+export function applyLogoUrl(url) {
+  const loginImg   = document.getElementById("loginLogoImg");
+  const sidebarImg = document.getElementById("sidebarLogoImg");
+  const loginWrap   = document.getElementById("loginCompanyLogo");
+  const sidebarWrap = document.getElementById("sidebarCompanyLogo");
+  if (loginImg)   { loginImg.src = url;   if (loginWrap)   loginWrap.style.display = "flex"; }
+  if (sidebarImg) { sidebarImg.src = url; if (sidebarWrap) sidebarWrap.style.display = "flex"; }
+}
+window.applyLogoUrl = applyLogoUrl;
 
 // ── DOM refs ─────────────────────────────────────────────────
 const loginPage    = document.getElementById("loginPage");

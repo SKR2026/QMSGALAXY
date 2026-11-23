@@ -702,6 +702,17 @@ async function renderGmailTab(el) {
 
   const statusEl = el.querySelector("#gmailSaveStatus");
 
+  // ── Load existing logo URL into preview ───────────────────────
+  try {
+    const bSnap = await getDoc(doc(db, "settings", "branding"));
+    if (bSnap.exists() && bSnap.data().logoUrl) {
+      const existingUrl = bSnap.data().logoUrl;
+      el.querySelector("#logoPreview").src = existingUrl;
+      el.querySelector("#logoPreview").style.display = "block";
+      el.querySelector("#logoNone").style.display = "none";
+    }
+  } catch (_) {}
+
   // ── Logo: file select → preview + enable upload btn ──────────
   let _logoFile = null;
   const logoInfo    = el.querySelector("#logoUploadStatus");
@@ -749,10 +760,8 @@ async function renderGmailTab(el) {
       // Persist URL to Firestore so app reads it on load
       await setDoc(doc(db, "settings", "branding"), { logoUrl: url, updatedAt: serverTimestamp() }, { merge: true });
 
-      // Update live logos across the page
-      [document.getElementById("loginLogoImg"), document.getElementById("sidebarLogoImg")].forEach(img => {
-        if (img) { img.src = url; img.closest("[style*='display:none']") && (img.closest("[style*='display:none']").style.display = "flex"); }
-      });
+      // Update live logos across the page immediately
+      if (window.applyLogoUrl) window.applyLogoUrl(url);
 
       logoInfo.style.cssText = "color:var(--success);font-weight:500";
       logoInfo.textContent = "✅ Logo uploaded and saved successfully!";
@@ -780,8 +789,10 @@ async function renderGmailTab(el) {
       logoPreview.src = "";
       logoPreview.style.display = "none";
       logoNone.style.display = "block";
-      [document.getElementById("loginLogoImg"), document.getElementById("sidebarLogoImg")].forEach(img => {
-        if (img) img.closest(".login-company-logo,.sidebar-company-logo") && (img.closest(".login-company-logo,.sidebar-company-logo").style.display = "none");
+      // Hide live logos on page
+      ["loginCompanyLogo", "sidebarCompanyLogo"].forEach(id => {
+        const el2 = document.getElementById(id);
+        if (el2) el2.style.display = "none";
       });
 
       logoInfo.style.cssText = "color:var(--text-mid)";
