@@ -183,7 +183,7 @@ async function openDispatchModal(user) {
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop";
   backdrop.innerHTML = `
-    <div class="modal">
+    <div class="modal modal-fullscreen">
       <div class="modal-header">
         <span>🚚 Create Dispatch</span>
         <button class="btn-close">✕</button>
@@ -211,9 +211,9 @@ async function openDispatchModal(user) {
           <div class="form-group">
             <label>Unit *</label>
             <select id="dUnit">
+              <option value="Nos">Nos</option>
               <option value="Kg">Kg</option>
               <option value="MT">MT</option>
-              <option value="Nos">Nos</option>
               <option value="Boxes">Boxes</option>
               <option value="Bags">Bags</option>
               <option value="Ltrs">Ltrs</option>

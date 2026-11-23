@@ -93,11 +93,70 @@ function buildNav(user) {
       const el = document.createElement("div");
       el.className = "nav-item";
       el.dataset.route = item.id;
-      el.innerHTML = `<span class="nav-icon">${item.icon}</span><span>${item.label}</span>`;
-      el.addEventListener("click", () => navigate(item.id));
+      el.innerHTML = `<span class="nav-icon">${item.icon}</span><span class="nav-label">${item.label}</span>`;
+      el.addEventListener("click", () => {
+        navigate(item.id);
+        // On mobile, close sidebar after navigation
+        if (window.innerWidth <= 900) {
+          document.getElementById("sidebar").classList.remove("sidebar-open");
+          document.getElementById("sidebarOverlay").classList.remove("active");
+        }
+      });
       sidebarNav.appendChild(el);
     });
   });
+
+  // Set up sidebar toggle
+  setupSidebarToggle();
+}
+
+function setupSidebarToggle() {
+  const sidebar  = document.getElementById("sidebar");
+  const appShell = document.getElementById("appShell");
+
+  // Add toggle button to sidebar brand if not already there
+  if (!document.getElementById("sidebarToggleBtn")) {
+    const toggleBtn = document.createElement("button");
+    toggleBtn.id = "sidebarToggleBtn";
+    toggleBtn.className = "sidebar-toggle-btn";
+    toggleBtn.innerHTML = "☰";
+    toggleBtn.title = "Toggle sidebar";
+    toggleBtn.addEventListener("click", () => {
+      if (window.innerWidth <= 900) {
+        // Mobile: slide in/out
+        sidebar.classList.toggle("sidebar-open");
+        document.getElementById("sidebarOverlay").classList.toggle("active");
+      } else {
+        // Desktop: collapse to icons only
+        appShell.classList.toggle("sidebar-collapsed");
+        const isCollapsed = appShell.classList.contains("sidebar-collapsed");
+        toggleBtn.innerHTML = isCollapsed ? "»" : "☰";
+        localStorage.setItem("ptmsSidebarCollapsed", isCollapsed);
+      }
+    });
+    // Inject into header
+    const appHeader = document.getElementById("appHeader");
+    if (appHeader) appHeader.prepend(toggleBtn);
+  }
+
+  // Overlay for mobile
+  if (!document.getElementById("sidebarOverlay")) {
+    const overlay = document.createElement("div");
+    overlay.id = "sidebarOverlay";
+    overlay.className = "sidebar-overlay";
+    overlay.addEventListener("click", () => {
+      sidebar.classList.remove("sidebar-open");
+      overlay.classList.remove("active");
+    });
+    document.body.appendChild(overlay);
+  }
+
+  // Restore desktop collapsed state
+  if (window.innerWidth > 900 && localStorage.getItem("ptmsSidebarCollapsed") === "true") {
+    appShell.classList.add("sidebar-collapsed");
+    const btn = document.getElementById("sidebarToggleBtn");
+    if (btn) btn.innerHTML = "»";
+  }
 }
 
 // ── Routing ───────────────────────────────────────────────────
