@@ -86,6 +86,8 @@ export async function showReportsPage(container, user) {
   pSnap.docs
     .sort((a,b)=>a.data().name.localeCompare(b.data().name))
     .forEach((d,i)=>{
+      // Hide the user's own plant pill — it's redundant (all records already scoped to their plant)
+      if(user.role !== "superAdmin" && d.id === user.plantId) return;
       const pd=d.data(), c=plantColors[i%plantColors.length];
       const btn=document.createElement("button");
       btn.className="rpt-plant-pill";
@@ -183,27 +185,38 @@ async function runReport({from,to,type,plantId,user}){
   let rows=[];
   snap.forEach(d=>{
     const dp=d.data();
+
+    // ── Scope to current plant user's records ─────────────────
     if(user.role!=="superAdmin"){
       if(dp.fromPlantId!==user.plantId&&dp.toPlantId!==user.plantId)return;
     }
+
+    // ── Plant pill filter ─────────────────────────────────────
+    // Selecting plant X means:
+    //   Dispatched  = records dispatched TO plant X   → toPlantId === X
+    //   Received    = records received FROM plant X   → fromPlantId === X
+    //   All / Disc  = plant X appears on either side
     if(plantId){
-      // For dispatched/in-transit: plant is the sender (fromPlantId)
-      // For received: plant is the receiver (toPlantId)
-      // For discrepancy/all: plant is either side
       if(type==="dispatched"){
-        if(dp.fromPlantId!==plantId)return;
-      } else if(type==="received"){
         if(dp.toPlantId!==plantId)return;
+      } else if(type==="received"){
+        if(dp.fromPlantId!==plantId)return;
       } else {
-        // all / discrepancy — match either side
         if(dp.fromPlantId!==plantId && dp.toPlantId!==plantId)return;
       }
     }
+
+    // ── Status filter ─────────────────────────────────────────
     if(type==="dispatched"&&!["dispatched","in-transit"].includes(dp.status))return;
     if(type==="received"&&dp.status!=="received")return;
     if(type==="discrepancy"&&dp.status!=="discrepancy")return;
-    if(from&&dp.date&&dp.date<from)return;
-    if(to&&dp.date&&dp.date>to)return;
+
+    // ── Date filter — use dp.date, fall back to createdAt ─────
+    const recordDate = dp.date ||
+      (dp.createdAt?.toDate ? dp.createdAt.toDate().toISOString().slice(0,10) : null);
+    if(from && recordDate && recordDate < from)return;
+    if(to   && recordDate && recordDate > to  )return;
+
     rows.push({id:d.id,...dp});
   });
   rows.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
