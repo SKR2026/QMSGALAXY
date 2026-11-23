@@ -207,8 +207,11 @@ async function runReport({from,to,type,plantId,user}){
     }
 
     // ── Status filter ─────────────────────────────────────────
-    if(type==="dispatched"&&!["dispatched","in-transit"].includes(dp.status))return;
-    if(type==="received"&&dp.status!=="received")return;
+    // "Dispatched" type = all records sent to that plant (any status — may have been received already)
+    // "Received"   type = records that were received (status received or discrepancy)
+    // "Discrepancy"type = only discrepancy status
+    // No status filter for "dispatched" — plant pill already scopes by toPlantId
+    if(type==="received"&&!["received","discrepancy"].includes(dp.status))return;
     if(type==="discrepancy"&&dp.status!=="discrepancy")return;
 
     // ── Date filter — use dp.date, fall back to createdAt ─────
