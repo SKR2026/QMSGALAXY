@@ -8,6 +8,8 @@ import {
   collection, doc, getDocs, addDoc, updateDoc, deleteDoc, setDoc,
   query, orderBy, serverTimestamp, getDoc
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
 import { sendPasswordResetEmail }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import { getFunctions, httpsCallable }
@@ -655,6 +657,7 @@ async function renderGmailTab(el) {
           Recommended: PNG with transparent background, max 400×120 px.
         </p>
         <div style="display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem">
+          <!-- Preview box -->
           <div style="background:#f4f6fb;border:1.5px dashed var(--border);border-radius:8px;padding:1rem 1.5rem;text-align:center;min-width:200px">
             <img id="logoPreview" src="images/logo.png" alt="Current Logo"
               style="max-width:180px;max-height:56px;object-fit:contain;display:block;margin:0 auto"
@@ -662,22 +665,23 @@ async function renderGmailTab(el) {
             <span id="logoNone" style="display:none;font-size:.82rem;color:var(--text-light)">No logo uploaded</span>
             <div style="font-size:.75rem;color:var(--text-light);margin-top:.4rem">Current logo</div>
           </div>
-          <div style="flex:1;min-width:200px">
-            <label class="btn btn-outline" style="cursor:pointer;display:inline-flex;align-items:center;gap:.4rem">
-              📁 Choose Logo File
-              <input type="file" id="logoFileInput" accept="image/png,image/jpeg,image/svg+xml,image/webp"
-                style="display:none">
-            </label>
-            <div style="font-size:.78rem;color:var(--text-light);margin-top:.5rem">
+          <!-- Controls -->
+          <div style="flex:1;min-width:200px;display:flex;flex-direction:column;gap:.6rem">
+            <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
+              <label class="btn btn-outline btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:.4rem;margin:0">
+                📁 Choose File
+                <input type="file" id="logoFileInput" accept="image/png,image/jpeg,image/svg+xml,image/webp"
+                  style="display:none">
+              </label>
+              <button class="btn btn-primary btn-sm" id="logoUploadBtn" disabled>⬆️ Upload Logo</button>
+              <button class="btn btn-danger btn-sm" id="logoRemoveBtn">🗑 Remove Logo</button>
+            </div>
+            <div style="font-size:.78rem;color:var(--text-light)">
               PNG, JPG or SVG · Max 500 KB · Transparent background recommended
             </div>
-            <div id="logoUploadStatus" style="margin-top:.5rem;font-size:.85rem"></div>
+            <div id="logoUploadStatus" style="font-size:.85rem"></div>
           </div>
         </div>
-        <p class="text-muted" style="font-size:.8rem">
-          After uploading, the new logo will be saved as <code>images/logo.png</code> in your deployed app.
-          To apply permanently, re-deploy to Firebase Hosting after replacing the file in your GitHub repo.
-        </p>
       </div>
     </div>
 
@@ -698,32 +702,98 @@ async function renderGmailTab(el) {
 
   const statusEl = el.querySelector("#gmailSaveStatus");
 
-  // ── Logo preview on file select ───────────────────────────
+  // ── Logo: file select → preview + enable upload btn ──────────
+  let _logoFile = null;
+  const logoInfo    = el.querySelector("#logoUploadStatus");
+  const logoUpBtn   = el.querySelector("#logoUploadBtn");
+  const logoRemBtn  = el.querySelector("#logoRemoveBtn");
+  const logoPreview = el.querySelector("#logoPreview");
+  const logoNone    = el.querySelector("#logoNone");
+
   el.querySelector("#logoFileInput").addEventListener("change", (e) => {
     const file = e.target.files[0];
-    const info = el.querySelector("#logoUploadStatus");
     if (!file) return;
     if (file.size > 512 * 1024) {
-      info.style.color = "var(--danger)";
-      info.textContent = "⚠️ File is too large (max 500 KB). Please resize the image.";
+      logoInfo.style.cssText = "color:var(--danger)";
+      logoInfo.textContent = "⚠️ File too large (max 500 KB). Please resize.";
+      logoUpBtn.disabled = true;
       return;
     }
+    _logoFile = file;
+    // Show local preview immediately
     const reader = new FileReader();
     reader.onload = (ev) => {
-      const img = el.querySelector("#logoPreview");
-      img.src = ev.target.result;
-      img.style.display = "block";
-      el.querySelector("#logoNone").style.display = "none";
-      // Also update live login + sidebar logos on the page
-      const loginImg   = document.getElementById("loginLogoImg");
-      const sidebarImg = document.getElementById("sidebarLogoImg");
-      if (loginImg)   { loginImg.src = ev.target.result; loginImg.closest(".login-company-logo").style.display = "flex"; }
-      if (sidebarImg) { sidebarImg.src = ev.target.result; sidebarImg.closest(".sidebar-company-logo").style.display = "flex"; }
-
-      info.style.color = "var(--success)";
-      info.textContent = `✅ "${file.name}" selected. To make it permanent, replace images/logo.png in your GitHub repo and redeploy.`;
+      logoPreview.src = ev.target.result;
+      logoPreview.style.display = "block";
+      logoNone.style.display = "none";
     };
     reader.readAsDataURL(file);
+    logoInfo.style.cssText = "color:var(--text-mid)";
+    logoInfo.textContent = `"${file.name}" selected — click Upload Logo to save.`;
+    logoUpBtn.disabled = false;
+  });
+
+  // ── Upload button ─────────────────────────────────────────────
+  logoUpBtn.addEventListener("click", async () => {
+    if (!_logoFile) return;
+    logoUpBtn.disabled = true;
+    logoUpBtn.textContent = "Uploading…";
+    logoInfo.style.cssText = "";
+    logoInfo.textContent = "";
+    try {
+      const storage = getStorage(app);
+      const storageRef = ref(storage, "branding/logo.png");
+      await uploadBytes(storageRef, _logoFile, { contentType: _logoFile.type });
+      const url = await getDownloadURL(storageRef);
+
+      // Persist URL to Firestore so app reads it on load
+      await setDoc(doc(db, "settings", "branding"), { logoUrl: url, updatedAt: serverTimestamp() }, { merge: true });
+
+      // Update live logos across the page
+      [document.getElementById("loginLogoImg"), document.getElementById("sidebarLogoImg")].forEach(img => {
+        if (img) { img.src = url; img.closest("[style*='display:none']") && (img.closest("[style*='display:none']").style.display = "flex"); }
+      });
+
+      logoInfo.style.cssText = "color:var(--success);font-weight:500";
+      logoInfo.textContent = "✅ Logo uploaded and saved successfully!";
+      window.showToast("Logo updated.", "success");
+      _logoFile = null;
+    } catch (err) {
+      logoInfo.style.cssText = "color:var(--danger)";
+      logoInfo.textContent = "❌ Upload failed: " + err.message;
+    } finally {
+      logoUpBtn.textContent = "⬆️ Upload Logo";
+      logoUpBtn.disabled = true;
+    }
+  });
+
+  // ── Remove button ─────────────────────────────────────────────
+  logoRemBtn.addEventListener("click", async () => {
+    if (!confirm("Remove the company logo? The app will show no logo until a new one is uploaded.")) return;
+    logoRemBtn.disabled = true;
+    logoRemBtn.textContent = "Removing…";
+    try {
+      const storage = getStorage(app);
+      try { await deleteObject(ref(storage, "branding/logo.png")); } catch (_) { /* may not exist */ }
+      await setDoc(doc(db, "settings", "branding"), { logoUrl: "", updatedAt: serverTimestamp() }, { merge: true });
+
+      logoPreview.src = "";
+      logoPreview.style.display = "none";
+      logoNone.style.display = "block";
+      [document.getElementById("loginLogoImg"), document.getElementById("sidebarLogoImg")].forEach(img => {
+        if (img) img.closest(".login-company-logo,.sidebar-company-logo") && (img.closest(".login-company-logo,.sidebar-company-logo").style.display = "none");
+      });
+
+      logoInfo.style.cssText = "color:var(--text-mid)";
+      logoInfo.textContent = "Logo removed.";
+      window.showToast("Logo removed.", "info");
+    } catch (err) {
+      logoInfo.style.cssText = "color:var(--danger)";
+      logoInfo.textContent = "❌ Remove failed: " + err.message;
+    } finally {
+      logoRemBtn.disabled = false;
+      logoRemBtn.textContent = "🗑 Remove Logo";
+    }
   });
 
   el.querySelector("#clearPassBtn").addEventListener("click", () => {
