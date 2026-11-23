@@ -4,7 +4,7 @@
 //  Handles page routing, nav building, session, clock.
 // ─────────────────────────────────────────────────────────────
 
-import { observeAuth, logoutUser, currentUser as _cu } from "./auth.v2.js";
+import { observeAuth, logoutUser, currentUser as _cu, changePassword } from "./auth.v2.js";
 import { doc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { db } from "./firebase.v2.js";
 import { showDispatchPage }  from "./dispatch.v2.js";
@@ -242,6 +242,20 @@ observeAuth(
       user.role === "superAdmin" ? "admin" : "plant"
     );
 
+    // Add Change Password button to sidebar footer (once)
+    if (!document.getElementById("changePwdBtn")) {
+      const footer = document.querySelector(".sidebar-footer");
+      if (footer) {
+        const pwdBtn = document.createElement("button");
+        pwdBtn.id = "changePwdBtn";
+        pwdBtn.className = "btn btn-outline btn-sm btn-block";
+        pwdBtn.style.cssText = "margin-top:.5rem;color:rgba(255,255,255,.7);border-color:rgba(255,255,255,.25)";
+        pwdBtn.innerHTML = "🔒 Change Password";
+        pwdBtn.onclick = openChangePasswordModal;
+        footer.appendChild(pwdBtn);
+      }
+    }
+
     buildNav(user);
     navigate("dashboard");
   },
@@ -280,3 +294,87 @@ loginForm.addEventListener("submit", async e => {
 logoutBtn.addEventListener("click", () => {
   if (confirm("Sign out?")) logoutUser();
 });
+
+// ── Change Password Modal ──────────────────────────────────────
+function openChangePasswordModal() {
+  if (document.getElementById("changePwdBackdrop")) return; // already open
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.id = "changePwdBackdrop";
+  backdrop.innerHTML = `
+    <div class="modal" style="max-width:420px">
+      <div class="modal-header">
+        <span>🔒 Change Password</span>
+        <button class="btn-close" id="closePwdModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group" style="margin-bottom:.9rem">
+          <label>Current Password *</label>
+          <input type="password" id="pwdCurrent" placeholder="Enter current password" autocomplete="current-password">
+        </div>
+        <div class="form-group" style="margin-bottom:.9rem">
+          <label>New Password *</label>
+          <input type="password" id="pwdNew" placeholder="Min 6 characters" autocomplete="new-password">
+        </div>
+        <div class="form-group" style="margin-bottom:.9rem">
+          <label>Confirm New Password *</label>
+          <input type="password" id="pwdConfirm" placeholder="Repeat new password" autocomplete="new-password">
+        </div>
+        <div id="pwdError" class="error-msg hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" id="cancelPwdBtn">Cancel</button>
+        <button class="btn btn-primary" id="savePwdBtn">🔒 Update Password</button>
+      </div>
+    </div>`;
+  document.body.appendChild(backdrop);
+
+  const close = () => backdrop.remove();
+  backdrop.querySelector("#closePwdModal").onclick = close;
+  backdrop.querySelector("#cancelPwdBtn").onclick  = close;
+
+  backdrop.querySelector("#savePwdBtn").onclick = async () => {
+    const errEl    = backdrop.querySelector("#pwdError");
+    const saveBtn  = backdrop.querySelector("#savePwdBtn");
+    const current  = backdrop.querySelector("#pwdCurrent").value;
+    const newPwd   = backdrop.querySelector("#pwdNew").value;
+    const confirm2 = backdrop.querySelector("#pwdConfirm").value;
+
+    errEl.classList.add("hidden");
+
+    if (!current || !newPwd || !confirm2) {
+      errEl.textContent = "All fields are required.";
+      errEl.classList.remove("hidden");
+      return;
+    }
+    if (newPwd.length < 6) {
+      errEl.textContent = "New password must be at least 6 characters.";
+      errEl.classList.remove("hidden");
+      return;
+    }
+    if (newPwd !== confirm2) {
+      errEl.textContent = "New passwords do not match.";
+      errEl.classList.remove("hidden");
+      return;
+    }
+
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Updating…";
+    try {
+      await changePassword(current, newPwd);
+      window.showToast("✅ Password updated successfully.", "success");
+      close();
+    } catch (e) {
+      const msg = e.code === "auth/wrong-password" || e.code === "auth/invalid-credential"
+        ? "Current password is incorrect."
+        : e.code === "auth/too-many-requests"
+        ? "Too many attempts. Please try again later."
+        : e.message;
+      errEl.textContent = msg;
+      errEl.classList.remove("hidden");
+      saveBtn.disabled = false;
+      saveBtn.textContent = "🔒 Update Password";
+    }
+  };
+}
+window.openChangePasswordModal = openChangePasswordModal;
