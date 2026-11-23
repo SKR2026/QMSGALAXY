@@ -8,7 +8,7 @@ import { db } from "./firebase.v2.js";
 import {
   collection, doc, getDocs, addDoc, query,
   orderBy, where, serverTimestamp, getDoc,
-  runTransaction
+  runTransaction, deleteDoc
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { requirePlantUser } from "./auth.v2.js";
 import { sendDispatchEmail } from "./email.v2.js";
@@ -61,6 +61,7 @@ export async function showDispatchPage(container, user) {
 // ── Load list ─────────────────────────────────────────────────
 async function loadDispatchList(user, listEl, filters = {}) {
   listEl.innerHTML = `<div class="spinner"></div>`;
+  const isSA = user.role === "superAdmin";
   try {
     let q = query(
       collection(db, "dispatches"),
@@ -68,7 +69,7 @@ async function loadDispatchList(user, listEl, filters = {}) {
       orderBy("createdAt", "desc")
     );
     // For superAdmin show all
-    if (user.role === "superAdmin") {
+    if (isSA) {
       q = query(collection(db, "dispatches"), orderBy("createdAt", "desc"));
     }
 
@@ -87,7 +88,8 @@ async function loadDispatchList(user, listEl, filters = {}) {
         : "";
       const recvDT=(dp.arrivalDate&&dp.arrivalTime)?dp.arrivalDate+" "+dp.arrivalTime:(dp.arrivalDate||"—");
       rows += `
-        <tr>
+        <tr data-doc-id="${d.id}">
+          ${isSA ? `<td style="width:36px;text-align:center"><input type="checkbox" class="dispatch-chk" data-id="${d.id}" style="width:16px;height:16px;cursor:pointer"></td>` : ""}
           <td><span class="dispatch-id">${dp.dispatchId}</span></td>
           <td>${created}</td>
           <td>${recvDT}</td>
@@ -101,9 +103,16 @@ async function loadDispatchList(user, listEl, filters = {}) {
     });
 
     listEl.innerHTML = `
+      ${isSA ? `
+        <div id="dispatchBulkBar" style="display:none;align-items:center;gap:.7rem;margin-bottom:.6rem;padding:.5rem .75rem;background:#fff3f3;border:1.5px solid #c62828;border-radius:8px">
+          <span id="dispatchSelCount" style="font-weight:700;color:#c62828;font-size:.9rem">0 selected</span>
+          <button id="dispatchDeleteBtn" class="btn btn-sm" style="background:#c62828;color:#fff;border:none;padding:.35rem .9rem;border-radius:6px;font-weight:700;cursor:pointer">🗑 Delete Selected</button>
+          <button id="dispatchDeselectBtn" class="btn btn-outline btn-sm">✕ Deselect All</button>
+        </div>` : ""}
       <div class="table-wrap">
         <table>
           <thead><tr>
+            ${isSA ? `<th style="width:36px"><input type="checkbox" id="dispatchSelectAll" style="width:16px;height:16px;cursor:pointer" title="Select all"></th>` : ""}
             <th>Dispatch ID</th><th>Dispatch Date/Time</th><th>Receipt Date/Time</th><th>Material</th>
             <th>Qty</th><th>Vehicle No.</th><th>To Plant</th>
             <th>Status</th><th></th>
@@ -111,6 +120,49 @@ async function loadDispatchList(user, listEl, filters = {}) {
           <tbody>${rows}</tbody>
         </table>
       </div>`;
+
+    if (isSA) {
+      const bulkBar   = listEl.querySelector("#dispatchBulkBar");
+      const selCount  = listEl.querySelector("#dispatchSelCount");
+      const selectAll = listEl.querySelector("#dispatchSelectAll");
+
+      function updateBulkBar() {
+        const checked = listEl.querySelectorAll(".dispatch-chk:checked");
+        const n = checked.length;
+        bulkBar.style.display = n > 0 ? "flex" : "none";
+        selCount.textContent = `${n} selected`;
+        if (selectAll) selectAll.checked = n === listEl.querySelectorAll(".dispatch-chk").length;
+      }
+
+      listEl.addEventListener("change", e => {
+        if (e.target.classList.contains("dispatch-chk") || e.target.id === "dispatchSelectAll") {
+          if (e.target.id === "dispatchSelectAll") {
+            listEl.querySelectorAll(".dispatch-chk").forEach(c => c.checked = e.target.checked);
+          }
+          updateBulkBar();
+        }
+      });
+
+      listEl.querySelector("#dispatchDeselectBtn").addEventListener("click", () => {
+        listEl.querySelectorAll(".dispatch-chk").forEach(c => c.checked = false);
+        if (selectAll) selectAll.checked = false;
+        updateBulkBar();
+      });
+
+      listEl.querySelector("#dispatchDeleteBtn").addEventListener("click", async () => {
+        const checked = [...listEl.querySelectorAll(".dispatch-chk:checked")];
+        if (!checked.length) return;
+        if (!confirm(`Permanently delete ${checked.length} dispatch record(s)? This cannot be undone.`)) return;
+        try {
+          await Promise.all(checked.map(c => deleteDoc(doc(db, "dispatches", c.dataset.id))));
+          window.showToast(`${checked.length} record(s) deleted.`, "success");
+          await loadDispatchList(user, listEl, filters);
+        } catch (e) {
+          window.showToast("Delete failed: " + e.message, "error");
+        }
+      });
+    }
+
   } catch (e) {
     listEl.innerHTML = `<div class="error-msg">Error loading dispatches: ${e.message}</div>`;
   }
