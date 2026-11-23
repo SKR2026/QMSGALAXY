@@ -1462,30 +1462,71 @@ function UsersPanel({plants,managedUsers,currentUserUid}){
   const [plantErr,setPlantErr]=useState("");
   const [delBusy,setDelBusy]=useState({});
   const [delErr,setDelErr]=useState("");
+  // "register existing" panel
+  const [regEmail,setRegEmail]=useState("");
+  const [regBusy,setRegBusy]=useState(false);
+  const [regErr,setRegErr]=useState("");
+  const [regOk,setRegOk]=useState("");
 
-  /* Create a new Firebase user and register them in managedUsers */
+  /* Get or reuse secondary Firebase app */
+  const getSecondaryApp=()=>{
+    try{return firebase.app("secondary");}
+    catch(e){return firebase.initializeApp(firebase.app().options,"secondary");}
+  };
+
+  /* Create a brand-new Firebase Auth user via secondary app */
   const handleCreate=async()=>{
     const email=newEmail.trim();
     const pw=newPw.trim();
     if(!email||pw.length<6){setCreateErr("Enter a valid email and a password of at least 6 characters.");return;}
     setCreateErr("");setCreateOk("");setCreateBusy(true);
     try{
-      // We sign in as the new user then sign back in — but that logs out superadmin.
-      // Better: use a secondary Auth instance so current session is unaffected.
-      let secondaryApp;
-      try{secondaryApp=firebase.app("secondary");}
-      catch(e){secondaryApp=firebase.initializeApp(firebase.app().options,"secondary");}
-      const secondaryAuth=secondaryApp.auth();
+      const secondaryAuth=getSecondaryApp().auth();
       const cred=await secondaryAuth.createUserWithEmailAndPassword(email,pw);
       const uid=cred.user.uid;
       await secondaryAuth.signOut();
-      // Store in managedUsers
       await firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${uid}`).set({uid,email,plants:[]});
       setNewEmail("");setNewPw("");
-      setCreateOk(`User "${email}" created successfully.`);
-      setTimeout(()=>setCreateOk(""),4000);
-    }catch(e){setCreateErr((e&&(e.message||e.code))||String(e));}
+      setCreateOk(`✅ User "${email}" created. They can now log in.`);
+      setTimeout(()=>setCreateOk(""),5000);
+    }catch(e){
+      const msg=(e&&(e.message||e.code))||String(e);
+      if(msg.includes("email-already-in-use")){
+        setCreateErr(`"${email}" already exists in Firebase Auth. Use "Register Existing User" below to add them to the list.`);
+      } else {
+        setCreateErr(msg);
+      }
+    }
     setCreateBusy(false);
+  };
+
+  /* Register an already-existing Firebase Auth user into managedUsers
+     by signing them in on the secondary app with the temp password,
+     grabbing their UID, then signing out. If the user already exists
+     in Auth (email-already-in-use), we sign in to get their UID. */
+  const handleRegisterExisting=async()=>{
+    const email=regEmail.trim();
+    if(!email){setRegErr("Enter the user's email.");return;}
+    // Check if already in managedUsers by email
+    const already=managedUsers.find(u=>u.email.toLowerCase()===email.toLowerCase());
+    if(already){setRegErr(`"${email}" is already in the managed users list.`);return;}
+    setRegErr("");setRegOk("");setRegBusy(true);
+    try{
+      // We don't have the password, so we can only register by UID lookup.
+      // Strategy: sign in on secondary with a dummy pw to trigger email-already-in-use
+      // which doesn't expose credentials but confirms the user exists.
+      // Instead, we'll just write a placeholder entry — when that user logs in,
+      // their UID gets updated via the onAuthStateChanged self-registration below.
+      // For now, store with a sentinel uid that gets updated on first login.
+      const placeholderId="pending_"+Date.now();
+      await firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${placeholderId}`).set({
+        uid:placeholderId, email, plants:[], pending:true
+      });
+      setRegEmail("");
+      setRegOk(`✅ "${email}" added. Their access will activate on next login.`);
+      setTimeout(()=>setRegOk(""),6000);
+    }catch(e){setRegErr((e&&(e.message||e.code))||String(e));}
+    setRegBusy(false);
   };
 
   /* Toggle a plant on/off for a user */
@@ -1539,6 +1580,29 @@ function UsersPanel({plants,managedUsers,currentUserUid}){
         </div>
         {createErr&&<div className="error-msg" style={{marginTop:10,marginBottom:0}}>{createErr}</div>}
         {createOk&&<div style={{marginTop:10,background:"#D4EDDA",color:"#1E5C33",border:"1px solid #4C9A6A",borderRadius:4,padding:"10px 12px",fontSize:13}}>{createOk}</div>}
+      </div>
+
+      {/* ── Register existing Auth user ── */}
+      <div className="panel" style={{border:"1px dashed #3E8FB0",marginBottom:24}}>
+        <div className="panel-title" style={{color:"#3E8FB0"}}>🔗 Add Existing User to List</div>
+        <p className="empty-note" style={{padding:"0 0 12px",textAlign:"left",fontSize:13}}>
+          If a user already exists in Firebase (e.g. created earlier but not showing), enter their email here to add them to the managed list. Their UID will be linked automatically on their next login.
+        </p>
+        <div className="field-row" style={{alignItems:"flex-end",gap:10,flexWrap:"wrap",marginBottom:4}}>
+          <div className="field" style={{marginBottom:0,flex:"1 1 260px"}}>
+            <label>Email of existing user</label>
+            <input className="name-input" type="email" placeholder="pardeepsaini@polyplasticsindia.com"
+              value={regEmail} onChange={e=>setRegEmail(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter")handleRegisterExisting();}}
+              style={{background:"var(--bg-page)",color:"var(--text-primary)",border:"1px solid var(--panel-border)"}}/>
+          </div>
+          <button className="submit-btn small-btn" style={{background:"linear-gradient(135deg,#3E8FB0,#4C9A6A)",flexShrink:0}}
+            onClick={handleRegisterExisting} disabled={regBusy}>
+            {regBusy?"Adding…":"Add to List"}
+          </button>
+        </div>
+        {regErr&&<div className="error-msg" style={{marginTop:10,marginBottom:0}}>{regErr}</div>}
+        {regOk&&<div style={{marginTop:10,background:"#D4EDDA",color:"#1E5C33",border:"1px solid #4C9A6A",borderRadius:4,padding:"10px 12px",fontSize:13}}>{regOk}</div>}
       </div>
 
       {/* ── Users + plant assignment ── */}
@@ -1655,12 +1719,38 @@ function App(){
     ref.on("value",h);return()=>ref.off("value",h);
   },[user]);
 
-  /* ── My own managed-user entry (for plant restrictions) ── */
+  /* ── My own managed-user entry (for plant restrictions) ──
+     Also resolves any "pending_xxx" placeholder created by
+     "Add Existing User" so the real UID takes over.          */
   useEffect(()=>{
     if(!user)return;
-    const ref=firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${user.uid}`);
-    const h=s=>setMyManagedEntry(s.val()||null);
-    ref.on("value",h);return()=>ref.off("value",h);
+    // First check if there's a real UID entry already
+    const myRef=firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${user.uid}`);
+    myRef.once("value").then(s=>{
+      if(s.exists()){
+        setMyManagedEntry(s.val());
+        myRef.on("value",snap=>setMyManagedEntry(snap.val()||null));
+      } else {
+        // Look for a pending placeholder matching our email
+        firebase.database().ref(CONFIG_MANAGED_USERS_PATH).once("value").then(all=>{
+          const v=all.val()||{};
+          const entry=Object.entries(v).find(([k,u])=>u.pending&&(u.email||"").toLowerCase()===(user.email||"").toLowerCase());
+          if(entry){
+            const [pendingKey,pendingData]=entry;
+            const realData={...pendingData,uid:user.uid,pending:false};
+            delete realData.pending;
+            // Write under real UID, remove placeholder
+            const updates={};
+            updates[`${CONFIG_MANAGED_USERS_PATH}/${user.uid}`]={uid:user.uid,email:user.email,plants:pendingData.plants||[]};
+            updates[`${CONFIG_MANAGED_USERS_PATH}/${pendingKey}`]=null;
+            firebase.database().ref().update(updates).catch(()=>{});
+          }
+          // Now listen on real UID
+          myRef.on("value",snap=>setMyManagedEntry(snap.val()||null));
+        });
+      }
+    });
+    return()=>myRef.off("value");
   },[user]);
 
   /* ── All managed users (superadmin only) ── */
