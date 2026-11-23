@@ -47,6 +47,8 @@ const SETTINGS_VALID_UNTIL_PATH       = "interdept2/settings/validUntil";
 const CONFIG_DEPARTMENTS_PATH         = "interdept2/config/departments";
 const CONFIG_SHIFTS_PATH              = "interdept2/config/shifts";
 const CONFIG_PLANTS_PATH              = "interdept2/config/plants";
+const CONFIG_SUPERADMINS_PATH         = "interdept2/config/superadmins";   // {uid: {email,uid}}
+const CONFIG_MANAGED_USERS_PATH       = "interdept2/config/managedUsers";  // {uid: {email,uid,plants:[]}}
 const THEME_KEY = "interdept2-theme";
 
 const DEFAULT_COMPANY_NAME = "";
@@ -1438,6 +1440,162 @@ function AdminLogin({onCancel}){
   return(<div className="panel" style={{maxWidth:340,marginLeft:"auto"}}><div className="field-row" style={{marginBottom:8}}><input className="name-input" style={{flex:1}} type="email" placeholder="Email" value={email} onChange={(e)=>setEmail(e.target.value)}/></div><div className="field-row" style={{marginBottom:8}}><input className="name-input" style={{flex:1}} type="password" placeholder="Password" value={pw} onChange={(e)=>setPw(e.target.value)} onKeyDown={(e)=>{if(e.key==="Enter")go();}}/></div>{err&&<div className="error-msg">{err}</div>}<div style={{display:"flex",gap:8}}><button className="submit-btn small-btn" onClick={go} disabled={busy}>Log in</button><button className="submit-btn small-btn" style={{background:"#6C7A89"}} onClick={onCancel}>×</button></div></div>);
 }
 
+// ══════════════════════════════════════════════════════════════
+//  UsersPanel  —  superadmin creates users + assigns plants
+// ══════════════════════════════════════════════════════════════
+function UsersPanel({plants,managedUsers,currentUserUid}){
+  const [newEmail,setNewEmail]=useState("");
+  const [newPw,setNewPw]=useState("");
+  const [createBusy,setCreateBusy]=useState(false);
+  const [createErr,setCreateErr]=useState("");
+  const [createOk,setCreateOk]=useState("");
+  const [plantBusy,setPlantBusy]=useState({});
+  const [plantErr,setPlantErr]=useState("");
+  const [delBusy,setDelBusy]=useState({});
+  const [delErr,setDelErr]=useState("");
+
+  /* Create a new Firebase user and register them in managedUsers */
+  const handleCreate=async()=>{
+    const email=newEmail.trim();
+    const pw=newPw.trim();
+    if(!email||pw.length<6){setCreateErr("Enter a valid email and a password of at least 6 characters.");return;}
+    setCreateErr("");setCreateOk("");setCreateBusy(true);
+    try{
+      // We sign in as the new user then sign back in — but that logs out superadmin.
+      // Better: use a secondary Auth instance so current session is unaffected.
+      const secondaryApp=firebase.app.length>1
+        ?firebase.app("secondary")
+        :firebase.initializeApp(firebase.app().options,"secondary");
+      const secondaryAuth=secondaryApp.auth();
+      const cred=await secondaryAuth.createUserWithEmailAndPassword(email,pw);
+      const uid=cred.user.uid;
+      await secondaryAuth.signOut();
+      // Store in managedUsers
+      await firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${uid}`).set({uid,email,plants:[]});
+      setNewEmail("");setNewPw("");
+      setCreateOk(`User "${email}" created successfully.`);
+      setTimeout(()=>setCreateOk(""),4000);
+    }catch(e){setCreateErr((e&&(e.message||e.code))||String(e));}
+    setCreateBusy(false);
+  };
+
+  /* Toggle a plant on/off for a user */
+  const togglePlant=async(uid,plantName,currentPlants)=>{
+    setPlantErr("");
+    const key=uid+"__"+plantName;
+    setPlantBusy(p=>({...p,[key]:true}));
+    try{
+      const has=currentPlants.includes(plantName);
+      const next=has?currentPlants.filter(p=>p!==plantName):[...currentPlants,plantName];
+      await firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${uid}/plants`).set(next);
+    }catch(e){setPlantErr((e&&(e.message||e.code))||String(e));}
+    setPlantBusy(p=>({...p,[key+plantName]:false}));
+  };
+
+  /* Disable a user (remove from managedUsers — they can still log in but see nothing) */
+  const handleRemoveUser=async(uid,email)=>{
+    if(!window.confirm(`Remove user "${email}" from the managed list? They will lose all plant access.`))return;
+    setDelErr("");setDelBusy(p=>({...p,[uid]:true}));
+    try{await firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${uid}`).remove();}
+    catch(e){setDelErr((e&&(e.message||e.code))||String(e));}
+    setDelBusy(p=>({...p,[uid]:false}));
+  };
+
+  return(
+    <div style={{maxWidth:900}}>
+      {/* ── Create user ── */}
+      <div className="panel" style={{border:"2px solid #9B6BD1",marginBottom:24}}>
+        <div className="panel-title" style={{color:"#9B6BD1"}}>➕ Create New User</div>
+        <p className="empty-note" style={{padding:"0 0 14px",textAlign:"left",fontSize:13}}>
+          Only Superadmins can create users. Enter an email and temporary password — the user can change their password after first login.
+        </p>
+        <div className="field-row" style={{alignItems:"flex-end",gap:10,flexWrap:"wrap",marginBottom:4}}>
+          <div className="field" style={{marginBottom:0,flex:"1 1 220px"}}>
+            <label>Email</label>
+            <input className="name-input" type="email" placeholder="user@company.com"
+              value={newEmail} onChange={e=>setNewEmail(e.target.value)}
+              style={{background:"var(--bg-page)",color:"var(--text-primary)",border:"1px solid var(--panel-border)"}}/>
+          </div>
+          <div className="field" style={{marginBottom:0,flex:"1 1 180px"}}>
+            <label>Temporary Password</label>
+            <input className="name-input" type="password" placeholder="Min 6 characters"
+              value={newPw} onChange={e=>setNewPw(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter")handleCreate();}}
+              style={{background:"var(--bg-page)",color:"var(--text-primary)",border:"1px solid var(--panel-border)"}}/>
+          </div>
+          <button className="submit-btn small-btn" style={{background:"linear-gradient(135deg,#9B6BD1,#6366F1)",flexShrink:0}}
+            onClick={handleCreate} disabled={createBusy}>
+            {createBusy?"Creating…":"Create User"}
+          </button>
+        </div>
+        {createErr&&<div className="error-msg" style={{marginTop:10,marginBottom:0}}>{createErr}</div>}
+        {createOk&&<div style={{marginTop:10,background:"#D4EDDA",color:"#1E5C33",border:"1px solid #4C9A6A",borderRadius:4,padding:"10px 12px",fontSize:13}}>{createOk}</div>}
+      </div>
+
+      {/* ── Users + plant assignment ── */}
+      <div className="panel">
+        <div className="panel-title">👤 Manage Users &amp; Plant Access</div>
+        <p className="empty-note" style={{padding:"0 0 14px",textAlign:"left",fontSize:13}}>
+          Check the plants each user is allowed to view. Users with <strong>no plants checked</strong> will see <em>all plants</em>.
+        </p>
+        {plantErr&&<div className="error-msg" style={{marginBottom:12}}>{plantErr}</div>}
+        {delErr&&<div className="error-msg" style={{marginBottom:12}}>{delErr}</div>}
+        {managedUsers.length===0
+          ?<div className="empty-note">No users yet. Create one above.</div>
+          :<div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:420}}>
+              <thead>
+                <tr>
+                  <th style={{textAlign:"left",padding:"9px 12px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:200}}>Email</th>
+                  {plants.map(p=>(
+                    <th key={p.id} style={{textAlign:"center",padding:"9px 10px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.4px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:110,whiteSpace:"nowrap"}}>
+                      {p.name}
+                    </th>
+                  ))}
+                  <th style={{textAlign:"center",padding:"9px 8px",borderBottom:"2px solid var(--panel-border)",minWidth:70}}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {managedUsers.map((u,i)=>{
+                  const userPlants=Array.isArray(u.plants)?u.plants:[];
+                  const allAccess=userPlants.length===0;
+                  return(
+                    <tr key={u.uid} style={{background:i%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
+                      <td style={{padding:"10px 12px",borderBottom:"1px solid var(--panel-border)",color:"var(--text-primary)",fontWeight:500}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                          <span>{u.email}</span>
+                          {allAccess&&<span style={{fontSize:10,background:"#3E8FB0",color:"#fff",padding:"2px 7px",borderRadius:999,fontWeight:700,whiteSpace:"nowrap"}}>ALL PLANTS</span>}
+                        </div>
+                      </td>
+                      {plants.map(p=>{
+                        const has=userPlants.includes(p.name);
+                        const busy=plantBusy[u.uid+"__"+p.name];
+                        return(
+                          <td key={p.id} style={{textAlign:"center",padding:"10px 8px",borderBottom:"1px solid var(--panel-border)"}}>
+                            <input type="checkbox" checked={has} disabled={!!busy}
+                              onChange={()=>togglePlant(u.uid,p.name,userPlants)}
+                              style={{width:16,height:16,cursor:"pointer",accentColor:"#6366F1"}}/>
+                          </td>
+                        );
+                      })}
+                      <td style={{textAlign:"center",padding:"10px 8px",borderBottom:"1px solid var(--panel-border)"}}>
+                        <button onClick={()=>handleRemoveUser(u.uid,u.email)} disabled={!!delBusy[u.uid]}
+                          style={{background:"none",border:"1px solid #E8552D",color:"#E8552D",borderRadius:6,padding:"4px 10px",cursor:"pointer",fontSize:11,fontWeight:600}}>
+                          {delBusy[u.uid]?"…":"Remove"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        }
+      </div>
+    </div>
+  );
+}
+
 function App(){
   const [tab,setTab]=useState("survey");
   const [theme,setTheme]=useState("dark");
@@ -1452,13 +1610,55 @@ function App(){
   const [plants,setPlants]=useState(DEFAULT_PLANTS.map((n)=>({id:n,name:n})));
   const [user,setUser]=useState(null);
   const [showLogin,setShowLogin]=useState(false);
-  const isAdmin=!!user;
+  // role state
+  const [isSuperAdmin,setIsSuperAdmin]=useState(false);
+  const [myManagedEntry,setMyManagedEntry]=useState(null);  // my own record from managedUsers
+  const [managedUsers,setManagedUsers]=useState([]);         // all managed users (superadmin only)
+  const isLoggedIn=!!user;
 
-  useEffect(()=>{const u=firebase.auth().onAuthStateChanged((u)=>{setUser(u);if(u)setShowLogin(false);else setTab("survey");});return u;},[]);
+  /* ── Auth ── */
+  useEffect(()=>{
+    const unsub=firebase.auth().onAuthStateChanged(u=>{
+      setUser(u);
+      if(!u){setTab("survey");setIsSuperAdmin(false);setMyManagedEntry(null);}
+    });
+    return unsub;
+  },[]);
   useEffect(()=>{try{const s=localStorage.getItem(THEME_KEY);if(s)setTheme(s);}catch(e){};},[]);
 
-  // Public reads
-  const dbListen=(path,setter)=>useEffect(()=>{const ref=firebase.database().ref(path);const h=(s)=>setter(s.val()||"");ref.on("value",h);return()=>ref.off("value",h);},[]);
+  /* ── Superadmin check (read from Firebase) ── */
+  useEffect(()=>{
+    if(!user)return;
+    const ref=firebase.database().ref(`${CONFIG_SUPERADMINS_PATH}/${user.uid}`);
+    const h=s=>setIsSuperAdmin(!!s.val());
+    ref.on("value",h);return()=>ref.off("value",h);
+  },[user]);
+
+  /* ── My own managed-user entry (for plant restrictions) ── */
+  useEffect(()=>{
+    if(!user)return;
+    const ref=firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${user.uid}`);
+    const h=s=>setMyManagedEntry(s.val()||null);
+    ref.on("value",h);return()=>ref.off("value",h);
+  },[user]);
+
+  /* ── All managed users (superadmin only) ── */
+  useEffect(()=>{
+    if(!user||!isSuperAdmin)return;
+    const ref=firebase.database().ref(CONFIG_MANAGED_USERS_PATH);
+    const h=s=>{const v=s.val();setManagedUsers(v?Object.values(v):[]);};
+    ref.on("value",h);return()=>ref.off("value",h);
+  },[user,isSuperAdmin]);
+
+  /* ── Plants allowed for current user ── */
+  const myAllowedPlants=useMemo(()=>{
+    if(!user||isSuperAdmin)return null;          // superadmin sees all
+    if(!myManagedEntry)return null;              // unknown managed user → see all
+    const arr=myManagedEntry.plants||[];
+    return arr.length?arr:null;                  // empty array → all plants
+  },[user,isSuperAdmin,myManagedEntry]);
+
+  /* ── Public reads ── */
   useEffect(()=>{const ref=firebase.database().ref(SETTINGS_SURVEY_URL_PATH);const h=(s)=>setSurveyUrl(s.val()||"");ref.on("value",h);return()=>ref.off("value",h);},[]);
   useEffect(()=>{const ref=firebase.database().ref(SETTINGS_LOGO_PATH);const h=(s)=>setLogoUrl(s.val()||"");ref.on("value",h);return()=>ref.off("value",h);},[]);
   useEffect(()=>{const ref=firebase.database().ref(SETTINGS_COMPANY_NAME_PATH);const h=(s)=>setCompanyName(s.val()||DEFAULT_COMPANY_NAME);ref.on("value",h);return()=>ref.off("value",h);},[]);
@@ -1468,10 +1668,10 @@ function App(){
   useEffect(()=>{const ref=firebase.database().ref(CONFIG_SHIFTS_PATH);const h=(s)=>{const v=s.val();if(v)setShifts(Object.entries(v).map(([id,x])=>({id,name:x.name})));};ref.on("value",h);return()=>ref.off("value",h);},[]);
   useEffect(()=>{const ref=firebase.database().ref(CONFIG_PLANTS_PATH);const h=(s)=>{const v=s.val();if(v)setPlants(Object.entries(v).map(([id,x])=>({id,name:x.name})));};ref.on("value",h);return()=>ref.off("value",h);},[]);
 
-  // Auth-only: read responses
+  /* ── Auth-only: responses ── */
   useEffect(()=>{if(!user){setResponses([]);return;}const ref=firebase.database().ref(RESPONSES_PATH);const h=(s)=>{const v=s.val();setResponses(v?Object.entries(v).map(([k,x])=>({...x,id:k})):[]);};ref.on("value",h);return()=>ref.off("value",h);},[user]);
 
-  // Seed defaults when admin first logs in
+  /* ── Seed defaults on first login ── */
   useEffect(()=>{
     if(!user)return;
     [[CONFIG_DEPARTMENTS_PATH,DEFAULT_DEPTS],[CONFIG_SHIFTS_PATH,DEFAULT_SHIFTS],[CONFIG_PLANTS_PATH,DEFAULT_PLANTS]].forEach(([path,defaults])=>{
@@ -1480,13 +1680,8 @@ function App(){
     });
   },[user]);
 
-  // PUBLIC write — no auth needed; Firebase rules must allow write to interdept2/responses
-  const handleSubmit=useCallback(async(payload)=>{
-    await firebase.database().ref(RESPONSES_PATH+"/"+payload.id).set(payload);
-  },[]);
-
+  const handleSubmit=useCallback(async(payload)=>{await firebase.database().ref(RESPONSES_PATH+"/"+payload.id).set(payload);},[]);
   const toggleTheme=()=>{const n=theme==="dark"?"light":"dark";setTheme(n);try{localStorage.setItem(THEME_KEY,n);}catch(e){};};
-
   const saveSurveyUrl       =async(v)=>await firebase.database().ref(SETTINGS_SURVEY_URL_PATH).set(v);
   const saveCompanyName     =async(v)=>await firebase.database().ref(SETTINGS_COMPANY_NAME_PATH).set(v);
   const saveLogo            =async(v)=>await firebase.database().ref(SETTINGS_LOGO_PATH).set(v);
@@ -1506,6 +1701,17 @@ function App(){
   const deptNames=departments.map((d)=>d.name);
   const shiftNames=shifts.map((s)=>s.name);
   const plantNames=plants.map((p)=>p.name);
+
+  // Dashboard props: filter to allowed plants
+  const dashPlantNames=myAllowedPlants||plantNames;
+  const dashResponses=myAllowedPlants?responses.filter(r=>myAllowedPlants.includes(r.plant)):responses;
+
+  // Role badge
+  const roleBadge=isSuperAdmin
+    ?<span style={{fontSize:10,fontWeight:700,letterSpacing:"1px",textTransform:"uppercase",background:"linear-gradient(135deg,#9B6BD1,#6366F1)",color:"#fff",padding:"4px 10px",borderRadius:999,flexShrink:0}}>Superadmin</span>
+    :isLoggedIn
+      ?<span style={{fontSize:10,fontWeight:700,letterSpacing:"1px",textTransform:"uppercase",background:"var(--bg-tab)",color:"#3E8FB0",border:"1px solid #3E8FB0",padding:"4px 10px",borderRadius:999,flexShrink:0}}>User</span>
+      :null;
 
   return(<div className="app-root" data-theme={theme}>
     <style>{`
@@ -1681,15 +1887,22 @@ function App(){
           <div><div className="brand">{companyName}</div><div className="brand-sub">Inter-Dept Satisfaction</div></div>
         </div>
         <div className="tabs">
-          {isAdmin&&(<>
+          {isLoggedIn&&(<>
             <button className={"tab-btn"+(tab==="survey"?" active":"")} onClick={()=>setTab("survey")}>Take Survey</button>
             <button className={"tab-btn"+(tab==="dashboard"?" active":"")} onClick={()=>setTab("dashboard")}>Dashboard</button>
             <button className={"tab-btn"+(tab==="poster"?" active":"")} onClick={()=>setTab("poster")}>QR Poster</button>
-            <button className={"tab-btn"+(tab==="settings"?" active":"")} onClick={()=>setTab("settings")}>Settings</button>
+            {/* Users tab — superadmin sees full mgmt, regular user sees their plant access */}
+            <button className={"tab-btn"+(tab==="users"?" active":"")} onClick={()=>setTab("users")}>
+              {isSuperAdmin?"Users":"My Access"}
+            </button>
+            {/* Settings — superadmin only */}
+            {isSuperAdmin&&<button className={"tab-btn"+(tab==="settings"?" active":"")} onClick={()=>setTab("settings")}>Settings</button>}
           </>)}
           <button className="theme-toggle" onClick={toggleTheme}>{theme==="dark"?"Light mode":"Dark mode"}</button>
-          {isAdmin?<button className="theme-toggle" onClick={handleLogout}>Log out</button>
-            :<button className="admin-gear-btn" onClick={()=>setShowLogin((v)=>!v)} title="Admin login" aria-label="Admin login">
+          {roleBadge}
+          {isLoggedIn
+            ?<button className="theme-toggle" onClick={handleLogout}>Log out</button>
+            :<button className="admin-gear-btn" onClick={()=>setShowLogin((v)=>!v)} title="Login" aria-label="Login">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
               </svg>
@@ -1697,23 +1910,59 @@ function App(){
           }
         </div>
       </div>
-      {!isAdmin&&showLogin&&<div style={{padding:"0 1.5rem 1rem"}}><AdminLogin onCancel={()=>setShowLogin(false)}/></div>}
+      {!isLoggedIn&&showLogin&&<div style={{padding:"0 1.5rem 1rem"}}><AdminLogin onCancel={()=>setShowLogin(false)}/></div>}
       <HazardBar/>
     </div>
 
     <div className="content">
-      {(tab==="survey"||!isAdmin)&&(<>
+      {(tab==="survey"||!isLoggedIn)&&(<>
         {ratingGuidelines&&(
           <div className="guidelines-banner">
             <div className="guidelines-banner-label">📋 Rating Guidelines</div>
             <div className="guidelines-banner-text">{ratingGuidelines}</div>
           </div>
         )}
-        <SurveyForm onSubmit={handleSubmit} logoUrl={logoUrl} plants={plantNames} departments={deptNames} shifts={shiftNames} ratingGuidelines={ratingGuidelines} isAdmin={isAdmin} onAddDummyEntry={addDummyEntry} validUntil={validUntil}/>
+        <SurveyForm onSubmit={handleSubmit} logoUrl={logoUrl} plants={plantNames} departments={deptNames} shifts={shiftNames} ratingGuidelines={ratingGuidelines} isAdmin={isSuperAdmin} onAddDummyEntry={addDummyEntry} validUntil={validUntil}/>
       </>)}
-      {tab==="dashboard"&&isAdmin&&<Dashboard responses={responses} theme={theme} plants={plantNames} departments={deptNames} shifts={shiftNames} companyName={companyName} logoUrl={logoUrl} onDeleteResponses={deleteResponses} onAddDummyEntry={addDummyEntry}/>}
-      {tab==="poster"&&isAdmin&&<QRPoster surveyUrl={surveyUrl} logoUrl={logoUrl} companyName={companyName} onGoSettings={()=>setTab("settings")}/>}
-      {tab==="settings"&&isAdmin&&<SettingsPanel surveyUrl={surveyUrl} onSaveUrl={saveSurveyUrl} logoUrl={logoUrl} onSaveLogo={saveLogo} onRemoveLogo={removeLogo} companyName={companyName} onSaveCompanyName={saveCompanyName} ratingGuidelines={ratingGuidelines} onSaveGuidelines={saveGuidelines} validUntil={validUntil} onSaveValidUntil={saveValidUntil} plants={plants} onAddPlant={addPlant} onDeletePlant={deletePlant} departments={departments} onAddDepartment={addDepartment} onDeleteDepartment={deleteDepartment} shifts={shifts} onAddShift={addShift} onDeleteShift={deleteShift}/>}
+      {tab==="dashboard"&&isLoggedIn&&(
+        <Dashboard
+          responses={dashResponses}
+          theme={theme}
+          plants={dashPlantNames}
+          departments={deptNames}
+          shifts={shiftNames}
+          companyName={companyName}
+          logoUrl={logoUrl}
+          onDeleteResponses={isSuperAdmin?deleteResponses:null}
+          onAddDummyEntry={isSuperAdmin?addDummyEntry:null}
+        />
+      )}
+      {tab==="poster"&&isLoggedIn&&<QRPoster surveyUrl={surveyUrl} logoUrl={logoUrl} companyName={companyName} onGoSettings={isSuperAdmin?()=>setTab("settings"):null}/>}
+      {tab==="users"&&isLoggedIn&&(
+        isSuperAdmin
+          ?<UsersPanel plants={plants} managedUsers={managedUsers} currentUserUid={user.uid}/>
+          :<div className="panel" style={{maxWidth:560}}>
+            <div className="panel-title">My Plant Access</div>
+            <p style={{color:"var(--text-secondary)",fontSize:14,marginBottom:16,lineHeight:1.6}}>
+              You are logged in as <strong style={{color:"var(--text-primary)"}}>{user.email}</strong>.
+            </p>
+            {myAllowedPlants
+              ?<>
+                <p style={{color:"var(--text-secondary)",fontSize:13,marginBottom:12}}>You have access to the following plant(s):</p>
+                <div style={{display:"flex",flexWrap:"wrap",gap:10}}>
+                  {myAllowedPlants.map(p=>(
+                    <span key={p} style={{background:"linear-gradient(135deg,#6366F1,#3E8FB0)",color:"#fff",padding:"8px 20px",borderRadius:999,fontWeight:700,fontSize:14}}>{p}</span>
+                  ))}
+                </div>
+              </>
+              :<p style={{color:"var(--text-secondary)",fontSize:14}}>You have access to <strong style={{color:"var(--text-primary)"}}>all plants</strong>.</p>
+            }
+            <p style={{color:"var(--text-tertiary)",fontSize:12,marginTop:16}}>Contact a Superadmin to change your plant access.</p>
+          </div>
+      )}
+      {tab==="settings"&&isLoggedIn&&isSuperAdmin&&(
+        <SettingsPanel surveyUrl={surveyUrl} onSaveUrl={saveSurveyUrl} logoUrl={logoUrl} onSaveLogo={saveLogo} onRemoveLogo={removeLogo} companyName={companyName} onSaveCompanyName={saveCompanyName} ratingGuidelines={ratingGuidelines} onSaveGuidelines={saveGuidelines} validUntil={validUntil} onSaveValidUntil={saveValidUntil} plants={plants} onAddPlant={addPlant} onDeletePlant={deletePlant} departments={departments} onAddDepartment={addDepartment} onDeleteDepartment={deleteDepartment} shifts={shifts} onAddShift={addShift} onDeleteShift={deleteShift}/>
+      )}
     </div>
   </div>);
 }
