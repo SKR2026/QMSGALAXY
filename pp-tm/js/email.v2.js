@@ -88,6 +88,7 @@ export async function sendDispatchEmail(dispatch, user) {
       ewayBill:         dispatch.ewayBill || "",
       remarks:          dispatch.remarks || "",
       dispatchedByName: user.name,
+      senderEmail:      user.email || "",   // ← auto-CC the dispatcher
     },
   });
 }
@@ -115,6 +116,7 @@ export async function sendReceiptEmail(dispatch, receipt, user) {
       qtyReceived:     receipt.qtyReceived,
       receiptRemarks:  receipt.receiptRemarks || "",
       receivedByName:  user.name,
+      receiverEmail:   user.email || "",    // ← auto-CC the receiver
     },
   });
 }
