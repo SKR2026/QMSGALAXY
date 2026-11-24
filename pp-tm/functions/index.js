@@ -153,13 +153,25 @@ exports.sendPtmsEmail = onCall(async (request) => {
     throw new HttpsError("invalid-argument", `Unknown email type: ${type}`);
   }
 
+  // ── Auto-add acting user emails to CC ─────────────────────
+  // senderEmail  = dispatcher's email (passed on dispatch events)
+  // receiverEmail = receiver's email  (passed on receipt events)
+  // Both are automatically CC'd so the acting user always gets
+  // a copy — without needing to be in the fixed settings list.
+  const autoCC = [];
+  if (dispatchData.senderEmail)   autoCC.push(dispatchData.senderEmail);
+  if (receiptData  && receiptData.receiverEmail) autoCC.push(receiptData.receiverEmail);
+
   // ── Validate recipients ───────────────────────────────────
   const toList = (cfg.to || []).filter(Boolean);
-  const ccList = (cfg.cc || []).filter(Boolean);
-  if (toList.length === 0) {
+  const ccList = [...new Set([...(cfg.cc || []), ...autoCC])].filter(Boolean);
+  if (toList.length === 0 && ccList.length === 0) {
     console.log(`No recipients configured for type "${type}" — skipping email.`);
     return { sent: false, reason: "No recipients configured" };
   }
+  // If only autoCCs exist (no fixed TO), promote first autoCC to TO
+  const finalTo  = toList.length ? toList : [autoCC[0]];
+  const finalCC  = toList.length ? ccList : ccList.filter(e => e !== autoCC[0]);
 
   // ── Send via Gmail ────────────────────────────────────────
   const transporter = await createTransporter();
@@ -168,14 +180,14 @@ exports.sendPtmsEmail = onCall(async (request) => {
 
   const mailOptions = {
     from:    `"PTMS Notifications" <${gmailUser}>`,
-    to:      toList.join(", "),
-    cc:      ccList.length ? ccList.join(", ") : undefined,
+    to:      finalTo.join(", "),
+    cc:      finalCC.length ? finalCC.join(", ") : undefined,
     subject,
     html:    htmlBody,
   };
 
   await transporter.sendMail(mailOptions);
-  console.log(`✅ Email sent [${type}] to: ${toList.join(", ")}`);
+  console.log(`✅ Email sent [${type}] to: ${finalTo.join(", ")}${finalCC.length ? " | cc: " + finalCC.join(", ") : ""}`);
   return { sent: true };
 });
 
