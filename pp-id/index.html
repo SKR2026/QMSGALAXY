@@ -1848,6 +1848,437 @@ function UsersPanel({plants,managedUsers,currentUserUid}){
   );
 }
 
+// ══════════════════════════════════════════════════════════════
+//  AIAnalysisPanel  —  client-side summarised analysis of survey data
+// ══════════════════════════════════════════════════════════════
+function AIAnalysisPanel({responses,departments,plants,shifts,theme}){
+  const ct=CHART_THEME[theme]||CHART_THEME.dark;
+
+  // ── compute all metrics ──────────────────────────────────────
+  const analysis=useMemo(()=>{
+    if(!responses.length) return null;
+
+    // Flatten ratings
+    const flatRows=[];
+    responses.forEach(r=>{
+      Object.entries(r.deptRatings||{}).forEach(([dept,info])=>{
+        const score=deptOverallScore(info);
+        flatRows.push({...r,ratedDept:dept,rating:score,factors:info.factors||{},comment:info.comment||""});
+      });
+    });
+    if(!flatRows.length) return null;
+
+    const rated=flatRows.filter(r=>r.rating>0);
+    const overall=rated.reduce((s,r)=>s+r.rating,0)/rated.length;
+
+    // Dept averages
+    const deptMap={};
+    rated.forEach(r=>{
+      if(!deptMap[r.ratedDept])deptMap[r.ratedDept]={total:0,count:0,factors:{}};
+      deptMap[r.ratedDept].total+=r.rating;
+      deptMap[r.ratedDept].count+=1;
+      DEPT_FACTORS.forEach(f=>{
+        const v=r.factors[f.id];
+        if(v>0){
+          if(!deptMap[r.ratedDept].factors[f.id])deptMap[r.ratedDept].factors[f.id]=[];
+          deptMap[r.ratedDept].factors[f.id].push(v);
+        }
+      });
+    });
+    const deptStats=Object.entries(deptMap).map(([name,d])=>{
+      const avg=d.total/d.count;
+      const factorAvgs={};
+      DEPT_FACTORS.forEach(f=>{
+        const arr=d.factors[f.id]||[];
+        factorAvgs[f.id]=arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0;
+      });
+      const weakestFactor=DEPT_FACTORS.filter(f=>factorAvgs[f.id]>0).sort((a,b)=>factorAvgs[a.id]-factorAvgs[b.id])[0];
+      const strongestFactor=DEPT_FACTORS.filter(f=>factorAvgs[f.id]>0).sort((a,b)=>factorAvgs[b.id]-factorAvgs[a.id])[0];
+      return{name,avg,count:d.count,factorAvgs,weakestFactor,strongestFactor};
+    }).sort((a,b)=>b.avg-a.avg);
+
+    const top3=deptStats.slice(0,3);
+    const bottom3=[...deptStats].sort((a,b)=>a.avg-b.avg).slice(0,3);
+
+    // Cross-dept bias: which dept is the harshest / most generous rater
+    const raterMap={};
+    rated.forEach(r=>{
+      if(!raterMap[r.submitterDept])raterMap[r.submitterDept]={total:0,count:0};
+      raterMap[r.submitterDept].total+=r.rating;
+      raterMap[r.submitterDept].count+=1;
+    });
+    const raterStats=Object.entries(raterMap).map(([dept,d])=>({dept,avg:d.total/d.count,count:d.count})).sort((a,b)=>a.avg-b.avg);
+    const harshestRater=raterStats[0];
+    const generousRater=raterStats[raterStats.length-1];
+
+    // Tenure distribution
+    const tenureMap={};
+    responses.forEach(r=>{if(r.tenure)tenureMap[r.tenure]=(tenureMap[r.tenure]||0)+1;});
+    const dominantTenure=TENURE_OPTIONS.filter(k=>tenureMap[k]).sort((a,b)=>(tenureMap[b]||0)-(tenureMap[a]||0))[0];
+
+    // Factor weaknesses across all depts
+    const globalFactorMap={};
+    rated.forEach(r=>{
+      DEPT_FACTORS.forEach(f=>{
+        const v=r.factors[f.id];
+        if(v>0){if(!globalFactorMap[f.id])globalFactorMap[f.id]=[];globalFactorMap[f.id].push(v);}
+      });
+    });
+    const globalFactorAvgs=DEPT_FACTORS.map(f=>{
+      const arr=globalFactorMap[f.id]||[];
+      return{...f,avg:arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0};
+    }).filter(f=>f.avg>0).sort((a,b)=>a.avg-b.avg);
+
+    // Comment sentiment proxy: collect comments
+    const allComments=flatRows.filter(r=>r.comment.trim().length>0);
+
+    // Participation
+    const uniqueEmps=new Set(responses.map(r=>r.employeeCode).filter(Boolean)).size;
+    const totalSubs=responses.length;
+
+    // Trend: monthly averages
+    const monthMap={};
+    rated.forEach(r=>{
+      const d=new Date(r.ts);
+      const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+      if(!monthMap[key])monthMap[key]={total:0,count:0};
+      monthMap[key].total+=r.rating;monthMap[key].count+=1;
+    });
+    const monthlyTrend=Object.entries(monthMap).sort(([a],[b])=>a.localeCompare(b)).map(([k,d])=>({month:k,avg:d.total/d.count}));
+    const trendDir=monthlyTrend.length>=2
+      ?(monthlyTrend[monthlyTrend.length-1].avg>monthlyTrend[0].avg?"improving":"declining")
+      :"insufficient data";
+
+    // Response rate by shift
+    const shiftMap={};
+    responses.forEach(r=>{if(r.shift)shiftMap[r.shift]=(shiftMap[r.shift]||0)+1;});
+
+    return{
+      overall,totalSubs,uniqueEmps,deptStats,top3,bottom3,
+      raterStats,harshestRater,generousRater,
+      dominantTenure,tenureMap,
+      globalFactorAvgs,allComments,
+      monthlyTrend,trendDir,shiftMap,flatRows,rated
+    };
+  },[responses]);
+
+  if(!responses.length){
+    return(
+      <div className="panel" style={{textAlign:"center",padding:"3rem 2rem"}}>
+        <div style={{fontSize:48,marginBottom:12}}>🤖</div>
+        <div className="panel-title" style={{fontSize:16,color:"var(--text-primary)"}}>AI Analysis</div>
+        <p style={{color:"var(--text-secondary)",maxWidth:400,margin:"0 auto",lineHeight:1.6}}>
+          No survey responses yet. Once employees submit ratings, the AI will generate a comprehensive analysis of your inter-department satisfaction data.
+        </p>
+      </div>
+    );
+  }
+
+  const {overall,totalSubs,uniqueEmps,deptStats,top3,bottom3,
+         raterStats,harshestRater,generousRater,
+         dominantTenure,tenureMap,globalFactorAvgs,allComments,
+         monthlyTrend,trendDir,shiftMap,flatRows,rated}=analysis;
+
+  const scoreLabel=(v)=>v>=4.5?"Excellent":v>=4?"Good":v>=3?"Neutral":v>=2?"Below Average":"Poor";
+  const scoreColor=(v)=>v>=4?"#4C9A6A":v>=3?"#F5B400":"#E8552D";
+  const Arrow=({dir})=>dir==="improving"?<span style={{color:"#4C9A6A"}}>↑ Improving</span>:dir==="declining"?<span style={{color:"#E8552D"}}>↓ Declining</span>:<span style={{color:"#F5B400"}}>→ Stable</span>;
+
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:20}}>
+
+      {/* ── Executive Summary ── */}
+      <div className="panel" style={{border:"2px solid #6366F1"}}>
+        <div className="panel-title" style={{color:"#6366F1",fontSize:16,marginBottom:20}}>🤖 AI Analysis Summary</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:16,marginBottom:24}}>
+          {[
+            {label:"Overall Score",value:fmt1(overall)+"/5",sub:scoreLabel(overall),color:scoreColor(overall)},
+            {label:"Total Submissions",value:totalSubs,sub:`${uniqueEmps} unique employees`,color:"#3E8FB0"},
+            {label:"Departments Rated",value:deptStats.length,sub:`of ${departments.length} configured`,color:"#9B6BD1"},
+            {label:"Satisfaction Trend",value:trendDir==="improving"?"↑":trendDir==="declining"?"↓":"→",sub:trendDir,color:trendDir==="improving"?"#4C9A6A":trendDir==="declining"?"#E8552D":"#F5B400"},
+          ].map((k,i)=>(
+            <div key={i} style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"16px 20px"}}>
+              <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.8px",color:"var(--text-secondary)",marginBottom:6}}>{k.label}</div>
+              <div style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,fontSize:28,color:k.color,lineHeight:1.1}}>{k.value}</div>
+              <div style={{fontSize:12,color:"var(--text-tertiary)",marginTop:4}}>{k.sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* AI narrative */}
+        <div style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"18px 20px",lineHeight:1.75,fontSize:14,color:"var(--text-primary)"}}>
+          <p style={{margin:"0 0 10px"}}>
+            <strong>Overall Health:</strong> The organisation's inter-department satisfaction score is <strong style={{color:scoreColor(overall)}}>{fmt1(overall)}/5</strong> ({scoreLabel(overall)}), based on <strong>{rated.length}</strong> ratings from <strong>{totalSubs}</strong> submissions by <strong>{uniqueEmps}</strong> unique employee{uniqueEmps!==1?"s":""}.
+            {overall>=4?" This is a strong result, reflecting healthy cross-functional collaboration.":overall>=3?" There is room for improvement in several areas highlighted below.":" Immediate attention to inter-department relations is recommended."}
+          </p>
+          {deptStats.length>0&&(
+            <p style={{margin:"0 0 10px"}}>
+              <strong>Top Performer:</strong> <span style={{color:"#4C9A6A",fontWeight:600}}>{top3[0].name}</span> leads with an average of <strong>{fmt1(top3[0].avg)}/5</strong> ({top3[0].count} rating{top3[0].count!==1?"s":""}).
+              {top3[0].strongestFactor?" Its strongest dimension is "+top3[0].strongestFactor.icon+" "+top3[0].strongestFactor.label+".":""}
+            </p>
+          )}
+          {bottom3.length>0&&bottom3[0].avg<3.5&&(
+            <p style={{margin:"0 0 10px"}}>
+              <strong>Needs Attention:</strong> <span style={{color:"#E8552D",fontWeight:600}}>{bottom3[0].name}</span> has the lowest score at <strong>{fmt1(bottom3[0].avg)}/5</strong>.
+              {bottom3[0].weakestFactor?" The weakest factor is "+bottom3[0].weakestFactor.icon+" "+bottom3[0].weakestFactor.label+", which should be prioritised in improvement plans.":""}
+            </p>
+          )}
+          {globalFactorAvgs.length>0&&(
+            <p style={{margin:"0 0 10px"}}>
+              <strong>Organisation-wide Weakness:</strong> <strong style={{color:"#F5B400"}}>{globalFactorAvgs[0].icon} {globalFactorAvgs[0].label}</strong> is the lowest-rated factor across all departments (avg {fmt1(globalFactorAvgs[0].avg)}/5). Focus organisation-wide initiatives here first.
+            </p>
+          )}
+          {monthlyTrend.length>=2&&(
+            <p style={{margin:0}}>
+              <strong>Trend:</strong> Satisfaction is <Arrow dir={trendDir}/> — from {fmt1(monthlyTrend[0].avg)} in {monthlyTrend[0].month} to {fmt1(monthlyTrend[monthlyTrend.length-1].avg)} in {monthlyTrend[monthlyTrend.length-1].month}.
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* ── Department Leaderboard ── */}
+      <div className="panel">
+        <div className="panel-title">🏆 Department Leaderboard</div>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:520}}>
+            <thead>
+              <tr>
+                {["Rank","Department","Score","Ratings","Strongest Dimension","Weakest Dimension","Assessment"].map((h,i)=>(
+                  <th key={i} style={{textAlign:i===0||i===2||i===3?"center":"left",padding:"8px 10px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {deptStats.map((d,i)=>(
+                <tr key={d.name} style={{background:i%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
+                  <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:i===0?"#F5B400":i===1?"#8A93A8":i===2?"#C87941":"var(--text-tertiary)",fontSize:16}}>
+                    {i===0?"🥇":i===1?"🥈":i===2?"🥉":i+1}
+                  </td>
+                  <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontWeight:600,color:"var(--text-primary)"}}>{d.name}</td>
+                  <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)"}}>
+                    <span style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,fontSize:16,color:scoreColor(d.avg)}}>{fmt1(d.avg)}</span>
+                    <span style={{fontSize:11,color:"var(--text-tertiary)"}}>/5</span>
+                  </td>
+                  <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{d.count}</td>
+                  <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontSize:12,color:"#4C9A6A"}}>{d.strongestFactor?d.strongestFactor.icon+" "+d.strongestFactor.label:"—"}</td>
+                  <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontSize:12,color:"#E8552D"}}>{d.weakestFactor?d.weakestFactor.icon+" "+d.weakestFactor.label:"—"}</td>
+                  <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontSize:12,color:scoreColor(d.avg)}}>{scoreLabel(d.avg)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── Factor Heatmap ── */}
+      <div className="panel">
+        <div className="panel-title">🔥 Factor Heatmap — Organisational Weak Spots</div>
+        <p style={{color:"var(--text-secondary)",fontSize:13,marginBottom:16,lineHeight:1.6}}>Average score per factor across all departments. Lower scores (red) indicate areas that need organisation-wide attention.</p>
+        <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+          {globalFactorAvgs.map((f,i)=>(
+            <div key={f.id} style={{flex:"1 1 160px",background:"var(--bg-page)",border:`2px solid ${scoreColor(f.avg)}`,borderRadius:10,padding:"14px 18px",position:"relative"}}>
+              {i===0&&<div style={{position:"absolute",top:8,right:10,fontSize:10,fontWeight:700,textTransform:"uppercase",background:"#E8552D",color:"#fff",padding:"2px 7px",borderRadius:999}}>Lowest</div>}
+              {i===globalFactorAvgs.length-1&&<div style={{position:"absolute",top:8,right:10,fontSize:10,fontWeight:700,textTransform:"uppercase",background:"#4C9A6A",color:"#fff",padding:"2px 7px",borderRadius:999}}>Highest</div>}
+              <div style={{fontSize:24,marginBottom:6}}>{f.icon}</div>
+              <div style={{fontSize:12,fontWeight:600,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:6}}>{f.label}</div>
+              <div style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,fontSize:28,color:scoreColor(f.avg)}}>{fmt1(f.avg)}</div>
+              <div style={{fontSize:11,color:"var(--text-tertiary)"}}>/ 5.0</div>
+              <div style={{marginTop:10,height:5,background:"var(--panel-border)",borderRadius:3}}>
+                <div style={{width:`${((f.avg-1)/4)*100}%`,height:5,background:scoreColor(f.avg),borderRadius:3,transition:"width 0.4s"}}/>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Rating Behaviour ── */}
+      <div className="panel">
+        <div className="panel-title">⚖️ Rating Behaviour by Department</div>
+        <p style={{color:"var(--text-secondary)",fontSize:13,marginBottom:16,lineHeight:1.6}}>How generous or critical each department is when rating others. Significant gaps may indicate departmental bias.</p>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:400}}>
+            <thead>
+              <tr>
+                {["Department (as Rater)","Avg Rating Given","Submissions","Tendency"].map((h,i)=>(
+                  <th key={i} style={{textAlign:i>0?"center":"left",padding:"8px 10px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[...raterStats].sort((a,b)=>b.avg-a.avg).map((r,i)=>{
+                const globalDiff=r.avg-overall;
+                const tendency=globalDiff>0.3?"Generous":globalDiff<-0.3?"Critical":"Balanced";
+                const tCol=tendency==="Generous"?"#4C9A6A":tendency==="Critical"?"#E8552D":"#F5B400";
+                return(
+                  <tr key={r.dept} style={{background:i%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
+                    <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontWeight:600,color:"var(--text-primary)"}}>{r.dept}</td>
+                    <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)"}}>
+                      <span style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:scoreColor(r.avg)}}>{fmt1(r.avg)}</span>
+                      <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{globalDiff>=0?" (+"+fmt1(globalDiff)+")":"("+fmt1(globalDiff)+")"}</span>
+                    </td>
+                    <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontFamily:"'IBM Plex Mono',monospace",color:"var(--text-secondary)"}}>{r.count}</td>
+                    <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)"}}>
+                      <span style={{background:tCol+"22",color:tCol,border:`1px solid ${tCol}`,borderRadius:999,padding:"3px 12px",fontWeight:700,fontSize:11,textTransform:"uppercase"}}>{tendency}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {harshestRater&&generousRater&&harshestRater.dept!==generousRater.dept&&(
+          <div style={{marginTop:16,display:"flex",gap:12,flexWrap:"wrap"}}>
+            <div style={{flex:1,minWidth:220,background:"#E8552D11",border:"1px solid #E8552D44",borderRadius:8,padding:"12px 16px"}}>
+              <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",color:"#E8552D",marginBottom:4}}>Most Critical Rater</div>
+              <div style={{fontWeight:700,color:"var(--text-primary)",fontSize:15}}>{harshestRater.dept}</div>
+              <div style={{fontSize:12,color:"var(--text-secondary)"}}>Avg given: {fmt1(harshestRater.avg)}/5</div>
+            </div>
+            <div style={{flex:1,minWidth:220,background:"#4C9A6A11",border:"1px solid #4C9A6A44",borderRadius:8,padding:"12px 16px"}}>
+              <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",color:"#4C9A6A",marginBottom:4}}>Most Generous Rater</div>
+              <div style={{fontWeight:700,color:"var(--text-primary)",fontSize:15}}>{generousRater.dept}</div>
+              <div style={{fontSize:12,color:"var(--text-secondary)"}}>Avg given: {fmt1(generousRater.avg)}/5</div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Recommendations ── */}
+      <div className="panel" style={{border:"2px solid #9B6BD1"}}>
+        <div className="panel-title" style={{color:"#9B6BD1"}}>💡 AI Recommendations</div>
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          {bottom3.filter(d=>d.avg<3.8).map((d,i)=>(
+            <div key={d.name} style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#E8552D22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>⚠️</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>{d.name} — Score {fmt1(d.avg)}/5</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>
+                  {d.weakestFactor
+                    ?`Focus improvement on ${d.weakestFactor.icon} ${d.weakestFactor.label} (avg ${fmt1(d.factorAvgs[d.weakestFactor.id])}/5). Consider cross-functional workshops or dedicated feedback sessions between ${d.name} and the departments that rated them lowest.`
+                    :`Schedule structured improvement workshops for ${d.name} to address the low satisfaction scores. Gather qualitative feedback to identify specific pain points.`}
+                </div>
+              </div>
+            </div>
+          ))}
+          {globalFactorAvgs.length>0&&globalFactorAvgs[0].avg<3.5&&(
+            <div style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#F5B40022",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>📌</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>Organisation-wide: {globalFactorAvgs[0].icon} {globalFactorAvgs[0].label}</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>
+                  This is the lowest-scoring dimension across all departments (avg {fmt1(globalFactorAvgs[0].avg)}/5). An organisation-wide initiative — such as communication training, shared SLAs, or a cross-team responsiveness charter — could yield broad improvements.
+                </div>
+              </div>
+            </div>
+          )}
+          {trendDir==="declining"&&(
+            <div style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#E8552D22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>📉</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>Declining Trend Detected</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>Satisfaction scores have been declining over the tracked period. Review recent operational changes, process disruptions or staffing changes that may have affected cross-department collaboration.</div>
+              </div>
+            </div>
+          )}
+          {top3.length>0&&(
+            <div style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#4C9A6A22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>✅</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>Leverage Best Practices from {top3[0].name}</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>
+                  {top3[0].name} scores highest at {fmt1(top3[0].avg)}/5.{top3[0].strongestFactor?" Particularly strong in "+top3[0].strongestFactor.icon+" "+top3[0].strongestFactor.label+".":" "} Document and share their working practices as internal best practices for other departments to adopt.
+                </div>
+              </div>
+            </div>
+          )}
+          {allComments.length>=5&&(
+            <div style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#3E8FB022",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>💬</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>Qualitative Feedback Available</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>
+                  {allComments.length} written comments have been collected. Review the Recent Comments section in the Dashboard for specific qualitative insights that may reveal themes not captured by ratings alone.
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Participation Analysis ── */}
+      <div className="panel">
+        <div className="panel-title">📊 Participation & Demographics</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:16}}>
+          {/* Shift breakdown */}
+          {Object.keys(shiftMap).length>0&&(
+            <div style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px"}}>
+              <div style={{fontSize:12,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",marginBottom:12}}>By Shift</div>
+              {Object.entries(shiftMap).sort((a,b)=>b[1]-a[1]).map(([shift,count])=>{
+                const pct=Math.round(count/totalSubs*100);
+                return(
+                  <div key={shift} style={{marginBottom:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:3}}>
+                      <span style={{color:"var(--text-primary)",fontWeight:500}}>{shift}</span>
+                      <span style={{color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{count} ({pct}%)</span>
+                    </div>
+                    <div style={{height:5,background:"var(--panel-border)",borderRadius:3}}>
+                      <div style={{width:`${pct}%`,height:5,background:"#3E8FB0",borderRadius:3}}/>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {/* Tenure breakdown */}
+          {Object.keys(tenureMap).length>0&&(
+            <div style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px"}}>
+              <div style={{fontSize:12,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",marginBottom:12}}>By Tenure</div>
+              {TENURE_OPTIONS.filter(k=>tenureMap[k]).map(k=>{
+                const count=tenureMap[k];const pct=Math.round(count/totalSubs*100);
+                return(
+                  <div key={k} style={{marginBottom:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:3}}>
+                      <span style={{color:"var(--text-primary)",fontWeight:500}}>{k}</span>
+                      <span style={{color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{count} ({pct}%)</span>
+                    </div>
+                    <div style={{height:5,background:"var(--panel-border)",borderRadius:3}}>
+                      <div style={{width:`${pct}%`,height:5,background:TENURE_COLORS[k]||"#6366F1",borderRadius:3}}/>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {/* Score distribution */}
+          {(()=>{
+            const dist={1:0,2:0,3:0,4:0,5:0};
+            rated.forEach(r=>{const b=Math.min(5,Math.max(1,Math.round(r.rating)));dist[b]=(dist[b]||0)+1;});
+            const total=rated.length;
+            return(
+              <div style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px"}}>
+                <div style={{fontSize:12,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",marginBottom:12}}>Score Distribution</div>
+                {[5,4,3,2,1].map(v=>{
+                  const count=dist[v]||0;const pct=total?Math.round(count/total*100):0;
+                  return(
+                    <div key={v} style={{marginBottom:10}}>
+                      <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:3}}>
+                        <span style={{color:"var(--text-primary)"}}>{"★".repeat(v)} {v}</span>
+                        <span style={{color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{count} ({pct}%)</span>
+                      </div>
+                      <div style={{height:5,background:"var(--panel-border)",borderRadius:3}}>
+                        <div style={{width:`${pct}%`,height:5,background:scoreColor(v),borderRadius:3}}/>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
 function App(){
   const [tab,setTab]=useState("survey");
   const [theme,setTheme]=useState("dark");
@@ -2186,6 +2617,7 @@ function App(){
               {isSuperAdmin?"Users":"My Access"}
             </button>
             {/* Settings — superadmin only */}
+            <button className={"tab-btn"+(tab==="ai"?" active":"")} onClick={()=>setTab("ai")} style={tab==="ai"?{}:{background:"linear-gradient(135deg,rgba(155,107,209,0.12),rgba(99,102,241,0.12))",border:"1px solid rgba(155,107,209,0.4)",color:"#9B6BD1"}}>🤖 AI Analysis</button>
             {isSuperAdmin&&<button className={"tab-btn"+(tab==="settings"?" active":"")} onClick={()=>setTab("settings")}>Settings</button>}
           </>)}
           <button className="theme-toggle" onClick={toggleTheme}>{theme==="dark"?"Light mode":"Dark mode"}</button>
@@ -2249,6 +2681,15 @@ function App(){
             }
             <p style={{color:"var(--text-tertiary)",fontSize:12,marginTop:16}}>Contact a Superadmin to change your plant access.</p>
           </div>
+      )}
+      {tab==="ai"&&isLoggedIn&&(
+        <AIAnalysisPanel
+          responses={dashResponses}
+          departments={deptNames}
+          plants={dashPlantNames}
+          shifts={shiftNames}
+          theme={theme}
+        />
       )}
       {tab==="settings"&&isLoggedIn&&isSuperAdmin&&(
         <SettingsPanel surveyUrl={surveyUrl} onSaveUrl={saveSurveyUrl} logoUrl={logoUrl} onSaveLogo={saveLogo} onRemoveLogo={removeLogo} companyName={companyName} onSaveCompanyName={saveCompanyName} ratingGuidelines={ratingGuidelines} onSaveGuidelines={saveGuidelines} validUntil={validUntil} onSaveValidUntil={saveValidUntil} plants={plants} onAddPlant={addPlant} onDeletePlant={deletePlant} departments={departments} onAddDepartment={addDepartment} onDeleteDepartment={deleteDepartment} shifts={shifts} onAddShift={addShift} onDeleteShift={deleteShift}/>
