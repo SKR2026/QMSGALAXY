@@ -18,6 +18,8 @@
 <script src="https://unpkg.com/recharts@2/umd/Recharts.js"></script>
 <script src="https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script src="https://unpkg.com/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script>window.XLSX=window.XLSX||XLSX;</script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
 <body>
@@ -306,7 +308,7 @@ function MiniStarRating({ value, onChange }) {
   );
 }
 
-function SurveyForm({onSubmit,logoUrl,plants,departments,shifts,ratingGuidelines,isAdmin,onAddDummyEntry,validUntil}){
+function SurveyForm({onSubmit,logoUrl,plants,departments,shifts,ratingGuidelines,isAdmin,onAddDummyEntry,validUntil,existingResponses}){
   const [step,setStep]=useState(1);
   const [plant,setPlant]=useState(plants.length===1?plants[0]:"");
   const [myDept,setMyDept]=useState("");
@@ -395,13 +397,30 @@ function SurveyForm({onSubmit,logoUrl,plants,departments,shifts,ratingGuidelines
   };
 
   const handleNext=()=>{
+    if(!empCode.trim()){setError("Employee Code is required.");return;}
     if((plants.length>1&&!plant)||!myDept||!shift||!tenure){setError("Please fill in all fields before continuing.");return;}
     setError("");setStep(2);window.scrollTo(0,0);
   };
 
   const handleSubmit=async()=>{
+    if(!empCode.trim()){setError("Employee Code is required.");setStep(1);window.scrollTo(0,0);return;}
     const rated=ratableDepts.filter((d)=>ratings[d]&&ratings[d].factors&&DEPT_FACTORS.some(f=>ratings[d].factors[f.id]>0));
     if(!rated.length){setError("Please rate at least one factor for at least one department before submitting.");return;}
+    // Single-entry-per-month check
+    const now=new Date();
+    const curYear=now.getFullYear();const curMonth=now.getMonth();
+    const normalCode=empCode.trim().toUpperCase();
+    const duplicate=(existingResponses||[]).find(r=>{
+      if(!r.employeeCode)return false;
+      if(r.employeeCode.toUpperCase()!==normalCode)return false;
+      const rDate=new Date(r.ts);
+      return rDate.getFullYear()===curYear&&rDate.getMonth()===curMonth&&!r._isDummy;
+    });
+    if(duplicate){
+      const monthName=now.toLocaleString("default",{month:"long"});
+      setError(`Employee Code "${empCode.trim()}" has already submitted a response for ${monthName} ${curYear}. Only one submission per employee per month is allowed.`);
+      return;
+    }
     setError("");setSaving(true);
     const payload={
       id:`r-${Date.now()}-${Math.floor(Math.random()*10000)}`,
@@ -478,7 +497,7 @@ function SurveyForm({onSubmit,logoUrl,plants,departments,shifts,ratingGuidelines
           <h2 className="form-title">Inter-Department Satisfaction</h2>
           <p className="form-sub">Step 1 of 2 — Enter your details. Your own department will be excluded from ratings.</p>
           <div className="field-row">
-            <div className="field"><label>Employee Code (optional)</label><input className="name-input" placeholder="e.g. EMP1043" value={empCode} onChange={(e)=>setEmpCode(e.target.value)}/></div>
+            <div className="field"><label>Employee Code <span style={{color:"#E8552D"}}>*</span></label><input className="name-input" placeholder="e.g. EMP1043" value={empCode} onChange={(e)=>setEmpCode(e.target.value)}/></div>
             <div className="field"><label>Employee Name (optional)</label><input className="name-input" placeholder="Your name" value={empName} onChange={(e)=>setEmpName(e.target.value)}/></div>
           </div>
           <div className="field-row">
@@ -543,6 +562,7 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
   const [bulkBusy,setBulkBusy]=useState(false);
   const [bulkErr,setBulkErr]=useState("");
   const [expBusy,setExpBusy]=useState(false);
+  const [expXlsBusy,setExpXlsBusy]=useState(false);
   const [dummyBusy,setDummyBusy]=useState(false);
   const [dummyCount,setDummyCount]=useState(0);
   const ct=CHART_THEME[theme]||CHART_THEME.dark;
@@ -1102,6 +1122,33 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
         y=doc.lastAutoTable.finalY+6;
       }
 
+      // ── Department-wise Participation ───────────────────────
+      {
+        const deptPartPdf={};
+        filteredResponses.forEach(r=>{
+          const d=r.submitterDept;if(!d)return;
+          if(!deptPartPdf[d]){deptPartPdf[d]={dept:d,count:0,empCodes:new Set()};}
+          deptPartPdf[d].count+=1;
+          if(r.employeeCode)deptPartPdf[d].empCodes.add(r.employeeCode.toUpperCase());
+        });
+        const partRows=Object.values(deptPartPdf).sort((a,b)=>b.count-a.count);
+        const partTotal=partRows.reduce((s,r)=>s+r.count,0);
+        if(partRows.length){
+          sectionHead("Department-wise Participation");
+          if(y>pageH-40){doc.addPage();y=margin;}
+          doc.autoTable({
+            startY:y,
+            head:[["Department","Submissions","Unique Employees","Share %"]],
+            body:partRows.map(r=>[r.dept,r.count,r.empCodes.size,partTotal?`${Math.round(r.count/partTotal*100)}%`:"0%"]),
+            styles:{fontSize:8,cellPadding:3},
+            headStyles:{fillColor:[99,102,241],textColor:255,fontStyle:"bold",fontSize:8},
+            columnStyles:{1:{halign:"center"},2:{halign:"center"},3:{halign:"center"}},
+            margin:{left:margin,right:margin},
+          });
+          y=doc.lastAutoTable.finalY+6;
+        }
+      }
+
       // ── Trend ─────────────────────────────────────────────────
       if(trendData.length>1){
         sectionHead("Rating Trend (Weekly Average)");
@@ -1205,6 +1252,83 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
     setExpBusy(false);
   };
 
+  const handleExportExcel=()=>{
+    if(!window.XLSX){setBulkErr("Excel library not loaded yet. Please wait a moment and try again.");return;}
+    setExpXlsBusy(true);
+    try{
+      const XLSX=window.XLSX;
+      const wb=XLSX.utils.book_new();
+      const dateStr=new Date().toISOString().slice(0,10);
+
+      // ── Sheet 1: All Responses ────────────────────────────
+      const respHeader=["Date","Plant","Emp Code","Emp Name","From Dept","Rated Dept","Collaboration","Communication","Responsiveness","Quality of Work","Support & Helpfulness","Avg Rating","Comment","Shift","Tenure"];
+      const respBody=filtered.map(r=>[
+        new Date(r.ts).toLocaleDateString(),
+        r.plant||"",r.employeeCode||"",r.employeeName||"",
+        r.submitterDept,r.ratedDept,
+        r.factors&&r.factors.collaboration||"",
+        r.factors&&r.factors.communication||"",
+        r.factors&&r.factors.responsiveness||"",
+        r.factors&&r.factors.quality_of_work||"",
+        r.factors&&r.factors.support_helpfulness||"",
+        r.rating?parseFloat(fmt1(r.rating)):"",
+        r.comment||"",r.shift,r.tenure||"",
+      ]);
+      const wsResp=XLSX.utils.aoa_to_sheet([respHeader,...respBody]);
+      wsResp["!cols"]=[{wch:12},{wch:14},{wch:12},{wch:18},{wch:20},{wch:20},{wch:14},{wch:14},{wch:14},{wch:14},{wch:18},{wch:11},{wch:36},{wch:10},{wch:10}];
+      XLSX.utils.book_append_sheet(wb,wsResp,"All Responses");
+
+      // ── Sheet 2: Dept Summary ─────────────────────────────
+      const dSorted=[...deptData].sort((a,b)=>b.score-a.score);
+      const deptHeader=["Department","Avg Rating","Ratings Count"];
+      const deptBody=dSorted.map(d=>[d.name,parseFloat(fmt1(d.score)),d.count]);
+      const wsDept=XLSX.utils.aoa_to_sheet([deptHeader,...deptBody]);
+      wsDept["!cols"]=[{wch:24},{wch:12},{wch:14}];
+      XLSX.utils.book_append_sheet(wb,wsDept,"Dept Rating Summary");
+
+      // ── Sheet 3: Factor Breakdown ─────────────────────────
+      const fbHeader=["Department",...DEPT_FACTORS.map(f=>f.label),"Overall"];
+      const pdfFa={};
+      filtered.forEach(r=>{
+        if(!r.factors||!Object.keys(r.factors).length)return;
+        if(!pdfFa[r.ratedDept])pdfFa[r.ratedDept]={};
+        DEPT_FACTORS.forEach(f=>{
+          const v=r.factors[f.id];
+          if(v>0){if(!pdfFa[r.ratedDept][f.id])pdfFa[r.ratedDept][f.id]=[];pdfFa[r.ratedDept][f.id].push(v);}
+        });
+      });
+      const fbBody=Object.keys(pdfFa).sort().map(dept=>{
+        const fm=pdfFa[dept];
+        const vals=DEPT_FACTORS.map(f=>{const arr=fm[f.id]||[];return arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0;});
+        const nonZero=vals.filter(v=>v>0);
+        const ov=nonZero.length?nonZero.reduce((a,b)=>a+b,0)/nonZero.length:0;
+        return[dept,...vals.map(v=>v>0?parseFloat(fmt1(v)):""),ov>0?parseFloat(fmt1(ov)):""];
+      });
+      const wsFb=XLSX.utils.aoa_to_sheet([fbHeader,...fbBody]);
+      wsFb["!cols"]=[{wch:24},...DEPT_FACTORS.map(()=>({wch:18})),{wch:10}];
+      XLSX.utils.book_append_sheet(wb,wsFb,"Factor Breakdown");
+
+      // ── Sheet 4: Dept-wise Participation ─────────────────
+      const deptPartXls={};
+      filteredResponses.forEach(r=>{
+        const d=r.submitterDept;if(!d)return;
+        if(!deptPartXls[d]){deptPartXls[d]={dept:d,count:0,empCodes:new Set()};}
+        deptPartXls[d].count+=1;
+        if(r.employeeCode)deptPartXls[d].empCodes.add(r.employeeCode.toUpperCase());
+      });
+      const partRowsXls=Object.values(deptPartXls).sort((a,b)=>b.count-a.count);
+      const partTotalXls=partRowsXls.reduce((s,r)=>s+r.count,0);
+      const partHeader=["Department","Submissions","Unique Employees","Share %"];
+      const partBody=partRowsXls.map(r=>[r.dept,r.count,r.empCodes.size,partTotalXls?parseFloat((r.count/partTotalXls*100).toFixed(1)):0]);
+      const wsPart=XLSX.utils.aoa_to_sheet([partHeader,...partBody]);
+      wsPart["!cols"]=[{wch:24},{wch:14},{wch:18},{wch:10}];
+      XLSX.utils.book_append_sheet(wb,wsPart,"Dept Participation");
+
+      XLSX.writeFile(wb,`inter-dept-satisfaction-${dateStr}.xlsx`);
+    }catch(e){console.error("Excel export failed:",e);setBulkErr((e&&e.message)||String(e));}
+    setExpXlsBusy(false);
+  };
+
   return(
     <div className="dash-grid">
       {plants.length>1&&<div className="plant-pill-bar">{<button className={"plant-pill"+(pf===ALL_PLANTS_ID?" active":"")} onClick={()=>setPf(ALL_PLANTS_ID)}>All Plants</button>}{plants.map((p)=><button key={p} className={"plant-pill"+(pf===p?" active":"")} onClick={()=>setPf(p)}>{p}</button>)}</div>}
@@ -1222,6 +1346,7 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
           {dummyCount>0&&<span style={{fontSize:12,color:"#9B6BD1",fontWeight:600}}>{dummyCount} dummy entr{dummyCount===1?"y":"ies"} added this session</span>}
         </div>
         <button className="submit-btn small-btn" style={{background:"#3E8FB0"}} onClick={handleExportPdf} disabled={expBusy||!flatRows.length}>{expBusy?"…":"Export PDF"}</button>
+        <button className="submit-btn small-btn" style={{background:"#4C9A6A"}} onClick={handleExportExcel} disabled={expXlsBusy||!flatRows.length}>{expXlsBusy?"…":"Export Excel"}</button>
       </div>
       <div className="filter-bar">
         <div className="filter-field"><label>Rated Department</label><select value={rf} onChange={(e)=>setRf(e.target.value)}><option value="All">All departments</option>{ratedOpts.map((d)=><option key={d} value={d}>{d}</option>)}</select></div>
@@ -1323,6 +1448,58 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
         </div>
       )}
 
+      {/* ── Department-wise Participation ── */}
+      {(()=>{
+        const deptPart={};
+        filteredResponses.forEach(r=>{
+          const d=r.submitterDept;
+          if(!d)return;
+          if(!deptPart[d]){deptPart[d]={dept:d,count:0,empCodes:new Set()};}
+          deptPart[d].count+=1;
+          if(r.employeeCode)deptPart[d].empCodes.add(r.employeeCode.toUpperCase());
+        });
+        const rows=Object.values(deptPart).sort((a,b)=>b.count-a.count);
+        const total=rows.reduce((s,r)=>s+r.count,0);
+        if(!rows.length)return null;
+        return(
+          <div className="panel dash-full">
+            <div className="panel-title">Department-wise Participation</div>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:400}}>
+                <thead>
+                  <tr>
+                    <th style={{textAlign:"left",padding:"8px 12px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:160}}>Department</th>
+                    <th style={{textAlign:"center",padding:"8px 10px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.4px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:100}}>Submissions</th>
+                    <th style={{textAlign:"center",padding:"8px 10px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.4px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:100}}>Unique Employees</th>
+                    <th style={{textAlign:"left",padding:"8px 10px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.4px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)"}}>Share</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r,di)=>{
+                    const pct=total?Math.round(r.count/total*100):0;
+                    return(
+                      <tr key={r.dept} style={{background:di%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
+                        <td style={{padding:"10px 12px",fontWeight:600,color:"var(--text-primary)",borderBottom:"1px solid var(--panel-border)"}}>{r.dept}</td>
+                        <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#3E8FB0"}}>{r.count}</td>
+                        <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#4C9A6A"}}>{r.empCodes.size}</td>
+                        <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",minWidth:160}}>
+                          <div style={{display:"flex",alignItems:"center",gap:8}}>
+                            <div style={{flex:1,background:"var(--panel-border)",borderRadius:3,height:6}}>
+                              <div style={{width:`${pct}%`,background:"linear-gradient(90deg,#6366F1,#3E8FB0)",borderRadius:3,height:6}}/>
+                            </div>
+                            <span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:12,color:"var(--text-secondary)",minWidth:36}}>{pct}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
+
       <div className="panel">
         <div className="panel-title">Rating Trend (Weekly Average)</div>
         {trendData.length>1?(<ResponsiveContainer width="100%" height={220}>
@@ -1346,6 +1523,7 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
           <div className="panel-title" style={{marginBottom:0}}>All Responses</div>
           <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
             <button className="submit-btn small-btn" style={{background:"#3E8FB0"}} onClick={handleExportPdf} disabled={expBusy||!flatRows.length}>{expBusy?"…":"Export PDF"}</button>
+            <button className="submit-btn small-btn" style={{background:"#4C9A6A"}} onClick={handleExportExcel} disabled={expXlsBusy||!flatRows.length}>{expXlsBusy?"…":"Export Excel"}</button>
             <button className="submit-btn small-btn" style={{background:"#E8552D"}} onClick={handleDel} disabled={bulkBusy||!selCount}>{bulkBusy?"…":`Delete Selected (${selCount})`}</button>
           </div>
         </div>
@@ -2034,7 +2212,7 @@ function App(){
             <div className="guidelines-banner-text">{ratingGuidelines}</div>
           </div>
         )}
-        <SurveyForm onSubmit={handleSubmit} logoUrl={logoUrl} plants={plantNames} departments={deptNames} shifts={shiftNames} ratingGuidelines={ratingGuidelines} isAdmin={isSuperAdmin} onAddDummyEntry={addDummyEntry} validUntil={validUntil}/>
+        <SurveyForm onSubmit={handleSubmit} logoUrl={logoUrl} plants={plantNames} departments={deptNames} shifts={shiftNames} ratingGuidelines={ratingGuidelines} isAdmin={isSuperAdmin} onAddDummyEntry={addDummyEntry} validUntil={validUntil} existingResponses={responses}/>
       </>)}
       {tab==="dashboard"&&isLoggedIn&&(
         <Dashboard
