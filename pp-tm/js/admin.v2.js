@@ -387,7 +387,6 @@ async function createUser(backdrop) {
   saveBtn.textContent = "Creating…";
 
   try {
-    // ── Call Cloud Function (uses Admin SDK — no permission issues) ──
     const createPtmsUser = httpsCallable(fns, "createPtmsUser");
     await createPtmsUser({ name, email, password: pwd, role, plantId: plantId || null });
 
@@ -396,7 +395,6 @@ async function createUser(backdrop) {
     const wrap = document.querySelector("#usersTableWrap");
     if (wrap) await loadUsersTable(wrap);
   } catch (e) {
-    // HttpsError surfaces as e.message; raw Firebase errors as e.message too
     showErr(e?.message || "Failed to create user.");
     saveBtn.disabled = false;
     saveBtn.textContent = "Create User";
@@ -418,11 +416,176 @@ window.toggleUser = async (userId, currentlyActive) => {
 };
 
 // ══════════════════════════════════════════════════════════════
-//  EMAIL SETTINGS TAB
+//  EMAIL SETTINGS TAB  –  chip / tag input UI
 // ══════════════════════════════════════════════════════════════
+
+// ── Shared state for the chip UI ──────────────────────────────
+// chipState holds the live arrays while the user edits.
+// Populated from Firestore on load; flushed to Firestore on save.
+let chipState = {
+  onDispatch:    { to: [], cc: [] },
+  onReceipt:     { to: [], cc: [] },
+  onDiscrepancy: { to: [], cc: [] },
+};
+
+function normaliseArray(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) return val.map(v => String(v).trim()).filter(Boolean);
+  // Legacy semicolon/comma string stored before this update
+  return String(val).split(/[,;]+/).map(v => v.trim()).filter(Boolean);
+}
+
+function isValidEmail(e) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim());
+}
+
+// ── Chip CSS (injected once) ──────────────────────────────────
+function injectChipStyles() {
+  if (document.getElementById("ptms-chip-styles")) return;
+  const s = document.createElement("style");
+  s.id = "ptms-chip-styles";
+  s.textContent = `
+    .chip-box {
+      display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+      min-height:42px; border:1.5px solid #d1d5db; border-radius:10px;
+      padding:6px 8px; background:#fff; cursor:text; transition:border-color .2s;
+    }
+    .chip-box:focus-within { border-color:#3b82f6; box-shadow:0 0 0 3px rgba(59,130,246,.12); }
+    .chip-tag {
+      display:inline-flex; align-items:center; gap:5px;
+      background:#eff6ff; color:#1d4ed8; border:1px solid #bfdbfe;
+      border-radius:50px; padding:3px 10px 3px 12px;
+      font-size:12.5px; font-weight:500; white-space:nowrap; max-width:280px;
+    }
+    .chip-tag span { overflow:hidden; text-overflow:ellipsis; }
+    .chip-tag button {
+      background:none; border:none; cursor:pointer; color:#93c5fd;
+      font-size:14px; line-height:1; padding:0; display:flex; align-items:center;
+      transition:color .15s;
+    }
+    .chip-tag button:hover { color:#1d4ed8; }
+    .chip-input {
+      border:none; outline:none; font-size:13px; color:#1f2937;
+      flex:1; min-width:160px; background:transparent; padding:2px 4px;
+    }
+    .chip-input::placeholder { color:#9ca3af; }
+    .chip-add-btn {
+      background:#eff6ff; color:#1d4ed8; border:1.5px solid #bfdbfe;
+      border-radius:7px; padding:4px 11px; font-size:12px; font-weight:600;
+      cursor:pointer; white-space:nowrap; flex-shrink:0; transition:background .15s;
+    }
+    .chip-add-btn:hover { background:#dbeafe; }
+    .chip-hint { font-size:11.5px; color:#ef4444; min-height:16px; margin-top:3px; }
+    .chip-note { font-size:11.5px; color:#6b7280; margin-top:3px; line-height:1.4; }
+  `;
+  document.head.appendChild(s);
+}
+
+// ── Render one chip-input field ───────────────────────────────
+function renderChipField(container, eventKey, field, labelText, hint) {
+  const wrap = container.querySelector(`[data-chip="${eventKey}-${field}"]`);
+  if (!wrap) return;
+  const chips = chipState[eventKey][field];
+
+  wrap.innerHTML = `
+    <div class="chip-box" id="cb-${eventKey}-${field}">
+      ${chips.map(email => `
+        <span class="chip-tag">
+          <span title="${email}">${email}</span>
+          <button type="button"
+            data-remove-event="${eventKey}"
+            data-remove-field="${field}"
+            data-remove-email="${email}"
+            aria-label="Remove ${email}">✕</button>
+        </span>`).join("")}
+      <input class="chip-input"
+        id="ci-${eventKey}-${field}"
+        type="email" multiple
+        placeholder="name@company.com"
+        autocomplete="off">
+      <button class="chip-add-btn"
+        data-add-event="${eventKey}"
+        data-add-field="${field}">+ Add</button>
+    </div>
+    <div class="chip-hint" id="ch-${eventKey}-${field}"></div>
+  `;
+
+  // Click on box → focus input
+  wrap.querySelector(`#cb-${eventKey}-${field}`)
+    .addEventListener("click", ev => {
+      if (!ev.target.closest(".chip-tag") && !ev.target.closest(".chip-add-btn"))
+        wrap.querySelector(`#ci-${eventKey}-${field}`).focus();
+    });
+
+  // Remove chip
+  wrap.querySelectorAll("[data-remove-email]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const { removeEvent, removeField, removeEmail } = btn.dataset;
+      chipState[removeEvent][removeField] =
+        chipState[removeEvent][removeField].filter(e => e !== removeEmail);
+      renderChipField(container, removeEvent, removeField);
+    });
+  });
+
+  // Add button
+  wrap.querySelector(`[data-add-event="${eventKey}"][data-add-field="${field}"]`)
+    .addEventListener("click", () => tryAddChip(container, eventKey, field));
+
+  // Enter / comma key
+  wrap.querySelector(`#ci-${eventKey}-${field}`)
+    .addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === ",") {
+        e.preventDefault();
+        tryAddChip(container, eventKey, field);
+      }
+      // Clear hint on typing
+      if (e.key !== "Enter") {
+        container.querySelector(`#ch-${eventKey}-${field}`).textContent = "";
+      }
+    });
+}
+
+function tryAddChip(container, eventKey, field) {
+  const input = container.querySelector(`#ci-${eventKey}-${field}`);
+  const hint  = container.querySelector(`#ch-${eventKey}-${field}`);
+  const raw   = (input?.value || "").trim();
+  if (!raw) return;
+
+  const parts   = raw.split(/[,;\s]+/).map(e => e.trim()).filter(Boolean);
+  const invalid = parts.filter(e => !isValidEmail(e));
+  if (invalid.length) {
+    hint.textContent = `Invalid: ${invalid.join(", ")}`;
+    return;
+  }
+
+  const existing = chipState[eventKey][field];
+  chipState[eventKey][field] = [...new Set([...existing, ...parts])];
+  renderChipField(container, eventKey, field);
+  // Restore focus after re-render
+  container.querySelector(`#ci-${eventKey}-${field}`)?.focus();
+}
+
+// ── Main renderEmailTab ───────────────────────────────────────
 async function renderEmailTab(el) {
+  injectChipStyles();
   await loadEmailConfig();
   const cfg = getEmailConfig();
+
+  // Seed chipState from Firestore (handle legacy string values)
+  chipState = {
+    onDispatch: {
+      to: normaliseArray(cfg.onDispatch?.to),
+      cc: normaliseArray(cfg.onDispatch?.cc),
+    },
+    onReceipt: {
+      to: normaliseArray(cfg.onReceipt?.to),
+      cc: normaliseArray(cfg.onReceipt?.cc),
+    },
+    onDiscrepancy: {
+      to: normaliseArray(cfg.onDiscrepancy?.to),
+      cc: normaliseArray(cfg.onDiscrepancy?.cc),
+    },
+  };
 
   el.innerHTML = `
     <div class="card section">
@@ -430,8 +593,11 @@ async function renderEmailTab(el) {
       <div class="card-body">
         <p class="text-muted mb-2" style="font-size:.88rem;line-height:1.6">
           Emails are sent via <strong>Gmail SMTP</strong> using your 16-digit App Password,
-          securely stored in Firebase Cloud Functions (never in the browser).
-          Configure who receives each notification type below — separate multiple addresses with commas.
+          securely stored in Firebase Cloud Functions (never in the browser).<br>
+          <strong>Plant contact</strong> emails are added automatically from each plant's profile —
+          add extra recipients below.
+          Press <kbd style="background:#f3f4f6;border:1px solid #d1d5db;border-radius:4px;padding:1px 5px;font-size:11px">Enter</kbd>
+          or click <strong>+ Add</strong> after typing an address.
         </p>
 
         <!-- On Dispatch -->
@@ -440,16 +606,12 @@ async function renderEmailTab(el) {
           <div class="card-body">
             <div class="form-row">
               <div class="form-group">
-                <label>To (required recipients)</label>
-                <input type="text" id="eDispTo"
-                  placeholder="manager@company.com, logistics@company.com"
-                  value="${(cfg.onDispatch?.to || []).join(", ")}">
+                <label>To <span style="font-weight:400;color:#9ca3af;font-size:.8rem">(required recipients)</span></label>
+                <div data-chip="onDispatch-to"></div>
               </div>
               <div class="form-group">
-                <label>CC (optional)</label>
-                <input type="text" id="eDispCc"
-                  placeholder="gm@company.com"
-                  value="${(cfg.onDispatch?.cc || []).join(", ")}">
+                <label>CC <span style="font-weight:400;color:#9ca3af;font-size:.8rem">(optional)</span></label>
+                <div data-chip="onDispatch-cc"></div>
               </div>
             </div>
           </div>
@@ -462,15 +624,11 @@ async function renderEmailTab(el) {
             <div class="form-row">
               <div class="form-group">
                 <label>To</label>
-                <input type="text" id="eRecvTo"
-                  placeholder="manager@company.com"
-                  value="${(cfg.onReceipt?.to || []).join(", ")}">
+                <div data-chip="onReceipt-to"></div>
               </div>
               <div class="form-group">
                 <label>CC</label>
-                <input type="text" id="eRecvCc"
-                  placeholder=""
-                  value="${(cfg.onReceipt?.cc || []).join(", ")}">
+                <div data-chip="onReceipt-cc"></div>
               </div>
             </div>
           </div>
@@ -482,23 +640,18 @@ async function renderEmailTab(el) {
           <div class="card-body">
             <div class="form-row">
               <div class="form-group">
-                <label>To (escalation recipients)</label>
-                <input type="text" id="eDiscTo"
-                  placeholder="gm@company.com, quality@company.com"
-                  value="${(cfg.onDiscrepancy?.to || []).join(", ")}">
+                <label>To <span style="font-weight:400;color:#9ca3af;font-size:.8rem">(escalation recipients)</span></label>
+                <div data-chip="onDiscrepancy-to"></div>
               </div>
               <div class="form-group">
                 <label>CC</label>
-                <input type="text" id="eDiscCc"
-                  placeholder="manager@company.com"
-                  value="${(cfg.onDiscrepancy?.cc || []).join(", ")}">
+                <div data-chip="onDiscrepancy-cc"></div>
               </div>
             </div>
           </div>
         </div>
 
-        <div id="emailSaveStatus" class="hidden"></div>
-        <div style="display:flex;gap:.75rem;flex-wrap:wrap">
+        <div style="display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;margin-top:.5rem">
           <button class="btn btn-primary" id="saveEmailCfgBtn">💾 Save Email Settings</button>
           <button class="btn btn-outline" id="testEmailBtn">🧪 Send Test Email</button>
         </div>
@@ -541,31 +694,43 @@ async function renderEmailTab(el) {
     </div>
   `;
 
+  // Render all chip fields
+  const fields = [
+    ["onDispatch",    "to"], ["onDispatch",    "cc"],
+    ["onReceipt",     "to"], ["onReceipt",     "cc"],
+    ["onDiscrepancy", "to"], ["onDiscrepancy", "cc"],
+  ];
+  fields.forEach(([ev, f]) => renderChipField(el, ev, f));
+
+  // ── Save ───────────────────────────────────────────────────
   el.querySelector("#saveEmailCfgBtn").addEventListener("click", async () => {
-    const parseEmails = id => el.querySelector(id).value
-      .split(",").map(e => e.trim()).filter(Boolean);
-
-    const config = {
-      onDispatch:    { to: parseEmails("#eDispTo"), cc: parseEmails("#eDispCc") },
-      onReceipt:     { to: parseEmails("#eRecvTo"), cc: parseEmails("#eRecvCc") },
-      onDiscrepancy: { to: parseEmails("#eDiscTo"), cc: parseEmails("#eDiscCc") },
-    };
-
+    const btn = el.querySelector("#saveEmailCfgBtn");
+    btn.disabled = true;
+    btn.textContent = "Saving…";
     try {
-      await saveEmailConfig(config);
+      await saveEmailConfig({
+        onDispatch:    { to: chipState.onDispatch.to,    cc: chipState.onDispatch.cc    },
+        onReceipt:     { to: chipState.onReceipt.to,     cc: chipState.onReceipt.cc     },
+        onDiscrepancy: { to: chipState.onDiscrepancy.to, cc: chipState.onDiscrepancy.cc },
+      });
       window.showToast("Email settings saved.", "success");
     } catch (e) {
       window.showToast("Error saving: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "💾 Save Email Settings";
     }
   });
 
+  // ── Test email ─────────────────────────────────────────────
   el.querySelector("#testEmailBtn").addEventListener("click", async () => {
-    const { sendDispatchEmail } = await import("./email.js");
+    const { sendDispatchEmail } = await import("./email.v2.js");
     const result = await sendDispatchEmail({
       dispatchId:    "PTMS-TEST-00001",
       date:          new Date().toISOString().slice(0,10),
       fromPlantName: "Plant A (Test)",
       toPlantName:   "Plant B (Test)",
+      toPlantId:     null,
       material:      "Test Material",
       qtyDispatched: 100,
       unit:          "Kg",
@@ -592,7 +757,6 @@ async function renderEmailTab(el) {
 //  GMAIL CREDENTIALS TAB
 // ══════════════════════════════════════════════════════════════
 async function renderGmailTab(el) {
-  // Load existing config (show user/pass already saved if any)
   let savedUser = "";
   try {
     const snap = await getDoc(doc(db, "settings", "gmailConfig"));
@@ -702,7 +866,7 @@ async function renderGmailTab(el) {
 
   const statusEl = el.querySelector("#gmailSaveStatus");
 
-  // ── Load existing logo URL into preview ───────────────────────
+  // ── Load existing logo URL ────────────────────────────────
   try {
     const bSnap = await getDoc(doc(db, "settings", "branding"));
     if (bSnap.exists() && bSnap.data().logoUrl) {
@@ -713,7 +877,7 @@ async function renderGmailTab(el) {
     }
   } catch (_) {}
 
-  // ── Logo: file select → preview + enable upload btn ──────────
+  // ── Logo file select ──────────────────────────────────────
   let _logoFile = null;
   const logoInfo    = el.querySelector("#logoUploadStatus");
   const logoUpBtn   = el.querySelector("#logoUploadBtn");
@@ -731,7 +895,6 @@ async function renderGmailTab(el) {
       return;
     }
     _logoFile = file;
-    // Show local preview immediately
     const reader = new FileReader();
     reader.onload = (ev) => {
       logoPreview.src = ev.target.result;
@@ -744,25 +907,17 @@ async function renderGmailTab(el) {
     logoUpBtn.disabled = false;
   });
 
-  // ── Upload button ─────────────────────────────────────────────
   logoUpBtn.addEventListener("click", async () => {
     if (!_logoFile) return;
     logoUpBtn.disabled = true;
     logoUpBtn.textContent = "Uploading…";
-    logoInfo.style.cssText = "";
-    logoInfo.textContent = "";
     try {
       const storage = getStorage(app);
       const storageRef = ref(storage, "branding/logo.png");
       await uploadBytes(storageRef, _logoFile, { contentType: _logoFile.type });
       const url = await getDownloadURL(storageRef);
-
-      // Persist URL to Firestore so app reads it on load
       await setDoc(doc(db, "settings", "branding"), { logoUrl: url, updatedAt: serverTimestamp() }, { merge: true });
-
-      // Update live logos across the page immediately
       if (window.applyLogoUrl) window.applyLogoUrl(url);
-
       logoInfo.style.cssText = "color:var(--success);font-weight:500";
       logoInfo.textContent = "✅ Logo uploaded and saved successfully!";
       window.showToast("Logo updated.", "success");
@@ -776,25 +931,21 @@ async function renderGmailTab(el) {
     }
   });
 
-  // ── Remove button ─────────────────────────────────────────────
   logoRemBtn.addEventListener("click", async () => {
-    if (!confirm("Remove the company logo? The app will show no logo until a new one is uploaded.")) return;
+    if (!confirm("Remove the company logo?")) return;
     logoRemBtn.disabled = true;
     logoRemBtn.textContent = "Removing…";
     try {
       const storage = getStorage(app);
-      try { await deleteObject(ref(storage, "branding/logo.png")); } catch (_) { /* may not exist */ }
+      try { await deleteObject(ref(storage, "branding/logo.png")); } catch (_) {}
       await setDoc(doc(db, "settings", "branding"), { logoUrl: "", updatedAt: serverTimestamp() }, { merge: true });
-
       logoPreview.src = "";
       logoPreview.style.display = "none";
       logoNone.style.display = "block";
-      // Hide live logos on page
       ["loginCompanyLogo", "sidebarCompanyLogo"].forEach(id => {
         const el2 = document.getElementById(id);
         if (el2) el2.style.display = "none";
       });
-
       logoInfo.style.cssText = "color:var(--text-mid)";
       logoInfo.textContent = "Logo removed.";
       window.showToast("Logo removed.", "info");
@@ -813,9 +964,9 @@ async function renderGmailTab(el) {
   });
 
   el.querySelector("#saveGmailBtn").addEventListener("click", async () => {
-    const user    = el.querySelector("#gmailUser").value.trim();
-    const pass    = el.querySelector("#gmailPass").value.trim();
-    const btn     = el.querySelector("#saveGmailBtn");
+    const user = el.querySelector("#gmailUser").value.trim();
+    const pass = el.querySelector("#gmailPass").value.trim();
+    const btn  = el.querySelector("#saveGmailBtn");
 
     statusEl.textContent = "";
     statusEl.style.cssText = "";
@@ -831,7 +982,7 @@ async function renderGmailTab(el) {
 
     try {
       const data = { user, updatedAt: serverTimestamp() };
-      if (pass) data.pass = pass.replace(/\s+/g, ""); // strip spaces before saving
+      if (pass) data.pass = pass.replace(/\s+/g, "");
       await setDoc(doc(db, "settings", "gmailConfig"), data, { merge: true });
       statusEl.textContent = "✅ Credentials saved successfully!";
       statusEl.style.cssText = "color:#2e7d32;padding:.5rem .75rem;background:#e8f5e9;border-radius:6px;font-weight:500";
@@ -851,12 +1002,13 @@ async function renderGmailTab(el) {
     btn.disabled = true;
     btn.textContent = "Sending…";
     try {
-      const { sendDispatchEmail } = await import("./email.js");
+      const { sendDispatchEmail } = await import("./email.v2.js");
       const result = await sendDispatchEmail({
         dispatchId: "PTMS-TEST-00001",
         date: new Date().toISOString().slice(0, 10),
         fromPlantName: "Plant A (Test)",
         toPlantName:   "Plant B (Test)",
+        toPlantId:     null,
         material:      "Test Material",
         qtyDispatched: 100, unit: "Kg", boxes: 5,
         batch: "TEST-LOT", vehicleNo: "GJ 01 AB 1234",
@@ -911,13 +1063,13 @@ export async function wipeAllData() {
   if (!confirm("⚠️ WARNING: This will permanently delete ALL dispatches and activity logs. This cannot be undone.\n\nType 'WIPE' to confirm:")) return;
   const input = prompt("Type WIPE to confirm permanent deletion:");
   if (input !== "WIPE") { alert("Cancelled."); return; }
-  
+
   const batch1 = [];
   const dispSnap = await getDocs(collection(db, "dispatches"));
   dispSnap.forEach(d => batch1.push(deleteDoc(doc(db, "dispatches", d.id))));
   const logSnap = await getDocs(collection(db, "activityLogs"));
   logSnap.forEach(d => batch1.push(deleteDoc(doc(db, "activityLogs", d.id))));
-  
+
   await Promise.all(batch1);
   alert("✅ All dispatches and logs have been wiped.");
   location.reload();

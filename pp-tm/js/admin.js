@@ -1,9 +1,9 @@
 // ─────────────────────────────────────────────────────────────
-//  PTMS – Admin Module
+//  PTMS – Admin Module (v1)
 //  Super Admin only: manage plants, manage users.
 // ─────────────────────────────────────────────────────────────
 
-import { db, auth, app } from "./firebase.js";
+import { db, auth } from "./firebase.js";
 import {
   collection, doc, getDocs, addDoc, updateDoc, deleteDoc, setDoc,
   query, orderBy, serverTimestamp, getDoc
@@ -16,7 +16,7 @@ import { requireSuperAdmin } from "./auth.js";
 import { getEmailConfig, saveEmailConfig, loadEmailConfig } from "./email.js";
 
 // ── Cloud Functions client ────────────────────────────────────
-const fns = getFunctions(app, "asia-south1");
+const fns = getFunctions(undefined, "asia-south1");
 
 // ── Entry point ───────────────────────────────────────────────
 export async function showAdminPage(container, user) {
@@ -46,7 +46,6 @@ export async function showAdminPage(container, user) {
     });
   });
 
-  // Run each tab independently so one failure doesn't block others
   await Promise.allSettled([
     renderPlantsTab(container.querySelector("#tabPlants")),
     renderUsersTab(container.querySelector("#tabUsers")),
@@ -203,7 +202,6 @@ async function savePlant(backdrop, existingId) {
       window.showToast("Plant added.", "success");
     }
     backdrop.remove();
-    // Refresh table
     const wrap = document.querySelector("#plantsTableWrap");
     if (wrap) await loadPlantsTable(wrap);
   } catch (e) {
@@ -212,7 +210,6 @@ async function savePlant(backdrop, existingId) {
   }
 }
 
-// Global handlers for inline buttons
 window.editPlant = async (plantId) => {
   const snap = await getDoc(doc(db, "plants", plantId));
   if (snap.exists()) openPlantModal(plantId, snap.data());
@@ -289,7 +286,6 @@ async function loadUsersTable(wrap) {
 }
 
 async function openUserModal() {
-  // Load plants for dropdown
   const plantSnap = await getDocs(query(collection(db, "plants"), orderBy("name")));
   let plantOptions = `<option value="">— Select Plant —</option>`;
   plantSnap.forEach(d => {
@@ -376,25 +372,22 @@ async function createUser(backdrop) {
   };
   errEl.classList.add("hidden");
 
-  if (!name || !email || !pwd)                       return showErr("All fields are required.");
-  if (pwd !== pwd2)                                  return showErr("Passwords do not match.");
-  if (pwd.length < 6)                                return showErr("Password must be at least 6 characters.");
-  if (role === "plantUser" && !plantId)              return showErr("Please assign a plant.");
+  if (!name || !email || !pwd)             return showErr("All fields are required.");
+  if (pwd !== pwd2)                        return showErr("Passwords do not match.");
+  if (pwd.length < 6)                      return showErr("Password must be at least 6 characters.");
+  if (role === "plantUser" && !plantId)    return showErr("Please assign a plant.");
 
   saveBtn.disabled = true;
   saveBtn.textContent = "Creating…";
 
   try {
-    // ── Call Cloud Function (uses Admin SDK — no permission issues) ──
     const createPtmsUser = httpsCallable(fns, "createPtmsUser");
     await createPtmsUser({ name, email, password: pwd, role, plantId: plantId || null });
-
     window.showToast("User created successfully.", "success");
     backdrop.remove();
     const wrap = document.querySelector("#usersTableWrap");
     if (wrap) await loadUsersTable(wrap);
   } catch (e) {
-    // HttpsError surfaces as e.message; raw Firebase errors as e.message too
     showErr(e?.message || "Failed to create user.");
     saveBtn.disabled = false;
     saveBtn.textContent = "Create User";
@@ -416,11 +409,167 @@ window.toggleUser = async (userId, currentlyActive) => {
 };
 
 // ══════════════════════════════════════════════════════════════
-//  EMAIL SETTINGS TAB
+//  EMAIL SETTINGS TAB  –  chip / tag input UI
 // ══════════════════════════════════════════════════════════════
+
+// ── Live edit state ───────────────────────────────────────────
+let chipState = {
+  onDispatch:    { to: [], cc: [] },
+  onReceipt:     { to: [], cc: [] },
+  onDiscrepancy: { to: [], cc: [] },
+};
+
+function normaliseArray(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) return val.map(v => String(v).trim()).filter(Boolean);
+  // Handle legacy semicolon/comma-separated strings
+  return String(val).split(/[,;]+/).map(v => v.trim()).filter(Boolean);
+}
+
+function isValidEmail(e) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim());
+}
+
+// ── Inject chip CSS once ──────────────────────────────────────
+function injectChipStyles() {
+  if (document.getElementById("ptms-chip-styles")) return;
+  const s = document.createElement("style");
+  s.id = "ptms-chip-styles";
+  s.textContent = `
+    .chip-box {
+      display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+      min-height:42px; border:1.5px solid #d1d5db; border-radius:10px;
+      padding:6px 8px; background:#fff; cursor:text; transition:border-color .2s;
+    }
+    .chip-box:focus-within { border-color:#3b82f6; box-shadow:0 0 0 3px rgba(59,130,246,.12); }
+    .chip-tag {
+      display:inline-flex; align-items:center; gap:5px;
+      background:#eff6ff; color:#1d4ed8; border:1px solid #bfdbfe;
+      border-radius:50px; padding:3px 10px 3px 12px;
+      font-size:12.5px; font-weight:500; white-space:nowrap; max-width:280px;
+    }
+    .chip-tag span { overflow:hidden; text-overflow:ellipsis; }
+    .chip-tag button {
+      background:none; border:none; cursor:pointer; color:#93c5fd;
+      font-size:14px; line-height:1; padding:0; display:flex; align-items:center;
+      transition:color .15s;
+    }
+    .chip-tag button:hover { color:#1d4ed8; }
+    .chip-input {
+      border:none; outline:none; font-size:13px; color:#1f2937;
+      flex:1; min-width:160px; background:transparent; padding:2px 4px;
+    }
+    .chip-input::placeholder { color:#9ca3af; }
+    .chip-add-btn {
+      background:#eff6ff; color:#1d4ed8; border:1.5px solid #bfdbfe;
+      border-radius:7px; padding:4px 11px; font-size:12px; font-weight:600;
+      cursor:pointer; white-space:nowrap; flex-shrink:0; transition:background .15s;
+    }
+    .chip-add-btn:hover { background:#dbeafe; }
+    .chip-hint { font-size:11.5px; color:#ef4444; min-height:16px; margin-top:3px; }
+  `;
+  document.head.appendChild(s);
+}
+
+// ── Render one chip field ─────────────────────────────────────
+function renderChipField(container, eventKey, field) {
+  const wrap = container.querySelector(`[data-chip="${eventKey}-${field}"]`);
+  if (!wrap) return;
+  const chips = chipState[eventKey][field];
+
+  wrap.innerHTML = `
+    <div class="chip-box" id="cb-${eventKey}-${field}">
+      ${chips.map(email => `
+        <span class="chip-tag">
+          <span title="${email}">${email}</span>
+          <button type="button"
+            data-remove-event="${eventKey}"
+            data-remove-field="${field}"
+            data-remove-email="${email}"
+            aria-label="Remove ${email}">✕</button>
+        </span>`).join("")}
+      <input class="chip-input"
+        id="ci-${eventKey}-${field}"
+        type="email" multiple
+        placeholder="name@company.com"
+        autocomplete="off">
+      <button class="chip-add-btn"
+        data-add-event="${eventKey}"
+        data-add-field="${field}">+ Add</button>
+    </div>
+    <div class="chip-hint" id="ch-${eventKey}-${field}"></div>
+  `;
+
+  wrap.querySelector(`#cb-${eventKey}-${field}`)
+    .addEventListener("click", ev => {
+      if (!ev.target.closest(".chip-tag") && !ev.target.closest(".chip-add-btn"))
+        wrap.querySelector(`#ci-${eventKey}-${field}`).focus();
+    });
+
+  wrap.querySelectorAll("[data-remove-email]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const { removeEvent, removeField, removeEmail } = btn.dataset;
+      chipState[removeEvent][removeField] =
+        chipState[removeEvent][removeField].filter(e => e !== removeEmail);
+      renderChipField(container, removeEvent, removeField);
+    });
+  });
+
+  wrap.querySelector(`[data-add-event="${eventKey}"][data-add-field="${field}"]`)
+    .addEventListener("click", () => tryAddChip(container, eventKey, field));
+
+  wrap.querySelector(`#ci-${eventKey}-${field}`)
+    .addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === ",") {
+        e.preventDefault();
+        tryAddChip(container, eventKey, field);
+      }
+      if (e.key !== "Enter") {
+        container.querySelector(`#ch-${eventKey}-${field}`).textContent = "";
+      }
+    });
+}
+
+function tryAddChip(container, eventKey, field) {
+  const input = container.querySelector(`#ci-${eventKey}-${field}`);
+  const hint  = container.querySelector(`#ch-${eventKey}-${field}`);
+  const raw   = (input?.value || "").trim();
+  if (!raw) return;
+
+  const parts   = raw.split(/[,;\s]+/).map(e => e.trim()).filter(Boolean);
+  const invalid = parts.filter(e => !isValidEmail(e));
+  if (invalid.length) {
+    hint.textContent = `Invalid: ${invalid.join(", ")}`;
+    return;
+  }
+
+  const existing = chipState[eventKey][field];
+  chipState[eventKey][field] = [...new Set([...existing, ...parts])];
+  renderChipField(container, eventKey, field);
+  container.querySelector(`#ci-${eventKey}-${field}`)?.focus();
+}
+
+// ── Main renderEmailTab ───────────────────────────────────────
 async function renderEmailTab(el) {
+  injectChipStyles();
   await loadEmailConfig();
   const cfg = getEmailConfig();
+
+  // Seed chipState; handle legacy string values from old text-input UI
+  chipState = {
+    onDispatch: {
+      to: normaliseArray(cfg.onDispatch?.to),
+      cc: normaliseArray(cfg.onDispatch?.cc),
+    },
+    onReceipt: {
+      to: normaliseArray(cfg.onReceipt?.to),
+      cc: normaliseArray(cfg.onReceipt?.cc),
+    },
+    onDiscrepancy: {
+      to: normaliseArray(cfg.onDiscrepancy?.to),
+      cc: normaliseArray(cfg.onDiscrepancy?.cc),
+    },
+  };
 
   el.innerHTML = `
     <div class="card section">
@@ -428,8 +577,11 @@ async function renderEmailTab(el) {
       <div class="card-body">
         <p class="text-muted mb-2" style="font-size:.88rem;line-height:1.6">
           Emails are sent via <strong>Gmail SMTP</strong> using your 16-digit App Password,
-          securely stored in Firebase Cloud Functions (never in the browser).
-          Configure who receives each notification type below — separate multiple addresses with commas.
+          securely stored in Firebase Cloud Functions (never in the browser).<br>
+          <strong>Plant contact</strong> emails are added automatically from each plant's profile —
+          add extra recipients below.
+          Press <kbd style="background:#f3f4f6;border:1px solid #d1d5db;border-radius:4px;padding:1px 5px;font-size:11px">Enter</kbd>
+          or click <strong>+ Add</strong> after typing an address.
         </p>
 
         <!-- On Dispatch -->
@@ -438,16 +590,12 @@ async function renderEmailTab(el) {
           <div class="card-body">
             <div class="form-row">
               <div class="form-group">
-                <label>To (required recipients)</label>
-                <input type="text" id="eDispTo"
-                  placeholder="manager@company.com, logistics@company.com"
-                  value="${(cfg.onDispatch?.to || []).join(", ")}">
+                <label>To <span style="font-weight:400;color:#9ca3af;font-size:.8rem">(required recipients)</span></label>
+                <div data-chip="onDispatch-to"></div>
               </div>
               <div class="form-group">
-                <label>CC (optional)</label>
-                <input type="text" id="eDispCc"
-                  placeholder="gm@company.com"
-                  value="${(cfg.onDispatch?.cc || []).join(", ")}">
+                <label>CC <span style="font-weight:400;color:#9ca3af;font-size:.8rem">(optional)</span></label>
+                <div data-chip="onDispatch-cc"></div>
               </div>
             </div>
           </div>
@@ -460,15 +608,11 @@ async function renderEmailTab(el) {
             <div class="form-row">
               <div class="form-group">
                 <label>To</label>
-                <input type="text" id="eRecvTo"
-                  placeholder="manager@company.com"
-                  value="${(cfg.onReceipt?.to || []).join(", ")}">
+                <div data-chip="onReceipt-to"></div>
               </div>
               <div class="form-group">
                 <label>CC</label>
-                <input type="text" id="eRecvCc"
-                  placeholder=""
-                  value="${(cfg.onReceipt?.cc || []).join(", ")}">
+                <div data-chip="onReceipt-cc"></div>
               </div>
             </div>
           </div>
@@ -480,23 +624,18 @@ async function renderEmailTab(el) {
           <div class="card-body">
             <div class="form-row">
               <div class="form-group">
-                <label>To (escalation recipients)</label>
-                <input type="text" id="eDiscTo"
-                  placeholder="gm@company.com, quality@company.com"
-                  value="${(cfg.onDiscrepancy?.to || []).join(", ")}">
+                <label>To <span style="font-weight:400;color:#9ca3af;font-size:.8rem">(escalation recipients)</span></label>
+                <div data-chip="onDiscrepancy-to"></div>
               </div>
               <div class="form-group">
                 <label>CC</label>
-                <input type="text" id="eDiscCc"
-                  placeholder="manager@company.com"
-                  value="${(cfg.onDiscrepancy?.cc || []).join(", ")}">
+                <div data-chip="onDiscrepancy-cc"></div>
               </div>
             </div>
           </div>
         </div>
 
-        <div id="emailSaveStatus" class="hidden"></div>
-        <div style="display:flex;gap:.75rem;flex-wrap:wrap">
+        <div style="display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;margin-top:.5rem">
           <button class="btn btn-primary" id="saveEmailCfgBtn">💾 Save Email Settings</button>
           <button class="btn btn-outline" id="testEmailBtn">🧪 Send Test Email</button>
         </div>
@@ -539,24 +678,35 @@ async function renderEmailTab(el) {
     </div>
   `;
 
+  // Render all chip fields
+  const fields = [
+    ["onDispatch",    "to"], ["onDispatch",    "cc"],
+    ["onReceipt",     "to"], ["onReceipt",     "cc"],
+    ["onDiscrepancy", "to"], ["onDiscrepancy", "cc"],
+  ];
+  fields.forEach(([ev, f]) => renderChipField(el, ev, f));
+
+  // ── Save ───────────────────────────────────────────────────
   el.querySelector("#saveEmailCfgBtn").addEventListener("click", async () => {
-    const parseEmails = id => el.querySelector(id).value
-      .split(",").map(e => e.trim()).filter(Boolean);
-
-    const config = {
-      onDispatch:    { to: parseEmails("#eDispTo"), cc: parseEmails("#eDispCc") },
-      onReceipt:     { to: parseEmails("#eRecvTo"), cc: parseEmails("#eRecvCc") },
-      onDiscrepancy: { to: parseEmails("#eDiscTo"), cc: parseEmails("#eDiscCc") },
-    };
-
+    const btn = el.querySelector("#saveEmailCfgBtn");
+    btn.disabled = true;
+    btn.textContent = "Saving…";
     try {
-      await saveEmailConfig(config);
+      await saveEmailConfig({
+        onDispatch:    { to: chipState.onDispatch.to,    cc: chipState.onDispatch.cc    },
+        onReceipt:     { to: chipState.onReceipt.to,     cc: chipState.onReceipt.cc     },
+        onDiscrepancy: { to: chipState.onDiscrepancy.to, cc: chipState.onDiscrepancy.cc },
+      });
       window.showToast("Email settings saved.", "success");
     } catch (e) {
       window.showToast("Error saving: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "💾 Save Email Settings";
     }
   });
 
+  // ── Test email ─────────────────────────────────────────────
   el.querySelector("#testEmailBtn").addEventListener("click", async () => {
     const { sendDispatchEmail } = await import("./email.js");
     const result = await sendDispatchEmail({
@@ -564,6 +714,7 @@ async function renderEmailTab(el) {
       date:          new Date().toISOString().slice(0,10),
       fromPlantName: "Plant A (Test)",
       toPlantName:   "Plant B (Test)",
+      toPlantId:     null,
       material:      "Test Material",
       qtyDispatched: 100,
       unit:          "Kg",
@@ -587,10 +738,9 @@ async function renderEmailTab(el) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  GMAIL CREDENTIALS TAB
+//  GMAIL CREDENTIALS TAB  (v1 — no Firebase Storage logo upload)
 // ══════════════════════════════════════════════════════════════
 async function renderGmailTab(el) {
-  // Load existing config (show user/pass already saved if any)
   let savedUser = "";
   try {
     const snap = await getDoc(doc(db, "settings", "gmailConfig"));
@@ -647,37 +797,35 @@ async function renderGmailTab(el) {
       </div>
     </div>
 
+    <!-- Logo (FileReader preview only — no cloud upload in v1) -->
     <div class="card section">
       <div class="card-header">🖼️ Company Logo</div>
       <div class="card-body">
         <p class="text-muted mb-2" style="font-size:.88rem;line-height:1.6">
-          Upload your company logo — it appears on the login page and sidebar.
-          Recommended: PNG with transparent background, max 400×120 px.
+          Preview your logo file below. It is loaded from <code>images/logo.png</code> at runtime.
+          Replace that file in your project to update the logo.
         </p>
-        <div style="display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem">
+        <div style="display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap">
           <div style="background:#f4f6fb;border:1.5px dashed var(--border);border-radius:8px;padding:1rem 1.5rem;text-align:center;min-width:200px">
-            <img id="logoPreview" src="images/logo.png" alt="Current Logo"
+            <img id="logoPreview" src="images/logo.png" alt="Company Logo"
               style="max-width:180px;max-height:56px;object-fit:contain;display:block;margin:0 auto"
               onerror="this.style.display='none';document.getElementById('logoNone').style.display='block'">
-            <span id="logoNone" style="display:none;font-size:.82rem;color:var(--text-light)">No logo uploaded</span>
-            <div style="font-size:.75rem;color:var(--text-light);margin-top:.4rem">Current logo</div>
+            <span id="logoNone" style="display:none;font-size:.82rem;color:var(--text-light)">No logo found</span>
+            <div style="font-size:.75rem;color:var(--text-light);margin-top:.4rem">images/logo.png</div>
           </div>
           <div style="flex:1;min-width:200px">
-            <label class="btn btn-outline" style="cursor:pointer;display:inline-flex;align-items:center;gap:.4rem">
-              📁 Choose Logo File
+            <label class="btn btn-outline btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:.4rem">
+              🔍 Preview a file
               <input type="file" id="logoFileInput" accept="image/png,image/jpeg,image/svg+xml,image/webp"
                 style="display:none">
             </label>
             <div style="font-size:.78rem;color:var(--text-light);margin-top:.5rem">
-              PNG, JPG or SVG · Max 500 KB · Transparent background recommended
+              Select a file to preview how it will look.<br>
+              To apply permanently, replace <code>images/logo.png</code> in your project.
             </div>
-            <div id="logoUploadStatus" style="margin-top:.5rem;font-size:.85rem"></div>
+            <div id="logoPreviewStatus" style="font-size:.85rem;margin-top:.4rem"></div>
           </div>
         </div>
-        <p class="text-muted" style="font-size:.8rem">
-          After uploading, the new logo will be saved as <code>images/logo.png</code> in your deployed app.
-          To apply permanently, re-deploy to Firebase Hosting after replacing the file in your GitHub repo.
-        </p>
       </div>
     </div>
 
@@ -698,32 +846,25 @@ async function renderGmailTab(el) {
 
   const statusEl = el.querySelector("#gmailSaveStatus");
 
-  // ── Logo preview on file select ───────────────────────────
+  // ── Logo preview (FileReader only) ───────────────────────
   el.querySelector("#logoFileInput").addEventListener("change", (e) => {
     const file = e.target.files[0];
-    const info = el.querySelector("#logoUploadStatus");
     if (!file) return;
+    const statusDiv = el.querySelector("#logoPreviewStatus");
     if (file.size > 512 * 1024) {
-      info.style.color = "var(--danger)";
-      info.textContent = "⚠️ File is too large (max 500 KB). Please resize the image.";
+      statusDiv.style.cssText = "color:var(--danger)";
+      statusDiv.textContent = "⚠️ File exceeds 500 KB — please resize before using.";
       return;
     }
     const reader = new FileReader();
     reader.onload = (ev) => {
-      const img = el.querySelector("#logoPreview");
-      img.src = ev.target.result;
-      img.style.display = "block";
+      el.querySelector("#logoPreview").src = ev.target.result;
+      el.querySelector("#logoPreview").style.display = "block";
       el.querySelector("#logoNone").style.display = "none";
-      // Also update live login + sidebar logos on the page
-      const loginImg   = document.getElementById("loginLogoImg");
-      const sidebarImg = document.getElementById("sidebarLogoImg");
-      if (loginImg)   { loginImg.src = ev.target.result; loginImg.closest(".login-company-logo").style.display = "flex"; }
-      if (sidebarImg) { sidebarImg.src = ev.target.result; sidebarImg.closest(".sidebar-company-logo").style.display = "flex"; }
-
-      info.style.color = "var(--success)";
-      info.textContent = `✅ "${file.name}" selected. To make it permanent, replace images/logo.png in your GitHub repo and redeploy.`;
     };
     reader.readAsDataURL(file);
+    statusDiv.style.cssText = "color:var(--text-mid)";
+    statusDiv.textContent = `Previewing "${file.name}" — replace images/logo.png to make it permanent.`;
   });
 
   el.querySelector("#clearPassBtn").addEventListener("click", () => {
@@ -732,9 +873,9 @@ async function renderGmailTab(el) {
   });
 
   el.querySelector("#saveGmailBtn").addEventListener("click", async () => {
-    const user    = el.querySelector("#gmailUser").value.trim();
-    const pass    = el.querySelector("#gmailPass").value.trim();
-    const btn     = el.querySelector("#saveGmailBtn");
+    const user = el.querySelector("#gmailUser").value.trim();
+    const pass = el.querySelector("#gmailPass").value.trim();
+    const btn  = el.querySelector("#saveGmailBtn");
 
     statusEl.textContent = "";
     statusEl.style.cssText = "";
@@ -750,7 +891,7 @@ async function renderGmailTab(el) {
 
     try {
       const data = { user, updatedAt: serverTimestamp() };
-      if (pass) data.pass = pass.replace(/\s+/g, ""); // strip spaces before saving
+      if (pass) data.pass = pass.replace(/\s+/g, "");
       await setDoc(doc(db, "settings", "gmailConfig"), data, { merge: true });
       statusEl.textContent = "✅ Credentials saved successfully!";
       statusEl.style.cssText = "color:#2e7d32;padding:.5rem .75rem;background:#e8f5e9;border-radius:6px;font-weight:500";
@@ -776,6 +917,7 @@ async function renderGmailTab(el) {
         date: new Date().toISOString().slice(0, 10),
         fromPlantName: "Plant A (Test)",
         toPlantName:   "Plant B (Test)",
+        toPlantId:     null,
         material:      "Test Material",
         qtyDispatched: 100, unit: "Kg", boxes: 5,
         batch: "TEST-LOT", vehicleNo: "GJ 01 AB 1234",
@@ -798,11 +940,9 @@ async function renderGmailTab(el) {
   });
 }
 
-// ── Helpers ───────────────────────────────────────────────────
-function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
-
-
-// ── Danger Zone Tab ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+//  DANGER ZONE TAB
+// ══════════════════════════════════════════════════════════════
 async function renderDangerTab(el, user) {
   if (user.role !== "superAdmin") {
     el.innerHTML = `<div class="card"><p style="color:#666">Access restricted to Super Admin.</p></div>`;
@@ -825,20 +965,22 @@ async function renderDangerTab(el, user) {
     </div>`;
 }
 
-// ── Wipe All Data (superAdmin only) ──────────────────────────
 export async function wipeAllData() {
-  if (!confirm("⚠️ WARNING: This will permanently delete ALL dispatches and activity logs. This cannot be undone.\n\nType 'WIPE' to confirm:")) return;
+  if (!confirm("⚠️ WARNING: This will permanently delete ALL dispatches and activity logs.\n\nThis cannot be undone.")) return;
   const input = prompt("Type WIPE to confirm permanent deletion:");
   if (input !== "WIPE") { alert("Cancelled."); return; }
-  
-  const batch1 = [];
+
+  const tasks = [];
   const dispSnap = await getDocs(collection(db, "dispatches"));
-  dispSnap.forEach(d => batch1.push(deleteDoc(doc(db, "dispatches", d.id))));
+  dispSnap.forEach(d => tasks.push(deleteDoc(doc(db, "dispatches", d.id))));
   const logSnap = await getDocs(collection(db, "activityLogs"));
-  logSnap.forEach(d => batch1.push(deleteDoc(doc(db, "activityLogs", d.id))));
-  
-  await Promise.all(batch1);
+  logSnap.forEach(d => tasks.push(deleteDoc(doc(db, "activityLogs", d.id))));
+
+  await Promise.all(tasks);
   alert("✅ All dispatches and logs have been wiped.");
   location.reload();
 }
 window.wipeAllData = wipeAllData;
+
+// ── Utility ───────────────────────────────────────────────────
+function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
