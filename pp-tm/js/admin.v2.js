@@ -1141,11 +1141,16 @@ window.editUser = async (userId) => {
 
 // ── Delete user ───────────────────────────────────────────────
 window.deleteUser = async (userId, userName, userEmail) => {
-  if (!confirm(`Permanently delete user "${userName}" (${userEmail})?\n\nThis removes their Firestore profile. Their Firebase Auth account must be removed separately from the Firebase Console if needed.`)) return;
-  await deleteDoc(doc(db, "users", userId));
-  window.showToast(`User "${userName}" deleted.`, "info");
-  const wrap = document.querySelector("#usersTableWrap");
-  if (wrap) await loadUsersTable(wrap);
+  if (!confirm(`Permanently delete user "${userName}" (${userEmail})?\n\nThis deletes their login account and all profile data. This cannot be undone.`)) return;
+  try {
+    const deletePtmsUser = httpsCallable(fns, "deletePtmsUser");
+    await deletePtmsUser({ uid: userId });
+    window.showToast(`User "${userName}" deleted.`, "info");
+    const wrap = document.querySelector("#usersTableWrap");
+    if (wrap) await loadUsersTable(wrap);
+  } catch (e) {
+    window.showToast("Delete failed: " + (e?.message || e), "error");
+  }
 };
 
 // ── Helpers ───────────────────────────────────────────────────
