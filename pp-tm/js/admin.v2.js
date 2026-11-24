@@ -99,6 +99,7 @@ async function loadPlantsTable(wrap) {
           <button class="btn btn-danger btn-sm" onclick="togglePlant('${d.id}', ${p.isActive})">
             ${p.isActive ? 'Deactivate' : 'Activate'}
           </button>
+          <button class="btn btn-sm" style="background:#7f1d1d;color:#fff" onclick="deletePlant('${d.id}','${p.name}')">🗑 Delete</button>
         </td>
       </tr>`;
   });
@@ -273,10 +274,12 @@ async function loadUsersTable(wrap) {
         <td>${u.plantId ? (plantMap[u.plantId] || u.plantId) : '—'}</td>
         <td><span class="badge ${u.isActive ? 'badge-green' : 'badge-grey'}">${u.isActive ? 'Active' : 'Inactive'}</span></td>
         <td>
+          <button class="btn btn-outline btn-sm" onclick="editUser('${d.id}')">Edit</button>
           <button class="btn btn-outline btn-sm" onclick="resetPassword('${u.email}')">Reset Pwd</button>
           <button class="btn btn-danger btn-sm" onclick="toggleUser('${d.id}', ${u.isActive})">
             ${u.isActive ? 'Deactivate' : 'Activate'}
           </button>
+          <button class="btn btn-sm" style="background:#7f1d1d;color:#fff" onclick="deleteUser('${d.id}','${u.name}','${u.email}')">🗑 Delete</button>
         </td>
       </tr>`;
   });
@@ -1030,6 +1033,120 @@ async function renderGmailTab(el) {
     }
   });
 }
+
+// ── Delete plant ─────────────────────────────────────────────
+window.deletePlant = async (plantId, plantName) => {
+  if (!confirm(`Permanently delete plant "${plantName}"?\n\nThis cannot be undone. Dispatches referencing this plant will still exist but show the plant ID.`)) return;
+  await deleteDoc(doc(db, "plants", plantId));
+  window.showToast(`Plant "${plantName}" deleted.`, "info");
+  const wrap = document.querySelector("#plantsTableWrap");
+  if (wrap) await loadPlantsTable(wrap);
+};
+
+// ── Edit user modal ───────────────────────────────────────────
+window.editUser = async (userId) => {
+  const [uSnap, plantSnap] = await Promise.all([
+    getDoc(doc(db, "users", userId)),
+    getDocs(query(collection(db, "plants"), orderBy("name")))
+  ]);
+  if (!uSnap.exists()) return;
+  const u = uSnap.data();
+
+  let plantOptions = `<option value="">— No Plant —</option>`;
+  plantSnap.forEach(d => {
+    const sel = u.plantId === d.id ? "selected" : "";
+    plantOptions += `<option value="${d.id}" ${sel}>${d.data().name} (${d.data().code})</option>`;
+  });
+
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+    <div class="modal">
+      <div class="modal-header">
+        <span>Edit User</span>
+        <button class="btn-close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Full Name *</label>
+            <input type="text" id="euName" value="${u.name || ''}">
+          </div>
+          <div class="form-group">
+            <label>Email</label>
+            <input type="email" id="euEmail" value="${u.email || ''}" readonly style="background:#f9fafb;color:#6b7280">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Role *</label>
+            <select id="euRole">
+              <option value="plantUser" ${u.role === 'plantUser' ? 'selected' : ''}>Plant User</option>
+              <option value="superAdmin" ${u.role === 'superAdmin' ? 'selected' : ''}>Super Admin</option>
+            </select>
+          </div>
+          <div class="form-group" id="euPlantGroup">
+            <label>Assigned Plant</label>
+            <select id="euPlant">${plantOptions}</select>
+          </div>
+        </div>
+        <div id="editUserError" class="error-msg hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" id="cancelEUBtn">Cancel</button>
+        <button class="btn btn-primary" id="saveEUBtn">💾 Save Changes</button>
+      </div>
+    </div>`;
+  document.body.appendChild(backdrop);
+
+  const roleEl = backdrop.querySelector("#euRole");
+  const plantGroup = backdrop.querySelector("#euPlantGroup");
+  const togglePlantGroup = () => {
+    plantGroup.style.display = roleEl.value === "superAdmin" ? "none" : "";
+  };
+  togglePlantGroup();
+  roleEl.addEventListener("change", togglePlantGroup);
+
+  backdrop.querySelector(".btn-close").onclick    = () => backdrop.remove();
+  backdrop.querySelector("#cancelEUBtn").onclick  = () => backdrop.remove();
+  backdrop.querySelector("#saveEUBtn").onclick = async () => {
+    const errEl  = backdrop.querySelector("#editUserError");
+    const name   = backdrop.querySelector("#euName").value.trim();
+    const role   = roleEl.value;
+    const plantId = backdrop.querySelector("#euPlant").value;
+    if (!name) {
+      errEl.textContent = "Name is required.";
+      errEl.classList.remove("hidden");
+      return;
+    }
+    const btn = backdrop.querySelector("#saveEUBtn");
+    btn.disabled = true; btn.textContent = "Saving…";
+    try {
+      await updateDoc(doc(db, "users", userId), {
+        name, role,
+        plantId: role === "superAdmin" ? null : (plantId || null),
+        updatedAt: serverTimestamp()
+      });
+      window.showToast("User updated.", "success");
+      backdrop.remove();
+      const wrap = document.querySelector("#usersTableWrap");
+      if (wrap) await loadUsersTable(wrap);
+    } catch (e) {
+      errEl.textContent = e.message;
+      errEl.classList.remove("hidden");
+      btn.disabled = false; btn.textContent = "💾 Save Changes";
+    }
+  };
+};
+
+// ── Delete user ───────────────────────────────────────────────
+window.deleteUser = async (userId, userName, userEmail) => {
+  if (!confirm(`Permanently delete user "${userName}" (${userEmail})?\n\nThis removes their Firestore profile. Their Firebase Auth account must be removed separately from the Firebase Console if needed.`)) return;
+  await deleteDoc(doc(db, "users", userId));
+  window.showToast(`User "${userName}" deleted.`, "info");
+  const wrap = document.querySelector("#usersTableWrap");
+  if (wrap) await loadUsersTable(wrap);
+};
 
 // ── Helpers ───────────────────────────────────────────────────
 function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
