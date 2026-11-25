@@ -3,7 +3,9 @@
 //
 //  1. createPtmsUser  – creates Firebase Auth user + Firestore
 //                       profile (requires superAdmin caller)
-//  2. sendPtmsEmail   – sends Gmail via Nodemailer
+//  2. deletePtmsUser  – deletes Firebase Auth account + Firestore
+//                       profile (requires superAdmin caller)
+//  3. sendPtmsEmail   – sends Gmail via Nodemailer
 //
 //  Gmail credentials are stored in Firestore settings/gmailConfig
 //  (set them via Admin → 🔑 Gmail Credentials in the app).
@@ -19,6 +21,22 @@ const db = admin.firestore();
 
 // Set region + allow all origins for CORS (site hosted on custom domain qmsgalaxy.com)
 setGlobalOptions({ region: "asia-south1", cors: true });
+
+// ─────────────────────────────────────────────────────────────
+//  Helper: normalise a Firestore field that may be stored as
+//  a comma/semicolon-separated string OR a proper array.
+//  Returns a deduplicated array of non-empty trimmed strings.
+// ─────────────────────────────────────────────────────────────
+function toEmailArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return [...new Set(value.map(v => (v || "").trim()).filter(Boolean))];
+  }
+  // Legacy string storage: "a@x.com; b@x.com, c@x.com"
+  return [...new Set(
+    String(value).split(/[,;]+/).map(v => v.trim()).filter(Boolean)
+  )];
+}
 
 // ═════════════════════════════════════════════════════════════
 //  HTTPS callable: createPtmsUser
@@ -78,6 +96,47 @@ exports.createPtmsUser = onCall(async (request) => {
   return { uid: userRecord.uid };
 });
 
+// ═════════════════════════════════════════════════════════════
+//  HTTPS callable: deletePtmsUser
+//  Deletes Firebase Auth account + Firestore profile.
+//  Only a verified superAdmin may call this.
+// ═════════════════════════════════════════════════════════════
+exports.deletePtmsUser = onCall(async (request) => {
+
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "You must be logged in.");
+  }
+
+  // Caller must be superAdmin
+  const callerDoc = await db.doc(`users/${request.auth.uid}`).get();
+  if (!callerDoc.exists || callerDoc.data().role !== "superAdmin") {
+    throw new HttpsError("permission-denied", "Only Super Admins can delete users.");
+  }
+
+  const { uid } = request.data;
+  if (!uid) throw new HttpsError("invalid-argument", "uid is required.");
+
+  // Prevent superAdmin from deleting themselves
+  if (uid === request.auth.uid) {
+    throw new HttpsError("failed-precondition", "You cannot delete your own account.");
+  }
+
+  // Delete Firebase Auth account (ignore if already deleted)
+  try {
+    await admin.auth().deleteUser(uid);
+  } catch (e) {
+    if (e.code !== "auth/user-not-found") {
+      throw new HttpsError("internal", "Failed to delete Auth account: " + e.message);
+    }
+  }
+
+  // Delete Firestore profile
+  await db.doc(`users/${uid}`).delete();
+
+  console.log(`✅ User deleted: ${uid} by ${request.auth.uid}`);
+  return { deleted: true };
+});
+
 // ── Gmail transporter (credentials from Firestore settings/gmailConfig) ──
 async function createTransporter() {
   const snap = await db.doc("settings/gmailConfig").get();
@@ -95,6 +154,22 @@ async function createTransporter() {
       pass: cfg.pass.replace(/\s+/g, ""), // strip spaces from 16-digit app password
     },
   });
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Helper: fetch a plant's contact email from Firestore.
+//  Plants are stored in collection "plants" with doc ID = plantId.
+//  Returns "" if not found or no email set.
+// ─────────────────────────────────────────────────────────────
+async function getPlantEmail(plantId) {
+  if (!plantId) return "";
+  try {
+    const snap = await db.doc(`plants/${plantId}`).get();
+    return (snap.exists && snap.data().email) ? snap.data().email.trim() : "";
+  } catch (e) {
+    console.warn(`Could not fetch plant email for ${plantId}:`, e.message);
+    return "";
+  }
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -116,8 +191,8 @@ exports.sendPtmsEmail = onCall(async (request) => {
 
   // ── Load recipient config from Firestore ──────────────────
   let emailConfig = {
-    onDispatch: { to: [], cc: [] },
-    onReceipt:  { to: [], cc: [] },
+    onDispatch:    { to: [], cc: [] },
+    onReceipt:     { to: [], cc: [] },
     onDiscrepancy: { to: [], cc: [] },
   };
   try {
@@ -126,6 +201,12 @@ exports.sendPtmsEmail = onCall(async (request) => {
   } catch (e) {
     console.warn("Could not load emailConfig from Firestore:", e.message);
   }
+
+  // ── Auto-fetch destination plant's contact email ──────────
+  //  dispatchData.toPlantId is passed from the browser client.
+  //  On dispatch: notify the receiving plant's contact.
+  //  On receipt:  same plant (they just confirmed arrival).
+  const plantContactEmail = await getPlantEmail(dispatchData.toPlantId);
 
   // ── Build email content ───────────────────────────────────
   let subject, htmlBody, cfg;
@@ -138,10 +219,14 @@ exports.sendPtmsEmail = onCall(async (request) => {
   } else if (type === "receipt") {
     const isDiscrep = receiptData && Math.abs(receiptData.qtyReceived - dispatchData.qtyDispatched) > 0.001;
     cfg = isDiscrep ? emailConfig.onDiscrepancy : emailConfig.onReceipt;
-    if (isDiscrep && emailConfig.onReceipt.to?.length) {
+
+    // On discrepancy: also CC the normal receipt list
+    if (isDiscrep) {
+      const receiptTo = toEmailArray(emailConfig.onReceipt.to);
+      const receiptCc = toEmailArray(emailConfig.onReceipt.cc);
       cfg = {
-        to: cfg.to || [],
-        cc: [...new Set([...(cfg.cc || []), ...(emailConfig.onReceipt.to || [])])],
+        to: toEmailArray(cfg.to),
+        cc: [...new Set([...toEmailArray(cfg.cc), ...receiptTo, ...receiptCc])],
       };
     }
     subject = isDiscrep
@@ -153,13 +238,42 @@ exports.sendPtmsEmail = onCall(async (request) => {
     throw new HttpsError("invalid-argument", `Unknown email type: ${type}`);
   }
 
-  // ── Validate recipients ───────────────────────────────────
-  const toList = (cfg.to || []).filter(Boolean);
-  const ccList = (cfg.cc || []).filter(Boolean);
-  if (toList.length === 0) {
+  // ── Build TO / CC lists (parse string or array from Firestore) ──
+  //
+  //  Priority / routing:
+  //    TO   = configured TO list  +  plant contact email (auto)
+  //    CC   = configured CC list  +  dispatcher/receiver (auto-CC acting user)
+  //
+  //  Plant contact is added to TO so the receiving plant always
+  //  gets the notification even if no fixed TO is configured.
+
+  const configuredTo = toEmailArray(cfg.to);
+  const configuredCc = toEmailArray(cfg.cc);
+
+  // Auto-CC the acting user (dispatcher / receiver)
+  const actingUserEmails = [];
+  if (dispatchData.senderEmail)                    actingUserEmails.push(dispatchData.senderEmail.trim());
+  if (receiptData && receiptData.receiverEmail)    actingUserEmails.push(receiptData.receiverEmail.trim());
+
+  // Merge plant contact into TO (deduplicated)
+  const toList = [...new Set([
+    ...configuredTo,
+    ...(plantContactEmail ? [plantContactEmail] : []),
+  ])].filter(Boolean);
+
+  const ccList = [...new Set([
+    ...configuredCc,
+    ...actingUserEmails,
+  ])].filter(e => e && !toList.includes(e)); // don't CC someone already in TO
+
+  if (toList.length === 0 && ccList.length === 0) {
     console.log(`No recipients configured for type "${type}" — skipping email.`);
     return { sent: false, reason: "No recipients configured" };
   }
+
+  // If somehow still no TO (no config, no plant email), promote first CC to TO
+  const finalTo = toList.length ? toList : [ccList[0]];
+  const finalCC = toList.length ? ccList : ccList.slice(1);
 
   // ── Send via Gmail ────────────────────────────────────────
   const transporter = await createTransporter();
@@ -168,14 +282,18 @@ exports.sendPtmsEmail = onCall(async (request) => {
 
   const mailOptions = {
     from:    `"PTMS Notifications" <${gmailUser}>`,
-    to:      toList.join(", "),
-    cc:      ccList.length ? ccList.join(", ") : undefined,
+    to:      finalTo.join(", "),
+    cc:      finalCC.length ? finalCC.join(", ") : undefined,
     subject,
     html:    htmlBody,
   };
 
   await transporter.sendMail(mailOptions);
-  console.log(`✅ Email sent [${type}] to: ${toList.join(", ")}`);
+  console.log(
+    `✅ Email sent [${type}] to: ${finalTo.join(", ")}` +
+    (finalCC.length ? ` | cc: ${finalCC.join(", ")}` : "") +
+    (plantContactEmail ? ` | plant-contact: ${plantContactEmail}` : "")
+  );
   return { sent: true };
 });
 

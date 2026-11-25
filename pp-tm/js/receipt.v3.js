@@ -7,7 +7,7 @@
 import { db } from "./firebase.v2.js";
 import {
   collection, doc, getDocs, updateDoc, addDoc,
-  query, orderBy, where, serverTimestamp, getDoc
+  query, orderBy, where, serverTimestamp, getDoc, deleteDoc
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { getStorage, ref, uploadBytes, getDownloadURL }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
@@ -58,26 +58,26 @@ export async function showReceiptPage(container, user) {
 // ── Pending ───────────────────────────────────────────────────
 async function loadPendingList(user, listEl, countEl) {
   listEl.innerHTML = `<div class="spinner"></div>`;
+  const isSA = user.role === "superAdmin";
   try {
-    const baseQuery = user.role === "superAdmin"
+    const baseQuery = isSA
       ? query(collection(db, "dispatches"))
       : query(collection(db, "dispatches"), where("toPlantId", "==", user.plantId));
     const allSnap = await getDocs(baseQuery);
-    const snap = {
-      docs: allSnap.docs
-        .filter(d => ["dispatched","in-transit"].includes(d.data().status))
-        .sort((a,b) => (a.data().createdAt?.seconds||0) - (b.data().createdAt?.seconds||0))
-    };
-    countEl.textContent = snap.docs.length;
-    if (!snap.docs.length) {
+    const docs = allSnap.docs
+      .filter(d => ["dispatched","in-transit"].includes(d.data().status))
+      .sort((a,b) => (a.data().createdAt?.seconds||0) - (b.data().createdAt?.seconds||0));
+    countEl.textContent = docs.length;
+    if (!docs.length) {
       listEl.innerHTML = `<div class="empty-state"><div class="empty-icon">✅</div><p>No pending receipts. All clear!</p></div>`;
       return;
     }
     let rows = "";
-    snap.docs.forEach(d => {
+    docs.forEach(d => {
       const dp = d.data();
       const dispDT=dp.createdAt?.toDate?dp.createdAt.toDate().toLocaleString("en-IN"):(dp.date||"—");
-      rows += `<tr>
+      rows += `<tr data-doc-id="${d.id}">
+        ${isSA ? `<td style="width:36px;text-align:center"><input type="checkbox" class="recv-chk" data-id="${d.id}" style="width:16px;height:16px;cursor:pointer"></td>` : ""}
         <td><span class="dispatch-id">${dp.dispatchId}</span></td>
         <td>${dispDT}</td><td>${dp.fromPlantName}</td><td>${dp.material}</td>
         <td>${dp.qtyDispatched} ${dp.unit}</td><td>${dp.vehicleNo}</td><td>${dp.driverName}</td>
@@ -85,18 +85,73 @@ async function loadPendingList(user, listEl, countEl) {
         <td><button class="btn btn-success btn-sm" onclick="openReceiptModal('${d.id}')">Confirm Receipt</button></td>
       </tr>`;
     });
-    listEl.innerHTML = `<div class="table-wrap"><table>
-      <thead><tr><th>Dispatch ID</th><th>Dispatch Date/Time</th><th>From</th><th>Material</th>
-        <th>Dispatched Qty</th><th>Vehicle</th><th>Driver</th><th>Status</th><th></th></tr></thead>
-      <tbody>${rows}</tbody></table></div>`;
+    listEl.innerHTML = `
+      ${isSA ? `
+        <div id="pendingBulkBar" style="display:none;align-items:center;gap:.7rem;margin-bottom:.6rem;padding:.5rem .75rem;background:#fff3f3;border:1.5px solid #c62828;border-radius:8px">
+          <span id="pendingSelCount" style="font-weight:700;color:#c62828;font-size:.9rem">0 selected</span>
+          <button id="pendingDeleteBtn" class="btn btn-sm" style="background:#c62828;color:#fff;border:none;padding:.35rem .9rem;border-radius:6px;font-weight:700;cursor:pointer">🗑 Delete Selected</button>
+          <button id="pendingDeselectBtn" class="btn btn-outline btn-sm">✕ Deselect All</button>
+        </div>` : ""}
+      <div class="table-wrap"><table>
+        <thead><tr>
+          ${isSA ? `<th style="width:36px"><input type="checkbox" id="pendingSelectAll" style="width:16px;height:16px;cursor:pointer" title="Select all"></th>` : ""}
+          <th>Dispatch ID</th><th>Dispatch Date/Time</th><th>From</th><th>Material</th>
+          <th>Dispatched Qty</th><th>Vehicle</th><th>Driver</th><th>Status</th><th></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+
+    if (isSA) {
+      const bulkBar  = listEl.querySelector("#pendingBulkBar");
+      const selCount = listEl.querySelector("#pendingSelCount");
+      const selAll   = listEl.querySelector("#pendingSelectAll");
+
+      function updateBar() {
+        const checked = listEl.querySelectorAll(".recv-chk:checked");
+        const n = checked.length;
+        bulkBar.style.display = n > 0 ? "flex" : "none";
+        selCount.textContent = `${n} selected`;
+        if (selAll) selAll.checked = n === listEl.querySelectorAll(".recv-chk").length;
+      }
+
+      listEl.addEventListener("change", e => {
+        if (e.target.classList.contains("recv-chk") || e.target.id === "pendingSelectAll") {
+          if (e.target.id === "pendingSelectAll") {
+            listEl.querySelectorAll(".recv-chk").forEach(c => c.checked = e.target.checked);
+          }
+          updateBar();
+        }
+      });
+
+      listEl.querySelector("#pendingDeselectBtn").addEventListener("click", () => {
+        listEl.querySelectorAll(".recv-chk").forEach(c => c.checked = false);
+        if (selAll) selAll.checked = false;
+        updateBar();
+      });
+
+      listEl.querySelector("#pendingDeleteBtn").addEventListener("click", async () => {
+        const checked = [...listEl.querySelectorAll(".recv-chk:checked")];
+        if (!checked.length) return;
+        if (!confirm(`Permanently delete ${checked.length} dispatch record(s)? This cannot be undone.`)) return;
+        try {
+          await Promise.all(checked.map(c => deleteDoc(doc(db, "dispatches", c.dataset.id))));
+          window.showToast(`${checked.length} record(s) deleted.`, "success");
+          const pCnt = document.querySelector("#pendingCount");
+          await loadPendingList(user, listEl, pCnt || countEl);
+        } catch (e) {
+          window.showToast("Delete failed: " + e.message, "error");
+        }
+      });
+    }
   } catch(e) { listEl.innerHTML = `<div class="error-msg">Error: ${e.message}</div>`; }
 }
 
 // ── Received history ──────────────────────────────────────────
 async function loadReceivedList(user, listEl, filters) {
   listEl.innerHTML = `<div class="spinner"></div>`;
+  const isSA = user.role === "superAdmin";
   try {
-    const baseQuery = user.role === "superAdmin"
+    const baseQuery = isSA
       ? query(collection(db, "dispatches"))
       : query(collection(db, "dispatches"), where("toPlantId", "==", user.plantId));
     const allSnap = await getDocs(baseQuery);
@@ -121,7 +176,8 @@ async function loadReceivedList(user, listEl, filters) {
               style="width:38px;height:38px;object-fit:cover;border-radius:5px;border:2px solid #c62828;cursor:pointer" title="View photo">`).join("")}
            </div>` : "";
       const dispDT2=dp.createdAt?.toDate?dp.createdAt.toDate().toLocaleString("en-IN"):(dp.date||"—");
-      rows += `<tr>
+      rows += `<tr data-doc-id="${d.id}">
+        ${isSA ? `<td style="width:36px;text-align:center"><input type="checkbox" class="hist-chk" data-id="${d.id}" style="width:16px;height:16px;cursor:pointer"></td>` : ""}
         <td><span class="dispatch-id">${dp.dispatchId}</span></td>
         <td>${dispDT2}</td><td>${recvDate}</td><td>${dp.fromPlantName}</td><td>${dp.material}</td>
         <td>${dp.qtyDispatched} ${dp.unit}</td><td>${dp.qtyReceived??'—'} ${dp.unit}</td>
@@ -130,10 +186,63 @@ async function loadReceivedList(user, listEl, filters) {
         <td>${photoThumb}<button class="btn btn-outline btn-sm" onclick="viewDispatch('${d.id}')">View</button></td>
       </tr>`;
     });
-    listEl.innerHTML = `<div class="table-wrap"><table>
-      <thead><tr><th>Dispatch ID</th><th>Dispatch Date/Time</th><th>Receipt Date/Time</th><th>From</th><th>Material</th>
-        <th>Dispatched</th><th>Received</th><th>Difference</th><th>Status</th><th>Photos</th></tr></thead>
-      <tbody>${rows}</tbody></table></div>`;
+    listEl.innerHTML = `
+      ${isSA ? `
+        <div id="histBulkBar" style="display:none;align-items:center;gap:.7rem;margin-bottom:.6rem;padding:.5rem .75rem;background:#fff3f3;border:1.5px solid #c62828;border-radius:8px">
+          <span id="histSelCount" style="font-weight:700;color:#c62828;font-size:.9rem">0 selected</span>
+          <button id="histDeleteBtn" class="btn btn-sm" style="background:#c62828;color:#fff;border:none;padding:.35rem .9rem;border-radius:6px;font-weight:700;cursor:pointer">🗑 Delete Selected</button>
+          <button id="histDeselectBtn" class="btn btn-outline btn-sm">✕ Deselect All</button>
+        </div>` : ""}
+      <div class="table-wrap"><table>
+        <thead><tr>
+          ${isSA ? `<th style="width:36px"><input type="checkbox" id="histSelectAll" style="width:16px;height:16px;cursor:pointer" title="Select all"></th>` : ""}
+          <th>Dispatch ID</th><th>Dispatch Date/Time</th><th>Receipt Date/Time</th><th>From</th><th>Material</th>
+          <th>Dispatched</th><th>Received</th><th>Difference</th><th>Status</th><th>Photos</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+
+    if (isSA) {
+      const bulkBar  = listEl.querySelector("#histBulkBar");
+      const selCount = listEl.querySelector("#histSelCount");
+      const selAll   = listEl.querySelector("#histSelectAll");
+
+      function updateBar() {
+        const checked = listEl.querySelectorAll(".hist-chk:checked");
+        const n = checked.length;
+        bulkBar.style.display = n > 0 ? "flex" : "none";
+        selCount.textContent = `${n} selected`;
+        if (selAll) selAll.checked = n === listEl.querySelectorAll(".hist-chk").length;
+      }
+
+      listEl.addEventListener("change", e => {
+        if (e.target.classList.contains("hist-chk") || e.target.id === "histSelectAll") {
+          if (e.target.id === "histSelectAll") {
+            listEl.querySelectorAll(".hist-chk").forEach(c => c.checked = e.target.checked);
+          }
+          updateBar();
+        }
+      });
+
+      listEl.querySelector("#histDeselectBtn").addEventListener("click", () => {
+        listEl.querySelectorAll(".hist-chk").forEach(c => c.checked = false);
+        if (selAll) selAll.checked = false;
+        updateBar();
+      });
+
+      listEl.querySelector("#histDeleteBtn").addEventListener("click", async () => {
+        const checked = [...listEl.querySelectorAll(".hist-chk:checked")];
+        if (!checked.length) return;
+        if (!confirm(`Permanently delete ${checked.length} receipt record(s)? This cannot be undone.`)) return;
+        try {
+          await Promise.all(checked.map(c => deleteDoc(doc(db, "dispatches", c.dataset.id))));
+          window.showToast(`${checked.length} record(s) deleted.`, "success");
+          await loadReceivedList(user, listEl, filters);
+        } catch (e) {
+          window.showToast("Delete failed: " + e.message, "error");
+        }
+      });
+    }
   } catch(e) { listEl.innerHTML = `<div class="error-msg">Error: ${e.message}</div>`; }
 }
 

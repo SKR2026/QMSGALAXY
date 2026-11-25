@@ -974,7 +974,8 @@ function renderAdminApps() {
         <a href="${a.url}" target="_blank" style="color:var(--accent);font-size:12px">${a.url}</a>
       </td>
       <td><span class="tag" style="background:${a.bg||'#eee'};color:${a.color||'#333'}">${a.tag||''}</span></td>
-      <td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-outline btn-sm" style="margin-right:4px" onclick="startEditApp('${a.id}','${a.name.replace(/'/g,"\\'")}')">✏️ Edit</button>
         <button class="btn btn-danger btn-sm" onclick="deleteApp('${a.id}','${a.name.replace(/'/g,"\\'")}')">Delete</button>
       </td>
     </tr>`).join('');
@@ -995,24 +996,27 @@ function startRowDrag(e, handle) {
   e.preventDefault();
   const row = handle.closest('tr');
   const tbody = row.parentNode;
+  // Use document-level pointer capture so dragging fast doesn't drop events
   handle.setPointerCapture(e.pointerId);
   row.classList.add('row-dragging');
   tbody.classList.add('is-dragging');
-  rowDrag = { row, tbody, handle, startId: row.dataset.id,
+  rowDrag = { row, tbody, handle, pointerId: e.pointerId,
               startIndex: [...tbody.children].indexOf(row),
               scroller: document.getElementById('admin-overlay') };
-  handle.onpointermove = onRowDragMove;
-  handle.onpointerup = handle.onpointercancel = endRowDrag;
+  document.addEventListener('pointermove', onRowDragMove, { passive: true });
+  document.addEventListener('pointerup',   endRowDrag);
+  document.addEventListener('pointercancel', endRowDrag);
 }
 
 function onRowDragMove(e) {
-  if (!rowDrag) return;
+  if (!rowDrag || e.pointerId !== rowDrag.pointerId) return;
   const { row, tbody, scroller } = rowDrag;
-  // Auto-scroll when dragging near the top/bottom edge of the screen
+  // Auto-scroll when dragging near the top/bottom edge of the overlay
   const edge = 60;
-  if (e.clientY < edge) { scroller.scrollTop -= 12; window.scrollBy(0, -12); }
-  else if (e.clientY > window.innerHeight - edge) { scroller.scrollTop += 12; window.scrollBy(0, 12); }
-  // Place the row before the first row whose midpoint is below the pointer
+  const overlayRect = scroller.getBoundingClientRect();
+  if (e.clientY < overlayRect.top + edge) scroller.scrollTop -= 10;
+  else if (e.clientY > overlayRect.bottom - edge) scroller.scrollTop += 10;
+  // Place the row before the first sibling whose midpoint is below the pointer
   let before = null;
   for (const r of tbody.children) {
     if (r === row) continue;
@@ -1022,10 +1026,13 @@ function onRowDragMove(e) {
   if (row.nextSibling !== before) tbody.insertBefore(row, before);
 }
 
-function endRowDrag() {
+function endRowDrag(e) {
   if (!rowDrag) return;
-  const { row, tbody, handle, startIndex } = rowDrag;
-  handle.onpointermove = handle.onpointerup = handle.onpointercancel = null;
+  if (e && e.pointerId !== undefined && e.pointerId !== rowDrag.pointerId) return;
+  document.removeEventListener('pointermove', onRowDragMove);
+  document.removeEventListener('pointerup',   endRowDrag);
+  document.removeEventListener('pointercancel', endRowDrag);
+  const { row, tbody, startIndex } = rowDrag;
   row.classList.remove('row-dragging');
   tbody.classList.remove('is-dragging');
   const newIndex = [...tbody.children].indexOf(row);
@@ -1467,6 +1474,50 @@ async function openBioSettings() {
     renderBioSheet('Unlock with fingerprint?',
       "Open the launcher with your phone's fingerprint, face unlock or screen lock.",
       [['Cancel', 'bio-secondary', closeBioSheet], ['Turn on', 'bio-primary', enableBioFromSheet]]);
+  }
+}
+
+// ── Inline app name edit ──────────────────────────────────────────
+function startEditApp(id, currentName) {
+  const tbody = document.getElementById('apps-tbody');
+  const row = [...tbody.querySelectorAll('tr')].find(r => r.dataset.id === id);
+  if (!row) return;
+  const nameCell = row.cells[2]; // Name column (index 2)
+  if (nameCell.querySelector('input')) return; // already editing
+  nameCell.innerHTML = `
+    <div style="display:flex;align-items:center;gap:6px;">
+      <input class="inp" id="edit-name-${id}" value="${currentName.replace(/"/g,'&quot;')}"
+             style="padding:5px 8px;font-size:13px;min-width:120px;"
+             onkeydown="if(event.key==='Enter')saveEditApp('${id}');if(event.key==='Escape')cancelEditApp('${id}','${currentName.replace(/'/g,"\\'")}')"/>
+      <button class="btn btn-primary btn-sm" onclick="saveEditApp('${id}')">Save</button>
+      <button class="btn btn-outline btn-sm" onclick="cancelEditApp('${id}','${currentName.replace(/'/g,"\\'")}')">✕</button>
+    </div>`;
+  document.getElementById(`edit-name-${id}`)?.focus();
+}
+
+function cancelEditApp(id, originalName) {
+  const tbody = document.getElementById('apps-tbody');
+  const row = [...tbody.querySelectorAll('tr')].find(r => r.dataset.id === id);
+  if (!row) return;
+  row.cells[2].innerHTML = `<strong>${originalName}</strong>`;
+}
+
+async function saveEditApp(id) {
+  const inp = document.getElementById(`edit-name-${id}`);
+  if (!inp) return;
+  const newName = inp.value.trim();
+  if (!newName) { showToast('App name cannot be empty.'); inp.focus(); return; }
+  inp.disabled = true;
+  try {
+    await db.collection('launcher_apps').doc(id).update({ name: newName });
+    const app = allApps.find(a => a.id === id);
+    if (app) app.name = newName;
+    showToast('✅ App name updated!');
+    renderAdminApps();
+    loadAppsAndRender(document.getElementById('search')?.value || '');
+  } catch(err) {
+    showToast('⚠️ Could not save — try again.');
+    inp.disabled = false;
   }
 }
 

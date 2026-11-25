@@ -18,6 +18,9 @@
 <script src="https://unpkg.com/recharts@2/umd/Recharts.js"></script>
 <script src="https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script src="https://unpkg.com/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script>window.XLSX=window.XLSX||XLSX;</script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
 <body>
@@ -35,7 +38,7 @@
   firebase.initializeApp(firebaseConfig);
 </script>
 <script type="text/babel" id="app-source">
-const { useState, useEffect, useMemo, useCallback } = React;
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
 const { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, Cell, PieChart, Pie } = Recharts;
 
 const RESPONSES_PATH                  = "interdept2/responses";
@@ -47,6 +50,17 @@ const SETTINGS_VALID_UNTIL_PATH       = "interdept2/settings/validUntil";
 const CONFIG_DEPARTMENTS_PATH         = "interdept2/config/departments";
 const CONFIG_SHIFTS_PATH              = "interdept2/config/shifts";
 const CONFIG_PLANTS_PATH              = "interdept2/config/plants";
+const CONFIG_SUPERADMINS_PATH         = "interdept2/config/superadmins";   // {uid: {email,uid}}
+const CONFIG_MANAGED_USERS_PATH       = "interdept2/config/managedUsers";  // {uid: {email,uid,plants:[]}}
+
+// ── Bootstrap superadmin emails ──────────────────────────────
+// Add the email address(es) of your superadmin account(s) here.
+// These emails will always have superadmin rights, even before
+// the Firebase node exists. They are also auto-written to Firebase
+// on first login so future logins work via DB only.
+const SUPERADMIN_EMAILS = [
+  "sushil@polyplasticsindia.com",
+];
 const THEME_KEY = "interdept2-theme";
 
 const DEFAULT_COMPANY_NAME = "";
@@ -266,9 +280,9 @@ function HazardBar(){
   );
 }
 
-function StatCard({label,value,sub,accent}){
-  const vs=String(value),fs=vs.length>12?18:vs.length>8?24:32;
-  return (<div className="stat-card"><div className="stat-label">{label}</div><div className="stat-value" style={{fontSize:fs,...(accent?{color:accent}:{})}}>{value}</div>{sub&&<div className="stat-sub">{sub}</div>}</div>);
+function StatCard({label,value,sub,accent,onClick,title}){
+  const vs=String(value),fs=vs.length>20?12:vs.length>14?13:vs.length>10?15:vs.length>6?18:22;
+  return (<div className="stat-card" onClick={onClick} title={title} style={{cursor:onClick?"pointer":"default",transition:"transform 0.1s,box-shadow 0.1s"}} onMouseEnter={e=>{if(onClick){e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 4px 12px rgba(0,0,0,0.3)";}}} onMouseLeave={e=>{e.currentTarget.style.transform="";e.currentTarget.style.boxShadow="";}}><div className="stat-label">{label}{onClick&&<span style={{marginLeft:4,opacity:0.5,fontSize:9}}>▼</span>}</div><div className="stat-value" style={{fontSize:fs,lineHeight:1.25,wordBreak:"break-word",overflowWrap:"break-word",...(accent?{color:accent}:{})}}>{value}</div>{sub&&<div className="stat-sub">{sub}</div>}</div>);
 }
 
 function MiniStarRating({ value, onChange }) {
@@ -295,7 +309,7 @@ function MiniStarRating({ value, onChange }) {
   );
 }
 
-function SurveyForm({onSubmit,logoUrl,plants,departments,shifts,ratingGuidelines,isAdmin,onAddDummyEntry,validUntil}){
+function SurveyForm({onSubmit,logoUrl,plants,departments,shifts,ratingGuidelines,isAdmin,onAddDummyEntry,validUntil,existingResponses}){
   const [step,setStep]=useState(1);
   const [plant,setPlant]=useState(plants.length===1?plants[0]:"");
   const [myDept,setMyDept]=useState("");
@@ -384,13 +398,30 @@ function SurveyForm({onSubmit,logoUrl,plants,departments,shifts,ratingGuidelines
   };
 
   const handleNext=()=>{
+    if(!empCode.trim()){setError("Employee Code is required.");return;}
     if((plants.length>1&&!plant)||!myDept||!shift||!tenure){setError("Please fill in all fields before continuing.");return;}
     setError("");setStep(2);window.scrollTo(0,0);
   };
 
   const handleSubmit=async()=>{
+    if(!empCode.trim()){setError("Employee Code is required.");setStep(1);window.scrollTo(0,0);return;}
     const rated=ratableDepts.filter((d)=>ratings[d]&&ratings[d].factors&&DEPT_FACTORS.some(f=>ratings[d].factors[f.id]>0));
     if(!rated.length){setError("Please rate at least one factor for at least one department before submitting.");return;}
+    // Single-entry-per-month check
+    const now=new Date();
+    const curYear=now.getFullYear();const curMonth=now.getMonth();
+    const normalCode=empCode.trim().toUpperCase();
+    const duplicate=(existingResponses||[]).find(r=>{
+      if(!r.employeeCode)return false;
+      if(r.employeeCode.toUpperCase()!==normalCode)return false;
+      const rDate=new Date(r.ts);
+      return rDate.getFullYear()===curYear&&rDate.getMonth()===curMonth&&!r._isDummy;
+    });
+    if(duplicate){
+      const monthName=now.toLocaleString("default",{month:"long"});
+      setError(`Employee Code "${empCode.trim()}" has already submitted a response for ${monthName} ${curYear}. Only one submission per employee per month is allowed.`);
+      return;
+    }
     setError("");setSaving(true);
     const payload={
       id:`r-${Date.now()}-${Math.floor(Math.random()*10000)}`,
@@ -467,7 +498,7 @@ function SurveyForm({onSubmit,logoUrl,plants,departments,shifts,ratingGuidelines
           <h2 className="form-title">Inter-Department Satisfaction</h2>
           <p className="form-sub">Step 1 of 2 — Enter your details. Your own department will be excluded from ratings.</p>
           <div className="field-row">
-            <div className="field"><label>Employee Code (optional)</label><input className="name-input" placeholder="e.g. EMP1043" value={empCode} onChange={(e)=>setEmpCode(e.target.value)}/></div>
+            <div className="field"><label>Employee Code <span style={{color:"#E8552D"}}>*</span></label><input className="name-input" placeholder="e.g. EMP1043" value={empCode} onChange={(e)=>setEmpCode(e.target.value)}/></div>
             <div className="field"><label>Employee Name (optional)</label><input className="name-input" placeholder="Your name" value={empName} onChange={(e)=>setEmpName(e.target.value)}/></div>
           </div>
           <div className="field-row">
@@ -528,10 +559,22 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
   const [pf,setPf]=useState(ALL_PLANTS_ID);
   const [rf,setRf]=useState("All");
   const [ff,setFf]=useState("All");
+  const [tf,setTf]=useState("All"); // tenure filter
+  const tableRef=useRef(null);
+  const scrollToTable=()=>setTimeout(()=>tableRef.current&&tableRef.current.scrollIntoView({behavior:"smooth",block:"start"}),50);
+  const applyFilter=(opts)=>{
+    if(opts.rf!==undefined)setRf(opts.rf);
+    if(opts.ff!==undefined)setFf(opts.ff);
+    if(opts.tf!==undefined)setTf(opts.tf);
+    if(opts.pf!==undefined)setPf(opts.pf);
+    scrollToTable();
+  };
+  const clearFilters=()=>{setRf("All");setFf("All");setTf("All");};
   const [selIds,setSelIds]=useState({});
   const [bulkBusy,setBulkBusy]=useState(false);
   const [bulkErr,setBulkErr]=useState("");
   const [expBusy,setExpBusy]=useState(false);
+  const [expXlsBusy,setExpXlsBusy]=useState(false);
   const [dummyBusy,setDummyBusy]=useState(false);
   const [dummyCount,setDummyCount]=useState(0);
   const ct=CHART_THEME[theme]||CHART_THEME.dark;
@@ -545,15 +588,15 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
     return rows;
   },[responses]);
 
-  const filteredResponses=useMemo(()=>responses.filter((r)=>pf===ALL_PLANTS_ID||r.plant===pf),[responses,pf]);
-  const filteredFlatRows=useMemo(()=>flatRows.filter((r)=>pf===ALL_PLANTS_ID||r.plant===pf),[flatRows,pf]);
-  const filtered=useMemo(()=>flatRows.filter((r)=>(pf===ALL_PLANTS_ID||r.plant===pf)&&(rf==="All"||r.ratedDept===rf)&&(ff==="All"||r.submitterDept===ff)),[flatRows,pf,rf,ff]);
+  const filteredResponses=useMemo(()=>responses.filter((r)=>(pf===ALL_PLANTS_ID||r.plant===pf)&&(tf==="All"||r.tenure===tf)),[responses,pf,tf]);
+  const filteredFlatRows=useMemo(()=>flatRows.filter((r)=>(pf===ALL_PLANTS_ID||r.plant===pf)&&(tf==="All"||r.tenure===tf)),[flatRows,pf,tf]);
+  const filtered=useMemo(()=>flatRows.filter((r)=>(pf===ALL_PLANTS_ID||r.plant===pf)&&(rf==="All"||r.ratedDept===rf)&&(ff==="All"||r.submitterDept===ff)&&(tf==="All"||r.tenure===tf)),[flatRows,pf,rf,ff,tf]);
   const overall=useMemo(()=>{const v=filtered.filter((r)=>r.rating>0);return v.length?v.reduce((s,r)=>s+r.rating,0)/v.length:0;},[filtered]);
 
   const deptData=useMemo(()=>{
     const m={};
     filtered.forEach((r)=>{if(!r.rating)return;if(!m[r.ratedDept])m[r.ratedDept]={total:0,count:0};m[r.ratedDept].total+=r.rating;m[r.ratedDept].count+=1;});
-    return Object.entries(m).map(([name,d])=>({name,score:parseFloat((d.total/d.count).toFixed(2)),count:d.count})).sort((a,b)=>b.score-a.score);
+    return Object.entries(m).map(([name,d])=>({name,score:Math.round((d.total/d.count)*10)/10,count:d.count})).sort((a,b)=>b.score-a.score||b.count-a.count);
   },[filtered]);
 
   const topDept=deptData[0],lowDept=deptData.length>1?deptData[deptData.length-1]:null;
@@ -1000,7 +1043,7 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
       // ── Dept bar chart ─────────────────────────────────────────
       if(deptData.length){
         sectionHead("Average Rating by Department");
-        const dSorted=[...deptData].sort((a,b)=>b.score-a.score);
+        const dSorted=[...deptData].sort((a,b)=>b.score-a.score||b.count-a.count);
         const labelColW=42;
         const barAreaX=margin+labelColW;
         const barAreaW=contentW-labelColW-18;
@@ -1089,6 +1132,33 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
           margin:{left:margin,right:margin},
         });
         y=doc.lastAutoTable.finalY+6;
+      }
+
+      // ── Department-wise Participation ───────────────────────
+      {
+        const deptPartPdf={};
+        filteredResponses.forEach(r=>{
+          const d=r.submitterDept;if(!d)return;
+          if(!deptPartPdf[d]){deptPartPdf[d]={dept:d,count:0,empCodes:new Set()};}
+          deptPartPdf[d].count+=1;
+          if(r.employeeCode)deptPartPdf[d].empCodes.add(r.employeeCode.toUpperCase());
+        });
+        const partRows=Object.values(deptPartPdf).sort((a,b)=>b.count-a.count);
+        const partTotal=partRows.reduce((s,r)=>s+r.count,0);
+        if(partRows.length){
+          sectionHead("Department-wise Participation");
+          if(y>pageH-40){doc.addPage();y=margin;}
+          doc.autoTable({
+            startY:y,
+            head:[["Department","Submissions","Unique Employees","Share %"]],
+            body:partRows.map(r=>[r.dept,r.count,r.empCodes.size,partTotal?`${Math.round(r.count/partTotal*100)}%`:"0%"]),
+            styles:{fontSize:8,cellPadding:3},
+            headStyles:{fillColor:[99,102,241],textColor:255,fontStyle:"bold",fontSize:8},
+            columnStyles:{1:{halign:"center"},2:{halign:"center"},3:{halign:"center"}},
+            margin:{left:margin,right:margin},
+          });
+          y=doc.lastAutoTable.finalY+6;
+        }
       }
 
       // ── Trend ─────────────────────────────────────────────────
@@ -1194,10 +1264,87 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
     setExpBusy(false);
   };
 
+  const handleExportExcel=()=>{
+    if(!window.XLSX){setBulkErr("Excel library not loaded yet. Please wait a moment and try again.");return;}
+    setExpXlsBusy(true);
+    try{
+      const XLSX=window.XLSX;
+      const wb=XLSX.utils.book_new();
+      const dateStr=new Date().toISOString().slice(0,10);
+
+      // ── Sheet 1: All Responses ────────────────────────────
+      const respHeader=["Date","Plant","Emp Code","Emp Name","From Dept","Rated Dept","Collaboration","Communication","Responsiveness","Quality of Work","Support & Helpfulness","Avg Rating","Comment","Shift","Tenure"];
+      const respBody=filtered.map(r=>[
+        new Date(r.ts).toLocaleDateString(),
+        r.plant||"",r.employeeCode||"",r.employeeName||"",
+        r.submitterDept,r.ratedDept,
+        r.factors&&r.factors.collaboration||"",
+        r.factors&&r.factors.communication||"",
+        r.factors&&r.factors.responsiveness||"",
+        r.factors&&r.factors.quality_of_work||"",
+        r.factors&&r.factors.support_helpfulness||"",
+        r.rating?parseFloat(fmt1(r.rating)):"",
+        r.comment||"",r.shift,r.tenure||"",
+      ]);
+      const wsResp=XLSX.utils.aoa_to_sheet([respHeader,...respBody]);
+      wsResp["!cols"]=[{wch:12},{wch:14},{wch:12},{wch:18},{wch:20},{wch:20},{wch:14},{wch:14},{wch:14},{wch:14},{wch:18},{wch:11},{wch:36},{wch:10},{wch:10}];
+      XLSX.utils.book_append_sheet(wb,wsResp,"All Responses");
+
+      // ── Sheet 2: Dept Summary ─────────────────────────────
+      const dSorted=[...deptData].sort((a,b)=>b.score-a.score||b.count-a.count);
+      const deptHeader=["Department","Avg Rating","Ratings Count"];
+      const deptBody=dSorted.map(d=>[d.name,parseFloat(fmt1(d.score)),d.count]);
+      const wsDept=XLSX.utils.aoa_to_sheet([deptHeader,...deptBody]);
+      wsDept["!cols"]=[{wch:24},{wch:12},{wch:14}];
+      XLSX.utils.book_append_sheet(wb,wsDept,"Dept Rating Summary");
+
+      // ── Sheet 3: Factor Breakdown ─────────────────────────
+      const fbHeader=["Department",...DEPT_FACTORS.map(f=>f.label),"Overall"];
+      const pdfFa={};
+      filtered.forEach(r=>{
+        if(!r.factors||!Object.keys(r.factors).length)return;
+        if(!pdfFa[r.ratedDept])pdfFa[r.ratedDept]={};
+        DEPT_FACTORS.forEach(f=>{
+          const v=r.factors[f.id];
+          if(v>0){if(!pdfFa[r.ratedDept][f.id])pdfFa[r.ratedDept][f.id]=[];pdfFa[r.ratedDept][f.id].push(v);}
+        });
+      });
+      const fbBody=Object.keys(pdfFa).sort().map(dept=>{
+        const fm=pdfFa[dept];
+        const vals=DEPT_FACTORS.map(f=>{const arr=fm[f.id]||[];return arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0;});
+        const nonZero=vals.filter(v=>v>0);
+        const ov=nonZero.length?nonZero.reduce((a,b)=>a+b,0)/nonZero.length:0;
+        return[dept,...vals.map(v=>v>0?parseFloat(fmt1(v)):""),ov>0?parseFloat(fmt1(ov)):""];
+      });
+      const wsFb=XLSX.utils.aoa_to_sheet([fbHeader,...fbBody]);
+      wsFb["!cols"]=[{wch:24},...DEPT_FACTORS.map(()=>({wch:18})),{wch:10}];
+      XLSX.utils.book_append_sheet(wb,wsFb,"Factor Breakdown");
+
+      // ── Sheet 4: Dept-wise Participation ─────────────────
+      const deptPartXls={};
+      filteredResponses.forEach(r=>{
+        const d=r.submitterDept;if(!d)return;
+        if(!deptPartXls[d]){deptPartXls[d]={dept:d,count:0,empCodes:new Set()};}
+        deptPartXls[d].count+=1;
+        if(r.employeeCode)deptPartXls[d].empCodes.add(r.employeeCode.toUpperCase());
+      });
+      const partRowsXls=Object.values(deptPartXls).sort((a,b)=>b.count-a.count);
+      const partTotalXls=partRowsXls.reduce((s,r)=>s+r.count,0);
+      const partHeader=["Department","Submissions","Unique Employees","Share %"];
+      const partBody=partRowsXls.map(r=>[r.dept,r.count,r.empCodes.size,partTotalXls?parseFloat((r.count/partTotalXls*100).toFixed(1)):0]);
+      const wsPart=XLSX.utils.aoa_to_sheet([partHeader,...partBody]);
+      wsPart["!cols"]=[{wch:24},{wch:14},{wch:18},{wch:10}];
+      XLSX.utils.book_append_sheet(wb,wsPart,"Dept Participation");
+
+      XLSX.writeFile(wb,`inter-dept-satisfaction-${dateStr}.xlsx`);
+    }catch(e){console.error("Excel export failed:",e);setBulkErr((e&&e.message)||String(e));}
+    setExpXlsBusy(false);
+  };
+
   return(
     <div className="dash-grid">
       {plants.length>1&&<div className="plant-pill-bar">{<button className={"plant-pill"+(pf===ALL_PLANTS_ID?" active":"")} onClick={()=>setPf(ALL_PLANTS_ID)}>All Plants</button>}{plants.map((p)=><button key={p} className={"plant-pill"+(pf===p?" active":"")} onClick={()=>setPf(p)}>{p}</button>)}</div>}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:6}}>
         <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
           <button
             className="submit-btn small-btn"
@@ -1210,7 +1357,10 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
           </button>
           {dummyCount>0&&<span style={{fontSize:12,color:"#9B6BD1",fontWeight:600}}>{dummyCount} dummy entr{dummyCount===1?"y":"ies"} added this session</span>}
         </div>
-        <button className="submit-btn small-btn" style={{background:"#3E8FB0"}} onClick={handleExportPdf} disabled={expBusy||!flatRows.length}>{expBusy?"…":"Export PDF"}</button>
+        <div style={{display:"flex",gap:8}}>
+          <button className="submit-btn small-btn" style={{background:"#4C9A6A"}} onClick={handleExportExcel} disabled={expXlsBusy||!flatRows.length}>{expXlsBusy?"…":"Export Excel"}</button>
+          <button className="submit-btn small-btn" style={{background:"#3E8FB0"}} onClick={handleExportPdf} disabled={expBusy||!flatRows.length}>{expBusy?"…":"Export PDF"}</button>
+        </div>
       </div>
       <div className="filter-bar">
         <div className="filter-field"><label>Rated Department</label><select value={rf} onChange={(e)=>setRf(e.target.value)}><option value="All">All departments</option>{ratedOpts.map((d)=><option key={d} value={d}>{d}</option>)}</select></div>
@@ -1218,122 +1368,378 @@ function Dashboard({responses,theme,plants,departments,shifts,companyName,logoUr
         <div className="filter-count">{filtered.length} rating{filtered.length===1?"":"s"}</div>
       </div>
 
-      <div className="panel-row top-row">
-        <div className="gauge-panel"><div className="panel-title">Overall Satisfaction</div><Gauge value={overall} theme={theme}/></div>
-        <div className="kpi-grid">
-          <StatCard label="Total Submissions" value={filteredResponses.length}/>
-          <StatCard label="Total Ratings" value={filtered.length}/>
-          <StatCard label="Highest Rated" value={topDept?topDept.name:"—"} sub={topDept?`${fmt1(topDept.score)} / 5.0`:""} accent="#4C9A6A"/>
-          <StatCard label="Needs Attention" value={lowDept?lowDept.name:"—"} sub={lowDept?`${fmt1(lowDept.score)} / 5.0`:""} accent="#E8552D"/>
+      {/* ── Top row: Gauge + KPIs (left) | Tenure chart (right) ── */}
+      <div style={{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap",alignItems:"stretch"}}>
+        {/* left: gauge + kpi */}
+        <div style={{display:"flex",gap:12,flex:"2 1 480px",flexWrap:"wrap",alignItems:"stretch"}}>
+          <div className="gauge-panel" style={{flex:"1 1 180px"}}><div className="panel-title">Overall Satisfaction</div><Gauge value={overall} theme={theme}/></div>
+          <div className="kpi-grid" style={{flex:"2 1 240px"}}>
+            <StatCard label="Total Submissions" value={filteredResponses.length} onClick={()=>{clearFilters();scrollToTable();}} title="Click to show all responses"/>
+            <StatCard label="Total Ratings" value={filtered.length} onClick={()=>{clearFilters();scrollToTable();}} title="Click to show all responses"/>
+            <StatCard label="Highest Rated" value={topDept?topDept.name:"—"} sub={topDept?`${fmt1(topDept.score)} / 5.0`:""} accent="#4C9A6A" onClick={topDept?()=>applyFilter({rf:topDept.name}):null} title={topDept?"Click to filter by "+topDept.name:""}/>
+            <StatCard label="Needs Attention" value={lowDept?lowDept.name:"—"} sub={lowDept?`${fmt1(lowDept.score)} / 5.0`:""} accent="#E8552D" onClick={lowDept?()=>applyFilter({rf:lowDept.name}):null} title={lowDept?"Click to filter by "+lowDept.name:""}/>
+          </div>
+        </div>
+        {/* right: tenure */}
+        <div className="panel" style={{flex:"1 1 280px",margin:0}}>
+          <div className="panel-title">Responses by Tenure</div>
+          {tenureData.length?(<div className="tenure-donut-wrap">
+            <div className="tenure-donut-chart">
+              <ResponsiveContainer width="100%" height={180}>
+                <PieChart><Pie data={tenureData} dataKey="count" nameKey="name" cx="50%" cy="50%" innerRadius={52} outerRadius={80} paddingAngle={3} stroke="none" onClick={(d)=>d&&applyFilter({tf:d.key})} style={{cursor:"pointer"}}>
+                  {tenureData.map((e,i)=><Cell key={i} fill={e.color} opacity={tf==="All"||tf===e.key?1:0.35}/>)}
+                </Pie><Tooltip contentStyle={{background:ct.tooltipBg,border:`1px solid ${ct.tooltipBorder}`,borderRadius:4}} formatter={(v,n,p)=>[`${v} (${p.payload.pct}%) — click to filter`,n]}/></PieChart>
+              </ResponsiveContainer>
+              <div className="tenure-donut-center" onClick={()=>applyFilter({tf:"All"})} style={{cursor:"pointer"}} title="Click to show all tenure"><div className="tenure-donut-total">{tenureTotal}</div><div className="tenure-donut-total-label">responses</div></div>
+            </div>
+            <div className="tenure-stats-list">{tenureData.map((d)=>(<div className="tenure-stat-row" key={d.key} onClick={()=>applyFilter({tf:d.key})} title={`Filter by ${d.name}`} style={{cursor:"pointer",opacity:tf==="All"||tf===d.key?1:0.45,transition:"opacity 0.15s"}}><div className="tenure-stat-top"><span className="tenure-stat-dot" style={{background:d.color}}/><span className="tenure-stat-name">{d.name}</span><span className="tenure-stat-pct">{d.pct}%</span><span className="tenure-stat-count">{d.count}</span></div><div className="tenure-stat-bar-track"><div className="tenure-stat-bar-fill" style={{width:`${d.pct}%`,background:d.color}}/></div></div>))}</div>
+          </div>):<div className="empty-note">No responses yet.</div>}
         </div>
       </div>
 
-      <div className="panel">
-        <div className="panel-title">Responses by Tenure</div>
-        {tenureData.length?(<div className="tenure-donut-wrap">
-          <div className="tenure-donut-chart">
-            <ResponsiveContainer width="100%" height={240}>
-              <PieChart><Pie data={tenureData} dataKey="count" nameKey="name" cx="50%" cy="50%" innerRadius={72} outerRadius={106} paddingAngle={3} stroke="none">
-                {tenureData.map((e,i)=><Cell key={i} fill={e.color}/>)}
-              </Pie><Tooltip contentStyle={{background:ct.tooltipBg,border:`1px solid ${ct.tooltipBorder}`,borderRadius:4}} formatter={(v,n,p)=>[`${v} (${p.payload.pct}%)`,n]}/></PieChart>
-            </ResponsiveContainer>
-            <div className="tenure-donut-center"><div className="tenure-donut-total">{tenureTotal}</div><div className="tenure-donut-total-label">responses</div></div>
+      {/* ── Dept-wise (LEFT vertical) + Plant-wise (RIGHT horizontal) ── */}
+      {filteredResponses.length>0&&(()=>{
+        /* build maps */
+        const validPlantSet=new Set(plants);
+        const deptMap={},plantMap={};
+        filteredResponses.forEach(r=>{
+          /* skip responses from plants no longer in the live list */
+          if(r.plant&&!validPlantSet.has(r.plant))return;
+          /* dept */
+          const d=r.submitterDept||"Unknown";
+          if(!deptMap[d])deptMap[d]={dept:d,count:0,empCodes:new Set(),avgSum:0,avgCount:0};
+          deptMap[d].count+=1;
+          if(r.employeeCode)deptMap[d].empCodes.add(r.employeeCode.toUpperCase());
+          /* plant */
+          const p=r.plant||"Unknown";
+          if(!plantMap[p])plantMap[p]={plant:p,count:0,empCodes:new Set(),avgSum:0,avgCount:0};
+          plantMap[p].count+=1;
+          if(r.employeeCode)plantMap[p].empCodes.add(r.employeeCode.toUpperCase());
+          /* avg for both */
+          const vals=Object.values(r.deptRatings||{}).map(info=>{
+            if(info&&info.factors){const fv=Object.values(info.factors).filter(v=>v>0);return fv.length?fv.reduce((a,b)=>a+b,0)/fv.length:0;}
+            return typeof info==="number"?info:0;
+          }).filter(v=>v>0);
+          if(vals.length){
+            const avg=vals.reduce((a,b)=>a+b,0)/vals.length;
+            deptMap[d].avgSum+=avg;deptMap[d].avgCount+=1;
+            plantMap[p].avgSum+=avg;plantMap[p].avgCount+=1;
+          }
+        });
+        const deptRows=Object.values(deptMap).sort((a,b)=>b.count-a.count);
+        const plantRows=Object.values(plantMap).sort((a,b)=>b.count-a.count);
+        const dTotal=deptRows.reduce((s,r)=>s+r.count,0);
+        const pTotal=plantRows.reduce((s,r)=>s+r.count,0);
+        const scoreCol=v=>v>=4?"#4C9A6A":v>=3?"#F5B400":"#E8552D";
+        const thS={padding:"7px 10px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",whiteSpace:"nowrap"};
+        const tdS={padding:"6px 8px",borderBottom:"1px solid var(--panel-border)",fontSize:12};
+        return(
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+
+            {/* LEFT — Dept-wise (vertical layout: dept in rows) */}
+            <div className="panel" style={{margin:0}}>
+              <div className="panel-title">Dept-wise Responses</div>
+              <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead><tr style={{textAlign:"left"}}>
+                    <th style={thS}>Department</th>
+                    <th style={{...thS,textAlign:"center"}}>Count</th>
+                    <th style={{...thS,textAlign:"center"}}>Emp</th>
+                    <th style={{...thS,textAlign:"center"}}>Avg</th>
+                    <th style={{...thS,textAlign:"center"}}>%</th>
+                  </tr></thead>
+                  <tbody>{deptRows.map((r,i)=>{
+                    const pct=dTotal?Math.round(r.count/dTotal*100):0;
+                    const avg=r.avgCount?r.avgSum/r.avgCount:0;
+                    const isActive=ff===r.dept;
+                    return(
+                      <tr key={r.dept} onClick={()=>applyFilter({ff:isActive?"All":r.dept})} title={isActive?"Click to clear filter":"Click to filter by "+r.dept} style={{background:isActive?"rgba(99,102,241,0.15)":i%2===0?"var(--bg-page)":"var(--bg-panel)",cursor:"pointer",transition:"background 0.15s"}}>
+                        <td style={{...tdS,fontWeight:600,color:isActive?"#9B6BD1":"var(--text-primary)",maxWidth:150,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.dept}>{r.dept}{isActive&&<span style={{marginLeft:4,fontSize:10,color:"#9B6BD1"}}>✕</span>}</td>
+                        <td style={{...tdS,textAlign:"center",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#3E8FB0"}}>{r.count}</td>
+                        <td style={{...tdS,textAlign:"center",fontFamily:"'IBM Plex Mono',monospace",color:"#4C9A6A"}}>{r.empCodes.size}</td>
+                        <td style={{...tdS,textAlign:"center"}}>{avg>0?<span style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:scoreCol(avg)}}>{avg.toFixed(1)}</span>:<span style={{color:"var(--text-tertiary)"}}>—</span>}</td>
+                        <td style={{...tdS,textAlign:"center"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:4}}>
+                            <div style={{width:36,background:"var(--panel-border)",borderRadius:2,height:5}}>
+                              <div style={{width:`${pct}%`,background:"linear-gradient(90deg,#9B6BD1,#6366F1)",borderRadius:2,height:5}}/>
+                            </div>
+                            <span style={{fontSize:11,color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{pct}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}</tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* RIGHT — Plant-wise (vertical rows, same layout as dept-wise) */}
+            <div className="panel" style={{margin:0}}>
+              <div className="panel-title">Plant-wise Responses</div>
+              <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead><tr style={{textAlign:"left"}}>
+                    <th style={thS}>Plant</th>
+                    <th style={{...thS,textAlign:"center"}}>Count</th>
+                    <th style={{...thS,textAlign:"center"}}>Emp</th>
+                    <th style={{...thS,textAlign:"center"}}>Avg</th>
+                    <th style={{...thS,textAlign:"center"}}>%</th>
+                  </tr></thead>
+                  <tbody>{plantRows.map((r,i)=>{
+                    const pct=pTotal?Math.round(r.count/pTotal*100):0;
+                    const avg=r.avgCount?r.avgSum/r.avgCount:0;
+                    const isActive=pf===r.plant;
+                    return(
+                      <tr key={r.plant} onClick={()=>{setPf(isActive?ALL_PLANTS_ID:r.plant);scrollToTable();}} title={isActive?"Click to clear filter":"Click to filter by "+r.plant} style={{background:isActive?"rgba(62,143,176,0.15)":i%2===0?"var(--bg-page)":"var(--bg-panel)",cursor:"pointer",transition:"background 0.15s"}}>
+                        <td style={{...tdS,fontWeight:600,color:isActive?"#3E8FB0":"var(--text-primary)",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.plant}>{r.plant}{isActive&&<span style={{marginLeft:4,fontSize:10,color:"#3E8FB0"}}>✕</span>}</td>
+                        <td style={{...tdS,textAlign:"center",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:"#3E8FB0"}}>{r.count}</td>
+                        <td style={{...tdS,textAlign:"center",fontFamily:"'IBM Plex Mono',monospace",color:"#4C9A6A"}}>{r.empCodes.size}</td>
+                        <td style={{...tdS,textAlign:"center"}}>{avg>0?<span style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:scoreCol(avg)}}>{avg.toFixed(1)}</span>:<span style={{color:"var(--text-tertiary)"}}>—</span>}</td>
+                        <td style={{...tdS,textAlign:"center"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:4}}>
+                            <div style={{width:36,background:"var(--panel-border)",borderRadius:2,height:5}}>
+                              <div style={{width:`${pct}%`,background:"linear-gradient(90deg,#3E8FB0,#6366F1)",borderRadius:2,height:5}}/>
+                            </div>
+                            <span style={{fontSize:11,color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{pct}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}</tbody>
+                </table>
+              </div>
+            </div>
+
           </div>
-          <div className="tenure-stats-list">{tenureData.map((d)=>(<div className="tenure-stat-row" key={d.key}><div className="tenure-stat-top"><span className="tenure-stat-dot" style={{background:d.color}}/><span className="tenure-stat-name">{d.name}</span><span className="tenure-stat-pct">{d.pct}%</span><span className="tenure-stat-count">{d.count}</span></div><div className="tenure-stat-bar-track"><div className="tenure-stat-bar-fill" style={{width:`${d.pct}%`,background:d.color}}/></div></div>))}</div>
-        </div>):<div className="empty-note">No responses yet.</div>}
-      </div>
+        );
+      })()}
 
-      <div className="panel">
-        <div className="panel-title">Average Rating by Department</div>
-        {deptData.length?(<ResponsiveContainer width="100%" height={Math.max(160,deptData.length*44)}>
-          <BarChart data={deptData} layout="vertical" margin={{left:10,right:40,top:5,bottom:5}}>
-            <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} horizontal={false}/>
-            <XAxis type="number" domain={[0,5]} stroke={ct.axis} fontSize={11} ticks={[1,2,3,4,5]}/>
-            <YAxis type="category" dataKey="name" stroke={ct.axis} fontSize={11} width={typeof window!=="undefined"&&window.innerWidth<600?110:180}/>
-            <Tooltip contentStyle={{background:ct.tooltipBg,border:`1px solid ${ct.tooltipBorder}`,borderRadius:4}} labelStyle={{color:ct.tooltipLabel}} formatter={(v,n,p)=>[`${v} (${p.payload.count} rating${p.payload.count===1?"":"s"})`,"Avg"]}/>
-            <Bar dataKey="score" radius={[0,3,3,0]}>
-              {deptData.map((d,i)=><Cell key={i} fill={d.score>=4?"#4C9A6A":d.score>=3?"#F5B400":"#E8552D"}/>)}
-            </Bar>
-          </BarChart>
-        </ResponsiveContainer>):<div className="empty-note">No ratings match the current filters.</div>}
-      </div>
+      {/* ── Dept × Plant Participation Matrix ── */}
+      {filteredResponses.length>0&&(()=>{
+        /* use live plants list; collect depts from responses */
+        const validPlants=new Set(plants);
+        const deptSet=new Set();
+        filteredResponses.forEach(r=>{
+          if(r.submitterDept)deptSet.add(r.submitterDept);
+        });
+        const plantCols=[...plants].sort();   /* only configured plants */
+        const depts=[...deptSet].sort();
+        /* matrix: deptMap[dept][plant] = Set of employeeCodes */
+        const matrix={};
+        depts.forEach(d=>{matrix[d]={};plantCols.forEach(p=>{matrix[d][p]=new Set();});});
+        filteredResponses.forEach(r=>{
+          const d=r.submitterDept||"Unknown",p=r.plant||"Unknown";
+          /* skip responses whose plant is no longer in the live list */
+          if(!validPlants.has(p))return;
+          if(matrix[d]&&matrix[d][p]!==undefined){
+            const code=(r.employeeCode||r.id||"?").toUpperCase();
+            matrix[d][p].add(code);
+          }
+        });
+        /* row totals (unique emp per dept across configured plants only) */
+        const rowTotal={};
+        depts.forEach(d=>{
+          const all=new Set();
+          plantCols.forEach(p=>matrix[d][p].forEach(c=>all.add(c)));
+          rowTotal[d]=all.size;
+        });
+        /* col totals */
+        const colTotal={};
+        plantCols.forEach(p=>{
+          const all=new Set();
+          depts.forEach(d=>matrix[d][p].forEach(c=>all.add(c)));
+          colTotal[p]=all.size;
+        });
+        /* grand total: unique emp in configured plants only */
+        const grandSet=new Set();
+        filteredResponses.forEach(r=>{if(validPlants.has(r.plant||""))grandSet.add((r.employeeCode||r.id||"?").toUpperCase());});
+        const grandTotal=grandSet.size;
 
-      {Object.keys(factorAvgs).length>0&&(
-        <div className="panel dash-full">
-          <div className="panel-title">Factor Breakdown by Department</div>
-          <div style={{overflowX:"auto"}}>
-            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:520}}>
-              <thead>
-                <tr>
-                  <th style={{textAlign:"left",padding:"8px 12px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:160}}>Department</th>
-                  {DEPT_FACTORS.map(f=>(
-                    <th key={f.id} style={{textAlign:"center",padding:"8px 8px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.4px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:110}}>
-                      <span style={{display:"block"}}>{f.icon}</span>{f.label}
-                    </th>
-                  ))}
-                  <th style={{textAlign:"center",padding:"8px 8px",fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.4px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:80}}>Overall</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(factorAvgs).sort(([a],[b])=>a.localeCompare(b)).map(([dept,fm],di)=>{
-                  const overallVals=DEPT_FACTORS.map(f=>fm[f.id]).filter(v=>v>0);
-                  const overallAvgDept=overallVals.length?overallVals.reduce((a,b)=>a+b,0)/overallVals.length:0;
-                  const scoreCol=(v)=>v>=4?"#4C9A6A":v>=3?"#F5B400":"#E8552D";
-                  return(
-                    <tr key={dept} style={{background:di%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
-                      <td style={{padding:"10px 12px",fontWeight:600,color:"var(--text-primary)",borderBottom:"1px solid var(--panel-border)"}}>{dept}</td>
-                      {DEPT_FACTORS.map(f=>{
-                        const v=fm[f.id]||0;
+        /* hide rows where every configured-plant cell is empty */
+        const visibleDepts=depts.filter(d=>plantCols.some(p=>matrix[d][p].size>0));
+
+        const thS={padding:"5px 8px",fontSize:10,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",whiteSpace:"nowrap",textAlign:"center"};
+        const tdS={padding:"5px 8px",borderBottom:"1px solid var(--panel-border)",fontSize:11,textAlign:"center",fontFamily:"'IBM Plex Mono',monospace"};
+        const maxVal=Math.max(...visibleDepts.flatMap(d=>plantCols.map(p=>matrix[d][p].size)),1);
+        const cellBg=(n)=>{
+          if(n===0)return"transparent";
+          const intensity=Math.round(30+Math.min(n/maxVal,1)*70);
+          return`rgba(62,143,176,${intensity/100})`;
+        };
+
+        return(
+          <div className="panel dash-full">
+            <div className="panel-title">Participation Matrix — Employees by Dept × Plant</div>
+            <div style={{fontSize:11,color:"var(--text-secondary)",marginBottom:8}}>Rows = department · Columns = configured plants only · Values = unique employees participated</div>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",minWidth:Math.max(400,plantCols.length*72+160)}}>
+                <thead>
+                  <tr>
+                    <th style={{...thS,textAlign:"left",minWidth:150}}>Department</th>
+                    {plantCols.map(p=><th key={p} style={thS}>{p}</th>)}
+                    <th style={{...thS,background:"var(--bg-page)",color:"var(--text-primary)"}}>Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleDepts.map((d,di)=>(
+                    <tr key={d} style={{background:di%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
+                      <td style={{...tdS,textAlign:"left",fontWeight:600,color:"var(--text-primary)",fontFamily:"inherit",padding:"8px 10px"}}>{d}</td>
+                      {plantCols.map(p=>{
+                        const n=matrix[d][p].size;
                         return(
-                          <td key={f.id} style={{textAlign:"center",padding:"10px 8px",borderBottom:"1px solid var(--panel-border)"}}>
-                            {v>0?(
-                              <div>
-                                <div style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,fontSize:15,color:scoreCol(v)}}>{fmt1(v)}</div>
-                                <div style={{fontSize:10,color:"var(--text-tertiary)"}}>/5</div>
-                              </div>
-                            ):<span style={{color:"var(--text-tertiary)"}}>—</span>}
+                          <td key={p} style={{...tdS,background:cellBg(n),color:n>0?"var(--text-primary)":"var(--text-tertiary)",fontWeight:n>0?700:400}}
+                            title={n>0?`${n} employee${n===1?"":"s"} from ${d} at ${p}`:""}>
+                            {n>0?n:"—"}
                           </td>
                         );
                       })}
-                      <td style={{textAlign:"center",padding:"10px 8px",borderBottom:"1px solid var(--panel-border)"}}>
-                        {overallAvgDept>0?(
-                          <div>
-                            <div style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,fontSize:15,color:scoreCol(overallAvgDept)}}>{fmt1(overallAvgDept)}</div>
-                            <div style={{fontSize:10,color:"var(--text-tertiary)"}}>/5</div>
-                          </div>
-                        ):<span style={{color:"var(--text-tertiary)"}}>—</span>}
-                      </td>
+                      <td style={{...tdS,fontWeight:700,color:"#3E8FB0",background:"var(--bg-page)",borderLeft:"2px solid var(--panel-border)"}}>{rowTotal[d]}</td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                  ))}
+                  {/* col totals footer */}
+                  <tr style={{borderTop:"2px solid var(--panel-border)"}}>
+                    <td style={{...tdS,textAlign:"left",fontWeight:700,color:"var(--text-primary)",fontFamily:"inherit",padding:"8px 10px"}}>Total</td>
+                    {plantCols.map(p=><td key={p} style={{...tdS,fontWeight:700,color:"#4C9A6A"}}>{colTotal[p]}</td>)}
+                    <td style={{...tdS,fontWeight:700,color:"#9B6BD1",borderLeft:"2px solid var(--panel-border)"}}>{grandTotal}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div style={{marginTop:10,display:"flex",alignItems:"center",gap:6,fontSize:11,color:"var(--text-secondary)"}}>
+              <span>Low</span>
+              {[0.1,0.3,0.5,0.7,1.0].map(v=><div key={v} style={{width:20,height:12,borderRadius:2,background:`rgba(62,143,176,${0.3+v*0.7})`}}/>)}
+              <span>High</span>
+              <span style={{marginLeft:12,color:"var(--text-tertiary)"}}>— = no participation</span>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── Avg Rating by Dept (left) | Trend + Comments (right) ── */}
+      <div style={{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap",alignItems:"stretch"}}>
+        <div className="panel" style={{flex:"3 1 420px",margin:0}}>
+          <div className="panel-title">Average Rating by Department</div>
+          {deptData.length?(<ResponsiveContainer width="100%" height={Math.max(120,deptData.length*32)}>
+            <BarChart data={deptData} layout="vertical" margin={{left:10,right:40,top:5,bottom:5}}>
+              <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} horizontal={false}/>
+              <XAxis type="number" domain={[0,5]} stroke={ct.axis} fontSize={11} ticks={[1,2,3,4,5]}/>
+              <YAxis type="category" dataKey="name" stroke={ct.axis} fontSize={11} width={typeof window!=="undefined"&&window.innerWidth<600?110:180}/>
+              <Tooltip contentStyle={{background:ct.tooltipBg,border:`1px solid ${ct.tooltipBorder}`,borderRadius:4}} labelStyle={{color:ct.tooltipLabel}} formatter={(v,n,p)=>[`${v} (${p.payload.count} rating${p.payload.count===1?"":"s"}) — click to filter`,"Avg"]}/>
+              <Bar dataKey="score" radius={[0,3,3,0]} onClick={(d)=>d&&applyFilter({rf:rf===d.name?"All":d.name})} style={{cursor:"pointer"}}>
+                {deptData.map((d,i)=><Cell key={i} fill={d.score>=4?"#4C9A6A":d.score>=3?"#F5B400":"#E8552D"} opacity={rf==="All"||rf===d.name?1:0.35}/>)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>):<div className="empty-note">No ratings match the current filters.</div>}
+        </div>
+        <div style={{flex:"2 1 260px",display:"flex",flexDirection:"column",gap:12}}>
+          <div className="panel" style={{margin:0}}>
+            <div className="panel-title">Rating Trend (Weekly Average)</div>
+            {trendData.length>1?(<ResponsiveContainer width="100%" height={140}>
+              <LineChart data={trendData} margin={{left:0,right:20,top:8,bottom:5}}>
+                <CartesianGrid strokeDasharray="3 3" stroke={ct.grid}/>
+                <XAxis dataKey="week" stroke={ct.axis} fontSize={11}/>
+                <YAxis domain={[1,5]} stroke={ct.axis} fontSize={11} ticks={[1,2,3,4,5]}/>
+                <Tooltip contentStyle={{background:ct.tooltipBg,border:`1px solid ${ct.tooltipBorder}`,borderRadius:4}} labelStyle={{color:ct.tooltipLabel}}/>
+                <Line type="monotone" dataKey="score" stroke="#F5B400" strokeWidth={2} dot={{r:3}}/>
+              </LineChart>
+            </ResponsiveContainer>):<div className="empty-note">Not enough data to show a trend yet.</div>}
+          </div>
+          <div className="panel" style={{margin:0,flex:1,overflow:"hidden"}}>
+            <div className="panel-title">Recent Comments</div>
+            {comments.length?(<div className="comment-feed" style={{maxHeight:200,overflowY:"auto"}}>{comments.map((r)=>(<div className="comment-item" key={r._fid}><div className="comment-meta"><span style={{color:"#3E8FB0",fontWeight:600}}>{r.submitterDept}</span><span>→</span><span style={{color:"#E8552D",fontWeight:600}}>{r.ratedDept}</span><span>·</span><span>{"★".repeat(r.rating)} ({r.rating}/5)</span><span>·</span><span>{new Date(r.ts).toLocaleDateString()}</span></div><p className="comment-text">{r.comment}</p></div>))}</div>):<div className="empty-note">No comments yet.</div>}
           </div>
         </div>
-      )}
-
-      <div className="panel">
-        <div className="panel-title">Rating Trend (Weekly Average)</div>
-        {trendData.length>1?(<ResponsiveContainer width="100%" height={220}>
-          <LineChart data={trendData} margin={{left:0,right:20,top:10,bottom:5}}>
-            <CartesianGrid strokeDasharray="3 3" stroke={ct.grid}/>
-            <XAxis dataKey="week" stroke={ct.axis} fontSize={11}/>
-            <YAxis domain={[1,5]} stroke={ct.axis} fontSize={11} ticks={[1,2,3,4,5]}/>
-            <Tooltip contentStyle={{background:ct.tooltipBg,border:`1px solid ${ct.tooltipBorder}`,borderRadius:4}} labelStyle={{color:ct.tooltipLabel}}/>
-            <Line type="monotone" dataKey="score" stroke="#F5B400" strokeWidth={2} dot={{r:3}}/>
-          </LineChart>
-        </ResponsiveContainer>):<div className="empty-note">Not enough data to show a trend yet.</div>}
       </div>
 
-      <div className="panel">
-        <div className="panel-title">Recent Comments</div>
-        {comments.length?(<div className="comment-feed">{comments.map((r)=>(<div className="comment-item" key={r._fid}><div className="comment-meta"><span style={{color:"#3E8FB0",fontWeight:600}}>{r.submitterDept}</span><span>→</span><span style={{color:"#E8552D",fontWeight:600}}>{r.ratedDept}</span><span>·</span><span>{"★".repeat(r.rating)} ({r.rating}/5)</span><span>·</span><span>{new Date(r.ts).toLocaleDateString()}</span></div><p className="comment-text">{r.comment}</p></div>))}</div>):<div className="empty-note">No comments yet.</div>}
-      </div>
+      {/* ── Factor Breakdown + Dept Participation — unified table ── */}
+      {(()=>{
+        const deptPart={};
+        filteredResponses.forEach(r=>{
+          const d=r.submitterDept;if(!d)return;
+          if(!deptPart[d]){deptPart[d]={count:0,empCodes:new Set()};}
+          deptPart[d].count+=1;
+          if(r.employeeCode)deptPart[d].empCodes.add(r.employeeCode.toUpperCase());
+        });
+        /* union of all depts from either source */
+        const allDepts=Array.from(new Set([...Object.keys(factorAvgs),...Object.keys(deptPart)])).sort();
+        if(!allDepts.length)return null;
+        const total=Object.values(deptPart).reduce((s,v)=>s+v.count,0);
+        const scoreCol=(v)=>v>=4?"#4C9A6A":v>=3?"#F5B400":"#E8552D";
+        const thS={padding:"6px 7px",fontSize:10,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.4px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",textAlign:"center",whiteSpace:"nowrap"};
+        const tdS={padding:"6px 7px",borderBottom:"1px solid var(--panel-border)",textAlign:"center",fontFamily:"'IBM Plex Mono',monospace",fontSize:12};
+        const dividerCol="3px solid var(--panel-border)";
+        return(
+          <div className="panel dash-full">
+            <div className="panel-title">Factor Breakdown &amp; Participation by Department</div>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead>
+                  <tr>
+                    {/* dept name */}
+                    <th style={{...thS,textAlign:"left",minWidth:140,borderRight:dividerCol}}>Department</th>
+                    {/* factor columns */}
+                    {DEPT_FACTORS.map(f=>(
+                      <th key={f.id} style={{...thS,minWidth:72}}><span style={{display:"block",fontSize:13}}>{f.icon}</span>{f.label}</th>
+                    ))}
+                    <th style={{...thS,minWidth:62,borderRight:dividerCol}}>Overall</th>
+                    {/* participation columns */}
+                    <th style={{...thS,minWidth:72}}>Sub­missions</th>
+                    <th style={{...thS,minWidth:62}}>Unique Emp</th>
+                    <th style={{...thS,minWidth:100,textAlign:"left"}}>Share</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {allDepts.map((dept,di)=>{
+                    const fm=factorAvgs[dept]||{};
+                    const overallVals=DEPT_FACTORS.map(f=>fm[f.id]||0).filter(v=>v>0);
+                    const overallAvg=overallVals.length?overallVals.reduce((a,b)=>a+b,0)/overallVals.length:0;
+                    const part=deptPart[dept]||{count:0,empCodes:new Set()};
+                    const pct=total?Math.round(part.count/total*100):0;
+                    return(
+                      <tr key={dept} style={{background:di%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
+                        <td style={{...tdS,textAlign:"left",fontFamily:"inherit",fontWeight:600,color:"var(--text-primary)",padding:"6px 10px",borderRight:dividerCol}}>{dept}</td>
+                        {DEPT_FACTORS.map(f=>{const v=fm[f.id]||0;return(
+                          <td key={f.id} style={tdS}>
+                            {v>0?<span style={{fontWeight:700,color:scoreCol(v)}}>{fmt1(v)}</span>:<span style={{color:"var(--text-tertiary)"}}>—</span>}
+                          </td>
+                        );})}
+                        <td style={{...tdS,borderRight:dividerCol}}>
+                          {overallAvg>0?<span style={{fontWeight:700,color:scoreCol(overallAvg)}}>{fmt1(overallAvg)}</span>:<span style={{color:"var(--text-tertiary)"}}>—</span>}
+                        </td>
+                        <td style={{...tdS,color:"#3E8FB0",fontWeight:700}}>{part.count||"—"}</td>
+                        <td style={{...tdS,color:"#4C9A6A",fontWeight:700}}>{part.empCodes.size||"—"}</td>
+                        <td style={{...tdS,textAlign:"left",padding:"6px 8px"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:5}}>
+                            <div style={{width:60,background:"var(--panel-border)",borderRadius:2,height:4,flexShrink:0}}>
+                              <div style={{width:`${pct}%`,background:"linear-gradient(90deg,#6366F1,#3E8FB0)",borderRadius:2,height:4}}/>
+                            </div>
+                            <span style={{fontSize:11,color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{pct}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
 
-      <div className="panel dash-full">
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12,marginBottom:14}}>
-          <div className="panel-title" style={{marginBottom:0}}>All Responses</div>
+      <div className="panel dash-full" ref={tableRef}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12,marginBottom:8}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            <div className="panel-title" style={{marginBottom:0}}>All Responses</div>
+            {/* Active filter badges */}
+            {(rf!=="All"||ff!=="All"||tf!=="All")&&(<div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+              {rf!=="All"&&<span style={{fontSize:11,background:"rgba(76,154,106,0.2)",color:"#4C9A6A",border:"1px solid rgba(76,154,106,0.4)",borderRadius:20,padding:"2px 8px",fontWeight:600,cursor:"pointer"}} onClick={()=>setRf("All")} title="Clear filter">Rated: {rf} ✕</span>}
+              {ff!=="All"&&<span style={{fontSize:11,background:"rgba(99,102,241,0.2)",color:"#9B6BD1",border:"1px solid rgba(99,102,241,0.4)",borderRadius:20,padding:"2px 8px",fontWeight:600,cursor:"pointer"}} onClick={()=>setFf("All")} title="Clear filter">From: {ff} ✕</span>}
+              {tf!=="All"&&<span style={{fontSize:11,background:"rgba(245,180,0,0.2)",color:"#F5B400",border:"1px solid rgba(245,180,0,0.4)",borderRadius:20,padding:"2px 8px",fontWeight:600,cursor:"pointer"}} onClick={()=>setTf("All")} title="Clear filter">Tenure: {tf} ✕</span>}
+              <button style={{fontSize:11,background:"none",border:"1px solid var(--panel-border)",color:"var(--text-secondary)",borderRadius:20,padding:"2px 8px",cursor:"pointer"}} onClick={clearFilters}>Clear all</button>
+            </div>)}
+          </div>
           <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <button className="submit-btn small-btn" style={{background:"#4C9A6A"}} onClick={handleExportExcel} disabled={expXlsBusy||!flatRows.length}>{expXlsBusy?"…":"Export Excel"}</button>
             <button className="submit-btn small-btn" style={{background:"#3E8FB0"}} onClick={handleExportPdf} disabled={expBusy||!flatRows.length}>{expBusy?"…":"Export PDF"}</button>
             <button className="submit-btn small-btn" style={{background:"#E8552D"}} onClick={handleDel} disabled={bulkBusy||!selCount}>{bulkBusy?"…":`Delete Selected (${selCount})`}</button>
           </div>
@@ -1438,6 +1844,986 @@ function AdminLogin({onCancel}){
   return(<div className="panel" style={{maxWidth:340,marginLeft:"auto"}}><div className="field-row" style={{marginBottom:8}}><input className="name-input" style={{flex:1}} type="email" placeholder="Email" value={email} onChange={(e)=>setEmail(e.target.value)}/></div><div className="field-row" style={{marginBottom:8}}><input className="name-input" style={{flex:1}} type="password" placeholder="Password" value={pw} onChange={(e)=>setPw(e.target.value)} onKeyDown={(e)=>{if(e.key==="Enter")go();}}/></div>{err&&<div className="error-msg">{err}</div>}<div style={{display:"flex",gap:8}}><button className="submit-btn small-btn" onClick={go} disabled={busy}>Log in</button><button className="submit-btn small-btn" style={{background:"#6C7A89"}} onClick={onCancel}>×</button></div></div>);
 }
 
+// ══════════════════════════════════════════════════════════════
+//  UsersPanel  —  superadmin creates users + assigns plants
+// ══════════════════════════════════════════════════════════════
+function UsersPanel({plants,managedUsers,currentUserUid}){
+  const [newEmail,setNewEmail]=useState("");
+  const [newPw,setNewPw]=useState("");
+  const [createBusy,setCreateBusy]=useState(false);
+  const [createErr,setCreateErr]=useState("");
+  const [createOk,setCreateOk]=useState("");
+  const [plantBusy,setPlantBusy]=useState({});
+  const [plantErr,setPlantErr]=useState("");
+  const [delBusy,setDelBusy]=useState({});
+  const [delErr,setDelErr]=useState("");
+  // "register existing" panel
+  const [regEmail,setRegEmail]=useState("");
+  const [regBusy,setRegBusy]=useState(false);
+  const [regErr,setRegErr]=useState("");
+  const [regOk,setRegOk]=useState("");
+
+  /* Get or reuse secondary Firebase app */
+  const getSecondaryApp=()=>{
+    try{return firebase.app("secondary");}
+    catch(e){return firebase.initializeApp(firebase.app().options,"secondary");}
+  };
+
+  /* Create a brand-new Firebase Auth user via secondary app */
+  const handleCreate=async()=>{
+    const email=newEmail.trim();
+    const pw=newPw.trim();
+    if(!email||pw.length<6){setCreateErr("Enter a valid email and a password of at least 6 characters.");return;}
+    setCreateErr("");setCreateOk("");setCreateBusy(true);
+    try{
+      const secondaryAuth=getSecondaryApp().auth();
+      const cred=await secondaryAuth.createUserWithEmailAndPassword(email,pw);
+      const uid=cred.user.uid;
+      await secondaryAuth.signOut();
+      await firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${uid}`).set({uid,email,plants:[]});
+      setNewEmail("");setNewPw("");
+      setCreateOk(`✅ User "${email}" created. They can now log in.`);
+      setTimeout(()=>setCreateOk(""),5000);
+    }catch(e){
+      const msg=(e&&(e.message||e.code))||String(e);
+      if(msg.includes("email-already-in-use")){
+        setCreateErr(`"${email}" already exists in Firebase Auth. Use "Register Existing User" below to add them to the list.`);
+      } else {
+        setCreateErr(msg);
+      }
+    }
+    setCreateBusy(false);
+  };
+
+  /* Register an already-existing Firebase Auth user into managedUsers
+     by signing them in on the secondary app with the temp password,
+     grabbing their UID, then signing out. If the user already exists
+     in Auth (email-already-in-use), we sign in to get their UID. */
+  const handleRegisterExisting=async()=>{
+    const email=regEmail.trim();
+    if(!email){setRegErr("Enter the user's email.");return;}
+    // Check if already in managedUsers by email
+    const already=managedUsers.find(u=>u.email.toLowerCase()===email.toLowerCase());
+    if(already){setRegErr(`"${email}" is already in the managed users list.`);return;}
+    setRegErr("");setRegOk("");setRegBusy(true);
+    try{
+      // We don't have the password, so we can only register by UID lookup.
+      // Strategy: sign in on secondary with a dummy pw to trigger email-already-in-use
+      // which doesn't expose credentials but confirms the user exists.
+      // Instead, we'll just write a placeholder entry — when that user logs in,
+      // their UID gets updated via the onAuthStateChanged self-registration below.
+      // For now, store with a sentinel uid that gets updated on first login.
+      const placeholderId="pending_"+Date.now();
+      await firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${placeholderId}`).set({
+        uid:placeholderId, email, plants:[], pending:true
+      });
+      setRegEmail("");
+      setRegOk(`✅ "${email}" added. Their access will activate on next login.`);
+      setTimeout(()=>setRegOk(""),6000);
+    }catch(e){setRegErr((e&&(e.message||e.code))||String(e));}
+    setRegBusy(false);
+  };
+
+  /* Toggle a plant on/off for a user */
+  const togglePlant=async(uid,plantName,currentPlants)=>{
+    setPlantErr("");
+    const key=uid+"__"+plantName;
+    setPlantBusy(p=>({...p,[key]:true}));
+    try{
+      const has=currentPlants.includes(plantName);
+      const next=has?currentPlants.filter(p=>p!==plantName):[...currentPlants,plantName];
+      await firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${uid}/plants`).set(next);
+    }catch(e){setPlantErr((e&&(e.message||e.code))||String(e));}
+    setPlantBusy(p=>({...p,[key]:false}));
+  };
+
+  /* Disable a user (remove from managedUsers — they can still log in but see nothing) */
+  const handleRemoveUser=async(uid,email)=>{
+    if(!window.confirm(`Remove user "${email}" from the managed list? They will lose all plant access.`))return;
+    setDelErr("");setDelBusy(p=>({...p,[uid]:true}));
+    try{await firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${uid}`).remove();}
+    catch(e){setDelErr((e&&(e.message||e.code))||String(e));}
+    setDelBusy(p=>({...p,[uid]:false}));
+  };
+
+  return(
+    <div style={{maxWidth:900}}>
+      {/* ── Create user ── */}
+      <div className="panel" style={{border:"2px solid #9B6BD1",marginBottom:24}}>
+        <div className="panel-title" style={{color:"#9B6BD1"}}>➕ Create New User</div>
+        <p className="empty-note" style={{padding:"0 0 14px",textAlign:"left",fontSize:13}}>
+          Only Superadmins can create users. Enter an email and temporary password — the user can change their password after first login.
+        </p>
+        <div className="field-row" style={{alignItems:"flex-end",gap:10,flexWrap:"wrap",marginBottom:4}}>
+          <div className="field" style={{marginBottom:0,flex:"1 1 220px"}}>
+            <label>Email</label>
+            <input className="name-input" type="email" placeholder="user@company.com"
+              value={newEmail} onChange={e=>setNewEmail(e.target.value)}
+              style={{background:"var(--bg-page)",color:"var(--text-primary)",border:"1px solid var(--panel-border)"}}/>
+          </div>
+          <div className="field" style={{marginBottom:0,flex:"1 1 180px"}}>
+            <label>Temporary Password</label>
+            <input className="name-input" type="password" placeholder="Min 6 characters"
+              value={newPw} onChange={e=>setNewPw(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter")handleCreate();}}
+              style={{background:"var(--bg-page)",color:"var(--text-primary)",border:"1px solid var(--panel-border)"}}/>
+          </div>
+          <button className="submit-btn small-btn" style={{background:"linear-gradient(135deg,#9B6BD1,#6366F1)",flexShrink:0}}
+            onClick={handleCreate} disabled={createBusy}>
+            {createBusy?"Creating…":"Create User"}
+          </button>
+        </div>
+        {createErr&&<div className="error-msg" style={{marginTop:10,marginBottom:0}}>{createErr}</div>}
+        {createOk&&<div style={{marginTop:10,background:"#D4EDDA",color:"#1E5C33",border:"1px solid #4C9A6A",borderRadius:4,padding:"10px 12px",fontSize:13}}>{createOk}</div>}
+      </div>
+
+      {/* ── Register existing Auth user ── */}
+      <div className="panel" style={{border:"1px dashed #3E8FB0",marginBottom:24}}>
+        <div className="panel-title" style={{color:"#3E8FB0"}}>🔗 Add Existing User to List</div>
+        <p className="empty-note" style={{padding:"0 0 12px",textAlign:"left",fontSize:13}}>
+          If a user already exists in Firebase (e.g. created earlier but not showing), enter their email here to add them to the managed list. Their UID will be linked automatically on their next login.
+        </p>
+        <div className="field-row" style={{alignItems:"flex-end",gap:10,flexWrap:"wrap",marginBottom:4}}>
+          <div className="field" style={{marginBottom:0,flex:"1 1 260px"}}>
+            <label>Email of existing user</label>
+            <input className="name-input" type="email" placeholder="pardeepsaini@polyplasticsindia.com"
+              value={regEmail} onChange={e=>setRegEmail(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter")handleRegisterExisting();}}
+              style={{background:"var(--bg-page)",color:"var(--text-primary)",border:"1px solid var(--panel-border)"}}/>
+          </div>
+          <button className="submit-btn small-btn" style={{background:"linear-gradient(135deg,#3E8FB0,#4C9A6A)",flexShrink:0}}
+            onClick={handleRegisterExisting} disabled={regBusy}>
+            {regBusy?"Adding…":"Add to List"}
+          </button>
+        </div>
+        {regErr&&<div className="error-msg" style={{marginTop:10,marginBottom:0}}>{regErr}</div>}
+        {regOk&&<div style={{marginTop:10,background:"#D4EDDA",color:"#1E5C33",border:"1px solid #4C9A6A",borderRadius:4,padding:"10px 12px",fontSize:13}}>{regOk}</div>}
+      </div>
+
+      {/* ── Users + plant assignment ── */}
+      <div className="panel">
+        <div className="panel-title">👤 Manage Users &amp; Plant Access</div>
+        <p className="empty-note" style={{padding:"0 0 14px",textAlign:"left",fontSize:13}}>
+          Check the plants each user is allowed to view. Users with <strong>no plants checked</strong> will see <em>all plants</em>.
+        </p>
+        {plantErr&&<div className="error-msg" style={{marginBottom:12}}>{plantErr}</div>}
+        {delErr&&<div className="error-msg" style={{marginBottom:12}}>{delErr}</div>}
+        {managedUsers.length===0
+          ?<div className="empty-note">No users yet. Create one above.</div>
+          :<div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:420}}>
+              <thead>
+                <tr>
+                  <th style={{textAlign:"left",padding:"9px 12px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:200}}>Email</th>
+                  {plants.map(p=>(
+                    <th key={p.id} style={{textAlign:"center",padding:"9px 10px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.4px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",minWidth:110,whiteSpace:"nowrap"}}>
+                      {p.name}
+                    </th>
+                  ))}
+                  <th style={{textAlign:"center",padding:"9px 8px",borderBottom:"2px solid var(--panel-border)",minWidth:70}}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {managedUsers.map((u,i)=>{
+                  const userPlants=Array.isArray(u.plants)?u.plants:[];
+                  const allAccess=userPlants.length===0;
+                  return(
+                    <tr key={u.uid} style={{background:i%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
+                      <td style={{padding:"10px 12px",borderBottom:"1px solid var(--panel-border)",color:"var(--text-primary)",fontWeight:500}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                          <span>{u.email}</span>
+                          {u.pending&&<span style={{fontSize:10,background:"#F5B400",color:"#5a3e00",padding:"2px 7px",borderRadius:999,fontWeight:700,whiteSpace:"nowrap"}}>⏳ Pending login</span>}
+                          {!u.pending&&allAccess&&<span style={{fontSize:10,background:"#3E8FB0",color:"#fff",padding:"2px 7px",borderRadius:999,fontWeight:700,whiteSpace:"nowrap"}}>ALL PLANTS</span>}
+                        </div>
+                      </td>
+                      {plants.map(p=>{
+                        const has=userPlants.includes(p.name);
+                        const busy=plantBusy[u.uid+"__"+p.name];
+                        return(
+                          <td key={p.id} style={{textAlign:"center",padding:"10px 8px",borderBottom:"1px solid var(--panel-border)"}}>
+                            <input type="checkbox" checked={has} disabled={!!busy}
+                              onChange={()=>togglePlant(u.uid,p.name,userPlants)}
+                              style={{width:16,height:16,cursor:busy?"wait":"pointer",accentColor:"#6366F1"}}/>
+                          </td>
+                        );
+                      })}
+                      <td style={{textAlign:"center",padding:"10px 8px",borderBottom:"1px solid var(--panel-border)"}}>
+                        <button onClick={()=>handleRemoveUser(u.uid,u.email)} disabled={!!delBusy[u.uid]}
+                          style={{background:"none",border:"1px solid #E8552D",color:"#E8552D",borderRadius:6,padding:"4px 10px",cursor:"pointer",fontSize:11,fontWeight:600}}>
+                          {delBusy[u.uid]?"…":"Remove"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        }
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  AIAnalysisPanel  —  client-side summarised analysis of survey data
+// ══════════════════════════════════════════════════════════════
+function AIAnalysisPanel({responses,departments,plants,shifts,theme}){
+  const ct=CHART_THEME[theme]||CHART_THEME.dark;
+
+  // ── Plant filter state ───────────────────────────────────────
+  const [selPlant,setSelPlant]=useState(ALL_PLANTS_ID);
+  const filteredByPlant=useMemo(()=>
+    selPlant===ALL_PLANTS_ID ? responses : responses.filter(r=>r.plant===selPlant)
+  ,[responses,selPlant]);
+
+  // ── compute all metrics ──────────────────────────────────────
+  const analysis=useMemo(()=>{
+    if(!filteredByPlant.length) return null;
+
+    // Flatten ratings
+    const flatRows=[];
+    filteredByPlant.forEach(r=>{
+      Object.entries(r.deptRatings||{}).forEach(([dept,info])=>{
+        const score=deptOverallScore(info);
+        flatRows.push({...r,ratedDept:dept,rating:score,factors:info.factors||{},comment:info.comment||""});
+      });
+    });
+    if(!flatRows.length) return null;
+
+    const rated=flatRows.filter(r=>r.rating>0);
+    const overall=rated.reduce((s,r)=>s+r.rating,0)/rated.length;
+
+    // Dept averages
+    const deptMap={};
+    rated.forEach(r=>{
+      if(!deptMap[r.ratedDept])deptMap[r.ratedDept]={total:0,count:0,factors:{}};
+      deptMap[r.ratedDept].total+=r.rating;
+      deptMap[r.ratedDept].count+=1;
+      DEPT_FACTORS.forEach(f=>{
+        const v=r.factors[f.id];
+        if(v>0){
+          if(!deptMap[r.ratedDept].factors[f.id])deptMap[r.ratedDept].factors[f.id]=[];
+          deptMap[r.ratedDept].factors[f.id].push(v);
+        }
+      });
+    });
+    const deptStats=Object.entries(deptMap).map(([name,d])=>{
+      const avg=Math.round((d.total/d.count)*10)/10;  // round to 1dp so ties resolve by count
+      const factorAvgs={};
+      DEPT_FACTORS.forEach(f=>{
+        const arr=d.factors[f.id]||[];
+        factorAvgs[f.id]=arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0;
+      });
+      const weakestFactor=DEPT_FACTORS.filter(f=>factorAvgs[f.id]>0).sort((a,b)=>factorAvgs[a.id]-factorAvgs[b.id])[0];
+      const strongestFactor=DEPT_FACTORS.filter(f=>factorAvgs[f.id]>0).sort((a,b)=>factorAvgs[b.id]-factorAvgs[a.id])[0];
+      return{name,avg,count:d.count,factorAvgs,weakestFactor,strongestFactor};
+    }).sort((a,b)=>b.avg-a.avg||b.count-a.count);  // tiebreak: higher rating count ranks first
+
+    const top3=deptStats.slice(0,3);
+    const bottom3=[...deptStats].sort((a,b)=>a.avg-b.avg||a.count-b.count).slice(0,3);
+
+    // Cross-dept bias: which dept is the harshest / most generous rater
+    const raterMap={};
+    rated.forEach(r=>{
+      if(!raterMap[r.submitterDept])raterMap[r.submitterDept]={total:0,count:0};
+      raterMap[r.submitterDept].total+=r.rating;
+      raterMap[r.submitterDept].count+=1;
+    });
+    const raterStats=Object.entries(raterMap).map(([dept,d])=>({dept,avg:d.total/d.count,count:d.count})).sort((a,b)=>a.avg-b.avg);
+    const harshestRater=raterStats[0];
+    const generousRater=raterStats[raterStats.length-1];
+
+    // Tenure distribution
+    const tenureMap={};
+    filteredByPlant.forEach(r=>{if(r.tenure)tenureMap[r.tenure]=(tenureMap[r.tenure]||0)+1;});
+    const dominantTenure=TENURE_OPTIONS.filter(k=>tenureMap[k]).sort((a,b)=>(tenureMap[b]||0)-(tenureMap[a]||0))[0];
+
+    // Factor weaknesses across all depts
+    const globalFactorMap={};
+    rated.forEach(r=>{
+      DEPT_FACTORS.forEach(f=>{
+        const v=r.factors[f.id];
+        if(v>0){if(!globalFactorMap[f.id])globalFactorMap[f.id]=[];globalFactorMap[f.id].push(v);}
+      });
+    });
+    const globalFactorAvgs=DEPT_FACTORS.map(f=>{
+      const arr=globalFactorMap[f.id]||[];
+      return{...f,avg:arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0};
+    }).filter(f=>f.avg>0).sort((a,b)=>a.avg-b.avg);
+
+    // Comment sentiment proxy: collect comments
+    const allComments=flatRows.filter(r=>r.comment.trim().length>0);
+
+    // Participation
+    const uniqueEmps=new Set(filteredByPlant.map(r=>r.employeeCode).filter(Boolean)).size;
+    const totalSubs=filteredByPlant.length;
+
+    // Trend: monthly averages
+    const monthMap={};
+    rated.forEach(r=>{
+      const d=new Date(r.ts);
+      const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+      if(!monthMap[key])monthMap[key]={total:0,count:0};
+      monthMap[key].total+=r.rating;monthMap[key].count+=1;
+    });
+    const monthlyTrend=Object.entries(monthMap).sort(([a],[b])=>a.localeCompare(b)).map(([k,d])=>({month:k,avg:d.total/d.count}));
+    const trendDir=monthlyTrend.length>=2
+      ?(monthlyTrend[monthlyTrend.length-1].avg>monthlyTrend[0].avg?"improving":"declining")
+      :"insufficient data";
+
+    // Response rate by shift
+    const shiftMap={};
+    filteredByPlant.forEach(r=>{if(r.shift)shiftMap[r.shift]=(shiftMap[r.shift]||0)+1;});
+
+    return{
+      overall,totalSubs,uniqueEmps,deptStats,top3,bottom3,
+      raterStats,harshestRater,generousRater,
+      dominantTenure,tenureMap,
+      globalFactorAvgs,allComments,
+      monthlyTrend,trendDir,shiftMap,flatRows,rated
+    };
+  },[filteredByPlant]);
+
+  if(!responses.length){
+    return(
+      <div className="panel" style={{textAlign:"center",padding:"3rem 2rem"}}>
+        <div style={{fontSize:48,marginBottom:12}}>🤖</div>
+        <div className="panel-title" style={{fontSize:16,color:"var(--text-primary)"}}>AI Analysis</div>
+        <p style={{color:"var(--text-secondary)",maxWidth:400,margin:"0 auto",lineHeight:1.6}}>
+          No survey responses yet. Once employees submit ratings, the AI will generate a comprehensive analysis of your inter-department satisfaction data.
+        </p>
+      </div>
+    );
+  }
+
+  if(!analysis){
+    return(
+      <div style={{display:"flex",flexDirection:"column",gap:20}}>
+        {plants.length>1&&(
+          <div className="plant-pill-bar" style={{padding:0}}>
+            <button className={"plant-pill"+(selPlant===ALL_PLANTS_ID?" active":"")} onClick={()=>setSelPlant(ALL_PLANTS_ID)}>🏭 All Plants</button>
+            {plants.map(p=><button key={p} className={"plant-pill"+(selPlant===p?" active":"")} onClick={()=>setSelPlant(p)}>{p}</button>)}
+          </div>
+        )}
+        <div className="panel" style={{textAlign:"center",padding:"3rem 2rem"}}>
+          <div style={{fontSize:36,marginBottom:12}}>🏭</div>
+          <p style={{color:"var(--text-secondary)",maxWidth:360,margin:"0 auto"}}>No responses found for <strong>{selPlant}</strong>.</p>
+        </div>
+      </div>
+    );
+  }
+
+  const {overall,totalSubs,uniqueEmps,deptStats,top3,bottom3,
+         raterStats,harshestRater,generousRater,
+         dominantTenure,tenureMap,globalFactorAvgs,allComments,
+         monthlyTrend,trendDir,shiftMap,flatRows,rated}=analysis;
+
+  const scoreLabel=(v)=>v>=4.5?"Excellent":v>=4?"Good":v>=3?"Neutral":v>=2?"Below Average":"Poor";
+  const scoreColor=(v)=>v>=4?"#4C9A6A":v>=3?"#F5B400":"#E8552D";
+  const Arrow=({dir})=>dir==="improving"?<span style={{color:"#4C9A6A"}}>↑ Improving</span>:dir==="declining"?<span style={{color:"#E8552D"}}>↓ Declining</span>:<span style={{color:"#F5B400"}}>→ Stable</span>;
+
+  const [expBusy,setExpBusy]=useState(false);
+  const [expErr,setExpErr]=useState("");
+  const panelRef=useRef(null);
+
+  // Strip emoji/unicode symbols — jsPDF Helvetica can't render them
+  // Keep: ASCII, Latin-1 Supplement, Latin Extended A/B, common arrows (←→↑↓), basic math
+  const noEmoji=(s)=>String(s==null?"":s)
+    .replace(/\uD83C[\uDF00-\uDFFF]|\uD83D[\uDC00-\uDEFF]|\uD83E[\uDD00-\uDDFF]/g,"")  // surrogate-pair emoji
+    .replace(/[\u{1F000}-\u{1FFFF}]/gu,"")   // high emoji plane
+    .replace(/[☀-⛿]/gu,"")          // Misc Symbols (☀☁⚠ etc)
+    .replace(/[✀-➿]/gu,"")          // Dingbats
+    .replace(/[︀-️]/g,"")           // variation selectors
+    .replace(/️/g,"")
+    .trim();
+  const rankLabel=(i)=>i===0?"#1 (Gold)":i===1?"#2 (Silver)":i===2?"#3 (Bronze)":String(i+1);
+
+  const handleExportPdf=async()=>{
+    setExpBusy(true);setExpErr("");
+    try{
+      const {jsPDF}=window.jspdf;
+      const doc=new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
+      const W=doc.internal.pageSize.getWidth();
+      const pageH=doc.internal.pageSize.getHeight();
+      const margin=14;
+      const contentW=W-margin*2;
+      let y=margin;
+
+      // ── helpers ──────────────────────────────────────────────
+      const checkPage=(needed=30)=>{if(y>pageH-needed){doc.addPage();y=margin;}};
+      const sectionHead=(title,color=[99,102,241])=>{
+        checkPage(40);
+        doc.setFillColor(...color);
+        doc.rect(margin,y,contentW,7,"F");
+        doc.setTextColor(255,255,255);
+        doc.setFontSize(9);doc.setFont("helvetica","bold");
+        doc.text(title.toUpperCase(),margin+3,y+5);
+        doc.setTextColor(30,30,30);doc.setFont("helvetica","normal");
+        y+=11;
+      };
+      const kpiBox=(kx,ky,kw,kh,label,value,sub,accentRgb)=>{
+        doc.setFillColor(255,255,255);doc.setDrawColor(220,215,201);doc.setLineWidth(0.3);
+        doc.roundedRect(kx,ky,kw,kh,2,2,"FD");
+        doc.setFontSize(6.5);doc.setFont("helvetica","normal");doc.setTextColor(107,106,98);
+        doc.text(label.toUpperCase(),kx+4,ky+6);
+        doc.setFontSize(value.length>12?10:14);doc.setFont("helvetica","bold");
+        doc.setTextColor(...(accentRgb||[30,34,41]));
+        const lines=doc.splitTextToSize(value,kw-8);
+        doc.text(lines[0],kx+4,ky+15);
+        if(sub){doc.setFontSize(7);doc.setFont("helvetica","normal");doc.setTextColor(107,106,98);doc.text(sub,kx+4,ky+kh-4);}
+      };
+      const scoreAccentRgb=(v)=>v>=4?[76,154,106]:v>=3?[245,180,0]:[232,85,45];
+
+      // ── Cover header ─────────────────────────────────────────
+      doc.setFillColor(30,34,41);doc.rect(0,0,W,38,"F");
+      const gradCanvas=document.createElement("canvas");
+      gradCanvas.width=Math.round(W*4);gradCanvas.height=8;
+      const gc=gradCanvas.getContext("2d");
+      const gr=gc.createLinearGradient(0,0,gradCanvas.width,0);
+      gr.addColorStop(0,"#9B6BD1");gr.addColorStop(0.3,"#3E8FB0");
+      gr.addColorStop(0.55,"#4C9A6A");gr.addColorStop(0.78,"#F5B400");gr.addColorStop(1,"#E8552D");
+      gc.fillStyle=gr;gc.fillRect(0,0,gradCanvas.width,8);
+      doc.addImage(gradCanvas.toDataURL("image/png"),"PNG",0,36,W,2);
+      doc.setTextColor(237,234,226);doc.setFontSize(16);doc.setFont("helvetica","bold");
+      doc.text("AI Analysis Report"+(selPlant!==ALL_PLANTS_ID?" — "+selPlant:""),margin,22);
+      doc.setFontSize(8);doc.setFont("helvetica","normal");doc.setTextColor(154,161,168);
+      doc.text(`Generated: ${new Date().toLocaleString()}${selPlant!==ALL_PLANTS_ID?"  |  Plant: "+selPlant:""}`,margin,30);
+      doc.setTextColor(30,30,30);y=46;
+
+      // ── Executive Summary KPIs ────────────────────────────────
+      sectionHead("Executive Summary");
+      const kpiW=(contentW-6)/4,kpiH=26;
+      const kpis=[
+        {label:"Overall Score",value:fmt1(overall)+"/5",sub:scoreLabel(overall),acc:scoreAccentRgb(overall)},
+        {label:"Total Submissions",value:String(totalSubs),sub:`${uniqueEmps} unique employees`,acc:[62,143,176]},
+        {label:"Departments Rated",value:String(deptStats.length),sub:`of ${departments.length} configured`,acc:[155,107,209]},
+        {label:"Trend",value:trendDir==="improving"?"Improving":trendDir==="declining"?"Declining":"Stable",sub:trendDir,acc:trendDir==="improving"?[76,154,106]:trendDir==="declining"?[232,85,45]:[245,180,0]},
+      ];
+      kpis.forEach((k,i)=>kpiBox(margin+i*(kpiW+2),y,kpiW,kpiH,k.label,k.value,k.sub,k.acc));
+      y+=kpiH+6;
+
+      // Narrative
+      checkPage(50);
+      const narrative=[];
+      narrative.push(`Overall Health: Score ${fmt1(overall)}/5 (${scoreLabel(overall)}) from ${rated.length} ratings by ${totalSubs} submissions (${uniqueEmps} unique employees).${overall>=4?" Strong cross-functional collaboration.":overall>=3?" Room for improvement identified below.":" Immediate attention recommended."}`);
+      if(deptStats.length>0)narrative.push(`Top Performer: ${top3[0].name} — ${fmt1(top3[0].avg)}/5 (${top3[0].count} ratings).${top3[0].strongestFactor?" Strongest: "+top3[0].strongestFactor.label+".":""}`);
+      if(bottom3.length>0&&bottom3[0].avg<3.8)narrative.push(`Needs Attention: ${bottom3[0].name} — ${fmt1(bottom3[0].avg)}/5.${bottom3[0].weakestFactor?" Weakest factor: "+bottom3[0].weakestFactor.label+".":""}`);
+      if(globalFactorAvgs.length>0)narrative.push(`Organisation-wide Weakness: ${globalFactorAvgs[0].label} (avg ${fmt1(globalFactorAvgs[0].avg)}/5) — lowest-scored dimension across all departments.`);
+      if(monthlyTrend.length>=2)narrative.push(`Trend: ${trendDir} — from ${fmt1(monthlyTrend[0].avg)} (${monthlyTrend[0].month}) to ${fmt1(monthlyTrend[monthlyTrend.length-1].avg)} (${monthlyTrend[monthlyTrend.length-1].month}).`);
+      narrative.forEach(line=>{
+        checkPage(16);
+        const lines=doc.splitTextToSize("• "+noEmoji(line),contentW-4);
+        doc.setFontSize(8.5);doc.setFont("helvetica","normal");doc.setTextColor(40,44,52);
+        doc.text(lines,margin+2,y);y+=lines.length*5+3;
+      });
+      y+=4;
+
+      // ── Department Leaderboard ────────────────────────────────
+      sectionHead("Department Leaderboard");
+      checkPage(40);
+      // Pre-render medal emojis to tiny canvas images for use in PDF cells
+      const medalImgs=["🥇","🥈","🥉"].map(em=>{
+        const c=document.createElement("canvas"); c.width=32; c.height=32;
+        const ctx=c.getContext("2d"); ctx.font="24px serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+        ctx.fillText(em,16,17); return c.toDataURL("image/png");
+      });
+      doc.autoTable({
+        startY:y,
+        head:[["Rank","Department","Score /5","Ratings","Strongest Factor","Weakest Factor","Assessment"]],
+        body:deptStats.map((d,i)=>[
+          i<3?"":String(i+1),   // blank for medal rows — image drawn in didDrawCell
+          d.name,fmt1(d.avg),d.count,
+          d.strongestFactor?noEmoji(d.strongestFactor.label):"—",
+          d.weakestFactor?noEmoji(d.weakestFactor.label):"—",
+          scoreLabel(d.avg),
+        ]),
+        styles:{fontSize:8,cellPadding:3},
+        headStyles:{fillColor:[99,102,241],textColor:255,fontStyle:"bold",fontSize:8},
+        columnStyles:{0:{cellWidth:16,halign:"center"},2:{halign:"center"},3:{halign:"center"}},
+        margin:{left:margin,right:margin},
+        didDrawCell:(data)=>{
+          if(data.section==="body"){
+            if(data.column.index===0 && data.row.index<3){
+              const sz=6, cx=data.cell.x+data.cell.width/2-sz/2, cy=data.cell.y+data.cell.height/2-sz/2;
+              doc.addImage(medalImgs[data.row.index],"PNG",cx,cy,sz,sz);
+            }
+            if(data.column.index===2){
+              const v=parseFloat(data.cell.text[0]);
+              if(!isNaN(v)){const c=scoreAccentRgb(v);doc.setTextColor(...c);}
+            }
+          }
+        },
+      });
+      y=doc.lastAutoTable.finalY+6;
+
+      // ── Factor Heatmap ────────────────────────────────────────
+      if(globalFactorAvgs.length){
+        sectionHead("Factor Heatmap — Organisation-wide Averages");
+        checkPage(28);
+        doc.autoTable({
+          startY:y,
+          head:[["Factor","Avg Score /5","Assessment","Bar"]],
+          body:globalFactorAvgs.map((f,i)=>[
+            noEmoji(f.label),
+            fmt1(f.avg),
+            scoreLabel(f.avg),
+            i===0?"< Lowest":i===globalFactorAvgs.length-1?"Highest >":"",
+          ]),
+          styles:{fontSize:8,cellPadding:3},
+          headStyles:{fillColor:[99,102,241],textColor:255,fontStyle:"bold",fontSize:8},
+          columnStyles:{1:{halign:"center"},2:{halign:"center"},3:{halign:"center"}},
+          margin:{left:margin,right:margin},
+          didDrawCell:(data)=>{
+            if(data.section==="body"){
+              if(data.column.index===1){
+                const v=parseFloat(data.cell.text[0]);
+                if(!isNaN(v)){doc.setTextColor(...scoreAccentRgb(v));doc.setFont("helvetica","bold");}
+              }
+              if(data.column.index===2){
+                const v=parseFloat(globalFactorAvgs[data.row.index]&&globalFactorAvgs[data.row.index].avg||0);
+                doc.setTextColor(...scoreAccentRgb(v));
+              }
+            }
+          },
+        });
+        y=doc.lastAutoTable.finalY+6;
+      }
+
+      // ── Rating Behaviour ──────────────────────────────────────
+      if(raterStats.length){
+        sectionHead("Rating Behaviour by Department");
+        checkPage(28);
+        doc.autoTable({
+          startY:y,
+          head:[["Department (as Rater)","Avg Rating Given","Diff vs Overall","Submissions","Tendency"]],
+          body:[...raterStats].sort((a,b)=>b.avg-a.avg).map(r=>{
+            const diff=r.avg-overall;
+            const tendency=diff>0.3?"Generous":diff<-0.3?"Critical":"Balanced";
+            return[r.dept,fmt1(r.avg),diff>=0?"+"+fmt1(diff):fmt1(diff),r.count,tendency];
+          }),
+          styles:{fontSize:8,cellPadding:3},
+          headStyles:{fillColor:[99,102,241],textColor:255,fontStyle:"bold",fontSize:8},
+          columnStyles:{1:{halign:"center"},2:{halign:"center"},3:{halign:"center"},4:{halign:"center"}},
+          margin:{left:margin,right:margin},
+        });
+        y=doc.lastAutoTable.finalY+6;
+      }
+
+      // ── Recommendations ───────────────────────────────────────
+      sectionHead("AI Recommendations",[155,107,209]);
+      checkPage(20);
+      const recs=[];
+      bottom3.filter(d=>d.avg<3.8).forEach(d=>{
+        recs.push(`[!] ${d.name} (${fmt1(d.avg)}/5): ${d.weakestFactor?"Focus on "+d.weakestFactor.label+" (avg "+fmt1(d.factorAvgs[d.weakestFactor.id])+"/5). Consider cross-functional workshops.":"Schedule structured workshops and gather qualitative feedback."}`);
+      });
+      if(globalFactorAvgs.length>0&&globalFactorAvgs[0].avg<3.5)
+        recs.push(`[Org-wide] ${globalFactorAvgs[0].label} (${fmt1(globalFactorAvgs[0].avg)}/5) — lowest dimension. Launch an organisation-wide improvement initiative targeting this factor.`);
+      if(trendDir==="declining")
+        recs.push(`[Trend] Declining trend detected. Review recent operational/staffing changes that may have impacted cross-department collaboration.`);
+      if(top3.length>0)
+        recs.push(`[Best Practice] Leverage ${top3[0].name} (${fmt1(top3[0].avg)}/5).${top3[0].strongestFactor?" Particularly strong in "+top3[0].strongestFactor.label+".":" "} Share their working methods as internal benchmarks.`);
+      if(allComments.length>=5)
+        recs.push(`[Comments] ${allComments.length} written comments collected — review qualitative feedback in the Dashboard for deeper insights.`);
+      if(!recs.length)recs.push("[OK] No critical issues detected. Continue monitoring monthly trends and maintain current collaboration standards.");
+      recs.forEach(r=>{
+        checkPage(18);
+        const lines=doc.splitTextToSize(r,contentW-6);
+        doc.setFontSize(8.5);doc.setFont("helvetica","normal");doc.setTextColor(40,44,52);
+        doc.text(lines,margin+3,y);y+=lines.length*5+5;
+      });
+      y+=4;
+
+      // ── Participation ─────────────────────────────────────────
+      const partSections=[];
+      if(Object.keys(shiftMap).length)partSections.push({title:"By Shift",rows:Object.entries(shiftMap).sort((a,b)=>b[1]-a[1]).map(([k,v])=>[k,v,Math.round(v/totalSubs*100)+"%"])});
+      if(Object.keys(tenureMap).length)partSections.push({title:"By Tenure",rows:TENURE_OPTIONS.filter(k=>tenureMap[k]).map(k=>[k,tenureMap[k],Math.round(tenureMap[k]/totalSubs*100)+"%"])});
+      if(partSections.length){
+        sectionHead("Participation & Demographics");
+        partSections.forEach(s=>{
+          checkPage(30);
+          doc.setFontSize(9);doc.setFont("helvetica","bold");doc.setTextColor(80,80,100);
+          doc.text(s.title,margin,y);y+=5;
+          doc.autoTable({
+            startY:y,
+            head:[["Category","Count","Share"]],
+            body:s.rows,
+            styles:{fontSize:8,cellPadding:2.5},
+            headStyles:{fillColor:[62,143,176],textColor:255,fontStyle:"bold",fontSize:7.5},
+            columnStyles:{1:{halign:"center"},2:{halign:"center"}},
+            margin:{left:margin,right:margin},
+          });
+          y=doc.lastAutoTable.finalY+8;
+        });
+      }
+
+      // ── html2canvas: capture live panel (preserves all emojis) ──
+      if(panelRef.current && window.html2canvas){
+        doc.addPage();
+        const W2=doc.internal.pageSize.getWidth();
+        const pageH2=doc.internal.pageSize.getHeight();
+        const margin2=10;
+        const cW2=W2-margin2*2;
+        doc.setFillColor(30,34,41);doc.rect(0,0,W2,14,"F");
+        doc.setFontSize(9);doc.setFont("helvetica","bold");doc.setTextColor(237,234,226);
+        doc.text("Visual Summary — as displayed on screen (with emojis)",W2/2,10,{align:"center"});
+        const canvas=await window.html2canvas(panelRef.current,{scale:1.5,useCORS:true,backgroundColor:"#1C1E26",logging:false});
+        const imgW=canvas.width, imgH=canvas.height;
+        const pxPerMm=imgW/cW2;
+        const pageHContent=pageH2-18;
+        let srcY=0, firstSlice=true;
+        while(srcY<imgH){
+          const sliceHPx=Math.min(pageHContent*pxPerMm,imgH-srcY);
+          const sliceHMm=sliceHPx/pxPerMm;
+          const tmp=document.createElement("canvas");
+          tmp.width=imgW; tmp.height=sliceHPx;
+          tmp.getContext("2d").drawImage(canvas,0,srcY,imgW,sliceHPx,0,0,imgW,sliceHPx);
+          doc.addImage(tmp.toDataURL("image/jpeg",0.88),"JPEG",margin2,firstSlice?16:8,cW2,sliceHMm);
+          srcY+=sliceHPx;
+          if(srcY<imgH){doc.addPage();firstSlice=false;}
+        }
+      }
+
+      // ── Footer on every page ──────────────────────────────────
+      const totalPages=doc.internal.getNumberOfPages();
+      const pageH3=doc.internal.pageSize.getHeight();
+      const W3=doc.internal.pageSize.getWidth();
+      for(let p=1;p<=totalPages;p++){
+        doc.setPage(p);doc.setFontSize(7);doc.setTextColor(154,161,168);
+        doc.text("AI Analysis Report",14,pageH3-6);
+        doc.text(`${p} / ${totalPages}`,W3-14,pageH3-6,{align:"right"});
+      }
+
+      doc.save(`ai-analysis-${new Date().toISOString().slice(0,10)}.pdf`);
+    }catch(e){console.error(e);setExpErr((e&&e.message)||String(e));}
+    setExpBusy(false);
+  };
+
+  return(
+    <div ref={panelRef} style={{display:"flex",flexDirection:"column",gap:20}}>
+
+      {/* ── Plant pills + Export bar ── */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
+        {/* Plant filter pills */}
+        {plants.length>1 && (
+          <div className="plant-pill-bar" style={{padding:0,flexWrap:"wrap",gap:8}}>
+            <button
+              className={"plant-pill"+(selPlant===ALL_PLANTS_ID?" active":"")}
+              onClick={()=>setSelPlant(ALL_PLANTS_ID)}>
+              🏭 All Plants
+            </button>
+            {plants.map(p=>(
+              <button
+                key={p}
+                className={"plant-pill"+(selPlant===p?" active":"")}
+                onClick={()=>setSelPlant(p)}>
+                {p}
+              </button>
+            ))}
+          </div>
+        )}
+        {/* Export button */}
+        <div style={{display:"flex",alignItems:"center",gap:10,marginLeft:"auto"}}>
+          {expErr&&<span style={{fontSize:12,color:"#E8552D"}}>{expErr}</span>}
+          <button className="submit-btn small-btn" style={{background:"#9B6BD1",marginTop:0}} onClick={handleExportPdf} disabled={expBusy}>
+            {expBusy?"Exporting…":"Export PDF"}
+          </button>
+        </div>
+      </div>
+
+      {/* ── Executive Summary ── */}
+      <div className="panel" style={{border:"2px solid #6366F1"}}>
+        <div className="panel-title" style={{color:"#6366F1",fontSize:16,marginBottom:20}}>🤖 AI Analysis Summary</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:16,marginBottom:24}}>
+          {[
+            {label:"Overall Score",value:fmt1(overall)+"/5",sub:scoreLabel(overall),color:scoreColor(overall)},
+            {label:"Total Submissions",value:totalSubs,sub:`${uniqueEmps} unique employees`,color:"#3E8FB0"},
+            {label:"Departments Rated",value:deptStats.length,sub:`of ${departments.length} configured`,color:"#9B6BD1"},
+            {label:"Satisfaction Trend",value:trendDir==="improving"?"↑":trendDir==="declining"?"↓":"→",sub:trendDir,color:trendDir==="improving"?"#4C9A6A":trendDir==="declining"?"#E8552D":"#F5B400"},
+          ].map((k,i)=>(
+            <div key={i} style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"16px 20px"}}>
+              <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.8px",color:"var(--text-secondary)",marginBottom:6}}>{k.label}</div>
+              <div style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,fontSize:28,color:k.color,lineHeight:1.1}}>{k.value}</div>
+              <div style={{fontSize:12,color:"var(--text-tertiary)",marginTop:4}}>{k.sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* AI narrative */}
+        <div style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"18px 20px",lineHeight:1.75,fontSize:14,color:"var(--text-primary)"}}>
+          <p style={{margin:"0 0 10px"}}>
+            <strong>Overall Health:</strong> The organisation's inter-department satisfaction score is <strong style={{color:scoreColor(overall)}}>{fmt1(overall)}/5</strong> ({scoreLabel(overall)}), based on <strong>{rated.length}</strong> ratings from <strong>{totalSubs}</strong> submissions by <strong>{uniqueEmps}</strong> unique employee{uniqueEmps!==1?"s":""}.
+            {overall>=4?" This is a strong result, reflecting healthy cross-functional collaboration.":overall>=3?" There is room for improvement in several areas highlighted below.":" Immediate attention to inter-department relations is recommended."}
+          </p>
+          {deptStats.length>0&&(
+            <p style={{margin:"0 0 10px"}}>
+              <strong>Top Performer:</strong> <span style={{color:"#4C9A6A",fontWeight:600}}>{top3[0].name}</span> leads with an average of <strong>{fmt1(top3[0].avg)}/5</strong> ({top3[0].count} rating{top3[0].count!==1?"s":""}).
+              {top3[0].strongestFactor?" Its strongest dimension is "+top3[0].strongestFactor.icon+" "+top3[0].strongestFactor.label+".":""}
+            </p>
+          )}
+          {bottom3.length>0&&bottom3[0].avg<3.5&&(
+            <p style={{margin:"0 0 10px"}}>
+              <strong>Needs Attention:</strong> <span style={{color:"#E8552D",fontWeight:600}}>{bottom3[0].name}</span> has the lowest score at <strong>{fmt1(bottom3[0].avg)}/5</strong>.
+              {bottom3[0].weakestFactor?" The weakest factor is "+bottom3[0].weakestFactor.icon+" "+bottom3[0].weakestFactor.label+", which should be prioritised in improvement plans.":""}
+            </p>
+          )}
+          {globalFactorAvgs.length>0&&(
+            <p style={{margin:"0 0 10px"}}>
+              <strong>Organisation-wide Weakness:</strong> <strong style={{color:"#F5B400"}}>{globalFactorAvgs[0].icon} {globalFactorAvgs[0].label}</strong> is the lowest-rated factor across all departments (avg {fmt1(globalFactorAvgs[0].avg)}/5). Focus organisation-wide initiatives here first.
+            </p>
+          )}
+          {monthlyTrend.length>=2&&(
+            <p style={{margin:0}}>
+              <strong>Trend:</strong> Satisfaction is <Arrow dir={trendDir}/> — from {fmt1(monthlyTrend[0].avg)} in {monthlyTrend[0].month} to {fmt1(monthlyTrend[monthlyTrend.length-1].avg)} in {monthlyTrend[monthlyTrend.length-1].month}.
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* ── Department Leaderboard ── */}
+      <div className="panel">
+        <div className="panel-title">🏆 Department Leaderboard</div>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:520}}>
+            <thead>
+              <tr>
+                {["Rank","Department","Score","Ratings","Strongest Dimension","Weakest Dimension","Assessment"].map((h,i)=>(
+                  <th key={i} style={{textAlign:i===0||i===2||i===3?"center":"left",padding:"8px 10px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)",whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {deptStats.map((d,i)=>(
+                <tr key={d.name} style={{background:i%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
+                  <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:i===0?"#F5B400":i===1?"#8A93A8":i===2?"#C87941":"var(--text-tertiary)",fontSize:16}}>
+                    {i===0?"🥇":i===1?"🥈":i===2?"🥉":i+1}
+                  </td>
+                  <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontWeight:600,color:"var(--text-primary)"}}>{d.name}</td>
+                  <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)"}}>
+                    <span style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,fontSize:16,color:scoreColor(d.avg)}}>{fmt1(d.avg)}</span>
+                    <span style={{fontSize:11,color:"var(--text-tertiary)"}}>/5</span>
+                  </td>
+                  <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{d.count}</td>
+                  <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontSize:12,color:"#4C9A6A"}}>{d.strongestFactor?d.strongestFactor.icon+" "+d.strongestFactor.label:"—"}</td>
+                  <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontSize:12,color:"#E8552D"}}>{d.weakestFactor?d.weakestFactor.icon+" "+d.weakestFactor.label:"—"}</td>
+                  <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontSize:12,color:scoreColor(d.avg)}}>{scoreLabel(d.avg)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── Factor Heatmap ── */}
+      <div className="panel">
+        <div className="panel-title">🔥 Factor Heatmap — Organisational Weak Spots</div>
+        <p style={{color:"var(--text-secondary)",fontSize:13,marginBottom:16,lineHeight:1.6}}>Average score per factor across all departments. Lower scores (red) indicate areas that need organisation-wide attention.</p>
+        <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+          {globalFactorAvgs.map((f,i)=>(
+            <div key={f.id} style={{flex:"1 1 160px",background:"var(--bg-page)",border:`2px solid ${scoreColor(f.avg)}`,borderRadius:10,padding:"14px 18px",position:"relative"}}>
+              {i===0&&<div style={{position:"absolute",top:8,right:10,fontSize:10,fontWeight:700,textTransform:"uppercase",background:"#E8552D",color:"#fff",padding:"2px 7px",borderRadius:999}}>Lowest</div>}
+              {i===globalFactorAvgs.length-1&&<div style={{position:"absolute",top:8,right:10,fontSize:10,fontWeight:700,textTransform:"uppercase",background:"#4C9A6A",color:"#fff",padding:"2px 7px",borderRadius:999}}>Highest</div>}
+              <div style={{fontSize:24,marginBottom:6}}>{f.icon}</div>
+              <div style={{fontSize:12,fontWeight:600,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:6}}>{f.label}</div>
+              <div style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,fontSize:28,color:scoreColor(f.avg)}}>{fmt1(f.avg)}</div>
+              <div style={{fontSize:11,color:"var(--text-tertiary)"}}>/ 5.0</div>
+              <div style={{marginTop:10,height:5,background:"var(--panel-border)",borderRadius:3}}>
+                <div style={{width:`${((f.avg-1)/4)*100}%`,height:5,background:scoreColor(f.avg),borderRadius:3,transition:"width 0.4s"}}/>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Rating Behaviour ── */}
+      <div className="panel">
+        <div className="panel-title">⚖️ Rating Behaviour by Department</div>
+        <p style={{color:"var(--text-secondary)",fontSize:13,marginBottom:16,lineHeight:1.6}}>How generous or critical each department is when rating others. Significant gaps may indicate departmental bias.</p>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:400}}>
+            <thead>
+              <tr>
+                {["Department (as Rater)","Avg Rating Given","Submissions","Tendency"].map((h,i)=>(
+                  <th key={i} style={{textAlign:i>0?"center":"left",padding:"8px 10px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",borderBottom:"2px solid var(--panel-border)"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[...raterStats].sort((a,b)=>b.avg-a.avg).map((r,i)=>{
+                const globalDiff=r.avg-overall;
+                const tendency=globalDiff>0.3?"Generous":globalDiff<-0.3?"Critical":"Balanced";
+                const tCol=tendency==="Generous"?"#4C9A6A":tendency==="Critical"?"#E8552D":"#F5B400";
+                return(
+                  <tr key={r.dept} style={{background:i%2===0?"var(--bg-page)":"var(--bg-panel)"}}>
+                    <td style={{padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontWeight:600,color:"var(--text-primary)"}}>{r.dept}</td>
+                    <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)"}}>
+                      <span style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:scoreColor(r.avg)}}>{fmt1(r.avg)}</span>
+                      <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{globalDiff>=0?" (+"+fmt1(globalDiff)+")":"("+fmt1(globalDiff)+")"}</span>
+                    </td>
+                    <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)",fontFamily:"'IBM Plex Mono',monospace",color:"var(--text-secondary)"}}>{r.count}</td>
+                    <td style={{textAlign:"center",padding:"10px 10px",borderBottom:"1px solid var(--panel-border)"}}>
+                      <span style={{background:tCol+"22",color:tCol,border:`1px solid ${tCol}`,borderRadius:999,padding:"3px 12px",fontWeight:700,fontSize:11,textTransform:"uppercase"}}>{tendency}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {harshestRater&&generousRater&&harshestRater.dept!==generousRater.dept&&(
+          <div style={{marginTop:16,display:"flex",gap:12,flexWrap:"wrap"}}>
+            <div style={{flex:1,minWidth:220,background:"#E8552D11",border:"1px solid #E8552D44",borderRadius:8,padding:"12px 16px"}}>
+              <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",color:"#E8552D",marginBottom:4}}>Most Critical Rater</div>
+              <div style={{fontWeight:700,color:"var(--text-primary)",fontSize:15}}>{harshestRater.dept}</div>
+              <div style={{fontSize:12,color:"var(--text-secondary)"}}>Avg given: {fmt1(harshestRater.avg)}/5</div>
+            </div>
+            <div style={{flex:1,minWidth:220,background:"#4C9A6A11",border:"1px solid #4C9A6A44",borderRadius:8,padding:"12px 16px"}}>
+              <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",color:"#4C9A6A",marginBottom:4}}>Most Generous Rater</div>
+              <div style={{fontWeight:700,color:"var(--text-primary)",fontSize:15}}>{generousRater.dept}</div>
+              <div style={{fontSize:12,color:"var(--text-secondary)"}}>Avg given: {fmt1(generousRater.avg)}/5</div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Recommendations ── */}
+      <div className="panel" style={{border:"2px solid #9B6BD1"}}>
+        <div className="panel-title" style={{color:"#9B6BD1"}}>💡 AI Recommendations</div>
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          {bottom3.filter(d=>d.avg<3.8).map((d,i)=>(
+            <div key={d.name} style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#E8552D22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>⚠️</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>{d.name} — Score {fmt1(d.avg)}/5</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>
+                  {d.weakestFactor
+                    ?`Focus improvement on ${d.weakestFactor.icon} ${d.weakestFactor.label} (avg ${fmt1(d.factorAvgs[d.weakestFactor.id])}/5). Consider cross-functional workshops or dedicated feedback sessions between ${d.name} and the departments that rated them lowest.`
+                    :`Schedule structured improvement workshops for ${d.name} to address the low satisfaction scores. Gather qualitative feedback to identify specific pain points.`}
+                </div>
+              </div>
+            </div>
+          ))}
+          {globalFactorAvgs.length>0&&globalFactorAvgs[0].avg<3.5&&(
+            <div style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#F5B40022",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>📌</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>Organisation-wide: {globalFactorAvgs[0].icon} {globalFactorAvgs[0].label}</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>
+                  This is the lowest-scoring dimension across all departments (avg {fmt1(globalFactorAvgs[0].avg)}/5). An organisation-wide initiative — such as communication training, shared SLAs, or a cross-team responsiveness charter — could yield broad improvements.
+                </div>
+              </div>
+            </div>
+          )}
+          {trendDir==="declining"&&(
+            <div style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#E8552D22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>📉</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>Declining Trend Detected</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>Satisfaction scores have been declining over the tracked period. Review recent operational changes, process disruptions or staffing changes that may have affected cross-department collaboration.</div>
+              </div>
+            </div>
+          )}
+          {top3.length>0&&(
+            <div style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#4C9A6A22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>✅</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>Leverage Best Practices from {top3[0].name}</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>
+                  {top3[0].name} scores highest at {fmt1(top3[0].avg)}/5.{top3[0].strongestFactor?" Particularly strong in "+top3[0].strongestFactor.icon+" "+top3[0].strongestFactor.label+".":" "} Document and share their working practices as internal best practices for other departments to adopt.
+                </div>
+              </div>
+            </div>
+          )}
+          {allComments.length>=5&&(
+            <div style={{display:"flex",gap:14,background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px",alignItems:"flex-start"}}>
+              <div style={{width:36,height:36,borderRadius:8,background:"#3E8FB022",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>💬</div>
+              <div>
+                <div style={{fontWeight:700,color:"var(--text-primary)",marginBottom:4}}>Qualitative Feedback Available</div>
+                <div style={{fontSize:13,color:"var(--text-secondary)",lineHeight:1.6}}>
+                  {allComments.length} written comments have been collected. Review the Recent Comments section in the Dashboard for specific qualitative insights that may reveal themes not captured by ratings alone.
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Participation Analysis ── */}
+      <div className="panel">
+        <div className="panel-title">📊 Participation & Demographics</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:16}}>
+          {/* Shift breakdown */}
+          {Object.keys(shiftMap).length>0&&(
+            <div style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px"}}>
+              <div style={{fontSize:12,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",marginBottom:12}}>By Shift</div>
+              {Object.entries(shiftMap).sort((a,b)=>b[1]-a[1]).map(([shift,count])=>{
+                const pct=Math.round(count/totalSubs*100);
+                return(
+                  <div key={shift} style={{marginBottom:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:3}}>
+                      <span style={{color:"var(--text-primary)",fontWeight:500}}>{shift}</span>
+                      <span style={{color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{count} ({pct}%)</span>
+                    </div>
+                    <div style={{height:5,background:"var(--panel-border)",borderRadius:3}}>
+                      <div style={{width:`${pct}%`,height:5,background:"#3E8FB0",borderRadius:3}}/>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {/* Tenure breakdown */}
+          {Object.keys(tenureMap).length>0&&(
+            <div style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px"}}>
+              <div style={{fontSize:12,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",marginBottom:12}}>By Tenure</div>
+              {TENURE_OPTIONS.filter(k=>tenureMap[k]).map(k=>{
+                const count=tenureMap[k];const pct=Math.round(count/totalSubs*100);
+                return(
+                  <div key={k} style={{marginBottom:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:3}}>
+                      <span style={{color:"var(--text-primary)",fontWeight:500}}>{k}</span>
+                      <span style={{color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{count} ({pct}%)</span>
+                    </div>
+                    <div style={{height:5,background:"var(--panel-border)",borderRadius:3}}>
+                      <div style={{width:`${pct}%`,height:5,background:TENURE_COLORS[k]||"#6366F1",borderRadius:3}}/>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {/* Score distribution */}
+          {(()=>{
+            const dist={1:0,2:0,3:0,4:0,5:0};
+            rated.forEach(r=>{const b=Math.min(5,Math.max(1,Math.round(r.rating)));dist[b]=(dist[b]||0)+1;});
+            const total=rated.length;
+            return(
+              <div style={{background:"var(--bg-page)",border:"1px solid var(--panel-border)",borderRadius:10,padding:"14px 18px"}}>
+                <div style={{fontSize:12,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.5px",color:"var(--text-secondary)",marginBottom:12}}>Score Distribution</div>
+                {[5,4,3,2,1].map(v=>{
+                  const count=dist[v]||0;const pct=total?Math.round(count/total*100):0;
+                  return(
+                    <div key={v} style={{marginBottom:10}}>
+                      <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:3}}>
+                        <span style={{color:"var(--text-primary)"}}>{"★".repeat(v)} {v}</span>
+                        <span style={{color:"var(--text-secondary)",fontFamily:"'IBM Plex Mono',monospace"}}>{count} ({pct}%)</span>
+                      </div>
+                      <div style={{height:5,background:"var(--panel-border)",borderRadius:3}}>
+                        <div style={{width:`${pct}%`,height:5,background:scoreColor(v),borderRadius:3}}/>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
 function App(){
   const [tab,setTab]=useState("survey");
   const [theme,setTheme]=useState("dark");
@@ -1452,13 +2838,93 @@ function App(){
   const [plants,setPlants]=useState(DEFAULT_PLANTS.map((n)=>({id:n,name:n})));
   const [user,setUser]=useState(null);
   const [showLogin,setShowLogin]=useState(false);
-  const isAdmin=!!user;
+  // role state
+  const [isSuperAdmin,setIsSuperAdmin]=useState(false);
+  const [myManagedEntry,setMyManagedEntry]=useState(null);  // my own record from managedUsers
+  const [managedUsers,setManagedUsers]=useState([]);         // all managed users (superadmin only)
+  const isLoggedIn=!!user;
 
-  useEffect(()=>{const u=firebase.auth().onAuthStateChanged((u)=>{setUser(u);if(u)setShowLogin(false);else setTab("survey");});return u;},[]);
+  /* ── Auth ── */
+  useEffect(()=>{
+    const unsub=firebase.auth().onAuthStateChanged(u=>{
+      setUser(u);
+      if(!u){setTab("survey");setIsSuperAdmin(false);setMyManagedEntry(null);}
+    });
+    return unsub;
+  },[]);
   useEffect(()=>{try{const s=localStorage.getItem(THEME_KEY);if(s)setTheme(s);}catch(e){};},[]);
 
-  // Public reads
-  const dbListen=(path,setter)=>useEffect(()=>{const ref=firebase.database().ref(path);const h=(s)=>setter(s.val()||"");ref.on("value",h);return()=>ref.off("value",h);},[]);
+  /* ── Superadmin check ──────────────────────────────────────
+     1. If email is in SUPERADMIN_EMAILS → always superadmin,
+        and auto-write UID into Firebase so DB check works too.
+     2. Otherwise listen to Firebase node for the UID.
+  ─────────────────────────────────────────────────────────── */
+  useEffect(()=>{
+    if(!user)return;
+    const emailMatch=SUPERADMIN_EMAILS.map(e=>e.trim().toLowerCase()).includes((user.email||"").toLowerCase());
+    if(emailMatch){
+      setIsSuperAdmin(true);
+      // Auto-register in Firebase so the DB node exists for future checks
+      firebase.database().ref(`${CONFIG_SUPERADMINS_PATH}/${user.uid}`).set({uid:user.uid,email:user.email}).catch(()=>{});
+      return;
+    }
+    // Fall back to Firebase DB check
+    const ref=firebase.database().ref(`${CONFIG_SUPERADMINS_PATH}/${user.uid}`);
+    const h=s=>setIsSuperAdmin(!!s.val());
+    ref.on("value",h);return()=>ref.off("value",h);
+  },[user]);
+
+  /* ── My own managed-user entry (for plant restrictions) ──
+     Also resolves any "pending_xxx" placeholder created by
+     "Add Existing User" so the real UID takes over.          */
+  useEffect(()=>{
+    if(!user)return;
+    // First check if there's a real UID entry already
+    const myRef=firebase.database().ref(`${CONFIG_MANAGED_USERS_PATH}/${user.uid}`);
+    myRef.once("value").then(s=>{
+      if(s.exists()){
+        setMyManagedEntry(s.val());
+        myRef.on("value",snap=>setMyManagedEntry(snap.val()||null));
+      } else {
+        // Look for a pending placeholder matching our email
+        firebase.database().ref(CONFIG_MANAGED_USERS_PATH).once("value").then(all=>{
+          const v=all.val()||{};
+          const entry=Object.entries(v).find(([k,u])=>u.pending&&(u.email||"").toLowerCase()===(user.email||"").toLowerCase());
+          if(entry){
+            const [pendingKey,pendingData]=entry;
+            const realData={...pendingData,uid:user.uid,pending:false};
+            delete realData.pending;
+            // Write under real UID, remove placeholder
+            const updates={};
+            updates[`${CONFIG_MANAGED_USERS_PATH}/${user.uid}`]={uid:user.uid,email:user.email,plants:pendingData.plants||[]};
+            updates[`${CONFIG_MANAGED_USERS_PATH}/${pendingKey}`]=null;
+            firebase.database().ref().update(updates).catch(()=>{});
+          }
+          // Now listen on real UID
+          myRef.on("value",snap=>setMyManagedEntry(snap.val()||null));
+        });
+      }
+    });
+    return()=>myRef.off("value");
+  },[user]);
+
+  /* ── All managed users (superadmin only) ── */
+  useEffect(()=>{
+    if(!user||!isSuperAdmin)return;
+    const ref=firebase.database().ref(CONFIG_MANAGED_USERS_PATH);
+    const h=s=>{const v=s.val();setManagedUsers(v?Object.values(v):[]);};
+    ref.on("value",h);return()=>ref.off("value",h);
+  },[user,isSuperAdmin]);
+
+  /* ── Plants allowed for current user ── */
+  const myAllowedPlants=useMemo(()=>{
+    if(!user||isSuperAdmin)return null;          // superadmin sees all
+    if(!myManagedEntry)return null;              // unknown managed user → see all
+    const arr=myManagedEntry.plants||[];
+    return arr.length?arr:null;                  // empty array → all plants
+  },[user,isSuperAdmin,myManagedEntry]);
+
+  /* ── Public reads ── */
   useEffect(()=>{const ref=firebase.database().ref(SETTINGS_SURVEY_URL_PATH);const h=(s)=>setSurveyUrl(s.val()||"");ref.on("value",h);return()=>ref.off("value",h);},[]);
   useEffect(()=>{const ref=firebase.database().ref(SETTINGS_LOGO_PATH);const h=(s)=>setLogoUrl(s.val()||"");ref.on("value",h);return()=>ref.off("value",h);},[]);
   useEffect(()=>{const ref=firebase.database().ref(SETTINGS_COMPANY_NAME_PATH);const h=(s)=>setCompanyName(s.val()||DEFAULT_COMPANY_NAME);ref.on("value",h);return()=>ref.off("value",h);},[]);
@@ -1468,10 +2934,10 @@ function App(){
   useEffect(()=>{const ref=firebase.database().ref(CONFIG_SHIFTS_PATH);const h=(s)=>{const v=s.val();if(v)setShifts(Object.entries(v).map(([id,x])=>({id,name:x.name})));};ref.on("value",h);return()=>ref.off("value",h);},[]);
   useEffect(()=>{const ref=firebase.database().ref(CONFIG_PLANTS_PATH);const h=(s)=>{const v=s.val();if(v)setPlants(Object.entries(v).map(([id,x])=>({id,name:x.name})));};ref.on("value",h);return()=>ref.off("value",h);},[]);
 
-  // Auth-only: read responses
+  /* ── Auth-only: responses ── */
   useEffect(()=>{if(!user){setResponses([]);return;}const ref=firebase.database().ref(RESPONSES_PATH);const h=(s)=>{const v=s.val();setResponses(v?Object.entries(v).map(([k,x])=>({...x,id:k})):[]);};ref.on("value",h);return()=>ref.off("value",h);},[user]);
 
-  // Seed defaults when admin first logs in
+  /* ── Seed defaults on first login ── */
   useEffect(()=>{
     if(!user)return;
     [[CONFIG_DEPARTMENTS_PATH,DEFAULT_DEPTS],[CONFIG_SHIFTS_PATH,DEFAULT_SHIFTS],[CONFIG_PLANTS_PATH,DEFAULT_PLANTS]].forEach(([path,defaults])=>{
@@ -1480,13 +2946,8 @@ function App(){
     });
   },[user]);
 
-  // PUBLIC write — no auth needed; Firebase rules must allow write to interdept2/responses
-  const handleSubmit=useCallback(async(payload)=>{
-    await firebase.database().ref(RESPONSES_PATH+"/"+payload.id).set(payload);
-  },[]);
-
+  const handleSubmit=useCallback(async(payload)=>{await firebase.database().ref(RESPONSES_PATH+"/"+payload.id).set(payload);},[]);
   const toggleTheme=()=>{const n=theme==="dark"?"light":"dark";setTheme(n);try{localStorage.setItem(THEME_KEY,n);}catch(e){};};
-
   const saveSurveyUrl       =async(v)=>await firebase.database().ref(SETTINGS_SURVEY_URL_PATH).set(v);
   const saveCompanyName     =async(v)=>await firebase.database().ref(SETTINGS_COMPANY_NAME_PATH).set(v);
   const saveLogo            =async(v)=>await firebase.database().ref(SETTINGS_LOGO_PATH).set(v);
@@ -1506,6 +2967,17 @@ function App(){
   const deptNames=departments.map((d)=>d.name);
   const shiftNames=shifts.map((s)=>s.name);
   const plantNames=plants.map((p)=>p.name);
+
+  // Dashboard props: filter to allowed plants
+  const dashPlantNames=myAllowedPlants||plantNames;
+  const dashResponses=myAllowedPlants?responses.filter(r=>myAllowedPlants.includes(r.plant)):responses;
+
+  // Role badge
+  const roleBadge=isSuperAdmin
+    ?<span style={{fontSize:10,fontWeight:700,letterSpacing:"1px",textTransform:"uppercase",background:"linear-gradient(135deg,#9B6BD1,#6366F1)",color:"#fff",padding:"4px 10px",borderRadius:999,flexShrink:0}}>Superadmin</span>
+    :isLoggedIn
+      ?<span style={{fontSize:10,fontWeight:700,letterSpacing:"1px",textTransform:"uppercase",background:"var(--bg-tab)",color:"#3E8FB0",border:"1px solid #3E8FB0",padding:"4px 10px",borderRadius:999,flexShrink:0}}>User</span>
+      :null;
 
   return(<div className="app-root" data-theme={theme}>
     <style>{`
@@ -1561,50 +3033,50 @@ function App(){
       .submit-btn.small-btn{padding:10px 20px;font-size:13px;margin-top:0;}
       .submit-btn:disabled{opacity:0.6;cursor:default;}
       .submit-btn:hover:not(:disabled){background:linear-gradient(135deg,#4F52D9,#2E7A96);box-shadow:0 4px 16px rgba(99,102,241,0.4);}
-      .plant-pill-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:0 0 16px;}
-      .plant-pill{display:inline-flex;align-items:center;padding:7px 20px;border-radius:999px;border:1.5px solid var(--tab-border);background:var(--bg-tab);color:var(--text-secondary);font-size:12px;font-weight:600;cursor:pointer;transition:all 0.15s;white-space:nowrap;font-family:inherit;}
+      .plant-pill-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:0 0 10px;}
+      .plant-pill{display:inline-flex;align-items:center;padding:4px 14px;border-radius:999px;border:1.5px solid var(--tab-border);background:var(--bg-tab);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer;transition:all 0.15s;white-space:nowrap;font-family:inherit;}
       .plant-pill:hover{border-color:#6366F1;color:#6366F1;}
       .plant-pill.active{background:linear-gradient(135deg,#6366F1,#3E8FB0);border-color:transparent;color:#fff;font-weight:700;}
-      .filter-bar{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:20px;}
-      .filter-field{display:flex;flex-direction:column;gap:4px;min-width:160px;}
-      .filter-field label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-secondary);}
-      .filter-field select{background:var(--bg-panel);color:var(--text-primary);border:1px solid var(--panel-border);border-radius:4px;padding:7px 10px;font-size:13px;cursor:pointer;font-family:inherit;}
-      .filter-count{font-size:13px;color:var(--text-secondary);padding:7px 0;align-self:flex-end;}
-      .panel{background:var(--bg-panel);border:1px solid var(--panel-border);border-radius:12px;padding:20px 24px;margin-bottom:20px;}
-      .panel-title{font-family:'Oswald',sans-serif;font-size:14px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-secondary);margin-bottom:16px;}
-      .panel-row{display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap;}
-      .gauge-panel{background:var(--bg-panel);border:1px solid var(--panel-border);border-radius:12px;padding:16px 12px 10px;flex:1;min-width:240px;overflow:visible;}
-      .kpi-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;flex:2;min-width:260px;}
+      .filter-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px;}
+      .filter-field{display:flex;flex-direction:column;gap:3px;min-width:140px;}
+      .filter-field label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-secondary);}
+      .filter-field select{background:var(--bg-panel);color:var(--text-primary);border:1px solid var(--panel-border);border-radius:4px;padding:5px 8px;font-size:12px;cursor:pointer;font-family:inherit;}
+      .filter-count{font-size:12px;color:var(--text-secondary);padding:5px 0;align-self:flex-end;}
+      .panel{background:var(--bg-panel);border:1px solid var(--panel-border);border-radius:10px;padding:12px 16px;margin-bottom:12px;}
+      .panel-title{font-family:'Oswald',sans-serif;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1.2px;color:var(--text-secondary);margin-bottom:10px;}
+      .panel-row{display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap;}
+      .gauge-panel{background:var(--bg-panel);border:1px solid var(--panel-border);border-radius:10px;padding:10px 10px 6px;flex:1;min-width:200px;overflow:visible;}
+      .kpi-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;flex:2;min-width:240px;}
       .top-row{align-items:stretch;}
-      .stat-card{background:var(--bg-panel);border:1px solid var(--panel-border);border-radius:8px;padding:16px 20px;display:flex;flex-direction:column;gap:4px;}
-      .stat-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:var(--text-secondary);}
-      .stat-value{font-family:'IBM Plex Mono',monospace;font-weight:700;line-height:1.1;}
-      .stat-sub{font-size:12px;color:var(--text-tertiary);}
-      .comment-feed{display:flex;flex-direction:column;gap:12px;}
-      .comment-item{background:var(--comment-bg);border-radius:6px;padding:14px 16px;}
-      .comment-meta{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--text-secondary);margin-bottom:6px;flex-wrap:wrap;}
-      .comment-text{margin:0;font-size:14px;color:var(--text-primary);line-height:1.55;}
-      .empty-note{color:var(--text-tertiary);font-size:13px;padding:16px;text-align:center;}
+      .stat-card{background:var(--bg-panel);border:1px solid var(--panel-border);border-radius:7px;padding:10px 14px;display:flex;flex-direction:column;gap:2px;}
+      .stat-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:var(--text-secondary);}
+      .stat-value{font-family:'IBM Plex Mono',monospace;font-weight:700;line-height:1.25;font-size:15px;word-break:break-word;overflow-wrap:break-word;}
+      .stat-sub{font-size:11px;color:var(--text-tertiary);}
+      .comment-feed{display:flex;flex-direction:column;gap:8px;}
+      .comment-item{background:var(--comment-bg);border-radius:5px;padding:8px 12px;}
+      .comment-meta{display:flex;gap:6px;align-items:center;font-size:11px;color:var(--text-secondary);margin-bottom:4px;flex-wrap:wrap;}
+      .comment-text{margin:0;font-size:13px;color:var(--text-primary);line-height:1.45;}
+      .empty-note{color:var(--text-tertiary);font-size:12px;padding:10px;text-align:center;}
       .responses-table-wrap{overflow-x:auto;}
-      .responses-table{width:100%;border-collapse:collapse;font-size:13px;}
-      .responses-table th{text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-secondary);padding:8px 10px;border-bottom:2px solid var(--panel-border);}
-      .responses-table td{padding:9px 10px;border-bottom:1px solid var(--panel-border);color:var(--text-primary);vertical-align:top;}
+      .responses-table{width:100%;border-collapse:collapse;font-size:12px;}
+      .responses-table th{text-align:left;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-secondary);padding:6px 8px;border-bottom:2px solid var(--panel-border);}
+      .responses-table td{padding:6px 8px;border-bottom:1px solid var(--panel-border);color:var(--text-primary);vertical-align:top;}
       .responses-table tr:last-child td{border-bottom:none;}
-      .responses-table-comment{max-width:260px;white-space:pre-wrap;word-break:break-word;}
-      .tenure-donut-wrap{display:flex;gap:32px;align-items:center;flex-wrap:wrap;}
-      .tenure-donut-chart{position:relative;flex:1;min-width:220px;max-width:300px;}
+      .responses-table-comment{max-width:220px;white-space:pre-wrap;word-break:break-word;}
+      .tenure-donut-wrap{display:flex;gap:20px;align-items:center;flex-wrap:wrap;}
+      .tenure-donut-chart{position:relative;flex:1;min-width:160px;max-width:220px;}
       .tenure-donut-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;pointer-events:none;}
-      .tenure-donut-total{font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:700;color:var(--text-primary);}
-      .tenure-donut-total-label{font-size:11px;color:var(--text-secondary);white-space:nowrap;}
-      .tenure-stats-list{flex:1;min-width:200px;display:flex;flex-direction:column;gap:12px;}
-      .tenure-stat-row{display:flex;flex-direction:column;gap:4px;}
-      .tenure-stat-top{display:flex;align-items:center;gap:8px;}
-      .tenure-stat-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
-      .tenure-stat-name{font-size:13px;color:var(--text-primary);flex:1;}
-      .tenure-stat-pct{font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:600;color:var(--text-primary);}
-      .tenure-stat-count{font-size:12px;color:var(--text-secondary);min-width:24px;text-align:right;}
-      .tenure-stat-bar-track{height:4px;background:var(--panel-border);border-radius:2px;}
-      .tenure-stat-bar-fill{height:4px;border-radius:2px;transition:width 0.4s ease;}
+      .tenure-donut-total{font-family:'IBM Plex Mono',monospace;font-size:22px;font-weight:700;color:var(--text-primary);}
+      .tenure-donut-total-label{font-size:10px;color:var(--text-secondary);white-space:nowrap;}
+      .tenure-stats-list{flex:1;min-width:160px;display:flex;flex-direction:column;gap:7px;}
+      .tenure-stat-row{display:flex;flex-direction:column;gap:3px;}
+      .tenure-stat-top{display:flex;align-items:center;gap:6px;}
+      .tenure-stat-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+      .tenure-stat-name{font-size:12px;color:var(--text-primary);flex:1;}
+      .tenure-stat-pct{font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;color:var(--text-primary);}
+      .tenure-stat-count{font-size:11px;color:var(--text-secondary);min-width:20px;text-align:right;}
+      .tenure-stat-bar-track{height:3px;background:var(--panel-border);border-radius:2px;}
+      .tenure-stat-bar-fill{height:3px;border-radius:2px;transition:width 0.4s ease;}
       .logo-preview-box{width:80px;height:60px;background:var(--bg-tab);border:1px solid var(--panel-border);border-radius:4px;display:flex;align-items:center;justify-content:center;overflow:hidden;}
       .logo-preview-img{max-width:100%;max-height:100%;object-fit:contain;}
       .logo-preview-empty{font-size:10px;color:var(--text-tertiary);text-align:center;padding:4px;}
@@ -1627,14 +3099,14 @@ function App(){
       .app-root{min-height:100vh;}
       .content>.guidelines-banner,.content>.paper-card{max-width:1280px;margin-left:auto;margin-right:auto;}
       .content>.guidelines-banner{margin-bottom:20px;}
-      .dash-grid{display:grid;grid-template-columns:minmax(0,1fr);column-gap:20px;align-items:start;}
+      .dash-grid{display:grid;grid-template-columns:minmax(0,1fr);column-gap:12px;align-items:start;}
       .dash-grid>*{min-width:0;}
       .poster-wrap{max-width:760px;margin:0 auto;}
       .settings-grid{columns:3 420px;column-gap:20px;}
       .settings-grid>.panel{display:inline-block;width:100%;break-inside:avoid;}
       .header-bar{padding:1rem clamp(1rem,2.2vw,2.5rem);}
       @media(min-width:1200px){
-        .dash-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+        .dash-grid{grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px;}
         .dash-grid>div:not(.panel),.dash-grid>.dash-full{grid-column:1/-1;}
         .dash-grid .comment-feed{max-height:420px;overflow-y:auto;padding-right:4px;}
         .kpi-grid{grid-template-columns:repeat(4,minmax(0,1fr));flex:3;}
@@ -1681,15 +3153,23 @@ function App(){
           <div><div className="brand">{companyName}</div><div className="brand-sub">Inter-Dept Satisfaction</div></div>
         </div>
         <div className="tabs">
-          {isAdmin&&(<>
+          {isLoggedIn&&(<>
             <button className={"tab-btn"+(tab==="survey"?" active":"")} onClick={()=>setTab("survey")}>Take Survey</button>
             <button className={"tab-btn"+(tab==="dashboard"?" active":"")} onClick={()=>setTab("dashboard")}>Dashboard</button>
             <button className={"tab-btn"+(tab==="poster"?" active":"")} onClick={()=>setTab("poster")}>QR Poster</button>
-            <button className={"tab-btn"+(tab==="settings"?" active":"")} onClick={()=>setTab("settings")}>Settings</button>
+            {/* Users tab — superadmin sees full mgmt, regular user sees their plant access */}
+            <button className={"tab-btn"+(tab==="users"?" active":"")} onClick={()=>setTab("users")}>
+              {isSuperAdmin?"Users":"My Access"}
+            </button>
+            {/* Settings — superadmin only */}
+            {isSuperAdmin&&<button className={"tab-btn"+(tab==="ai"?" active":"")} onClick={()=>setTab("ai")} style={tab==="ai"?{}:{background:"linear-gradient(135deg,rgba(155,107,209,0.12),rgba(99,102,241,0.12))",border:"1px solid rgba(155,107,209,0.4)",color:"#9B6BD1"}}>🤖 AI Analysis</button>}
+            {isSuperAdmin&&<button className={"tab-btn"+(tab==="settings"?" active":"")} onClick={()=>setTab("settings")}>Settings</button>}
           </>)}
           <button className="theme-toggle" onClick={toggleTheme}>{theme==="dark"?"Light mode":"Dark mode"}</button>
-          {isAdmin?<button className="theme-toggle" onClick={handleLogout}>Log out</button>
-            :<button className="admin-gear-btn" onClick={()=>setShowLogin((v)=>!v)} title="Admin login" aria-label="Admin login">
+          {roleBadge}
+          {isLoggedIn
+            ?<button className="theme-toggle" onClick={handleLogout}>Log out</button>
+            :<button className="admin-gear-btn" onClick={()=>setShowLogin((v)=>!v)} title="Login" aria-label="Login">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
               </svg>
@@ -1697,23 +3177,68 @@ function App(){
           }
         </div>
       </div>
-      {!isAdmin&&showLogin&&<div style={{padding:"0 1.5rem 1rem"}}><AdminLogin onCancel={()=>setShowLogin(false)}/></div>}
+      {!isLoggedIn&&showLogin&&<div style={{padding:"0 1.5rem 1rem"}}><AdminLogin onCancel={()=>setShowLogin(false)}/></div>}
       <HazardBar/>
     </div>
 
     <div className="content">
-      {(tab==="survey"||!isAdmin)&&(<>
+      {(tab==="survey"||!isLoggedIn)&&(<>
         {ratingGuidelines&&(
           <div className="guidelines-banner">
             <div className="guidelines-banner-label">📋 Rating Guidelines</div>
             <div className="guidelines-banner-text">{ratingGuidelines}</div>
           </div>
         )}
-        <SurveyForm onSubmit={handleSubmit} logoUrl={logoUrl} plants={plantNames} departments={deptNames} shifts={shiftNames} ratingGuidelines={ratingGuidelines} isAdmin={isAdmin} onAddDummyEntry={addDummyEntry} validUntil={validUntil}/>
+        <SurveyForm onSubmit={handleSubmit} logoUrl={logoUrl} plants={plantNames} departments={deptNames} shifts={shiftNames} ratingGuidelines={ratingGuidelines} isAdmin={isSuperAdmin} onAddDummyEntry={addDummyEntry} validUntil={validUntil} existingResponses={responses}/>
       </>)}
-      {tab==="dashboard"&&isAdmin&&<Dashboard responses={responses} theme={theme} plants={plantNames} departments={deptNames} shifts={shiftNames} companyName={companyName} logoUrl={logoUrl} onDeleteResponses={deleteResponses} onAddDummyEntry={addDummyEntry}/>}
-      {tab==="poster"&&isAdmin&&<QRPoster surveyUrl={surveyUrl} logoUrl={logoUrl} companyName={companyName} onGoSettings={()=>setTab("settings")}/>}
-      {tab==="settings"&&isAdmin&&<SettingsPanel surveyUrl={surveyUrl} onSaveUrl={saveSurveyUrl} logoUrl={logoUrl} onSaveLogo={saveLogo} onRemoveLogo={removeLogo} companyName={companyName} onSaveCompanyName={saveCompanyName} ratingGuidelines={ratingGuidelines} onSaveGuidelines={saveGuidelines} validUntil={validUntil} onSaveValidUntil={saveValidUntil} plants={plants} onAddPlant={addPlant} onDeletePlant={deletePlant} departments={departments} onAddDepartment={addDepartment} onDeleteDepartment={deleteDepartment} shifts={shifts} onAddShift={addShift} onDeleteShift={deleteShift}/>}
+      {tab==="dashboard"&&isLoggedIn&&(
+        <Dashboard
+          responses={dashResponses}
+          theme={theme}
+          plants={dashPlantNames}
+          departments={deptNames}
+          shifts={shiftNames}
+          companyName={companyName}
+          logoUrl={logoUrl}
+          onDeleteResponses={isSuperAdmin?deleteResponses:null}
+          onAddDummyEntry={isSuperAdmin?addDummyEntry:null}
+        />
+      )}
+      {tab==="poster"&&isLoggedIn&&<QRPoster surveyUrl={surveyUrl} logoUrl={logoUrl} companyName={companyName} onGoSettings={isSuperAdmin?()=>setTab("settings"):null}/>}
+      {tab==="users"&&isLoggedIn&&(
+        isSuperAdmin
+          ?<UsersPanel plants={plants} managedUsers={managedUsers} currentUserUid={user.uid}/>
+          :<div className="panel" style={{maxWidth:560}}>
+            <div className="panel-title">My Plant Access</div>
+            <p style={{color:"var(--text-secondary)",fontSize:14,marginBottom:16,lineHeight:1.6}}>
+              You are logged in as <strong style={{color:"var(--text-primary)"}}>{user.email}</strong>.
+            </p>
+            {myAllowedPlants
+              ?<>
+                <p style={{color:"var(--text-secondary)",fontSize:13,marginBottom:12}}>You have access to the following plant(s):</p>
+                <div style={{display:"flex",flexWrap:"wrap",gap:10}}>
+                  {myAllowedPlants.map(p=>(
+                    <span key={p} style={{background:"linear-gradient(135deg,#6366F1,#3E8FB0)",color:"#fff",padding:"8px 20px",borderRadius:999,fontWeight:700,fontSize:14}}>{p}</span>
+                  ))}
+                </div>
+              </>
+              :<p style={{color:"var(--text-secondary)",fontSize:14}}>You have access to <strong style={{color:"var(--text-primary)"}}>all plants</strong>.</p>
+            }
+            <p style={{color:"var(--text-tertiary)",fontSize:12,marginTop:16}}>Contact a Superadmin to change your plant access.</p>
+          </div>
+      )}
+      {tab==="ai"&&isLoggedIn&&isSuperAdmin&&(
+        <AIAnalysisPanel
+          responses={dashResponses}
+          departments={deptNames}
+          plants={dashPlantNames}
+          shifts={shiftNames}
+          theme={theme}
+        />
+      )}
+      {tab==="settings"&&isLoggedIn&&isSuperAdmin&&(
+        <SettingsPanel surveyUrl={surveyUrl} onSaveUrl={saveSurveyUrl} logoUrl={logoUrl} onSaveLogo={saveLogo} onRemoveLogo={removeLogo} companyName={companyName} onSaveCompanyName={saveCompanyName} ratingGuidelines={ratingGuidelines} onSaveGuidelines={saveGuidelines} validUntil={validUntil} onSaveValidUntil={saveValidUntil} plants={plants} onAddPlant={addPlant} onDeletePlant={deletePlant} departments={departments} onAddDepartment={addDepartment} onDeleteDepartment={deleteDepartment} shifts={shifts} onAddShift={addShift} onDeleteShift={deleteShift}/>
+      )}
     </div>
   </div>);
 }

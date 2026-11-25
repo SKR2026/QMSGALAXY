@@ -41,11 +41,23 @@ export async function loadEmailConfig() {
 }
 
 export async function saveEmailConfig(config) {
+  // Ensure all fields are stored as plain arrays (never strings)
+  const clean = {};
+  for (const [eventKey, val] of Object.entries(config)) {
+    if (val && typeof val === "object" && ("to" in val || "cc" in val)) {
+      clean[eventKey] = {
+        to: Array.isArray(val.to) ? val.to.filter(Boolean) : [],
+        cc: Array.isArray(val.cc) ? val.cc.filter(Boolean) : [],
+      };
+    } else {
+      clean[eventKey] = val;
+    }
+  }
   await setDoc(doc(db, "settings", "emailConfig"), {
-    ...config,
+    ...clean,
     updatedAt: serverTimestamp()
   });
-  EMAIL_CONFIG = config;
+  EMAIL_CONFIG = clean;
 }
 
 export function getEmailConfig() { return EMAIL_CONFIG; }
@@ -75,6 +87,7 @@ export async function sendDispatchEmail(dispatch, user) {
       date:             dispatch.date,
       fromPlantName:    dispatch.fromPlantName,
       toPlantName:      dispatch.toPlantName,
+      toPlantId:        dispatch.toPlantId,        // ← for auto plant-contact lookup
       material:         dispatch.material,
       qtyDispatched:    dispatch.qtyDispatched,
       unit:             dispatch.unit,
@@ -88,6 +101,7 @@ export async function sendDispatchEmail(dispatch, user) {
       ewayBill:         dispatch.ewayBill || "",
       remarks:          dispatch.remarks || "",
       dispatchedByName: user.name,
+      senderEmail:      user.email || "",          // ← auto-CC the dispatcher
     },
   });
 }
@@ -105,6 +119,7 @@ export async function sendReceiptEmail(dispatch, receipt, user) {
       date:          dispatch.date,
       fromPlantName: dispatch.fromPlantName,
       toPlantName:   dispatch.toPlantName,
+      toPlantId:     dispatch.toPlantId,           // ← for auto plant-contact lookup
       material:      dispatch.material,
       qtyDispatched: dispatch.qtyDispatched,
       unit:          dispatch.unit,
@@ -115,6 +130,7 @@ export async function sendReceiptEmail(dispatch, receipt, user) {
       qtyReceived:     receipt.qtyReceived,
       receiptRemarks:  receipt.receiptRemarks || "",
       receivedByName:  user.name,
+      receiverEmail:   user.email || "",           // ← auto-CC the receiver
     },
   });
 }

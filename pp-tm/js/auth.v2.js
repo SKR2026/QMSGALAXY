@@ -7,7 +7,10 @@ import { auth, db } from "./firebase.v2.js";
 import {
   signInWithEmailAndPassword,
   signOut,
-  onAuthStateChanged
+  onAuthStateChanged,
+  updatePassword,
+  reauthenticateWithCredential,
+  EmailAuthProvider
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import {
   doc, getDoc
@@ -75,6 +78,16 @@ export function observeAuth(onLoggedIn, onLoggedOut) {
       onLoggedOut();
     }
   });
+}
+
+// ── Change Password ──────────────────────────────────────────
+export async function changePassword(currentPassword, newPassword) {
+  const user = auth.currentUser;
+  if (!user) throw new Error("Not logged in.");
+  // Re-authenticate first (required by Firebase before sensitive operations)
+  const credential = EmailAuthProvider.credential(user.email, currentPassword);
+  await reauthenticateWithCredential(user, credential);
+  await updatePassword(user, newPassword);
 }
 
 // ── Role guards ──────────────────────────────────────────────
