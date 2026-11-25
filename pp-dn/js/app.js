@@ -11,7 +11,10 @@ import {
   signInAnonymously,
   signOut,
   onAuthStateChanged,
-  sendPasswordResetEmail
+  sendPasswordResetEmail,
+  updatePassword,
+  reauthenticateWithCredential,
+  EmailAuthProvider
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 
 import {
@@ -155,6 +158,24 @@ function logActivity(data) {
   }).catch(console.error);
 }
 
+// ── EARLY BRANDING (apply logo on auth screen before login) ──────────────
+(async () => {
+  try {
+    const snap = await getDoc(doc(db, "appSettings", "branding"));
+    if (snap.exists()) {
+      const b = snap.data();
+      if (b.logoUrl) {
+        const authLogo = document.getElementById("authLogo");
+        if (authLogo) { authLogo.src = b.logoUrl; authLogo.style.display = ""; }
+      }
+      if (b.primaryColor) {
+        document.documentElement.style.setProperty("--primary", b.primaryColor);
+        document.documentElement.style.setProperty("--primary-dark", b.primaryColor);
+      }
+    }
+  } catch (_) {}
+})();
+
 // ═══════════════════════════════════════════════════════════════════════════
 // AUTH
 // ═══════════════════════════════════════════════════════════════════════════
@@ -163,32 +184,50 @@ document.getElementById("togglePass").addEventListener("click", () => {
   el.type = el.type === "password" ? "text" : "password";
 });
 
+// ── AUTH TAB SWITCHING ────────────────────────────────────────────────────
+function showAuthTab(tab) {
+  // tab = "login" | "mgmt" | "forgot"
+  const loginPanel  = document.getElementById("loginForm");
+  const mgmtPanel   = document.getElementById("mgmtForm");
+  const forgotPanel = document.getElementById("forgotForm");
+  const authTabs    = document.getElementById("authTabs");
+  const tabSignIn   = document.getElementById("tabSignIn");
+  const tabMgmt     = document.getElementById("tabMgmt");
+
+  loginPanel.classList.add("d-none");
+  mgmtPanel.classList.add("d-none");
+  forgotPanel.classList.add("d-none");
+
+  if (tab === "login") {
+    loginPanel.classList.remove("d-none");
+    authTabs.style.display = "";
+    tabSignIn.classList.add("active");
+    tabMgmt.classList.remove("active");
+  } else if (tab === "mgmt") {
+    mgmtPanel.classList.remove("d-none");
+    authTabs.style.display = "";
+    tabMgmt.classList.add("active");
+    tabSignIn.classList.remove("active");
+  } else if (tab === "forgot") {
+    forgotPanel.classList.remove("d-none");
+    authTabs.style.display = "none";
+  }
+}
+
+document.getElementById("tabSignIn").addEventListener("click", () => showAuthTab("login"));
+document.getElementById("tabMgmt").addEventListener("click", () => showAuthTab("mgmt"));
+
 document.getElementById("forgotPassLink").addEventListener("click", e => {
   e.preventDefault();
-  document.getElementById("loginForm").classList.add("d-none");
-  document.getElementById("forgotForm").classList.remove("d-none");
+  showAuthTab("forgot");
 });
 
 document.getElementById("backToLogin").addEventListener("click", e => {
   e.preventDefault();
-  document.getElementById("loginForm").classList.remove("d-none");
-  document.getElementById("forgotForm").classList.add("d-none");
+  showAuthTab("login");
 });
 
 // ── MANAGEMENT VIEW (no PIN — direct access) ─────────────────────────────
-
-document.getElementById("mgmtViewLink").addEventListener("click", e => {
-  e.preventDefault();
-  document.getElementById("loginForm").classList.add("d-none");
-  document.getElementById("mgmtForm").classList.remove("d-none");
-});
-
-document.getElementById("backToLoginFromMgmt").addEventListener("click", e => {
-  e.preventDefault();
-  document.getElementById("mgmtForm").classList.add("d-none");
-  document.getElementById("loginForm").classList.remove("d-none");
-  document.getElementById("mgmtPinError").classList.add("d-none");
-});
 
 document.getElementById("mgmtLoginBtn").addEventListener("click", async () => {
   const errEl = document.getElementById("mgmtPinError");
@@ -253,12 +292,76 @@ document.getElementById("loginBtn").addEventListener("click", async () => {
   }
 });
 
-document.getElementById("logoutBtn").addEventListener("click", () => {
+function doSignOut() {
   signOut(auth).then(() => {
     currentUser = null; currentUserData = null; allDocuments = [];
     document.getElementById("appShell").classList.add("d-none");
     document.getElementById("authScreen").classList.remove("d-none");
+    showAuthTab("login");
   });
+}
+
+document.getElementById("logoutBtn").addEventListener("click", doSignOut);
+document.getElementById("powerOffBtn").addEventListener("click", e => { e.preventDefault(); doSignOut(); });
+
+// ── CHANGE PASSWORD ───────────────────────────────────────────────────────
+document.getElementById("changePassMenuBtn").addEventListener("click", e => {
+  e.preventDefault();
+  document.getElementById("cpCurrentPass").value = "";
+  document.getElementById("cpNewPass").value = "";
+  document.getElementById("cpConfirmPass").value = "";
+  document.getElementById("cpMsg").classList.add("d-none");
+  new bootstrap.Modal(document.getElementById("changePassModal")).show();
+});
+
+document.getElementById("cpSaveBtn").addEventListener("click", async () => {
+  const current = document.getElementById("cpCurrentPass").value;
+  const newPass = document.getElementById("cpNewPass").value;
+  const confirm = document.getElementById("cpConfirmPass").value;
+  const msgEl   = document.getElementById("cpMsg");
+  const spin    = document.getElementById("cpSpinner");
+
+  msgEl.classList.add("d-none");
+
+  if (!current || !newPass || !confirm) {
+    msgEl.className = "alert alert-danger";
+    msgEl.textContent = "Please fill in all fields.";
+    msgEl.classList.remove("d-none");
+    return;
+  }
+  if (newPass.length < 8) {
+    msgEl.className = "alert alert-danger";
+    msgEl.textContent = "New password must be at least 8 characters.";
+    msgEl.classList.remove("d-none");
+    return;
+  }
+  if (newPass !== confirm) {
+    msgEl.className = "alert alert-danger";
+    msgEl.textContent = "New passwords do not match.";
+    msgEl.classList.remove("d-none");
+    return;
+  }
+
+  spin.classList.remove("d-none");
+  try {
+    const credential = EmailAuthProvider.credential(currentUser.email, current);
+    await reauthenticateWithCredential(currentUser, credential);
+    await updatePassword(currentUser, newPass);
+    msgEl.className = "alert alert-success";
+    msgEl.textContent = "Password changed successfully!";
+    msgEl.classList.remove("d-none");
+    document.getElementById("cpCurrentPass").value = "";
+    document.getElementById("cpNewPass").value = "";
+    document.getElementById("cpConfirmPass").value = "";
+  } catch (e) {
+    msgEl.className = "alert alert-danger";
+    msgEl.textContent = e.code === "auth/wrong-password" || e.code === "auth/invalid-credential"
+      ? "Current password is incorrect."
+      : e.message;
+    msgEl.classList.remove("d-none");
+  } finally {
+    spin.classList.add("d-none");
+  }
 });
 
 onAuthStateChanged(auth, async user => {
@@ -311,13 +414,59 @@ async function loadCurrentUser() {
 // ═══════════════════════════════════════════════════════════════════════════
 async function initApp() {
   startClock();
+  applyBranding();          // load logo/color/title from Firestore first
   buildSidebar();
+  buildTopnavUser();
   setupNavigation();
   setupSidebar();
   loadMasterData();
   setupSubmitForm();
   setupSendNotification();
   navigateTo("dashboard");
+}
+
+async function applyBranding() {
+  try {
+    const snap = await getDoc(doc(db, "appSettings", "branding"));
+    if (!snap.exists()) return;
+    const b = snap.data();
+    // Apply logo to auth screen and sidebar
+    if (b.logoUrl) {
+      const authLogo = document.getElementById("authLogo");
+      const sidebarLogo = document.getElementById("sidebarLogo");
+      if (authLogo)   { authLogo.src = b.logoUrl; authLogo.style.display = ""; }
+      if (sidebarLogo){ sidebarLogo.src = b.logoUrl; sidebarLogo.style.display = ""; }
+    }
+    // Apply primary color
+    if (b.primaryColor) {
+      document.documentElement.style.setProperty("--primary", b.primaryColor);
+      // Compute darker shade for hover
+      document.documentElement.style.setProperty("--primary-dark", b.primaryColor);
+    }
+    // Apply app title
+    if (b.appTitle) {
+      document.title = b.appTitle + " – Corporate Document Registration & Tracking";
+      document.querySelectorAll(".sidebar-title").forEach(el => el.textContent = b.appTitle);
+    }
+  } catch (e) {
+    console.warn("Branding load failed:", e);
+  }
+}
+
+function buildTopnavUser() {
+  const name = currentUserData?.displayName || currentUser?.email || "User";
+  const role = currentUserData?.role;
+  document.getElementById("topnavAvatar").textContent = getInitials(name);
+  document.getElementById("topnavName").textContent = name;
+  document.getElementById("topnavRoleLabel").textContent = roleName(role);
+
+  // Show change password only for real (non-anonymous) users
+  const cpBtn = document.getElementById("changePassMenuBtn");
+  if (role !== "top_management") {
+    cpBtn.style.display = "";
+  } else {
+    cpBtn.style.display = "none";
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1579,22 +1728,67 @@ async function loadSettings() {
   if (emailSnap?.exists()) {
     const s = emailSnap.data();
     document.getElementById("settingAppUrl").value = s.appUrl || "";
+    document.getElementById("settingFromName").value = s.fromName || "CDRTS System";
     document.getElementById("settingCooldown").value = s.notificationCooldownMinutes || 120;
   }
+  // Load Gmail credentials (stored separately for security)
+  const gmailSnap = await getDoc(doc(db, "appSettings", "emailCredentials")).catch(() => null);
+  if (gmailSnap?.exists()) {
+    const g = gmailSnap.data();
+    document.getElementById("settingGmailUser").value = g.gmailUser || "";
+    // Show masked password placeholder if set
+    if (g.gmailPassSet) {
+      document.getElementById("settingGmailPass").placeholder = "••••••••••••••••  (saved — enter new to change)";
+    }
+  }
+
+  // Toggle Gmail password visibility
+  document.getElementById("toggleGmailPass").addEventListener("click", () => {
+    const el = document.getElementById("settingGmailPass");
+    const icon = document.querySelector("#toggleGmailPass i");
+    el.type = el.type === "password" ? "text" : "password";
+    icon.className = el.type === "password" ? "bi bi-eye" : "bi bi-eye-slash";
+  });
 
   document.getElementById("saveEmailSettings").onclick = async () => {
-    await updateDoc(doc(db, "appSettings", "notifications"), {
-      appUrl: document.getElementById("settingAppUrl").value.trim(),
-      fromName: document.getElementById("settingFromName").value.trim(),
-    }, { merge: true }).catch(() =>
-      addDoc(collection(db, "appSettings"), { appUrl: document.getElementById("settingAppUrl").value.trim() })
-    );
-    // Using set with merge
-    await setOrMergeSettings("notifications", {
-      appUrl: document.getElementById("settingAppUrl").value.trim(),
-      fromName: document.getElementById("settingFromName").value.trim(),
-    });
-    showToast("Email settings saved.", "success");
+    const msgEl  = document.getElementById("emailSettingsMsg");
+    const spin   = document.getElementById("emailSaveSpinner");
+    const gmailUser = document.getElementById("settingGmailUser").value.trim();
+    const gmailPass = document.getElementById("settingGmailPass").value.trim();
+    const appUrl    = document.getElementById("settingAppUrl").value.trim();
+    const fromName  = document.getElementById("settingFromName").value.trim();
+
+    msgEl.classList.add("d-none");
+    spin.classList.remove("d-none");
+
+    try {
+      // Save general settings
+      await setOrMergeSettings("notifications", { appUrl, fromName });
+
+      // Save Gmail credentials if provided
+      if (gmailUser || gmailPass) {
+        const credData = { gmailUser, updatedAt: serverTimestamp() };
+        if (gmailPass) {
+          // Strip spaces from app password (xxxx xxxx xxxx xxxx → xxxxxxxxxxxxxxxx)
+          credData.gmailAppPassword = gmailPass.replace(/\s/g, "");
+          credData.gmailPassSet = true;
+        }
+        await setOrMergeSettings("emailCredentials", credData);
+      }
+
+      spin.classList.add("d-none");
+      msgEl.className = "alert alert-success";
+      msgEl.textContent = "✓ Email settings saved successfully.";
+      msgEl.classList.remove("d-none");
+      document.getElementById("settingGmailPass").value = "";
+      document.getElementById("settingGmailPass").placeholder = "••••••••••••••••  (saved — enter new to change)";
+      showToast("Email settings saved.", "success");
+    } catch (e) {
+      spin.classList.add("d-none");
+      msgEl.className = "alert alert-danger";
+      msgEl.textContent = "Error: " + e.message;
+      msgEl.classList.remove("d-none");
+    }
   };
 
   document.getElementById("saveNotifSettings").onclick = async () => {
@@ -1604,12 +1798,22 @@ async function loadSettings() {
     showToast("Notification settings saved.", "success");
   };
 
-  // Branding
+  // Branding — load existing values
+  const brandSnap = await getDoc(doc(db, "appSettings", "branding")).catch(() => null);
+  if (brandSnap?.exists()) {
+    const b = brandSnap.data();
+    if (b.appTitle)     document.getElementById("settingAppTitle").value = b.appTitle;
+    if (b.primaryColor) document.getElementById("settingPrimaryColor").value = b.primaryColor;
+    if (b.logoUrl)      document.getElementById("currentLogo").innerHTML =
+      `<img src="${b.logoUrl}" height="40" alt="Current Logo" style="border-radius:6px;border:1px solid var(--border);">`;
+  }
+
   document.getElementById("saveBrandingBtn").onclick = async () => {
     await setOrMergeSettings("branding", {
       appTitle: document.getElementById("settingAppTitle").value,
       primaryColor: document.getElementById("settingPrimaryColor").value,
     });
+    applyBranding();
     showToast("Branding saved.", "success");
   };
 
