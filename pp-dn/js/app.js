@@ -8,6 +8,7 @@ import { auth, db, storage, functions }
 
 import {
   signInWithEmailAndPassword,
+  signInAnonymously,
   signOut,
   onAuthStateChanged,
   sendPasswordResetEmail
@@ -125,12 +126,13 @@ function getInitials(name) {
 }
 
 function roleName(r) {
-  return { superadmin: "Superadmin", corporate_mr: "Corporate MR", user: "Plant User" }[r] || r;
+  return { superadmin: "Superadmin", corporate_mr: "Corporate MR", user: "Plant User", top_management: "Top Management" }[r] || r;
 }
 
 function isSuperadmin() { return currentUserData?.role === "superadmin"; }
 function isCorporateMR() { return currentUserData?.role === "corporate_mr"; }
 function isUser() { return currentUserData?.role === "user"; }
+function isTopManagement() { return currentUserData?.role === "top_management"; }
 
 // IST clock ticker
 function startClock() {
@@ -171,6 +173,48 @@ document.getElementById("backToLogin").addEventListener("click", e => {
   e.preventDefault();
   document.getElementById("loginForm").classList.remove("d-none");
   document.getElementById("forgotForm").classList.add("d-none");
+});
+
+// ── MANAGEMENT VIEW (no PIN — direct access) ─────────────────────────────
+
+document.getElementById("mgmtViewLink").addEventListener("click", e => {
+  e.preventDefault();
+  document.getElementById("loginForm").classList.add("d-none");
+  document.getElementById("mgmtForm").classList.remove("d-none");
+});
+
+document.getElementById("backToLoginFromMgmt").addEventListener("click", e => {
+  e.preventDefault();
+  document.getElementById("mgmtForm").classList.add("d-none");
+  document.getElementById("loginForm").classList.remove("d-none");
+  document.getElementById("mgmtPinError").classList.add("d-none");
+});
+
+document.getElementById("mgmtLoginBtn").addEventListener("click", async () => {
+  const errEl = document.getElementById("mgmtPinError");
+  const spin  = document.getElementById("mgmtSpinner");
+  errEl.classList.add("d-none");
+  spin.classList.remove("d-none");
+
+  try {
+    const cred = await signInAnonymously(auth);
+    currentUser = cred.user;
+    currentUserData = {
+      uid: cred.user.uid,
+      email: "management@view",
+      displayName: "Top Management",
+      role: "top_management",
+      isActive: true,
+    };
+    spin.classList.add("d-none");
+    document.getElementById("authScreen").classList.add("d-none");
+    document.getElementById("appShell").classList.remove("d-none");
+    initApp();
+  } catch (e) {
+    spin.classList.add("d-none");
+    errEl.textContent = "Error: " + e.message;
+    errEl.classList.remove("d-none");
+  }
 });
 
 document.getElementById("resetBtn").addEventListener("click", async () => {
@@ -218,6 +262,8 @@ document.getElementById("logoutBtn").addEventListener("click", () => {
 });
 
 onAuthStateChanged(auth, async user => {
+  // Skip if already in management view mode
+  if (currentUserData?.role === "top_management") return;
   if (user) {
     currentUser = user;
     await loadCurrentUser();
@@ -225,8 +271,11 @@ onAuthStateChanged(auth, async user => {
     document.getElementById("appShell").classList.remove("d-none");
     initApp();
   } else {
-    document.getElementById("authScreen").classList.remove("d-none");
-    document.getElementById("appShell").classList.add("d-none");
+    // Don't redirect if management view is active
+    if (currentUserData?.role !== "top_management") {
+      document.getElementById("authScreen").classList.remove("d-none");
+      document.getElementById("appShell").classList.add("d-none");
+    }
   }
 });
 
@@ -316,6 +365,16 @@ function buildSidebar() {
     addLink("settings", "bi-gear", "Settings");
   }
 
+  if (isTopManagement()) {
+    // Read-only: dashboard only, no actions
+    const badge = document.createElement("li");
+    badge.innerHTML = `<div class="text-center px-3 py-2">
+      <span class="badge bg-success-subtle text-success border border-success-subtle w-100">
+        <i class="bi bi-eye me-1"></i>Read-Only View
+      </span></div>`;
+    nav.appendChild(badge);
+  }
+
   // Send Notification button (users only)
   const sendNotifBtn = document.getElementById("sendNotifBtn");
   if (isUser()) {
@@ -326,6 +385,11 @@ function buildSidebar() {
   if (isSuperadmin()) {
     document.querySelectorAll(".superadmin-only").forEach(el => el.classList.remove("d-none"));
     document.getElementById("bulkActions").classList.remove("d-none");
+  }
+
+  // Hide action buttons for top management
+  if (isTopManagement()) {
+    document.querySelectorAll(".superadmin-only, #bulkActions, #sendNotifBtn, .btn-assign, .btn-return, .btn-delete").forEach(el => el.classList.add("d-none"));
   }
 }
 
