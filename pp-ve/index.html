@@ -1096,6 +1096,7 @@ let S = {
   filterMonth: '', filterVehicle: '', filterCat: '',
   expVehicleSearch: '',
   selectedVehicleId: null, selectedExpenses: new Set(), _selectedVehicleBar: null,
+  saAiPlant: '__all__',
   modal: null, loading: false, dataLoaded: false, notifications: [],
   companyLogo: localStorage.getItem('vems_logo') || '',
   companyLogoNatW: parseInt(localStorage.getItem('vems_logo_w')||'0')||0,
@@ -4501,6 +4502,204 @@ function auditHTML() {
 }
 
 // ── SUPERADMIN PANEL ──────────────────────────────────────────────
+// ── AI Analysis (Superadmin) ─────────────────────────────────────────────────
+const SA_AI_ALL = '__all__';
+
+window.setSaAiPlant = function(plantId) {
+  S.saAiPlant = plantId;
+  const panel = document.getElementById('sa-ai-panel');
+  if (panel) panel.innerHTML = saAIAnalysisHTML();
+};
+
+function saAIAnalysisHTML() {
+  const selPlant = S.saAiPlant || SA_AI_ALL;
+  const plants   = S.plants || [];
+
+  // Filter expenses by selected plant
+  const exps = selPlant === SA_AI_ALL
+    ? S.expenses
+    : S.expenses.filter(e => e.plantId === selPlant);
+
+  const plantName2 = id => S.plants.find(p => p.id === id)?.name || id;
+  const selPlantName = selPlant === SA_AI_ALL ? 'All Plants' : (plants.find(p=>p.id===selPlant)?.name || selPlant);
+
+  // ── KPIs ──
+  const total     = exps.length;
+  const totalAmt  = exps.reduce((s,e)=>s+(e.amount||0)+(e.gst||0),0);
+  const withBill  = exps.filter(e=>e.hasBill||e.billUrl).length;
+  const noBill    = total - withBill;
+  const acked     = exps.filter(e=>e.erpAck?.loggedInERP===true).length;
+  const pending   = total - acked;
+  const totalCO2  = exps.reduce((s,e)=>s+expCO2(e),0);
+  const billPct   = total ? Math.round(withBill/total*100) : 0;
+  const ackPct    = total ? Math.round(acked/total*100) : 0;
+
+  if (total === 0) {
+    // Build pills + empty state
+    const pillsHTML = `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
+      <button onclick="setSaAiPlant('${SA_AI_ALL}')" style="${pillStyle(selPlant===SA_AI_ALL)}">All Plants</button>
+      ${plants.map(p=>`<button onclick="setSaAiPlant('${p.id}')" style="${pillStyle(selPlant===p.id)}">${p.name}</button>`).join('')}
+    </div>`;
+    return pillsHTML + `<div style="text-align:center;padding:40px;color:#9ca3af;font-size:14px">No expenses found${selPlant!==SA_AI_ALL?' for '+selPlantName:''}.</div>`;
+  }
+
+  // ── Category breakdown ──
+  const catMap = {};
+  exps.forEach(e=>{ catMap[e.category]=(catMap[e.category]||{count:0,amt:0}); catMap[e.category].count++; catMap[e.category].amt+=(e.amount||0)+(e.gst||0); });
+  const catList = Object.entries(catMap).sort((a,b)=>b[1].amt-a[1].amt);
+
+  // ── Monthly trend (last 6 months) ──
+  const monthMap = {};
+  exps.forEach(e=>{ if(!e.date)return; const k=e.date.slice(0,7); monthMap[k]=(monthMap[k]||{count:0,amt:0}); monthMap[k].count++; monthMap[k].amt+=(e.amount||0)+(e.gst||0); });
+  const monthList = Object.entries(monthMap).sort((a,b)=>a[0].localeCompare(b[0])).slice(-6);
+  const maxMonthAmt = Math.max(...monthList.map(([,v])=>v.amt),1);
+
+  // ── Plant breakdown (only for All Plants view) ──
+  const plantMap = {};
+  if (selPlant === SA_AI_ALL) {
+    exps.forEach(e=>{ const pid=e.plantId||'Unknown'; plantMap[pid]=(plantMap[pid]||{count:0,amt:0}); plantMap[pid].count++; plantMap[pid].amt+=(e.amount||0)+(e.gst||0); });
+  }
+  const plantList = Object.entries(plantMap).sort((a,b)=>b[1].amt-a[1].amt);
+  const maxPlantAmt = Math.max(...plantList.map(([,v])=>v.amt),1);
+
+  // ── Top vendors ──
+  const vendMap = {};
+  exps.forEach(e=>{ if(!e.vendor)return; vendMap[e.vendor]=(vendMap[e.vendor]||{count:0,amt:0}); vendMap[e.vendor].count++; vendMap[e.vendor].amt+=(e.amount||0)+(e.gst||0); });
+  const topVendors = Object.entries(vendMap).sort((a,b)=>b[1].amt-a[1].amt).slice(0,5);
+
+  // ── Bills compliance ──
+  const noBillExps = exps.filter(e=>!e.hasBill&&!e.billUrl).slice(0,5);
+
+  // ── Recommendations ──
+  const recs = [];
+  if (billPct < 80) recs.push(`⚠️ Only ${billPct}% of expenses have bills attached — ${noBill} expense${noBill!==1?'s':''} missing invoices. Follow up with plant admins.`);
+  if (ackPct < 60) recs.push(`🔴 ERP acknowledgement is at ${ackPct}% — ${pending} entr${pending!==1?'ies':'y'} still pending. Accounts team action required.`);
+  if (billPct >= 80 && ackPct >= 80) { recs.push('✅ Compliance is healthy — both bill upload and ERP acknowledgement rates are above 80%.'); }
+  if (catList.length>0) recs.push(`📌 Highest spend category: ${catList[0][0]} (${fmtR(catList[0][1].amt)}) — verify all invoices are captured.`);
+  if (monthList.length>=2) {
+    const last=monthList[monthList.length-1][1].amt, prev=monthList[monthList.length-2][1].amt;
+    if (last>prev*1.2) recs.push(`📈 Expense spend jumped ${Math.round((last-prev)/prev*100)}% last month — review for unusual entries.`);
+    else if (last<prev*0.8) recs.push(`📉 Expense spend dropped ${Math.round((prev-last)/prev*100)}% last month — confirm no expenses were missed.`);
+  }
+
+  function pillStyle(active) {
+    return active
+      ? 'padding:7px 18px;border-radius:20px;border:2px solid #16a34a;background:#16a34a;color:#fff;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s'
+      : 'padding:7px 18px;border-radius:20px;border:2px solid #d97706;background:transparent;color:#d97706;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s';
+  }
+
+  const kpiStyle = 'background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px 18px;text-align:left';
+  const kpiLabel = 'font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:#9ca3af;font-weight:600;margin-bottom:6px';
+  const kpiVal   = (color='#111827') => `font-size:22px;font-weight:800;color:${color};font-family:monospace`;
+  const bar = (pct,color) => `<div style="background:#f3f4f6;border-radius:4px;height:8px;margin-top:6px"><div style="width:${pct}%;height:100%;border-radius:4px;background:${color}"></div></div>`;
+
+  return `
+    <!-- Plant pills -->
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
+      <button onclick="setSaAiPlant('${SA_AI_ALL}')" style="${pillStyle(selPlant===SA_AI_ALL)}">🏭 All Plants</button>
+      ${plants.map(p=>`<button onclick="setSaAiPlant('${p.id}')" style="${pillStyle(selPlant===p.id)}">${p.name}</button>`).join('')}
+    </div>
+
+    <!-- KPI row -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px">
+      <div style="${kpiStyle}"><div style="${kpiLabel}">Total Expenses</div><div style="${kpiVal()}">${total}</div><div style="font-size:11px;color:#6b7280;margin-top:4px">${fmtR(totalAmt)} total</div></div>
+      <div style="${kpiStyle}"><div style="${kpiLabel}">Bills Uploaded</div><div style="${kpiVal(billPct>=80?'#16a34a':billPct>=60?'#d97706':'#dc2626')}">${billPct}%</div>${bar(billPct,billPct>=80?'#16a34a':billPct>=60?'#d97706':'#dc2626')}<div style="font-size:11px;color:#6b7280;margin-top:4px">${withBill} of ${total}</div></div>
+      <div style="${kpiStyle}"><div style="${kpiLabel}">ERP Acknowledged</div><div style="${kpiVal(ackPct>=80?'#16a34a':ackPct>=60?'#d97706':'#dc2626')}">${ackPct}%</div>${bar(ackPct,ackPct>=80?'#16a34a':ackPct>=60?'#d97706':'#dc2626')}<div style="font-size:11px;color:#6b7280;margin-top:4px">${acked} of ${total}</div></div>
+      <div style="${kpiStyle}"><div style="${kpiLabel}">Total CO₂</div><div style="${kpiVal('#7c3aed')}">${totalCO2.toFixed(0)}<span style="font-size:12px;font-weight:600"> kg</span></div><div style="font-size:11px;color:#6b7280;margin-top:4px">All fuel expenses</div></div>
+      <div style="${kpiStyle};border-top:3px solid #dc2626"><div style="${kpiLabel}">Missing Bills</div><div style="${kpiVal(noBill>0?'#dc2626':'#16a34a')}">${noBill}</div><div style="font-size:11px;color:#6b7280;margin-top:4px">${pending} pending ERP</div></div>
+    </div>
+
+    <!-- Middle grid: Category + Monthly trend -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+      <!-- Category breakdown -->
+      <div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px">
+        <div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:12px">📂 Spend by Category</div>
+        ${catList.map(([cat,v])=>{
+          const pct = Math.round(v.amt/totalAmt*100);
+          const col = isFuelCat(cat)?'#1a56a0':cat==='Maintenance'?'#7c3aed':'#0ea5e9';
+          return `<div style="margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+              <span style="font-weight:600;color:#374151">${cat}</span>
+              <span style="color:${col};font-weight:700">${fmtR(v.amt)} <span style="color:#9ca3af;font-weight:400">(${pct}%)</span></span>
+            </div>
+            <div style="background:#f3f4f6;border-radius:4px;height:7px"><div style="width:${pct}%;height:100%;border-radius:4px;background:${col}"></div></div>
+            <div style="font-size:10px;color:#9ca3af;margin-top:2px">${v.count} expense${v.count!==1?'s':''}</div>
+          </div>`;
+        }).join('')}
+      </div>
+
+      <!-- Monthly trend -->
+      <div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px">
+        <div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:12px">📅 Monthly Spend Trend</div>
+        ${monthList.length===0?'<div style="text-align:center;color:#9ca3af;padding:20px;font-size:13px">No monthly data</div>':
+          monthList.map(([month,v])=>{
+            const pct = Math.round(v.amt/maxMonthAmt*100);
+            const shortMon = new Date(month+'-01').toLocaleDateString('en-IN',{month:'short',year:'2-digit'});
+            return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <div style="font-size:11px;color:#6b7280;width:46px;flex-shrink:0">${shortMon}</div>
+              <div style="flex:1;background:#f3f4f6;border-radius:4px;height:16px">
+                <div style="width:${pct}%;height:100%;border-radius:4px;background:#1a56a0;position:relative">
+                  <span style="position:absolute;right:4px;top:1px;font-size:9px;color:#fff;font-weight:700;white-space:nowrap">${pct>25?fmtR(v.amt):''}</span>
+                </div>
+              </div>
+              <div style="font-size:11px;font-weight:700;color:#1a56a0;width:70px;text-align:right;flex-shrink:0">${fmtR(v.amt)}</div>
+            </div>`;
+          }).join('')
+        }
+      </div>
+    </div>
+
+    <!-- Plant breakdown (All Plants only) + Top Vendors -->
+    <div style="display:grid;grid-template-columns:${selPlant===SA_AI_ALL?'1fr 1fr':'1fr'};gap:12px;margin-bottom:12px">
+      ${selPlant===SA_AI_ALL?`
+      <div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px">
+        <div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:12px">🏭 Spend by Plant</div>
+        ${plantList.map(([pid,v],i)=>{
+          const pct=Math.round(v.amt/maxPlantAmt*100);
+          const col=['#1a56a0','#16a34a','#d97706','#7c3aed','#dc2626'][i%5];
+          return `<div style="margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+              <span style="font-weight:600;color:#374151">${plantName2(pid)}</span>
+              <span style="color:${col};font-weight:700">${fmtR(v.amt)}</span>
+            </div>
+            <div style="background:#f3f4f6;border-radius:4px;height:7px"><div style="width:${pct}%;height:100%;border-radius:4px;background:${col}"></div></div>
+            <div style="font-size:10px;color:#9ca3af;margin-top:2px">${v.count} expense${v.count!==1?'s':''}</div>
+          </div>`;
+        }).join('')}
+      </div>`:``}
+
+      <div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px">
+        <div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:12px">🏪 Top Vendors</div>
+        ${topVendors.length===0?'<div style="text-align:center;color:#9ca3af;padding:20px;font-size:13px">No vendor data</div>':
+          topVendors.map(([vnd,v],i)=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #f3f4f6">
+            <div style="font-size:12px">
+              <span style="font-weight:600;color:#374151">${i+1}. ${vnd}</span>
+              <span style="color:#9ca3af;font-size:11px"> · ${v.count} entry${v.count!==1?'s':''}</span>
+            </div>
+            <div style="font-size:12px;font-weight:700;color:#1a56a0">${fmtR(v.amt)}</div>
+          </div>`).join('')
+        }
+      </div>
+    </div>
+
+    <!-- AI Recommendations -->
+    <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:16px;margin-bottom:12px">
+      <div style="font-size:13px;font-weight:700;color:#1e40af;margin-bottom:10px">💡 AI Recommendations${selPlant!==SA_AI_ALL?' · '+selPlantName:''}</div>
+      ${recs.map(r=>`<div style="background:#fff;border:1px solid #dbeafe;border-radius:8px;padding:10px 12px;margin-bottom:7px;font-size:12.5px;line-height:1.6;color:#374151">${r}</div>`).join('')}
+    </div>
+
+    <!-- Missing bills list -->
+    ${noBillExps.length>0?`
+    <div style="background:#fff;border:1px solid #fecaca;border-radius:10px;padding:16px">
+      <div style="font-size:13px;font-weight:700;color:#dc2626;margin-bottom:10px">⚠️ Expenses Missing Bills (up to 5 shown)</div>
+      <div class="table-wrap"><table style="font-size:11px">
+        <thead><tr style="background:#fef2f2"><th style="padding:6px 10px">Date</th><th style="padding:6px 10px">Plant</th><th style="padding:6px 10px">Category</th><th style="padding:6px 10px">Vendor</th><th style="padding:6px 10px;text-align:right">Amount</th></tr></thead>
+        <tbody>${noBillExps.map(e=>`<tr><td style="padding:6px 10px">${e.date||'—'}</td><td style="padding:6px 10px">${plantName2(e.plantId)}</td><td style="padding:6px 10px">${e.category||'—'}</td><td style="padding:6px 10px">${e.vendor||'—'}</td><td style="padding:6px 10px;text-align:right;font-weight:600;color:#dc2626">${fmtR((e.amount||0)+(e.gst||0))}</td></tr>`).join('')}</tbody>
+      </table></div>
+    </div>`:''}
+  `;
+}
+
 function superadminHTML() {
   const sc = S.schedulerCrons || {};
   const cfg = S.notifConfig || {
@@ -4896,6 +5095,15 @@ function superadminHTML() {
         <span class="emission-factor-fuel">${SUPERADMIN_EMAIL}</span>
         <span class="badge badge-purple">🛡️ You · Active</span>
       </div>
+    </div>
+
+    <!-- 🤖 AI Analysis Card -->
+    <div class="card mb-4">
+      <div class="card-title">🤖 AI Analysis — Expense Intelligence
+        <span class="badge badge-purple">Superadmin Only</span>
+      </div>
+      <p style="font-size:12px;color:var(--gray-500);margin-bottom:14px">Plant-wise analysis of expenses, bills compliance, ERP acknowledgement, CO₂ emissions and spend patterns. Select a plant pill to drill down.</p>
+      <div id="sa-ai-panel">${saAIAnalysisHTML()}</div>
     </div>
 
     <div id="modal-root"></div>
