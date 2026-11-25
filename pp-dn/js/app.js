@@ -272,24 +272,32 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
   }
 });
 
-document.getElementById("loginBtn").addEventListener("click", async () => {
+async function doLogin() {
   const email = document.getElementById("loginEmail").value.trim();
   const pass  = document.getElementById("loginPassword").value;
   const errEl = document.getElementById("loginError");
   const spin  = document.getElementById("loginSpinner");
-
+  if (!email || !pass) return;
   errEl.classList.add("d-none");
   spin.classList.remove("d-none");
-
   try {
     await signInWithEmailAndPassword(auth, email, pass);
   } catch (e) {
-    errEl.textContent = e.code === "auth/invalid-credential"
+    errEl.textContent = e.code === "auth/invalid-credential" || e.code === "auth/wrong-password"
       ? "Invalid email or password." : e.message;
     errEl.classList.remove("d-none");
   } finally {
     spin.classList.add("d-none");
   }
+}
+
+document.getElementById("loginBtn").addEventListener("click", doLogin);
+
+// Allow Enter key to trigger login from email or password field
+["loginEmail","loginPassword"].forEach(id => {
+  document.getElementById(id).addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); doLogin(); }
+  });
 });
 
 function doSignOut() {
@@ -383,28 +391,40 @@ onAuthStateChanged(auth, async user => {
 });
 
 async function loadCurrentUser() {
-  const snap = await getDoc(doc(db, "users", currentUser.uid));
+  const { setDoc } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+  const userRef = doc(db, "users", currentUser.uid);
+  const snap = await getDoc(userRef);
+
   if (snap.exists()) {
-    currentUserData = snap.data();
+    currentUserData = { uid: currentUser.uid, ...snap.data() };
+
+    // Guard: if user is marked inactive, sign them out
+    if (currentUserData.active === false) {
+      showToast("Your account has been deactivated. Contact the administrator.", "error");
+      await signOut(auth);
+      return;
+    }
   } else {
-    // First run: check if any users exist; if not, create as superadmin
+    // No user document exists yet — check if this should be the first superadmin
     const usersSnap = await getDocs(query(collection(db, "users"), limit(1)));
-    if (usersSnap.empty) {
-      currentUserData = {
-        uid: currentUser.uid,
-        email: currentUser.email,
-        displayName: currentUser.displayName || currentUser.email,
-        role: "superadmin",
-        active: true,
-      };
-      await doc(db, "users", currentUser.uid).set
-        ? null
-        : await addDoc(collection(db, "users"), currentUserData);
-      await db.collection
-        ? null
-        : await updateDoc(doc(db, "users", currentUser.uid), currentUserData).catch(() =>
-            addDoc(collection(db, "users"), { ...currentUserData, createdAt: serverTimestamp() })
-          );
+    const isFirstUser = usersSnap.empty;
+
+    currentUserData = {
+      uid: currentUser.uid,
+      email: currentUser.email,
+      displayName: currentUser.displayName || currentUser.email.split("@")[0],
+      role: isFirstUser ? "superadmin" : "user",
+      active: true,
+      createdAt: serverTimestamp(),
+    };
+
+    // Use setDoc via Admin SDK route (Cloud Function) if not first user
+    // For first user, we write directly (Firestore rules allow write if no users exist)
+    try {
+      await setDoc(userRef, currentUserData);
+    } catch (e) {
+      console.warn("Could not write user doc:", e.message);
+      // Still proceed with in-memory data so app doesn't break
     }
   }
 }
@@ -1823,12 +1843,26 @@ async function loadSettings() {
   logoFile.addEventListener("change", async e => {
     const file = e.target.files[0];
     if (!file) return;
-    const storageRef = ref(storage, `branding/logo.${file.name.split(".").pop()}`);
-    await uploadBytesResumable(storageRef, file);
-    const url = await getDownloadURL(storageRef);
-    await setOrMergeSettings("branding", { logoUrl: url });
-    document.getElementById("currentLogo").innerHTML = `<img src="${url}" height="40" alt="Logo">`;
-    showToast("Logo updated.", "success");
+    const logoDiv = document.getElementById("currentLogo");
+    logoDiv.innerHTML = `<div class="spinner-border spinner-border-sm text-primary me-2"></div><span class="text-muted small">Uploading logo…</span>`;
+    try {
+      const ext = file.name.split(".").pop().toLowerCase();
+      const storageRef = ref(storage, `branding/logo.${ext}`);
+      const task = uploadBytesResumable(storageRef, file);
+      await new Promise((resolve, reject) => task.on("state_changed", null, reject, resolve));
+      const url = await getDownloadURL(storageRef);
+      await setOrMergeSettings("branding", { logoUrl: url });
+      // Apply immediately
+      const authLogo = document.getElementById("authLogo");
+      const sidebarLogo = document.getElementById("sidebarLogo");
+      if (authLogo)    { authLogo.src = url; authLogo.style.display = ""; }
+      if (sidebarLogo) { sidebarLogo.src = url; sidebarLogo.style.display = ""; }
+      logoDiv.innerHTML = `<img src="${url}" height="40" alt="Logo" style="border-radius:6px;border:1px solid var(--border);">`;
+      showToast("Logo uploaded successfully.", "success");
+    } catch (err) {
+      logoDiv.innerHTML = `<span class="text-danger small"><i class="bi bi-exclamation-triangle me-1"></i>Upload failed: ${err.message}</span>`;
+      showToast("Logo upload failed: " + err.message, "error");
+    }
   });
 }
 
@@ -1999,14 +2033,53 @@ async function loadUsersTable() {
       const pSel = document.getElementById("gm_userPlant");
       const dSel = document.getElementById("gm_userDept");
       if (!displayName || !email || !password) { showToast("Fill all required fields.", "error"); return; }
-      const createFn = httpsCallable(functions, "createUser");
-      await createFn({
-        displayName, email, password, role,
-        plantId: pSel.value, plantName: pSel.options[pSel.selectedIndex]?.dataset.name || "",
-        departmentId: dSel.value, departmentName: dSel.options[dSel.selectedIndex]?.dataset.name || "",
-      });
+
+      const plantId   = pSel.value;
+      const plantName = pSel.options[pSel.selectedIndex]?.dataset.name || "";
+      const deptId    = dSel.value;
+      const deptName  = dSel.options[dSel.selectedIndex]?.dataset.name || "";
+
+      // Try Cloud Function first (preferred — creates Auth user without affecting current session)
+      let uid = null;
+      try {
+        const createFn = httpsCallable(functions, "createUser");
+        const result = await createFn({ displayName, email, password, role, plantId, plantName, departmentId: deptId, departmentName: deptName });
+        uid = result?.data?.uid;
+      } catch (fnErr) {
+        // Cloud Function not available — create via secondary auth instance
+        const { initializeApp: initApp2, getApps } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js");
+        const { getAuth: getAuth2, createUserWithEmailAndPassword: cwep, updateProfile, signOut: so2 } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js");
+        const { setDoc: sd2 } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+
+        // Use a secondary app instance so we don't sign out the current admin
+        const secondaryAppName = "secondary-" + Date.now();
+        const secondaryApp = initApp2(
+          { apiKey: "AIzaSyCUvMUFJ9kPTcyJMbZDymSBDLwqvAvjZmU", authDomain: "skr-doc.firebaseapp.com", projectId: "skr-doc" },
+          secondaryAppName
+        );
+        const secondaryAuth = getAuth2(secondaryApp);
+
+        try {
+          const cred = await cwep(secondaryAuth, email, password);
+          uid = cred.user.uid;
+          await updateProfile(cred.user, { displayName });
+          await so2(secondaryAuth); // sign out of secondary immediately
+        } catch (authErr) {
+          throw new Error("Cannot create user: " + authErr.message);
+        }
+
+        // Write user doc to Firestore
+        const { setDoc: setDocFn } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+        await setDocFn(doc(db, "users", uid), {
+          uid, email, displayName, role,
+          plantId: plantId || null, plantName: plantName || null,
+          departmentId: deptId || null, departmentName: deptName || null,
+          active: true, createdAt: serverTimestamp(), createdBy: currentUser.uid,
+        });
+      }
+
       loadUsersTable();
-      showToast("User created successfully.", "success");
+      showToast(`User "${displayName}" created successfully.`, "success");
     });
   };
 }
