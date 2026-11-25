@@ -771,21 +771,23 @@ function populateFilterDropdowns() {
   });
 
   // Submit form dropdowns
-  const docCatSel = document.getElementById("docCategory");
-  const docPlantSel = document.getElementById("docPlant");
+  const docCatSel  = document.getElementById("docCategory");
   const docDeptSel = document.getElementById("docDept");
   docCatSel.innerHTML = `<option value="">Select Category</option>`;
   categories.forEach(c => docCatSel.innerHTML += `<option value="${c.id}" data-name="${c.name}">${c.name}</option>`);
 
-  docPlantSel.innerHTML = `<option value="">Select Plant</option>`;
-  plants.forEach(p => docPlantSel.innerHTML += `<option value="${p.id}" data-name="${p.name}">${p.name}</option>`);
-
   docDeptSel.innerHTML = `<option value="">Select Department</option>`;
   departments.forEach(d => docDeptSel.innerHTML += `<option value="${d.id}" data-name="${d.name}">${d.name}</option>`);
 
-  // Default to user's plant/dept
-  if (currentUserData?.plantId) docPlantSel.value = currentUserData.plantId;
+  // docPlant is now a hidden input + docPlantDisplay text input (read-only)
+  // Plant auto-filled from currentUserData in prepareSubmitForm()
   if (currentUserData?.departmentId) docDeptSel.value = currentUserData.departmentId;
+
+  // Also resolve plantName in currentUserData if only plantId is known
+  if (currentUserData?.plantId && !currentUserData?.plantName) {
+    const matchPlant = plants.find(p => p.id === currentUserData.plantId);
+    if (matchPlant) currentUserData.plantName = matchPlant.name;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1446,16 +1448,44 @@ let uploadedFileRef = null;
 
 function prepareSubmitForm(docId = null) {
   editingDocId = docId;
+
+  // Auto-fill submitter info (Plant MR = current user)
   document.getElementById("subByDisplay").value = currentUserData?.displayName || currentUser.email;
   document.getElementById("subEmailDisplay").value = currentUser.email;
-  document.getElementById("subDateDisplay").value = nowIST();
+
+  // Live clock in date field
+  if (window._submitClock) clearInterval(window._submitClock);
+  const updateDate = () => {
+    const el = document.getElementById("subDateDisplay");
+    if (el) el.value = nowIST();
+  };
+  updateDate();
+  window._submitClock = setInterval(updateDate, 1000);
+
   document.getElementById("submitDocMsg").classList.add("d-none");
+
+  // Auto-fill plant from user's mapped plant (read-only display)
+  const plantDisplay = document.getElementById("docPlantDisplay");
+  const plantHidden  = document.getElementById("docPlant");
+  if (currentUserData?.plantId) {
+    plantHidden.value  = currentUserData.plantId;
+    plantDisplay.value = currentUserData.plantName || currentUserData.plantId;
+  } else {
+    plantHidden.value  = "";
+    plantDisplay.value = "Not assigned";
+  }
 
   if (!docId) {
     document.getElementById("submitDocForm").reset();
+    // Re-apply plant after reset
+    if (currentUserData?.plantId) {
+      plantHidden.value  = currentUserData.plantId;
+      plantDisplay.value = currentUserData.plantName || currentUserData.plantId;
+    }
+    document.getElementById("subByDisplay").value = currentUserData?.displayName || currentUser.email;
+    document.getElementById("subEmailDisplay").value = currentUser.email;
     document.getElementById("filePreview").classList.add("d-none");
     uploadedFileRef = null;
-    if (currentUserData?.plantId) document.getElementById("docPlant").value = currentUserData.plantId;
     if (currentUserData?.departmentId) document.getElementById("docDept").value = currentUserData.departmentId;
   } else {
     // Load existing doc for editing
@@ -1464,10 +1494,13 @@ function prepareSubmitForm(docId = null) {
       const d = snap.data();
       document.getElementById("docTitle").value = d.documentTitle || "";
       document.getElementById("docCategory").value = d.categoryId || "";
-      document.getElementById("docPlant").value = d.plantId || "";
+      plantHidden.value  = d.plantId || "";
+      plantDisplay.value = d.plantName || d.plantId || "";
       document.getElementById("docDept").value = d.departmentId || "";
       document.getElementById("docDesc").value = d.documentDescription || "";
       document.getElementById("docRevision").value = d.documentRevision || "";
+      document.getElementById("reqByName").value = d.requestedByName || "";
+      document.getElementById("reqByEmail").value = d.requestedByEmail || "";
     });
   }
 }
@@ -1517,127 +1550,223 @@ function handleFileSelect(file) {
 }
 
 async function saveDocument(isDraft) {
-  const title   = document.getElementById("docTitle").value.trim();
-  const catSel  = document.getElementById("docCategory");
-  const catId   = catSel.value;
-  const catName = catSel.options[catSel.selectedIndex]?.dataset.name || "";
-  const plantSel = document.getElementById("docPlant");
-  const plantId  = plantSel.value;
-  const plantName = plantSel.options[plantSel.selectedIndex]?.dataset.name || "";
-  const deptSel  = document.getElementById("docDept");
-  const deptId   = deptSel.value;
-  const deptName = deptSel.options[deptSel.selectedIndex]?.dataset.name || "";
-  const desc    = document.getElementById("docDesc").value.trim();
-  const rev     = document.getElementById("docRevision").value.trim();
-  const msgEl   = document.getElementById("submitDocMsg");
-  const spin    = document.getElementById("submitSpinner");
+  const title      = document.getElementById("docTitle").value.trim();
+  const catSel     = document.getElementById("docCategory");
+  const catId      = catSel.value;
+  const catName    = catSel.options[catSel.selectedIndex]?.dataset.name || catSel.options[catSel.selectedIndex]?.text || "";
+  const plantId    = document.getElementById("docPlant").value;
+  const plantName  = document.getElementById("docPlantDisplay")?.value || "";
+  const deptSel    = document.getElementById("docDept");
+  const deptId     = deptSel.value;
+  const deptName   = deptSel.options[deptSel.selectedIndex]?.dataset.name || deptSel.options[deptSel.selectedIndex]?.text || "";
+  const desc       = document.getElementById("docDesc").value.trim();
+  const rev        = document.getElementById("docRevision").value.trim();
+  const reqName    = document.getElementById("reqByName")?.value.trim() || "";
+  const reqEmail   = document.getElementById("reqByEmail")?.value.trim() || "";
+  const msgEl      = document.getElementById("submitDocMsg");
+  const spin       = document.getElementById("submitSpinner");
 
   msgEl.classList.add("d-none");
 
   if (!isDraft && (!title || !catId || !plantId || !deptId)) {
-    msgEl.className = "alert alert-danger mt-3";
-    msgEl.textContent = "Please fill all required fields.";
+    msgEl.className = "mt-2 alert alert-danger";
+    msgEl.textContent = "Please fill all required fields (Title, Category, Dept).";
     msgEl.classList.remove("d-none");
     return;
   }
-
+  if (!isDraft && !reqEmail) {
+    msgEl.className = "mt-2 alert alert-danger";
+    msgEl.textContent = "Requester email is required for submission.";
+    msgEl.classList.remove("d-none");
+    return;
+  }
   if (!isDraft && !uploadedFileRef && !editingDocId) {
-    msgEl.className = "alert alert-danger mt-3";
-    msgEl.textContent = "Please attach a document.";
+    msgEl.className = "mt-2 alert alert-danger";
+    msgEl.textContent = "Please attach a document file before submitting.";
     msgEl.classList.remove("d-none");
     return;
   }
 
   spin?.classList.remove("d-none");
+  const submitBtn = document.getElementById("submitDocBtn");
+  if (submitBtn) submitBtn.disabled = true;
 
   try {
-    let fileUrl = null, fileName = null;
+    let fileUrl = null, fileName = null, fileSize = null;
 
-    // Upload file if selected
+    // ── Upload file if selected ──────────────────────────────────────────────
     if (uploadedFileRef) {
-      const docIdForPath = editingDocId || Date.now().toString();
+      const docIdForPath = editingDocId || ("new_" + Date.now());
       const storageRef = ref(storage, `documents/${currentUser.uid}/${docIdForPath}/${uploadedFileRef.name}`);
       const uploadTask = uploadBytesResumable(storageRef, uploadedFileRef);
 
-      // Show progress
       const progDiv = document.getElementById("uploadProgress");
       const progBar = document.getElementById("uploadBar");
       const progPct = document.getElementById("uploadPct");
-      progDiv.classList.remove("d-none");
+      if (progDiv) progDiv.classList.remove("d-none");
 
       await new Promise((resolve, reject) => {
         uploadTask.on("state_changed",
           snap => {
             const pct = Math.round((snap.bytesTransferred / snap.totalBytes) * 100);
-            progBar.style.width = pct + "%";
-            progPct.textContent = pct + "%";
+            if (progBar) progBar.style.width = pct + "%";
+            if (progPct) progPct.textContent = pct + "%";
           },
           reject,
           resolve
         );
       });
 
-      fileUrl = await getDownloadURL(storageRef);
+      fileUrl  = await getDownloadURL(storageRef);
       fileName = uploadedFileRef.name;
-      progDiv.classList.add("d-none");
+      fileSize = uploadedFileRef.size;
+      if (progDiv) progDiv.classList.add("d-none");
     }
 
+    // ── Build document data ─────────────────────────────────────────────────
+    const submitterName  = currentUserData?.displayName || currentUser.email;
+    const submitterEmail = currentUser.email;
+
     const docData = {
-      documentTitle: title,
-      categoryId: catId,
-      categoryName: catName,
+      documentTitle:      title,
+      categoryId:         catId,
+      categoryName:       catName,
       plantId,
       plantName,
-      departmentId: deptId,
-      departmentName: deptName,
+      departmentId:       deptId,
+      departmentName:     deptName,
       documentDescription: desc,
-      documentRevision: rev,
-      submittedBy: currentUser.uid,
-      submittedByName: currentUserData?.displayName || currentUser.email,
-      submittedByEmail: currentUser.email,
-      status: isDraft ? "draft" : (editingDocId ? "returned_for_correction" : "draft"),
-      updatedAt: serverTimestamp(),
+      documentRevision:   rev,
+      submittedBy:        currentUser.uid,
+      submittedByName:    submitterName,
+      submittedByEmail:   submitterEmail,
+      requestedByName:    reqName,
+      requestedByEmail:   reqEmail,
+      status:             isDraft ? "draft" : "submitted",
+      updatedAt:          serverTimestamp(),
     };
+    if (fileUrl)  { docData.fileUrl = fileUrl; docData.fileName = fileName; docData.fileSize = fileSize; }
 
-    if (fileUrl) { docData.fileUrl = fileUrl; docData.fileName = fileName; }
-
+    // ── Save or update Firestore document ───────────────────────────────────
     if (editingDocId) {
       await updateDoc(doc(db, "documents", editingDocId), docData);
     } else {
       const newRef = await addDoc(collection(db, "documents"), {
         ...docData,
-        createdAt: serverTimestamp(),
-        statusHistory: [{ status: "draft", changedBy: currentUser.uid,
-          changedByName: currentUserData?.displayName || currentUser.email, changedAt: nowIST() }],
+        createdAt:     serverTimestamp(),
+        statusHistory: [{
+          status:      isDraft ? "draft" : "submitted",
+          changedBy:   currentUser.uid,
+          changedByName: submitterName,
+          changedAt:   nowIST(),
+        }],
       });
       editingDocId = newRef.id;
     }
 
     if (!isDraft) {
-      // Submit via Cloud Function (generates ref number)
-      const submitFn = httpsCallable(functions, "submitDocument");
-      const result = await submitFn({ documentId: editingDocId });
-      msgEl.className = "alert alert-success mt-3";
-      msgEl.textContent = `Document submitted successfully! Reference No: ${result.data.submissionRefNo}`;
+      // ── Generate ref number (Cloud Function first, then client-side fallback) ──
+      let refNo = null;
+      try {
+        const submitFn = httpsCallable(functions, "submitDocument");
+        const result   = await submitFn({ documentId: editingDocId });
+        refNo = result?.data?.submissionRefNo || result?.data?.refNo || null;
+      } catch (fnErr) {
+        console.warn("Cloud Function submitDocument unavailable, generating ref client-side:", fnErr.message);
+        // Client-side ref number via Firestore transaction
+        refNo = await runTransaction(db, async (txn) => {
+          const counterRef = doc(db, "appSettings", "refCounter");
+          const counterSnap = await txn.get(counterRef);
+          let seq = 1;
+          if (counterSnap.exists()) {
+            seq = (counterSnap.data().lastSeq || 0) + 1;
+          }
+          txn.set(counterRef, { lastSeq: seq }, { merge: true });
+          const year = new Date().getFullYear();
+          return `CDRTS/${year}/${String(seq).padStart(5, "0")}`;
+        });
+        // Update the doc with the ref number and confirmed status
+        await updateDoc(doc(db, "documents", editingDocId), {
+          submissionRefNo: refNo,
+          status:          "submitted",
+          submittedAt:     serverTimestamp(),
+        });
+      }
+
+      // ── Send email notifications ─────────────────────────────────────────
+      try {
+        const sendMailFn = httpsCallable(functions, "sendEmail");
+        const appTitle   = document.title.replace(/\.+$/, "") || "CDRTS";
+        const docLink    = `${location.origin}${location.pathname}#doc/${editingDocId}`;
+
+        const bodyBase = `
+<p>A new document has been submitted in <strong>${appTitle}</strong>.</p>
+<table style="border-collapse:collapse;font-family:sans-serif;font-size:14px;">
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Reference No:</td><td><strong>${refNo}</strong></td></tr>
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Title:</td><td>${title}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Plant:</td><td>${plantName}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Category:</td><td>${catName}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Submitted By:</td><td>${submitterName} &lt;${submitterEmail}&gt;</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Requested By:</td><td>${reqName || "—"} &lt;${reqEmail}&gt;</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Status:</td><td>Submitted</td></tr>
+</table>
+<p><a href="${docLink}">View Document →</a></p>`;
+
+        const recipients = [
+          { to: submitterEmail, role: "submitter" },
+        ];
+        if (reqEmail && reqEmail !== submitterEmail) {
+          recipients.push({ to: reqEmail, role: "requester" });
+        }
+
+        for (const r of recipients) {
+          const greeting = r.role === "requester"
+            ? `<p>Dear ${reqName || "Requester"},</p><p>Your document request has been submitted successfully.</p>`
+            : `<p>Dear ${submitterName},</p><p>The document you submitted has been registered.</p>`;
+          await sendMailFn({
+            to:      r.to,
+            subject: `[${appTitle}] Document Submitted – ${refNo}`,
+            html:    greeting + bodyBase,
+          }).catch(e => console.warn("Email to", r.to, "failed:", e.message));
+        }
+      } catch (mailErr) {
+        console.warn("Email notifications failed:", mailErr.message);
+        // Non-fatal — submission already saved
+      }
+
+      // ── Success UI ───────────────────────────────────────────────────────
+      msgEl.className = "mt-2 alert alert-success";
+      msgEl.innerHTML = `✅ Document submitted! <strong>Ref: ${refNo}</strong>`;
       msgEl.classList.remove("d-none");
-      editingDocId = null;
-      uploadedFileRef = null;
-      document.getElementById("submitDocForm").reset();
-      document.getElementById("filePreview").classList.add("d-none");
-      showToast(`Submitted! Ref: ${result.data.submissionRefNo}`, "success");
+      showToast(`Submitted! Ref: ${refNo}`, "success");
+
+      // Clear form after short delay
+      setTimeout(() => {
+        editingDocId = null;
+        uploadedFileRef = null;
+        if (window._submitClock) { clearInterval(window._submitClock); window._submitClock = null; }
+        document.getElementById("submitDocForm").reset();
+        document.getElementById("filePreview")?.classList.add("d-none");
+        // Re-apply auto-fills
+        prepareSubmitForm(null);
+      }, 3000);
+
     } else {
-      msgEl.className = "alert alert-info mt-3";
+      // Draft saved
+      msgEl.className = "mt-2 alert alert-info";
       msgEl.textContent = "Draft saved successfully.";
       msgEl.classList.remove("d-none");
       showToast("Draft saved.", "info");
     }
+
   } catch (e) {
-    console.error(e);
-    msgEl.className = "alert alert-danger mt-3";
-    msgEl.textContent = e.message || "An error occurred.";
+    console.error("saveDocument error:", e);
+    msgEl.className = "mt-2 alert alert-danger";
+    msgEl.textContent = e.message || "An error occurred. Please try again.";
     msgEl.classList.remove("d-none");
   } finally {
     spin?.classList.add("d-none");
+    if (submitBtn) submitBtn.disabled = false;
   }
 }
 
@@ -1864,6 +1993,62 @@ async function loadSettings() {
       showToast("Logo upload failed: " + err.message, "error");
     }
   });
+
+  // ── Test Mail ──────────────────────────────────────────────────────────────
+  const sendTestMailBtn = document.getElementById("sendTestMailBtn");
+  if (sendTestMailBtn) {
+    sendTestMailBtn.addEventListener("click", async () => {
+      const toEl      = document.getElementById("testMailTo");
+      const subjEl    = document.getElementById("testMailSubject");
+      const bodyEl    = document.getElementById("testMailBody");
+      const msgEl     = document.getElementById("testMailMsg");
+      const to        = toEl?.value.trim();
+      const subject   = subjEl?.value.trim() || "CDRTS – Test Email";
+      const bodyText  = bodyEl?.value.trim();
+
+      if (!to) {
+        if (msgEl) { msgEl.className = "alert alert-danger"; msgEl.textContent = "Please enter a recipient email."; msgEl.classList.remove("d-none"); }
+        return;
+      }
+
+      sendTestMailBtn.disabled = true;
+      sendTestMailBtn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> Sending…`;
+      if (msgEl) msgEl.classList.add("d-none");
+
+      try {
+        const sendMailFn = httpsCallable(functions, "sendEmail");
+        await sendMailFn({
+          to,
+          subject,
+          html: `<div style="font-family:sans-serif;padding:16px;">
+            <h3 style="color:#1971c2;">📧 CDRTS Test Email</h3>
+            <p>${bodyText || "This is a test email from CDRTS to verify your email configuration."}</p>
+            <hr style="border:none;border-top:1px solid #dee2e6;margin:16px 0;">
+            <p style="color:#868e96;font-size:12px;">Sent from CDRTS at ${nowIST()}</p>
+          </div>`,
+        });
+        if (msgEl) {
+          msgEl.className = "alert alert-success";
+          msgEl.innerHTML = `✅ Test email sent to <strong>${to}</strong>. Check your inbox.`;
+          msgEl.classList.remove("d-none");
+        }
+        showToast("Test email sent!", "success");
+      } catch (e) {
+        const hint = e.message?.includes("not found") || e.message?.includes("UNAUTHENTICATED")
+          ? " (Cloud Function not deployed — deploy functions first)"
+          : "";
+        if (msgEl) {
+          msgEl.className = "alert alert-danger";
+          msgEl.textContent = "Failed to send: " + (e.message || "Unknown error") + hint;
+          msgEl.classList.remove("d-none");
+        }
+        showToast("Test email failed.", "error");
+      } finally {
+        sendTestMailBtn.disabled = false;
+        sendTestMailBtn.innerHTML = `<i class="bi bi-send me-1"></i> Send Test Email`;
+      }
+    });
+  }
 }
 
 async function setOrMergeSettings(docId, data) {

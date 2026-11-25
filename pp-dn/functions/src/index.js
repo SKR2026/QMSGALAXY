@@ -821,3 +821,23 @@ exports.checkDocumentNumber = functions.https.onCall(async (data, context) => {
 
   return { exists: false };
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CALLABLE: Send email (generic — used for submission notifications & test mail)
+// ─────────────────────────────────────────────────────────────────────────────
+exports.sendEmail = functions.https.onCall(async (data, context) => {
+  if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Login required.");
+
+  const { to, subject, html, text } = data;
+  if (!to || !subject) {
+    throw new functions.https.HttpsError("invalid-argument", "to and subject are required.");
+  }
+
+  try {
+    await sendEmail(to, subject, html || text || "(no body)");
+    return { success: true };
+  } catch (e) {
+    console.error("sendEmail callable error:", e);
+    throw new functions.https.HttpsError("internal", e.message || "Email send failed.");
+  }
+});
