@@ -14,13 +14,15 @@ const db = admin.firestore();
 // EMAIL TRANSPORT (Gmail SMTP via Secret Manager)
 // ─────────────────────────────────────────────────────────────────────────────
 let transporter = null;
+let cachedGmailUser = null; // FIX: track which credentials are cached
 
 async function getTransporter() {
-  if (transporter) return transporter;
-
+  // FIX: Always re-read credentials so changes saved via UI take effect immediately.
+  // nodemailer.createTransport() never throws, so a stale/broken transporter
+  // would be cached forever without this check.
   let gmailUser, gmailPass;
 
-  // 1. Try Secret Manager / environment first
+  // 1. Try environment / Secret Manager first
   if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
     gmailUser = process.env.GMAIL_USER;
     gmailPass = process.env.GMAIL_APP_PASSWORD;
@@ -40,15 +42,23 @@ async function getTransporter() {
     throw new Error("Gmail credentials not configured. Set them in Settings → Email Configuration.");
   }
 
-  transporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
-    auth: {
-      user: gmailUser,
-      pass: gmailPass,
-    },
-  });
+  // FIX: Reset transporter whenever the Gmail user changes (e.g. credentials updated in UI)
+  if (cachedGmailUser !== gmailUser) {
+    transporter = null;
+    cachedGmailUser = gmailUser;
+  }
+
+  if (!transporter) {
+    transporter = nodemailer.createTransport({
+      host: "smtp.gmail.com",
+      port: 465,
+      secure: true,
+      auth: {
+        user: gmailUser,
+        pass: gmailPass,
+      },
+    });
+  }
 
   return transporter;
 }
@@ -526,8 +536,9 @@ exports.submitDocument = functions.https.onCall(async (data, context) => {
   const userDoc = await db.collection("users").doc(uid).get();
   const user = userDoc.data();
 
-  if (!user || user.role !== "user") {
-    throw new functions.https.HttpsError("permission-denied", "Only plant/department users can submit documents.");
+  // FIX: Allow superadmin to submit documents (previously blocked by role !== "user")
+  if (!user || !["user", "superadmin"].includes(user.role)) {
+    throw new functions.https.HttpsError("permission-denied", "Only plant/department users or admins can submit documents.");
   }
 
   const docRef = db.collection("documents").doc(documentId);
@@ -823,9 +834,12 @@ exports.checkDocumentNumber = functions.https.onCall(async (data, context) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CALLABLE: Send email (generic — used for submission notifications & test mail)
+// CALLABLE: Send test email (used in Settings → Test Mail tab)
+// FIX: Renamed from exports.sendEmail to exports.sendTestEmail to avoid name
+// collision with the internal sendEmail() helper function above.
+// Update your frontend app.js to call "sendTestEmail" instead of "sendEmail".
 // ─────────────────────────────────────────────────────────────────────────────
-exports.sendEmail = functions.https.onCall(async (data, context) => {
+exports.sendTestEmail = functions.https.onCall(async (data, context) => {
   if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Login required.");
 
   const { to, subject, html, text } = data;
