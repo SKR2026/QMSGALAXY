@@ -1695,7 +1695,7 @@ async function saveDocument(isDraft) {
 
       // ── Send email notifications ─────────────────────────────────────────
       try {
-        const sendMailFn = httpsCallable(functions, "sendEmail");
+        const sendMailFn = httpsCallable(functions, "sendTestEmail");
         const appTitle   = document.title.replace(/\.+$/, "") || "CDRTS";
         const docLink    = `${location.origin}${location.pathname}#doc/${editingDocId}`;
 
@@ -2016,7 +2016,7 @@ async function loadSettings() {
       if (msgEl) msgEl.classList.add("d-none");
 
       try {
-        const sendMailFn = httpsCallable(functions, "sendEmail");
+        const sendMailFn = httpsCallable(functions, "sendTestEmail");
         await sendMailFn({
           to,
           subject,
