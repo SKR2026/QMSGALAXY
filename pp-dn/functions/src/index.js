@@ -18,16 +18,26 @@ let transporter = null;
 async function getTransporter() {
   if (transporter) return transporter;
 
-  // Retrieve secrets from Firebase Secret Manager
-  const gmailUser = functions.config().gmail
-    ? functions.config().gmail.user
-    : process.env.GMAIL_USER;
-  const gmailPass = functions.config().gmail
-    ? functions.config().gmail.app_password
-    : process.env.GMAIL_APP_PASSWORD;
+  let gmailUser, gmailPass;
+
+  // 1. Try Secret Manager / environment first
+  if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+    gmailUser = process.env.GMAIL_USER;
+    gmailPass = process.env.GMAIL_APP_PASSWORD;
+  } else if (functions.config().gmail?.user) {
+    gmailUser = functions.config().gmail.user;
+    gmailPass = functions.config().gmail.app_password;
+  } else {
+    // 2. Fall back to Firestore appSettings/emailCredentials (set via UI)
+    const credSnap = await db.collection("appSettings").doc("emailCredentials").get();
+    if (credSnap.exists) {
+      gmailUser = credSnap.data().gmailUser;
+      gmailPass = credSnap.data().gmailAppPassword;
+    }
+  }
 
   if (!gmailUser || !gmailPass) {
-    throw new Error("Gmail credentials not configured in Secret Manager / environment.");
+    throw new Error("Gmail credentials not configured. Set them in Settings → Email Configuration.");
   }
 
   transporter = nodemailer.createTransport({
@@ -59,12 +69,16 @@ async function logActivity(data) {
 async function sendEmail(to, subject, html) {
   try {
     const t = await getTransporter();
-    const gmailUser = functions.config().gmail
-      ? functions.config().gmail.user
-      : process.env.GMAIL_USER;
+    // Get from name and gmail user from Firestore settings
+    const [credSnap, notifSnap] = await Promise.all([
+      db.collection("appSettings").doc("emailCredentials").get(),
+      db.collection("appSettings").doc("notifications").get(),
+    ]);
+    const gmailUser = process.env.GMAIL_USER || credSnap.data()?.gmailUser || "";
+    const fromName  = notifSnap.data()?.fromName || "CDRTS System";
 
     await t.sendMail({
-      from: `"CDRTS System" <${gmailUser}>`,
+      from: `"${fromName}" <${gmailUser}>`,
       to,
       subject,
       html,
