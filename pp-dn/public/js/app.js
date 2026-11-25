@@ -158,6 +158,24 @@ function logActivity(data) {
   }).catch(console.error);
 }
 
+// ── EARLY BRANDING (apply logo on auth screen before login) ──────────────
+(async () => {
+  try {
+    const snap = await getDoc(doc(db, "appSettings", "branding"));
+    if (snap.exists()) {
+      const b = snap.data();
+      if (b.logoUrl) {
+        const authLogo = document.getElementById("authLogo");
+        if (authLogo) { authLogo.src = b.logoUrl; authLogo.style.display = ""; }
+      }
+      if (b.primaryColor) {
+        document.documentElement.style.setProperty("--primary", b.primaryColor);
+        document.documentElement.style.setProperty("--primary-dark", b.primaryColor);
+      }
+    }
+  } catch (_) {}
+})();
+
 // ═══════════════════════════════════════════════════════════════════════════
 // AUTH
 // ═══════════════════════════════════════════════════════════════════════════
@@ -166,32 +184,50 @@ document.getElementById("togglePass").addEventListener("click", () => {
   el.type = el.type === "password" ? "text" : "password";
 });
 
+// ── AUTH TAB SWITCHING ────────────────────────────────────────────────────
+function showAuthTab(tab) {
+  // tab = "login" | "mgmt" | "forgot"
+  const loginPanel  = document.getElementById("loginForm");
+  const mgmtPanel   = document.getElementById("mgmtForm");
+  const forgotPanel = document.getElementById("forgotForm");
+  const authTabs    = document.getElementById("authTabs");
+  const tabSignIn   = document.getElementById("tabSignIn");
+  const tabMgmt     = document.getElementById("tabMgmt");
+
+  loginPanel.classList.add("d-none");
+  mgmtPanel.classList.add("d-none");
+  forgotPanel.classList.add("d-none");
+
+  if (tab === "login") {
+    loginPanel.classList.remove("d-none");
+    authTabs.style.display = "";
+    tabSignIn.classList.add("active");
+    tabMgmt.classList.remove("active");
+  } else if (tab === "mgmt") {
+    mgmtPanel.classList.remove("d-none");
+    authTabs.style.display = "";
+    tabMgmt.classList.add("active");
+    tabSignIn.classList.remove("active");
+  } else if (tab === "forgot") {
+    forgotPanel.classList.remove("d-none");
+    authTabs.style.display = "none";
+  }
+}
+
+document.getElementById("tabSignIn").addEventListener("click", () => showAuthTab("login"));
+document.getElementById("tabMgmt").addEventListener("click", () => showAuthTab("mgmt"));
+
 document.getElementById("forgotPassLink").addEventListener("click", e => {
   e.preventDefault();
-  document.getElementById("loginForm").classList.add("d-none");
-  document.getElementById("forgotForm").classList.remove("d-none");
+  showAuthTab("forgot");
 });
 
 document.getElementById("backToLogin").addEventListener("click", e => {
   e.preventDefault();
-  document.getElementById("loginForm").classList.remove("d-none");
-  document.getElementById("forgotForm").classList.add("d-none");
+  showAuthTab("login");
 });
 
 // ── MANAGEMENT VIEW (no PIN — direct access) ─────────────────────────────
-
-document.getElementById("mgmtViewLink").addEventListener("click", e => {
-  e.preventDefault();
-  document.getElementById("loginForm").classList.add("d-none");
-  document.getElementById("mgmtForm").classList.remove("d-none");
-});
-
-document.getElementById("backToLoginFromMgmt").addEventListener("click", e => {
-  e.preventDefault();
-  document.getElementById("mgmtForm").classList.add("d-none");
-  document.getElementById("loginForm").classList.remove("d-none");
-  document.getElementById("mgmtPinError").classList.add("d-none");
-});
 
 document.getElementById("mgmtLoginBtn").addEventListener("click", async () => {
   const errEl = document.getElementById("mgmtPinError");
@@ -236,24 +272,32 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
   }
 });
 
-document.getElementById("loginBtn").addEventListener("click", async () => {
+async function doLogin() {
   const email = document.getElementById("loginEmail").value.trim();
   const pass  = document.getElementById("loginPassword").value;
   const errEl = document.getElementById("loginError");
   const spin  = document.getElementById("loginSpinner");
-
+  if (!email || !pass) return;
   errEl.classList.add("d-none");
   spin.classList.remove("d-none");
-
   try {
     await signInWithEmailAndPassword(auth, email, pass);
   } catch (e) {
-    errEl.textContent = e.code === "auth/invalid-credential"
+    errEl.textContent = e.code === "auth/invalid-credential" || e.code === "auth/wrong-password"
       ? "Invalid email or password." : e.message;
     errEl.classList.remove("d-none");
   } finally {
     spin.classList.add("d-none");
   }
+}
+
+document.getElementById("loginBtn").addEventListener("click", doLogin);
+
+// Allow Enter key to trigger login from email or password field
+["loginEmail","loginPassword"].forEach(id => {
+  document.getElementById(id).addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); doLogin(); }
+  });
 });
 
 function doSignOut() {
@@ -261,8 +305,7 @@ function doSignOut() {
     currentUser = null; currentUserData = null; allDocuments = [];
     document.getElementById("appShell").classList.add("d-none");
     document.getElementById("authScreen").classList.remove("d-none");
-    document.getElementById("loginForm").classList.remove("d-none");
-    document.getElementById("mgmtForm").classList.add("d-none");
+    showAuthTab("login");
   });
 }
 
@@ -379,6 +422,7 @@ async function loadCurrentUser() {
 // ═══════════════════════════════════════════════════════════════════════════
 async function initApp() {
   startClock();
+  applyBranding();          // load logo/color/title from Firestore first
   buildSidebar();
   buildTopnavUser();
   setupNavigation();
@@ -387,6 +431,34 @@ async function initApp() {
   setupSubmitForm();
   setupSendNotification();
   navigateTo("dashboard");
+}
+
+async function applyBranding() {
+  try {
+    const snap = await getDoc(doc(db, "appSettings", "branding"));
+    if (!snap.exists()) return;
+    const b = snap.data();
+    // Apply logo to auth screen and sidebar
+    if (b.logoUrl) {
+      const authLogo = document.getElementById("authLogo");
+      const sidebarLogo = document.getElementById("sidebarLogo");
+      if (authLogo)   { authLogo.src = b.logoUrl; authLogo.style.display = ""; }
+      if (sidebarLogo){ sidebarLogo.src = b.logoUrl; sidebarLogo.style.display = ""; }
+    }
+    // Apply primary color
+    if (b.primaryColor) {
+      document.documentElement.style.setProperty("--primary", b.primaryColor);
+      // Compute darker shade for hover
+      document.documentElement.style.setProperty("--primary-dark", b.primaryColor);
+    }
+    // Apply app title
+    if (b.appTitle) {
+      document.title = b.appTitle + " – Corporate Document Registration & Tracking";
+      document.querySelectorAll(".sidebar-title").forEach(el => el.textContent = b.appTitle);
+    }
+  } catch (e) {
+    console.warn("Branding load failed:", e);
+  }
 }
 
 function buildTopnavUser() {
@@ -1734,12 +1806,22 @@ async function loadSettings() {
     showToast("Notification settings saved.", "success");
   };
 
-  // Branding
+  // Branding — load existing values
+  const brandSnap = await getDoc(doc(db, "appSettings", "branding")).catch(() => null);
+  if (brandSnap?.exists()) {
+    const b = brandSnap.data();
+    if (b.appTitle)     document.getElementById("settingAppTitle").value = b.appTitle;
+    if (b.primaryColor) document.getElementById("settingPrimaryColor").value = b.primaryColor;
+    if (b.logoUrl)      document.getElementById("currentLogo").innerHTML =
+      `<img src="${b.logoUrl}" height="40" alt="Current Logo" style="border-radius:6px;border:1px solid var(--border);">`;
+  }
+
   document.getElementById("saveBrandingBtn").onclick = async () => {
     await setOrMergeSettings("branding", {
       appTitle: document.getElementById("settingAppTitle").value,
       primaryColor: document.getElementById("settingPrimaryColor").value,
     });
+    applyBranding();
     showToast("Branding saved.", "success");
   };
 
@@ -1749,12 +1831,26 @@ async function loadSettings() {
   logoFile.addEventListener("change", async e => {
     const file = e.target.files[0];
     if (!file) return;
-    const storageRef = ref(storage, `branding/logo.${file.name.split(".").pop()}`);
-    await uploadBytesResumable(storageRef, file);
-    const url = await getDownloadURL(storageRef);
-    await setOrMergeSettings("branding", { logoUrl: url });
-    document.getElementById("currentLogo").innerHTML = `<img src="${url}" height="40" alt="Logo">`;
-    showToast("Logo updated.", "success");
+    const logoDiv = document.getElementById("currentLogo");
+    logoDiv.innerHTML = `<div class="spinner-border spinner-border-sm text-primary me-2"></div><span class="text-muted small">Uploading logo…</span>`;
+    try {
+      const ext = file.name.split(".").pop().toLowerCase();
+      const storageRef = ref(storage, `branding/logo.${ext}`);
+      const task = uploadBytesResumable(storageRef, file);
+      await new Promise((resolve, reject) => task.on("state_changed", null, reject, resolve));
+      const url = await getDownloadURL(storageRef);
+      await setOrMergeSettings("branding", { logoUrl: url });
+      // Apply immediately
+      const authLogo = document.getElementById("authLogo");
+      const sidebarLogo = document.getElementById("sidebarLogo");
+      if (authLogo)    { authLogo.src = url; authLogo.style.display = ""; }
+      if (sidebarLogo) { sidebarLogo.src = url; sidebarLogo.style.display = ""; }
+      logoDiv.innerHTML = `<img src="${url}" height="40" alt="Logo" style="border-radius:6px;border:1px solid var(--border);">`;
+      showToast("Logo uploaded successfully.", "success");
+    } catch (err) {
+      logoDiv.innerHTML = `<span class="text-danger small"><i class="bi bi-exclamation-triangle me-1"></i>Upload failed: ${err.message}</span>`;
+      showToast("Logo upload failed: " + err.message, "error");
+    }
   });
 }
 
@@ -1926,13 +2022,14 @@ async function loadUsersTable() {
       const dSel = document.getElementById("gm_userDept");
       if (!displayName || !email || !password) { showToast("Fill all required fields.", "error"); return; }
       const createFn = httpsCallable(functions, "createUser");
-      await createFn({
+      const result = await createFn({
         displayName, email, password, role,
         plantId: pSel.value, plantName: pSel.options[pSel.selectedIndex]?.dataset.name || "",
         departmentId: dSel.value, departmentName: dSel.options[dSel.selectedIndex]?.dataset.name || "",
       });
+      if (!result?.data?.success) throw new Error("User creation failed — check Firebase Functions logs.");
       loadUsersTable();
-      showToast("User created successfully.", "success");
+      showToast(`User "${displayName}" created successfully.`, "success");
     });
   };
 }
