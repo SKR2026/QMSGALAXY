@@ -2360,3 +2360,43 @@ function exportToExcel() {
   XLSX.writeFile(wb, `CDRTS_Export_${new Date().toISOString().split("T")[0]}.xlsx`);
   showToast("Excel file exported.", "success");
 }
+
+// ── Power button sign out ──────────────────────────────────────────
+document.getElementById('topPowerBtn')?.addEventListener('click', () => {
+  document.getElementById('logoutBtn')?.click();
+});
+
+// ── Notification Bell toggle ───────────────────────────────────────
+document.getElementById('notifBellBtn')?.addEventListener('click', function(e) {
+  e.stopPropagation();
+  const d = document.getElementById('notifDropdown');
+  if (d) d.style.display = d.style.display === 'none' ? 'block' : 'none';
+});
+document.addEventListener('click', () => {
+  const d = document.getElementById('notifDropdown');
+  if (d) d.style.display = 'none';
+});
+
+// ── Mark all notifications read ────────────────────────────────────
+document.getElementById('markAllReadBtn')?.addEventListener('click', async (e) => {
+  e.stopPropagation();
+  const items = document.querySelectorAll('.notif-item.unread');
+  items.forEach(el => el.classList.remove('unread'));
+  document.getElementById('notifBadge')?.classList.add('d-none');
+});
+
+// ── Remove Logo button ─────────────────────────────────────────────
+document.getElementById('removeLogoBtn')?.addEventListener('click', async () => {
+  if (!confirm('Remove company logo? This cannot be undone.')) return;
+  try {
+    const { db } = await import('./firebase-config.js');
+    const { doc, updateDoc } = await import('https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js');
+    await updateDoc(doc(db, 'appSettings', 'branding'), { logoUrl: '' });
+    document.getElementById('authLogo').style.display = 'none';
+    document.getElementById('sidebarLogo').style.display = 'none';
+    document.getElementById('currentLogo').innerHTML = '<span class="text-muted small">No logo set</span>';
+    alert('Logo removed successfully.');
+  } catch(e) {
+    alert('Error removing logo: ' + e.message);
+  }
+});
