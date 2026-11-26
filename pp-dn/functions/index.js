@@ -233,34 +233,10 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
   const user    = userDoc.data();
   if (!user) throw new HttpsError("not-found", "User not found.");
 
-  const settingsSnap     = await db.collection("appSettings").doc("notifications").get();
-  const settings         = settingsSnap.exists ? settingsSnap.data() : {};
-  const cooldownMinutes  = settings.notificationCooldownMinutes || 120;
-
-  // Cooldown check — single where only to avoid composite index requirement
-  // Filter by type in memory
-  let lastNotifTime = null;
-  try {
-    const lastNotifSnap = await db.collection("notificationQueue")
-      .where("userId", "==", uid)
-      .get();
-    const sorted = lastNotifSnap.docs
-      .map((d) => d.data())
-      .filter((d) => d.createdAt)
-      .sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
-    if (sorted.length > 0) lastNotifTime = sorted[0].createdAt;
-  } catch (_) { /* skip cooldown check if query fails */ }
-
-  if (lastNotifTime) {
-    const diffMins = (Date.now() - lastNotifTime.toMillis()) / 60000;
-    if (diffMins < cooldownMinutes) {
-      const remaining = Math.ceil(cooldownMinutes - diffMins);
-      throw new HttpsError(
-        "resource-exhausted",
-        `Please wait ${remaining} more minute(s) before sending another notification.`
-      );
-    }
-  }
+  const settingsSnap = await db.collection("appSettings").doc("notifications").get();
+  const settings     = settingsSnap.exists ? settingsSnap.data() : {};
+  // Cooldown check removed — was causing Firestore index errors.
+  // Rate limiting can be re-added later via a dedicated lastNotifiedAt field on the user doc.
 
   const isMR = user.role === "corporate_mr" || user.role === "superadmin";
 
@@ -352,17 +328,6 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
         }
       }
 
-      // Store only first 100 doc IDs to stay within Firestore 1MB doc limit
-      await db.collection("notificationQueue").add({
-        userId: uid,
-        type:   "mr_completion_summary",
-        documentIds: completedDocs.slice(0, 100).map((d) => d.id),
-        docCount: completedDocs.length,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        status: "sent",
-        recipientCount: totalEmailsSent,
-      });
-
       await logActivity({
         userId:   uid,
         userName: user.displayName || user.email,
@@ -433,14 +398,6 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
     if (!mrEmails.length) return { success: false, message: "No Corporate MR users found. Add a Corporate MR account first." };
 
     await sendEmail(mrEmails.join(","), `[CDRTS] Pending Documents Reminder – ${user.displayName || user.email}`, html);
-
-    await db.collection("notificationQueue").add({
-      userId: uid,
-      type:   "user_consolidated",
-      documentIds: docs.map((d) => d.id),
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      status: "sent",
-    });
 
     await logActivity({
       userId:   uid,
