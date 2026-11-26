@@ -635,8 +635,10 @@ exports.returnDocumentForCorrection = functions.https.onCall(async (data, contex
     }),
   });
 
-  const submitterDoc = await db.collection("users").doc(doc.submittedBy).get();
-  const submitter    = submitterDoc.data();
+  const submitterDoc = doc.submittedBy
+    ? await db.collection("users").doc(doc.submittedBy).get()
+    : null;
+  const submitter = submitterDoc?.exists ? submitterDoc.data() : null;
 
   if (submitter && submitter.email) {
     const settingsSnap = await db.collection("appSettings").doc("notifications").get();
