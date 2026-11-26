@@ -171,6 +171,7 @@ function logActivity(data) {
       if (b.logoRemoved) {
         if (authLogoWrap) authLogoWrap.style.display = "none";
       } else if (b.logoUrl) {
+        if (authLogoWrap) authLogoWrap.style.display = "";
         if (authLogo) { authLogo.src = b.logoUrl; authLogo.style.display = ""; }
       }
       // Company name under logo
@@ -467,6 +468,7 @@ async function applyBranding() {
       if (authLogo)     authLogo.style.display = "none";
       if (sidebarLogo)  sidebarLogo.style.display = "none";
     } else if (b.logoUrl) {
+      if (authLogoWrap) authLogoWrap.style.display = "";
       if (authLogo)   { authLogo.src = b.logoUrl; authLogo.style.display = ""; }
       if (sidebarLogo){ sidebarLogo.src = b.logoUrl; sidebarLogo.style.display = ""; }
     }
@@ -483,10 +485,15 @@ async function applyBranding() {
       // Compute darker shade for hover
       document.documentElement.style.setProperty("--primary-dark", b.primaryColor);
     }
-    // Apply app title
+    // Apply app title — update page title only; hide topnav brand text if logo is present
+    const topnavBrandText = document.getElementById("topnavBrandText");
     if (b.appTitle) {
       document.title = b.appTitle + " – Corporate Document Registration & Tracking";
       document.querySelectorAll(".sidebar-title").forEach(el => el.textContent = b.appTitle);
+    }
+    // Hide topnav brand text when a logo is shown in sidebar (avoid duplication)
+    if (!b.logoRemoved && b.logoUrl && topnavBrandText) {
+      topnavBrandText.style.display = "none";
     }
   } catch (e) {
     console.warn("Branding load failed:", e);
@@ -2024,6 +2031,8 @@ async function loadSettings() {
       // Apply immediately
       const authLogo = document.getElementById("authLogo");
       const sidebarLogo = document.getElementById("sidebarLogo");
+      const authLogoWrapU = document.getElementById("authLogoWrap");
+      if (authLogoWrapU) authLogoWrapU.style.display = "";
       if (authLogo)    { authLogo.src = url; authLogo.style.display = ""; }
       if (sidebarLogo) { sidebarLogo.src = url; sidebarLogo.style.display = ""; }
       logoDiv.innerHTML = `<img src="${url}" height="40" alt="Logo" style="border-radius:6px;border:1px solid var(--border);">`;
