@@ -2884,6 +2884,7 @@ async function loadPlantsTable() {
         <button class="btn btn-sm btn-outline-primary edit-plant" data-id="${p.id}" data-name="${p.name}" data-code="${p.code||""}">Edit</button>
         <button class="btn btn-sm btn-outline-${p.active ? "danger" : "success"} toggle-plant"
           data-id="${p.id}" data-active="${p.active}">${p.active ? "Deactivate" : "Activate"}</button>
+        <button class="btn btn-sm btn-outline-danger delete-plant" data-id="${p.id}" data-name="${p.name}">Delete</button>
       </td>
     </tr>
   `).join("") || `<tr><td colspan="5" class="text-center text-muted">No plants yet.</td></tr>`;
@@ -2907,6 +2908,17 @@ async function loadPlantsTable() {
     const active = b.dataset.active !== "true";
     await updateDoc(doc(db, "plants", b.dataset.id), { active });
     loadPlantsTable();
+  }));
+
+  tbody.querySelectorAll(".delete-plant").forEach(b => b.addEventListener("click", () => {
+    showGenericModal("Delete Plant",
+      `<p>Are you sure you want to delete plant <strong>${b.dataset.name}</strong>?</p>
+       <p class="text-danger small">This cannot be undone. Documents linked to this plant will retain their plant name.</p>`,
+      async () => {
+        await deleteDoc(doc(db, "plants", b.dataset.id));
+        loadPlantsTable(); loadMasterData();
+        showToast("Plant deleted.", "success");
+      }, "Delete", "btn-danger");
   }));
 
   document.getElementById("addPlantBtn").onclick = () => {
@@ -2939,8 +2951,10 @@ async function loadDeptsTable() {
       <td>${d.plantName || "—"}</td>
       <td>${d.active ? `<span class="badge bg-success">Active</span>` : `<span class="badge bg-secondary">Inactive</span>`}</td>
       <td>
+        <button class="btn btn-sm btn-outline-primary edit-dept" data-id="${d.id}" data-name="${d.name}" data-plantid="${d.plantId||""}" data-plantname="${d.plantName||""}">Edit</button>
         <button class="btn btn-sm btn-outline-${d.active ? "danger" : "success"} toggle-dept"
           data-id="${d.id}" data-active="${d.active}">${d.active ? "Deactivate" : "Activate"}</button>
+        <button class="btn btn-sm btn-outline-danger delete-dept" data-id="${d.id}" data-name="${d.name}">Delete</button>
       </td>
     </tr>
   `).join("") || `<tr><td colspan="5" class="text-center text-muted">No departments yet.</td></tr>`;
@@ -2948,6 +2962,40 @@ async function loadDeptsTable() {
   tbody.querySelectorAll(".toggle-dept").forEach(b => b.addEventListener("click", async () => {
     await updateDoc(doc(db, "departments", b.dataset.id), { active: b.dataset.active !== "true" });
     loadDeptsTable();
+  }));
+
+  tbody.querySelectorAll(".edit-dept").forEach(b => b.addEventListener("click", () => {
+    const plantOptions = plants.map(p =>
+      `<option value="${p.id}" data-name="${p.name}" ${p.id === b.dataset.plantid ? "selected" : ""}>${p.name}</option>`
+    ).join("");
+    showGenericModal("Edit Department", `
+      <div class="mb-3"><label class="form-label fw-semibold">Department Name *</label>
+        <input type="text" id="gm_deptName" class="form-control" value="${b.dataset.name}" /></div>
+      <div class="mb-3"><label class="form-label">Associated Plant</label>
+        <select id="gm_deptPlant" class="form-select"><option value="">None</option>${plantOptions}</select></div>
+    `, async () => {
+      const name = document.getElementById("gm_deptName").value.trim();
+      const pSel = document.getElementById("gm_deptPlant");
+      if (!name) return;
+      await updateDoc(doc(db, "departments", b.dataset.id), {
+        name,
+        plantId: pSel.value || null,
+        plantName: pSel.options[pSel.selectedIndex]?.dataset.name || "",
+      });
+      loadDeptsTable(); loadMasterData();
+      showToast("Department updated.", "success");
+    });
+  }));
+
+  tbody.querySelectorAll(".delete-dept").forEach(b => b.addEventListener("click", () => {
+    showGenericModal("Delete Department",
+      `<p>Are you sure you want to delete department <strong>${b.dataset.name}</strong>?</p>
+       <p class="text-danger small">This cannot be undone. Documents linked to this department will retain their department name.</p>`,
+      async () => {
+        await deleteDoc(doc(db, "departments", b.dataset.id));
+        loadDeptsTable(); loadMasterData();
+        showToast("Department deleted.", "success");
+      }, "Delete", "btn-danger");
   }));
 
   document.getElementById("addDeptBtn").onclick = () => {
@@ -2985,8 +3033,13 @@ async function loadUsersTable() {
       <td>${u.departmentName || "—"}</td>
       <td>${u.active ? `<span class="badge bg-success">Active</span>` : `<span class="badge bg-secondary">Inactive</span>`}</td>
       <td>
+        <button class="btn btn-sm btn-outline-primary edit-user"
+          data-id="${u.id}" data-name="${u.displayName||""}" data-role="${u.role||""}"
+          data-plantid="${u.plantId||""}" data-plantname="${u.plantName||""}"
+          data-deptid="${u.departmentId||""}" data-deptname="${u.departmentName||""}">Edit</button>
         <button class="btn btn-sm btn-outline-${u.active ? "danger" : "success"} toggle-user"
           data-id="${u.id}" data-active="${u.active}">${u.active ? "Deactivate" : "Activate"}</button>
+        <button class="btn btn-sm btn-outline-danger delete-user" data-id="${u.id}" data-name="${u.displayName||u.email}">Delete</button>
       </td>
     </tr>
   `).join("") || `<tr><td colspan="7" class="text-center text-muted">No users yet.</td></tr>`;
@@ -2994,6 +3047,55 @@ async function loadUsersTable() {
   tbody.querySelectorAll(".toggle-user").forEach(b => b.addEventListener("click", async () => {
     await updateDoc(doc(db, "users", b.dataset.id), { active: b.dataset.active !== "true" });
     loadUsersTable();
+  }));
+
+  tbody.querySelectorAll(".edit-user").forEach(b => b.addEventListener("click", () => {
+    const plantOptions = plants.map(p =>
+      `<option value="${p.id}" data-name="${p.name}" ${p.id === b.dataset.plantid ? "selected" : ""}>${p.name}</option>`
+    ).join("");
+    const deptOptions = departments.map(d =>
+      `<option value="${d.id}" data-name="${d.name}" ${d.id === b.dataset.deptid ? "selected" : ""}>${d.name}</option>`
+    ).join("");
+    showGenericModal("Edit User", `
+      <div class="mb-3"><label class="form-label fw-semibold">Full Name *</label>
+        <input type="text" id="gm_userName" class="form-control" value="${b.dataset.name}" /></div>
+      <div class="mb-3"><label class="form-label fw-semibold">Role *</label>
+        <select id="gm_userRole" class="form-select">
+          <option value="user" ${b.dataset.role==="user"?"selected":""}>Plant / Department User</option>
+          <option value="corporate_mr" ${b.dataset.role==="corporate_mr"?"selected":""}>Corporate MR</option>
+          <option value="superadmin" ${b.dataset.role==="superadmin"?"selected":""}>Superadmin</option>
+        </select></div>
+      <div class="mb-3"><label class="form-label">Plant</label>
+        <select id="gm_userPlant" class="form-select"><option value="">None</option>${plantOptions}</select></div>
+      <div class="mb-3"><label class="form-label">Department</label>
+        <select id="gm_userDept" class="form-select"><option value="">None</option>${deptOptions}</select></div>
+    `, async () => {
+      const displayName = document.getElementById("gm_userName").value.trim();
+      const role = document.getElementById("gm_userRole").value;
+      const pSel = document.getElementById("gm_userPlant");
+      const dSel = document.getElementById("gm_userDept");
+      if (!displayName) { showToast("Name is required.", "error"); return; }
+      await updateDoc(doc(db, "users", b.dataset.id), {
+        displayName, role,
+        plantId:        pSel.value || null,
+        plantName:      pSel.options[pSel.selectedIndex]?.dataset.name || "",
+        departmentId:   dSel.value || null,
+        departmentName: dSel.options[dSel.selectedIndex]?.dataset.name || "",
+      });
+      loadUsersTable();
+      showToast("User updated.", "success");
+    });
+  }));
+
+  tbody.querySelectorAll(".delete-user").forEach(b => b.addEventListener("click", () => {
+    showGenericModal("Delete User",
+      `<p>Are you sure you want to delete user <strong>${b.dataset.name}</strong>?</p>
+       <p class="text-danger small">This removes the user from CDRTS. Their submitted documents will remain. Firebase Auth account is not deleted automatically.</p>`,
+      async () => {
+        await deleteDoc(doc(db, "users", b.dataset.id));
+        loadUsersTable();
+        showToast("User deleted from CDRTS.", "success");
+      }, "Delete", "btn-danger");
   }));
 
   document.getElementById("addUserBtn").onclick = () => {
@@ -3085,8 +3187,10 @@ async function loadCatsTable() {
       <td>${i+1}</td><td>${c.name}</td><td>${c.description || "—"}</td>
       <td>${c.active !== false ? `<span class="badge bg-success">Active</span>` : `<span class="badge bg-secondary">Inactive</span>`}</td>
       <td>
+        <button class="btn btn-sm btn-outline-primary edit-cat" data-id="${c.id}" data-name="${c.name}" data-desc="${(c.description||"").replace(/"/g,"&quot;")}">Edit</button>
         <button class="btn btn-sm btn-outline-${c.active !== false ? "danger" : "success"} toggle-cat"
           data-id="${c.id}" data-active="${c.active !== false}">${c.active !== false ? "Deactivate" : "Activate"}</button>
+        <button class="btn btn-sm btn-outline-danger delete-cat" data-id="${c.id}" data-name="${c.name}">Delete</button>
       </td>
     </tr>
   `).join("") || `<tr><td colspan="5" class="text-center text-muted">No categories yet.</td></tr>`;
@@ -3094,6 +3198,33 @@ async function loadCatsTable() {
   tbody.querySelectorAll(".toggle-cat").forEach(b => b.addEventListener("click", async () => {
     await updateDoc(doc(db, "documentCategories", b.dataset.id), { active: b.dataset.active !== "true" });
     loadCatsTable();
+  }));
+
+  tbody.querySelectorAll(".edit-cat").forEach(b => b.addEventListener("click", () => {
+    showGenericModal("Edit Category", `
+      <div class="mb-3"><label class="form-label fw-semibold">Category Name *</label>
+        <input type="text" id="gm_catName" class="form-control" value="${b.dataset.name}" /></div>
+      <div class="mb-3"><label class="form-label">Description</label>
+        <textarea id="gm_catDesc" class="form-control" rows="2">${b.dataset.desc}</textarea></div>
+    `, async () => {
+      const name = document.getElementById("gm_catName").value.trim();
+      const desc = document.getElementById("gm_catDesc").value.trim();
+      if (!name) return;
+      await updateDoc(doc(db, "documentCategories", b.dataset.id), { name, description: desc });
+      loadCatsTable(); loadMasterData();
+      showToast("Category updated.", "success");
+    });
+  }));
+
+  tbody.querySelectorAll(".delete-cat").forEach(b => b.addEventListener("click", () => {
+    showGenericModal("Delete Category",
+      `<p>Are you sure you want to delete category <strong>${b.dataset.name}</strong>?</p>
+       <p class="text-danger small">This cannot be undone. Documents in this category will retain their category name.</p>`,
+      async () => {
+        await deleteDoc(doc(db, "documentCategories", b.dataset.id));
+        loadCatsTable(); loadMasterData();
+        showToast("Category deleted.", "success");
+      }, "Delete", "btn-danger");
   }));
 
   document.getElementById("addCatBtn").onclick = () => {
@@ -3117,7 +3248,7 @@ async function loadCatsTable() {
 // ═══════════════════════════════════════════════════════════════════════════
 // GENERIC MODAL HELPER
 // ═══════════════════════════════════════════════════════════════════════════
-function showGenericModal(title, bodyHtml, onSave) {
+function showGenericModal(title, bodyHtml, onSave, saveLabel = "Save", saveCls = "btn-primary") {
   document.getElementById("genericModalTitle").textContent = title;
   document.getElementById("genericModalBody").innerHTML = bodyHtml;
   hideError("genericSpinner");
@@ -3125,6 +3256,10 @@ function showGenericModal(title, bodyHtml, onSave) {
   modal.show();
 
   const saveBtn = document.getElementById("genericModalSave");
+  saveBtn.textContent = saveLabel;
+  // Swap button colour class
+  saveBtn.className = saveBtn.className.replace(/btn-\w+/, saveCls);
+
   const newSave = saveBtn.cloneNode(true);
   saveBtn.parentNode.replaceChild(newSave, saveBtn);
 
