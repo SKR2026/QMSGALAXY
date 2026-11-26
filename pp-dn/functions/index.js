@@ -231,9 +231,11 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
 
   const settingsSnap     = await db.collection("appSettings").doc("notifications").get();
   const settings         = settingsSnap.exists ? settingsSnap.data() : {};
-  // No cooldown — notifications send immediately on every click.
+  // No cooldown — notifications send immediately on every click. v3
+  console.log("sendUserNotification: uid=", uid, "role=", user.role);
 
   const isMR = user.role === "corporate_mr" || user.role === "superadmin";
+  console.log("sendUserNotification: isMR=", isMR);
 
   if (isMR) {
     // ── Corporate MR / Superadmin ────────────────────────────────────────────
