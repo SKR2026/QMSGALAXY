@@ -383,8 +383,9 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
 
     } catch (err) {
       if (err instanceof HttpsError) throw err;
-      console.error("sendUserNotification MR branch error:", err);
-      throw new HttpsError("internal", `Failed to send notifications: ${err.message}`);
+      console.error("sendUserNotification MR branch error:", err.stack || err);
+      // Return error as data so client sees the real message (not generic INTERNAL)
+      return { success: false, message: `Error: ${err.message}` };
     }
 
   } else {
@@ -452,8 +453,8 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
 
     } catch (err) {
       if (err instanceof HttpsError) throw err;
-      console.error("sendUserNotification user branch error:", err);
-      throw new HttpsError("internal", `Failed to send notification: ${err.message}`);
+      console.error("sendUserNotification user branch error:", err.stack || err);
+      return { success: false, message: `Error: ${err.message}` };
     }
   }
 });

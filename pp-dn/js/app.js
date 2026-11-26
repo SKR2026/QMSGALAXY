@@ -2140,10 +2140,12 @@ function setupSendNotification() {
         lastEl.textContent = `Last sent: ${nowIST()}`;
         lastEl.classList.remove("d-none");
       } else {
-        showToast(res.data.message || "No documents found.", "info");
+        showToast(res.data.message || "No documents found.", "warning");
       }
     } catch (e) {
-      showToast(e.message || "Failed to send notification.", "error");
+      // e.message for Firebase callable errors contains the real server message
+      const msg = e?.details?.message || e?.message || "Failed to send notification.";
+      showToast(msg, "danger");
     } finally {
       btn.disabled = false;
       btn.innerHTML = `<i class="bi bi-bell-fill me-1"></i>Send Notification`;
