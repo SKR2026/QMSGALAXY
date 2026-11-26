@@ -2947,16 +2947,15 @@ async function loadDeptsTable() {
   tbody.innerHTML = depts.map((d, i) => `
     <tr>
       <td>${i+1}</td><td>${d.name}</td>
-      <td>${d.plantName || "—"}</td>
       <td>${d.active ? `<span class="badge bg-success">Active</span>` : `<span class="badge bg-secondary">Inactive</span>`}</td>
       <td>
-        <button class="btn btn-sm btn-outline-primary edit-dept" data-id="${d.id}" data-name="${d.name}" data-plantid="${d.plantId||""}" data-plantname="${d.plantName||""}">Edit</button>
+        <button class="btn btn-sm btn-outline-primary edit-dept" data-id="${d.id}" data-name="${d.name}">Edit</button>
         <button class="btn btn-sm btn-outline-${d.active ? "danger" : "success"} toggle-dept"
           data-id="${d.id}" data-active="${d.active}">${d.active ? "Deactivate" : "Activate"}</button>
         <button class="btn btn-sm btn-outline-danger delete-dept" data-id="${d.id}" data-name="${d.name}">Delete</button>
       </td>
     </tr>
-  `).join("") || `<tr><td colspan="5" class="text-center text-muted">No departments yet.</td></tr>`;
+  `).join("") || `<tr><td colspan="4" class="text-center text-muted">No departments yet.</td></tr>`;
 
   tbody.querySelectorAll(".toggle-dept").forEach(b => b.addEventListener("click", async () => {
     await updateDoc(doc(db, "departments", b.dataset.id), { active: b.dataset.active !== "true" });
@@ -2964,23 +2963,13 @@ async function loadDeptsTable() {
   }));
 
   tbody.querySelectorAll(".edit-dept").forEach(b => b.addEventListener("click", () => {
-    const plantOptions = plants.map(p =>
-      `<option value="${p.id}" data-name="${p.name}" ${p.id === b.dataset.plantid ? "selected" : ""}>${p.name}</option>`
-    ).join("");
     showGenericModal("Edit Department", `
       <div class="mb-3"><label class="form-label fw-semibold">Department Name *</label>
         <input type="text" id="gm_deptName" class="form-control" value="${b.dataset.name}" /></div>
-      <div class="mb-3"><label class="form-label">Associated Plant</label>
-        <select id="gm_deptPlant" class="form-select"><option value="">None</option>${plantOptions}</select></div>
     `, async () => {
       const name = document.getElementById("gm_deptName").value.trim();
-      const pSel = document.getElementById("gm_deptPlant");
       if (!name) throw new Error("Department name is required.");
-      await updateDoc(doc(db, "departments", b.dataset.id), {
-        name,
-        plantId: pSel.value || null,
-        plantName: pSel.options[pSel.selectedIndex]?.dataset.name || "",
-      });
+      await updateDoc(doc(db, "departments", b.dataset.id), { name });
       loadDeptsTable(); loadMasterData();
       showToast("Department updated.", "success");
     });
@@ -2998,21 +2987,15 @@ async function loadDeptsTable() {
   }));
 
   document.getElementById("addDeptBtn").onclick = () => {
-    const plantOptions = plants.map(p => `<option value="${p.id}" data-name="${p.name}">${p.name}</option>`).join("");
     showGenericModal("Add Department", `
       <div class="mb-3"><label class="form-label fw-semibold">Department Name *</label>
         <input type="text" id="gm_deptName" class="form-control" /></div>
-      <div class="mb-3"><label class="form-label">Associated Plant</label>
-        <select id="gm_deptPlant" class="form-select"><option value="">None</option>${plantOptions}</select></div>
     `, async () => {
       const name = document.getElementById("gm_deptName").value.trim();
-      const pSel = document.getElementById("gm_deptPlant");
-      const plantId2 = pSel.value;
-      const plantName2 = pSel.options[pSel.selectedIndex]?.dataset.name || "";
       if (!name) throw new Error("Department name is required.");
       const existing = await getDocs(query(collection(db, "departments"), where("name", "==", name)));
       if (!existing.empty) throw new Error("Department already exists.");
-      await addDoc(collection(db, "departments"), { name, plantId: plantId2, plantName: plantName2, active: true, createdAt: serverTimestamp() });
+      await addDoc(collection(db, "departments"), { name, active: true, createdAt: serverTimestamp() });
       loadDeptsTable(); loadMasterData();
     });
   };
