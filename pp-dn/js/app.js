@@ -2384,9 +2384,10 @@ function setupSendNotification() {
       const res = await notifFn();
       if (res.data.success) {
         const isMR = currentUserData?.role === "corporate_mr" || currentUserData?.role === "superadmin";
-        const msg = isMR
-          ? `DMS assignment summary sent to ${res.data.emailsSent} submitter(s) for ${res.data.count} document(s).`
-          : `Reminder sent to Corporate MR for ${res.data.count} document(s).`;
+        const msg = res.data.message ||
+          (isMR
+            ? `Notification sent for ${res.data.count} document(s).`
+            : `Reminder sent to Corporate MR for ${res.data.count} document(s).`);
         showToast(msg, "success");
         lastEl.textContent = `Last sent: ${nowIST()}`;
         lastEl.classList.remove("d-none");
