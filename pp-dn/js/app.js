@@ -1261,70 +1261,73 @@ async function loadMyDocuments() {
   };
 }
 
-// ── Horizontal timeline builder (numbered circles style) ─────────────────────
+// ── Horizontal timeline builder (numbered circles, perfectly aligned) ─────────
 function buildHorizontalTimeline(d) {
   const allSteps = [
-    { key: "submitted",               label: "Submitted"       },
-    { key: "resubmitted",             label: "Resubmitted"     },
-    { key: "pending_with_mr",         label: "MR Assigned"     },
-    { key: "under_process",           label: "MR Submitted"    },
-    { key: "returned_for_correction", label: "Returned"        },
-    { key: "number_assigned",         label: "DMS Assigned"    },
-    { key: "completed",               label: "Completed"       },
+    { key: "submitted",               label: "Submitted"    },
+    { key: "resubmitted",             label: "Resubmitted"  },
+    { key: "under_process",           label: "MR Submitted" },
+    { key: "returned_for_correction", label: "Returned"     },
+    { key: "number_assigned",         label: "DMS Assigned" },
+    { key: "completed",               label: "Completed"    },
   ];
 
-  // Keep first-occurrence per status from history
   const histMap = {};
   (d.statusHistory || []).forEach(h => { if (!histMap[h.status]) histMap[h.status] = h; });
 
-  // Only show resubmitted / returned if they actually occurred
   const steps = allSteps.filter(s => {
-    if (s.key === "resubmitted")            return !!histMap["resubmitted"];
+    if (s.key === "resubmitted")             return !!histMap["resubmitted"];
     if (s.key === "returned_for_correction") return !!histMap["returned_for_correction"];
     return true;
   });
 
   const currentIdx = steps.findIndex(s => s.key === d.status);
+  const n = steps.length;
 
-  const html = steps.map((step, idx) => {
+  // ── Render: one wrapper with two rows stacked ──
+  // Row 1: [half-line] [circle] [half-line] ... repeated — all in one flex row
+  // Row 2: labels — same flex widths so they align under circles
+
+  const circlesRow = steps.map((step, idx) => {
     const hit       = histMap[step.key];
     const isCurrent = step.key === d.status;
-    // A step is "done" if it has history AND it's not the current active step
     const isDone    = !!hit && !isCurrent;
-    const isFuture  = !hit && !isCurrent;
-
     const circleClass = isDone ? "done" : isCurrent ? "current" : "future";
-    const labelClass  = isDone ? "done" : isCurrent ? "current" : "";
-
-    // Circle inner: check for done, play-triangle for current, number for future
     const inner = isDone
-      ? `<i class="bi bi-check-lg" style="font-size:13px"></i>`
+      ? `<i class="bi bi-check-lg"></i>`
       : isCurrent
-        ? `<i class="bi bi-play-fill" style="font-size:13px;margin-left:1px"></i>`
+        ? `<i class="bi bi-play-fill" style="margin-left:1px"></i>`
         : `${idx + 1}`;
-
-    // Connecting lines: green if passed, grey if not
-    const leftLine  = idx === 0               ? "transparent" : (idx <= currentIdx ? "#22c55e" : "#cbd5e1");
-    const rightLine = idx === steps.length - 1 ? "transparent" : (idx < currentIdx  ? "#22c55e" : "#cbd5e1");
-
-    // Sub-label: name below step label
-    const nameLabel = hit?.changedByName
-      ? `<div class="doc-hstep-sub">${hit.changedByName.split(" ")[0]}</div>`
-      : "";
-
+    const leftColor  = idx === 0   ? "transparent" : idx <= currentIdx ? "#22c55e" : "#cbd5e1";
+    const rightColor = idx === n-1 ? "transparent" : idx <  currentIdx ? "#22c55e" : "#cbd5e1";
     return `
       <div class="doc-hstep">
         <div class="doc-hstep-track">
-          <div class="doc-hstep-line" style="background:${leftLine}"></div>
+          <div class="doc-hstep-line" style="background:${leftColor}"></div>
           <div class="doc-hstep-circle ${circleClass}">${inner}</div>
-          <div class="doc-hstep-line" style="background:${rightLine}"></div>
+          <div class="doc-hstep-line" style="background:${rightColor}"></div>
         </div>
-        <div class="doc-hstep-label ${labelClass}">${step.label}</div>
-        ${nameLabel}
       </div>`;
   }).join("");
 
-  return `<div class="doc-hline">${html}</div>`;
+  const labelsRow = steps.map((step, idx) => {
+    const hit       = histMap[step.key];
+    const isCurrent = step.key === d.status;
+    const isDone    = !!hit && !isCurrent;
+    const labelClass = isDone ? "done" : isCurrent ? "current" : "";
+    const name = hit?.changedByName ? hit.changedByName.split(" ")[0] : "";
+    return `
+      <div class="doc-hstep">
+        <div class="doc-hstep-label ${labelClass}">${step.label}</div>
+        ${name ? `<div class="doc-hstep-sub">${name}</div>` : ""}
+      </div>`;
+  }).join("");
+
+  return `
+    <div style="display:flex;flex-direction:column;width:100%">
+      <div class="doc-hline">${circlesRow}</div>
+      <div class="doc-hline" style="margin-top:2px">${labelsRow}</div>
+    </div>`;
 }
 
 // ── (showDocTimeline removed – timeline now inline per row via buildHorizontalTimeline)
