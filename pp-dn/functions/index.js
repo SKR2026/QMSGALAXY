@@ -92,13 +92,16 @@ async function sendEmail(to, subject, html) {
     return { success: true };
   } catch (err) {
     console.error("Email send error:", err);
-    await db.collection("notificationLogs").add({
-      to, subject,
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
-      status: "failed",
-      error:  err.message,
-    });
-    throw err;
+    try {
+      await db.collection("notificationLogs").add({
+        to, subject,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: "failed",
+        error:  err.message,
+      });
+    } catch (_) { /* ignore log failure */ }
+    // Re-throw as HttpsError so the client sees a readable message, not INTERNAL
+    throw new functions.https.HttpsError("internal", `Email failed: ${err.message}`);
   }
 }
 
@@ -106,11 +109,16 @@ async function sendEmail(to, subject, html) {
 // HELPER: Get Corporate MR emails
 // ─────────────────────────────────────────────────────────────────────────────
 async function getCorporateMREmails() {
+  // Single where clause only — avoids composite index requirement.
+  // Filter active status in memory.
   const snap = await db.collection("users")
-    .where("role",   "==", "corporate_mr")
-    .where("active", "==", true)
+    .where("role", "==", "corporate_mr")
     .get();
-  return snap.docs.map((d) => d.data().email).filter(Boolean);
+  return snap.docs
+    .map((d) => d.data())
+    .filter((u) => u.active !== false)   // include if active is true or missing
+    .map((u) => u.email)
+    .filter(Boolean);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

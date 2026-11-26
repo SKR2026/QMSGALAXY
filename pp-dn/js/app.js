@@ -644,7 +644,7 @@ function setupNavigation() {
   // KPI card clicks → filter by status
   const kpiStatusMap = {
     kpiTotal:       "",                      // all (clear status filter)
-    kpiPending:     "__awaiting_mr",           // multi-status: submitted + pending_with_mr + resubmitted
+    kpiPending:     "__awaiting_mr",           // multi-status: submitted + pending_with_mr + resubmitted + under_process
     kpiUnderProcess:"under_process",
     kpiReturned:    "returned_for_correction",
     kpiNumbered:    "completed",
@@ -931,7 +931,7 @@ async function loadDashboard() {
   // Filter client-side (no index required)
   allDocuments = allDocuments.filter(d => d.status !== "deleted");
   if (filters.status === "__awaiting_mr") {
-    allDocuments = allDocuments.filter(d => ["submitted","pending_with_mr","resubmitted"].includes(d.status));
+    allDocuments = allDocuments.filter(d => ["submitted","pending_with_mr","resubmitted","under_process"].includes(d.status));
   }
   if (filters.plantId)      allDocuments = allDocuments.filter(d => d.plantId === filters.plantId);
   if (filters.departmentId) allDocuments = allDocuments.filter(d => d.departmentId === filters.departmentId);
@@ -985,7 +985,7 @@ function getActiveFilters() {
 
 function updateKPIs(docs) {
   const total     = docs.filter(d => d.status !== "draft" && d.status !== "deleted").length;
-  const pending   = docs.filter(d => ["submitted","pending_with_mr","resubmitted"].includes(d.status)).length;
+  const pending   = docs.filter(d => ["submitted","pending_with_mr","resubmitted","under_process"].includes(d.status)).length;
   const process   = docs.filter(d => ["under_process"].includes(d.status)).length;
   const returned  = docs.filter(d => d.status === "returned_for_correction").length;
   const numbered  = docs.filter(d => ["completed","number_assigned","closed"].includes(d.status)).length;
