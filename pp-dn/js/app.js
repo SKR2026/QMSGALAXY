@@ -18,7 +18,7 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 
 import {
-  collection, doc, getDocs, getDoc, addDoc, updateDoc, deleteDoc,
+  collection, doc, getDocs, getDoc, addDoc, updateDoc, deleteDoc, setDoc,
   query, where, orderBy, limit, onSnapshot, serverTimestamp,
   Timestamp, writeBatch, runTransaction, startAfter
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
@@ -164,10 +164,18 @@ function logActivity(data) {
     const snap = await getDoc(doc(db, "appSettings", "branding"));
     if (snap.exists()) {
       const b = snap.data();
-      if (b.logoUrl) {
-        const authLogo = document.getElementById("authLogo");
+      const authLogo    = document.getElementById("authLogo");
+      const authLogoWrap= document.getElementById("authLogoWrap");
+      const authCoName  = document.getElementById("authCompanyName");
+      // Logo
+      if (b.logoRemoved) {
+        if (authLogoWrap) authLogoWrap.style.display = "none";
+      } else if (b.logoUrl) {
         if (authLogo) { authLogo.src = b.logoUrl; authLogo.style.display = ""; }
       }
+      // Company name under logo
+      if (b.companyName && authCoName) authCoName.textContent = b.companyName;
+      // Primary color
       if (b.primaryColor) {
         document.documentElement.style.setProperty("--primary", b.primaryColor);
         document.documentElement.style.setProperty("--primary-dark", b.primaryColor);
@@ -451,11 +459,23 @@ async function applyBranding() {
     if (!snap.exists()) return;
     const b = snap.data();
     // Apply logo to auth screen and sidebar
-    if (b.logoUrl) {
-      const authLogo = document.getElementById("authLogo");
-      const sidebarLogo = document.getElementById("sidebarLogo");
+    const authLogo     = document.getElementById("authLogo");
+    const authLogoWrap = document.getElementById("authLogoWrap");
+    const sidebarLogo  = document.getElementById("sidebarLogo");
+    if (b.logoRemoved) {
+      if (authLogoWrap) authLogoWrap.style.display = "none";
+      if (authLogo)     authLogo.style.display = "none";
+      if (sidebarLogo)  sidebarLogo.style.display = "none";
+    } else if (b.logoUrl) {
       if (authLogo)   { authLogo.src = b.logoUrl; authLogo.style.display = ""; }
       if (sidebarLogo){ sidebarLogo.src = b.logoUrl; sidebarLogo.style.display = ""; }
+    }
+    // Apply company name
+    const authCoName     = document.getElementById("authCompanyName");
+    const sidebarCoName  = document.getElementById("sidebarCompanyName");
+    if (b.companyName) {
+      if (authCoName)    authCoName.textContent    = b.companyName;
+      if (sidebarCoName) sidebarCoName.textContent = b.companyName;
     }
     // Apply primary color
     if (b.primaryColor) {
@@ -796,18 +816,30 @@ function populateFilterDropdowns() {
 async function loadDashboard() {
   const filters = getActiveFilters();
   let q = collection(db, "documents");
-  let constraints = [where("status", "!=", "deleted")];
+  // Avoid != operator (requires composite index) — fetch all, filter client-side
+  let constraints = [];
 
-  if (filters.plantId) constraints.push(where("plantId", "==", filters.plantId));
-  if (filters.departmentId) constraints.push(where("departmentId", "==", filters.departmentId));
-  if (filters.categoryId) constraints.push(where("categoryId", "==", filters.categoryId));
-  if (filters.status) constraints.push(where("status", "==", filters.status));
-
-  // User only sees own docs
+  // Only add equality filters (safe, no index needed with single field)
+  if (filters.status && filters.status !== "") {
+    constraints.push(where("status", "==", filters.status));
+  }
   if (isUser()) constraints.push(where("submittedBy", "==", currentUser.uid));
 
-  const snap = await getDocs(query(q, ...constraints, orderBy("status"), orderBy("submissionDate", "desc")));
+  const snap = await getDocs(constraints.length ? query(q, ...constraints) : q);
   allDocuments = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+  // Filter client-side (no index required)
+  allDocuments = allDocuments.filter(d => d.status !== "deleted");
+  if (filters.plantId)      allDocuments = allDocuments.filter(d => d.plantId === filters.plantId);
+  if (filters.departmentId) allDocuments = allDocuments.filter(d => d.departmentId === filters.departmentId);
+  if (filters.categoryId)   allDocuments = allDocuments.filter(d => d.categoryId === filters.categoryId);
+
+  // Sort client-side by date desc
+  allDocuments.sort((a, b) => {
+    const da = a.submissionDate?.toMillis?.() || 0;
+    const db2 = b.submissionDate?.toMillis?.() || 0;
+    return db2 - da;
+  });
 
   // Date range filter (client-side)
   let filtered = allDocuments;
@@ -1070,13 +1102,13 @@ function renderDocTable(docs) {
 async function loadMyDocuments() {
   const snap = await getDocs(query(
     collection(db, "documents"),
-    where("submittedBy", "==", currentUser.uid),
-    where("status", "!=", "deleted"),
-    orderBy("status"),
-    orderBy("submissionDate", "desc")
+    where("submittedBy", "==", currentUser.uid)
   ));
 
-  const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const docs = snap.docs
+    .map(d => ({ id: d.id, ...d.data() }))
+    .filter(d => d.status !== "deleted")
+    .sort((a,b) => (b.submissionDate?.toMillis?.() || 0) - (a.submissionDate?.toMillis?.() || 0));
   const tbody = document.getElementById("myDocsBody");
 
   if (!docs.length) {
@@ -1355,23 +1387,21 @@ async function loadMRQueue(searchText = "") {
   const statusV  = document.getElementById("mrFilterStatus").value;
   const srch     = typeof searchText === "string" ? searchText : document.getElementById("mrSearch").value;
 
-  let constraints = [];
-  if (statusV && statusV !== "all") {
-    constraints.push(where("status", "==", statusV));
-  } else if (!statusV || statusV === "") {
-    constraints.push(where("status", "in", ["submitted","pending_with_mr","under_process","resubmitted"]));
-  }
-  if (plantId)  constraints.push(where("plantId", "==", plantId));
-  if (deptId)   constraints.push(where("departmentId", "==", deptId));
-  if (catId)    constraints.push(where("categoryId", "==", catId));
-
-  const snap = await getDocs(query(
-    collection(db, "documents"),
-    ...constraints,
-    orderBy("submissionDate", "desc")
-  ));
-
+  // Fetch all non-deleted docs, filter client-side (avoids composite index requirement)
+  const snap = await getDocs(collection(db, "documents"));
+  const PENDING = ["submitted","pending_with_mr","under_process","resubmitted"];
   let docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+  // Client-side filters
+  if (statusV && statusV !== "all") {
+    docs = docs.filter(d => d.status === statusV);
+  } else {
+    docs = docs.filter(d => PENDING.includes(d.status));
+  }
+  if (plantId) docs = docs.filter(d => d.plantId === plantId);
+  if (deptId)  docs = docs.filter(d => d.departmentId === deptId);
+  if (catId)   docs = docs.filter(d => d.categoryId === catId);
+  docs.sort((a,b) => (b.submissionDate?.toMillis?.() || 0) - (a.submissionDate?.toMillis?.() || 0));
 
   if (srch) {
     const q = srch.toLowerCase();
@@ -1951,19 +1981,29 @@ async function loadSettings() {
   const brandSnap = await getDoc(doc(db, "appSettings", "branding")).catch(() => null);
   if (brandSnap?.exists()) {
     const b = brandSnap.data();
-    if (b.appTitle)     document.getElementById("settingAppTitle").value = b.appTitle;
-    if (b.primaryColor) document.getElementById("settingPrimaryColor").value = b.primaryColor;
-    if (b.logoUrl)      document.getElementById("currentLogo").innerHTML =
-      `<img src="${b.logoUrl}" height="40" alt="Current Logo" style="border-radius:6px;border:1px solid var(--border);">`;
+    if (b.appTitle)     { const el = document.getElementById("settingAppTitle");     if(el) el.value = b.appTitle; }
+    if (b.primaryColor) { const el = document.getElementById("settingPrimaryColor"); if(el) el.value = b.primaryColor; }
+    if (b.companyName)  { const el = document.getElementById("settingCompanyName");  if(el) el.value = b.companyName; }
+    const logoDiv = document.getElementById("currentLogo");
+    if (logoDiv) {
+      if (b.logoRemoved || !b.logoUrl) {
+        logoDiv.innerHTML = `<span class="text-muted small">No logo set.</span>`;
+      } else {
+        logoDiv.innerHTML = `<img src="${b.logoUrl}" height="40" alt="Current Logo" style="border-radius:6px;border:1px solid var(--border);">`;
+      }
+    }
   }
 
   document.getElementById("saveBrandingBtn").onclick = async () => {
-    await setOrMergeSettings("branding", {
-      appTitle: document.getElementById("settingAppTitle").value,
-      primaryColor: document.getElementById("settingPrimaryColor").value,
-    });
-    applyBranding();
-    showToast("Branding saved.", "success");
+    try {
+      await setOrMergeSettings("branding", {
+        appTitle:     document.getElementById("settingAppTitle")?.value || "",
+        primaryColor: document.getElementById("settingPrimaryColor")?.value || "",
+        companyName:  document.getElementById("settingCompanyName")?.value || "",
+      });
+      applyBranding();
+      showToast("Branding saved.", "success");
+    } catch(e) { showToast("Save failed: " + e.message, "error"); }
   };
 
   const logoZone = document.getElementById("logoUploadZone");
@@ -1991,6 +2031,26 @@ async function loadSettings() {
     } catch (err) {
       logoDiv.innerHTML = `<span class="text-danger small"><i class="bi bi-exclamation-triangle me-1"></i>Upload failed: ${err.message}</span>`;
       showToast("Logo upload failed: " + err.message, "error");
+    }
+  });
+
+  // ── Remove Logo ────────────────────────────────────────────────────────────
+  document.getElementById("removeLogoBtn")?.addEventListener("click", async () => {
+    if (!confirm("Remove the branding logo? You can upload a new one anytime.")) return;
+    try {
+      await setOrMergeSettings("branding", { logoUrl: "", logoRemoved: true });
+      // Hide immediately on page
+      const authLogo     = document.getElementById("authLogo");
+      const authLogoWrap = document.getElementById("authLogoWrap");
+      const sidebarLogo  = document.getElementById("sidebarLogo");
+      if (authLogoWrap) authLogoWrap.style.display = "none";
+      if (authLogo)     { authLogo.src = ""; authLogo.style.display = "none"; }
+      if (sidebarLogo)  { sidebarLogo.src = ""; sidebarLogo.style.display = "none"; }
+      document.getElementById("currentLogo").innerHTML = `<span class="text-muted small">No logo set.</span>`;
+      showToast("Logo removed.", "success");
+    } catch(err) {
+      showToast("Error removing logo: " + err.message, "error");
+      console.error("removeLogoBtn error:", err);
     }
   });
 
@@ -2053,13 +2113,6 @@ async function loadSettings() {
 
 async function setOrMergeSettings(docId, data) {
   const ref2 = doc(db, "appSettings", docId);
-  const snap = await getDoc(ref2);
-  if (snap.exists()) await updateDoc(ref2, data);
-  else await addDoc(collection(db, "appSettings"), { ...data, _id: docId }).catch(() =>
-    updateDoc(ref2, data)
-  );
-  // Proper set with merge:
-  const { setDoc } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
   await setDoc(ref2, data, { merge: true });
 }
 
