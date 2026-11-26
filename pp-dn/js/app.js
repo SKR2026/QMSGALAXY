@@ -644,17 +644,21 @@ function setupNavigation() {
   document.getElementById("kpiRow").addEventListener("click", e => {
     const card = e.target.closest(".kpi-card");
     if (!card) return;
-    // find which kpi id is inside this card
     const valueEl = card.querySelector("[id^='kpi']");
     if (!valueEl) return;
     const kpiId = valueEl.id;
     const statusVal = kpiStatusMap[kpiId];
     if (statusVal === undefined) return;
-    // special case: kpiPending covers submitted + pending_with_mr → use pending_with_mr
     document.getElementById("filterStatus").value = statusVal;
     // highlight active card
-    document.querySelectorAll(".kpi-card").forEach(c => c.style.outline = "");
-    if (statusVal !== "") card.style.outline = "2px solid var(--accent)";
+    document.querySelectorAll(".kpi-card").forEach(c => {
+      c.style.outline = "";
+      c.style.boxShadow = "";
+    });
+    if (statusVal !== "") {
+      card.style.outline = "2px solid var(--accent)";
+      card.style.boxShadow = "0 0 0 4px rgba(46,134,222,0.15)";
+    }
     loadDashboard();
   });
 
