@@ -893,7 +893,8 @@ exports.sendTestEmail = functions.https.onCall(async (data, context) => {
 // mode = "docs"  → delete documents + logs + reset ref counter
 // mode = "full"  → above + plants, departments, categories
 // ─────────────────────────────────────────────────────────────────────────────
-exports.wipeAppData = functions
+exports.wipeAppData = functionsBase
+  .region("asia-south1")
   .runWith({ timeoutSeconds: 300, memory: "512MB" })
   .https.onCall(async (data, context) => {
     const caller = await requireSuperadmin(context);
@@ -995,7 +996,8 @@ async function doRetentionDelete() {
 // ─────────────────────────────────────────────────────────────────────────────
 // CALLABLE: Run retention delete now (Superadmin)
 // ─────────────────────────────────────────────────────────────────────────────
-exports.runRetentionDelete = functions
+exports.runRetentionDelete = functionsBase
+  .region("asia-south1")
   .runWith({ timeoutSeconds: 300, memory: "512MB" })
   .https.onCall(async (data, context) => {
     await requireSuperadmin(context);
@@ -1005,8 +1007,9 @@ exports.runRetentionDelete = functions
 // ─────────────────────────────────────────────────────────────────────────────
 // SCHEDULED: Daily auto-retention delete at 1:00 AM IST (19:30 UTC)
 // ─────────────────────────────────────────────────────────────────────────────
-exports.dailyRetentionDelete = functions.pubsub
-  .schedule("30 19 * * *")
+exports.dailyRetentionDelete = functionsBase
+  .region("asia-south1")
+  .pubsub.schedule("30 19 * * *")
   .timeZone("Asia/Kolkata")
   .onRun(async () => {
     const result = await doRetentionDelete();
