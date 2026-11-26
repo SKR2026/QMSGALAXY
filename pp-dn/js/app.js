@@ -635,7 +635,10 @@ function navigateTo(view) {
   document.querySelector(".sidebar-overlay")?.classList.remove("active");
 }
 
+let _navigationInitialized = false;
 function setupNavigation() {
+  if (_navigationInitialized) return;
+  _navigationInitialized = true;
   document.getElementById("sidebarNav").addEventListener("click", e => {
     const a = e.target.closest("a[data-view]");
     if (a) { e.preventDefault(); navigateTo(a.dataset.view); }
@@ -782,7 +785,18 @@ function applySidebarLayout(collapsed) {
   // No inline styles needed — CSS transitions handle the animation.
 }
 
+let _sidebarInitialized = false;
 function setupSidebar() {
+  // Only initialize once — re-running on account switch adds duplicate listeners
+  if (_sidebarInitialized) {
+    // Just reset mobile-open state when switching accounts
+    const sidebar = document.getElementById("sidebar");
+    sidebar.classList.remove("mobile-open");
+    document.querySelector(".sidebar-overlay")?.classList.remove("active");
+    return;
+  }
+  _sidebarInitialized = true;
+
   const overlay = document.createElement("div");
   overlay.className = "sidebar-overlay";
   document.body.appendChild(overlay);
@@ -812,7 +826,10 @@ function setupSidebar() {
   });
 }
 
+let _filterToggleInitialized = false;
 function setupFilterToggle() {
+  if (_filterToggleInitialized) return;
+  _filterToggleInitialized = true;
   const btn = document.getElementById("filterToggle");
   const body = document.getElementById("filterBody");
   const chevron = document.getElementById("filterChevron");
@@ -2025,7 +2042,10 @@ function prepareSubmitForm(docId = null) {
   }
 }
 
+let _submitFormInitialized = false;
 function setupSubmitForm() {
+  if (_submitFormInitialized) return;
+  _submitFormInitialized = true;
   const uploadZone = document.getElementById("uploadZone");
   const fileInput = document.getElementById("docFile");
 
@@ -2340,7 +2360,10 @@ async function saveDocument(isDraft) {
 // ═══════════════════════════════════════════════════════════════════════════
 // SEND NOTIFICATION (user button)
 // ═══════════════════════════════════════════════════════════════════════════
+let _sendNotifInitialized = false;
 function setupSendNotification() {
+  if (_sendNotifInitialized) return;
+  _sendNotifInitialized = true;
   const btn = document.getElementById("sendNotifBtn");
   const lastEl = document.getElementById("notifLastSent");
 
@@ -2601,7 +2624,10 @@ async function executeWipe() {
   }
 }
 
+let _dangerZoneInitialized = false;
 function setupDangerZone() {
+  if (_dangerZoneInitialized) return;
+  _dangerZoneInitialized = true;
   document.getElementById("wipeDocsBtn")?.addEventListener("click", () => openWipeModal("docs"));
   document.getElementById("wipeAllBtn")?.addEventListener("click",  () => openWipeModal("full"));
   document.getElementById("confirmWipeBtn")?.addEventListener("click", executeWipe);
@@ -2625,7 +2651,7 @@ async function loadSettings() {
     const s = emailSnap.data();
     document.getElementById("settingAppUrl").value = s.appUrl || "";
     document.getElementById("settingFromName").value = s.fromName || "CDRTS System";
-    document.getElementById("settingCooldown").value = s.notificationCooldownMinutes || 120;
+    if (document.getElementById("settingFromName")) document.getElementById("settingFromName").value = s.fromName || "CDRTS System";
   }
   // Load Gmail credentials (stored separately for security)
   const gmailSnap = await getDoc(doc(db, "appSettings", "emailCredentials")).catch(() => null);
@@ -2689,7 +2715,7 @@ async function loadSettings() {
 
   document.getElementById("saveNotifSettings").onclick = async () => {
     await setOrMergeSettings("notifications", {
-      notificationCooldownMinutes: parseInt(document.getElementById("settingCooldown").value) || 120,
+      fromName: document.getElementById("settingFromName")?.value.trim() || "CDRTS System",
     });
     showToast("Notification settings saved.", "success");
   };
