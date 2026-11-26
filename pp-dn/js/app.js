@@ -631,6 +631,33 @@ function setupNavigation() {
     if (a) { e.preventDefault(); navigateTo(a.dataset.view); }
   });
 
+  // KPI card clicks → filter by status
+  const kpiStatusMap = {
+    kpiTotal:       "",                      // all (clear status filter)
+    kpiPending:     "pending_with_mr",       // closest single status; also "submitted"
+    kpiUnderProcess:"under_process",
+    kpiReturned:    "returned_for_correction",
+    kpiNumbered:    "number_assigned",
+    kpiDmsTime:     "",                      // metric only — no status filter
+    kpiTurnaround:  "",                      // metric only — no status filter
+  };
+  document.getElementById("kpiRow").addEventListener("click", e => {
+    const card = e.target.closest(".kpi-card");
+    if (!card) return;
+    // find which kpi id is inside this card
+    const valueEl = card.querySelector("[id^='kpi']");
+    if (!valueEl) return;
+    const kpiId = valueEl.id;
+    const statusVal = kpiStatusMap[kpiId];
+    if (statusVal === undefined) return;
+    // special case: kpiPending covers submitted + pending_with_mr → use pending_with_mr
+    document.getElementById("filterStatus").value = statusVal;
+    // highlight active card
+    document.querySelectorAll(".kpi-card").forEach(c => c.style.outline = "");
+    if (statusVal !== "") card.style.outline = "2px solid var(--accent)";
+    loadDashboard();
+  });
+
   document.getElementById("applyFilters").addEventListener("click", () => loadDashboard());
   document.getElementById("clearFilters").addEventListener("click", () => {
     document.getElementById("filterFY").value = "";
@@ -711,19 +738,26 @@ function setupNavigation() {
   });
 }
 
+function setSidebarMargin(collapsed) {
+  const main = document.getElementById("mainContent");
+  if (!main) return;
+  // styles.css sets margin-left:260px (--sidebar-width). Collapsed → 56px icon strip.
+  main.style.marginLeft = collapsed ? "56px" : "260px";
+}
+
 function setupSidebar() {
-  // Create overlay for mobile
   const overlay = document.createElement("div");
   overlay.className = "sidebar-overlay";
   document.body.appendChild(overlay);
 
   const sidebar = document.getElementById("sidebar");
 
-  // Restore collapsed state from localStorage
-  if (localStorage.getItem("sidebarCollapsed") === "true") {
+  // Restore collapsed state
+  const startCollapsed = localStorage.getItem("sidebarCollapsed") === "true";
+  if (startCollapsed) {
     sidebar.classList.add("collapsed");
-    // CSS handles margin-left via .sidebar.collapsed ~ .main-content
   }
+  setSidebarMargin(startCollapsed);
 
   document.getElementById("menuToggle").addEventListener("click", () => {
     sidebar.classList.toggle("mobile-open");
@@ -732,6 +766,7 @@ function setupSidebar() {
 
   document.getElementById("sidebarToggle").addEventListener("click", () => {
     const isCollapsed = sidebar.classList.toggle("collapsed");
+    setSidebarMargin(isCollapsed);
     localStorage.setItem("sidebarCollapsed", String(isCollapsed));
     document.getElementById("sidebarToggle").title = isCollapsed ? "Expand sidebar" : "Collapse sidebar";
   });
