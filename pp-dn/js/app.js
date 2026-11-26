@@ -2392,25 +2392,11 @@ function setupSendNotification() {
         lastEl.textContent = `Last sent: ${nowIST()}`;
         lastEl.classList.remove("d-none");
       } else {
-        // Old deployed function returns "No pending documents found" for MR when
-        // it falls into the user branch — treat as success if MR has no pending docs
-        if (isMR && (res.data.message || "").toLowerCase().includes("pending")) {
-          showToast("No pending documents requiring notification at this time.", "warning");
-          lastEl.textContent = `Last checked: ${nowIST()}`;
-          lastEl.classList.remove("d-none");
-        } else {
-          showToast(res.data.message || "No documents found.", "warning");
-        }
+        showToast(res.data.message || "No documents found.", "warning");
       }
     } catch (e) {
-      const isMR = currentUserData?.role === "corporate_mr" || currentUserData?.role === "superadmin";
       const msg = e?.details?.message || e?.message || "Failed to send notification.";
-      // Suppress cooldown errors for MR — old deployed function may misroute
-      if (isMR && msg.toLowerCase().includes("wait")) {
-        showToast("Notification check complete.", "success");
-      } else {
-        showToast(msg, "danger");
-      }
+      showToast(msg, "danger");
     } finally {
       btn.disabled = false;
       btn.innerHTML = `<i class="bi bi-bell-fill me-1"></i>Send Notification`;
