@@ -1228,11 +1228,12 @@ async function loadMyDocuments() {
   tbody.innerHTML = docs.map(d => `
     <tr class="mydoc-row" data-id="${d.id}">
       <td class="fw-semibold text-primary" style="white-space:nowrap">${d.submissionRefNo || "Draft"}</td>
-      <td>${d.documentTitle || "—"}</td>
+      <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.documentTitle || "—"}</td>
       <td><span class="text-muted small">${d.categoryName || "—"}</span></td>
       <td><span class="small" style="white-space:nowrap">${toIST(d.submissionDate)}</span></td>
-      <td class="fw-semibold text-success">${d.officialDocNumber || `<span class="text-muted">—</span>`}</td>
+      <td class="fw-semibold text-success" style="white-space:nowrap">${d.officialDocNumber || `<span class="text-muted">—</span>`}</td>
       <td>${statusBadge(d.status)}</td>
+      <td style="min-width:280px;padding:6px 10px">${buildHorizontalTimeline(d)}</td>
       <td>
         <div class="action-btns">
           <button class="btn btn-sm btn-outline-primary view-doc-btn" data-id="${d.id}"><i class="bi bi-eye"></i></button>
@@ -1244,9 +1245,6 @@ async function loadMyDocuments() {
         </div>
       </td>
     </tr>
-    <tr class="mydoc-timeline-row" data-id="${d.id}">
-      <td colspan="7">${buildHorizontalTimeline(d)}</td>
-    </tr>
   `).join("");
 
   tbody.querySelectorAll(".view-doc-btn").forEach(b =>
@@ -1254,14 +1252,11 @@ async function loadMyDocuments() {
   tbody.querySelectorAll(".edit-doc-btn").forEach(b =>
     b.addEventListener("click", () => { navigateTo("submit"); prepareSubmitForm(b.dataset.id); }));
 
-  // Search — hide both main row and its timeline row
+  // Search
   document.getElementById("myDocsSearch").oninput = e => {
     const q = e.target.value.toLowerCase();
     tbody.querySelectorAll(".mydoc-row").forEach(row => {
-      const hide = !row.textContent.toLowerCase().includes(q);
-      row.style.display = hide ? "none" : "";
-      const next = row.nextElementSibling;
-      if (next?.classList.contains("mydoc-timeline-row")) next.style.display = hide ? "none" : "";
+      row.style.display = row.textContent.toLowerCase().includes(q) ? "" : "none";
     });
   };
 }
