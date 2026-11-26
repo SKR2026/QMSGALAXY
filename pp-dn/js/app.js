@@ -2691,7 +2691,9 @@ async function sendDigestNow() {
     const fn = httpsCallable(functions, "sendDailyDigestNow");
     const result = await fn();
     msgEl.className = "alert alert-success mt-3";
-    msgEl.textContent = `Digest sent successfully. ${result.data.sent} email(s) dispatched.`;
+    msgEl.textContent = result.data.test
+      ? `Test email sent to superadmin. No document activity found in last 24h — blank template delivered.`
+      : `Digest sent successfully. ${result.data.sent} email(s) dispatched.`;
     msgEl.classList.remove("d-none");
     loadDigestSettings();
   } catch(e) {
