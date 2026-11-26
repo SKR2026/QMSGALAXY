@@ -10,8 +10,11 @@ const functionsBase = require("firebase-functions");
 const admin         = require("firebase-admin");
 const nodemailer    = require("nodemailer");
 
-// All functions deploy to asia-south1 (Mumbai)
+// Regional builder for defining functions (asia-south1 = Mumbai)
 const functions = functionsBase.region("asia-south1");
+
+// HttpsError lives on the base module, not the regional builder
+const HttpsError = functionsBase.https.HttpsError;
 
 admin.initializeApp();
 const db      = admin.firestore();
@@ -103,8 +106,8 @@ async function sendEmail(to, subject, html) {
         error:  err.message,
       });
     } catch (_) { /* ignore log failure */ }
-    // Re-throw as HttpsError so the client sees a readable message, not INTERNAL
-    throw new functions.https.HttpsError("internal", `Email failed: ${err.message}`);
+    // Re-throw plain Error (not HttpsError) so callers can catch and continue
+    throw new Error(`Email failed: ${err.message}`);
   }
 }
 
@@ -129,11 +132,11 @@ async function getCorporateMREmails() {
 // ─────────────────────────────────────────────────────────────────────────────
 async function requireSuperadmin(context) {
   if (!context.auth) {
-    throw new functions.https.HttpsError("unauthenticated", "Sign in required.");
+    throw new HttpsError("unauthenticated", "Sign in required.");
   }
   const userDoc = await db.collection("users").doc(context.auth.uid).get();
   if (!userDoc.exists || userDoc.data().role !== "superadmin") {
-    throw new functions.https.HttpsError("permission-denied", "Superadmin access required.");
+    throw new HttpsError("permission-denied", "Superadmin access required.");
   }
   return userDoc.data();
 }
@@ -219,12 +222,12 @@ function emailWrapper(title, body) {
 // CALLABLE: Send consolidated notification to Corporate MR
 // ─────────────────────────────────────────────────────────────────────────────
 exports.sendUserNotification = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Login required.");
+  if (!context.auth) throw new HttpsError("unauthenticated", "Login required.");
 
   const uid     = context.auth.uid;
   const userDoc = await db.collection("users").doc(uid).get();
   const user    = userDoc.data();
-  if (!user) throw new functions.https.HttpsError("not-found", "User not found.");
+  if (!user) throw new HttpsError("not-found", "User not found.");
 
   const settingsSnap     = await db.collection("appSettings").doc("notifications").get();
   const settings         = settingsSnap.exists ? settingsSnap.data() : {};
@@ -248,7 +251,7 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
       const diffMins = (Date.now() - lastNotif.createdAt.toMillis()) / 60000;
       if (diffMins < cooldownMinutes) {
         const remaining = Math.ceil(cooldownMinutes - diffMins);
-        throw new functions.https.HttpsError(
+        throw new HttpsError(
           "resource-exhausted",
           `Please wait ${remaining} more minute(s) before sending another notification.`
         );
@@ -342,7 +345,7 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
           totalEmailsSent++;
         } catch (mailErr) {
           console.error(`Failed to email ${info.email}:`, mailErr.message);
-          errors.push(info.email);
+          errors.push(mailErr.message);
         }
       }
 
@@ -363,15 +366,20 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
       });
 
       if (totalEmailsSent === 0) {
-        throw new functions.https.HttpsError("internal", "No emails could be sent. Check email configuration in Settings.");
+        return {
+          success: false,
+          message: errors.length
+            ? `Emails failed to send. Check Gmail credentials in Settings → Email Configuration. Error: ${errors[0]}`
+            : "No submitter emails found.",
+        };
       }
 
       return { success: true, count: completedDocs.length, emailsSent: totalEmailsSent };
 
     } catch (err) {
-      if (err instanceof functions.https.HttpsError) throw err;
+      if (err instanceof HttpsError) throw err;
       console.error("sendUserNotification MR branch error:", err);
-      throw new functions.https.HttpsError("internal", `Failed to send notifications: ${err.message}`);
+      throw new HttpsError("internal", `Failed to send notifications: ${err.message}`);
     }
 
   } else {
@@ -414,7 +422,7 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
     );
 
     const mrEmails = await getCorporateMREmails();
-    if (!mrEmails.length) throw new functions.https.HttpsError("not-found", "No Corporate MR users found.");
+    if (!mrEmails.length) return { success: false, message: "No Corporate MR users found. Add a Corporate MR account first." };
 
     await sendEmail(mrEmails.join(","), `[CDRTS] Pending Documents Reminder – ${user.displayName || user.email}`, html);
 
@@ -436,9 +444,9 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
     return { success: true, count: docs.length };
 
     } catch (err) {
-      if (err instanceof functions.https.HttpsError) throw err;
+      if (err instanceof HttpsError) throw err;
       console.error("sendUserNotification user branch error:", err);
-      throw new functions.https.HttpsError("internal", `Failed to send notification: ${err.message}`);
+      throw new HttpsError("internal", `Failed to send notification: ${err.message}`);
     }
   }
 });
@@ -447,11 +455,11 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
 // CALLABLE: Assign official document number (Corporate MR)
 // ─────────────────────────────────────────────────────────────────────────────
 exports.assignDocumentNumber = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Login required.");
+  if (!context.auth) throw new HttpsError("unauthenticated", "Login required.");
 
   const { documentId, officialDocNumber, dmsUploadDate, dmsUploadTime, remarks } = data;
   if (!documentId || !officialDocNumber) {
-    throw new functions.https.HttpsError("invalid-argument", "documentId and officialDocNumber are required.");
+    throw new HttpsError("invalid-argument", "documentId and officialDocNumber are required.");
   }
 
   const normalizedDocNumber = officialDocNumber.trim().toUpperCase().replace(/\s+/g, "");
@@ -461,7 +469,7 @@ exports.assignDocumentNumber = functions.https.onCall(async (data, context) => {
   const mrUser  = userDoc.data();
 
   if (!mrUser || mrUser.role !== "corporate_mr") {
-    throw new functions.https.HttpsError("permission-denied", "Only Corporate MR can assign document numbers.");
+    throw new HttpsError("permission-denied", "Only Corporate MR can assign document numbers.");
   }
 
   const docRef      = db.collection("documents").doc(documentId);
@@ -472,16 +480,16 @@ exports.assignDocumentNumber = functions.https.onCall(async (data, context) => {
       const docSnap      = await transaction.get(docRef);
       const registrySnap = await transaction.get(registryRef);
 
-      if (!docSnap.exists) throw new functions.https.HttpsError("not-found", "Document not found.");
+      if (!docSnap.exists) throw new HttpsError("not-found", "Document not found.");
 
       const doc = docSnap.data();
       if (!["submitted", "pending_with_mr", "under_process", "resubmitted"].includes(doc.status)) {
-        throw new functions.https.HttpsError("failed-precondition", `Cannot assign number to document with status: ${doc.status}`);
+        throw new HttpsError("failed-precondition", `Cannot assign number to document with status: ${doc.status}`);
       }
 
       if (registrySnap.exists) {
         const existing = registrySnap.data();
-        throw new functions.https.HttpsError(
+        throw new HttpsError(
           "already-exists",
           `Document number ${officialDocNumber} is already assigned to: ${existing.documentTitle} (Ref: ${existing.submissionRefNo}) – Plant: ${existing.plantName}, Dept: ${existing.departmentName}`
         );
@@ -528,8 +536,8 @@ exports.assignDocumentNumber = functions.https.onCall(async (data, context) => {
       });
     });
   } catch (err) {
-    if (err instanceof functions.https.HttpsError) throw err;
-    throw new functions.https.HttpsError("internal", err.message);
+    if (err instanceof HttpsError) throw err;
+    throw new HttpsError("internal", err.message);
   }
 
   const updatedDoc    = (await docRef.get()).data();
@@ -580,11 +588,11 @@ exports.assignDocumentNumber = functions.https.onCall(async (data, context) => {
 // CALLABLE: Return document for correction
 // ─────────────────────────────────────────────────────────────────────────────
 exports.returnDocumentForCorrection = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Login required.");
+  if (!context.auth) throw new HttpsError("unauthenticated", "Login required.");
 
   const { documentId, remarks } = data;
   if (!documentId || !remarks) {
-    throw new functions.https.HttpsError("invalid-argument", "documentId and remarks are required.");
+    throw new HttpsError("invalid-argument", "documentId and remarks are required.");
   }
 
   const uid     = context.auth.uid;
@@ -592,12 +600,12 @@ exports.returnDocumentForCorrection = functions.https.onCall(async (data, contex
   const mrUser  = userDoc.data();
 
   if (!mrUser || mrUser.role !== "corporate_mr") {
-    throw new functions.https.HttpsError("permission-denied", "Only Corporate MR can return documents.");
+    throw new HttpsError("permission-denied", "Only Corporate MR can return documents.");
   }
 
   const docRef  = db.collection("documents").doc(documentId);
   const docSnap = await docRef.get();
-  if (!docSnap.exists) throw new functions.https.HttpsError("not-found", "Document not found.");
+  if (!docSnap.exists) throw new HttpsError("not-found", "Document not found.");
 
   const doc    = docSnap.data();
   const now    = admin.firestore.FieldValue.serverTimestamp();
@@ -662,26 +670,26 @@ exports.returnDocumentForCorrection = functions.https.onCall(async (data, contex
 // CALLABLE: Submit document (generates ref number)
 // ─────────────────────────────────────────────────────────────────────────────
 exports.submitDocument = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Login required.");
+  if (!context.auth) throw new HttpsError("unauthenticated", "Login required.");
 
   const uid     = context.auth.uid;
   const { documentId } = data;
-  if (!documentId) throw new functions.https.HttpsError("invalid-argument", "documentId required.");
+  if (!documentId) throw new HttpsError("invalid-argument", "documentId required.");
 
   const userDoc = await db.collection("users").doc(uid).get();
   const user    = userDoc.data();
 
   if (!user || !["user", "superadmin"].includes(user.role)) {
-    throw new functions.https.HttpsError("permission-denied", "Only plant/department users or admins can submit documents.");
+    throw new HttpsError("permission-denied", "Only plant/department users or admins can submit documents.");
   }
 
   const docRef  = db.collection("documents").doc(documentId);
   const docSnap = await docRef.get();
-  if (!docSnap.exists) throw new functions.https.HttpsError("not-found", "Document not found.");
+  if (!docSnap.exists) throw new HttpsError("not-found", "Document not found.");
 
   const doc = docSnap.data();
   if (doc.submittedBy !== uid) {
-    throw new functions.https.HttpsError("permission-denied", "You can only submit your own documents.");
+    throw new HttpsError("permission-denied", "You can only submit your own documents.");
   }
 
   const year       = new Date().getFullYear();
@@ -747,7 +755,7 @@ exports.createUser = functions.https.onCall(async (data, context) => {
 
   const { email, password, displayName, role, plantId, plantName, departmentId, departmentName } = data;
   if (!email || !password || !displayName || !role) {
-    throw new functions.https.HttpsError("invalid-argument", "Missing required fields.");
+    throw new HttpsError("invalid-argument", "Missing required fields.");
   }
 
   const userRecord = await admin.auth().createUser({ email, password, displayName });
@@ -784,7 +792,7 @@ exports.deleteRecords = functions.https.onCall(async (data, context) => {
 
   const { documentIds, reason } = data;
   if (!documentIds || !documentIds.length || !reason) {
-    throw new functions.https.HttpsError("invalid-argument", "documentIds and reason are required.");
+    throw new HttpsError("invalid-argument", "documentIds and reason are required.");
   }
 
   const batch  = db.batch();
@@ -833,10 +841,10 @@ exports.deleteRecords = functions.https.onCall(async (data, context) => {
 // CALLABLE: Check document number uniqueness
 // ─────────────────────────────────────────────────────────────────────────────
 exports.checkDocumentNumber = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Login required.");
+  if (!context.auth) throw new HttpsError("unauthenticated", "Login required.");
 
   const { docNumber } = data;
-  if (!docNumber) throw new functions.https.HttpsError("invalid-argument", "docNumber required.");
+  if (!docNumber) throw new HttpsError("invalid-argument", "docNumber required.");
 
   const normalized = docNumber.trim().toUpperCase().replace(/\s+/g, "");
   const snap       = await db.collection("documentNumberRegistry").doc(normalized).get();
@@ -863,11 +871,11 @@ exports.checkDocumentNumber = functions.https.onCall(async (data, context) => {
 // CALLABLE: Send test / transactional email
 // ─────────────────────────────────────────────────────────────────────────────
 exports.sendTestEmail = functions.https.onCall(async (data, context) => {
-  if (!context.auth) throw new functions.https.HttpsError("unauthenticated", "Login required.");
+  if (!context.auth) throw new HttpsError("unauthenticated", "Login required.");
 
   const { to, subject, html, text } = data;
   if (!to || !subject) {
-    throw new functions.https.HttpsError("invalid-argument", "to and subject are required.");
+    throw new HttpsError("invalid-argument", "to and subject are required.");
   }
 
   try {
@@ -875,7 +883,7 @@ exports.sendTestEmail = functions.https.onCall(async (data, context) => {
     return { success: true };
   } catch (e) {
     console.error("sendTestEmail error:", e);
-    throw new functions.https.HttpsError("internal", e.message || "Email send failed.");
+    throw new HttpsError("internal", e.message || "Email send failed.");
   }
 });
 
