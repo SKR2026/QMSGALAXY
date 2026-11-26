@@ -448,6 +448,7 @@ async function initApp() {
   buildTopnavUser();
   setupNavigation();
   setupSidebar();
+  setupFilterToggle();
   loadMasterData();
   setupSubmitForm();
   setupSendNotification();
@@ -717,11 +718,11 @@ function setupSidebar() {
   document.body.appendChild(overlay);
 
   const sidebar = document.getElementById("sidebar");
-  const main    = document.getElementById("mainContent");
 
   // Restore collapsed state from localStorage
   if (localStorage.getItem("sidebarCollapsed") === "true") {
     sidebar.classList.add("collapsed");
+    // CSS handles margin-left via .sidebar.collapsed ~ .main-content
   }
 
   document.getElementById("menuToggle").addEventListener("click", () => {
@@ -738,6 +739,18 @@ function setupSidebar() {
   overlay.addEventListener("click", () => {
     sidebar.classList.remove("mobile-open");
     overlay.classList.remove("active");
+  });
+}
+
+function setupFilterToggle() {
+  const btn = document.getElementById("filterToggle");
+  const body = document.getElementById("filterBody");
+  const chevron = document.getElementById("filterChevron");
+  if (!btn || !body) return;
+  btn.addEventListener("click", () => {
+    const hidden = body.style.display === "none";
+    body.style.display = hidden ? "" : "none";
+    chevron.className = hidden ? "bi bi-chevron-up" : "bi bi-chevron-down";
   });
 }
 
@@ -995,21 +1008,21 @@ function buildChart(canvasId, type, labels, data, label, colors) {
     },
     options: {
       responsive: true,
-      maintainAspectRatio: true,
+      maintainAspectRatio: false,
       layout: { padding: { top: 2, bottom: 2 } },
       plugins: {
         legend: {
           display: type !== "bar",
           position: "bottom",
-          labels: { boxWidth: 8, boxHeight: 8, font: { size: 10 }, padding: 8 }
+          labels: { boxWidth: 7, boxHeight: 7, font: { size: 9 }, padding: 6 }
         },
-        tooltip: { bodyFont: { size: 11 }, titleFont: { size: 11 } }
+        tooltip: { bodyFont: { size: 10 }, titleFont: { size: 10 } }
       },
       scales: type !== "doughnut" ? {
-        x: { ticks: { font: { size: 10 }, maxRotation: 30 }, grid: { display: false } },
-        y: { ticks: { font: { size: 10 }, stepSize: 1 }, beginAtZero: true, grid: { color: "#f1f5f9" } }
+        x: { ticks: { font: { size: 9 }, maxRotation: 30 }, grid: { display: false } },
+        y: { ticks: { font: { size: 9 }, stepSize: 1 }, beginAtZero: true, grid: { color: "#f1f5f9" } }
       } : {},
-      cutout: type === "doughnut" ? "60%" : undefined
+      cutout: type === "doughnut" ? "65%" : undefined
     }
   });
 }
