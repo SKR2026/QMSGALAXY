@@ -1226,11 +1226,11 @@ async function loadMyDocuments() {
   }
 
   tbody.innerHTML = docs.map(d => `
-    <tr class="mydoc-row" data-id="${d.id}" style="cursor:pointer">
-      <td class="fw-semibold text-primary">${d.submissionRefNo || "Draft"}</td>
+    <tr class="mydoc-row" data-id="${d.id}">
+      <td class="fw-semibold text-primary" style="white-space:nowrap">${d.submissionRefNo || "Draft"}</td>
       <td>${d.documentTitle || "—"}</td>
       <td><span class="text-muted small">${d.categoryName || "—"}</span></td>
-      <td><span class="small">${toIST(d.submissionDate)}</span></td>
+      <td><span class="small" style="white-space:nowrap">${toIST(d.submissionDate)}</span></td>
       <td class="fw-semibold text-success">${d.officialDocNumber || `<span class="text-muted">—</span>`}</td>
       <td>${statusBadge(d.status)}</td>
       <td>
@@ -1244,103 +1244,158 @@ async function loadMyDocuments() {
         </div>
       </td>
     </tr>
+    <tr class="mydoc-timeline-row" data-id="${d.id}">
+      <td colspan="7">${buildHorizontalTimeline(d)}</td>
+    </tr>
   `).join("");
-
-  // Store docs for timeline lookup
-  tbody._docsMap = Object.fromEntries(docs.map(d => [d.id, d]));
-
-  // Row click → show timeline
-  tbody.querySelectorAll(".mydoc-row").forEach(row => {
-    row.addEventListener("click", e => {
-      if (e.target.closest("a,button")) return; // let buttons work normally
-      tbody.querySelectorAll(".mydoc-row").forEach(r => r.classList.remove("table-primary"));
-      row.classList.add("table-primary");
-      showDocTimeline(tbody._docsMap[row.dataset.id]);
-    });
-  });
 
   tbody.querySelectorAll(".view-doc-btn").forEach(b =>
     b.addEventListener("click", () => openDocModal(b.dataset.id)));
   tbody.querySelectorAll(".edit-doc-btn").forEach(b =>
     b.addEventListener("click", () => { navigateTo("submit"); prepareSubmitForm(b.dataset.id); }));
 
-  // Search
+  // Search — hide both main row and its timeline row
   document.getElementById("myDocsSearch").oninput = e => {
     const q = e.target.value.toLowerCase();
-    tbody.querySelectorAll("tr").forEach(row => {
-      row.style.display = row.textContent.toLowerCase().includes(q) ? "" : "none";
+    tbody.querySelectorAll(".mydoc-row").forEach(row => {
+      const hide = !row.textContent.toLowerCase().includes(q);
+      row.style.display = hide ? "none" : "";
+      const next = row.nextElementSibling;
+      if (next?.classList.contains("mydoc-timeline-row")) next.style.display = hide ? "none" : "";
     });
   };
-
-  // Auto-select first row
-  const firstRow = tbody.querySelector(".mydoc-row");
-  if (firstRow) { firstRow.classList.add("table-primary"); showDocTimeline(docs[0]); }
 }
 
-// ── Timeline panel renderer ──────────────────────────────────────────────────
+// ── Horizontal timeline builder ──────────────────────────────────────────────
+function buildHorizontalTimeline(d) {
+  const steps = [
+    { key: "submitted",              label: "Submitted",         icon: "bi-send",              color: "#0d6efd" },
+    { key: "resubmitted",            label: "Resubmitted",       icon: "bi-arrow-repeat",      color: "#0d6efd" },
+    { key: "pending_with_mr",        label: "Pending with MR",   icon: "bi-hourglass-split",   color: "#fd7e14" },
+    { key: "under_process",          label: "Under Process",     icon: "bi-gear-fill",         color: "#6610f2" },
+    { key: "returned_for_correction",label: "Returned",          icon: "bi-arrow-left-circle", color: "#dc3545" },
+    { key: "number_assigned",        label: "DMS Assigned",      icon: "bi-award-fill",        color: "#198754" },
+    { key: "completed",              label: "Completed",         icon: "bi-check-circle-fill", color: "#198754" },
+  ];
+
+  // Build a lookup from actual statusHistory (keeps first occurrence per status)
+  const histMap = {};
+  (d.statusHistory || []).forEach(h => { if (!histMap[h.status]) histMap[h.status] = h; });
+
+  // Filter out resubmitted if not in history (only show if actually happened)
+  const relevantSteps = steps.filter(s => {
+    if (s.key === "resubmitted") return !!histMap["resubmitted"];
+    if (s.key === "returned_for_correction") return !!histMap["returned_for_correction"];
+    return true;
+  });
+
+  const currentIdx = relevantSteps.findIndex(s => s.key === d.status);
+
+  return `<div class="doc-hline">` + relevantSteps.map((step, idx) => {
+    const hit      = histMap[step.key];
+    const isCurrent = step.key === d.status;
+    const isDone   = !!hit;
+    const isFuture = !isDone && !isCurrent;
+
+    const dotBg    = isDone || isCurrent ? step.color : "#dee2e6";
+    const lineBg   = idx < currentIdx    ? step.color : "#dee2e6";
+    const opacity  = isFuture ? "0.35" : "1";
+
+    // Date and name from history
+    const sub = hit
+      ? `<div class="doc-hstep-sub">${hit.changedAt ? hit.changedAt.split(",")[0] : ""}</div>
+         ${hit.changedByName ? `<div class="doc-hstep-sub">${hit.changedByName}</div>` : ""}`
+      : "";
+
+    return `
+      <div class="doc-hstep" style="opacity:${opacity}">
+        <div class="doc-hstep-track">
+          <div class="doc-hstep-line" style="background:${idx===0?"transparent":lineBg}"></div>
+          <div class="doc-hstep-dot${isCurrent?" current":""}" style="background:${dotBg}">
+            <i class="bi ${step.icon}"></i>
+          </div>
+          <div class="doc-hstep-line" style="background:${idx===relevantSteps.length-1?"transparent":lineBg}"></div>
+        </div>
+        <div class="doc-hstep-label${isDone?" done":""}${isCurrent?" current":""}">${step.label}</div>
+        ${sub}
+      </div>`;
+  }).join("") + `</div>`;
+}
+
+// ── (showDocTimeline removed – timeline now inline per row via buildHorizontalTimeline)
 function showDocTimeline(d) {
   const panel = document.getElementById("myDocsTimelineBody");
   if (!panel || !d) return;
 
-  // Define all possible steps in order
-  const steps = [
-    { key: "draft",                 label: "Draft Created",        icon: "bi-pencil-square",     color: "#6c757d" },
-    { key: "submitted",             label: "Submitted",            icon: "bi-send",              color: "#0d6efd" },
-    { key: "resubmitted",           label: "Resubmitted",          icon: "bi-arrow-repeat",      color: "#0d6efd" },
-    { key: "pending_with_mr",       label: "Pending with MR",      icon: "bi-hourglass-split",   color: "#fd7e14" },
-    { key: "under_process",         label: "Under Process",        icon: "bi-gear",              color: "#6610f2" },
-    { key: "returned_for_correction",label:"Returned for Correction",icon:"bi-arrow-left-circle",color: "#dc3545" },
-    { key: "number_assigned",       label: "DMS Number Assigned",  icon: "bi-award",             color: "#198754" },
-    { key: "completed",             label: "Completed",            icon: "bi-check-circle-fill", color: "#198754" },
-  ];
+  const statusColors = {
+    draft:                   "#6c757d",
+    submitted:               "#0d6efd",
+    resubmitted:             "#0d6efd",
+    pending_with_mr:         "#fd7e14",
+    under_process:           "#6610f2",
+    returned_for_correction: "#dc3545",
+    number_assigned:         "#198754",
+    completed:               "#198754",
+  };
+  const statusIcons = {
+    draft:                   "bi-pencil-square",
+    submitted:               "bi-send",
+    resubmitted:             "bi-arrow-repeat",
+    pending_with_mr:         "bi-hourglass-split",
+    under_process:           "bi-gear",
+    returned_for_correction: "bi-arrow-left-circle",
+    number_assigned:         "bi-award",
+    completed:               "bi-check-circle-fill",
+  };
 
-  const history = d.statusHistory || [];
-  const historyMap = {};
-  history.forEach(h => { historyMap[h.status] = h; });
+  // Use raw statusHistory array (preserves duplicates & order)
+  const history = [...(d.statusHistory || [])];
 
-  // Which steps occurred?
-  const currentIdx = steps.findIndex(s => s.key === d.status);
+  // If no history yet but doc has a status, synthesise one entry
+  if (!history.length && d.status) {
+    history.push({ status: d.status, changedByName: d.submittedByName || "", changedAt: "" });
+  }
 
-  const stepsHtml = steps.map((step, idx) => {
-    const hit     = historyMap[step.key];
-    const isCurrent = step.key === d.status;
-    const isDone  = hit != null;
-    const isFuture = !isDone && !isCurrent;
-
-    const dotColor  = isDone || isCurrent ? step.color : "#dee2e6";
-    const lineColor = idx < currentIdx ? step.color : "#dee2e6";
-    const opacity   = isFuture ? "0.4" : "1";
+  const entriesHtml = history.map((h, idx) => {
+    const isLast  = idx === history.length - 1;
+    const color   = statusColors[h.status] || "#6c757d";
+    const icon    = statusIcons[h.status]  || "bi-circle";
+    const lineColor = isLast ? "#dee2e6" : color;
 
     return `
-      <div class="d-flex gap-2 mb-1" style="opacity:${opacity}">
-        <div class="d-flex flex-column align-items-center" style="width:20px">
-          <div style="width:14px;height:14px;border-radius:50%;background:${dotColor};
-               border:2px solid ${isCurrent ? step.color : dotColor};
-               box-shadow:${isCurrent ? `0 0 0 3px ${step.color}30` : "none"};
-               flex-shrink:0;margin-top:2px"></div>
-          ${idx < steps.length - 1 ? `<div style="width:2px;flex:1;background:${lineColor};min-height:16px;margin-top:2px"></div>` : ""}
-        </div>
-        <div class="pb-2" style="min-width:0">
-          <div class="fw-semibold small" style="color:${isDone||isCurrent ? step.color : '#adb5bd'};line-height:1.2">
-            <i class="bi ${step.icon} me-1"></i>${step.label}
-            ${isCurrent ? `<span class="badge ms-1" style="background:${step.color};font-size:9px">NOW</span>` : ""}
+      <div class="d-flex gap-2">
+        <div class="d-flex flex-column align-items-center" style="width:22px;flex-shrink:0">
+          <div style="width:16px;height:16px;border-radius:50%;background:${color};
+               flex-shrink:0;margin-top:2px;display:flex;align-items:center;justify-content:center">
+            <i class="bi ${icon}" style="font-size:8px;color:#fff"></i>
           </div>
-          ${hit ? `
-            <div class="text-muted" style="font-size:11px;line-height:1.3">${hit.changedAt || ""}</div>
-            ${hit.changedByName ? `<div class="text-muted" style="font-size:11px">${hit.changedByName}</div>` : ""}
-            ${hit.remarks ? `<div class="text-muted fst-italic" style="font-size:10px;margin-top:1px">"${hit.remarks}"</div>` : ""}
-          ` : ""}
+          ${!isLast ? `<div style="width:2px;flex:1;background:${lineColor}33;min-height:20px;margin-top:2px"></div>` : ""}
+        </div>
+        <div class="pb-3" style="min-width:0;padding-top:1px">
+          <div class="fw-semibold" style="font-size:12px;color:${color};line-height:1.3">
+            ${statusLabel(h.status)}
+            ${isLast ? `<span class="badge ms-1 rounded-pill" style="background:${color};font-size:9px;vertical-align:middle">CURRENT</span>` : ""}
+          </div>
+          ${h.changedByName ? `<div style="font-size:11px;color:#6c757d">By: ${h.changedByName}</div>` : ""}
+          ${h.changedAt     ? `<div style="font-size:11px;color:#adb5bd">${h.changedAt}</div>` : ""}
+          ${h.remarks       ? `<div style="font-size:10px;color:#6c757d;font-style:italic;margin-top:2px">"${h.remarks}"</div>` : ""}
         </div>
       </div>`;
   }).join("");
 
   panel.innerHTML = `
-    <div class="mb-2 pb-2 border-bottom">
-      <div class="fw-bold text-primary small">${d.submissionRefNo || "Draft"}</div>
+    <div class="mb-3 pb-2 border-bottom">
+      <div class="fw-bold text-primary" style="font-size:13px">${d.submissionRefNo || "Draft"}</div>
       <div class="text-muted" style="font-size:12px">${d.documentTitle || "—"}</div>
-      ${d.officialDocNumber ? `<div class="mt-1"><span class="badge bg-success">${d.officialDocNumber}</span></div>` : ""}
+      <div class="mt-1 d-flex gap-1 flex-wrap">
+        ${statusBadge(d.status)}
+        ${d.officialDocNumber ? `<span class="badge bg-success">${d.officialDocNumber}</span>` : ""}
+      </div>
     </div>
-    ${stepsHtml}
+    <div class="fw-semibold text-uppercase mb-2" style="font-size:10px;letter-spacing:.06em;color:#adb5bd">
+      Status History
+    </div>
+    ${entriesHtml || '<div class="text-muted small">No history yet.</div>'}
   `;
 }
 
