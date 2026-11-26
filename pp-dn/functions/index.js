@@ -243,10 +243,10 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
       const allDocsSnap = await db.collection("documents").get();
       const completedDocs = allDocsSnap.docs
         .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((d) => d.status === "completed" || d.status === "number_assigned");
+        .filter((d) => ["completed","number_assigned","closed","under_process","submitted","pending_with_mr","resubmitted"].includes(d.status));
 
       if (!completedDocs.length) {
-        return { success: false, message: "No completed documents found to notify about." };
+        return { success: false, message: "No documents found to notify about." };
       }
 
       // Fetch all users once so we can look up emails reliably
