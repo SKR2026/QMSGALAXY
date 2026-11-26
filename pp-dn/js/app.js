@@ -742,6 +742,21 @@ function setupNavigation() {
   });
 }
 
+const SIDEBAR_FULL = 260;   // matches --sidebar-width in styles.css
+const SIDEBAR_MINI = 56;    // icon-strip width
+
+function applySidebarLayout(collapsed) {
+  const main = document.getElementById("mainContent");
+  if (!main) return;
+  if (collapsed) {
+    main.style.marginLeft = SIDEBAR_MINI + "px";
+    main.style.width = `calc(100% - ${SIDEBAR_MINI}px)`;
+  } else {
+    main.style.marginLeft = SIDEBAR_FULL + "px";
+    main.style.width = `calc(100% - ${SIDEBAR_FULL}px)`;
+  }
+}
+
 function setupSidebar() {
   const overlay = document.createElement("div");
   overlay.className = "sidebar-overlay";
@@ -749,10 +764,10 @@ function setupSidebar() {
 
   const sidebar = document.getElementById("sidebar");
 
-  // Restore collapsed state — margin-left never changes (sidebar overlays content)
-  if (localStorage.getItem("sidebarCollapsed") === "true") {
-    sidebar.classList.add("collapsed");
-  }
+  // Restore state on load
+  const startCollapsed = localStorage.getItem("sidebarCollapsed") === "true";
+  if (startCollapsed) sidebar.classList.add("collapsed");
+  applySidebarLayout(startCollapsed);
 
   document.getElementById("menuToggle").addEventListener("click", () => {
     sidebar.classList.toggle("mobile-open");
@@ -761,6 +776,7 @@ function setupSidebar() {
 
   document.getElementById("sidebarToggle").addEventListener("click", () => {
     const isCollapsed = sidebar.classList.toggle("collapsed");
+    applySidebarLayout(isCollapsed);
     localStorage.setItem("sidebarCollapsed", String(isCollapsed));
     document.getElementById("sidebarToggle").title = isCollapsed ? "Expand sidebar" : "Collapse sidebar";
   });
