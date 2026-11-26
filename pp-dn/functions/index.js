@@ -233,29 +233,28 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
   const settings         = settingsSnap.exists ? settingsSnap.data() : {};
   const cooldownMinutes  = settings.notificationCooldownMinutes || 120;
 
-  // NOTE: No orderBy here — avoids need for a composite Firestore index.
-  // We fetch all matching docs and find the most recent one in memory.
-  const lastNotifSnap = await db.collection("notificationQueue")
-    .where("userId", "==", uid)
-    .where("type",   "==", "user_consolidated")
-    .get();
+  // Cooldown check — single where only to avoid composite index requirement
+  // Filter by type in memory
+  let lastNotifTime = null;
+  try {
+    const lastNotifSnap = await db.collection("notificationQueue")
+      .where("userId", "==", uid)
+      .get();
+    const sorted = lastNotifSnap.docs
+      .map((d) => d.data())
+      .filter((d) => d.createdAt)
+      .sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
+    if (sorted.length > 0) lastNotifTime = sorted[0].createdAt;
+  } catch (_) { /* skip cooldown check if query fails */ }
 
-  const sortedNotifs = lastNotifSnap.docs
-    .map((d) => d.data())
-    .filter((d) => d.createdAt)
-    .sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
-
-  if (sortedNotifs.length > 0) {
-    const lastNotif = sortedNotifs[0];
-    if (lastNotif.createdAt) {
-      const diffMins = (Date.now() - lastNotif.createdAt.toMillis()) / 60000;
-      if (diffMins < cooldownMinutes) {
-        const remaining = Math.ceil(cooldownMinutes - diffMins);
-        throw new HttpsError(
-          "resource-exhausted",
-          `Please wait ${remaining} more minute(s) before sending another notification.`
-        );
-      }
+  if (lastNotifTime) {
+    const diffMins = (Date.now() - lastNotifTime.toMillis()) / 60000;
+    if (diffMins < cooldownMinutes) {
+      const remaining = Math.ceil(cooldownMinutes - diffMins);
+      throw new HttpsError(
+        "resource-exhausted",
+        `Please wait ${remaining} more minute(s) before sending another notification.`
+      );
     }
   }
 
@@ -349,10 +348,12 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
         }
       }
 
+      // Store only first 100 doc IDs to stay within Firestore 1MB doc limit
       await db.collection("notificationQueue").add({
         userId: uid,
         type:   "mr_completion_summary",
-        documentIds: completedDocs.map((d) => d.id),
+        documentIds: completedDocs.slice(0, 100).map((d) => d.id),
+        docCount: completedDocs.length,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         status: "sent",
         recipientCount: totalEmailsSent,
