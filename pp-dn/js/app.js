@@ -1266,60 +1266,70 @@ async function loadMyDocuments() {
   };
 }
 
-// ── Horizontal timeline builder ──────────────────────────────────────────────
+// ── Horizontal timeline builder (numbered circles style) ─────────────────────
 function buildHorizontalTimeline(d) {
-  const steps = [
-    { key: "submitted",              label: "Submitted",         icon: "bi-send",              color: "#0d6efd" },
-    { key: "resubmitted",            label: "Resubmitted",       icon: "bi-arrow-repeat",      color: "#0d6efd" },
-    { key: "pending_with_mr",        label: "Pending with MR",   icon: "bi-hourglass-split",   color: "#fd7e14" },
-    { key: "under_process",          label: "Under Process",     icon: "bi-gear-fill",         color: "#6610f2" },
-    { key: "returned_for_correction",label: "Returned",          icon: "bi-arrow-left-circle", color: "#dc3545" },
-    { key: "number_assigned",        label: "DMS Assigned",      icon: "bi-award-fill",        color: "#198754" },
-    { key: "completed",              label: "Completed",         icon: "bi-check-circle-fill", color: "#198754" },
+  const allSteps = [
+    { key: "submitted",               label: "Submitted"       },
+    { key: "resubmitted",             label: "Resubmitted"     },
+    { key: "pending_with_mr",         label: "MR Assigned"     },
+    { key: "under_process",           label: "MR Submitted"    },
+    { key: "returned_for_correction", label: "Returned"        },
+    { key: "number_assigned",         label: "DMS Assigned"    },
+    { key: "completed",               label: "Completed"       },
   ];
 
-  // Build a lookup from actual statusHistory (keeps first occurrence per status)
+  // Keep first-occurrence per status from history
   const histMap = {};
   (d.statusHistory || []).forEach(h => { if (!histMap[h.status]) histMap[h.status] = h; });
 
-  // Filter out resubmitted if not in history (only show if actually happened)
-  const relevantSteps = steps.filter(s => {
-    if (s.key === "resubmitted") return !!histMap["resubmitted"];
+  // Only show resubmitted / returned if they actually occurred
+  const steps = allSteps.filter(s => {
+    if (s.key === "resubmitted")            return !!histMap["resubmitted"];
     if (s.key === "returned_for_correction") return !!histMap["returned_for_correction"];
     return true;
   });
 
-  const currentIdx = relevantSteps.findIndex(s => s.key === d.status);
+  const currentIdx = steps.findIndex(s => s.key === d.status);
 
-  return `<div class="doc-hline">` + relevantSteps.map((step, idx) => {
-    const hit      = histMap[step.key];
+  const html = steps.map((step, idx) => {
+    const hit       = histMap[step.key];
     const isCurrent = step.key === d.status;
-    const isDone   = !!hit;
-    const isFuture = !isDone && !isCurrent;
+    // A step is "done" if it has history AND it's not the current active step
+    const isDone    = !!hit && !isCurrent;
+    const isFuture  = !hit && !isCurrent;
 
-    const dotBg    = isDone || isCurrent ? step.color : "#dee2e6";
-    const lineBg   = idx < currentIdx    ? step.color : "#dee2e6";
-    const opacity  = isFuture ? "0.35" : "1";
+    const circleClass = isDone ? "done" : isCurrent ? "current" : "future";
+    const labelClass  = isDone ? "done" : isCurrent ? "current" : "";
 
-    // Date and name from history
-    const sub = hit
-      ? `<div class="doc-hstep-sub">${hit.changedAt ? hit.changedAt.split(",")[0] : ""}</div>
-         ${hit.changedByName ? `<div class="doc-hstep-sub">${hit.changedByName}</div>` : ""}`
+    // Circle inner: check for done, play-triangle for current, number for future
+    const inner = isDone
+      ? `<i class="bi bi-check-lg" style="font-size:13px"></i>`
+      : isCurrent
+        ? `<i class="bi bi-play-fill" style="font-size:13px;margin-left:1px"></i>`
+        : `${idx + 1}`;
+
+    // Connecting lines: green if passed, grey if not
+    const leftLine  = idx === 0               ? "transparent" : (idx <= currentIdx ? "#22c55e" : "#cbd5e1");
+    const rightLine = idx === steps.length - 1 ? "transparent" : (idx < currentIdx  ? "#22c55e" : "#cbd5e1");
+
+    // Sub-label: name below step label
+    const nameLabel = hit?.changedByName
+      ? `<div class="doc-hstep-sub">${hit.changedByName.split(" ")[0]}</div>`
       : "";
 
     return `
-      <div class="doc-hstep" style="opacity:${opacity}">
+      <div class="doc-hstep">
         <div class="doc-hstep-track">
-          <div class="doc-hstep-line" style="background:${idx===0?"transparent":lineBg}"></div>
-          <div class="doc-hstep-dot${isCurrent?" current":""}" style="background:${dotBg}">
-            <i class="bi ${step.icon}"></i>
-          </div>
-          <div class="doc-hstep-line" style="background:${idx===relevantSteps.length-1?"transparent":lineBg}"></div>
+          <div class="doc-hstep-line" style="background:${leftLine}"></div>
+          <div class="doc-hstep-circle ${circleClass}">${inner}</div>
+          <div class="doc-hstep-line" style="background:${rightLine}"></div>
         </div>
-        <div class="doc-hstep-label${isDone?" done":""}${isCurrent?" current":""}">${step.label}</div>
-        ${sub}
+        <div class="doc-hstep-label ${labelClass}">${step.label}</div>
+        ${nameLabel}
       </div>`;
-  }).join("") + `</div>`;
+  }).join("");
+
+  return `<div class="doc-hline">${html}</div>`;
 }
 
 // ── (showDocTimeline removed – timeline now inline per row via buildHorizontalTimeline)
