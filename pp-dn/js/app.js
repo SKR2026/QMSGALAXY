@@ -2020,7 +2020,7 @@ async function loadSettings() {
       const task = uploadBytesResumable(storageRef, file);
       await new Promise((resolve, reject) => task.on("state_changed", null, reject, resolve));
       const url = await getDownloadURL(storageRef);
-      await setOrMergeSettings("branding", { logoUrl: url });
+      await setOrMergeSettings("branding", { logoUrl: url, logoRemoved: false });
       // Apply immediately
       const authLogo = document.getElementById("authLogo");
       const sidebarLogo = document.getElementById("sidebarLogo");
