@@ -937,10 +937,10 @@ async function loadDashboard() {
   if (filters.departmentId) allDocuments = allDocuments.filter(d => d.departmentId === filters.departmentId);
   if (filters.categoryId)   allDocuments = allDocuments.filter(d => d.categoryId === filters.categoryId);
 
-  // Sort client-side by date desc
+  // Sort client-side by date desc (support both old submissionDate and new submittedAt)
   allDocuments.sort((a, b) => {
-    const da = a.submissionDate?.toMillis?.() || 0;
-    const db2 = b.submissionDate?.toMillis?.() || 0;
+    const da = (a.submittedAt || a.submissionDate)?.toMillis?.() || 0;
+    const db2 = (b.submittedAt || b.submissionDate)?.toMillis?.() || 0;
     return db2 - da;
   });
 
@@ -1171,9 +1171,9 @@ function renderDocTable(docs) {
       <td>${d.plantName || "—"}</td>
       <td>${d.departmentName || "—"}</td>
       <td>${d.submittedByName || "—"}</td>
-      <td>${toIST(d.submissionDate)}</td>
+      <td>${toIST(d.submittedAt || d.submissionDate)}</td>
       <td class="fw-semibold">${d.officialDocNumber || "—"}</td>
-      <td>${d.dmsUploadDate || "—"}</td>
+      <td>${d.assignmentDate ? toIST(d.assignmentDate) : (d.dmsUploadDate || "—")}</td>
       <td>${statusBadge(d.status)}</td>
       <td style="min-width:260px;padding:4px 8px">${buildHorizontalTimeline(d)}</td>
       <td>
@@ -1227,28 +1227,36 @@ async function loadMyDocuments() {
     // Support both old field (submissionDate) and new field (submittedAt)
     const submittedTs = d.submittedAt || d.submissionDate;
 
-    // DMS assignment date: dmsUploadDate stored as "YYYY-MM-DD"
+    // DMS assignment: use assignmentDate (Firestore Timestamp) for accurate time
     let dmsDateDisplay = "—";
     let dmsDateMs = null;
-    if (d.dmsUploadDate) {
+    if (d.assignmentDate) {
+      const parsed = d.assignmentDate.toDate ? d.assignmentDate.toDate() : new Date(d.assignmentDate);
+      dmsDateMs = parsed.getTime();
+      dmsDateDisplay = `<span class="small" style="white-space:nowrap">${parsed.toLocaleString("en-IN",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit",timeZone:"Asia/Kolkata"})}</span>`;
+    } else if (d.dmsUploadDate) {
+      // Fallback for old records that only have date string
       const parsed = new Date(d.dmsUploadDate + "T00:00:00+05:30");
       dmsDateMs = parsed.getTime();
       dmsDateDisplay = `<span class="small" style="white-space:nowrap">${parsed.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric",timeZone:"Asia/Kolkata"})}</span>`;
     }
 
-    // Time taken: DMS assigned date − submitted date
+    // Time taken: DMS assigned − submitted (using accurate timestamps)
     let timeTakenDisplay = "—";
     if (dmsDateMs && submittedTs) {
       const submittedMs = submittedTs.toDate ? submittedTs.toDate().getTime() : new Date(submittedTs).getTime();
       const diffMs = dmsDateMs - submittedMs;
       if (diffMs >= 0) {
-        const days  = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-        const hours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-        if (days > 0) {
-          timeTakenDisplay = `<span class="badge bg-${days <= 3 ? "success" : days <= 7 ? "warning" : "danger"} text-white" style="font-size:0.72rem;">${days}d ${hours}h</span>`;
-        } else {
-          timeTakenDisplay = `<span class="badge bg-success text-white" style="font-size:0.72rem;">${hours}h</span>`;
-        }
+        const totalMins = Math.floor(diffMs / 60000);
+        const days  = Math.floor(totalMins / (60 * 24));
+        const hours = Math.floor((totalMins % (60 * 24)) / 60);
+        const mins  = totalMins % 60;
+        let label = "";
+        if (days > 0)       label = `${days}d ${hours}h`;
+        else if (hours > 0) label = `${hours}h ${mins}m`;
+        else                label = `${mins}m`;
+        const color = days <= 3 ? "success" : days <= 7 ? "warning" : "danger";
+        timeTakenDisplay = `<span class="badge bg-${color} text-white" style="font-size:0.72rem;" title="Assigned: ${new Date(dmsDateMs).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})}&#10;Submitted: ${submittedTs.toDate ? submittedTs.toDate().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : '—'}">${label}</span>`;
       }
     }
 
@@ -1308,25 +1316,32 @@ function buildHorizontalTimeline(d) {
     return true;
   });
 
-  const currentIdx = steps.findIndex(s => s.key === d.status);
+  // Map terminal statuses to the last step
+  const statusForIdx = ["number_assigned","closed"].includes(d.status) ? "completed" : d.status;
+  const currentIdx = steps.findIndex(s => s.key === statusForIdx);
+  const effectiveIdx = currentIdx === -1 ? steps.length - 1 : currentIdx;
   const n = steps.length;
 
   // ── Render: one wrapper with two rows stacked ──
   // Row 1: [half-line] [circle] [half-line] ... repeated — all in one flex row
   // Row 2: labels — same flex widths so they align under circles
 
+  // "completed" is a terminal/final status — treat ALL steps as done, not "current"
+  const isFullyComplete = ["completed","number_assigned","closed"].includes(d.status);
+
   const circlesRow = steps.map((step, idx) => {
     const hit       = histMap[step.key];
-    const isCurrent = step.key === d.status;
-    const isDone    = !!hit && !isCurrent;
+    // For completed docs: every step is "done" (green check)
+    const isCurrent = !isFullyComplete && step.key === d.status;
+    const isDone    = isFullyComplete ? idx <= effectiveIdx : (!!hit && !isCurrent);
     const circleClass = isDone ? "done" : isCurrent ? "current" : "future";
     const inner = isDone
       ? `<i class="bi bi-check-lg"></i>`
       : isCurrent
         ? `<i class="bi bi-play-fill" style="margin-left:1px"></i>`
         : `${idx + 1}`;
-    const leftColor  = idx === 0   ? "transparent" : idx <= currentIdx ? "#22c55e" : "#cbd5e1";
-    const rightColor = idx === n-1 ? "transparent" : idx <  currentIdx ? "#22c55e" : "#cbd5e1";
+    const leftColor  = idx === 0   ? "transparent" : idx <= effectiveIdx ? "#22c55e" : "#cbd5e1";
+    const rightColor = idx === n-1 ? "transparent" : idx <  effectiveIdx ? "#22c55e" : "#cbd5e1";
     return `
       <div class="doc-hstep">
         <div class="doc-hstep-track">
@@ -1339,8 +1354,8 @@ function buildHorizontalTimeline(d) {
 
   const labelsRow = steps.map((step, idx) => {
     const hit       = histMap[step.key];
-    const isCurrent = step.key === d.status;
-    const isDone    = !!hit && !isCurrent;
+    const isCurrent = !isFullyComplete && step.key === d.status;
+    const isDone    = isFullyComplete ? idx <= effectiveIdx : (!!hit && !isCurrent);
     const labelClass = isDone ? "done" : isCurrent ? "current" : "";
     const name = hit?.changedByName ? hit.changedByName.split(" ")[0] : "";
     return `
@@ -1626,6 +1641,7 @@ document.getElementById("confirmAssignBtn").addEventListener("click", async () =
     dmsUploadDate:     document.getElementById("dmsDate").value,
     dmsUploadTime:     document.getElementById("dmsTime").value,
     remarks:           document.getElementById("dmsRemarks").value,
+    dmsAssignedAt:     new Date().toISOString(),   // ISO string for accurate time-taken calc
   };
 
   // Close modal right away so user isn't blocked
@@ -1797,7 +1813,11 @@ async function loadMRQueue(searchText = "") {
   if (plantId) docs = docs.filter(d => d.plantId === plantId);
   if (deptId)  docs = docs.filter(d => d.departmentId === deptId);
   if (catId)   docs = docs.filter(d => d.categoryId === catId);
-  docs.sort((a,b) => (b.submissionDate?.toMillis?.() || 0) - (a.submissionDate?.toMillis?.() || 0));
+  docs.sort((a,b) => {
+    const ta = (a.submittedAt || a.submissionDate)?.toMillis?.() || 0;
+    const tb = (b.submittedAt || b.submissionDate)?.toMillis?.() || 0;
+    return tb - ta;
+  });
 
   if (srch) {
     const q = srch.toLowerCase();
@@ -1815,13 +1835,15 @@ async function loadMRQueue(searchText = "") {
     return;
   }
 
-  tbody.innerHTML = docs.map(d => `
+  tbody.innerHTML = docs.map(d => {
+    const submittedTs = d.submittedAt || d.submissionDate;
+    return `
     <tr>
       <td class="fw-semibold text-primary" style="white-space:nowrap">${d.submissionRefNo || "—"}</td>
       <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.documentTitle || "—"}</td>
       <td><span class="small">${d.plantName || "—"}<br><span class="text-muted">${d.departmentName || ""}</span></span></td>
       <td>${d.submittedByName || "—"}</td>
-      <td><span class="small" style="white-space:nowrap">${toIST(d.submissionDate)}</span></td>
+      <td><span class="small" style="white-space:nowrap">${toIST(submittedTs)}</span></td>
       <td class="fw-semibold text-success" style="white-space:nowrap">${d.officialDocNumber || "—"}</td>
       <td>${statusBadge(d.status)}</td>
       <td style="min-width:260px;padding:4px 8px">${buildHorizontalTimeline(d)}</td>
@@ -1835,8 +1857,8 @@ async function loadMRQueue(searchText = "") {
             <button class="btn-act-return return-btn" data-id="${d.id}" title="Return for Correction"><i class="bi bi-arrow-return-left"></i></button>` : ""}
         </div>
       </td>
-    </tr>
-  `).join("");
+    </tr>`;
+  }).join("");
 
   tbody.querySelectorAll(".view-doc-btn").forEach(b =>
     b.addEventListener("click", () => openDocModal(b.dataset.id)));
