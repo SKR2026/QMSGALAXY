@@ -722,7 +722,6 @@ function setupSidebar() {
   // Restore collapsed state from localStorage
   if (localStorage.getItem("sidebarCollapsed") === "true") {
     sidebar.classList.add("collapsed");
-    main.classList.add("full-width");
   }
 
   document.getElementById("menuToggle").addEventListener("click", () => {
@@ -732,9 +731,7 @@ function setupSidebar() {
 
   document.getElementById("sidebarToggle").addEventListener("click", () => {
     const isCollapsed = sidebar.classList.toggle("collapsed");
-    main.classList.toggle("full-width", isCollapsed);
-    localStorage.setItem("sidebarCollapsed", isCollapsed);
-    // Update tooltip on toggle button
+    localStorage.setItem("sidebarCollapsed", String(isCollapsed));
     document.getElementById("sidebarToggle").title = isCollapsed ? "Expand sidebar" : "Collapse sidebar";
   });
 
@@ -999,12 +996,20 @@ function buildChart(canvasId, type, labels, data, label, colors) {
     options: {
       responsive: true,
       maintainAspectRatio: true,
-      plugins: { legend: { display: type !== "bar", position: "bottom",
-        labels: { boxWidth: 10, font: { size: 11 } } } },
+      layout: { padding: { top: 2, bottom: 2 } },
+      plugins: {
+        legend: {
+          display: type !== "bar",
+          position: "bottom",
+          labels: { boxWidth: 8, boxHeight: 8, font: { size: 10 }, padding: 8 }
+        },
+        tooltip: { bodyFont: { size: 11 }, titleFont: { size: 11 } }
+      },
       scales: type !== "doughnut" ? {
-        x: { ticks: { font: { size: 11 } }, grid: { display: false } },
-        y: { ticks: { font: { size: 11 }, stepSize: 1 }, beginAtZero: true }
-      } : {}
+        x: { ticks: { font: { size: 10 }, maxRotation: 30 }, grid: { display: false } },
+        y: { ticks: { font: { size: 10 }, stepSize: 1 }, beginAtZero: true, grid: { color: "#f1f5f9" } }
+      } : {},
+      cutout: type === "doughnut" ? "60%" : undefined
     }
   });
 }
