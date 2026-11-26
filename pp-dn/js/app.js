@@ -746,13 +746,8 @@ const SIDEBAR_FULL = 260;   // matches --sidebar-width in styles.css
 const SIDEBAR_MINI = 56;    // icon-strip width
 
 function applySidebarLayout(collapsed) {
-  const main = document.getElementById("mainContent");
-  if (!main) return;
-  // Sidebar is position:fixed so only margin-left is needed.
-  // width:auto (set in CSS) lets the content fill remaining space naturally.
-  const margin = collapsed ? SIDEBAR_MINI : SIDEBAR_FULL;
-  main.style.marginLeft = margin + "px";
-  main.style.width = `calc(100vw - ${margin}px)`;
+  // styles.css now handles margin-left and width via the sibling selector.
+  // No inline styles needed — CSS transitions handle the animation.
 }
 
 function setupSidebar() {
@@ -1051,8 +1046,7 @@ function buildChart(canvasId, type, labels, data, label, colors) {
     },
     options: {
       responsive: true,
-      maintainAspectRatio: type === "doughnut" ? true : false,
-      aspectRatio: type === "doughnut" ? 1.4 : undefined,
+      maintainAspectRatio: false,
       layout: { padding: { top: 2, bottom: 2 } },
       plugins: {
         legend: {
