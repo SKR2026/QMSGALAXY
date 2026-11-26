@@ -2898,7 +2898,7 @@ async function loadPlantsTable() {
     `, async () => {
       const name = document.getElementById("gm_plantName").value.trim();
       const code = document.getElementById("gm_plantCode").value.trim();
-      if (!name) return;
+      if (!name) throw new Error("Plant name is required.");
       await updateDoc(doc(db, "plants", b.dataset.id), { name, code });
       loadPlantsTable(); loadMasterData();
     });
@@ -2930,10 +2930,9 @@ async function loadPlantsTable() {
     `, async () => {
       const name = document.getElementById("gm_plantName").value.trim();
       const code = document.getElementById("gm_plantCode").value.trim();
-      if (!name) return;
-      // Check duplicate
+      if (!name) throw new Error("Plant name is required.");
       const existing = await getDocs(query(collection(db, "plants"), where("name", "==", name)));
-      if (!existing.empty) { showToast("Plant already exists.", "error"); return; }
+      if (!existing.empty) throw new Error("Plant already exists.");
       await addDoc(collection(db, "plants"), { name, code, active: true, createdAt: serverTimestamp() });
       loadPlantsTable(); loadMasterData();
     });
@@ -2976,7 +2975,7 @@ async function loadDeptsTable() {
     `, async () => {
       const name = document.getElementById("gm_deptName").value.trim();
       const pSel = document.getElementById("gm_deptPlant");
-      if (!name) return;
+      if (!name) throw new Error("Department name is required.");
       await updateDoc(doc(db, "departments", b.dataset.id), {
         name,
         plantId: pSel.value || null,
@@ -3010,9 +3009,9 @@ async function loadDeptsTable() {
       const pSel = document.getElementById("gm_deptPlant");
       const plantId2 = pSel.value;
       const plantName2 = pSel.options[pSel.selectedIndex]?.dataset.name || "";
-      if (!name) return;
+      if (!name) throw new Error("Department name is required.");
       const existing = await getDocs(query(collection(db, "departments"), where("name", "==", name)));
-      if (!existing.empty) { showToast("Department already exists.", "error"); return; }
+      if (!existing.empty) throw new Error("Department already exists.");
       await addDoc(collection(db, "departments"), { name, plantId: plantId2, plantName: plantName2, active: true, createdAt: serverTimestamp() });
       loadDeptsTable(); loadMasterData();
     });
@@ -3024,6 +3023,10 @@ async function loadUsersTable() {
   const snap = await getDocs(collection(db, "users"));
   const usersAll = snap.docs.map(d => ({ id: d.id, ...d.data() }));
   const tbody = document.getElementById("usersBody");
+  // Store user objects by id for safe access in event handlers (avoids HTML attribute escaping issues)
+  const usersMap = {};
+  usersAll.forEach(u => { usersMap[u.id] = u; });
+
   tbody.innerHTML = usersAll.map(u => `
     <tr>
       <td>${u.displayName || "—"}</td>
@@ -3033,13 +3036,10 @@ async function loadUsersTable() {
       <td>${u.departmentName || "—"}</td>
       <td>${u.active ? `<span class="badge bg-success">Active</span>` : `<span class="badge bg-secondary">Inactive</span>`}</td>
       <td>
-        <button class="btn btn-sm btn-outline-primary edit-user"
-          data-id="${u.id}" data-name="${u.displayName||""}" data-role="${u.role||""}"
-          data-plantid="${u.plantId||""}" data-plantname="${u.plantName||""}"
-          data-deptid="${u.departmentId||""}" data-deptname="${u.departmentName||""}">Edit</button>
+        <button class="btn btn-sm btn-outline-primary edit-user" data-id="${u.id}">Edit</button>
         <button class="btn btn-sm btn-outline-${u.active ? "danger" : "success"} toggle-user"
           data-id="${u.id}" data-active="${u.active}">${u.active ? "Deactivate" : "Activate"}</button>
-        <button class="btn btn-sm btn-outline-danger delete-user" data-id="${u.id}" data-name="${u.displayName||u.email}">Delete</button>
+        <button class="btn btn-sm btn-outline-danger delete-user" data-id="${u.id}">Delete</button>
       </td>
     </tr>
   `).join("") || `<tr><td colspan="7" class="text-center text-muted">No users yet.</td></tr>`;
@@ -3050,20 +3050,22 @@ async function loadUsersTable() {
   }));
 
   tbody.querySelectorAll(".edit-user").forEach(b => b.addEventListener("click", () => {
+    const u = usersMap[b.dataset.id];
+    if (!u) return;
     const plantOptions = plants.map(p =>
-      `<option value="${p.id}" data-name="${p.name}" ${p.id === b.dataset.plantid ? "selected" : ""}>${p.name}</option>`
+      `<option value="${p.id}" data-name="${p.name}" ${p.id === (u.plantId||"") ? "selected" : ""}>${p.name}</option>`
     ).join("");
     const deptOptions = departments.map(d =>
-      `<option value="${d.id}" data-name="${d.name}" ${d.id === b.dataset.deptid ? "selected" : ""}>${d.name}</option>`
+      `<option value="${d.id}" data-name="${d.name}" ${d.id === (u.departmentId||"") ? "selected" : ""}>${d.name}</option>`
     ).join("");
     showGenericModal("Edit User", `
       <div class="mb-3"><label class="form-label fw-semibold">Full Name *</label>
-        <input type="text" id="gm_userName" class="form-control" value="${b.dataset.name}" /></div>
+        <input type="text" id="gm_userName" class="form-control" value="${(u.displayName||"").replace(/"/g,"&quot;")}" /></div>
       <div class="mb-3"><label class="form-label fw-semibold">Role *</label>
         <select id="gm_userRole" class="form-select">
-          <option value="user" ${b.dataset.role==="user"?"selected":""}>Plant / Department User</option>
-          <option value="corporate_mr" ${b.dataset.role==="corporate_mr"?"selected":""}>Corporate MR</option>
-          <option value="superadmin" ${b.dataset.role==="superadmin"?"selected":""}>Superadmin</option>
+          <option value="user" ${u.role==="user"?"selected":""}>Plant / Department User</option>
+          <option value="corporate_mr" ${u.role==="corporate_mr"?"selected":""}>Corporate MR</option>
+          <option value="superadmin" ${u.role==="superadmin"?"selected":""}>Superadmin</option>
         </select></div>
       <div class="mb-3"><label class="form-label">Plant</label>
         <select id="gm_userPlant" class="form-select"><option value="">None</option>${plantOptions}</select></div>
@@ -3074,8 +3076,8 @@ async function loadUsersTable() {
       const role = document.getElementById("gm_userRole").value;
       const pSel = document.getElementById("gm_userPlant");
       const dSel = document.getElementById("gm_userDept");
-      if (!displayName) { showToast("Name is required.", "error"); return; }
-      await updateDoc(doc(db, "users", b.dataset.id), {
+      if (!displayName) throw new Error("Name is required.");
+      await updateDoc(doc(db, "users", u.id), {
         displayName, role,
         plantId:        pSel.value || null,
         plantName:      pSel.options[pSel.selectedIndex]?.dataset.name || "",
@@ -3088,11 +3090,13 @@ async function loadUsersTable() {
   }));
 
   tbody.querySelectorAll(".delete-user").forEach(b => b.addEventListener("click", () => {
+    const u = usersMap[b.dataset.id];
+    if (!u) return;
     showGenericModal("Delete User",
-      `<p>Are you sure you want to delete user <strong>${b.dataset.name}</strong>?</p>
+      `<p>Are you sure you want to delete user <strong>${u.displayName || u.email}</strong>?</p>
        <p class="text-danger small">This removes the user from CDRTS. Their submitted documents will remain. Firebase Auth account is not deleted automatically.</p>`,
       async () => {
-        await deleteDoc(doc(db, "users", b.dataset.id));
+        await deleteDoc(doc(db, "users", u.id));
         loadUsersTable();
         showToast("User deleted from CDRTS.", "success");
       }, "Delete", "btn-danger");
@@ -3125,7 +3129,7 @@ async function loadUsersTable() {
       const role = document.getElementById("gm_userRole").value;
       const pSel = document.getElementById("gm_userPlant");
       const dSel = document.getElementById("gm_userDept");
-      if (!displayName || !email || !password) { showToast("Fill all required fields.", "error"); return; }
+      if (!displayName || !email || !password) throw new Error("Fill all required fields (Name, Email, Password).");
 
       const plantId   = pSel.value;
       const plantName = pSel.options[pSel.selectedIndex]?.dataset.name || "";
@@ -3209,7 +3213,7 @@ async function loadCatsTable() {
     `, async () => {
       const name = document.getElementById("gm_catName").value.trim();
       const desc = document.getElementById("gm_catDesc").value.trim();
-      if (!name) return;
+      if (!name) throw new Error("Category name is required.");
       await updateDoc(doc(db, "documentCategories", b.dataset.id), { name, description: desc });
       loadCatsTable(); loadMasterData();
       showToast("Category updated.", "success");
@@ -3236,11 +3240,12 @@ async function loadCatsTable() {
     `, async () => {
       const name = document.getElementById("gm_catName").value.trim();
       const desc = document.getElementById("gm_catDesc").value.trim();
-      if (!name) return;
+      if (!name) throw new Error("Category name is required.");
       const existing = await getDocs(query(collection(db, "documentCategories"), where("name", "==", name)));
-      if (!existing.empty) { showToast("Category already exists.", "error"); return; }
+      if (!existing.empty) throw new Error("Category already exists.");
       await addDoc(collection(db, "documentCategories"), { name, description: desc, active: true, createdAt: serverTimestamp() });
       loadCatsTable(); loadMasterData();
+      showToast("Category added.", "success");
     });
   };
 }
@@ -3255,23 +3260,29 @@ function showGenericModal(title, bodyHtml, onSave, saveLabel = "Save", saveCls =
   const modal = new bootstrap.Modal(document.getElementById("genericModal"));
   modal.show();
 
+  // Clone first to strip old listeners
   const saveBtn = document.getElementById("genericModalSave");
-  saveBtn.textContent = saveLabel;
-  // Swap button colour class
-  saveBtn.className = saveBtn.className.replace(/btn-\w+/, saveCls);
-
   const newSave = saveBtn.cloneNode(true);
   saveBtn.parentNode.replaceChild(newSave, saveBtn);
 
+  // Update label — find/set only the text node so the spinner <span> is preserved
+  const spinnerSpan = newSave.querySelector("span");
+  // Clear text nodes then re-add label after spinner
+  Array.from(newSave.childNodes).forEach(n => { if (n.nodeType === Node.TEXT_NODE) n.remove(); });
+  newSave.appendChild(document.createTextNode(saveLabel));
+
+  // Replace only the colour class (btn-primary / btn-danger / btn-success etc.)
+  newSave.className = newSave.className.replace(/\bbtn-(primary|secondary|danger|success|warning|info)\b/, saveCls);
+
   newSave.addEventListener("click", async () => {
-    document.getElementById("genericSpinner").classList.remove("d-none");
+    if (spinnerSpan) spinnerSpan.classList.remove("d-none");
     try {
       await onSave();
       modal.hide();
     } catch (e) {
       showToast(e.message || "Save failed.", "error");
     } finally {
-      document.getElementById("genericSpinner").classList.add("d-none");
+      if (spinnerSpan) spinnerSpan.classList.add("d-none");
     }
   });
 }
