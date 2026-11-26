@@ -1174,18 +1174,12 @@ function renderDocTable(docs) {
       <td style="min-width:260px;padding:4px 8px">${buildHorizontalTimeline(d)}</td>
       <td>
         <div class="action-btns">
-          <button class="btn btn-sm btn-outline-primary view-doc-btn" data-id="${d.id}" title="View">
-            <i class="bi bi-eye"></i>
-          </button>
-          ${d.fileUrl ? `<a class="btn btn-sm btn-outline-secondary" href="${d.fileUrl}" target="_blank" title="Download">
-            <i class="bi bi-download"></i></a>` : ""}
+          <button class="btn-act-view view-doc-btn" data-id="${d.id}" title="View Details"><i class="bi bi-eye"></i></button>
+          ${d.fileUrl ? `<a class="btn-act-open" href="${d.fileUrl}" target="_blank" title="Open Document"><i class="bi bi-box-arrow-up-right"></i></a>` : ""}
+          ${d.fileUrl ? `<a class="btn-act-dl" href="${d.fileUrl}" download title="Download"><i class="bi bi-download"></i></a>` : ""}
           ${(isCorporateMR() || isSuperadmin()) && ["submitted","pending_with_mr","under_process","resubmitted"].includes(d.status) ? `
-            <button class="btn btn-sm btn-outline-success assign-btn" data-id="${d.id}" title="Assign Number">
-              <i class="bi bi-hash"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-warning return-btn" data-id="${d.id}" title="Return">
-              <i class="bi bi-arrow-return-left"></i>
-            </button>` : ""}
+            <button class="btn-act-assign assign-btn" data-id="${d.id}" title="Assign DMS Number"><i class="bi bi-hash"></i></button>
+            <button class="btn-act-return return-btn" data-id="${d.id}" title="Return for Correction"><i class="bi bi-arrow-return-left"></i></button>` : ""}
         </div>
       </td>
     </tr>
@@ -1236,12 +1230,11 @@ async function loadMyDocuments() {
       <td style="min-width:280px;padding:6px 10px">${buildHorizontalTimeline(d)}</td>
       <td>
         <div class="action-btns">
-          <button class="btn btn-sm btn-outline-primary view-doc-btn" data-id="${d.id}"><i class="bi bi-eye"></i></button>
-          ${d.fileUrl ? `<a class="btn btn-sm btn-outline-secondary" href="${d.fileUrl}" target="_blank"><i class="bi bi-download"></i></a>` : ""}
+          <button class="btn-act-view view-doc-btn" data-id="${d.id}" title="View Details"><i class="bi bi-eye"></i></button>
+          ${d.fileUrl ? `<a class="btn-act-open" href="${d.fileUrl}" target="_blank" title="Open Document"><i class="bi bi-box-arrow-up-right"></i></a>` : ""}
+          ${d.fileUrl ? `<a class="btn-act-dl" href="${d.fileUrl}" download title="Download"><i class="bi bi-download"></i></a>` : ""}
           ${["draft","returned_for_correction"].includes(d.status) ? `
-            <button class="btn btn-sm btn-warning edit-doc-btn" data-id="${d.id}">
-              <i class="bi bi-pencil"></i> Edit
-            </button>` : ""}
+            <button class="btn-act-edit edit-doc-btn" data-id="${d.id}" title="Edit"><i class="bi bi-pencil"></i></button>` : ""}
         </div>
       </td>
     </tr>
@@ -1686,15 +1679,12 @@ async function loadMRQueue(searchText = "") {
       <td style="min-width:260px;padding:4px 8px">${buildHorizontalTimeline(d)}</td>
       <td>
         <div class="action-btns">
-          <button class="btn btn-sm btn-outline-primary view-doc-btn" data-id="${d.id}"><i class="bi bi-eye"></i></button>
-          ${d.fileUrl ? `<a class="btn btn-sm btn-outline-secondary" href="${d.fileUrl}" target="_blank"><i class="bi bi-download"></i></a>` : ""}
+          <button class="btn-act-view view-doc-btn" data-id="${d.id}" title="View Details"><i class="bi bi-eye"></i></button>
+          ${d.fileUrl ? `<a class="btn-act-open" href="${d.fileUrl}" target="_blank" title="Open Document"><i class="bi bi-box-arrow-up-right"></i></a>` : ""}
+          ${d.fileUrl ? `<a class="btn-act-dl" href="${d.fileUrl}" download title="Download"><i class="bi bi-download"></i></a>` : ""}
           ${["submitted","pending_with_mr","under_process","resubmitted"].includes(d.status) ? `
-            <button class="btn btn-sm btn-success assign-btn" data-id="${d.id}">
-              <i class="bi bi-hash"></i> Assign
-            </button>
-            <button class="btn btn-sm btn-warning return-btn" data-id="${d.id}">
-              <i class="bi bi-arrow-return-left"></i>
-            </button>` : ""}
+            <button class="btn-act-assign assign-btn" data-id="${d.id}" title="Assign DMS Number"><i class="bi bi-hash"></i></button>
+            <button class="btn-act-return return-btn" data-id="${d.id}" title="Return for Correction"><i class="bi bi-arrow-return-left"></i></button>` : ""}
         </div>
       </td>
     </tr>
