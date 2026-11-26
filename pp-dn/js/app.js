@@ -2643,6 +2643,8 @@ function setupDangerZone() {
   document.getElementById("runRetentionNowBtn")?.addEventListener("click", runRetentionNow);
   document.getElementById("saveDigestBtn")?.addEventListener("click", saveDigestSettings);
   document.getElementById("sendDigestNowBtn")?.addEventListener("click", sendDigestNow);
+  document.getElementById("fillDummyDataBtn")?.addEventListener("click", fillDummyDigestData);
+  document.getElementById("clearDummyDataBtn")?.addEventListener("click", clearDummyDigestData);
 }
 
 // ─── DAILY DIGEST SETTINGS ───────────────────────────────────────────────
@@ -2704,6 +2706,92 @@ async function sendDigestNow() {
     if (spin) spin.classList.add("d-none");
     if (btn) btn.disabled = false;
   }
+}
+
+const DUMMY_DIGEST_TAG = "__digestTest__";
+
+async function fillDummyDigestData() {
+  const msgEl = document.getElementById("digestMsg");
+  const btn = document.getElementById("fillDummyDataBtn");
+  btn.disabled = true;
+  try {
+    const now = new Date();
+    const batch = writeBatch(db);
+    const dummyDocs = [
+      {
+        submissionRefNo: "TEST-001", documentTitle: "Welding Procedure Rev 3",
+        plantName: "YNR", plantId: "test-plant-1",
+        categoryName: "SOP", departmentName: "ENG",
+        submittedBy: currentUser.uid, submittedByName: currentUserData?.displayName || "Test User",
+        submittedByEmail: currentUser.email,
+        submissionDate: serverTimestamp(),
+        numberAssignedAt: serverTimestamp(),
+        officialDocNumber: "CORP-2026-045",
+        status: "completed", tag: DUMMY_DIGEST_TAG,
+      },
+      {
+        submissionRefNo: "TEST-002", documentTitle: "ISO Inspection Checklist",
+        plantName: "ENG", plantId: "test-plant-2",
+        categoryName: "ISO", departmentName: "QC",
+        submittedBy: currentUser.uid, submittedByName: currentUserData?.displayName || "Test User",
+        submittedByEmail: currentUser.email,
+        submissionDate: serverTimestamp(),
+        status: "submitted", tag: DUMMY_DIGEST_TAG,
+      },
+      {
+        submissionRefNo: "TEST-003", documentTitle: "Safety Training Manual",
+        plantName: "YNR", plantId: "test-plant-1",
+        categoryName: "Training", departmentName: "HR",
+        submittedBy: currentUser.uid, submittedByName: currentUserData?.displayName || "Test User",
+        submittedByEmail: currentUser.email,
+        submissionDate: Timestamp.fromDate(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)),
+        status: "under_process", tag: DUMMY_DIGEST_TAG,
+      },
+      {
+        submissionRefNo: "TEST-004", documentTitle: "Quality Control Procedure",
+        plantName: "ENG", plantId: "test-plant-2",
+        categoryName: "QC", departmentName: "QC",
+        submittedBy: currentUser.uid, submittedByName: currentUserData?.displayName || "Test User",
+        submittedByEmail: currentUser.email,
+        submissionDate: Timestamp.fromDate(new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000)),
+        status: "pending_with_mr", tag: DUMMY_DIGEST_TAG,
+      },
+    ];
+    dummyDocs.forEach(d => batch.set(doc(collection(db, "documents")), d));
+    await batch.commit();
+    msgEl.className = "alert alert-success mt-3";
+    msgEl.textContent = "4 test documents added. Click Send Now (Test) to preview the digest.";
+    msgEl.classList.remove("d-none");
+  } catch(e) {
+    msgEl.className = "alert alert-danger mt-3";
+    msgEl.textContent = "Failed: " + e.message;
+    msgEl.classList.remove("d-none");
+  } finally { btn.disabled = false; }
+}
+
+async function clearDummyDigestData() {
+  const msgEl = document.getElementById("digestMsg");
+  const btn = document.getElementById("clearDummyDataBtn");
+  btn.disabled = true;
+  try {
+    const snap = await getDocs(query(collection(db, "documents"), where("tag", "==", DUMMY_DIGEST_TAG)));
+    if (snap.empty) {
+      msgEl.className = "alert alert-warning mt-3";
+      msgEl.textContent = "No test documents found to clear.";
+      msgEl.classList.remove("d-none");
+      return;
+    }
+    const batch = writeBatch(db);
+    snap.docs.forEach(d => batch.delete(d.ref));
+    await batch.commit();
+    msgEl.className = "alert alert-success mt-3";
+    msgEl.textContent = `${snap.size} test document(s) cleared.`;
+    msgEl.classList.remove("d-none");
+  } catch(e) {
+    msgEl.className = "alert alert-danger mt-3";
+    msgEl.textContent = "Failed: " + e.message;
+    msgEl.classList.remove("d-none");
+  } finally { btn.disabled = false; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
