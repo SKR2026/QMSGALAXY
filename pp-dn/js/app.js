@@ -717,6 +717,7 @@ function setupNavigation() {
       cb.checked = e.target.checked;
       e.target.checked ? selectedDocIds.add(cb.dataset.id) : selectedDocIds.delete(cb.dataset.id);
     });
+    updateSelectionUI();
   });
 
   // Export Excel
@@ -744,6 +745,29 @@ function setupNavigation() {
 
 const SIDEBAR_FULL = 260;   // matches --sidebar-width in styles.css
 const SIDEBAR_MINI = 56;    // icon-strip width
+
+function updateSelectionUI() {
+  const count = selectedDocIds.size;
+  const badge = document.getElementById("selectedCountBadge");
+  const deleteBtn = document.getElementById("deleteSelectedBtn");
+  if (badge) {
+    if (count > 0) {
+      badge.textContent = count;
+      badge.style.setProperty("display", "inline-block", "important");
+    } else {
+      badge.style.setProperty("display", "none", "important");
+    }
+  }
+  // Also update Select All button label
+  const selectAllBtn = document.getElementById("selectAllBtn");
+  if (selectAllBtn) {
+    const total = document.querySelectorAll(".row-checkbox").length;
+    const allSelected = count > 0 && count === total;
+    selectAllBtn.innerHTML = allSelected
+      ? `<i class="bi bi-x-square"></i> Deselect All`
+      : `<i class="bi bi-check-all"></i> Select All <span style="font-size:11px;opacity:0.7;">${count > 0 ? "("+count+" selected)" : ""}</span>`;
+  }
+}
 
 function applySidebarLayout(collapsed) {
   // styles.css now handles margin-left and width via the sibling selector.
@@ -1167,6 +1191,7 @@ function renderDocTable(docs) {
   tbody.querySelectorAll(".row-checkbox").forEach(cb =>
     cb.addEventListener("change", e => {
       e.target.checked ? selectedDocIds.add(cb.dataset.id) : selectedDocIds.delete(cb.dataset.id);
+      updateSelectionUI();
     }));
 }
 
@@ -1959,6 +1984,7 @@ async function handleDeleteRecords() {
     showToast(`${result.data.count} record(s) archived successfully.`, "success");
     selectedDocIds.clear();
     document.getElementById("masterCheckbox").checked = false;
+    updateSelectionUI();
     loadDashboard();
   } catch (e) {
     showError("deleteError", e.message);
