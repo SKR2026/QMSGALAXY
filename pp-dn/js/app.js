@@ -582,9 +582,9 @@ function buildSidebar() {
     nav.appendChild(badge);
   }
 
-  // Send Notification button (users only)
+  // Send Notification button (users + corporate MR)
   const sendNotifBtn = document.getElementById("sendNotifBtn");
-  if (isUser()) {
+  if (isUser() || isCorporateMR() || isSuperadmin()) {
     sendNotifBtn.classList.remove("d-none");
   }
 
@@ -2032,11 +2032,15 @@ function setupSendNotification() {
     try {
       const res = await notifFn();
       if (res.data.success) {
-        showToast(`Reminder sent to Corporate MR for ${res.data.count} document(s).`, "success");
+        const isMR = currentUserData?.role === "corporate_mr" || currentUserData?.role === "superadmin";
+        const msg = isMR
+          ? `DMS assignment summary sent to ${res.data.emailsSent} submitter(s) for ${res.data.count} document(s).`
+          : `Reminder sent to Corporate MR for ${res.data.count} document(s).`;
+        showToast(msg, "success");
         lastEl.textContent = `Last sent: ${nowIST()}`;
         lastEl.classList.remove("d-none");
       } else {
-        showToast(res.data.message || "No pending documents.", "info");
+        showToast(res.data.message || "No documents found.", "info");
       }
     } catch (e) {
       showToast(e.message || "Failed to send notification.", "error");

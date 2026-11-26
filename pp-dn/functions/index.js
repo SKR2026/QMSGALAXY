@@ -253,62 +253,163 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
     }
   }
 
-  const pendingStatuses = ["submitted", "pending_with_mr", "under_process", "resubmitted"];
-  const docsSnap = await db.collection("documents")
-    .where("submittedBy", "==", uid)
-    .where("status", "in", pendingStatuses)
-    .get();
+  const isMR = user.role === "corporate_mr" || user.role === "superadmin";
 
-  if (docsSnap.empty) return { success: false, message: "No pending documents found." };
+  if (isMR) {
+    // ── Corporate MR / Superadmin ────────────────────────────────────────────
+    // Fetch all completed docs (DMS number assigned).
+    // Group by submitter and send each submitter (+ plant MR) a personal email
+    // listing their document(s) with the assigned DMS numbers.
+    const completedSnap = await db.collection("documents")
+      .where("status", "in", ["completed", "number_assigned"])
+      .get();
 
-  const docs = docsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    if (completedSnap.empty) return { success: false, message: "No completed documents found to notify about." };
 
-  const rows = docs.map((doc) => `
-    <tr>
-      <td>${doc.submissionRefNo || doc.id}</td>
-      <td>${doc.documentTitle || "-"}</td>
-      <td>${doc.categoryName || "-"}</td>
-      <td>${doc.plantName || "-"}</td>
-      <td>${doc.departmentName || "-"}</td>
-      <td>${doc.submissionDate ? new Date(doc.submissionDate.toDate()).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "-"}</td>
-      <td><span class="badge badge-pending">${(doc.status || "").replace(/_/g, " ").toUpperCase()}</span></td>
-    </tr>
-  `).join("");
+    const completedDocs = completedSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-  const html = emailWrapper(
-    "Pending Document Reminder",
-    `<p>Dear Corporate MR,</p>
-     <p><strong>${user.displayName || user.email}</strong> from <strong>${user.plantName || "N/A"}</strong>
-     – <strong>${user.departmentName || "N/A"}</strong> has <strong>${docs.length}</strong> document(s) awaiting your action.</p>
-     <table>
-       <thead><tr><th>Ref. No.</th><th>Document Title</th><th>Category</th><th>Plant</th><th>Department</th><th>Submitted On (IST)</th><th>Status</th></tr></thead>
-       <tbody>${rows}</tbody>
-     </table>
-     <p>Please log in to CDRTS to process the above documents.</p>
-     <a class="btn" href="${settings.appUrl || "https://your-app.web.app"}">Open CDRTS</a>`
-  );
+    // Group docs by submitter uid
+    const bySubmitter = {};
+    completedDocs.forEach((doc) => {
+      const key = doc.submittedBy;
+      if (!bySubmitter[key]) bySubmitter[key] = { name: doc.submittedByName || doc.submittedByEmail || key, email: doc.submittedByEmail, docs: [] };
+      bySubmitter[key].docs.push(doc);
+    });
 
-  const mrEmails = await getCorporateMREmails();
-  if (!mrEmails.length) throw new functions.https.HttpsError("not-found", "No Corporate MR users found.");
+    // Fetch plant MR emails — users with role "user" in same plants
+    // We'll CC plant-level contacts by fetching from users collection grouped by plant
+    const plantMRSnap = await db.collection("users")
+      .where("role", "==", "user")
+      .get();
+    const plantMRByUid = {};
+    plantMRSnap.docs.forEach(d => { plantMRByUid[d.id] = d.data(); });
 
-  await sendEmail(mrEmails.join(","), `[CDRTS] Pending Documents Reminder – ${user.displayName || user.email}`, html);
+    let totalEmailsSent = 0;
+    const appUrl = settings.appUrl || "https://your-app.web.app";
 
-  await db.collection("notificationQueue").add({
-    userId: uid,
-    type:   "user_consolidated",
-    documentIds: docs.map((d) => d.id),
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    status: "sent",
-  });
+    for (const [submitterUid, info] of Object.entries(bySubmitter)) {
+      if (!info.email) continue;
 
-  await logActivity({
-    userId:   uid,
-    userName: user.displayName || user.email,
-    activity: "sent_notification",
-    details:  `Sent consolidated notification for ${docs.length} pending documents`,
-  });
+      const rows = info.docs.map((doc) => `
+        <tr>
+          <td>${doc.submissionRefNo || "-"}</td>
+          <td>${doc.documentTitle || "-"}</td>
+          <td>${doc.categoryName || "-"}</td>
+          <td>${doc.plantName || "-"}</td>
+          <td>${doc.departmentName || "-"}</td>
+          <td><strong>${doc.officialDocNumber || "-"}</strong></td>
+          <td>${doc.assignmentDateIST || "-"}</td>
+        </tr>
+      `).join("");
 
-  return { success: true, count: docs.length };
+      const html = emailWrapper(
+        "DMS Document Numbers Assigned",
+        `<p>Dear ${info.name},</p>
+         <p>Your document(s) have been successfully processed by Corporate MR and official DMS numbers have been assigned.</p>
+         <table>
+           <thead>
+             <tr>
+               <th>Ref. No.</th>
+               <th>Document Title</th>
+               <th>Category</th>
+               <th>Plant</th>
+               <th>Department</th>
+               <th>DMS Number</th>
+               <th>Assigned On (IST)</th>
+             </tr>
+           </thead>
+           <tbody>${rows}</tbody>
+         </table>
+         <p>Please keep these DMS numbers for your records.</p>
+         <a class="btn" href="${appUrl}">View in CDRTS</a>`
+      );
+
+      await sendEmail(
+        info.email,
+        `[CDRTS] DMS Number(s) Assigned – ${info.docs.length} document(s) completed`,
+        html
+      );
+      totalEmailsSent++;
+    }
+
+    await db.collection("notificationQueue").add({
+      userId: uid,
+      type:   "mr_completion_summary",
+      documentIds: completedDocs.map((d) => d.id),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: "sent",
+      recipientCount: totalEmailsSent,
+    });
+
+    await logActivity({
+      userId:   uid,
+      userName: user.displayName || user.email,
+      activity: "sent_completion_notification",
+      details:  `Sent DMS assignment summary to ${totalEmailsSent} submitter(s) covering ${completedDocs.length} document(s)`,
+    });
+
+    return { success: true, count: completedDocs.length, emailsSent: totalEmailsSent };
+
+  } else {
+    // ── Regular user ─────────────────────────────────────────────────────────
+    // Send reminder to Corporate MR about their own pending docs
+    const pendingStatuses = ["submitted", "pending_with_mr", "under_process", "resubmitted"];
+    const docsSnap = await db.collection("documents")
+      .where("submittedBy", "==", uid)
+      .where("status", "in", pendingStatuses)
+      .get();
+
+    if (docsSnap.empty) return { success: false, message: "No pending documents found." };
+
+    const docs = docsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+    const rows = docs.map((doc) => `
+      <tr>
+        <td>${doc.submissionRefNo || doc.id}</td>
+        <td>${doc.documentTitle || "-"}</td>
+        <td>${doc.categoryName || "-"}</td>
+        <td>${doc.plantName || "-"}</td>
+        <td>${doc.departmentName || "-"}</td>
+        <td>${doc.submissionDate ? new Date(doc.submissionDate.toDate()).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "-"}</td>
+        <td><span class="badge badge-pending">${(doc.status || "").replace(/_/g, " ").toUpperCase()}</span></td>
+      </tr>
+    `).join("");
+
+    const html = emailWrapper(
+      "Pending Document Reminder",
+      `<p>Dear Corporate MR,</p>
+       <p><strong>${user.displayName || user.email}</strong> from <strong>${user.plantName || "N/A"}</strong>
+       – <strong>${user.departmentName || "N/A"}</strong> has <strong>${docs.length}</strong> document(s) awaiting your action.</p>
+       <table>
+         <thead><tr><th>Ref. No.</th><th>Document Title</th><th>Category</th><th>Plant</th><th>Department</th><th>Submitted On (IST)</th><th>Status</th></tr></thead>
+         <tbody>${rows}</tbody>
+       </table>
+       <p>Please log in to CDRTS to process the above documents.</p>
+       <a class="btn" href="${settings.appUrl || "https://your-app.web.app"}">Open CDRTS</a>`
+    );
+
+    const mrEmails = await getCorporateMREmails();
+    if (!mrEmails.length) throw new functions.https.HttpsError("not-found", "No Corporate MR users found.");
+
+    await sendEmail(mrEmails.join(","), `[CDRTS] Pending Documents Reminder – ${user.displayName || user.email}`, html);
+
+    await db.collection("notificationQueue").add({
+      userId: uid,
+      type:   "user_consolidated",
+      documentIds: docs.map((d) => d.id),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: "sent",
+    });
+
+    await logActivity({
+      userId:   uid,
+      userName: user.displayName || user.email,
+      activity: "sent_notification",
+      details:  `Sent consolidated notification for ${docs.length} pending documents`,
+    });
+
+    return { success: true, count: docs.length };
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
