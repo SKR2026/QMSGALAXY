@@ -2220,13 +2220,58 @@ async function executeWipe() {
   const spin = document.getElementById("wipeSpinner");
   const btn  = document.getElementById("confirmWipeBtn");
   spin.classList.remove("d-none"); btn.disabled = true;
+
+  // Helper: delete all docs in a Firestore collection in batches (client-side)
+  async function wipeCollection(colName) {
+    let total = 0;
+    while (true) {
+      const snap = await getDocs(query(collection(db, colName), limit(400)));
+      if (snap.empty) break;
+      const batches = [];
+      let b = writeBatch(db);
+      let count = 0;
+      for (const d of snap.docs) {
+        b.delete(d.ref);
+        count++;
+        if (count === 400) { batches.push(b.commit()); b = writeBatch(db); count = 0; }
+      }
+      if (count > 0) batches.push(b.commit());
+      await Promise.all(batches);
+      total += snap.size;
+    }
+    return total;
+  }
+
   try {
-    const fn = httpsCallable(functions, "wipeAppData");
-    const res = await fn({ mode: _wipePendingMode });
+    const mode = _wipePendingMode || "docs";
+
+    // 1. Delete all documents
+    const docsDeleted = await wipeCollection("documents");
+    // 2. Clear activity logs & notification queue
+    await wipeCollection("activityLogs");
+    await wipeCollection("notificationQueue");
+    // 3. Reset ref counter
+    await setDoc(doc(db, "appSettings", "refCounter"), { lastSeq: 0 }, { merge: true });
+    // 4. Full reset: also wipe master data
+    if (mode === "full") {
+      await wipeCollection("plants");
+      await wipeCollection("departments");
+      await wipeCollection("categories");
+      await wipeCollection("documentNumberRegistry");
+    }
+    // 5. Write audit log
+    await addDoc(collection(db, "activityLogs"), {
+      activity:    mode === "full" ? "full_app_reset" : "wipe_documents",
+      performedBy: auth.currentUser.uid,
+      docsDeleted,
+      timestamp:   serverTimestamp(),
+    });
+
     bootstrap.Modal.getInstance(document.getElementById("wipeModal")).hide();
-    showToast(`✅ Wipe complete: ${res.data.deleted ?? 0} docs deleted.`, "success");
+    showToast(`✅ Wipe complete: ${docsDeleted} docs deleted.`, "success");
     loadDashboard();
   } catch(e) {
+    console.error("Wipe error:", e);
     errEl.textContent = "Error: " + (e.message || "Wipe failed.");
     errEl.classList.remove("d-none");
   } finally {
