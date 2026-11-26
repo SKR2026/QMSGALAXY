@@ -2641,6 +2641,67 @@ function setupDangerZone() {
   document.getElementById("confirmWipeBtn")?.addEventListener("click", executeWipe);
   document.getElementById("saveRetentionBtn")?.addEventListener("click", saveRetentionSettings);
   document.getElementById("runRetentionNowBtn")?.addEventListener("click", runRetentionNow);
+  document.getElementById("saveDigestBtn")?.addEventListener("click", saveDigestSettings);
+  document.getElementById("sendDigestNowBtn")?.addEventListener("click", sendDigestNow);
+}
+
+// ─── DAILY DIGEST SETTINGS ───────────────────────────────────────────────
+async function loadDigestSettings() {
+  try {
+    const snap = await getDoc(doc(db, "appSettings", "dailyDigest")).catch(() => null);
+    if (snap?.exists()) {
+      const d = snap.data();
+      const hourEl = document.getElementById("digestHour");
+      if (hourEl && d.hour !== undefined) hourEl.value = String(d.hour);
+      const enabledEl = document.getElementById("digestEnabled");
+      if (enabledEl) enabledEl.checked = d.enabled !== false;
+      const lastEl = document.getElementById("digestLastSent");
+      if (lastEl) {
+        const last = d.lastSentAt?.toDate ? d.lastSentAt.toDate() : null;
+        lastEl.textContent = last ? "Last sent: " + last.toLocaleString("en-IN") : "Never sent";
+      }
+    }
+  } catch(e) { console.warn("loadDigestSettings:", e); }
+}
+
+async function saveDigestSettings() {
+  const hour = parseInt(document.getElementById("digestHour").value);
+  const enabled = document.getElementById("digestEnabled").checked;
+  const msgEl = document.getElementById("digestMsg");
+  try {
+    await setDoc(doc(db, "appSettings", "dailyDigest"), { hour, enabled }, { merge: true });
+    msgEl.className = "alert alert-success mt-3";
+    msgEl.textContent = `Daily digest ${enabled ? "enabled" : "disabled"}. Will send at ${hour}:00 IST.`;
+    msgEl.classList.remove("d-none");
+    setTimeout(() => msgEl.classList.add("d-none"), 4000);
+  } catch(e) {
+    msgEl.className = "alert alert-danger mt-3";
+    msgEl.textContent = "Failed to save: " + e.message;
+    msgEl.classList.remove("d-none");
+  }
+}
+
+async function sendDigestNow() {
+  const spin = document.getElementById("digestSpinner");
+  const btn  = document.getElementById("sendDigestNowBtn");
+  const msgEl = document.getElementById("digestMsg");
+  if (spin) spin.classList.remove("d-none");
+  if (btn) btn.disabled = true;
+  try {
+    const fn = httpsCallable(functions, "sendDailyDigestNow");
+    const result = await fn();
+    msgEl.className = "alert alert-success mt-3";
+    msgEl.textContent = `Digest sent successfully. ${result.data.sent} email(s) dispatched.`;
+    msgEl.classList.remove("d-none");
+    loadDigestSettings();
+  } catch(e) {
+    msgEl.className = "alert alert-danger mt-3";
+    msgEl.textContent = "Failed: " + (e.message || "Unknown error");
+    msgEl.classList.remove("d-none");
+  } finally {
+    if (spin) spin.classList.add("d-none");
+    if (btn) btn.disabled = false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2651,7 +2712,7 @@ async function loadSettings() {
   loadDeptsTable();
   loadUsersTable();
   loadCatsTable();
-  if (isSuperadmin()) loadRetentionSettings();
+  if (isSuperadmin()) { loadRetentionSettings(); loadDigestSettings(); }
 
   // Load saved settings
   const emailSnap = await getDoc(doc(db, "appSettings", "notifications")).catch(() => null);
