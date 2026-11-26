@@ -743,14 +743,12 @@ function setupNavigation() {
   // Confirm delete
   document.getElementById("confirmDeleteBtn").addEventListener("click", handleDeleteRecords);
 
-  // MR filters
+  // MR filters — dropdowns & search filter in-memory instantly (no re-fetch)
   ["mrFilterPlant","mrFilterDept","mrFilterCat","mrFilterStatus"].forEach(id => {
-    document.getElementById(id).addEventListener("change", loadMRQueue);
+    document.getElementById(id).addEventListener("change", renderMRQueue);
   });
 
-  document.getElementById("mrSearch").addEventListener("input", e => {
-    loadMRQueue(e.target.value);
-  });
+  document.getElementById("mrSearch").addEventListener("input", renderMRQueue);
 }
 
 const SIDEBAR_FULL = 260;   // matches --sidebar-width in styles.css
@@ -1811,40 +1809,71 @@ document.getElementById("confirmReuploadBtn")?.addEventListener("click", async (
 // ═══════════════════════════════════════════════════════════════════════════
 // CORPORATE MR QUEUE
 // ═══════════════════════════════════════════════════════════════════════════
+let _mrAllDocs = [];   // cached for in-memory filtering
+
 async function loadMRQueue(searchText = "") {
-  const plantId  = document.getElementById("mrFilterPlant").value;
-  const deptId   = document.getElementById("mrFilterDept").value;
-  const catId    = document.getElementById("mrFilterCat").value;
-  const statusV  = document.getElementById("mrFilterStatus").value;
-  const srch     = typeof searchText === "string" ? searchText : document.getElementById("mrSearch").value;
-
-  // Fetch all non-deleted docs, filter client-side (avoids composite index requirement)
+  // Always re-fetch from Firestore (called on view open or after assign/return)
   const snap = await getDocs(collection(db, "documents"));
-  const PENDING = ["submitted","pending_with_mr","under_process","resubmitted"];
-  let docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-  // Client-side filters
-  if (statusV && statusV !== "all") {
-    docs = docs.filter(d => d.status === statusV);
-  } else {
-    docs = docs.filter(d => PENDING.includes(d.status));
-  }
-  if (plantId) docs = docs.filter(d => d.plantId === plantId);
-  if (deptId)  docs = docs.filter(d => d.departmentId === deptId);
-  if (catId)   docs = docs.filter(d => d.categoryId === catId);
-  docs.sort((a,b) => {
+  _mrAllDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+    .filter(d => d.status !== "deleted");
+  _mrAllDocs.sort((a,b) => {
     const ta = (a.submittedAt || a.submissionDate)?.toMillis?.() || 0;
     const tb = (b.submittedAt || b.submissionDate)?.toMillis?.() || 0;
     return tb - ta;
   });
 
+  // Auto-mark submitted/pending_with_mr as "Under Process" when MR views queue
+  _mrAllDocs.forEach(async d => {
+    if (d.status === "submitted" || d.status === "pending_with_mr") {
+      await updateDoc(doc(db, "documents", d.id), {
+        status: "under_process",
+        updatedAt: serverTimestamp(),
+        statusHistory: d.statusHistory ? [
+          ...d.statusHistory,
+          { status: "under_process", changedBy: currentUser.uid,
+            changedByName: currentUserData?.displayName || currentUser.email,
+            changedAt: nowIST() }
+        ] : [{ status: "under_process" }],
+      }).catch(console.error);
+      // Update local cache too so table reflects it immediately
+      d.status = "under_process";
+    }
+  });
+
+  renderMRQueue();
+}
+
+function renderMRQueue() {
+  const PENDING = ["submitted","pending_with_mr","under_process","resubmitted"];
+  const plantId = document.getElementById("mrFilterPlant").value;
+  const deptId  = document.getElementById("mrFilterDept").value;
+  const catId   = document.getElementById("mrFilterCat").value;
+  const statusV = document.getElementById("mrFilterStatus").value;
+  const srch    = document.getElementById("mrSearch").value.toLowerCase();
+
+  let docs = [..._mrAllDocs];
+
+  // Status filter
+  if (statusV === "all") {
+    // show everything
+  } else if (statusV === "pending" || statusV === "") {
+    docs = docs.filter(d => PENDING.includes(d.status));
+  } else {
+    docs = docs.filter(d => d.status === statusV);
+  }
+
+  if (plantId) docs = docs.filter(d => d.plantId === plantId);
+  if (deptId)  docs = docs.filter(d => d.departmentId === deptId);
+  if (catId)   docs = docs.filter(d => d.categoryId === catId);
+
   if (srch) {
-    const q = srch.toLowerCase();
     docs = docs.filter(d =>
-      (d.submissionRefNo||"").toLowerCase().includes(q) ||
-      (d.documentTitle||"").toLowerCase().includes(q) ||
-      (d.submittedByName||"").toLowerCase().includes(q) ||
-      (d.officialDocNumber||"").toLowerCase().includes(q)
+      (d.submissionRefNo||"").toLowerCase().includes(srch) ||
+      (d.documentTitle||"").toLowerCase().includes(srch) ||
+      (d.submittedByName||"").toLowerCase().includes(srch) ||
+      (d.categoryName||"").toLowerCase().includes(srch) ||
+      (d.plantName||"").toLowerCase().includes(srch) ||
+      (d.officialDocNumber||"").toLowerCase().includes(srch)
     );
   }
 
@@ -1912,22 +1941,6 @@ async function loadMRQueue(searchText = "") {
     b.addEventListener("click", () => openAssignModal(b.dataset.id)));
   tbody.querySelectorAll(".return-btn").forEach(b =>
     b.addEventListener("click", () => openReturnModal(b.dataset.id)));
-
-  // Mark as "Under Process" when MR opens/downloads
-  docs.forEach(async d => {
-    if (d.status === "submitted" || d.status === "pending_with_mr") {
-      await updateDoc(doc(db, "documents", d.id), {
-        status: "under_process",
-        updatedAt: serverTimestamp(),
-        statusHistory: d.statusHistory ? [
-          ...d.statusHistory,
-          { status: "under_process", changedBy: currentUser.uid,
-            changedByName: currentUserData.displayName || currentUser.email,
-            changedAt: nowIST() }
-        ] : [{ status: "under_process" }],
-      }).catch(console.error);
-    }
-  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
