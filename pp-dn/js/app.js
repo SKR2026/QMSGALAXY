@@ -988,25 +988,37 @@ function updateKPIs(docs) {
   const returned  = docs.filter(d => d.status === "returned_for_correction").length;
   const numbered  = docs.filter(d => ["completed","number_assigned","closed"].includes(d.status)).length;
 
+  // Helper: get submission timestamp (supports both old submissionDate and new submittedAt)
+  const getSubMs = d => {
+    const ts = d.submittedAt || d.submissionDate;
+    if (!ts) return null;
+    return ts.toDate ? ts.toDate().getTime() : (ts.seconds ? ts.seconds * 1000 : null);
+  };
+
   // Average DMS Upload Time: submission → dmsUploadDate
-  const dmsTimeDocs = docs.filter(d => d.submissionDate && d.dmsUploadDate);
+  const dmsTimeDocs = docs.filter(d => getSubMs(d) !== null && d.dmsUploadDate);
   let avgDms = "—";
   if (dmsTimeDocs.length) {
     const totalDays = dmsTimeDocs.reduce((acc, d) => {
-      const sub = d.submissionDate.toDate().getTime();
-      const dms = new Date(d.dmsUploadDate).getTime();
+      const sub = getSubMs(d);
+      const dms = new Date(d.dmsUploadDate + "T00:00:00+05:30").getTime();
       return acc + (dms - sub) / 86400000;
     }, 0);
     avgDms = (totalDays / dmsTimeDocs.length).toFixed(1) + "d";
   }
 
-  // Average Numbering Turnaround: submission → assignmentDate
-  const taDocs = docs.filter(d => d.submissionDate && d.assignmentDate);
+  // Average Numbering Turnaround: submission → assignmentDate (or dmsUploadDate fallback)
+  const taDocs = docs.filter(d => getSubMs(d) !== null && (d.assignmentDate || d.dmsUploadDate));
   let avgTA = "—";
   if (taDocs.length) {
     const totalDays = taDocs.reduce((acc, d) => {
-      const sub = d.submissionDate.toDate().getTime();
-      const asg = d.assignmentDate.toDate().getTime();
+      const sub = getSubMs(d);
+      let asg;
+      if (d.assignmentDate) {
+        asg = d.assignmentDate.toDate ? d.assignmentDate.toDate().getTime() : d.assignmentDate.seconds * 1000;
+      } else {
+        asg = new Date(d.dmsUploadDate + "T00:00:00+05:30").getTime();
+      }
       return acc + (asg - sub) / 86400000;
     }, 0);
     avgTA = (totalDays / taDocs.length).toFixed(1) + "d";
@@ -2052,27 +2064,31 @@ async function loadRecentSubmissions() {
   const container = document.getElementById("recentSubmissionsBody");
   if (!container || !currentUser) return;
   try {
+    // Single where only — no orderBy to avoid composite index requirement
     const snap = await getDocs(
       query(collection(db, "documents"),
         where("submittedBy", "==", currentUser.uid),
-        orderBy("submittedAt", "desc"),
-        limit(10))
+        limit(50))
     );
-    if (snap.empty) {
+    const allDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => {
+        const ta = (a.submittedAt || a.submissionDate)?.toMillis?.() || a.submittedAt?.seconds * 1000 || 0;
+        const tb = (b.submittedAt || b.submissionDate)?.toMillis?.() || b.submittedAt?.seconds * 1000 || 0;
+        return tb - ta;
+      })
+      .slice(0, 10);
+    if (!allDocs.length) {
       container.innerHTML = `<div class="text-center text-muted py-3" style="font-size:0.85rem;">No submissions yet.</div>`;
       return;
     }
-    const rows = snap.docs.map(d => {
-      const doc = d.data();
-      return `<tr>
+    const rows = allDocs.map(doc => `<tr>
         <td style="font-size:0.78rem;">${doc.submissionRefNo || "—"}</td>
-        <td style="font-size:0.78rem;" class="text-truncate" style="max-width:200px;">${doc.documentTitle || "—"}</td>
+        <td style="font-size:0.78rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${doc.documentTitle || "—"}</td>
         <td style="font-size:0.78rem;">${doc.plantName || "—"}</td>
         <td style="font-size:0.78rem;">${doc.departmentName || "—"}</td>
         <td style="font-size:0.78rem;">${statusBadge(doc.status)}</td>
-        <td style="font-size:0.78rem;">${toISTDate(doc.submittedAt)}</td>
-      </tr>`;
-    }).join("");
+        <td style="font-size:0.78rem;">${toISTDate(doc.submittedAt || doc.submissionDate)}</td>
+      </tr>`).join("");
     container.innerHTML = `<table class="table table-sm table-hover mb-0">
       <thead class="table-light">
         <tr>
