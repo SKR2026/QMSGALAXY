@@ -2371,6 +2371,14 @@ function setupSendNotification() {
     btn.disabled = true;
     btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span>Sending…`;
 
+    // Clear this user's notificationQueue entries so any server-side cooldown check is bypassed
+    try {
+      const { getDocs: gd, query: q2, collection: col2, where: wh, deleteDoc: dd, doc: dc } =
+        await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+      const qSnap = await gd(q2(col2(db, "notificationQueue"), wh("userId", "==", currentUser.uid)));
+      await Promise.all(qSnap.docs.map(d => dd(dc(db, "notificationQueue", d.id))));
+    } catch (_) { /* ignore — proceed to send anyway */ }
+
     const notifFn = httpsCallable(functions, "sendUserNotification");
     try {
       const res = await notifFn();
