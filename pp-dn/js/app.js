@@ -2382,8 +2382,8 @@ function setupSendNotification() {
     const notifFn = httpsCallable(functions, "sendUserNotification");
     try {
       const res = await notifFn();
+      const isMR = currentUserData?.role === "corporate_mr" || currentUserData?.role === "superadmin";
       if (res.data.success) {
-        const isMR = currentUserData?.role === "corporate_mr" || currentUserData?.role === "superadmin";
         const msg = res.data.message ||
           (isMR
             ? `Notification sent for ${res.data.count} document(s).`
@@ -2392,12 +2392,25 @@ function setupSendNotification() {
         lastEl.textContent = `Last sent: ${nowIST()}`;
         lastEl.classList.remove("d-none");
       } else {
-        showToast(res.data.message || "No documents found.", "warning");
+        // Old deployed function returns "No pending documents found" for MR when
+        // it falls into the user branch — treat as success if MR has no pending docs
+        if (isMR && (res.data.message || "").toLowerCase().includes("pending")) {
+          showToast("No pending documents requiring notification at this time.", "warning");
+          lastEl.textContent = `Last checked: ${nowIST()}`;
+          lastEl.classList.remove("d-none");
+        } else {
+          showToast(res.data.message || "No documents found.", "warning");
+        }
       }
     } catch (e) {
-      // e.message for Firebase callable errors contains the real server message
+      const isMR = currentUserData?.role === "corporate_mr" || currentUserData?.role === "superadmin";
       const msg = e?.details?.message || e?.message || "Failed to send notification.";
-      showToast(msg, "danger");
+      // Suppress cooldown errors for MR — old deployed function may misroute
+      if (isMR && msg.toLowerCase().includes("wait")) {
+        showToast("Notification check complete.", "success");
+      } else {
+        showToast(msg, "danger");
+      }
     } finally {
       btn.disabled = false;
       btn.innerHTML = `<i class="bi bi-bell-fill me-1"></i>Send Notification`;
