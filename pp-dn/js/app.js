@@ -996,13 +996,14 @@ function updateKPIs(docs) {
   };
 
   // Average DMS Upload Time: submission → dmsUploadDate
+  // dmsUploadDate is a date-only string; use end-of-day IST to avoid negative diff
   const dmsTimeDocs = docs.filter(d => getSubMs(d) !== null && d.dmsUploadDate);
   let avgDms = "—";
   if (dmsTimeDocs.length) {
     const totalDays = dmsTimeDocs.reduce((acc, d) => {
       const sub = getSubMs(d);
-      const dms = new Date(d.dmsUploadDate + "T00:00:00+05:30").getTime();
-      return acc + (dms - sub) / 86400000;
+      const dms = new Date(d.dmsUploadDate + "T23:59:59+05:30").getTime();
+      return acc + Math.max(0, (dms - sub) / 86400000);
     }, 0);
     avgDms = (totalDays / dmsTimeDocs.length).toFixed(1) + "d";
   }
@@ -1017,9 +1018,9 @@ function updateKPIs(docs) {
       if (d.assignmentDate) {
         asg = d.assignmentDate.toDate ? d.assignmentDate.toDate().getTime() : d.assignmentDate.seconds * 1000;
       } else {
-        asg = new Date(d.dmsUploadDate + "T00:00:00+05:30").getTime();
+        asg = new Date(d.dmsUploadDate + "T23:59:59+05:30").getTime();
       }
-      return acc + (asg - sub) / 86400000;
+      return acc + Math.max(0, (asg - sub) / 86400000);
     }, 0);
     avgTA = (totalDays / taDocs.length).toFixed(1) + "d";
   }
