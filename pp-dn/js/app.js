@@ -748,13 +748,11 @@ const SIDEBAR_MINI = 56;    // icon-strip width
 function applySidebarLayout(collapsed) {
   const main = document.getElementById("mainContent");
   if (!main) return;
-  if (collapsed) {
-    main.style.marginLeft = SIDEBAR_MINI + "px";
-    main.style.width = `calc(100% - ${SIDEBAR_MINI}px)`;
-  } else {
-    main.style.marginLeft = SIDEBAR_FULL + "px";
-    main.style.width = `calc(100% - ${SIDEBAR_FULL}px)`;
-  }
+  // Sidebar is position:fixed so only margin-left is needed.
+  // width:auto (set in CSS) lets the content fill remaining space naturally.
+  const margin = collapsed ? SIDEBAR_MINI : SIDEBAR_FULL;
+  main.style.marginLeft = margin + "px";
+  main.style.width = `calc(100vw - ${margin}px)`;
 }
 
 function setupSidebar() {
@@ -1053,7 +1051,8 @@ function buildChart(canvasId, type, labels, data, label, colors) {
     },
     options: {
       responsive: true,
-      maintainAspectRatio: false,
+      maintainAspectRatio: type === "doughnut" ? true : false,
+      aspectRatio: type === "doughnut" ? 1.4 : undefined,
       layout: { padding: { top: 2, bottom: 2 } },
       plugins: {
         legend: {
@@ -1067,7 +1066,7 @@ function buildChart(canvasId, type, labels, data, label, colors) {
         x: { ticks: { font: { size: 9 }, maxRotation: 30 }, grid: { display: false } },
         y: { ticks: { font: { size: 9 }, stepSize: 1 }, beginAtZero: true, grid: { color: "#f1f5f9" } }
       } : {},
-      cutout: type === "doughnut" ? "65%" : undefined
+      cutout: type === "doughnut" ? "60%" : undefined
     }
   });
 }
