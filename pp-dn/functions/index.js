@@ -8,10 +8,7 @@
 
 const functionsBase = require("firebase-functions");
 const admin         = require("firebase-admin");
-
-// Lazy-load nodemailer so a missing package only breaks email, not all functions
-let nodemailer;
-try { nodemailer = require("nodemailer"); } catch(e) { console.error("nodemailer not installed:", e.message); }
+const nodemailer    = require("nodemailer");
 
 // Regional builder for defining functions (asia-south1 = Mumbai)
 const functions = functionsBase.region("asia-south1");
@@ -30,7 +27,6 @@ let transporter    = null;
 let cachedGmailUser = null;
 
 async function getTransporter() {
-  if (!nodemailer) throw new Error("nodemailer is not installed. Run: npm install nodemailer in the functions/ directory.");
   let gmailUser, gmailPass;
 
   if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
@@ -233,10 +229,9 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
   const user    = userDoc.data();
   if (!user) throw new HttpsError("not-found", "User not found.");
 
-  const settingsSnap = await db.collection("appSettings").doc("notifications").get();
-  const settings     = settingsSnap.exists ? settingsSnap.data() : {};
-  // Cooldown check removed — was causing Firestore index errors.
-  // Rate limiting can be re-added later via a dedicated lastNotifiedAt field on the user doc.
+  const settingsSnap     = await db.collection("appSettings").doc("notifications").get();
+  const settings         = settingsSnap.exists ? settingsSnap.data() : {};
+  // No cooldown — notifications send immediately on every click.
 
   const isMR = user.role === "corporate_mr" || user.role === "superadmin";
 
@@ -328,6 +323,17 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
         }
       }
 
+      // Store only first 100 doc IDs to stay within Firestore 1MB doc limit
+      await db.collection("notificationQueue").add({
+        userId: uid,
+        type:   "mr_completion_summary",
+        documentIds: completedDocs.slice(0, 100).map((d) => d.id),
+        docCount: completedDocs.length,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: "sent",
+        recipientCount: totalEmailsSent,
+      });
+
       await logActivity({
         userId:   uid,
         userName: user.displayName || user.email,
@@ -348,9 +354,8 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
 
     } catch (err) {
       if (err instanceof HttpsError) throw err;
-      console.error("sendUserNotification MR branch error:", err.stack || err);
-      // Return error as data so client sees the real message (not generic INTERNAL)
-      return { success: false, message: `Error: ${err.message}` };
+      console.error("sendUserNotification MR branch error:", err);
+      throw new HttpsError("internal", `Failed to send notifications: ${err.message}`);
     }
 
   } else {
@@ -358,16 +363,14 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
     // Send reminder to Corporate MR about their own pending docs
     try {
     const pendingStatuses = ["submitted", "pending_with_mr", "under_process", "resubmitted"];
-    // Single where only — avoid composite index requirement; filter status in memory
     const docsSnap = await db.collection("documents")
       .where("submittedBy", "==", uid)
+      .where("status", "in", pendingStatuses)
       .get();
 
-    const docs = docsSnap.docs
-      .map((d) => ({ id: d.id, ...d.data() }))
-      .filter((d) => pendingStatuses.includes(d.status));
+    if (docsSnap.empty) return { success: false, message: "No pending documents found." };
 
-    if (!docs.length) return { success: false, message: "No pending documents found." };
+    const docs = docsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
     const rows = docs.map((doc) => `
       <tr>
@@ -399,6 +402,14 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
 
     await sendEmail(mrEmails.join(","), `[CDRTS] Pending Documents Reminder – ${user.displayName || user.email}`, html);
 
+    await db.collection("notificationQueue").add({
+      userId: uid,
+      type:   "user_consolidated",
+      documentIds: docs.map((d) => d.id),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: "sent",
+    });
+
     await logActivity({
       userId:   uid,
       userName: user.displayName || user.email,
@@ -410,8 +421,8 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
 
     } catch (err) {
       if (err instanceof HttpsError) throw err;
-      console.error("sendUserNotification user branch error:", err.stack || err);
-      return { success: false, message: `Error: ${err.message}` };
+      console.error("sendUserNotification user branch error:", err);
+      throw new HttpsError("internal", `Failed to send notification: ${err.message}`);
     }
   }
 });
@@ -592,10 +603,8 @@ exports.returnDocumentForCorrection = functions.https.onCall(async (data, contex
     }),
   });
 
-  const submitterDoc = doc.submittedBy
-    ? await db.collection("users").doc(doc.submittedBy).get()
-    : null;
-  const submitter = submitterDoc?.exists ? submitterDoc.data() : null;
+  const submitterDoc = await db.collection("users").doc(doc.submittedBy).get();
+  const submitter    = submitterDoc.data();
 
   if (submitter && submitter.email) {
     const settingsSnap = await db.collection("appSettings").doc("notifications").get();
@@ -859,7 +868,9 @@ exports.sendTestEmail = functions.https.onCall(async (data, context) => {
 // mode = "docs"  → delete documents + logs + reset ref counter
 // mode = "full"  → above + plants, departments, categories
 // ─────────────────────────────────────────────────────────────────────────────
-exports.wipeAppData = functions.https.onCall(async (data, context) => {
+exports.wipeAppData = functions
+  .runWith({ timeoutSeconds: 300, memory: "512MB" })
+  .https.onCall(async (data, context) => {
     const caller = await requireSuperadmin(context);
     const mode   = data?.mode || "docs";
 
@@ -959,17 +970,18 @@ async function doRetentionDelete() {
 // ─────────────────────────────────────────────────────────────────────────────
 // CALLABLE: Run retention delete now (Superadmin)
 // ─────────────────────────────────────────────────────────────────────────────
-exports.runRetentionDelete = functions.https.onCall(async (data, context) => {
-  await requireSuperadmin(context);
-  return doRetentionDelete();
-});
+exports.runRetentionDelete = functions
+  .runWith({ timeoutSeconds: 300, memory: "512MB" })
+  .https.onCall(async (data, context) => {
+    await requireSuperadmin(context);
+    return doRetentionDelete();
+  });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SCHEDULED: Daily auto-retention delete at 1:00 AM IST (19:30 UTC)
 // ─────────────────────────────────────────────────────────────────────────────
-exports.dailyRetentionDelete = functionsBase
-  .region("asia-south1")
-  .pubsub.schedule("30 19 * * *")
+exports.dailyRetentionDelete = functions.pubsub
+  .schedule("30 19 * * *")
   .timeZone("Asia/Kolkata")
   .onRun(async () => {
     const result = await doRetentionDelete();
