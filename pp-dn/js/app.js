@@ -310,6 +310,7 @@ document.getElementById("loginBtn").addEventListener("click", doLogin);
 });
 
 function doSignOut() {
+  localStorage.removeItem("sidebarCollapsed");
   signOut(auth).then(() => {
     currentUser = null; currentUserData = null; allDocuments = [];
     document.getElementById("appShell").classList.add("d-none");
