@@ -219,15 +219,20 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
   const settings         = settingsSnap.exists ? settingsSnap.data() : {};
   const cooldownMinutes  = settings.notificationCooldownMinutes || 120;
 
+  // NOTE: No orderBy here — avoids need for a composite Firestore index.
+  // We fetch all matching docs and find the most recent one in memory.
   const lastNotifSnap = await db.collection("notificationQueue")
     .where("userId", "==", uid)
     .where("type",   "==", "user_consolidated")
-    .orderBy("createdAt", "desc")
-    .limit(1)
     .get();
 
-  if (!lastNotifSnap.empty) {
-    const lastNotif = lastNotifSnap.docs[0].data();
+  const sortedNotifs = lastNotifSnap.docs
+    .map((d) => d.data())
+    .filter((d) => d.createdAt)
+    .sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
+
+  if (sortedNotifs.length > 0) {
+    const lastNotif = sortedNotifs[0];
     if (lastNotif.createdAt) {
       const diffMins = (Date.now() - lastNotif.createdAt.toMillis()) / 60000;
       if (diffMins < cooldownMinutes) {
@@ -355,10 +360,10 @@ exports.assignDocumentNumber = functions.https.onCall(async (data, context) => {
         processedByName:    mrUser.displayName || mrUser.email,
         assignmentDate:     now,
         assignmentDateIST:  assignmentTime,
-        status:             "number_assigned",
+        status:             "completed",
         updatedAt:          now,
         statusHistory: admin.firestore.FieldValue.arrayUnion({
-          status:        "number_assigned",
+          status:        "completed",
           changedBy:     uid,
           changedByName: mrUser.displayName || mrUser.email,
           changedAt:     assignmentTime,
@@ -421,7 +426,7 @@ exports.assignDocumentNumber = functions.https.onCall(async (data, context) => {
   await logActivity({
     userId:            uid,
     userName:          mrUser.displayName || mrUser.email,
-    activity:          "number_assigned",
+    activity:          "completed",
     documentId,
     submissionRefNo:   updatedDoc.submissionRefNo,
     officialDocNumber: officialDocNumber.trim(),
@@ -571,19 +576,9 @@ exports.submitDocument = functions.https.onCall(async (data, context) => {
     }),
   });
 
-  await db.collection("notificationQueue").add({
-    type:           "new_submission",
-    documentId,
-    submissionRefNo: refNo,
-    userId:         uid,
-    userName:       user.displayName || user.email,
-    plantName:      user.plantName,
-    departmentName: user.departmentName,
-    documentTitle:  doc.documentTitle,
-    categoryName:   doc.categoryName,
-    createdAt:      now,
-    emailSent:      false,
-  });
+  // ── Notification queue entry removed: emails are sent ONLY when user
+  //    clicks "Send Notification" (sendUserNotification callable).
+  //    Auto-queuing on submit caused unintended mail on every upload.
 
   await logActivity({
     userId:         uid,
@@ -598,61 +593,11 @@ exports.submitDocument = functions.https.onCall(async (data, context) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SCHEDULED: Send consolidated MR notification (every 30 min)
+// REMOVED: sendConsolidatedMRNotification (scheduled every 30 min)
+// Reason: This caused emails to send automatically after every document upload.
+// Notifications are now sent ONLY when user explicitly clicks "Send Notification"
+// via the sendUserNotification callable function.
 // ─────────────────────────────────────────────────────────────────────────────
-exports.sendConsolidatedMRNotification = functions.pubsub
-  .schedule("every 30 minutes")
-  .onRun(async () => {
-    const queueSnap = await db.collection("notificationQueue")
-      .where("type",      "==", "new_submission")
-      .where("emailSent", "==", false)
-      .get();
-
-    if (queueSnap.empty) { console.log("No pending notifications."); return null; }
-
-    const pending  = queueSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    const mrEmails = await getCorporateMREmails();
-    if (!mrEmails.length) { console.log("No Corporate MR users found."); return null; }
-
-    const settingsSnap = await db.collection("appSettings").doc("notifications").get();
-    const settings     = settingsSnap.exists ? settingsSnap.data() : {};
-
-    const rows = pending.map((item) => `
-      <tr>
-        <td>${item.submissionRefNo || item.documentId}</td>
-        <td>${item.documentTitle || "-"}</td>
-        <td>${item.categoryName || "-"}</td>
-        <td>${item.plantName || "-"}</td>
-        <td>${item.departmentName || "-"}</td>
-        <td>${item.userName || "-"}</td>
-        <td>${item.createdAt ? new Date(item.createdAt.toDate()).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "-"}</td>
-      </tr>
-    `).join("");
-
-    const html = emailWrapper(
-      "New Document Submissions – Action Required",
-      `<p>Dear Corporate MR,</p>
-       <p>The following <strong>${pending.length}</strong> document(s) have been submitted and are awaiting your review and DMS numbering:</p>
-       <table>
-         <thead><tr><th>Ref. No.</th><th>Document Title</th><th>Category</th><th>Plant</th><th>Department</th><th>Submitted By</th><th>Submitted On (IST)</th></tr></thead>
-         <tbody>${rows}</tbody>
-       </table>
-       <a class="btn" href="${settings.appUrl || "https://your-app.web.app"}">Review in CDRTS</a>`
-    );
-
-    await sendEmail(mrEmails.join(","), `[CDRTS] ${pending.length} New Document(s) Awaiting Numbering`, html);
-
-    const batch = db.batch();
-    pending.forEach((item) => {
-      batch.update(db.collection("notificationQueue").doc(item.id), {
-        emailSent:    true,
-        emailSentAt:  admin.firestore.FieldValue.serverTimestamp(),
-      });
-    });
-    await batch.commit();
-
-    return null;
-  });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CALLABLE: Create user (Superadmin)

@@ -77,7 +77,7 @@ function statusLabel(s) {
     under_process: "Under Process",
     returned_for_correction: "Returned",
     resubmitted: "Resubmitted",
-    number_assigned: "Number Assigned",
+    number_assigned: "Completed",
     closed: "Closed",
     deleted: "Deleted",
   };
@@ -647,7 +647,7 @@ function setupNavigation() {
     kpiPending:     "__awaiting_mr",           // multi-status: submitted + pending_with_mr + resubmitted
     kpiUnderProcess:"under_process",
     kpiReturned:    "returned_for_correction",
-    kpiNumbered:    "number_assigned",
+    kpiNumbered:    "completed",
     kpiDmsTime:     "",                      // metric only — no status filter
     kpiTurnaround:  "",                      // metric only — no status filter
   };
@@ -988,7 +988,7 @@ function updateKPIs(docs) {
   const pending   = docs.filter(d => ["submitted","pending_with_mr","resubmitted"].includes(d.status)).length;
   const process   = docs.filter(d => ["under_process"].includes(d.status)).length;
   const returned  = docs.filter(d => d.status === "returned_for_correction").length;
-  const numbered  = docs.filter(d => d.status === "number_assigned" || d.status === "closed").length;
+  const numbered  = docs.filter(d => ["completed","number_assigned","closed"].includes(d.status)).length;
 
   // Average DMS Upload Time: submission → dmsUploadDate
   const dmsTimeDocs = docs.filter(d => d.submissionDate && d.dmsUploadDate);
@@ -1265,7 +1265,6 @@ function buildHorizontalTimeline(d) {
     { key: "resubmitted",             label: "Resubmitted"  },
     { key: "under_process",           label: "MR Submitted" },
     { key: "returned_for_correction", label: "Returned"     },
-    { key: "number_assigned",         label: "DMS Assigned" },
     { key: "completed",               label: "Completed"    },
   ];
 
@@ -1572,29 +1571,43 @@ document.getElementById("checkDmsNumBtn").addEventListener("click", async () => 
 });
 
 document.getElementById("confirmAssignBtn").addEventListener("click", async () => {
-  const spin = document.getElementById("assignSpinner");
+  const spin    = document.getElementById("assignSpinner");
+  const btn     = document.getElementById("confirmAssignBtn");
   hideError("assignNumError");
   const num = document.getElementById("dmsDocNumber").value.trim();
   if (!num) { showError("assignNumError", "DMS Document Number is required."); return; }
 
+  // Instant feedback — close modal & show toast immediately
   spin.classList.remove("d-none");
-  const assignFn = httpsCallable(functions, "assignDocumentNumber");
+  btn.disabled = true;
+
+  const payload = {
+    documentId:        assignModalDocId,
+    officialDocNumber: num,
+    dmsUploadDate:     document.getElementById("dmsDate").value,
+    dmsUploadTime:     document.getElementById("dmsTime").value,
+    remarks:           document.getElementById("dmsRemarks").value,
+  };
+
+  // Close modal right away so user isn't blocked
+  bootstrap.Modal.getInstance(document.getElementById("assignNumModal")).hide();
+  showToast(`Assigning DMS Number "${num}"…`, "info");
+
+  const assignFn = httpsCallable(functions, "assignDocumentNumber", { timeout: 30000 });
   try {
-    await assignFn({
-      documentId: assignModalDocId,
-      officialDocNumber: num,
-      dmsUploadDate: document.getElementById("dmsDate").value,
-      dmsUploadTime: document.getElementById("dmsTime").value,
-      remarks: document.getElementById("dmsRemarks").value,
-    });
-    bootstrap.Modal.getInstance(document.getElementById("assignNumModal")).hide();
-    showToast(`DMS Number "${num}" assigned successfully.`, "success");
+    await assignFn(payload);
+    showToast(`DMS Number "${num}" assigned & document completed.`, "success");
     loadDashboard();
     if (isCorporateMR()) loadMRQueue();
   } catch (e) {
+    // Re-open modal on error so user can retry
+    showToast("Assignment failed: " + (e.message || "Unknown error"), "danger");
+    openAssignModal(payload.documentId);
+    document.getElementById("dmsDocNumber").value = num;
     showError("assignNumError", e.message || "Failed to assign number.");
   } finally {
     spin.classList.add("d-none");
+    btn.disabled = false;
   }
 });
 
@@ -1946,33 +1959,24 @@ async function saveDocument(isDraft) {
     }
 
     if (!isDraft) {
-      // ── Generate ref number (Cloud Function first, then client-side fallback) ──
-      let refNo = null;
-      try {
-        const submitFn = httpsCallable(functions, "submitDocument");
-        const result   = await submitFn({ documentId: editingDocId });
-        refNo = result?.data?.submissionRefNo || result?.data?.refNo || null;
-      } catch (fnErr) {
-        console.warn("Cloud Function submitDocument unavailable, generating ref client-side:", fnErr.message);
-        // Client-side ref number via Firestore transaction
-        refNo = await runTransaction(db, async (txn) => {
-          const counterRef = doc(db, "appSettings", "refCounter");
-          const counterSnap = await txn.get(counterRef);
-          let seq = 1;
-          if (counterSnap.exists()) {
-            seq = (counterSnap.data().lastSeq || 0) + 1;
-          }
-          txn.set(counterRef, { lastSeq: seq }, { merge: true });
-          const year = new Date().getFullYear();
-          return `CDRTS/${year}/${String(seq).padStart(5, "0")}`;
-        });
-        // Update the doc with the ref number and confirmed status
-        await updateDoc(doc(db, "documents", editingDocId), {
-          submissionRefNo: refNo,
-          status:          "submitted",
-          submittedAt:     serverTimestamp(),
-        });
-      }
+      // ── Generate ref number directly via Firestore (fast, no cold-start) ──
+      let refNo = await runTransaction(db, async (txn) => {
+        const counterRef  = doc(db, "appSettings", "refCounter");
+        const counterSnap = await txn.get(counterRef);
+        let seq = 1;
+        if (counterSnap.exists()) {
+          seq = (counterSnap.data().lastSeq || 0) + 1;
+        }
+        txn.set(counterRef, { lastSeq: seq }, { merge: true });
+        const year = new Date().getFullYear();
+        return `CDRTS/${year}/${String(seq).padStart(5, "0")}`;
+      });
+      // Update the doc with the ref number and confirmed status
+      await updateDoc(doc(db, "documents", editingDocId), {
+        submissionRefNo: refNo,
+        status:          "submitted",
+        submittedAt:     serverTimestamp(),
+      });
 
       // ── Emails are sent ONLY when user clicks "Send Notification" button ──
       // (handled by sendUserNotification Cloud Function — not triggered here)
