@@ -738,13 +738,6 @@ function setupNavigation() {
   });
 }
 
-function setSidebarMargin(collapsed) {
-  const main = document.getElementById("mainContent");
-  if (!main) return;
-  // styles.css sets margin-left:260px (--sidebar-width). Collapsed → 56px icon strip.
-  main.style.marginLeft = collapsed ? "56px" : "260px";
-}
-
 function setupSidebar() {
   const overlay = document.createElement("div");
   overlay.className = "sidebar-overlay";
@@ -752,12 +745,10 @@ function setupSidebar() {
 
   const sidebar = document.getElementById("sidebar");
 
-  // Restore collapsed state
-  const startCollapsed = localStorage.getItem("sidebarCollapsed") === "true";
-  if (startCollapsed) {
+  // Restore collapsed state — margin-left never changes (sidebar overlays content)
+  if (localStorage.getItem("sidebarCollapsed") === "true") {
     sidebar.classList.add("collapsed");
   }
-  setSidebarMargin(startCollapsed);
 
   document.getElementById("menuToggle").addEventListener("click", () => {
     sidebar.classList.toggle("mobile-open");
@@ -766,7 +757,6 @@ function setupSidebar() {
 
   document.getElementById("sidebarToggle").addEventListener("click", () => {
     const isCollapsed = sidebar.classList.toggle("collapsed");
-    setSidebarMargin(isCollapsed);
     localStorage.setItem("sidebarCollapsed", String(isCollapsed));
     document.getElementById("sidebarToggle").title = isCollapsed ? "Expand sidebar" : "Collapse sidebar";
   });
