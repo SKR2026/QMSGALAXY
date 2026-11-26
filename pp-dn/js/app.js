@@ -1221,18 +1221,17 @@ async function loadMyDocuments() {
   const tbody = document.getElementById("myDocsBody");
 
   if (!docs.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="text-center py-4 text-muted">No documents submitted yet.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="text-center py-4 text-muted">No documents submitted yet.</td></tr>`;
     return;
   }
 
   tbody.innerHTML = docs.map(d => `
-    <tr>
+    <tr class="mydoc-row" data-id="${d.id}" style="cursor:pointer">
       <td class="fw-semibold text-primary">${d.submissionRefNo || "Draft"}</td>
       <td>${d.documentTitle || "—"}</td>
-      <td>${d.categoryName || "—"}</td>
-      <td>${toIST(d.submissionDate)}</td>
-      <td class="fw-semibold text-success">${d.officialDocNumber || "—"}</td>
-      <td>${toIST(d.assignmentDate)}</td>
+      <td><span class="text-muted small">${d.categoryName || "—"}</span></td>
+      <td><span class="small">${toIST(d.submissionDate)}</span></td>
+      <td class="fw-semibold text-success">${d.officialDocNumber || `<span class="text-muted">—</span>`}</td>
       <td>${statusBadge(d.status)}</td>
       <td>
         <div class="action-btns">
@@ -1247,6 +1246,19 @@ async function loadMyDocuments() {
     </tr>
   `).join("");
 
+  // Store docs for timeline lookup
+  tbody._docsMap = Object.fromEntries(docs.map(d => [d.id, d]));
+
+  // Row click → show timeline
+  tbody.querySelectorAll(".mydoc-row").forEach(row => {
+    row.addEventListener("click", e => {
+      if (e.target.closest("a,button")) return; // let buttons work normally
+      tbody.querySelectorAll(".mydoc-row").forEach(r => r.classList.remove("table-primary"));
+      row.classList.add("table-primary");
+      showDocTimeline(tbody._docsMap[row.dataset.id]);
+    });
+  });
+
   tbody.querySelectorAll(".view-doc-btn").forEach(b =>
     b.addEventListener("click", () => openDocModal(b.dataset.id)));
   tbody.querySelectorAll(".edit-doc-btn").forEach(b =>
@@ -1259,6 +1271,77 @@ async function loadMyDocuments() {
       row.style.display = row.textContent.toLowerCase().includes(q) ? "" : "none";
     });
   };
+
+  // Auto-select first row
+  const firstRow = tbody.querySelector(".mydoc-row");
+  if (firstRow) { firstRow.classList.add("table-primary"); showDocTimeline(docs[0]); }
+}
+
+// ── Timeline panel renderer ──────────────────────────────────────────────────
+function showDocTimeline(d) {
+  const panel = document.getElementById("myDocsTimelineBody");
+  if (!panel || !d) return;
+
+  // Define all possible steps in order
+  const steps = [
+    { key: "draft",                 label: "Draft Created",        icon: "bi-pencil-square",     color: "#6c757d" },
+    { key: "submitted",             label: "Submitted",            icon: "bi-send",              color: "#0d6efd" },
+    { key: "resubmitted",           label: "Resubmitted",          icon: "bi-arrow-repeat",      color: "#0d6efd" },
+    { key: "pending_with_mr",       label: "Pending with MR",      icon: "bi-hourglass-split",   color: "#fd7e14" },
+    { key: "under_process",         label: "Under Process",        icon: "bi-gear",              color: "#6610f2" },
+    { key: "returned_for_correction",label:"Returned for Correction",icon:"bi-arrow-left-circle",color: "#dc3545" },
+    { key: "number_assigned",       label: "DMS Number Assigned",  icon: "bi-award",             color: "#198754" },
+    { key: "completed",             label: "Completed",            icon: "bi-check-circle-fill", color: "#198754" },
+  ];
+
+  const history = d.statusHistory || [];
+  const historyMap = {};
+  history.forEach(h => { historyMap[h.status] = h; });
+
+  // Which steps occurred?
+  const currentIdx = steps.findIndex(s => s.key === d.status);
+
+  const stepsHtml = steps.map((step, idx) => {
+    const hit     = historyMap[step.key];
+    const isCurrent = step.key === d.status;
+    const isDone  = hit != null;
+    const isFuture = !isDone && !isCurrent;
+
+    const dotColor  = isDone || isCurrent ? step.color : "#dee2e6";
+    const lineColor = idx < currentIdx ? step.color : "#dee2e6";
+    const opacity   = isFuture ? "0.4" : "1";
+
+    return `
+      <div class="d-flex gap-2 mb-1" style="opacity:${opacity}">
+        <div class="d-flex flex-column align-items-center" style="width:20px">
+          <div style="width:14px;height:14px;border-radius:50%;background:${dotColor};
+               border:2px solid ${isCurrent ? step.color : dotColor};
+               box-shadow:${isCurrent ? `0 0 0 3px ${step.color}30` : "none"};
+               flex-shrink:0;margin-top:2px"></div>
+          ${idx < steps.length - 1 ? `<div style="width:2px;flex:1;background:${lineColor};min-height:16px;margin-top:2px"></div>` : ""}
+        </div>
+        <div class="pb-2" style="min-width:0">
+          <div class="fw-semibold small" style="color:${isDone||isCurrent ? step.color : '#adb5bd'};line-height:1.2">
+            <i class="bi ${step.icon} me-1"></i>${step.label}
+            ${isCurrent ? `<span class="badge ms-1" style="background:${step.color};font-size:9px">NOW</span>` : ""}
+          </div>
+          ${hit ? `
+            <div class="text-muted" style="font-size:11px;line-height:1.3">${hit.changedAt || ""}</div>
+            ${hit.changedByName ? `<div class="text-muted" style="font-size:11px">${hit.changedByName}</div>` : ""}
+            ${hit.remarks ? `<div class="text-muted fst-italic" style="font-size:10px;margin-top:1px">"${hit.remarks}"</div>` : ""}
+          ` : ""}
+        </div>
+      </div>`;
+  }).join("");
+
+  panel.innerHTML = `
+    <div class="mb-2 pb-2 border-bottom">
+      <div class="fw-bold text-primary small">${d.submissionRefNo || "Draft"}</div>
+      <div class="text-muted" style="font-size:12px">${d.documentTitle || "—"}</div>
+      ${d.officialDocNumber ? `<div class="mt-1"><span class="badge bg-success">${d.officialDocNumber}</span></div>` : ""}
+    </div>
+    ${stepsHtml}
+  `;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
