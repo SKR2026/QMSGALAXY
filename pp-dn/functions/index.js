@@ -6,9 +6,12 @@
  * Or via GitHub Actions CI/CD (see .github/workflows/deploy.yml)
  */
 
-const functions = require("firebase-functions");
-const admin     = require("firebase-admin");
-const nodemailer = require("nodemailer");
+const functionsBase = require("firebase-functions");
+const admin         = require("firebase-admin");
+const nodemailer    = require("nodemailer");
+
+// All functions deploy to asia-south1 (Mumbai)
+const functions = functionsBase.region("asia-south1");
 
 admin.initializeApp();
 const db      = admin.firestore();
@@ -257,102 +260,124 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
 
   if (isMR) {
     // ── Corporate MR / Superadmin ────────────────────────────────────────────
-    // Fetch all completed docs (DMS number assigned).
-    // Group by submitter and send each submitter (+ plant MR) a personal email
-    // listing their document(s) with the assigned DMS numbers.
-    const completedSnap = await db.collection("documents")
-      .where("status", "in", ["completed", "number_assigned"])
-      .get();
+    // Fetch all completed docs then email each submitter their DMS numbers.
+    try {
+      // Get completed docs — fetch all then filter in memory to avoid index issues
+      const allDocsSnap = await db.collection("documents").get();
+      const completedDocs = allDocsSnap.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((d) => d.status === "completed" || d.status === "number_assigned");
 
-    if (completedSnap.empty) return { success: false, message: "No completed documents found to notify about." };
+      if (!completedDocs.length) {
+        return { success: false, message: "No completed documents found to notify about." };
+      }
 
-    const completedDocs = completedSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      // Fetch all users once so we can look up emails reliably
+      const usersSnap = await db.collection("users").get();
+      const usersMap  = {};
+      usersSnap.docs.forEach(d => { usersMap[d.id] = d.data(); });
 
-    // Group docs by submitter uid
-    const bySubmitter = {};
-    completedDocs.forEach((doc) => {
-      const key = doc.submittedBy;
-      if (!bySubmitter[key]) bySubmitter[key] = { name: doc.submittedByName || doc.submittedByEmail || key, email: doc.submittedByEmail, docs: [] };
-      bySubmitter[key].docs.push(doc);
-    });
+      // Group completed docs by submitter uid
+      const bySubmitter = {};
+      completedDocs.forEach((doc) => {
+        const submitterUid = doc.submittedBy;
+        if (!submitterUid) return;
+        if (!bySubmitter[submitterUid]) {
+          // Prefer email from users collection; fall back to doc field
+          const submitterUser = usersMap[submitterUid];
+          bySubmitter[submitterUid] = {
+            name:  submitterUser?.displayName || doc.submittedByName || submitterUser?.email || submitterUid,
+            email: submitterUser?.email || doc.submittedByEmail || null,
+            docs:  [],
+          };
+        }
+        bySubmitter[submitterUid].docs.push(doc);
+      });
 
-    // Fetch plant MR emails — users with role "user" in same plants
-    // We'll CC plant-level contacts by fetching from users collection grouped by plant
-    const plantMRSnap = await db.collection("users")
-      .where("role", "==", "user")
-      .get();
-    const plantMRByUid = {};
-    plantMRSnap.docs.forEach(d => { plantMRByUid[d.id] = d.data(); });
+      const appUrl = settings.appUrl || "https://your-app.web.app";
+      let totalEmailsSent = 0;
+      const errors = [];
 
-    let totalEmailsSent = 0;
-    const appUrl = settings.appUrl || "https://your-app.web.app";
+      for (const [submitterUid, info] of Object.entries(bySubmitter)) {
+        if (!info.email) {
+          console.warn(`No email found for submitter ${submitterUid}, skipping.`);
+          continue;
+        }
 
-    for (const [submitterUid, info] of Object.entries(bySubmitter)) {
-      if (!info.email) continue;
+        const rows = info.docs.map((doc) => `
+          <tr>
+            <td>${doc.submissionRefNo || "-"}</td>
+            <td>${doc.documentTitle || "-"}</td>
+            <td>${doc.categoryName || "-"}</td>
+            <td>${doc.plantName || "-"}</td>
+            <td>${doc.departmentName || "-"}</td>
+            <td><strong>${doc.officialDocNumber || "-"}</strong></td>
+            <td>${doc.assignmentDateIST || "-"}</td>
+          </tr>
+        `).join("");
 
-      const rows = info.docs.map((doc) => `
-        <tr>
-          <td>${doc.submissionRefNo || "-"}</td>
-          <td>${doc.documentTitle || "-"}</td>
-          <td>${doc.categoryName || "-"}</td>
-          <td>${doc.plantName || "-"}</td>
-          <td>${doc.departmentName || "-"}</td>
-          <td><strong>${doc.officialDocNumber || "-"}</strong></td>
-          <td>${doc.assignmentDateIST || "-"}</td>
-        </tr>
-      `).join("");
+        const html = emailWrapper(
+          "DMS Document Numbers Assigned",
+          `<p>Dear ${info.name},</p>
+           <p>Your document(s) have been successfully processed by Corporate MR and official DMS numbers have been assigned.</p>
+           <table>
+             <thead>
+               <tr>
+                 <th>Ref. No.</th><th>Document Title</th><th>Category</th>
+                 <th>Plant</th><th>Department</th><th>DMS Number</th><th>Assigned On (IST)</th>
+               </tr>
+             </thead>
+             <tbody>${rows}</tbody>
+           </table>
+           <p>Please keep these DMS numbers for your records.</p>
+           <a class="btn" href="${appUrl}">View in CDRTS</a>`
+        );
 
-      const html = emailWrapper(
-        "DMS Document Numbers Assigned",
-        `<p>Dear ${info.name},</p>
-         <p>Your document(s) have been successfully processed by Corporate MR and official DMS numbers have been assigned.</p>
-         <table>
-           <thead>
-             <tr>
-               <th>Ref. No.</th>
-               <th>Document Title</th>
-               <th>Category</th>
-               <th>Plant</th>
-               <th>Department</th>
-               <th>DMS Number</th>
-               <th>Assigned On (IST)</th>
-             </tr>
-           </thead>
-           <tbody>${rows}</tbody>
-         </table>
-         <p>Please keep these DMS numbers for your records.</p>
-         <a class="btn" href="${appUrl}">View in CDRTS</a>`
-      );
+        try {
+          await sendEmail(
+            info.email,
+            `[CDRTS] DMS Number(s) Assigned – ${info.docs.length} document(s) completed`,
+            html
+          );
+          totalEmailsSent++;
+        } catch (mailErr) {
+          console.error(`Failed to email ${info.email}:`, mailErr.message);
+          errors.push(info.email);
+        }
+      }
 
-      await sendEmail(
-        info.email,
-        `[CDRTS] DMS Number(s) Assigned – ${info.docs.length} document(s) completed`,
-        html
-      );
-      totalEmailsSent++;
+      await db.collection("notificationQueue").add({
+        userId: uid,
+        type:   "mr_completion_summary",
+        documentIds: completedDocs.map((d) => d.id),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: "sent",
+        recipientCount: totalEmailsSent,
+      });
+
+      await logActivity({
+        userId:   uid,
+        userName: user.displayName || user.email,
+        activity: "sent_completion_notification",
+        details:  `Sent DMS assignment summary to ${totalEmailsSent} submitter(s) covering ${completedDocs.length} document(s)`,
+      });
+
+      if (totalEmailsSent === 0) {
+        throw new functions.https.HttpsError("internal", "No emails could be sent. Check email configuration in Settings.");
+      }
+
+      return { success: true, count: completedDocs.length, emailsSent: totalEmailsSent };
+
+    } catch (err) {
+      if (err instanceof functions.https.HttpsError) throw err;
+      console.error("sendUserNotification MR branch error:", err);
+      throw new functions.https.HttpsError("internal", `Failed to send notifications: ${err.message}`);
     }
-
-    await db.collection("notificationQueue").add({
-      userId: uid,
-      type:   "mr_completion_summary",
-      documentIds: completedDocs.map((d) => d.id),
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      status: "sent",
-      recipientCount: totalEmailsSent,
-    });
-
-    await logActivity({
-      userId:   uid,
-      userName: user.displayName || user.email,
-      activity: "sent_completion_notification",
-      details:  `Sent DMS assignment summary to ${totalEmailsSent} submitter(s) covering ${completedDocs.length} document(s)`,
-    });
-
-    return { success: true, count: completedDocs.length, emailsSent: totalEmailsSent };
 
   } else {
     // ── Regular user ─────────────────────────────────────────────────────────
     // Send reminder to Corporate MR about their own pending docs
+    try {
     const pendingStatuses = ["submitted", "pending_with_mr", "under_process", "resubmitted"];
     const docsSnap = await db.collection("documents")
       .where("submittedBy", "==", uid)
@@ -409,6 +434,12 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
     });
 
     return { success: true, count: docs.length };
+
+    } catch (err) {
+      if (err instanceof functions.https.HttpsError) throw err;
+      console.error("sendUserNotification user branch error:", err);
+      throw new functions.https.HttpsError("internal", `Failed to send notification: ${err.message}`);
+    }
   }
 });
 
