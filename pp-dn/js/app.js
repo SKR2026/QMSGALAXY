@@ -1170,8 +1170,8 @@ function renderDocTable(docs) {
       <td>${toIST(d.submissionDate)}</td>
       <td class="fw-semibold">${d.officialDocNumber || "—"}</td>
       <td>${d.dmsUploadDate || "—"}</td>
-      <td>${toIST(d.assignmentDate)}</td>
       <td>${statusBadge(d.status)}</td>
+      <td style="min-width:260px;padding:4px 8px">${buildHorizontalTimeline(d)}</td>
       <td>
         <div class="action-btns">
           <button class="btn btn-sm btn-outline-primary view-doc-btn" data-id="${d.id}" title="View">
@@ -1667,21 +1667,20 @@ async function loadMRQueue(searchText = "") {
 
   const tbody = document.getElementById("mrTableBody");
   if (!docs.length) {
-    tbody.innerHTML = `<tr><td colspan="10" class="text-center py-4 text-muted">No documents in queue.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="text-center py-4 text-muted">No documents in queue.</td></tr>`;
     return;
   }
 
   tbody.innerHTML = docs.map(d => `
     <tr>
-      <td class="fw-semibold text-primary">${d.submissionRefNo || "—"}</td>
-      <td>${d.documentTitle || "—"}</td>
-      <td>${d.categoryName || "—"}</td>
-      <td>${d.plantName || "—"}</td>
-      <td>${d.departmentName || "—"}</td>
+      <td class="fw-semibold text-primary" style="white-space:nowrap">${d.submissionRefNo || "—"}</td>
+      <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.documentTitle || "—"}</td>
+      <td><span class="small">${d.plantName || "—"}<br><span class="text-muted">${d.departmentName || ""}</span></span></td>
       <td>${d.submittedByName || "—"}</td>
-      <td>${toIST(d.submissionDate)}</td>
-      <td class="fw-semibold text-success">${d.officialDocNumber || "—"}</td>
+      <td><span class="small" style="white-space:nowrap">${toIST(d.submissionDate)}</span></td>
+      <td class="fw-semibold text-success" style="white-space:nowrap">${d.officialDocNumber || "—"}</td>
       <td>${statusBadge(d.status)}</td>
+      <td style="min-width:260px;padding:4px 8px">${buildHorizontalTimeline(d)}</td>
       <td>
         <div class="action-btns">
           <button class="btn btn-sm btn-outline-primary view-doc-btn" data-id="${d.id}"><i class="bi bi-eye"></i></button>
