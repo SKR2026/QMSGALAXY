@@ -1046,7 +1046,8 @@ function buildChart(canvasId, type, labels, data, label, colors) {
     },
     options: {
       responsive: true,
-      maintainAspectRatio: false,
+      maintainAspectRatio: type === "doughnut",
+      aspectRatio: type === "doughnut" ? 1 : undefined,
       layout: { padding: { top: 2, bottom: 2 } },
       plugins: {
         legend: {
