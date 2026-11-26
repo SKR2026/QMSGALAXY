@@ -453,7 +453,16 @@ async function initApp() {
   loadMasterData();
   setupSubmitForm();
   setupSendNotification();
+  setupDangerZone();
   navigateTo("dashboard");
+
+  // Deep-link: open doc modal if URL contains #doc/<id>
+  const hashMatch = location.hash.match(/^#doc\/(.+)$/);
+  if (hashMatch) {
+    const docId = hashMatch[1];
+    // Small delay so Firestore listeners are ready
+    setTimeout(() => openDocModal(docId), 800);
+  }
 }
 
 async function applyBranding() {
@@ -1654,7 +1663,10 @@ function setupSubmitForm() {
   document.getElementById("saveDraftBtn").addEventListener("click", () => saveDocument(true));
   document.getElementById("submitDocForm").addEventListener("submit", async e => {
     e.preventDefault();
-    await saveDocument(false);
+    if (saveDocument._saving) return;          // block double-submit
+    saveDocument._saving = true;
+    try { await saveDocument(false); }
+    finally { saveDocument._saving = false; }
   });
 }
 
@@ -1830,33 +1842,131 @@ async function saveDocument(isDraft) {
         const docLink    = `${location.origin}${location.pathname}#doc/${editingDocId}`;
 
         const bodyBase = `
-<p>A new document has been submitted in <strong>${appTitle}</strong>.</p>
-<table style="border-collapse:collapse;font-family:sans-serif;font-size:14px;">
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Reference No:</td><td><strong>${refNo}</strong></td></tr>
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Title:</td><td>${title}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Plant:</td><td>${plantName}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Category:</td><td>${catName}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Submitted By:</td><td>${submitterName} &lt;${submitterEmail}&gt;</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Requested By:</td><td>${reqName || "—"} &lt;${reqEmail}&gt;</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Status:</td><td>Submitted</td></tr>
-</table>
-<p><a href="${docLink}">View Document →</a></p>`;
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f0f4f8;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f4f8;padding:32px 0;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;border-radius:14px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.10);">
+
+        <!-- HEADER -->
+        <tr>
+          <td style="background:linear-gradient(135deg,#1a3c5e 0%,#2563a8 100%);padding:32px 36px;text-align:left;">
+            <p style="margin:0 0 4px 0;color:rgba(255,255,255,0.75);font-size:11px;letter-spacing:2px;text-transform:uppercase;font-weight:600;">Polyplastics India</p>
+            <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.3px;">Document Submitted</h1>
+            <p style="margin:8px 0 0 0;color:rgba(255,255,255,0.80);font-size:13px;">Corporate Document Registration &amp; Tracking System</p>
+          </td>
+        </tr>
+
+        <!-- BODY -->
+        <tr>
+          <td style="background:#ffffff;padding:32px 36px;">
+
+            <!-- GREETING_PLACEHOLDER -->
+
+            <!-- Ref badge -->
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:24px;">
+              <tr>
+                <td style="background:#eef4fb;border-left:4px solid #2563a8;border-radius:0 8px 8px 0;padding:12px 20px;">
+                  <p style="margin:0;color:#2563a8;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;">Reference Number</p>
+                  <p style="margin:4px 0 0 0;color:#1a3c5e;font-size:20px;font-weight:700;letter-spacing:0.5px;">${refNo}</p>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Details table -->
+            <table width="100%" cellpadding="0" cellspacing="0" style="border-radius:10px;overflow:hidden;border:1px solid #e2e8f0;">
+              <tr style="background:#f8fafc;">
+                <td style="padding:11px 16px;color:#64748b;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;width:38%;border-bottom:1px solid #e2e8f0;">Field</td>
+                <td style="padding:11px 16px;color:#64748b;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid #e2e8f0;">Details</td>
+              </tr>
+              <tr style="background:#ffffff;">
+                <td style="padding:12px 16px;color:#64748b;font-size:13px;border-bottom:1px solid #f1f5f9;">Document Title</td>
+                <td style="padding:12px 16px;color:#1e293b;font-size:13px;font-weight:600;border-bottom:1px solid #f1f5f9;">${title}</td>
+              </tr>
+              <tr style="background:#f8fafc;">
+                <td style="padding:12px 16px;color:#64748b;font-size:13px;border-bottom:1px solid #f1f5f9;">Plant</td>
+                <td style="padding:12px 16px;color:#1e293b;font-size:13px;border-bottom:1px solid #f1f5f9;">${plantName}</td>
+              </tr>
+              <tr style="background:#ffffff;">
+                <td style="padding:12px 16px;color:#64748b;font-size:13px;border-bottom:1px solid #f1f5f9;">Category</td>
+                <td style="padding:12px 16px;color:#1e293b;font-size:13px;border-bottom:1px solid #f1f5f9;">${catName}</td>
+              </tr>
+              <tr style="background:#f8fafc;">
+                <td style="padding:12px 16px;color:#64748b;font-size:13px;border-bottom:1px solid #f1f5f9;">Submitted By</td>
+                <td style="padding:12px 16px;color:#1e293b;font-size:13px;border-bottom:1px solid #f1f5f9;">${submitterName}<br><span style="color:#64748b;font-size:12px;">${submitterEmail}</span></td>
+              </tr>
+              <tr style="background:#ffffff;">
+                <td style="padding:12px 16px;color:#64748b;font-size:13px;border-bottom:1px solid #f1f5f9;">Requested By</td>
+                <td style="padding:12px 16px;color:#1e293b;font-size:13px;border-bottom:1px solid #f1f5f9;">${reqName || "—"}<br><span style="color:#64748b;font-size:12px;">${reqEmail || ""}</span></td>
+              </tr>
+              <tr style="background:#f8fafc;">
+                <td style="padding:12px 16px;color:#64748b;font-size:13px;">Status</td>
+                <td style="padding:12px 16px;">
+                  <span style="display:inline-block;background:#dcfce7;color:#15803d;font-size:12px;font-weight:600;padding:3px 10px;border-radius:20px;letter-spacing:0.3px;">✔ Submitted</span>
+                </td>
+              </tr>
+            </table>
+
+            <!-- CTA Buttons -->
+            <table cellpadding="0" cellspacing="0" style="margin-top:28px;">
+              <tr>
+                <td style="padding-right:12px;">
+                  <a href="${docLink}" style="display:inline-block;background:#2563a8;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:13px 28px;border-radius:8px;letter-spacing:0.2px;">
+                    👁 View Document
+                  </a>
+                </td>
+                <td>
+                  <a href="${docLink}&download=1" style="display:inline-block;background:#f1f5f9;color:#1a3c5e;text-decoration:none;font-size:14px;font-weight:600;padding:13px 28px;border-radius:8px;border:1px solid #cbd5e1;letter-spacing:0.2px;">
+                    ⬇ Download
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:28px 0 0 0;color:#94a3b8;font-size:12px;line-height:1.6;">
+              This is an automated notification from ${appTitle}. Please do not reply to this email.<br>
+              If you have questions, contact your Corporate MR.
+            </p>
+          </td>
+        </tr>
+
+        <!-- FOOTER -->
+        <tr>
+          <td style="background:#f8fafc;padding:20px 36px;border-top:1px solid #e2e8f0;text-align:center;">
+            <p style="margin:0;color:#94a3b8;font-size:11px;">© ${new Date().getFullYear()} Polyplastics India Pvt. Ltd. &nbsp;|&nbsp; ${appTitle}</p>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
 
         const recipients = [
-          { to: submitterEmail, role: "submitter" },
+          { to: submitterEmail, name: submitterName, role: "submitter" },
         ];
         if (reqEmail && reqEmail !== submitterEmail) {
-          recipients.push({ to: reqEmail, role: "requester" });
+          recipients.push({ to: reqEmail, name: reqName || "Requester", role: "requester" });
         }
 
         for (const r of recipients) {
-          const greeting = r.role === "requester"
-            ? `<p>Dear ${reqName || "Requester"},</p><p>Your document request has been submitted successfully.</p>`
-            : `<p>Dear ${submitterName},</p><p>The document you submitted has been registered.</p>`;
+          const greetingLine = r.role === "requester"
+            ? `Your document request has been submitted and registered successfully.`
+            : `The document you submitted has been registered in the system.`;
+          // Inject personalised greeting into the template
+          const html = bodyBase.replace(
+            "<!-- GREETING_PLACEHOLDER -->",
+            `<p style="margin:0 0 20px 0;color:#334155;font-size:14px;line-height:1.6;">
+              Dear <strong>${r.name}</strong>,<br>${greetingLine}
+            </p>`
+          );
           await sendMailFn({
             to:      r.to,
             subject: `[${appTitle}] Document Submitted – ${refNo}`,
-            html:    greeting + bodyBase,
+            html,
           }).catch(e => console.warn("Email to", r.to, "failed:", e.message));
         }
       } catch (mailErr) {
@@ -1995,6 +2105,133 @@ async function handleDeleteRecords() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// DATA RETENTION & WIPE  (superadmin)
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function loadRetentionSettings() {
+  if (!isSuperadmin()) return;
+  try {
+    const snap = await getDoc(doc(db, "appSettings", "retention")).catch(() => null);
+    if (snap?.exists()) {
+      const r = snap.data();
+      document.getElementById("retentionDays").value = r.days ?? 90;
+      ["submitted","returned","completed"].forEach(s => {
+        const el = document.getElementById("retain" + s.charAt(0).toUpperCase() + s.slice(1));
+        if (el) el.checked = r.statuses ? r.statuses.includes(s) : true;
+      });
+      const lastRun = r.lastRunAt?.toDate ? r.lastRunAt.toDate() : null;
+      document.getElementById("retentionLastRun").textContent =
+        lastRun ? "Last run: " + lastRun.toLocaleString("en-IN") : "Never run";
+      if (r.days) {
+        const next = new Date(); next.setDate(next.getDate() + 1);
+        document.getElementById("retentionNextRun").textContent = "Next run: tomorrow (daily)";
+      }
+    }
+  } catch(e) { console.warn("loadRetentionSettings:", e); }
+}
+
+async function saveRetentionSettings() {
+  if (!isSuperadmin()) return;
+  const days = parseInt(document.getElementById("retentionDays").value) || 0;
+  const statuses = ["submitted","returned","completed"].filter(s => {
+    const el = document.getElementById("retain" + s.charAt(0).toUpperCase() + s.slice(1));
+    return el?.checked;
+  });
+  const msgEl = document.getElementById("retentionMsg");
+  msgEl.classList.add("d-none");
+  try {
+    await setDoc(doc(db, "appSettings", "retention"), { days, statuses }, { merge: true });
+    msgEl.className = "alert alert-success mt-3";
+    msgEl.textContent = `✅ Retention policy saved: delete after ${days} days${days === 0 ? " (disabled)" : ""}.`;
+    msgEl.classList.remove("d-none");
+  } catch(e) {
+    msgEl.className = "alert alert-danger mt-3";
+    msgEl.textContent = e.message;
+    msgEl.classList.remove("d-none");
+  }
+}
+
+async function runRetentionNow() {
+  if (!isSuperadmin()) return;
+  const spin = document.getElementById("retentionSpinner");
+  const btn  = document.getElementById("runRetentionNowBtn");
+  const msgEl = document.getElementById("retentionMsg");
+  spin.classList.remove("d-none"); btn.disabled = true;
+  msgEl.classList.add("d-none");
+  try {
+    const fn = httpsCallable(functions, "runRetentionDelete");
+    const res = await fn();
+    msgEl.className = "alert alert-success mt-3";
+    msgEl.textContent = `✅ Deleted ${res.data.deleted ?? 0} document(s) and ${res.data.files ?? 0} file(s).`;
+    msgEl.classList.remove("d-none");
+    await setDoc(doc(db, "appSettings", "retention"), { lastRunAt: serverTimestamp() }, { merge: true });
+    document.getElementById("retentionLastRun").textContent = "Last run: just now";
+  } catch(e) {
+    msgEl.className = "alert alert-danger mt-3";
+    msgEl.textContent = "Error: " + e.message;
+    msgEl.classList.remove("d-none");
+  } finally {
+    spin.classList.add("d-none"); btn.disabled = false;
+  }
+}
+
+// ── Wipe modal helpers ───────────────────────────────────────────────────────
+let _wipePendingMode = null;
+
+function openWipeModal(mode) {
+  _wipePendingMode = mode;
+  const titles = {
+    docs:  "Wipe All Documents",
+    full:  "Full App Reset",
+  };
+  const descs = {
+    docs: "This will permanently delete <strong>ALL documents</strong>, their uploaded files in Firebase Storage, and all activity logs. The reference counter will be reset to 0. <br><br>Plants, departments, users, and categories are NOT affected.",
+    full: "This will permanently delete <strong>ALL documents, plants, departments, and categories</strong>. User accounts and system settings (email, branding) are preserved. <br><br>Use this to start the app completely fresh.",
+  };
+  document.getElementById("wipeModalTitle").textContent = titles[mode] || "Confirm Wipe";
+  document.getElementById("wipeModalDesc").innerHTML   = descs[mode]  || "";
+  document.getElementById("wipeConfirmLabel").textContent = titles[mode];
+  document.getElementById("wipeConfirmInput").value = "";
+  document.getElementById("wipeModalError").classList.add("d-none");
+  new bootstrap.Modal(document.getElementById("wipeModal")).show();
+}
+
+async function executeWipe() {
+  if (!isSuperadmin()) return;
+  const input = document.getElementById("wipeConfirmInput").value.trim();
+  const errEl = document.getElementById("wipeModalError");
+  errEl.classList.add("d-none");
+  if (input !== "WIPE") {
+    errEl.textContent = "Please type WIPE (all caps) to confirm.";
+    errEl.classList.remove("d-none");
+    return;
+  }
+  const spin = document.getElementById("wipeSpinner");
+  const btn  = document.getElementById("confirmWipeBtn");
+  spin.classList.remove("d-none"); btn.disabled = true;
+  try {
+    const fn = httpsCallable(functions, "wipeAppData");
+    const res = await fn({ mode: _wipePendingMode });
+    bootstrap.Modal.getInstance(document.getElementById("wipeModal")).hide();
+    showToast(`✅ Wipe complete: ${res.data.deleted ?? 0} docs deleted.`, "success");
+    loadDashboard();
+  } catch(e) {
+    errEl.textContent = "Error: " + (e.message || "Wipe failed.");
+    errEl.classList.remove("d-none");
+  } finally {
+    spin.classList.add("d-none"); btn.disabled = false;
+  }
+}
+
+function setupDangerZone() {
+  document.getElementById("wipeDocsBtn")?.addEventListener("click", () => openWipeModal("docs"));
+  document.getElementById("wipeAllBtn")?.addEventListener("click",  () => openWipeModal("full"));
+  document.getElementById("confirmWipeBtn")?.addEventListener("click", executeWipe);
+  document.getElementById("saveRetentionBtn")?.addEventListener("click", saveRetentionSettings);
+  document.getElementById("runRetentionNowBtn")?.addEventListener("click", runRetentionNow);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SETTINGS
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadSettings() {
@@ -2002,6 +2239,7 @@ async function loadSettings() {
   loadDeptsTable();
   loadUsersTable();
   loadCatsTable();
+  if (isSuperadmin()) loadRetentionSettings();
 
   // Load saved settings
   const emailSnap = await getDoc(doc(db, "appSettings", "notifications")).catch(() => null);
