@@ -536,7 +536,7 @@ function buildSidebar() {
 
   const addLink = (view, icon, label) => {
     const li = document.createElement("li");
-    li.innerHTML = `<a href="#" data-view="${view}"><i class="bi ${icon}"></i>${label}</a>`;
+    li.innerHTML = `<a href="#" data-view="${view}" data-label="${label}"><i class="bi ${icon}"></i><span class="nav-label">&nbsp;${label}</span></a>`;
     nav.appendChild(li);
   };
 
@@ -711,25 +711,35 @@ function setupNavigation() {
 }
 
 function setupSidebar() {
-  // Create overlay
+  // Create overlay for mobile
   const overlay = document.createElement("div");
   overlay.className = "sidebar-overlay";
   document.body.appendChild(overlay);
 
+  const sidebar = document.getElementById("sidebar");
+  const main    = document.getElementById("mainContent");
+
+  // Restore collapsed state from localStorage
+  if (localStorage.getItem("sidebarCollapsed") === "true") {
+    sidebar.classList.add("collapsed");
+    main.classList.add("full-width");
+  }
+
   document.getElementById("menuToggle").addEventListener("click", () => {
-    document.getElementById("sidebar").classList.toggle("mobile-open");
+    sidebar.classList.toggle("mobile-open");
     overlay.classList.toggle("active");
   });
 
   document.getElementById("sidebarToggle").addEventListener("click", () => {
-    const sidebar = document.getElementById("sidebar");
-    const main = document.getElementById("mainContent");
-    sidebar.classList.toggle("collapsed");
-    main.classList.toggle("full-width");
+    const isCollapsed = sidebar.classList.toggle("collapsed");
+    main.classList.toggle("full-width", isCollapsed);
+    localStorage.setItem("sidebarCollapsed", isCollapsed);
+    // Update tooltip on toggle button
+    document.getElementById("sidebarToggle").title = isCollapsed ? "Expand sidebar" : "Collapse sidebar";
   });
 
   overlay.addEventListener("click", () => {
-    document.getElementById("sidebar").classList.remove("mobile-open");
+    sidebar.classList.remove("mobile-open");
     overlay.classList.remove("active");
   });
 }
