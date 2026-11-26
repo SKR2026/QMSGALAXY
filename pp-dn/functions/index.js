@@ -8,7 +8,10 @@
 
 const functionsBase = require("firebase-functions");
 const admin         = require("firebase-admin");
-const nodemailer    = require("nodemailer");
+
+// Lazy-load nodemailer so a missing package only breaks email, not all functions
+let nodemailer;
+try { nodemailer = require("nodemailer"); } catch(e) { console.error("nodemailer not installed:", e.message); }
 
 // Regional builder for defining functions (asia-south1 = Mumbai)
 const functions = functionsBase.region("asia-south1");
@@ -27,6 +30,7 @@ let transporter    = null;
 let cachedGmailUser = null;
 
 async function getTransporter() {
+  if (!nodemailer) throw new Error("nodemailer is not installed. Run: npm install nodemailer in the functions/ directory.");
   let gmailUser, gmailPass;
 
   if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
