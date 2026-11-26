@@ -1223,13 +1223,44 @@ async function loadMyDocuments() {
     return;
   }
 
-  tbody.innerHTML = docs.map(d => `
+  tbody.innerHTML = docs.map(d => {
+    // Support both old field (submissionDate) and new field (submittedAt)
+    const submittedTs = d.submittedAt || d.submissionDate;
+
+    // DMS assignment date: dmsUploadDate stored as "YYYY-MM-DD"
+    let dmsDateDisplay = "—";
+    let dmsDateMs = null;
+    if (d.dmsUploadDate) {
+      const parsed = new Date(d.dmsUploadDate + "T00:00:00+05:30");
+      dmsDateMs = parsed.getTime();
+      dmsDateDisplay = `<span class="small" style="white-space:nowrap">${parsed.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric",timeZone:"Asia/Kolkata"})}</span>`;
+    }
+
+    // Time taken: DMS assigned date − submitted date
+    let timeTakenDisplay = "—";
+    if (dmsDateMs && submittedTs) {
+      const submittedMs = submittedTs.toDate ? submittedTs.toDate().getTime() : new Date(submittedTs).getTime();
+      const diffMs = dmsDateMs - submittedMs;
+      if (diffMs >= 0) {
+        const days  = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+        const hours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        if (days > 0) {
+          timeTakenDisplay = `<span class="badge bg-${days <= 3 ? "success" : days <= 7 ? "warning" : "danger"} text-white" style="font-size:0.72rem;">${days}d ${hours}h</span>`;
+        } else {
+          timeTakenDisplay = `<span class="badge bg-success text-white" style="font-size:0.72rem;">${hours}h</span>`;
+        }
+      }
+    }
+
+    return `
     <tr class="mydoc-row" data-id="${d.id}">
       <td class="fw-semibold text-primary" style="white-space:nowrap">${d.submissionRefNo || "Draft"}</td>
       <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.documentTitle || "—"}</td>
       <td><span class="text-muted small">${d.categoryName || "—"}</span></td>
-      <td><span class="small" style="white-space:nowrap">${toIST(d.submissionDate)}</span></td>
+      <td><span class="small" style="white-space:nowrap">${toIST(submittedTs)}</span></td>
       <td class="fw-semibold text-success" style="white-space:nowrap">${d.officialDocNumber || `<span class="text-muted">—</span>`}</td>
+      <td>${dmsDateDisplay}</td>
+      <td>${timeTakenDisplay}</td>
       <td>${statusBadge(d.status)}</td>
       <td style="min-width:280px;padding:6px 10px">${buildHorizontalTimeline(d)}</td>
       <td>
@@ -1241,8 +1272,8 @@ async function loadMyDocuments() {
             <button class="btn-act-edit edit-doc-btn" data-id="${d.id}" title="Edit"><i class="bi bi-pencil"></i></button>` : ""}
         </div>
       </td>
-    </tr>
-  `).join("");
+    </tr>`;
+  }).join("");
 
   tbody.querySelectorAll(".view-doc-btn").forEach(b =>
     b.addEventListener("click", () => openDocModal(b.dataset.id)));
@@ -2168,6 +2199,7 @@ async function saveDocument(isDraft) {
         submissionRefNo: refNo,
         status:          "submitted",
         submittedAt:     serverTimestamp(),
+        submissionDate:  serverTimestamp(),   // keep both for backward compat
       });
 
       // ── Emails are sent ONLY when user clicks "Send Notification" button ──
