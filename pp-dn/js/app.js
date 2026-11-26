@@ -628,7 +628,7 @@ function navigateTo(view) {
   if (view === "mr")        loadMRQueue();
   if (view === "audit")     loadAuditLogs();
   if (view === "settings")  loadSettings();
-  if (view === "submit")    prepareSubmitForm();
+  if (view === "submit")    { prepareSubmitForm(); loadRecentSubmissions(); }
 
   // Close mobile sidebar
   document.getElementById("sidebar").classList.remove("mobile-open");
@@ -1844,11 +1844,15 @@ function prepareSubmitForm(docId = null) {
   document.getElementById("subByDisplay").value = currentUserData?.displayName || currentUser.email;
   document.getElementById("subEmailDisplay").value = currentUser.email;
 
-  // Live clock in date field
+  // Hide success panel, show form
+  document.getElementById("submitSuccessPanel")?.classList.add("d-none");
+  document.getElementById("submitDocForm")?.classList.remove("d-none");
+
+  // Live clock in header
   if (window._submitClock) clearInterval(window._submitClock);
   const updateDate = () => {
     const el = document.getElementById("subDateDisplay");
-    if (el) el.value = nowIST();
+    if (el) el.textContent = nowIST();
   };
   updateDate();
   window._submitClock = setInterval(updateDate, 1000);
@@ -1920,6 +1924,94 @@ function setupSubmitForm() {
     try { await saveDocument(false); }
     finally { saveDocument._saving = false; }
   });
+
+  // "New Entry" button after successful submit
+  document.getElementById("newEntryBtn").addEventListener("click", () => {
+    document.getElementById("submitSuccessPanel").classList.add("d-none");
+    document.getElementById("submitDocForm").classList.remove("d-none");
+    document.getElementById("submitDocForm").reset();
+    document.getElementById("filePreview")?.classList.add("d-none");
+    document.getElementById("submitDocMsg")?.classList.add("d-none");
+    prepareSubmitForm(null);
+  });
+}
+
+async function loadRecentSubmissions() {
+  const container = document.getElementById("recentSubmissionsBody");
+  if (!container || !currentUser) return;
+  try {
+    const snap = await getDocs(
+      query(collection(db, "documents"),
+        where("submittedBy", "==", currentUser.uid),
+        orderBy("submittedAt", "desc"),
+        limit(10))
+    );
+    if (snap.empty) {
+      container.innerHTML = `<div class="text-center text-muted py-3" style="font-size:0.85rem;">No submissions yet.</div>`;
+      return;
+    }
+    const rows = snap.docs.map(d => {
+      const doc = d.data();
+      return `<tr>
+        <td style="font-size:0.78rem;">${doc.submissionRefNo || "—"}</td>
+        <td style="font-size:0.78rem;" class="text-truncate" style="max-width:200px;">${doc.documentTitle || "—"}</td>
+        <td style="font-size:0.78rem;">${doc.plantName || "—"}</td>
+        <td style="font-size:0.78rem;">${doc.departmentName || "—"}</td>
+        <td style="font-size:0.78rem;">${statusBadge(doc.status)}</td>
+        <td style="font-size:0.78rem;">${toISTDate(doc.submittedAt)}</td>
+      </tr>`;
+    }).join("");
+    container.innerHTML = `<table class="table table-sm table-hover mb-0">
+      <thead class="table-light">
+        <tr>
+          <th style="font-size:0.75rem;">Ref No.</th>
+          <th style="font-size:0.75rem;">Document Title</th>
+          <th style="font-size:0.75rem;">Plant</th>
+          <th style="font-size:0.75rem;">Dept</th>
+          <th style="font-size:0.75rem;">Status</th>
+          <th style="font-size:0.75rem;">Submitted</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  } catch (e) {
+    // Fallback: try without orderBy (no composite index needed if no where+orderBy)
+    try {
+      const snap2 = await getDocs(
+        query(collection(db, "documents"), where("submittedBy", "==", currentUser.uid), limit(20))
+      );
+      const docs2 = snap2.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((a, b) => (b.submittedAt?.seconds || 0) - (a.submittedAt?.seconds || 0))
+        .slice(0, 10);
+      if (!docs2.length) {
+        container.innerHTML = `<div class="text-center text-muted py-3" style="font-size:0.85rem;">No submissions yet.</div>`;
+        return;
+      }
+      const rows2 = docs2.map(doc => `<tr>
+        <td style="font-size:0.78rem;">${doc.submissionRefNo || "—"}</td>
+        <td style="font-size:0.78rem;">${doc.documentTitle || "—"}</td>
+        <td style="font-size:0.78rem;">${doc.plantName || "—"}</td>
+        <td style="font-size:0.78rem;">${doc.departmentName || "—"}</td>
+        <td style="font-size:0.78rem;">${statusBadge(doc.status)}</td>
+        <td style="font-size:0.78rem;">${toISTDate(doc.submittedAt)}</td>
+      </tr>`).join("");
+      container.innerHTML = `<table class="table table-sm table-hover mb-0">
+        <thead class="table-light">
+          <tr>
+            <th style="font-size:0.75rem;">Ref No.</th>
+            <th style="font-size:0.75rem;">Document Title</th>
+            <th style="font-size:0.75rem;">Plant</th>
+            <th style="font-size:0.75rem;">Dept</th>
+            <th style="font-size:0.75rem;">Status</th>
+            <th style="font-size:0.75rem;">Submitted</th>
+          </tr>
+        </thead>
+        <tbody>${rows2}</tbody>
+      </table>`;
+    } catch(e2) {
+      container.innerHTML = `<div class="text-center text-muted py-3" style="font-size:0.85rem;">Unable to load recent submissions.</div>`;
+    }
+  }
 }
 
 function handleFileSelect(file) {
@@ -2082,21 +2174,19 @@ async function saveDocument(isDraft) {
       // (handled by sendUserNotification Cloud Function — not triggered here)
 
       // ── Success UI ───────────────────────────────────────────────────────
-      msgEl.className = "mt-2 alert alert-success";
-      msgEl.innerHTML = `✅ Document submitted! <strong>Ref: ${refNo}</strong>`;
-      msgEl.classList.remove("d-none");
       showToast(`Submitted! Ref: ${refNo}`, "success");
 
-      // Clear form after short delay
-      setTimeout(() => {
-        editingDocId = null;
-        uploadedFileRef = null;
-        if (window._submitClock) { clearInterval(window._submitClock); window._submitClock = null; }
-        document.getElementById("submitDocForm").reset();
-        document.getElementById("filePreview")?.classList.add("d-none");
-        // Re-apply auto-fills
-        prepareSubmitForm(null);
-      }, 3000);
+      // Show success panel, hide form
+      document.getElementById("submitDocForm").classList.add("d-none");
+      const successPanel = document.getElementById("submitSuccessPanel");
+      successPanel.classList.remove("d-none");
+      document.getElementById("submitSuccessRef").textContent = `Reference: ${refNo}`;
+      editingDocId = null;
+      uploadedFileRef = null;
+      if (window._submitClock) { clearInterval(window._submitClock); window._submitClock = null; }
+
+      // Refresh recent submissions
+      loadRecentSubmissions();
 
     } else {
       // Draft saved
