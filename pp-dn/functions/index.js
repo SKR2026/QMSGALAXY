@@ -388,14 +388,16 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
     // Send reminder to Corporate MR about their own pending docs
     try {
     const pendingStatuses = ["submitted", "pending_with_mr", "under_process", "resubmitted"];
+    // Single where only — avoid composite index requirement; filter status in memory
     const docsSnap = await db.collection("documents")
       .where("submittedBy", "==", uid)
-      .where("status", "in", pendingStatuses)
       .get();
 
-    if (docsSnap.empty) return { success: false, message: "No pending documents found." };
+    const docs = docsSnap.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .filter((d) => pendingStatuses.includes(d.status));
 
-    const docs = docsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    if (!docs.length) return { success: false, message: "No pending documents found." };
 
     const rows = docs.map((doc) => `
       <tr>

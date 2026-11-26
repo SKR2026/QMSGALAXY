@@ -1517,6 +1517,10 @@ async function openDocModal(docId) {
       <button class="btn btn-success" id="modalAssignBtn"><i class="bi bi-hash me-1"></i>Assign Number</button>
       <button class="btn btn-warning" id="modalReturnBtn"><i class="bi bi-arrow-return-left me-1"></i>Return</button>`;
   }
+  // Submitter sees Re-upload button when doc is returned for correction
+  if (isUser() && d.status === "returned_for_correction" && d.submittedBy === currentUser?.uid) {
+    footer += `<button class="btn btn-warning" id="modalReuploadBtn"><i class="bi bi-upload me-1"></i>Re-upload Corrected Doc</button>`;
+  }
   document.getElementById("docModalFooter").innerHTML = footer;
 
   document.getElementById("modalAssignBtn")?.addEventListener("click", () => {
@@ -1526,6 +1530,10 @@ async function openDocModal(docId) {
   document.getElementById("modalReturnBtn")?.addEventListener("click", () => {
     bootstrap.Modal.getInstance(document.getElementById("docModal")).hide();
     openReturnModal(docId);
+  });
+  document.getElementById("modalReuploadBtn")?.addEventListener("click", () => {
+    bootstrap.Modal.getInstance(document.getElementById("docModal")).hide();
+    openReuploadModal(docId, d);
   });
 
   // Log download attempt
@@ -1639,6 +1647,98 @@ document.getElementById("confirmReturnBtn").addEventListener("click", async () =
     showError("returnError", e.message);
   } finally {
     spin.classList.add("d-none");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RE-UPLOAD CORRECTED DOCUMENT (Submitter, returned docs only)
+// ═══════════════════════════════════════════════════════════════════════════
+let _reuploadDocId   = null;
+let _reuploadFileRef = null;
+
+function openReuploadModal(docId, docData) {
+  _reuploadDocId   = docId;
+  _reuploadFileRef = null;
+  document.getElementById("reuploadFileName").textContent = "";
+  document.getElementById("reuploadFileInput").value = "";
+  document.getElementById("reuploadProgress").classList.add("d-none");
+  document.getElementById("reuploadBar").style.width = "0%";
+  hideError("reuploadError");
+  // Show current remarks so submitter knows what to fix
+  const remarksEl = document.getElementById("reuploadRemarks");
+  remarksEl.textContent = docData.corporateMRRemarks
+    ? `Corporate MR Remarks: "${docData.corporateMRRemarks}"`
+    : "";
+  new bootstrap.Modal(document.getElementById("reuploadModal")).show();
+}
+
+document.getElementById("reuploadFileInput")?.addEventListener("change", (e) => {
+  _reuploadFileRef = e.target.files[0] || null;
+  document.getElementById("reuploadFileName").textContent = _reuploadFileRef
+    ? `Selected: ${_reuploadFileRef.name}`
+    : "";
+});
+
+document.getElementById("confirmReuploadBtn")?.addEventListener("click", async () => {
+  if (!_reuploadDocId) return;
+  if (!_reuploadFileRef) { showError("reuploadError", "Please select a file to upload."); return; }
+
+  const btn  = document.getElementById("confirmReuploadBtn");
+  const spin = document.getElementById("reuploadSpinner");
+  const prog = document.getElementById("reuploadProgress");
+  const bar  = document.getElementById("reuploadBar");
+  hideError("reuploadError");
+  btn.disabled = true;
+  spin.classList.remove("d-none");
+  prog.classList.remove("d-none");
+
+  try {
+    // Upload new file to same document path
+    const storageRef = ref(storage, `documents/${currentUser.uid}/${_reuploadDocId}/${_reuploadFileRef.name}`);
+    const uploadTask = uploadBytesResumable(storageRef, _reuploadFileRef);
+
+    await new Promise((resolve, reject) => {
+      uploadTask.on("state_changed",
+        snap => { bar.style.width = Math.round((snap.bytesTransferred / snap.totalBytes) * 100) + "%"; },
+        reject,
+        resolve
+      );
+    });
+
+    const newFileUrl    = await getDownloadURL(storageRef);
+    const submitterName = currentUserData?.displayName || currentUser.email;
+
+    // Read existing history first, then update in one write
+    const existingSnap = await getDoc(doc(db, "documents", _reuploadDocId));
+    const existingHistory = existingSnap.data()?.statusHistory || [];
+    const newHistoryEntry = {
+      status:        "resubmitted",
+      changedBy:     currentUser.uid,
+      changedByName: submitterName,
+      changedAt:     nowIST(),
+      note:          "Corrected document re-uploaded",
+    };
+
+    await updateDoc(doc(db, "documents", _reuploadDocId), {
+      fileUrl:       newFileUrl,
+      fileName:      _reuploadFileRef.name,
+      fileSize:      _reuploadFileRef.size,
+      status:        "resubmitted",
+      updatedAt:     serverTimestamp(),
+      resubmittedAt: serverTimestamp(),
+      statusHistory: [...existingHistory, newHistoryEntry],
+    });
+
+    bootstrap.Modal.getInstance(document.getElementById("reuploadModal")).hide();
+    showToast("✅ Corrected document uploaded. Document resubmitted for review.", "success");
+    loadDashboard();
+  } catch (e) {
+    console.error("Reupload error:", e);
+    showError("reuploadError", e.message || "Upload failed. Please try again.");
+  } finally {
+    btn.disabled = false;
+    spin.classList.add("d-none");
+    prog.classList.add("d-none");
   }
 });
 
