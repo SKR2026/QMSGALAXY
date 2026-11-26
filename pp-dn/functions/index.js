@@ -237,22 +237,53 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
 
   if (isMR) {
     // ── Corporate MR / Superadmin ────────────────────────────────────────────
-    // Fetch all completed docs then email each submitter their DMS numbers.
+    // Send MR a summary of all pending docs + email submitters about assigned docs
     try {
-      // Get completed docs — fetch all then filter in memory to avoid index issues
       const allDocsSnap = await db.collection("documents").get();
-      const completedDocs = allDocsSnap.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((d) => ["completed","number_assigned","closed"].includes(d.status));
+      const allDocs = allDocsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-      if (!completedDocs.length) {
-        return { success: false, message: "No assigned documents found to notify submitters about." };
+      // Pending docs = need MR action
+      const pendingDocs = allDocs.filter((d) =>
+        ["submitted","pending_with_mr","under_process","resubmitted"].includes(d.status));
+
+      // Completed docs = notify submitters
+      const completedDocs = allDocs.filter((d) =>
+        ["completed","number_assigned","closed"].includes(d.status));
+
+      if (!pendingDocs.length && !completedDocs.length) {
+        return { success: false, message: "No documents found." };
       }
 
       // Fetch all users once so we can look up emails reliably
       const usersSnap = await db.collection("users").get();
       const usersMap  = {};
       usersSnap.docs.forEach(d => { usersMap[d.id] = d.data(); });
+
+      // Send MR a pending docs summary email
+      if (pendingDocs.length && user.email) {
+        const pendingRows = pendingDocs.map((doc) => `
+          <tr>
+            <td>${doc.submissionRefNo || "-"}</td>
+            <td>${doc.documentTitle || "-"}</td>
+            <td>${doc.categoryName || "-"}</td>
+            <td>${doc.plantName || "-"}</td>
+            <td>${doc.departmentName || "-"}</td>
+            <td>${(doc.status || "").replace(/_/g, " ").toUpperCase()}</td>
+          </tr>`).join("");
+        const pendingHtml = emailWrapper(
+          "Pending Documents Summary",
+          `<p>Dear ${user.displayName || "Corporate MR"},</p>
+           <p>You have <strong>${pendingDocs.length}</strong> document(s) pending your action:</p>
+           <table>
+             <thead><tr><th>Ref. No.</th><th>Document Title</th><th>Category</th><th>Plant</th><th>Department</th><th>Status</th></tr></thead>
+             <tbody>${pendingRows}</tbody>
+           </table>
+           <a class="btn" href="${settings.appUrl || "https://your-app.web.app"}">Open CDRTS</a>`
+        );
+        try {
+          await sendEmail(user.email, `[CDRTS] ${pendingDocs.length} Pending Document(s) Awaiting Action`, pendingHtml);
+        } catch (e) { console.warn("MR pending summary email failed:", e.message); }
+      }
 
       // Group completed docs by submitter uid
       const bySubmitter = {};
@@ -341,16 +372,20 @@ exports.sendUserNotification = functions.https.onCall(async (data, context) => {
         details:  `Sent DMS assignment summary to ${totalEmailsSent} submitter(s) covering ${completedDocs.length} document(s)`,
       });
 
-      if (totalEmailsSent === 0) {
+      const parts = [];
+      if (pendingDocs.length) parts.push(`Pending summary sent to your email (${pendingDocs.length} docs).`);
+      if (totalEmailsSent > 0) parts.push(`DMS assignment notified to ${totalEmailsSent} submitter(s).`);
+
+      if (!parts.length) {
         return {
           success: false,
           message: errors.length
-            ? `Emails failed to send. Check Gmail credentials in Settings → Email Configuration. Error: ${errors[0]}`
-            : "No submitter emails found.",
+            ? `Emails failed. Check Gmail credentials in Settings. Error: ${errors[0]}`
+            : pendingDocs.length ? "Pending summary sent to your email." : "No submitter emails found.",
         };
       }
 
-      return { success: true, count: completedDocs.length, emailsSent: totalEmailsSent };
+      return { success: true, count: pendingDocs.length + completedDocs.length, emailsSent: totalEmailsSent, message: parts.join(" ") };
 
     } catch (err) {
       if (err instanceof HttpsError) throw err;
