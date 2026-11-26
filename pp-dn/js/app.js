@@ -1261,9 +1261,9 @@ async function loadMyDocuments() {
     }
 
     return `
-    <tr class="mydoc-row" data-id="${d.id}">
+    <tr class="mydoc-row" data-id="${d.id}" data-cat="${d.categoryName || ""}" data-status="${d.status || ""}">
       <td class="fw-semibold text-primary" style="white-space:nowrap">${d.submissionRefNo || "Draft"}</td>
-      <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.documentTitle || "—"}</td>
+      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${d.documentTitle || ""}">${d.documentTitle || "—"}</td>
       <td><span class="text-muted small">${d.categoryName || "—"}</span></td>
       <td><span class="small" style="white-space:nowrap">${toIST(submittedTs)}</span></td>
       <td class="fw-semibold text-success" style="white-space:nowrap">${d.officialDocNumber || `<span class="text-muted">—</span>`}</td>
@@ -1288,13 +1288,32 @@ async function loadMyDocuments() {
   tbody.querySelectorAll(".edit-doc-btn").forEach(b =>
     b.addEventListener("click", () => { navigateTo("submit"); prepareSubmitForm(b.dataset.id); }));
 
-  // Search
-  document.getElementById("myDocsSearch").oninput = e => {
-    const q = e.target.value.toLowerCase();
+  // Populate category filter from loaded docs
+  const catSel = document.getElementById("myDocsCatFilter");
+  const existingCats = new Set(docs.map(d => d.categoryName).filter(Boolean));
+  catSel.innerHTML = `<option value="">All Categories</option>`;
+  [...existingCats].sort().forEach(c => {
+    catSel.innerHTML += `<option value="${c}">${c}</option>`;
+  });
+
+  function applyMyDocsFilters() {
+    const q      = document.getElementById("myDocsSearch").value.toLowerCase();
+    const cat    = document.getElementById("myDocsCatFilter").value;
+    const status = document.getElementById("myDocsStatusFilter").value;
     tbody.querySelectorAll(".mydoc-row").forEach(row => {
-      row.style.display = row.textContent.toLowerCase().includes(q) ? "" : "none";
+      const text    = row.textContent.toLowerCase();
+      const rowCat  = row.dataset.cat || "";
+      const rowStat = row.dataset.status || "";
+      const matchQ  = !q      || text.includes(q);
+      const matchC  = !cat    || rowCat === cat;
+      const matchS  = !status || rowStat === status;
+      row.style.display = (matchQ && matchC && matchS) ? "" : "none";
     });
-  };
+  }
+
+  document.getElementById("myDocsSearch").oninput        = applyMyDocsFilters;
+  document.getElementById("myDocsCatFilter").onchange    = applyMyDocsFilters;
+  document.getElementById("myDocsStatusFilter").onchange = applyMyDocsFilters;
 }
 
 // ── Horizontal timeline builder (numbered circles, perfectly aligned) ─────────
@@ -1831,20 +1850,47 @@ async function loadMRQueue(searchText = "") {
 
   const tbody = document.getElementById("mrTableBody");
   if (!docs.length) {
-    tbody.innerHTML = `<tr><td colspan="9" class="text-center py-4 text-muted">No documents in queue.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12" class="text-center py-4 text-muted">No documents in queue.</td></tr>`;
     return;
   }
 
   tbody.innerHTML = docs.map(d => {
     const submittedTs = d.submittedAt || d.submissionDate;
+
+    // DMS assignment date + time taken (same logic as My Documents)
+    let mrDmsDate = "—", mrDmsMs = null;
+    if (d.assignmentDate) {
+      const p = d.assignmentDate.toDate ? d.assignmentDate.toDate() : new Date(d.assignmentDate);
+      mrDmsMs = p.getTime();
+      mrDmsDate = `<span class="small" style="white-space:nowrap">${p.toLocaleString("en-IN",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit",timeZone:"Asia/Kolkata"})}</span>`;
+    } else if (d.dmsUploadDate) {
+      const p = new Date(d.dmsUploadDate + "T00:00:00+05:30");
+      mrDmsMs = p.getTime();
+      mrDmsDate = `<span class="small">${p.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric",timeZone:"Asia/Kolkata"})}</span>`;
+    }
+    let mrTimeTaken = "—";
+    if (mrDmsMs && submittedTs) {
+      const sMs = submittedTs.toDate ? submittedTs.toDate().getTime() : new Date(submittedTs).getTime();
+      const diff = mrDmsMs - sMs;
+      if (diff >= 0) {
+        const totalMins = Math.floor(diff / 60000);
+        const days = Math.floor(totalMins / 1440), hrs = Math.floor((totalMins % 1440) / 60), mins = totalMins % 60;
+        const lbl = days > 0 ? `${days}d ${hrs}h` : hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
+        mrTimeTaken = `<span class="badge bg-${days <= 3 ? "success" : days <= 7 ? "warning" : "danger"} text-white" style="font-size:0.72rem;">${lbl}</span>`;
+      }
+    }
+
     return `
     <tr>
       <td class="fw-semibold text-primary" style="white-space:nowrap">${d.submissionRefNo || "—"}</td>
-      <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.documentTitle || "—"}</td>
+      <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${d.documentTitle||""}">${d.documentTitle || "—"}</td>
+      <td><span class="text-muted small">${d.categoryName || "—"}</span></td>
       <td><span class="small">${d.plantName || "—"}<br><span class="text-muted">${d.departmentName || ""}</span></span></td>
       <td>${d.submittedByName || "—"}</td>
       <td><span class="small" style="white-space:nowrap">${toIST(submittedTs)}</span></td>
       <td class="fw-semibold text-success" style="white-space:nowrap">${d.officialDocNumber || "—"}</td>
+      <td>${mrDmsDate}</td>
+      <td>${mrTimeTaken}</td>
       <td>${statusBadge(d.status)}</td>
       <td style="min-width:260px;padding:4px 8px">${buildHorizontalTimeline(d)}</td>
       <td>
