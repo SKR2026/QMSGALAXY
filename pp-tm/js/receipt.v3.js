@@ -257,7 +257,7 @@ window.openReceiptModal = async (dispatchDocId) => {
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop";
   backdrop.innerHTML = `
-    <div class="modal">
+    <div class="modal" style="max-width:900px;width:96vw">
       <div class="modal-header">
         <span>📥 Confirm Receipt — <span class="dispatch-id">${dp.dispatchId}</span></span>
         <button class="btn-close">✕</button>
@@ -290,19 +290,19 @@ window.openReceiptModal = async (dispatchDocId) => {
         <div class="form-row single" style="margin-bottom:.5rem">
           <div class="form-group">
             <label style="font-weight:700;color:#1565c0">📋 Item-wise Receipt</label>
-            <div class="table-wrap" style="margin-top:.4rem">
-              <table id="rItemsTable" style="width:100%;border-collapse:collapse;font-size:.87rem">
+            <div style="margin-top:.4rem;overflow-x:visible">
+              <table id="rItemsTable" style="width:100%;border-collapse:collapse;font-size:.86rem;table-layout:fixed">
                 <thead>
                   <tr style="background:#e3f2fd">
-                    <th style="padding:.45rem .6rem;text-align:left;border:1px solid #90caf9">#</th>
-                    <th style="padding:.45rem .6rem;text-align:left;border:1px solid #90caf9">Part No.</th>
-                    <th style="padding:.45rem .6rem;text-align:left;border:1px solid #90caf9">Part Name</th>
-                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Dispatched</th>
-                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Unit</th>
-                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Boxes Sent</th>
-                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Qty Received *</th>
-                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Boxes Recd</th>
-                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Diff</th>
+                    <th style="padding:.4rem .5rem;text-align:center;border:1px solid #90caf9;width:36px">#</th>
+                    <th style="padding:.4rem .5rem;text-align:left;border:1px solid #90caf9;width:90px">Part No.</th>
+                    <th style="padding:.4rem .5rem;text-align:left;border:1px solid #90caf9">Part Name</th>
+                    <th style="padding:.4rem .5rem;text-align:center;border:1px solid #90caf9;width:80px">Dispatched</th>
+                    <th style="padding:.4rem .5rem;text-align:center;border:1px solid #90caf9;width:55px">Unit</th>
+                    <th style="padding:.4rem .5rem;text-align:center;border:1px solid #90caf9;width:75px">Boxes Sent</th>
+                    <th style="padding:.4rem .5rem;text-align:center;border:1px solid #90caf9;width:110px">Qty Received *</th>
+                    <th style="padding:.4rem .5rem;text-align:center;border:1px solid #90caf9;width:85px">Boxes Recd</th>
+                    <th style="padding:.4rem .5rem;text-align:center;border:1px solid #90caf9;width:70px">Diff</th>
                   </tr>
                 </thead>
                 <tbody id="rItemsBody">
