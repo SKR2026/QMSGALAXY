@@ -119,7 +119,8 @@ export async function sendReceiptEmail(dispatch, receipt, user) {
       date:          dispatch.date,
       fromPlantName: dispatch.fromPlantName,
       toPlantName:   dispatch.toPlantName,
-      toPlantId:     dispatch.toPlantId,           // ← for auto plant-contact lookup
+      fromPlantId:   dispatch.fromPlantId,         // ← notify from-plant contacts
+      toPlantId:     dispatch.toPlantId,           // ← notify to-plant contacts
       material:      dispatch.material,
       qtyDispatched: dispatch.qtyDispatched,
       unit:          dispatch.unit,
@@ -132,5 +133,7 @@ export async function sendReceiptEmail(dispatch, receipt, user) {
       receivedByName:  user.name,
       receiverEmail:   user.email || "",           // ← auto-CC the receiver
     },
+    // Plant notify contacts collected client-side (from both plants)
+    plantNotifyEmails: receipt.plantNotifyEmails || [],
   });
 }

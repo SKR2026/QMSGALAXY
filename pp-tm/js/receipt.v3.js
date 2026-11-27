@@ -454,9 +454,31 @@ async function saveReceipt(backdrop, dispatchDocId, dp, user) {
     );
     backdrop.remove();
 
-    sendReceiptEmail(dp,{arrivalDate:arrDate,arrivalTime:arrTime,qtyReceived:qtyRecv,receiptRemarks:remarks},user)
-      .then(r=>{ if(r.sent) window.showToast("📧 Notification sent.","info",2500); })
-      .catch(()=>{});
+    // Collect notifyPersons emails from both from-plant and to-plant
+    (async () => {
+      try {
+        const plantNotifyEmails = [];
+        const plantIds = [dp.fromPlantId, dp.toPlantId].filter(Boolean);
+        await Promise.all(plantIds.map(async (pid) => {
+          const pSnap = await getDoc(doc(db, "plants", pid));
+          if (!pSnap.exists()) return;
+          const persons = pSnap.data().notifyPersons || [];
+          persons.forEach(p => {
+            (p.emails || []).forEach(e => {
+              if (e && !plantNotifyEmails.includes(e)) plantNotifyEmails.push(e);
+            });
+          });
+        }));
+        return sendReceiptEmail(
+          dp,
+          { arrivalDate:arrDate, arrivalTime:arrTime, qtyReceived:qtyRecv, receiptRemarks:remarks, plantNotifyEmails },
+          user
+        );
+      } catch(err) {
+        console.warn("Plant notify fetch failed, sending without plant contacts:", err);
+        return sendReceiptEmail(dp,{arrivalDate:arrDate,arrivalTime:arrTime,qtyReceived:qtyRecv,receiptRemarks:remarks},user);
+      }
+    })().then(r=>{ if(r&&r.sent) window.showToast("📧 Notification sent.","info",2500); }).catch(()=>{});
 
     const user2=window.__ptmsUser;
     const pend=document.querySelector("#pendingList");
