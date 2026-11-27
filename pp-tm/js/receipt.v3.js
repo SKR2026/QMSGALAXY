@@ -286,17 +286,72 @@ window.openReceiptModal = async (dispatchDocId) => {
             <input type="time" id="rArrTime" value="${now}">
           </div>
         </div>
-        <div class="form-row">
+        <!-- Item-wise receipt table -->
+        <div class="form-row single" style="margin-bottom:.5rem">
           <div class="form-group">
-            <label>Quantity Received *</label>
-            <input type="number" id="rQtyRecv" placeholder="0.00" min="0" step="0.01" value="${dp.qtyDispatched}">
-          </div>
-          <div class="form-group">
-            <label>No. of Boxes/Bags Received</label>
-            <input type="number" id="rBoxesRecv" placeholder="0" min="0" value="${dp.boxes||0}">
+            <label style="font-weight:700;color:#1565c0">📋 Item-wise Receipt</label>
+            <div class="table-wrap" style="margin-top:.4rem">
+              <table id="rItemsTable" style="width:100%;border-collapse:collapse;font-size:.87rem">
+                <thead>
+                  <tr style="background:#e3f2fd">
+                    <th style="padding:.45rem .6rem;text-align:left;border:1px solid #90caf9">#</th>
+                    <th style="padding:.45rem .6rem;text-align:left;border:1px solid #90caf9">Part No.</th>
+                    <th style="padding:.45rem .6rem;text-align:left;border:1px solid #90caf9">Part Name</th>
+                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Dispatched</th>
+                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Unit</th>
+                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Boxes Sent</th>
+                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Qty Received *</th>
+                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Boxes Recd</th>
+                    <th style="padding:.45rem .6rem;text-align:center;border:1px solid #90caf9">Diff</th>
+                  </tr>
+                </thead>
+                <tbody id="rItemsBody">
+                ${(() => {
+                  const items = dp.items && dp.items.length
+                    ? dp.items
+                    : [{ partNo: "—", partName: dp.material || "—", qty: dp.qtyDispatched, unit: dp.unit, boxes: dp.boxes || 0 }];
+                  return items.map((it, i) => `
+                    <tr data-idx="${i}" style="${i%2===1?'background:#f8fbff':''}">
+                      <td style="padding:.4rem .6rem;border:1px solid #d0dff0;text-align:center;color:#666">${i+1}</td>
+                      <td style="padding:.4rem .6rem;border:1px solid #d0dff0;font-weight:600;color:#1565c0">${it.partNo||'—'}</td>
+                      <td style="padding:.4rem .6rem;border:1px solid #d0dff0">${it.partName||it.description||'—'}</td>
+                      <td style="padding:.4rem .6rem;border:1px solid #d0dff0;text-align:center;font-weight:700">${it.qty}</td>
+                      <td style="padding:.4rem .6rem;border:1px solid #d0dff0;text-align:center;color:#555">${it.unit||dp.unit||''}</td>
+                      <td style="padding:.4rem .6rem;border:1px solid #d0dff0;text-align:center;color:#555">${it.boxes||0}</td>
+                      <td style="padding:.4rem .6rem;border:1px solid #d0dff0;text-align:center">
+                        <input type="number" class="ri-qty" data-disp="${it.qty}" data-unit="${it.unit||dp.unit||''}"
+                          value="${it.qty}" min="0" step="0.01"
+                          style="width:80px;padding:.3rem .4rem;border:1.5px solid #90caf9;border-radius:6px;text-align:center;font-size:.87rem">
+                      </td>
+                      <td style="padding:.4rem .6rem;border:1px solid #d0dff0;text-align:center">
+                        <input type="number" class="ri-boxes" value="${it.boxes||0}" min="0"
+                          style="width:65px;padding:.3rem .4rem;border:1.5px solid #cde;border-radius:6px;text-align:center;font-size:.87rem">
+                      </td>
+                      <td class="ri-diff" style="padding:.4rem .6rem;border:1px solid #d0dff0;text-align:center;font-weight:700;color:#2e7d32">0</td>
+                    </tr>`).join("");
+                })()}
+                </tbody>
+                <tfoot>
+                  <tr style="background:#e8f5e9;font-weight:700">
+                    <td colspan="3" style="padding:.5rem .6rem;border:1px solid #90caf9;text-align:right;color:#1b5e20">Total</td>
+                    <td id="rTotalDisp" style="padding:.5rem .6rem;border:1px solid #90caf9;text-align:center">${
+                      (dp.items && dp.items.length ? dp.items.reduce((s,it)=>s+(parseFloat(it.qty)||0),0) : dp.qtyDispatched)
+                    }</td>
+                    <td style="padding:.5rem .6rem;border:1px solid #90caf9"></td>
+                    <td style="padding:.5rem .6rem;border:1px solid #90caf9"></td>
+                    <td id="rTotalRecv" style="padding:.5rem .6rem;border:1px solid #90caf9;text-align:center">${
+                      (dp.items && dp.items.length ? dp.items.reduce((s,it)=>s+(parseFloat(it.qty)||0),0) : dp.qtyDispatched)
+                    }</td>
+                    <td style="padding:.5rem .6rem;border:1px solid #90caf9"></td>
+                    <td id="rTotalDiff" style="padding:.5rem .6rem;border:1px solid #90caf9;text-align:center;color:#2e7d32">0</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
           </div>
         </div>
-        <div class="form-row single">
+
+        <div class="form-row single" style="margin-bottom:.35rem">
           <div class="form-group">
             <label>Remarks / Condition Notes</label>
             <textarea id="rRemarks" placeholder="Note any shortage, excess, damaged goods…"></textarea>
@@ -326,9 +381,6 @@ window.openReceiptModal = async (dispatchDocId) => {
           </div>
         </div>
 
-        <div id="receiptCalc" class="card mt-1" style="background:#e3f2fd;border:1px solid #90caf9;display:none">
-          <div class="card-body" style="padding:.6rem 1rem;font-size:.88rem" id="receiptCalcContent"></div>
-        </div>
         <div id="receiptFormError" class="error-msg hidden mt-1"></div>
       </div>
       <div class="modal-footer">
@@ -377,20 +429,39 @@ window.openReceiptModal = async (dispatchDocId) => {
   backdrop.querySelector("#rPhotoGal").addEventListener("change", e => addFiles(e.target.files));
   backdrop.__photos = selectedFiles;
 
-  // ── Live diff calc ────────────────────────────────────────────
-  const qtyEl = backdrop.querySelector("#rQtyRecv");
-  const calcEl = backdrop.querySelector("#receiptCalc");
-  const calcContent = backdrop.querySelector("#receiptCalcContent");
-  qtyEl.addEventListener("input", () => {
-    const recv = parseFloat(qtyEl.value);
-    if (!isNaN(recv)) {
-      const diff = recv - dp.qtyDispatched;
-      const color = diff < 0 ? "#c62828" : diff > 0 ? "#1565c0" : "#2e7d32";
-      const label = diff < 0 ? "⚠️ Shortage" : diff > 0 ? "ℹ️ Excess" : "✅ Exact Match";
-      calcContent.innerHTML = `${label}: <strong style="color:${color}">${Math.abs(diff)} ${dp.unit}</strong>`;
-      calcEl.style.display = "";
+  // ── Live item-wise diff calc ──────────────────────────────────
+  function recalcItemDiffs() {
+    let totalDisp = 0, totalRecv = 0;
+    backdrop.querySelectorAll("#rItemsBody tr[data-idx]").forEach(row => {
+      const disp = parseFloat(row.querySelector(".ri-qty").dataset.disp) || 0;
+      const recv = parseFloat(row.querySelector(".ri-qty").value) || 0;
+      const diff = recv - disp;
+      const diffCell = row.querySelector(".ri-diff");
+      if (Math.abs(diff) < 0.001) {
+        diffCell.textContent = "✅";
+        diffCell.style.color = "#2e7d32";
+      } else {
+        diffCell.textContent = (diff > 0 ? "+" : "") + diff.toFixed(2);
+        diffCell.style.color = diff < 0 ? "#c62828" : "#1565c0";
+      }
+      totalDisp += disp;
+      totalRecv += recv;
+    });
+    const totalDiff = totalRecv - totalDisp;
+    const tDiffEl = backdrop.querySelector("#rTotalDiff");
+    backdrop.querySelector("#rTotalRecv").textContent = totalRecv.toFixed(2);
+    if (Math.abs(totalDiff) < 0.001) {
+      tDiffEl.textContent = "✅";
+      tDiffEl.style.color = "#2e7d32";
+    } else {
+      tDiffEl.textContent = (totalDiff > 0 ? "+" : "") + totalDiff.toFixed(2);
+      tDiffEl.style.color = totalDiff < 0 ? "#c62828" : "#1565c0";
     }
+  }
+  backdrop.querySelector("#rItemsBody").addEventListener("input", e => {
+    if (e.target.classList.contains("ri-qty")) recalcItemDiffs();
   });
+  recalcItemDiffs();
 
   backdrop.querySelector("#confirmReceiptBtn").onclick = async () => {
     await saveReceipt(backdrop, dispatchDocId, dp, window.__ptmsUser);
@@ -399,18 +470,49 @@ window.openReceiptModal = async (dispatchDocId) => {
 
 // ── Save Receipt ──────────────────────────────────────────────
 async function saveReceipt(backdrop, dispatchDocId, dp, user) {
-  const errEl    = backdrop.querySelector("#receiptFormError");
-  const arrDate  = backdrop.querySelector("#rArrDate").value;
-  const arrTime  = backdrop.querySelector("#rArrTime").value;
-  const qtyRecv  = parseFloat(backdrop.querySelector("#rQtyRecv").value);
-  const boxesRecv= parseInt(backdrop.querySelector("#rBoxesRecv").value||"0");
-  const remarks  = backdrop.querySelector("#rRemarks").value.trim();
+  const errEl   = backdrop.querySelector("#receiptFormError");
+  const arrDate = backdrop.querySelector("#rArrDate").value;
+  const arrTime = backdrop.querySelector("#rArrTime").value;
+  const remarks = backdrop.querySelector("#rRemarks").value.trim();
 
   errEl.classList.add("hidden");
   if (!arrDate||!arrTime) { errEl.textContent="Arrival date and time required."; errEl.classList.remove("hidden"); return; }
-  if (isNaN(qtyRecv)||qtyRecv<0) { errEl.textContent="Enter a valid quantity."; errEl.classList.remove("hidden"); return; }
 
-  const diff   = qtyRecv - dp.qtyDispatched;
+  // Collect item-wise received quantities
+  const sourceItems = dp.items && dp.items.length
+    ? dp.items
+    : [{ partNo: "—", partName: dp.material || "—", qty: dp.qtyDispatched, unit: dp.unit, boxes: dp.boxes || 0 }];
+
+  const itemsReceived = [];
+  let totalQtyRecv = 0, totalBoxesRecv = 0;
+  let hasInvalidQty = false;
+
+  backdrop.querySelectorAll("#rItemsBody tr[data-idx]").forEach((row, i) => {
+    const src = sourceItems[i] || {};
+    const qtyRecv  = parseFloat(row.querySelector(".ri-qty").value);
+    const boxesRecv = parseInt(row.querySelector(".ri-boxes").value || "0");
+    if (isNaN(qtyRecv) || qtyRecv < 0) { hasInvalidQty = true; return; }
+    const dispQty = parseFloat(src.qty) || 0;
+    itemsReceived.push({
+      partNo:      src.partNo  || "—",
+      partName:    src.partName || src.description || "—",
+      unit:        src.unit    || dp.unit || "",
+      qtyDispatched: dispQty,
+      boxesDispatched: src.boxes || 0,
+      qtyReceived: qtyRecv,
+      boxesReceived: boxesRecv,
+      diffQty:     qtyRecv - dispQty,
+    });
+    totalQtyRecv   += qtyRecv;
+    totalBoxesRecv += boxesRecv;
+  });
+
+  if (hasInvalidQty) { errEl.textContent="Enter valid quantities for all items."; errEl.classList.remove("hidden"); return; }
+
+  const totalQtyDisp = sourceItems.reduce((s, it) => s + (parseFloat(it.qty)||0), 0);
+  const diff   = totalQtyRecv - totalQtyDisp;
+  const qtyRecv = totalQtyRecv;
+  const boxesRecv = totalBoxesRecv;
   const status = Math.abs(diff) > 0.001 ? "discrepancy" : "received";
 
   const confirmBtn = backdrop.querySelector("#confirmReceiptBtn");
@@ -434,6 +536,7 @@ async function saveReceipt(backdrop, dispatchDocId, dp, user) {
       status, arrivalDate:arrDate, arrivalTime:arrTime,
       qtyReceived:qtyRecv, boxesReceived:boxesRecv,
       diffQty:diff, receiptRemarks:remarks,
+      itemsReceived,                                  // ← item-wise receipt detail
       receivedBy:user.uid, receivedByName:user.name,
       receivedByPlant:user.plantId,
       photoEvidence: photoUrls,
