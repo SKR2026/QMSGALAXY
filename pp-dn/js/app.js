@@ -594,6 +594,18 @@ function buildSidebar() {
     document.getElementById("bulkActions").classList.remove("d-none");
   }
 
+  // Corporate MR — explicitly block all delete access (belt-and-suspenders)
+  if (isCorporateMR()) {
+    const bulkActions = document.getElementById("bulkActions");
+    if (bulkActions) bulkActions.style.setProperty("display", "none", "important");
+    document.querySelectorAll(".superadmin-only").forEach(el => {
+      el.classList.add("d-none");
+      el.style.setProperty("display", "none", "important");
+    });
+    // Also set body attribute for CSS selector guard
+    document.body.dataset.role = "corporate_mr";
+  }
+
   // Hide action buttons for top management
   if (isTopManagement()) {
     document.querySelectorAll(".superadmin-only, #bulkActions, #sendNotifBtn, .btn-assign, .btn-return, .btn-delete").forEach(el => el.classList.add("d-none"));
@@ -625,7 +637,7 @@ function navigateTo(view) {
   // Load view-specific data
   if (view === "dashboard") loadDashboard();
   if (view === "mydocs")    loadMyDocuments();
-  if (view === "mr")        loadMRQueue();
+  if (view === "mr")        { _mrAllTabLoaded = false; initMRTabs(); loadMRQueue(); }
   if (view === "audit")     loadAuditLogs();
   if (view === "settings")  loadSettings();
   if (view === "submit")    { prepareSubmitForm(); loadRecentSubmissions(); }
@@ -1971,6 +1983,201 @@ function renderMRQueue() {
     b.addEventListener("click", () => openAssignModal(b.dataset.id)));
   tbody.querySelectorAll(".return-btn").forEach(b =>
     b.addEventListener("click", () => openReturnModal(b.dataset.id)));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MR — ALL DOCUMENTS TAB  (read-only, no delete, corporate_mr + superadmin)
+// ═══════════════════════════════════════════════════════════════════════════
+let _mrAllTabDocs = [];   // cached for filter/sort without re-fetch
+let _mrAllTabLoaded = false;
+let _mrAllTabPage = 1;
+const MR_ALL_PAGE = 25;
+let _mrTabsInited = false;
+
+function initMRTabs() {
+  if (_mrTabsInited) return;   // only wire events once
+  _mrTabsInited = true;
+  // Wire sub-tab clicks
+  document.querySelectorAll("#mrTabs [data-mr-tab]").forEach(link => {
+    link.addEventListener("click", e => {
+      e.preventDefault();
+      document.querySelectorAll("#mrTabs [data-mr-tab]").forEach(l => l.classList.remove("active"));
+      link.classList.add("active");
+      const tab = link.dataset.mrTab;
+      const qPanel = document.getElementById("mrPanelQueue");
+      const aPanel = document.getElementById("mrPanelAll");
+      if (tab === "queue") {
+        if (qPanel) qPanel.style.display = "";
+        if (aPanel) aPanel.style.display = "none";
+      } else {
+        if (qPanel) qPanel.style.display = "none";
+        if (aPanel) aPanel.style.display = "";
+        if (!_mrAllTabLoaded) { _mrAllTabLoaded = true; loadMRAllDocs(); }
+      }
+    });
+  });
+
+  // Wire All-docs filters + search
+  ["mrAllFilterPlant","mrAllFilterDept","mrAllFilterCat","mrAllFilterStatus","mrAllSearch"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("input", () => { _mrAllTabPage = 1; renderMRAllDocs(); });
+  });
+
+  // Export button
+  document.getElementById("mrAllExportBtn")?.addEventListener("click", exportMRAllDocs);
+
+  // Sort headers
+  document.getElementById("mrAllTable")?.querySelectorAll("th[data-col]").forEach(th => {
+    th.style.cursor = "pointer";
+    th.addEventListener("click", () => {
+      if (_mrAllTabSort.col === th.dataset.col) _mrAllTabSort.dir *= -1;
+      else { _mrAllTabSort.col = th.dataset.col; _mrAllTabSort.dir = -1; }
+      renderMRAllDocs();
+    });
+  });
+}
+
+let _mrAllTabSort = { col: "submissionDate", dir: -1 };
+
+async function loadMRAllDocs() {
+  const tbody = document.getElementById("mrAllTableBody");
+  if (!tbody) return;
+  tbody.innerHTML = `<tr><td colspan="12" class="text-center py-4 text-muted">
+    <span class="spinner-border spinner-border-sm me-2"></span>Loading all documents…</td></tr>`;
+
+  try {
+    const snap = await getDocs(collection(db, "documents"));
+    _mrAllTabDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .filter(d => d.status !== "deleted");
+    populateMRAllFilters();
+    renderMRAllDocs();
+  } catch (err) {
+    console.error("[MR-AllDocs] load error:", err);
+    if (tbody) tbody.innerHTML = `<tr><td colspan="12" class="text-center py-4 text-danger">Error: ${err.message}</td></tr>`;
+  }
+}
+
+function populateMRAllFilters() {
+  const plants = [...new Set(_mrAllTabDocs.map(d => d.plantName).filter(Boolean))].sort();
+  const depts  = [...new Set(_mrAllTabDocs.map(d => d.departmentName).filter(Boolean))].sort();
+  const cats   = [...new Set(_mrAllTabDocs.map(d => d.categoryName).filter(Boolean))].sort();
+  const fill = (id, vals) => {
+    const sel = document.getElementById(id); if (!sel) return;
+    const cur = sel.value;
+    while (sel.options.length > 1) sel.remove(1);
+    vals.forEach(v => sel.add(new Option(v, v)));
+    sel.value = cur;
+  };
+  fill("mrAllFilterPlant", plants);
+  fill("mrAllFilterDept",  depts);
+  fill("mrAllFilterCat",   cats);
+}
+
+function renderMRAllDocs() {
+  const plant  = document.getElementById("mrAllFilterPlant")?.value  || "";
+  const dept   = document.getElementById("mrAllFilterDept")?.value   || "";
+  const cat    = document.getElementById("mrAllFilterCat")?.value    || "";
+  const status = document.getElementById("mrAllFilterStatus")?.value || "";
+  const srch   = (document.getElementById("mrAllSearch")?.value || "").toLowerCase();
+
+  let rows = _mrAllTabDocs.filter(d => {
+    if (plant  && d.plantName      !== plant)  return false;
+    if (dept   && d.departmentName !== dept)   return false;
+    if (cat    && d.categoryName   !== cat)    return false;
+    if (status && d.status         !== status) return false;
+    if (srch) {
+      const hay = [d.submissionRefNo, d.documentTitle, d.submittedByName,
+                   d.officialDocNumber, d.plantName, d.departmentName, d.status]
+                  .join(" ").toLowerCase();
+      if (!hay.includes(srch)) return false;
+    }
+    return true;
+  });
+
+  // Sort
+  rows.sort((a, b) => {
+    let av = a[_mrAllTabSort.col], bv = b[_mrAllTabSort.col];
+    if (av?.toMillis) av = av.toMillis();
+    if (bv?.toMillis) bv = bv.toMillis();
+    av = av ?? ""; bv = bv ?? "";
+    return av < bv ? _mrAllTabSort.dir : av > bv ? -_mrAllTabSort.dir : 0;
+  });
+
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / MR_ALL_PAGE));
+  _mrAllTabPage = Math.min(_mrAllTabPage, pages);
+  const slice = rows.slice((_mrAllTabPage - 1) * MR_ALL_PAGE, _mrAllTabPage * MR_ALL_PAGE);
+
+  const tbody = document.getElementById("mrAllTableBody");
+  if (!tbody) return;
+
+  tbody.innerHTML = slice.length
+    ? slice.map(d => buildMRAllRow(d)).join("")
+    : `<tr><td colspan="12" class="text-center py-4 text-muted">No documents found.</td></tr>`;
+
+  // Wire view buttons
+  tbody.querySelectorAll(".view-doc-btn").forEach(b =>
+    b.addEventListener("click", () => openDocModal(b.dataset.id)));
+
+  // Info + pagination
+  const info = document.getElementById("mrAllTableInfo");
+  if (info) info.textContent = `Showing ${(_mrAllTabPage-1)*MR_ALL_PAGE+1}–${Math.min(_mrAllTabPage*MR_ALL_PAGE,total)} of ${total} record(s)`;
+
+  const pgNav = document.getElementById("mrAllTablePagination");
+  if (pgNav) {
+    pgNav.innerHTML = "";
+    for (let p = 1; p <= pages; p++) {
+      pgNav.innerHTML += `<li class="page-item ${p===_mrAllTabPage?"active":""}">
+        <a class="page-link" href="#" data-p="${p}">${p}</a></li>`;
+    }
+    pgNav.querySelectorAll("a[data-p]").forEach(a =>
+      a.addEventListener("click", e => { e.preventDefault(); _mrAllTabPage = +a.dataset.p; renderMRAllDocs(); }));
+  }
+}
+
+function buildMRAllRow(d) {
+  const submittedTs = d.submittedAt || d.submissionDate;
+  let dmsDate = "—";
+  if (d.assignmentDate) {
+    const p = d.assignmentDate.toDate ? d.assignmentDate.toDate() : new Date(d.assignmentDate);
+    dmsDate = p.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric",timeZone:"Asia/Kolkata"});
+  } else if (d.dmsUploadDate) {
+    dmsDate = d.dmsUploadDate;
+  }
+  // NO delete button — read-only tab
+  return `<tr>
+    <td class="fw-semibold text-primary" style="white-space:nowrap">${d.submissionRefNo || "—"}</td>
+    <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(d.documentTitle||"").replace(/"/g,"&quot;")}">${d.documentTitle || "—"}</td>
+    <td><span class="text-muted small">${d.categoryName || "—"}</span></td>
+    <td><span class="small">${d.plantName || "—"}</span></td>
+    <td><span class="small">${d.departmentName || "—"}</span></td>
+    <td>${d.submittedByName || "—"}</td>
+    <td><span class="small" style="white-space:nowrap">${toIST(submittedTs)}</span></td>
+    <td class="fw-semibold text-success">${d.officialDocNumber || "—"}</td>
+    <td>${dmsDate}</td>
+    <td>${statusBadge(d.status)}</td>
+    <td style="min-width:260px;padding:4px 8px">${buildHorizontalTimeline(d)}</td>
+    <td><button class="btn-act-view view-doc-btn" data-id="${d.id}" title="View"><i class="bi bi-eye"></i></button></td>
+  </tr>`;
+}
+
+function exportMRAllDocs() {
+  if (!window.XLSX) return showToast("XLSX library not ready. Please wait.", "warning");
+  const rows = _mrAllTabDocs.map(d => ({
+    "Ref. No.":     d.submissionRefNo  || "",
+    "Title":        d.documentTitle    || "",
+    "Category":     d.categoryName     || "",
+    "Plant":        d.plantName        || "",
+    "Department":   d.departmentName   || "",
+    "Submitted By": d.submittedByName  || "",
+    "Submitted On": d.submittedAt?.toDate ? d.submittedAt.toDate().toLocaleDateString("en-IN",{timeZone:"Asia/Kolkata"}) : (d.submissionDate?.toDate ? d.submissionDate.toDate().toLocaleDateString("en-IN",{timeZone:"Asia/Kolkata"}) : ""),
+    "DMS No.":      d.officialDocNumber || "",
+    "DMS Date":     d.dmsUploadDate    || "",
+    "Status":       d.status           || "",
+  }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "All Documents");
+  XLSX.writeFile(wb, "CDRTS_All_Documents.xlsx");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
