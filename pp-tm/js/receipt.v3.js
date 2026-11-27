@@ -2,6 +2,7 @@
 //  PTMS – Receipt / Incoming Vehicle Module  (Phase 3)
 //  Receiving plant confirms arrival, qty received.
 //  Photo evidence support for discrepancies.
+//  v3.4 – item-wise receipt + viewDispatch modal
 // ─────────────────────────────────────────────────────────────
 
 import { db } from "./firebase.v2.js";
@@ -191,9 +192,11 @@ async function loadReceivedList(user, listEl, filters) {
         <td>${dp.vehicleNo||"—"}</td>
         <td>${dp.driverName||"—"}</td>
         <td><span class="badge status-${dp.status}">${statusLabel(dp.status)}</span></td>
-        <td>
+        <td style="white-space:nowrap">
           ${photoThumb}
-          <button class="btn btn-outline btn-sm" onclick="viewDispatch('${d.id}')">🔍 View</button>
+          <button style="background:#1565c0;color:#fff;border:none;border-radius:7px;padding:.35rem .85rem;
+            font-size:.82rem;font-weight:700;cursor:pointer;white-space:nowrap"
+            onclick="viewDispatch('${d.id}')">🔍 View</button>
         </td>
       </tr>`;
     });
@@ -208,7 +211,7 @@ async function loadReceivedList(user, listEl, filters) {
         <thead><tr>
           ${isSA ? `<th style="width:36px"><input type="checkbox" id="histSelectAll" style="width:16px;height:16px;cursor:pointer" title="Select all"></th>` : ""}
           <th>Dispatch Date/Time</th><th>Receipt Date/Time</th><th>From</th><th>To</th><th>Material</th>
-          <th>Unit</th><th>Dispatched</th><th>Received</th><th>Diff</th><th>Vehicle</th><th>Driver</th><th>Status</th><th>Details</th>
+          <th>Unit</th><th>Dispatched</th><th>Received</th><th>Diff</th><th>Vehicle</th><th>Driver</th><th>Status</th><th style="min-width:80px">View</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table></div>`;

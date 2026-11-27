@@ -8,7 +8,7 @@ import { observeAuth, logoutUser, currentUser as _cu, changePassword } from "./a
 import { doc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { db } from "./firebase.v2.js";
 import { showDispatchPage }  from "./dispatch.v2.js";
-import { showReceiptPage }   from "./receipt.v3.js";
+import { showReceiptPage }   from "./receipt.v3.js?v=34";
 import { showDashboardPage } from "./dashboard.v2.js";
 import { showReportsPage }   from "./reports.v3.js";
 import { showAdminPage }     from "./admin.v2.js";
