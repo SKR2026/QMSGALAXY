@@ -86,6 +86,13 @@ async function loadPlantsTable(wrap) {
   let rows = "";
   snap.forEach(d => {
     const p = d.data();
+    const notifyCount = p.notifyPersons?.length || 0;
+    const notifyCell  = notifyCount
+      ? `<span title="${p.notifyPersons.map(x=>x.name||x.emails?.join(', ')).join('\n')}"
+           style="display:inline-flex;align-items:center;gap:.3rem;background:#e8f0fe;color:#1a73e8;border-radius:999px;padding:.18rem .6rem;font-size:.75rem;font-weight:700;cursor:default">
+           🔔 ${notifyCount} person${notifyCount>1?"s":""}
+         </span>`
+      : `<span style="color:#ccc;font-size:.82rem">—</span>`;
     rows += `
       <tr>
         <td><span class="dispatch-id">${p.code}</span></td>
@@ -93,6 +100,7 @@ async function loadPlantsTable(wrap) {
         <td>${p.location || "—"}</td>
         <td>${p.contactPerson || "—"}</td>
         <td>${p.phone || "—"}</td>
+        <td>${notifyCell}</td>
         <td><span class="badge ${p.isActive ? 'badge-green' : 'badge-grey'}">${p.isActive ? 'Active' : 'Inactive'}</span></td>
         <td>
           <button class="btn btn-outline btn-sm" onclick="editPlant('${d.id}')">Edit</button>
@@ -107,7 +115,7 @@ async function loadPlantsTable(wrap) {
     <table>
       <thead><tr>
         <th>Code</th><th>Name</th><th>Location</th>
-        <th>Contact</th><th>Phone</th><th>Status</th><th>Actions</th>
+        <th>Contact</th><th>Phone</th><th>🔔 Notify</th><th>Status</th><th>Actions</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
@@ -161,6 +169,25 @@ function openPlantModal(existingId = null, existing = null) {
             <textarea id="pNotes" placeholder="Optional remarks">${existing?.notes || ''}</textarea>
           </div>
         </div>
+
+        <!-- ── Notification Contacts ── -->
+        <div class="pn-section">
+          <div class="pn-section-title">
+            🔔 Dispatch Notification Contacts
+            <span class="pn-badge">Auto-notified on dispatch</span>
+          </div>
+          <div style="font-size:.78rem;color:#666;margin-bottom:.7rem">
+            These people will receive an email whenever a dispatch is confirmed involving this plant.
+          </div>
+          <div class="pn-col-labels">
+            <span>Person Name</span>
+            <span>Email(s) — press <kbd style="background:#f0f0f8;border-radius:4px;padding:1px 5px;font-size:.72rem">Enter</kbd> or <kbd style="background:#f0f0f8;border-radius:4px;padding:1px 5px;font-size:.72rem">+</kbd> after each</span>
+            <span></span>
+          </div>
+          <div id="pn-rows-container"></div>
+          <button type="button" class="pn-add-btn" id="pnAddBtn">＋ Add Person</button>
+        </div>
+
         <div id="plantFormError" class="error-msg hidden"></div>
       </div>
       <div class="modal-footer">
@@ -173,6 +200,156 @@ function openPlantModal(existingId = null, existing = null) {
   backdrop.querySelector("#cancelPlantBtn").onclick  = () => backdrop.remove();
   backdrop.querySelector("#savePlantBtn").onclick = async () => {
     await savePlant(backdrop, existingId);
+  };
+
+  // ── Inject notification styles (once) ────────────────────────
+  if (!document.getElementById("pn-modal-styles")) {
+    const s = document.createElement("style");
+    s.id = "pn-modal-styles";
+    s.textContent = `
+      .pn-section{margin-top:1.1rem;border-top:2px solid #f0f0f8;padding-top:1rem}
+      .pn-section-title{font-size:.82rem;font-weight:700;color:#4a4a6a;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.4rem;display:flex;align-items:center;gap:.45rem;flex-wrap:wrap}
+      .pn-badge{background:#e8f0fe;color:#1a73e8;border-radius:999px;padding:.1rem .55rem;font-size:.7rem;font-weight:700}
+      .pn-col-labels{display:grid;grid-template-columns:1fr 1.6fr auto;gap:.6rem;margin-bottom:.3rem}
+      .pn-col-labels span{font-size:.7rem;font-weight:700;color:#aaa;text-transform:uppercase;letter-spacing:.04em}
+      .pn-row{display:grid;grid-template-columns:1fr 1.6fr auto;gap:.6rem;align-items:start;margin-bottom:.5rem}
+      .pn-row input.pn-name-input{width:100%;padding:.42rem .7rem;border:1.5px solid #d0d0e8;border-radius:8px;font-size:.88rem;color:#1a1a2e;background:#fafaff;box-sizing:border-box;transition:border-color .18s}
+      .pn-row input.pn-name-input:focus{outline:none;border-color:#4f8ef7;background:#fff}
+      .pn-tags{display:flex;flex-wrap:wrap;gap:.3rem;padding:.32rem .5rem;border:1.5px solid #d0d0e8;border-radius:8px;background:#fafaff;min-height:36px;cursor:text;transition:border-color .18s;align-items:center}
+      .pn-tags:focus-within{border-color:#4f8ef7;background:#fff}
+      .pn-tag{display:inline-flex;align-items:center;gap:.22rem;background:#e8f0fe;color:#1a1a2e;border-radius:999px;padding:.16rem .52rem .16rem .58rem;font-size:.76rem;font-weight:600;white-space:nowrap;max-width:200px;overflow:hidden;text-overflow:ellipsis}
+      .pn-tag .pn-tag-del{background:none;border:none;cursor:pointer;color:#5f6368;font-size:.82rem;line-height:1;padding:0 1px}
+      .pn-tag .pn-tag-del:hover{color:#c62828}
+      .pn-tags input[type=email]{border:none!important;background:transparent!important;outline:none;padding:.12rem .3rem;font-size:.82rem;min-width:150px;flex:1;color:#1a1a2e}
+      .pn-email-hint{font-size:.68rem;color:#bbb;margin-top:.18rem}
+      .pn-del-btn{background:none;border:none;cursor:pointer;color:#c62828;font-size:1rem;display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:7px;margin-top:3px;transition:background .15s;flex-shrink:0}
+      .pn-del-btn:hover{background:#ffebee}
+      .pn-add-btn{background:none;border:1.5px dashed #4f8ef7;color:#4f8ef7;font-weight:700;font-size:.82rem;padding:.35rem .85rem;border-radius:8px;cursor:pointer;margin-top:.3rem;transition:background .15s}
+      .pn-add-btn:hover{background:#e8f0fe}
+    `;
+    document.head.appendChild(s);
+  }
+
+  // ── Notification row helpers ──────────────────────────────────
+  const pnEmailMap = new Map();   // rowId → string[]
+  let pnSeq = 0;
+
+  function pnIsValidEmail(e) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim());
+  }
+
+  function pnAddTag(tagsEl, emailInputEl, email) {
+    email = email.trim().toLowerCase();
+    if (!email || !pnIsValidEmail(email)) return false;
+    const rid = tagsEl.dataset.rowid;
+    const arr = pnEmailMap.get(rid) || [];
+    if (arr.includes(email)) return false;
+    arr.push(email);
+    pnEmailMap.set(rid, arr);
+    const tag = document.createElement("span");
+    tag.className = "pn-tag";
+    tag.title = email;
+    tag.innerHTML = `${email} <button type="button" class="pn-tag-del">✕</button>`;
+    tag.querySelector(".pn-tag-del").onclick = () => {
+      const i = arr.indexOf(email); if (i > -1) arr.splice(i, 1); tag.remove();
+    };
+    tagsEl.insertBefore(tag, emailInputEl);
+    emailInputEl.value = "";
+    return true;
+  }
+
+  function pnBuildRow(data = {}) {
+    pnSeq++;
+    const rid = `pnr-${pnSeq}`;
+    pnEmailMap.set(rid, data.emails ? [...data.emails] : []);
+
+    const row = document.createElement("div");
+    row.className = "pn-row"; row.dataset.rowid = rid;
+
+    // Name
+    const nameInp = document.createElement("input");
+    nameInp.type = "text"; nameInp.className = "pn-name-input";
+    nameInp.placeholder = "Person name"; nameInp.value = data.name || "";
+    nameInp.autocomplete = "off";
+
+    // Email tags
+    const wrap = document.createElement("div");
+    const tagsEl = document.createElement("div");
+    tagsEl.className = "pn-tags"; tagsEl.dataset.rowid = rid;
+    tagsEl.title = "Type email then Enter or +";
+    const emailInp = document.createElement("input");
+    emailInp.type = "email"; emailInp.placeholder = "email@co.com then ＋";
+    emailInp.autocomplete = "off"; emailInp.spellcheck = false;
+
+    // Restore existing emails
+    (data.emails || []).forEach(em => {
+      const arr = pnEmailMap.get(rid);
+      const tag = document.createElement("span");
+      tag.className = "pn-tag"; tag.title = em;
+      tag.innerHTML = `${em} <button type="button" class="pn-tag-del">✕</button>`;
+      tag.querySelector(".pn-tag-del").onclick = () => {
+        const i = arr.indexOf(em); if (i > -1) arr.splice(i, 1); tag.remove();
+      };
+      tagsEl.appendChild(tag);
+    });
+    tagsEl.appendChild(emailInp);
+    tagsEl.addEventListener("click", () => emailInp.focus());
+
+    emailInp.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === "+") {
+        e.preventDefault();
+        pnAddTag(tagsEl, emailInp, emailInp.value.replace(/\+$/,""));
+      }
+      if (e.key === "Backspace" && !emailInp.value) {
+        const arr = pnEmailMap.get(rid) || [];
+        if (arr.length) { arr.pop(); tagsEl.querySelector(".pn-tag:last-of-type")?.remove(); }
+      }
+    });
+    emailInp.addEventListener("blur", () => {
+      if (emailInp.value.trim()) pnAddTag(tagsEl, emailInp, emailInp.value.trim());
+    });
+
+    const hint = document.createElement("div");
+    hint.className = "pn-email-hint";
+    hint.textContent = "Press Enter or + to add multiple emails";
+    wrap.appendChild(tagsEl); wrap.appendChild(hint);
+
+    // Delete row
+    const delBtn = document.createElement("button");
+    delBtn.type = "button"; delBtn.className = "pn-del-btn"; delBtn.title = "Remove";
+    delBtn.textContent = "🗑";
+    delBtn.onclick = () => { pnEmailMap.delete(rid); row.remove(); };
+
+    row.appendChild(nameInp); row.appendChild(wrap); row.appendChild(delBtn);
+    return row;
+  }
+
+  // ── Populate rows ─────────────────────────────────────────────
+  const pnContainer = backdrop.querySelector("#pn-rows-container");
+  const existingPersons = existing?.notifyPersons || [];
+  if (existingPersons.length) {
+    existingPersons.forEach(p => pnContainer.appendChild(pnBuildRow(p)));
+  } else {
+    pnContainer.appendChild(pnBuildRow()); // one blank row
+  }
+
+  backdrop.querySelector("#pnAddBtn").onclick = () => {
+    pnContainer.appendChild(pnBuildRow());
+    pnContainer.lastElementChild?.querySelector(".pn-name-input")?.focus();
+  };
+
+  // ── Expose collector for savePlant ────────────────────────────
+  backdrop._getNotifyPersons = () => {
+    const persons = [];
+    pnContainer.querySelectorAll(".pn-row").forEach(row => {
+      const rid    = row.dataset.rowid;
+      const name   = row.querySelector(".pn-name-input")?.value.trim() || "";
+      const einp   = row.querySelector(".pn-tags input[type=email]");
+      if (einp?.value.trim()) pnAddTag(row.querySelector(".pn-tags"), einp, einp.value.trim());
+      const emails = pnEmailMap.get(rid) || [];
+      if (name || emails.length) persons.push({ name, emails });
+    });
+    return persons;
   };
 }
 
@@ -193,6 +370,7 @@ async function savePlant(backdrop, existingId) {
     phone:         backdrop.querySelector("#pPhone").value.trim(),
     email:         backdrop.querySelector("#pEmail").value.trim(),
     notes:         backdrop.querySelector("#pNotes").value.trim(),
+    notifyPersons: backdrop._getNotifyPersons ? backdrop._getNotifyPersons() : [],
     isActive:      true,
     updatedAt:     serverTimestamp(),
   };
