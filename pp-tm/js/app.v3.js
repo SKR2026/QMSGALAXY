@@ -1,4 +1,4 @@
-// v1795361569
+// v1795361569 + bulk-upload
 // ─────────────────────────────────────────────────────────────
 //  PTMS – Main App Router
 //  Handles page routing, nav building, session, clock.
@@ -88,10 +88,11 @@ function buildNav(user) {
     sections.push({
       title: "Operations",
       items: [
-        { id: "dashboard",  icon: "📊", label: "Dashboard" },
-        { id: "dispatch",   icon: "🚚", label: "All Dispatches" },
-        { id: "receipt",    icon: "📥", label: "Incoming Vehicles" },
-        { id: "reports",    icon: "📋", label: "Reports" },
+        { id: "dashboard",    icon: "📊", label: "Dashboard" },
+        { id: "dispatch",     icon: "🚚", label: "All Dispatches" },
+        { id: "bulkupload",   icon: "📦", label: "Bulk Upload" },   // ← NEW
+        { id: "receipt",      icon: "📥", label: "Incoming Vehicles" },
+        { id: "reports",      icon: "📋", label: "Reports" },
       ]
     });
   }
@@ -186,6 +187,20 @@ function setupSidebarToggle() {
 export function navigate(route) {
   activeRoute = route;
 
+  // "bulkupload" opens the modal overlay rather than a full page
+  if (route === "bulkupload") {
+    if (window.BulkUpload) {
+      window.BulkUpload.reset();
+      window.BulkUpload.open();
+    }
+    // Don't update pageContent — stay on whatever page was active
+    // But do highlight the nav item briefly
+    document.querySelectorAll(".nav-item").forEach(el => {
+      el.classList.toggle("active", el.dataset.route === route);
+    });
+    return;
+  }
+
   // Highlight active nav item
   document.querySelectorAll(".nav-item").forEach(el => {
     el.classList.toggle("active", el.dataset.route === route);
@@ -258,12 +273,17 @@ observeAuth(
 
     buildNav(user);
     navigate("dashboard");
+
+    // Show Bulk Upload FAB after login
+    if (window.BulkUpload) window.BulkUpload.showFab();
   },
   () => {
     // Logged out
     window.__ptmsUser = null;
     appShell.classList.add("hidden");
     loginPage.classList.remove("hidden");
+    // Hide FAB on logout
+    if (window.BulkUpload) window.BulkUpload.hideFab();
   }
 );
 
