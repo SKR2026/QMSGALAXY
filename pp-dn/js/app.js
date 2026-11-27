@@ -637,7 +637,19 @@ function navigateTo(view) {
   // Load view-specific data
   if (view === "dashboard") loadDashboard();
   if (view === "mydocs")    loadMyDocuments();
-  if (view === "mr")        { _mrAllTabLoaded = false; initMRTabs(); loadMRQueue(); }
+  if (view === "mr")        {
+    // Reset to Queue tab on every navigation
+    _mrAllTabLoaded = false;
+    const qp = document.getElementById("mrPanelQueue");
+    const ap = document.getElementById("mrPanelAll");
+    if (qp) qp.style.display = "";
+    if (ap) ap.style.display = "none";
+    document.querySelectorAll("#mrTabs [data-mr-tab]").forEach(l => l.classList.remove("active"));
+    const qTab = document.querySelector("#mrTabs [data-mr-tab='queue']");
+    if (qTab) qTab.classList.add("active");
+    initMRTabs();   // idempotent — only wires events once
+    loadMRQueue();
+  }
   if (view === "audit")     loadAuditLogs();
   if (view === "settings")  loadSettings();
   if (view === "submit")    { prepareSubmitForm(); loadRecentSubmissions(); }
