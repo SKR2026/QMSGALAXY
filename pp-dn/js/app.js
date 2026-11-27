@@ -563,6 +563,7 @@ function buildSidebar() {
   if (isCorporateMR()) {
     addSection("Processing");
     addLink("mr", "bi-clipboard-check", "Document Queue");
+    addLink("mr-all", "bi-archive", "All Documents");
   }
 
   if (isSuperadmin()) {
@@ -628,7 +629,8 @@ function navigateTo(view) {
     dashboard: "Dashboard",
     submit: "Submit Document",
     mydocs: "My Documents",
-    mr: "Document Processing Queue",
+    mr: "Document Queue",
+    "mr-all": "All Documents",
     audit: "Audit & Activity Logs",
     settings: "Settings"
   };
@@ -650,6 +652,7 @@ function navigateTo(view) {
     initMRTabs();   // idempotent — only wires events once
     loadMRQueue();
   }
+  if (view === "mr-all")    loadMRAllView();
   if (view === "audit")     loadAuditLogs();
   if (view === "settings")  loadSettings();
   if (view === "submit")    { prepareSubmitForm(); loadRecentSubmissions(); }
@@ -2052,20 +2055,27 @@ function initMRTabs() {
 let _mrAllTabSort = { col: "submissionDate", dir: -1 };
 
 async function loadMRAllDocs() {
-  const tbody = document.getElementById("mrAllTableBody");
-  if (!tbody) return;
-  tbody.innerHTML = `<tr><td colspan="12" class="text-center py-4 text-muted">
-    <span class="spinner-border spinner-border-sm me-2"></span>Loading all documents…</td></tr>`;
+  // Show spinner in whichever table body is currently visible
+  ["mrAllTableBody","mrAllViewTableBody"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = `<tr><td colspan="12" class="text-center py-4 text-muted">
+      <span class="spinner-border spinner-border-sm me-2"></span>Loading all documents…</td></tr>`;
+  });
 
   try {
     const snap = await getDocs(collection(db, "documents"));
     _mrAllTabDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
       .filter(d => d.status !== "deleted");
     populateMRAllFilters();
-    renderMRAllDocs();
+    // Render whichever panel is active
+    if (document.getElementById("mrAllTableBody")) renderMRAllDocs();
+    if (document.getElementById("mrAllViewTableBody")) renderMRAllDocsView();
   } catch (err) {
     console.error("[MR-AllDocs] load error:", err);
-    if (tbody) tbody.innerHTML = `<tr><td colspan="12" class="text-center py-4 text-danger">Error: ${err.message}</td></tr>`;
+    ["mrAllTableBody","mrAllViewTableBody"].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = `<tr><td colspan="12" class="text-center py-4 text-danger">Error: ${err.message}</td></tr>`;
+    });
   }
 }
 
@@ -2171,6 +2181,76 @@ function buildMRAllRow(d) {
     <td style="min-width:260px;padding:4px 8px">${buildHorizontalTimeline(d)}</td>
     <td><button class="btn-act-view view-doc-btn" data-id="${d.id}" title="View"><i class="bi bi-eye"></i></button></td>
   </tr>`;
+}
+
+async function loadMRAllView() {
+  // Standalone All Documents view (sidebar link) — reuses same data + render
+  _mrAllTabLoaded = true;
+  await loadMRAllDocs();
+  // Wire filters/search/export/sort for the standalone view panel
+  ["mrAllViewFilterPlant","mrAllViewFilterDept","mrAllViewFilterCat","mrAllViewFilterStatus","mrAllViewSearch"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.removeEventListener("input", _mrAllViewHandler); el.addEventListener("input", _mrAllViewHandler); }
+  });
+  document.getElementById("mrAllViewExportBtn")?.addEventListener("click", exportMRAllDocs);
+}
+function _mrAllViewHandler() { _mrAllTabPage = 1; renderMRAllDocsView(); }
+
+function renderMRAllDocsView() {
+  const plant  = document.getElementById("mrAllViewFilterPlant")?.value  || "";
+  const dept   = document.getElementById("mrAllViewFilterDept")?.value   || "";
+  const cat    = document.getElementById("mrAllViewFilterCat")?.value    || "";
+  const status = document.getElementById("mrAllViewFilterStatus")?.value || "";
+  const srch   = (document.getElementById("mrAllViewSearch")?.value || "").toLowerCase();
+
+  let rows = _mrAllTabDocs.filter(d => {
+    if (plant  && d.plantName      !== plant)  return false;
+    if (dept   && d.departmentName !== dept)   return false;
+    if (cat    && d.categoryName   !== cat)    return false;
+    if (status && d.status         !== status) return false;
+    if (srch) {
+      const hay = [d.submissionRefNo, d.documentTitle, d.submittedByName,
+                   d.officialDocNumber, d.plantName, d.departmentName, d.status]
+                  .join(" ").toLowerCase();
+      if (!hay.includes(srch)) return false;
+    }
+    return true;
+  });
+
+  rows.sort((a, b) => {
+    let av = a[_mrAllTabSort.col], bv = b[_mrAllTabSort.col];
+    if (av?.toMillis) av = av.toMillis(); if (bv?.toMillis) bv = bv.toMillis();
+    av = av ?? ""; bv = bv ?? "";
+    return av < bv ? _mrAllTabSort.dir : av > bv ? -_mrAllTabSort.dir : 0;
+  });
+
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / MR_ALL_PAGE));
+  _mrAllTabPage = Math.min(_mrAllTabPage, pages);
+  const slice = rows.slice((_mrAllTabPage - 1) * MR_ALL_PAGE, _mrAllTabPage * MR_ALL_PAGE);
+
+  const tbody = document.getElementById("mrAllViewTableBody");
+  if (!tbody) return;
+  tbody.innerHTML = slice.length
+    ? slice.map(d => buildMRAllRow(d, "mrAllViewTableBody")).join("")
+    : `<tr><td colspan="12" class="text-center py-4 text-muted">No documents found.</td></tr>`;
+
+  tbody.querySelectorAll(".view-doc-btn").forEach(b =>
+    b.addEventListener("click", () => openDocModal(b.dataset.id)));
+
+  const info = document.getElementById("mrAllViewTableInfo");
+  if (info) info.textContent = `Showing ${(_mrAllTabPage-1)*MR_ALL_PAGE+1}–${Math.min(_mrAllTabPage*MR_ALL_PAGE,total)} of ${total}`;
+
+  const pgNav = document.getElementById("mrAllViewTablePagination");
+  if (pgNav) {
+    pgNav.innerHTML = "";
+    for (let p = 1; p <= pages; p++) {
+      pgNav.innerHTML += `<li class="page-item ${p===_mrAllTabPage?"active":""}">
+        <a class="page-link" href="#" data-p="${p}">${p}</a></li>`;
+    }
+    pgNav.querySelectorAll("a[data-p]").forEach(a =>
+      a.addEventListener("click", e => { e.preventDefault(); _mrAllTabPage = +a.dataset.p; renderMRAllDocsView(); }));
+  }
 }
 
 function exportMRAllDocs() {
