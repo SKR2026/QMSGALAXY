@@ -86,7 +86,6 @@ export async function showReportsPage(container, user) {
   pSnap.docs
     .sort((a,b)=>a.data().name.localeCompare(b.data().name))
     .forEach((d,i)=>{
-      // Hide the user's own plant pill — it's redundant (all records already scoped to their plant)
       if(user.role !== "superAdmin" && d.id === user.plantId) return;
       const pd=d.data(), c=plantColors[i%plantColors.length];
       const btn=document.createElement("button");
@@ -132,10 +131,6 @@ export async function showReportsPage(container, user) {
 
     container.querySelector("#reportResultTitle").textContent=`${result.total} Records`;
     container.querySelector("#reportResult").innerHTML=renderReportTable(result.rows);
-
-    const show=result.rows.length?"":"none";
-    container.querySelector("#exportXlsBtn").style.display=show;
-    container.querySelector("#exportPdfBtn").style.display=show;
   }
 
   // ── Type pills ────────────────────────────────────────────────
@@ -186,16 +181,10 @@ async function runReport({from,to,type,plantId,user}){
   snap.forEach(d=>{
     const dp=d.data();
 
-    // ── Scope to current plant user's records ─────────────────
     if(user.role!=="superAdmin"){
       if(dp.fromPlantId!==user.plantId&&dp.toPlantId!==user.plantId)return;
     }
 
-    // ── Plant pill filter ─────────────────────────────────────
-    // Selecting plant X means:
-    //   Dispatched  = records dispatched TO plant X   → toPlantId === X
-    //   Received    = records received FROM plant X   → fromPlantId === X
-    //   All / Disc  = plant X appears on either side
     if(plantId){
       if(type==="dispatched"){
         if(dp.toPlantId!==plantId)return;
@@ -206,15 +195,9 @@ async function runReport({from,to,type,plantId,user}){
       }
     }
 
-    // ── Status filter ─────────────────────────────────────────
-    // "Dispatched" type = all records sent to that plant (any status — may have been received already)
-    // "Received"   type = records that were received (status received or discrepancy)
-    // "Discrepancy"type = only discrepancy status
-    // No status filter for "dispatched" — plant pill already scopes by toPlantId
     if(type==="received"&&!["received","discrepancy"].includes(dp.status))return;
     if(type==="discrepancy"&&dp.status!=="discrepancy")return;
 
-    // ── Date filter — use dp.date, fall back to createdAt ─────
     const recordDate = dp.date ||
       (dp.createdAt?.toDate ? dp.createdAt.toDate().toISOString().slice(0,10) : null);
     if(from && recordDate && recordDate < from)return;
@@ -232,10 +215,15 @@ async function runReport({from,to,type,plantId,user}){
 // ── Render Table ──────────────────────────────────────────────
 function renderReportTable(rows){
   if(!rows.length)return`<div class="empty-state"><div class="empty-icon">📋</div><p>No records found.</p></div>`;
+  const exportBtns = `
+    <div style="display:flex;gap:.5rem;justify-content:flex-end;margin-bottom:.6rem">
+      <button onclick="document.getElementById('exportXlsBtn').click()" style="padding:.38rem .9rem;border-radius:8px;border:2px solid #1d6f42;background:#fff;color:#1d6f42;font-weight:700;font-size:.82rem;cursor:pointer">📊 Excel</button>
+      <button onclick="document.getElementById('exportPdfBtn').click()" style="padding:.38rem .9rem;border-radius:8px;border:2px solid #c62828;background:#fff;color:#c62828;font-weight:700;font-size:.82rem;cursor:pointer">🖨 PDF</button>
+    </div>`;
   let html=`<table><thead><tr>
     <th>Dispatch ID</th><th>Dispatch Date/Time</th><th>Receipt Date/Time</th><th>From</th><th>To</th>
     <th>Material</th><th>Unit</th><th>Dispatched</th><th>Received</th>
-    <th>Diff</th><th>Vehicle</th><th>Driver</th><th>Status</th><th>Photos</th>
+    <th>Diff</th><th>Vehicle</th><th>Driver</th><th>Status</th><th>View</th>
   </tr></thead><tbody>`;
   rows.forEach(r=>{
     const diff=r.qtyReceived!=null?r.qtyReceived-r.qtyDispatched:null;
@@ -243,7 +231,7 @@ function renderReportTable(rows){
     const dc=diff==null?"":diff<0?"color:#c62828":diff>0?"color:#1565c0":"color:#2e7d32";
     const dispDT=r.createdAt?.toDate?r.createdAt.toDate().toLocaleString("en-IN"):(r.date||"—");
     const recvDT=(r.arrivalDate&&r.arrivalTime)?r.arrivalDate+" "+r.arrivalTime:(r.arrivalDate||"—");
-    html+=`<tr>
+    html+=`<tr data-doc-id="${r.id}">
       <td><span class="dispatch-id">${r.dispatchId}</span></td>
       <td>${dispDT}</td><td>${recvDT}</td><td>${r.fromPlantName}</td><td>${r.toPlantName}</td>
       <td>${r.material}</td><td>${r.unit}</td>
@@ -251,7 +239,8 @@ function renderReportTable(rows){
       <td style="${dc};font-weight:700">${ds}</td>
       <td>${r.vehicleNo||"—"}</td><td>${r.driverName||"—"}</td>
       <td><span class="badge status-${r.status}">${statusLabel(r.status)}</span></td>
-      <td>${r.photoEvidence?.length?r.photoEvidence.map(url=>`<img src="${url}" onclick="window.open('${url}','_blank')" style="width:38px;height:38px;object-fit:cover;border-radius:5px;border:2px solid #c62828;cursor:pointer">`).join(""):"—"}</td>
+      <td style="text-align:center"><button data-vd="1" onclick="window.viewDispatch('${r.id}')"
+        style="background:#1565c0;color:#fff;border:none;border-radius:7px;padding:.35rem .85rem;font-size:.82rem;font-weight:700;cursor:pointer">🔍 View</button></td>
     </tr>`;
   });
   return html+`</tbody></table>`;
@@ -285,7 +274,6 @@ async function exportXlsx(rows, filename, filters){
   ws["!cols"]=[14,12,18,18,16,8,13,12,10,14,13,16,14,14,12,12,14,10,12,20,20].map(w=>({wch:w}));
   const wb=X.utils.book_new();
   X.utils.book_append_sheet(wb,ws,"PTMS Report");
-  // Summary sheet
   const ws2=X.utils.aoa_to_sheet([
     ["PTMS – Plant Transfer Management System"],
     ["Generated:",new Date().toLocaleString("en-IN")],
